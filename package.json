@@ -30,7 +30,7 @@
     "undici": "^7.8.0"
   },
   "overrides": {
-    "hono": "^4.12.14"
+    "hono": "^4.12.18"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
