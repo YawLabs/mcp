@@ -302,10 +302,6 @@ When both exist, the project guide is appended after the user guide with a `---`
 
 When a server fails to start with stderr like `GITHUB_TOKEN is required` and your client advertises the MCP [elicitation](https://modelcontextprotocol.io/specification/server/elicitation) capability, mcph prompts you for the missing value inline and retries the load. Values stay in-memory for the current mcph session only — persist them in the mcp.hosting dashboard if you want them across restarts.
 
-### Test from the dashboard
-
-The `/dashboard/connect` page in mcp.hosting has a **Test** button per server that loads it through your running mcph and shows pass/fail inline — no LLM round-trip needed. Useful when you've just added a server and want to confirm the token works without prompting your AI.
-
 ### Errors come with deep-links
 
 When a load fails (missing token, runtime not on PATH, server crashes on init), mcph emits a message ending with `→ Edit at https://mcp.hosting/dashboard/connect#server-<id>`. Most LLMs render that as a clickable link, and the dashboard scrolls to and highlights the matching card so you find the right server in one click.

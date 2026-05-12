@@ -59,7 +59,6 @@ import { initRerank, rerank } from "./rerank.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
 import { buildCandidates, shouldTiebreak, tiebreakViaSampling } from "./sampling-rank.js";
 import { type LoadedSlot, evaluateServerCap, resolveServerCap } from "./server-cap.js";
-import { initTestRunner, startTestRunner, stopTestRunner } from "./test-runner.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
@@ -534,7 +533,6 @@ export class ConnectServer {
     initToolReport(this.apiUrl, this.token);
     initRerank(this.apiUrl, this.token);
     initRuntimeDetect(this.apiUrl, this.token);
-    initTestRunner(this.apiUrl, this.token, () => this.config);
     // Background runtime probe — fire-and-forget, the dashboard just
     // ignores stale snapshots. Subsequent reports happen on each new
     // mcph startup, which is sufficient for "what runtimes are
@@ -549,7 +547,6 @@ export class ConnectServer {
     if (this.config?.servers.some((s) => s.command === "uv" || s.command === "uvx")) {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
-    startTestRunner();
 
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -2986,7 +2983,6 @@ export class ConnectServer {
       await this.flushStateSave();
     }
 
-    stopTestRunner();
     await shutdownAnalytics();
 
     // Disconnect all upstreams
