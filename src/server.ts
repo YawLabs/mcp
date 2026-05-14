@@ -30,6 +30,7 @@ import {
   formatHealthWarning,
   healthFactor,
 } from "./health-score.js";
+import { initHeartbeat, reportHeartbeat } from "./heartbeat.js";
 import { HISTORY_LIMIT, type ToolCallRecord, adaptiveThreshold, pushToolCall } from "./idle-ttl.js";
 import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
@@ -533,6 +534,7 @@ export class ConnectServer {
     initToolReport(this.apiUrl, this.token);
     initRerank(this.apiUrl, this.token);
     initRuntimeDetect(this.apiUrl, this.token);
+    initHeartbeat(this.apiUrl, this.token);
     // Background runtime probe — fire-and-forget, the dashboard just
     // ignores stale snapshots. Subsequent reports happen on each new
     // mcph startup, which is sufficient for "what runtimes are
@@ -547,6 +549,21 @@ export class ConnectServer {
     if (this.config?.servers.some((s) => s.command === "uv" || s.command === "uvx")) {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
+
+    // Fire-once stage-4b beacon: the MCP SDK invokes `oninitialized`
+    // after the parent client (Claude Code, Cursor, etc.) completes
+    // the initialize handshake. We pull clientInfo from the SDK
+    // (getClientVersion returns the Implementation block from the
+    // initialize request) and POST it to /api/connect/heartbeat. Set
+    // BEFORE server.connect so the assignment can't race the first
+    // initialize on a fast client. Fire-and-forget — failure is
+    // telemetry loss, never a CLI-blocking error.
+    this.server.oninitialized = (): void => {
+      const info = this.server.getClientVersion();
+      reportHeartbeat(info?.name, info?.version).catch((err: Error) =>
+        log("warn", "reportHeartbeat failed", { error: err?.message }),
+      );
+    };
 
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
