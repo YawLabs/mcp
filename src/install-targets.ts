@@ -289,7 +289,10 @@ export interface BuildLaunchEntryOptions {
   /** Optional token to embed in env. Omit to keep env empty (preferred:
    *  token lives in ~/.mcph/config.json, not in the client config). */
   token?: string;
-  /** Optional override for the `args` binary (defaults to @yawlabs/mcph). */
+  /** Optional override for the `args` binary (defaults to
+   *  @yawlabs/mcph@latest -- the `@latest` tag makes `npx` re-resolve
+   *  the newest version on every spawn, so a client restart is all it
+   *  takes to pick up a new release). */
   pkg?: string;
 }
 
@@ -301,7 +304,7 @@ export interface LaunchEntry {
 }
 
 export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
-  const pkg = opts.pkg ?? "@yawlabs/mcph";
+  const pkg = opts.pkg ?? "@yawlabs/mcph@latest";
   const entry: LaunchEntry =
     opts.os === "windows" ? { command: "cmd", args: ["/c", "npx", "-y", pkg] } : { command: "npx", args: ["-y", pkg] };
   if (opts.token) entry.env = { MCPH_TOKEN: opts.token };

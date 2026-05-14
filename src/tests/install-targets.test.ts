@@ -329,7 +329,8 @@ describe("buildLaunchEntry", () => {
   it("Windows wraps npx in cmd /c (npx.cmd shim workaround)", () => {
     const e = buildLaunchEntry({ os: "windows" });
     expect(e.command).toBe("cmd");
-    expect(e.args).toEqual(["/c", "npx", "-y", "@yawlabs/mcph"]);
+    // @latest so npx re-resolves the newest release on every spawn.
+    expect(e.args).toEqual(["/c", "npx", "-y", "@yawlabs/mcph@latest"]);
     expect(e.env).toBeUndefined();
   });
 
@@ -337,7 +338,7 @@ describe("buildLaunchEntry", () => {
     for (const os of ["macos", "linux"] as const) {
       const e = buildLaunchEntry({ os });
       expect(e.command).toBe("npx");
-      expect(e.args).toEqual(["-y", "@yawlabs/mcph"]);
+      expect(e.args).toEqual(["-y", "@yawlabs/mcph@latest"]);
     }
   });
 

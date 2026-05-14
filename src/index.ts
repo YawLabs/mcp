@@ -225,7 +225,7 @@ async function runServer(): Promise<void> {
         '       "mcpServers": {\n' +
         '         "mcp.hosting": {\n' +
         '           "command": "npx",\n' +
-        '           "args": ["-y", "@yawlabs/mcph"],\n' +
+        '           "args": ["-y", "@yawlabs/mcph@latest"],\n' +
         '           "env": {\n' +
         '             "MCPH_TOKEN": "mcp_pat_your_token_here"\n' +
         "           }\n" +

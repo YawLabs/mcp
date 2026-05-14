@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
+import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { CURATED_BUNDLES, bundleActivateHint, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine } from "./cli-shadows.js";
 import { type ComplianceGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
@@ -589,6 +590,11 @@ export class ConnectServer {
     // → disconnect so we're not holding 9 upstream processes idle.
     // Fire-and-forget so this doesn't gate transport readiness.
     this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
+
+    // Self-upgrade check: if this install is stale, upgrade it in the
+    // background so the next client restart runs the latest version.
+    // Fire-and-forget -- never awaited, never gates transport readiness.
+    maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
 
     // Opt-in auto-load of the top recurring pack. Requires persistence
     // (so there IS a history to learn from) AND MCPH_AUTO_LOAD=1. Runs

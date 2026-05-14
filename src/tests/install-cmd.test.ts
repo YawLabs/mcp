@@ -311,7 +311,7 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
 
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
-    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcph"]);
+    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcph@latest"]);
     // Token is NOT embedded in client config — lives in ~/.mcph/config.json instead.
     expect(client.mcpServers[ENTRY_NAME].env).toBeUndefined();
 
@@ -430,7 +430,7 @@ describe("runInstall — Windows uses cmd /c", () => {
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("cmd");
-    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["/c", "npx", "-y", "@yawlabs/mcph"]);
+    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["/c", "npx", "-y", "@yawlabs/mcph@latest"]);
   });
 });
 
