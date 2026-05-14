@@ -208,10 +208,14 @@ export class ConnectServer {
   private config: ConnectConfig | null = null;
   private configVersion: string | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
-  // Flipped true once the first MCP `initialize` lands (see
-  // this.server.oninitialized). Gates the per-poll heartbeat refresh so
-  // we only ping liveness while a client is actually attached.
-  private aiClientAttached = false;
+  // Captures the AI client's Implementation block once the first MCP
+  // `initialize` lands (see this.server.oninitialized). Non-null means a
+  // client is attached. The per-poll heartbeat refresh reuses these
+  // exact values so its upsert always targets the same
+  // (accountId, clientName) key the attach beacon created; re-reading
+  // getClientVersion() per poll risked a transient undefined becoming a
+  // split-brain 'unknown' row on the backend.
+  private attachedClient: { name?: string; version?: string } | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -563,8 +567,10 @@ export class ConnectServer {
     // initialize on a fast client. Fire-and-forget — failure is
     // telemetry loss, never a CLI-blocking error.
     this.server.oninitialized = (): void => {
-      this.aiClientAttached = true;
       const info = this.server.getClientVersion();
+      // Capture once; the poll-loop refresh reuses these exact values so
+      // the beacon and the refresh never disagree on the upsert key.
+      this.attachedClient = { name: info?.name, version: info?.version };
       reportHeartbeat(info?.name, info?.version).catch((err: Error) =>
         log("warn", "reportHeartbeat failed", { error: err?.message }),
       );
@@ -2237,9 +2243,8 @@ export class ConnectServer {
       // client, so when the client closes this loop dies with it and
       // last_seen_at goes stale on schedule -- which is the desired
       // "client disconnected" signal.
-      if (this.aiClientAttached) {
-        const info = this.server.getClientVersion();
-        reportHeartbeat(info?.name, info?.version, true).catch((err: Error) =>
+      if (this.attachedClient) {
+        reportHeartbeat(this.attachedClient.name, this.attachedClient.version, true).catch((err: Error) =>
           log("warn", "reportHeartbeat refresh failed", { error: err?.message }),
         );
       }
