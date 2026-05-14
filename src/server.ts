@@ -208,6 +208,10 @@ export class ConnectServer {
   private config: ConnectConfig | null = null;
   private configVersion: string | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  // Flipped true once the first MCP `initialize` lands (see
+  // this.server.oninitialized). Gates the per-poll heartbeat refresh so
+  // we only ping liveness while a client is actually attached.
+  private aiClientAttached = false;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -559,6 +563,7 @@ export class ConnectServer {
     // initialize on a fast client. Fire-and-forget — failure is
     // telemetry loss, never a CLI-blocking error.
     this.server.oninitialized = (): void => {
+      this.aiClientAttached = true;
       const info = this.server.getClientVersion();
       reportHeartbeat(info?.name, info?.version).catch((err: Error) =>
         log("warn", "reportHeartbeat failed", { error: err?.message }),
@@ -2221,6 +2226,22 @@ export class ConnectServer {
         await this.fetchAndApplyConfig();
       } catch (err: any) {
         log("warn", "Config poll failed", { error: err.message });
+      }
+      // Liveness refresh: while an AI client is attached, re-report the
+      // heartbeat on every poll so the dashboard's 3-minute "AI client
+      // connected" window stays satisfied. The attach beacon in
+      // oninitialized fires only once; without this refresh the badge
+      // reverts to "no AI client connected" ~3 min into every session.
+      // isRefresh=true so the backend bumps last_seen_at without
+      // inflating initialize_count. mcph is a stdio child of the AI
+      // client, so when the client closes this loop dies with it and
+      // last_seen_at goes stale on schedule -- which is the desired
+      // "client disconnected" signal.
+      if (this.aiClientAttached) {
+        const info = this.server.getClientVersion();
+        reportHeartbeat(info?.name, info?.version, true).catch((err: Error) =>
+          log("warn", "reportHeartbeat refresh failed", { error: err?.message }),
+        );
       }
       this.pollTimer = setTimeout(poll, intervalMs);
       if (this.pollTimer.unref) this.pollTimer.unref();

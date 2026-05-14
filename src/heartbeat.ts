@@ -8,10 +8,16 @@ import { log } from "./logger.js";
 // "AI client driving mcph" (the wiring step is done) — the gap between
 // stage 4 and stage 5 in the activation funnel.
 //
-// Fires once per mcph process, on the FIRST initialize. Subsequent
-// initialize calls only happen if the AI client restarts the stdio
-// transport without respawning mcph, which is rare; the backend
-// upsert's COALESCE keeps it safe to call multiple times anyway.
+// Two call sites, distinguished by `isRefresh`:
+//   - Attach beacon (isRefresh false): fires once per mcph process on
+//     the FIRST `initialize`. The backend increments initialize_count.
+//   - Liveness refresh (isRefresh true): fires on every config-poll
+//     cycle (~60s) for as long as a client stays attached. The backend
+//     bumps last_seen_at only, leaving initialize_count alone. This is
+//     what keeps the dashboard's 3-minute "AI client connected" window
+//     satisfied for the life of the session; without it the badge
+//     reverts to "no AI client connected" ~3 min in.
+// The backend upsert's COALESCE keeps repeated calls safe.
 //
 // Fail-open everywhere: network errors, 4xx (e.g., 404 on older
 // mcp.hosting deploys), or absence of init credentials all silently
@@ -30,6 +36,9 @@ export function initHeartbeat(url: string, tok: string): void {
 export async function reportHeartbeat(
   clientName: string | undefined,
   clientVersion: string | undefined,
+  // false = one-shot attach beacon (on `initialize`); true = periodic
+  // liveness refresh (on each config poll). See the file header.
+  isRefresh = false,
 ): Promise<void> {
   if (!apiUrl || !token) return;
   try {
@@ -45,20 +54,23 @@ export async function reportHeartbeat(
         // side dumb so a backend tightening doesn't need a CLI roll.
         clientName: clientName ?? null,
         clientVersion: clientVersion ?? null,
+        isRefresh,
       }),
       headersTimeout: 10_000,
       bodyTimeout: 10_000,
     });
     await res.body.text().catch(() => {});
     if (res.statusCode >= 400 && res.statusCode !== 404) {
-      log("warn", "Heartbeat failed", { status: res.statusCode });
-    } else {
+      log("warn", "Heartbeat failed", { status: res.statusCode, isRefresh });
+    } else if (!isRefresh) {
+      // Only the once-per-process attach beacon is logged. The refresh
+      // ping fires on every config poll (~60s); logging each would spam.
       log("info", "Reported AI client connect to mcp.hosting", {
         clientName: clientName ?? null,
         clientVersion: clientVersion ?? null,
       });
     }
   } catch (err: any) {
-    log("warn", "Heartbeat error", { error: err?.message });
+    log("warn", "Heartbeat error", { error: err?.message, isRefresh });
   }
 }

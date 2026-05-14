@@ -49,6 +49,35 @@ describe("reportHeartbeat", () => {
     expect(body.clientVersion).toBe("1.2.3");
   });
 
+  it("sends isRefresh:false by default (the one-shot attach beacon)", async () => {
+    initHeartbeat("https://mcp.hosting", "tok");
+    vi.mocked(request).mockResolvedValue({
+      statusCode: 200,
+      body: { text: vi.fn().mockResolvedValue("") },
+    } as any);
+
+    await reportHeartbeat("claude-code", "1.2.3");
+
+    const body = JSON.parse((vi.mocked(request).mock.calls[0][1] as any).body);
+    expect(body.isRefresh).toBe(false);
+  });
+
+  it("sends isRefresh:true when called as a liveness refresh", async () => {
+    // The per-poll refresh ping keeps the dashboard's "AI client
+    // connected" window fresh. The backend keys on this flag to bump
+    // last_seen_at without inflating initialize_count.
+    initHeartbeat("https://mcp.hosting", "tok");
+    vi.mocked(request).mockResolvedValue({
+      statusCode: 200,
+      body: { text: vi.fn().mockResolvedValue("") },
+    } as any);
+
+    await reportHeartbeat("claude-code", "1.2.3", true);
+
+    const body = JSON.parse((vi.mocked(request).mock.calls[0][1] as any).body);
+    expect(body.isRefresh).toBe(true);
+  });
+
   it("sends nulls when client info is undefined (some clients omit it)", async () => {
     // Some MCP clients don't populate clientInfo.name or version. The
     // backend tolerates this (falls back to 'unknown'); we pass through
