@@ -197,19 +197,51 @@ fi
 # =============================================================================
 # Step 5: Publish to npm
 # =============================================================================
+# Two publish paths, and they must not collide:
+#   - CI mode: this script IS release.yml — it publishes directly.
+#   - Local mode: step 4 already pushed the tag, which triggers
+#     release.yml to publish via the org NPM_TOKEN. A local `npm publish`
+#     here is redundant, and on a workstation without an `npm login`
+#     session it 404s and — under `set -e` — fails the whole script even
+#     though the release itself succeeded (this burned every local
+#     release into looking broken). So in local mode we WAIT for
+#     release.yml to publish — polling `npm view`, same shape as the
+#     ci.yml gate in step 4 — and only fall back to a local publish if
+#     CI never lands the version.
 step 5 "Publish to npm"
 
 PUBLISHED_VERSION=$(npm view @yawlabs/mcph version 2>/dev/null || echo "")
 
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm — skipping"
-else
-  if [ "$IS_CI" = "true" ]; then
-    npm publish --access public --provenance
-  else
-    npm publish --access public
-  fi
+elif [ "$IS_CI" = "true" ]; then
+  npm publish --access public --provenance
   info "Published @yawlabs/mcph@${VERSION} to npm"
+else
+  # Local mode: release.yml (triggered by the step-4 tag push) is the
+  # publish path. Poll npm for up to 10 minutes — release.yml normally
+  # finishes in under a minute, so this breaks out almost immediately.
+  info "Waiting for release.yml to publish v${VERSION} (tag pushed in step 4)..."
+  PUBLISH_MAX=60
+  for i in $(seq 1 $PUBLISH_MAX); do
+    PUBLISHED_VERSION=$(npm view @yawlabs/mcph version 2>/dev/null || echo "")
+    if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
+      info "release.yml published @yawlabs/mcph@${VERSION}"
+      break
+    fi
+    echo "    not on npm yet (attempt $i/$PUBLISH_MAX)..."
+    sleep 10
+  done
+
+  # CI never landed it — fall back to a local publish. This is the only
+  # path that needs an `npm login` session; if it also fails, the
+  # release genuinely needs a human (check the release.yml run).
+  if [ "$PUBLISHED_VERSION" != "$VERSION" ]; then
+    warn "release.yml did not publish within 10 minutes — attempting a local publish."
+    warn "(needs an \`npm login\` session; if it fails, inspect the release.yml run)"
+    npm publish --access public
+    info "Published @yawlabs/mcph@${VERSION} to npm (local fallback)"
+  fi
 fi
 
 # =============================================================================
