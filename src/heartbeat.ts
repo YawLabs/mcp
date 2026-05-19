@@ -27,17 +27,20 @@ const HEARTBEAT_PATH = "/api/connect/heartbeat";
 
 let apiUrl = "";
 let token = "";
-// Last logged 4xx status (excluding 404). Suppresses re-logs while the
-// same failure persists across the per-poll refresh cycle (~60s) -- a
-// revoked token would otherwise produce a warn line every minute for
-// the life of the process. Reset on status change (next non-404 4xx of
-// a different code re-logs once) and on success.
+// Last logged 4xx status (excluding 404) and last network-error
+// message. Suppress re-logs while the same failure persists across the
+// per-poll refresh cycle (~60s) -- a revoked token or offline
+// workstation would otherwise produce a warn line every minute for the
+// life of the process. Reset on status/message change (re-logs once)
+// and on success.
 let lastLoggedFailureStatus: number | null = null;
+let lastLoggedErrorMessage: string | null = null;
 
 export function initHeartbeat(url: string, tok: string): void {
   apiUrl = url;
   token = tok;
   lastLoggedFailureStatus = null;
+  lastLoggedErrorMessage = null;
 }
 
 export async function reportHeartbeat(
@@ -74,8 +77,9 @@ export async function reportHeartbeat(
       }
     } else {
       // Success or 404 (older deploy). Either way the sticky failure
-      // -- if any -- has cleared; re-arm the latch.
+      // -- if any -- has cleared; re-arm both latches.
       lastLoggedFailureStatus = null;
+      lastLoggedErrorMessage = null;
       if (!isRefresh) {
         // Only the once-per-process attach beacon is logged. The refresh
         // ping fires on every config poll (~60s); logging each would spam.
@@ -86,6 +90,10 @@ export async function reportHeartbeat(
       }
     }
   } catch (err: any) {
-    log("warn", "Heartbeat error", { error: err?.message, isRefresh });
+    const errMsg = err?.message ?? "unknown error";
+    if (lastLoggedErrorMessage !== errMsg) {
+      log("warn", "Heartbeat error", { error: errMsg, isRefresh });
+      lastLoggedErrorMessage = errMsg;
+    }
   }
 }

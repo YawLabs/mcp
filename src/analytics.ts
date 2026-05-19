@@ -58,6 +58,16 @@ export interface AnalyticsFailure {
 }
 let lastFailure: AnalyticsFailure | null = null;
 
+// Per-path "last warn-logged HTTP status" latches. Suppress re-logging
+// the same failure code on back-to-back flushes -- a persistent 401
+// against an active user still hits flush() every interval as new
+// events arrive, so without these we'd warn-spam every 30s for the
+// life of the process. Reset on a 2xx for the same path and on
+// initAnalytics. The `lastFailure` field above remains the per-event
+// diagnostic surfaced by `mcph doctor`.
+let lastLoggedConnectStatus: number | null = null;
+let lastLoggedDispatchStatus: number | null = null;
+
 export function getLastAnalyticsFailure(): AnalyticsFailure | null {
   return lastFailure;
 }
@@ -105,10 +115,14 @@ async function flush(): Promise<void> {
         const room = MAX_BUFFER - buffer.length;
         if (room > 0) buffer.push(...events.slice(0, room));
       }
-      log("warn", "Analytics flush failed", { status: res.statusCode, retried: retryable });
+      if (lastLoggedConnectStatus !== res.statusCode) {
+        log("warn", "Analytics flush failed", { status: res.statusCode, retried: retryable });
+        lastLoggedConnectStatus = res.statusCode;
+      }
       lastFailure = { statusCode: res.statusCode, url, at: Date.now() };
     } else {
       lastFailure = null;
+      lastLoggedConnectStatus = null;
     }
     // Drain response body
     await res.body.text().catch(() => {});
@@ -137,16 +151,20 @@ async function flushDispatch(): Promise<void> {
       bodyTimeout: 10_000,
     });
     if (res.statusCode >= 400 && res.statusCode !== 204) {
-      // See flush() above for the retry-class rationale.
+      // See flush() above for the retry-class + log-latch rationale.
       const retryable = res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429;
       if (retryable) {
         const room = MAX_BUFFER - dispatchBuffer.length;
         if (room > 0) dispatchBuffer.push(...events.slice(0, room));
       }
-      log("warn", "Dispatch-events flush failed", { status: res.statusCode, retried: retryable });
+      if (lastLoggedDispatchStatus !== res.statusCode) {
+        log("warn", "Dispatch-events flush failed", { status: res.statusCode, retried: retryable });
+        lastLoggedDispatchStatus = res.statusCode;
+      }
       lastFailure = { statusCode: res.statusCode, url, at: Date.now() };
     } else if (res.statusCode < 400) {
       lastFailure = null;
+      lastLoggedDispatchStatus = null;
     }
     await res.body.text().catch(() => {});
   } catch (err: any) {
@@ -159,6 +177,8 @@ async function flushDispatch(): Promise<void> {
 export function initAnalytics(url: string, tok: string): void {
   apiUrl = url;
   token = tok;
+  lastLoggedConnectStatus = null;
+  lastLoggedDispatchStatus = null;
   flushTimer = setInterval(() => {
     flush().catch(() => {});
     flushDispatch().catch(() => {});

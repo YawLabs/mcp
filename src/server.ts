@@ -660,7 +660,11 @@ export class ConnectServer {
       // Single aggregate warn so a SERVER_CAP=6 user with a 9-server
       // recurring pack gets one actionable line, not N silent ok:false
       // returns disappearing into the void.
-      log("warn", "Auto-load could not activate every namespace in the pack", {
+      const message =
+        loaded.length === 0
+          ? "Auto-load could not activate any namespace in the pack"
+          : "Auto-load could not activate every namespace in the pack";
+      log("warn", message, {
         serverCap: this.serverCap,
         loadedCount: loaded.length,
         refused,
