@@ -165,6 +165,10 @@ if (subcommand === "compliance") {
     MCPH_AUTO_ACTIVATE         Set to \`0\` to disable discover's auto-activate
                                gate (default: a clearly-winning server is
                                activated in the same call).
+    MCPH_AUTO_UPGRADE          Set to \`0\` to disable the background
+                               self-upgrade check at \`mcph serve\` startup
+                               (default: stale global-npm installs are
+                               upgraded in the background).
     MCPH_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
     MCPH_DISABLE_PERSISTENCE   Disable cross-session learning state.
 

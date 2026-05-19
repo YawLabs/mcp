@@ -221,6 +221,9 @@ else
   # Local mode: release.yml (triggered by the step-4 tag push) is the
   # publish path. Poll npm for up to 10 minutes — release.yml normally
   # finishes in under a minute, so this breaks out almost immediately.
+  # Also peek at the release.yml run for THIS tag: if GitHub reports it
+  # `completed/failure`, short-circuit to the local-publish fallback
+  # rather than burning the full timeout on a run that's already dead.
   info "Waiting for release.yml to publish v${VERSION} (tag pushed in step 4)..."
   PUBLISH_MAX=60
   for i in $(seq 1 $PUBLISH_MAX); do
@@ -229,6 +232,26 @@ else
       info "release.yml published @yawlabs/mcph@${VERSION}"
       break
     fi
+
+    # Server-side filter on the tag name: `--branch="v$VERSION"` matches
+    # gh's `headBranch` column, which for tag-push workflows holds the
+    # tag name. Avoids the previous post-filter that could miss the
+    # target run after several quick releases. --limit 10 is belt and
+    # braces in case the branch filter isn't honored by an older gh CLI;
+    # if no record matches, the parse below yields empty strings and the
+    # poll degrades cleanly to the original 10-minute timeout.
+    RELEASE_JSON=$(gh run list --workflow=release.yml --branch="v${VERSION}" --limit 10 \
+      --json status,conclusion,databaseId 2>/dev/null || echo "[]")
+    # Single node parse extracts status, conclusion, run ID into one
+    # tab-separated line so we don't spawn 3 node processes per poll.
+    RELEASE_FIELDS=$(echo "$RELEASE_JSON" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d); const r=j[0]; console.log([r?.status||"",r?.conclusion||"",r?.databaseId||""].join("\t"))})')
+    IFS=$'\t' read -r RELEASE_STATUS RELEASE_CONCLUSION RELEASE_ID <<< "$RELEASE_FIELDS"
+    if [ "$RELEASE_STATUS" = "completed" ] && [ "$RELEASE_CONCLUSION" != "success" ]; then
+      warn "release.yml ${RELEASE_CONCLUSION} for tag v${VERSION} (run ${RELEASE_ID}) — falling back to local publish."
+      warn "Inspect with: gh run view ${RELEASE_ID} --log-failed"
+      break
+    fi
+
     echo "    not on npm yet (attempt $i/$PUBLISH_MAX)..."
     sleep 10
   done

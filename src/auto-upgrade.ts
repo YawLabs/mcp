@@ -14,10 +14,15 @@
 //   - local-node-modules / dev-checkout: the user owns that tree; we
 //     never run package installs against it.
 //
-// Never blocks serving: the registry fetch has a short timeout, the npm
-// spawn is detached/ignored, and the whole thing is fire-and-forget. A
-// failure is a no-op -- worst case the user runs the current version
-// for one more session.
+// Never blocks serving: the registry fetch has a short timeout, the
+// npm spawn's stdio is ignored (no parent I/O contention) and stays a
+// child of this process so it dies with mcph, and the whole thing is
+// fire-and-forget. A failure is a no-op -- worst case the user runs
+// the current version for one more session.
+//
+// Opt-out: set MCPH_AUTO_UPGRADE=0 (or =false) to suppress the check
+// entirely -- useful for pinned-version setups or sudo-installed
+// globals where `npm install -g` would always EACCES.
 
 import { spawn } from "node:child_process";
 import { log } from "./logger.js";
@@ -70,7 +75,15 @@ function defaultSpawn(cmd: string, args: string[]): void {
     if (code === 0) {
       log("info", "mcph self-upgrade complete; the next client restart will run the new version");
     } else {
-      log("warn", "mcph self-upgrade: npm exited non-zero", { code });
+      // stdio is "ignore" so we can't surface the underlying npm error.
+      // The common cause is a non-user-writable global prefix (mcph
+      // was installed with sudo). Give the user one actionable hint
+      // instead of warning generically on every restart.
+      log(
+        "warn",
+        "mcph self-upgrade: npm exited non-zero (often EACCES on a sudo-installed global). Run `npm install -g @yawlabs/mcph@latest` with the right permissions, or set MCPH_AUTO_UPGRADE=0 to silence this.",
+        { code },
+      );
     }
   });
   child.on("error", (err: Error) => {
@@ -81,6 +94,11 @@ function defaultSpawn(cmd: string, args: string[]): void {
 /** Fire-and-forget startup self-upgrade check. Resolves once the check
  *  completes; callers must NOT await it on the serve hot path. */
 export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void> {
+  // Opt-out escape hatch -- checked before everything else so pinned-
+  // version users / sudo-installed globals can suppress with one env var.
+  const optOut = process.env.MCPH_AUTO_UPGRADE;
+  if (optOut === "0" || optOut?.toLowerCase() === "false") return;
+
   const current = deps.currentVersion ?? (typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev");
   // An unbuilt checkout has no real version to compare; never touch it.
   if (current === "dev") return;
