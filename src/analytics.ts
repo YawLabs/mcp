@@ -95,10 +95,17 @@ async function flush(): Promise<void> {
       bodyTimeout: 10_000,
     });
     if (res.statusCode >= 400) {
-      // Re-insert at front for retry (up to buffer limit)
-      const room = MAX_BUFFER - buffer.length;
-      if (room > 0) buffer.push(...events.slice(0, room));
-      log("warn", "Analytics flush failed", { status: res.statusCode });
+      // Retry only transient classes: 5xx (server-side), 408 (timeout),
+      // 429 (rate-limit). A persistent 401/403 from a revoked or
+      // scope-reduced token would otherwise re-queue forever and spam
+      // the warn log on every flush interval. Latch is set either way
+      // so `mcph doctor` still surfaces the failure.
+      const retryable = res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429;
+      if (retryable) {
+        const room = MAX_BUFFER - buffer.length;
+        if (room > 0) buffer.push(...events.slice(0, room));
+      }
+      log("warn", "Analytics flush failed", { status: res.statusCode, retried: retryable });
       lastFailure = { statusCode: res.statusCode, url, at: Date.now() };
     } else {
       lastFailure = null;
@@ -130,9 +137,13 @@ async function flushDispatch(): Promise<void> {
       bodyTimeout: 10_000,
     });
     if (res.statusCode >= 400 && res.statusCode !== 204) {
-      const room = MAX_BUFFER - dispatchBuffer.length;
-      if (room > 0) dispatchBuffer.push(...events.slice(0, room));
-      log("warn", "Dispatch-events flush failed", { status: res.statusCode });
+      // See flush() above for the retry-class rationale.
+      const retryable = res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429;
+      if (retryable) {
+        const room = MAX_BUFFER - dispatchBuffer.length;
+        if (room > 0) dispatchBuffer.push(...events.slice(0, room));
+      }
+      log("warn", "Dispatch-events flush failed", { status: res.statusCode, retried: retryable });
       lastFailure = { statusCode: res.statusCode, url, at: Date.now() };
     } else if (res.statusCode < 400) {
       lastFailure = null;

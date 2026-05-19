@@ -634,16 +634,38 @@ export class ConnectServer {
     if (candidates.length === 0) return;
 
     const top = candidates[0];
+    const loaded: string[] = [];
+    const refused: { namespace: string; message: string }[] = [];
     for (const namespace of top.namespaces) {
-      await this.activateOne(namespace).catch((err: Error) =>
-        log("warn", "Auto-load activateOne failed", { namespace, error: err?.message }),
-      );
+      try {
+        const result = await this.activateOne(namespace);
+        if (result.ok) {
+          loaded.push(namespace);
+        } else {
+          // activateOne returns ok:false on cap rejection, profile
+          // refusal, "not installed", etc. -- not an exception path.
+          refused.push({ namespace, message: result.message });
+        }
+      } catch (err) {
+        refused.push({ namespace, message: (err as Error)?.message ?? "unknown error" });
+      }
     }
 
     log("info", "Auto-loaded recurring pack", {
-      namespaces: top.namespaces,
+      loaded,
+      refusedCount: refused.length,
       frequency: top.frequency,
     });
+    if (refused.length > 0) {
+      // Single aggregate warn so a SERVER_CAP=6 user with a 9-server
+      // recurring pack gets one actionable line, not N silent ok:false
+      // returns disappearing into the void.
+      log("warn", "Auto-load could not activate every namespace in the pack", {
+        serverCap: this.serverCap,
+        loadedCount: loaded.length,
+        refused,
+      });
+    }
   }
 
   // Populate toolCache for any isActive-but-never-activated server so

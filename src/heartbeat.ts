@@ -27,10 +27,17 @@ const HEARTBEAT_PATH = "/api/connect/heartbeat";
 
 let apiUrl = "";
 let token = "";
+// Last logged 4xx status (excluding 404). Suppresses re-logs while the
+// same failure persists across the per-poll refresh cycle (~60s) -- a
+// revoked token would otherwise produce a warn line every minute for
+// the life of the process. Reset on status change (next non-404 4xx of
+// a different code re-logs once) and on success.
+let lastLoggedFailureStatus: number | null = null;
 
 export function initHeartbeat(url: string, tok: string): void {
   apiUrl = url;
   token = tok;
+  lastLoggedFailureStatus = null;
 }
 
 export async function reportHeartbeat(
@@ -61,14 +68,22 @@ export async function reportHeartbeat(
     });
     await res.body.text().catch(() => {});
     if (res.statusCode >= 400 && res.statusCode !== 404) {
-      log("warn", "Heartbeat failed", { status: res.statusCode, isRefresh });
-    } else if (!isRefresh) {
-      // Only the once-per-process attach beacon is logged. The refresh
-      // ping fires on every config poll (~60s); logging each would spam.
-      log("info", "Reported AI client connect to mcp.hosting", {
-        clientName: clientName ?? null,
-        clientVersion: clientVersion ?? null,
-      });
+      if (lastLoggedFailureStatus !== res.statusCode) {
+        log("warn", "Heartbeat failed", { status: res.statusCode, isRefresh });
+        lastLoggedFailureStatus = res.statusCode;
+      }
+    } else {
+      // Success or 404 (older deploy). Either way the sticky failure
+      // -- if any -- has cleared; re-arm the latch.
+      lastLoggedFailureStatus = null;
+      if (!isRefresh) {
+        // Only the once-per-process attach beacon is logged. The refresh
+        // ping fires on every config poll (~60s); logging each would spam.
+        log("info", "Reported AI client connect to mcp.hosting", {
+          clientName: clientName ?? null,
+          clientVersion: clientVersion ?? null,
+        });
+      }
     }
   } catch (err: any) {
     log("warn", "Heartbeat error", { error: err?.message, isRefresh });

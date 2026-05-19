@@ -161,7 +161,9 @@ if (subcommand === "compliance") {
     MCPH_POLL_INTERVAL         Dashboard polling interval, seconds (default 60).
     MCPH_SERVER_CAP            Max concurrently active servers (default 6).
     MCPH_MIN_COMPLIANCE        Minimum grade to auto-activate (A|B|C|D|F).
-    MCPH_AUTO_LOAD             Load all servers at startup, ignoring SERVER_CAP.
+    MCPH_AUTO_LOAD             Auto-activate the namespaces of the highest-
+                               ranked recurring pack at startup, subject to
+                               SERVER_CAP (default: off).
     MCPH_AUTO_ACTIVATE         Set to \`0\` to disable discover's auto-activate
                                gate (default: a clearly-winning server is
                                activated in the same call).
