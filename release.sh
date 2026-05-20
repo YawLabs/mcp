@@ -7,17 +7,11 @@
 #   ./release.sh                  — CI mode (derives version from git tag)
 #
 # If interrupted, re-run with the same version — each step is idempotent.
-#
-# Prerequisites:
-#   - Node.js 18+ and npm installed
-#   - npm authenticated (npm whoami) or NODE_AUTH_TOKEN set
-#   - gh CLI authenticated (or GITHUB_TOKEN set)
 # =============================================================================
 
 set -euo pipefail
 trap 'echo -e "\n\033[0;31m  ✗ Release failed at line $LINENO (exit code $?)\033[0m"' ERR
 
-# ---- Helpers ----
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -31,7 +25,6 @@ fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
-# ---- Resolve version ----
 VERSION="${1:-}"
 IS_CI="${CI:-false}"
 
@@ -41,7 +34,7 @@ if [ -z "$VERSION" ]; then
     info "CI mode — version $VERSION from tag $GITHUB_REF_NAME"
   else
     echo "Usage: ./release.sh <version>"
-    echo "  e.g. ./release.sh 0.3.1"
+    echo "  e.g. ./release.sh 0.48.1"
     exit 1
   fi
 fi
@@ -50,7 +43,6 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   fail "Invalid version format: $VERSION (expected X.Y.Z)"
 fi
 
-# ---- Pre-flight checks ----
 echo -e "${CYAN}Pre-flight checks...${NC}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,7 +72,7 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo "  1. Run lint + tests"
   echo "  2. Build"
   echo "  3. Bump version in package.json"
-  echo "  4. Commit, push, wait for ci.yml green on the SHA, then tag"
+  echo "  4. Commit, tag, and push"
   echo "  5. Publish to npm"
   echo "  6. Create GitHub release"
   echo "  7. Verify"
@@ -93,47 +85,25 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   fi
 fi
 
-# =============================================================================
-# Step 1: Lint
-# =============================================================================
 step 1 "Lint"
-
 npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
 info "Lint passed"
 
-# =============================================================================
-# Step 2: Test
-# =============================================================================
 step 2 "Test"
-
 npm run build || fail "Build failed"
 npm test || fail "Tests failed"
 info "All tests passed"
 
-# =============================================================================
-# Step 3: Bump version
-# =============================================================================
 step 3 "Bump version to $VERSION"
-
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} — skipping"
 else
   npm version "$VERSION" --no-git-tag-version
-  info "Version bumped"
+  info "package.json bumped"
 fi
 
-# =============================================================================
-# Step 4: Commit, push, gate on green CI, then tag
-# =============================================================================
-# Why the split:
-#   v0.11.0 burned a tag because Linux-only test failures only surfaced
-#   inside CI. The fix is: push the version-bump commit first, wait for
-#   ci.yml to go green on that exact SHA, THEN create and push the tag.
-#   That way bad commits never become bad tags. The tag space stays clean
-#   and re-tagging the same version slot becomes unnecessary.
-step 4 "Commit, push, wait for CI green, then tag"
-
+step 4 "Commit, tag, and push"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode — skipping commit/tag/push (already tagged)"
 else
@@ -145,133 +115,130 @@ else
     info "Nothing to commit"
   fi
 
-  # Push the commit alone (no tag yet) so ci.yml runs on this SHA.
-  git push origin main
-  info "Pushed v${VERSION} commit"
-
   if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-    info "Tag v${VERSION} already exists locally — skipping CI gate"
+    info "Tag v${VERSION} already exists"
   else
-    SHA=$(git rev-parse HEAD)
-    info "Waiting for ci.yml to pass on ${SHA:0:7} before tagging..."
-
-    # Poll ci.yml status on this SHA. Timeout: 15 minutes (90 * 10s).
-    GATE_MAX=90
-    for i in $(seq 1 $GATE_MAX); do
-      RUN_JSON=$(gh run list --workflow=ci.yml --commit="$SHA" --limit 1 --json status,conclusion,databaseId 2>/dev/null || echo "[]")
-      if [ "$RUN_JSON" = "[]" ] || [ -z "$RUN_JSON" ]; then
-        echo "    ci.yml not started yet for $SHA (attempt $i/$GATE_MAX)..."
-        sleep 10
-        continue
-      fi
-      RUN_STATUS=$(echo "$RUN_JSON" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d); console.log(j[0]?.status||"")})')
-      RUN_CONCLUSION=$(echo "$RUN_JSON" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d); console.log(j[0]?.conclusion||"")})')
-      RUN_ID=$(echo "$RUN_JSON" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d); console.log(j[0]?.databaseId||"")})')
-
-      if [ "$RUN_STATUS" = "completed" ]; then
-        if [ "$RUN_CONCLUSION" = "success" ]; then
-          info "ci.yml passed on $SHA (run $RUN_ID)"
-          break
-        fi
-        fail "ci.yml ${RUN_CONCLUSION} on $SHA (run $RUN_ID).
-       Tag NOT created. Inspect with: gh run view $RUN_ID --log-failed
-       Fix the issue, bump version again, and re-run release.sh."
-      fi
-      echo "    ci.yml ${RUN_STATUS} (attempt $i/$GATE_MAX)..."
-      sleep 10
-    done
-
-    # If we fell out of the loop without break, the run never completed.
-    if [ "$RUN_STATUS" != "completed" ] || [ "$RUN_CONCLUSION" != "success" ]; then
-      fail "ci.yml did not finish within 15 minutes. Tag NOT created. Re-run when ci.yml has settled."
-    fi
-
-    git tag "v${VERSION}"
+    # Annotated (-a) so `git push --follow-tags` below picks it up;
+    # lightweight tags are ignored by --follow-tags and would silently
+    # fail to publish (release commit lands but tag-push is a no-op).
+    # Required anyway when tag.gpgSign=true is set in the user's config --
+    # an unadorned `git tag NAME` errors with "no tag message" in that mode.
+    git tag -a "v${VERSION}" -m "v${VERSION}"
     info "Tag v${VERSION} created"
   fi
 
-  git push origin "v${VERSION}"
-  info "Pushed tag v${VERSION} — release.yml will publish from green commit"
+  # --follow-tags pushes only annotated tags reachable from the pushed
+  # commits, not every local tag. Avoids accidentally publishing dangling
+  # experimental tags that happen to be lying around.
+  git push origin main --follow-tags
+  info "Pushed to origin"
 fi
 
-# =============================================================================
-# Step 5: Publish to npm
-# =============================================================================
-# Two publish paths, and they must not collide:
-#   - CI mode: this script IS release.yml — it publishes directly.
-#   - Local mode: step 4 already pushed the tag, which triggers
-#     release.yml to publish via the org NPM_TOKEN. A local `npm publish`
-#     here is redundant, and on a workstation without an `npm login`
-#     session it 404s and — under `set -e` — fails the whole script even
-#     though the release itself succeeded (this burned every local
-#     release into looking broken). So in local mode we WAIT for
-#     release.yml to publish — polling `npm view`, same shape as the
-#     ci.yml gate in step 4 — and only fall back to a local publish if
-#     CI never lands the version.
 step 5 "Publish to npm"
-
-PUBLISHED_VERSION=$(npm view @yawlabs/mcph version 2>/dev/null || echo "")
-
+# Three publish paths, picked by environment:
+#   1. IS_CI=true                    -> WE are CI. Do the publish (NODE_AUTH_TOKEN
+#                                       is set; --provenance for sigstore).
+#   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
+#      exists with a publish step       Watch `gh run watch` for that run and
+#                                       verify via `npm view`. The workstation
+#                                       MUST NOT also `npm publish` -- a stale
+#                                       ~/.npmrc session fails E404 (we hit this
+#                                       on v0.48.0) and a valid one races CI
+#                                       for the same version. CI is authoritative.
+#   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
+#      path                             with EOTP retry for fresh WebAuthn sessions.
+PUBLISHED_VERSION=$(npm view "@yawlabs/mcph@${VERSION}" version 2>/dev/null || echo "")
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm — skipping"
+  # Resume-path safety: a prior interrupted run may have published but never
+  # observed `gh run watch` to completion. Later CI steps (smoke test,
+  # attestation upload) could have failed silently. Look up the most recent
+  # Release run for this tag and warn if its conclusion was non-success.
+  # Best-effort -- if the tag isn't on origin yet or the run isn't visible,
+  # the warn just doesn't fire.
+  if [ "$IS_CI" != "true" ] && [ -f ".github/workflows/release.yml" ]; then
+    RESUME_TAG_SHA=$(git rev-parse "v${VERSION}^{}" 2>/dev/null || echo "")
+    if [ -n "$RESUME_TAG_SHA" ]; then
+      RESUME_CONCLUSION=$(gh run list --workflow=Release --event=push --commit="$RESUME_TAG_SHA" --limit=1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
+      if [ -n "$RESUME_CONCLUSION" ] && [ "$RESUME_CONCLUSION" != "success" ]; then
+        warn "Prior CI Release run for v${VERSION} ended with conclusion='$RESUME_CONCLUSION' (not 'success'). A post-publish step (smoke test, attestation) may have failed silently. Inspect: gh run list --workflow=Release --commit=$RESUME_TAG_SHA --limit=3"
+      fi
+    fi
+  fi
 elif [ "$IS_CI" = "true" ]; then
   npm publish --access public --provenance
-  info "Published @yawlabs/mcph@${VERSION} to npm"
-else
-  # Local mode: release.yml (triggered by the step-4 tag push) is the
-  # publish path. Poll npm for up to 10 minutes — release.yml normally
-  # finishes in under a minute, so this breaks out almost immediately.
-  # Also peek at the release.yml run for THIS tag: if GitHub reports it
-  # `completed/failure`, short-circuit to the local-publish fallback
-  # rather than burning the full timeout on a run that's already dead.
-  info "Waiting for release.yml to publish v${VERSION} (tag pushed in step 4)..."
-  PUBLISH_MAX=60
-  for i in $(seq 1 $PUBLISH_MAX); do
-    PUBLISHED_VERSION=$(npm view @yawlabs/mcph version 2>/dev/null || echo "")
-    if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
-      info "release.yml published @yawlabs/mcph@${VERSION}"
-      break
-    fi
-
-    # Server-side filter on the tag name: `--branch="v$VERSION"` matches
-    # gh's `headBranch` column, which for tag-push workflows holds the
-    # tag name. Avoids the previous post-filter that could miss the
-    # target run after several quick releases. --limit 10 is belt and
-    # braces in case the branch filter isn't honored by an older gh CLI;
-    # if no record matches, the parse below yields empty strings and the
-    # poll degrades cleanly to the original 10-minute timeout.
-    RELEASE_JSON=$(gh run list --workflow=release.yml --branch="v${VERSION}" --limit 10 \
-      --json status,conclusion,databaseId 2>/dev/null || echo "[]")
-    # Single node parse extracts status, conclusion, run ID into one
-    # tab-separated line so we don't spawn 3 node processes per poll.
-    RELEASE_FIELDS=$(echo "$RELEASE_JSON" | node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d); const r=j[0]; console.log([r?.status||"",r?.conclusion||"",r?.databaseId||""].join("\t"))})')
-    IFS=$'\t' read -r RELEASE_STATUS RELEASE_CONCLUSION RELEASE_ID <<< "$RELEASE_FIELDS"
-    if [ "$RELEASE_STATUS" = "completed" ] && [ "$RELEASE_CONCLUSION" != "success" ]; then
-      warn "release.yml ${RELEASE_CONCLUSION} for tag v${VERSION} (run ${RELEASE_ID}) — falling back to local publish."
-      warn "Inspect with: gh run view ${RELEASE_ID} --log-failed"
-      break
-    fi
-
-    echo "    not on npm yet (attempt $i/$PUBLISH_MAX)..."
-    sleep 10
-  done
-
-  # CI never landed it — fall back to a local publish. This is the only
-  # path that needs an `npm login` session; if it also fails, the
-  # release genuinely needs a human (check the release.yml run).
-  if [ "$PUBLISHED_VERSION" != "$VERSION" ]; then
-    warn "release.yml did not publish within 10 minutes — attempting a local publish."
-    warn "(needs an \`npm login\` session; if it fails, inspect the release.yml run)"
-    npm publish --access public
-    info "Published @yawlabs/mcph@${VERSION} to npm (local fallback)"
+  info "Published @yawlabs/mcph@${VERSION} to npm (with provenance)"
+elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_TOKEN" .github/workflows/release.yml; then
+  info "CI release.yml fires on v* tag push -- workstation hands off to CI"
+  # Verify the tag landed on origin BEFORE looking up the CI run. A local
+  # push that succeeded but the remote rejected (protected-tag rule, network
+  # blip) would otherwise dead-end in the lookup loop with a misleading
+  # "Push may have failed" error 62s later. ls-remote is one round-trip --
+  # cheap relative to gh run watch.
+  if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -q "refs/tags/v${VERSION}$"; then
+    fail "Tag v${VERSION} not visible on origin. Step 4's 'git push --follow-tags' may have failed silently (protected-tag rule, network blip), or the tag was deleted between push and now. Re-run step 4."
   fi
+  TAG_SHA=$(git rev-parse "v${VERSION}^{}")
+  RUN_ID=""
+  # Exponential backoff: 2+4+8+16+32 = 62s upper bound on GitHub's
+  # tag-push -> actions queue visibility lag.
+  DELAY=2
+  for i in 1 2 3 4 5; do
+    RUN_ID=$(gh run list --workflow=Release --event=push --commit="$TAG_SHA" --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+    [ -n "$RUN_ID" ] && break
+    sleep $DELAY
+    DELAY=$((DELAY * 2))
+  done
+  if [ -z "$RUN_ID" ]; then
+    fail "Could not find Release workflow run for tag v${VERSION} (commit $TAG_SHA) after 62s of polling. The actions queue may be backed up; check 'gh run list --limit 5' and rerun the script to retry."
+  fi
+  info "Watching CI Release run $RUN_ID"
+  gh run watch "$RUN_ID" --exit-status || fail "CI Release run $RUN_ID failed. See 'gh run view $RUN_ID --log-failed'."
+  # CI is authoritative on the publish itself -- if `gh run watch` exited 0,
+  # the package is live on npm regardless of how long the registry mirror
+  # takes to surface it. Verification here is a courtesy check; warn rather
+  # than fail when the mirror lags.
+  NPM_NOW=""
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    NPM_NOW=$(npm view "@yawlabs/mcph@${VERSION}" version 2>/dev/null || echo "")
+    [ "$NPM_NOW" = "$VERSION" ] && break
+    sleep 6
+  done
+  if [ "$NPM_NOW" = "$VERSION" ]; then
+    info "Published @yawlabs/mcph@${VERSION} via CI Release run $RUN_ID"
+  else
+    DISPLAY_NPM="${NPM_NOW:-(not found)}"
+    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/mcph@${VERSION} after 60s. Likely registry propagation lag -- verify with 'npm view @yawlabs/mcph@${VERSION}' in a minute. Publish is authoritative on CI's exit code."
+  fi
+else
+  # No CI publish path -- workstation is the publisher. Retry up to 3 times
+  # on EOTP/EAUTH/OTP only (WebAuthn-fresh sessions sometimes need ~30s for
+  # the auth backend to propagate); fail fast on everything else so a
+  # packaging error or duplicate-version doesn't waste 60s spinning.
+  ATTEMPT=1
+  MAX_ATTEMPTS=3
+  while true; do
+    PUBLISH_LOG=$(mktemp)
+    if npm publish --access public 2>&1 | tee "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      break
+    fi
+    if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: run 'npm login --auth-type=web' and retry."
+    fi
+    rm -f "$PUBLISH_LOG"
+    if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+      fail "npm publish failed after $MAX_ATTEMPTS OTP-class attempts. WebAuthn session may not be propagating."
+    fi
+    warn "npm publish attempt $ATTEMPT EOTPed -- waiting 30s for WebAuthn session to propagate"
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep 30
+  done
+  info "Published @yawlabs/mcph@${VERSION} to npm (workstation)"
 fi
 
-# =============================================================================
-# Step 6: Create GitHub release
-# =============================================================================
 step 6 "Create GitHub release"
-
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
   info "GitHub release v${VERSION} already exists — skipping"
 else
@@ -288,14 +255,10 @@ else
   info "GitHub release created"
 fi
 
-# =============================================================================
-# Step 7: Verify
-# =============================================================================
 step 7 "Verify"
-
 sleep 3
 
-NPM_VERSION=$(npm view @yawlabs/mcph version 2>/dev/null || echo "")
+NPM_VERSION=$(npm view "@yawlabs/mcph@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "npm: @yawlabs/mcph@${NPM_VERSION}"
 else
@@ -315,9 +278,6 @@ else
   warn "git tag v${VERSION} not found"
 fi
 
-# =============================================================================
-# Done
-# =============================================================================
 echo ""
 echo -e "${GREEN}  v${VERSION} released successfully!${NC}"
 echo ""
