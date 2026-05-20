@@ -37,10 +37,15 @@ jobs:
       - run: npm ci
 
       - name: Release
+        # No NODE_AUTH_TOKEN: with id-token:write granted and a trusted
+        # publisher configured for @yawlabs/mcph on npmjs.com, the npm
+        # CLI uses OIDC auth via the workflow's id-token claim. Setting
+        # NODE_AUTH_TOKEN ALONGSIDE OIDC makes the CLI prefer the token,
+        # which silently shadows TP -- that's the v0.48.0 mess. Drop the
+        # token here so OIDC is the only auth path.
         run: bash release.sh
         env:
           CI: true
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Post-publish smoke test: the release is live on npm, so we confirm
