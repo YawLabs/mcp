@@ -37,15 +37,19 @@ jobs:
       - run: npm ci
 
       - name: Release
-        # No NODE_AUTH_TOKEN: with id-token:write granted and a trusted
-        # publisher configured for @yawlabs/mcph on npmjs.com, the npm
-        # CLI uses OIDC auth via the workflow's id-token claim. Setting
-        # NODE_AUTH_TOKEN ALONGSIDE OIDC makes the CLI prefer the token,
-        # which silently shadows TP -- that's the v0.48.0 mess. Drop the
-        # token here so OIDC is the only auth path.
+        # Reverted 2026-05-20 from OIDC-only Trusted Publisher to
+        # NODE_AUTH_TOKEN: the OIDC switch attempted at v0.48.0 never
+        # landed cleanly on npmjs.com (every release v0.48.0 .. v0.48.3
+        # 404'd at PUT despite signed provenance), and every other
+        # @yawlabs/*-mcp repo publishes successfully via the org-level
+        # NPM_TOKEN secret. Match that pattern here -- can revisit TP
+        # once the org-wide rotation per npm's "Mini Shai-Hulud" advisory
+        # is settled and the TP config on npmjs.com is verified to
+        # match (owner=YawLabs, repo=mcph, workflow=release.yml).
         run: bash release.sh
         env:
           CI: true
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Post-publish smoke test: the release is live on npm, so we confirm
