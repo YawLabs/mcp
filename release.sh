@@ -25,7 +25,21 @@ fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
-VERSION="${1:-}"
+# Parse args. Supports a leading -y/--yes for non-interactive mode (used
+# when mcp-hosting's release.sh delegates here at the synced-version step --
+# the parent script has already confirmed the release).
+SKIP_CONFIRM=false
+VERSION=""
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes) SKIP_CONFIRM=true ;;
+    [0-9]*.[0-9]*.[0-9]*)
+      [ -n "$VERSION" ] && fail "Multiple versions passed: '$VERSION' and '$arg'"
+      VERSION="$arg"
+      ;;
+    *) fail "Unrecognized argument: '$arg' (expected version X.Y.Z or -y/--yes)" ;;
+  esac
+done
 IS_CI="${CI:-false}"
 
 if [ -z "$VERSION" ]; then
@@ -33,8 +47,9 @@ if [ -z "$VERSION" ]; then
     VERSION="${GITHUB_REF_NAME#v}"
     info "CI mode — version $VERSION from tag $GITHUB_REF_NAME"
   else
-    echo "Usage: ./release.sh <version>"
+    echo "Usage: ./release.sh [-y] <version>"
     echo "  e.g. ./release.sh 0.48.1"
+    echo "       ./release.sh -y 0.48.1   # non-interactive (skip confirm prompt)"
     exit 1
   fi
 fi
@@ -66,7 +81,7 @@ else
   info "Current: v${CURRENT_VERSION} → v${VERSION}"
 fi
 
-if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
+if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ] && [ "$SKIP_CONFIRM" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Run lint + tests"
