@@ -71,7 +71,9 @@ jobs:
             echo "Waiting for @yawlabs/mcph@${VERSION} to be installable via npx (attempt $i/$ATTEMPTS, ${SLEEP_SECONDS}s)..."
             sleep $SLEEP_SECONDS
           done
-          if [ "$OUTPUT" != "$VERSION" ]; then
-            echo "Expected $VERSION, got '$OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - STARTED_AT ))s)" >&2
+          # CLI prints `mcph X.Y.Z` (see src/index.ts handler for --version),
+          # not bare semver -- strip the program prefix before comparing.
+          if [ "${OUTPUT#mcph }" != "$VERSION" ]; then
+            echo "Expected 'mcph $VERSION', got '$OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - STARTED_AT ))s)" >&2
             exit 1
           fi
