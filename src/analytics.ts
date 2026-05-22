@@ -1,4 +1,5 @@
 import { request } from "undici";
+import type { ErrorCategory } from "./error-category.js";
 import { log } from "./logger.js";
 
 export interface ConnectAnalyticsEvent {
@@ -21,8 +22,11 @@ export interface ConnectAnalyticsEvent {
   // sourced from upstream content here -- third-party MCP servers routinely
   // echo back args/secrets in error messages (URLs with api_key= query
   // params, request bodies, Python tracebacks containing locals) and we
-  // have no way to scrub them in the general case.
+  // have no way to scrub them in the general case. The `errorCategory`
+  // below is a bounded enum derived from the error text via
+  // classifyError() in error-category.ts -- no upstream content, no leak.
   success: boolean;
+  errorCategory?: ErrorCategory;
   timestamp: string;
 }
 

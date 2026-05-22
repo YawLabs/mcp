@@ -22,6 +22,7 @@ import { ConfigError, fetchConfig } from "./config.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
 import { formatRelativeAge } from "./doctor-cmd.js";
+import { classifyError } from "./error-category.js";
 import { type ExecStepInput, RefError, resolveArgs, stepBindingKey, validateExecRequest } from "./exec-engine.js";
 import { closestNames } from "./fuzzy.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
@@ -774,6 +775,7 @@ export class ConnectServer {
           ? (args.tools as string[])
           : undefined;
       const result = await this.handleActivate(namespaces, progress, toolsFilter);
+      const category = result.isError ? classifyError(result.content?.[0]?.text) : undefined;
       for (const ns of namespaces) {
         recordConnectEvent({
           namespace: ns,
@@ -781,6 +783,7 @@ export class ConnectServer {
           action: "activate",
           latencyMs: null,
           success: !result.isError,
+          errorCategory: category,
         });
       }
       return this.attachGuideNudge(result);
@@ -788,6 +791,7 @@ export class ConnectServer {
     if (name === META_TOOLS.deactivate.name) {
       const namespaces = resolveNamespaces(args);
       const result = await this.handleDeactivate(namespaces);
+      const category = result.isError ? classifyError(result.content?.[0]?.text) : undefined;
       for (const ns of namespaces) {
         recordConnectEvent({
           namespace: ns,
@@ -795,6 +799,7 @@ export class ConnectServer {
           action: "deactivate",
           latencyMs: null,
           success: !result.isError,
+          errorCategory: category,
         });
       }
       return this.attachGuideNudge(result);
@@ -807,6 +812,7 @@ export class ConnectServer {
         action: "import",
         latencyMs: null,
         success: !result.isError,
+        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
       });
       return this.attachGuideNudge(result);
     }
@@ -818,6 +824,7 @@ export class ConnectServer {
         action: "install",
         latencyMs: null,
         success: !result.isError,
+        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
       });
       return this.attachGuideNudge(result);
     }
@@ -835,6 +842,7 @@ export class ConnectServer {
         action: "read_tool",
         latencyMs: null,
         success: !result.isError,
+        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
       });
       return this.attachGuideNudge(result);
     }
@@ -850,6 +858,7 @@ export class ConnectServer {
         action: "exec",
         latencyMs: null,
         success: !result.isError,
+        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
       });
       return this.attachGuideNudge(result);
     }
@@ -993,6 +1002,7 @@ export class ConnectServer {
         action: "tool_call",
         latencyMs,
         success: !result.isError,
+        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
       });
 
       // Prune the response before it hits the LLM. Rules are
