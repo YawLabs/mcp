@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcph",
-  "version": "0.57.0",
+  "version": "0.57.1",
   "mcpName": "io.github.YawLabs/mcph",
   "description": "mcp.hosting — one install, all your MCP servers, managed from the cloud",
   "license": "UNLICENSED",
