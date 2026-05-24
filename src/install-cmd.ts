@@ -459,15 +459,19 @@ export function readNested(root: Record<string, unknown>, containerPath: string[
   return cur;
 }
 
-/** Merge `entry` into the container at `existing[...containerPath][ENTRY_NAME]`,
+/** Merge `entry` into the container at `existing[...containerPath][entryName]`,
  *  preserving every sibling at every level of the path. Returns a new object;
  *  does not mutate. For Claude Code local scope, containerPath is
  *  ["projects", <absDir>, "mcpServers"] and this preserves every other
- *  project's settings + every other top-level key in ~/.claude.json. */
+ *  project's settings + every other top-level key in ~/.claude.json.
+ *  `entryName` defaults to ENTRY_NAME (the canonical mcph.hosting entry);
+ *  `mcph try` overrides it with `mcph-try-<slug>` so the trial entry sits
+ *  next to a real mcph install without colliding. */
 export function mergeClientConfig(
   existing: Record<string, unknown>,
   containerPath: string[],
   entry: Record<string, unknown> | { command: string; args: string[]; env?: Record<string, string> },
+  entryName: string = ENTRY_NAME,
 ): Record<string, unknown> {
   if (containerPath.length === 0) throw new Error("mergeClientConfig: containerPath cannot be empty");
   const out: Record<string, unknown> = { ...existing };
@@ -486,7 +490,44 @@ export function mergeClientConfig(
   const prev = parent[leafKey];
   const container: Record<string, unknown> =
     typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
-  container[ENTRY_NAME] = entry;
+  container[entryName] = entry;
+  parent[leafKey] = container;
+  return out;
+}
+
+/** Remove `entryName` from the container at `existing[...containerPath]`,
+ *  preserving every sibling at every level. Returns a new object; does not
+ *  mutate. If the container or entry doesn't exist, returns `existing`
+ *  unchanged (caller can detect via reference equality). Used by `mcph
+ *  try-cleanup` and doctor's trial-GC pass to peel a `mcph-try-<slug>`
+ *  entry back out of the client config without touching anything else. */
+export function removeFromClientConfig(
+  existing: Record<string, unknown>,
+  containerPath: string[],
+  entryName: string,
+): Record<string, unknown> {
+  if (containerPath.length === 0) throw new Error("removeFromClientConfig: containerPath cannot be empty");
+  // Walk to check the entry exists before allocating a clone.
+  let probe: unknown = existing;
+  for (const key of containerPath) {
+    if (typeof probe !== "object" || probe === null || Array.isArray(probe)) return existing;
+    probe = (probe as Record<string, unknown>)[key];
+  }
+  if (typeof probe !== "object" || probe === null || Array.isArray(probe)) return existing;
+  if (!(entryName in (probe as Record<string, unknown>))) return existing;
+
+  const out: Record<string, unknown> = { ...existing };
+  let parent: Record<string, unknown> = out;
+  for (let i = 0; i < containerPath.length - 1; i++) {
+    const key = containerPath[i];
+    const child = parent[key];
+    const cloned: Record<string, unknown> = { ...(child as Record<string, unknown>) };
+    parent[key] = cloned;
+    parent = cloned;
+  }
+  const leafKey = containerPath[containerPath.length - 1];
+  const container = { ...(parent[leafKey] as Record<string, unknown>) };
+  delete container[entryName];
   parent[leafKey] = container;
   return out;
 }

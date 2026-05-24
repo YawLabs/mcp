@@ -294,6 +294,20 @@ export interface BuildLaunchEntryOptions {
    *  the newest version on every spawn, so a client restart is all it
    *  takes to pick up a new release). */
   pkg?: string;
+  /** Optional upstream-shape override: when set, the entry is built for
+   *  an arbitrary upstream MCP server (used by `mcph try` to wire a
+   *  one-off trial entry pointing directly at the upstream's launcher,
+   *  bypassing mcph). When `os === "windows"`, the upstream command +
+   *  args are wrapped with `cmd /c` to dodge the same `.cmd` shim trap
+   *  that bit the default mcph launcher — keep this path going through
+   *  buildLaunchEntry so the wrapping logic stays in one place.
+   *  Mutually exclusive with `pkg`/`token` (those tune the default
+   *  mcph entry; with `upstream` they're ignored). */
+  upstream?: {
+    command: string;
+    args: string[];
+    env?: Record<string, string>;
+  };
 }
 
 /** The MCP client `mcpServers["mcp.hosting"]` entry — what `install` writes. */
@@ -304,6 +318,21 @@ export interface LaunchEntry {
 }
 
 export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
+  if (opts.upstream) {
+    // Upstream-shape entry (mcph try): preserve the upstream command +
+    // args verbatim, but wrap on Windows so a `.cmd` shim launcher
+    // (npx.cmd, uvx.cmd, pipx.cmd) doesn't ENOENT when the client
+    // spawns it directly.
+    const { command, args, env } = opts.upstream;
+    if (opts.os === "windows") {
+      const wrapped: LaunchEntry = { command: "cmd", args: ["/c", command, ...args] };
+      if (env && Object.keys(env).length > 0) wrapped.env = { ...env };
+      return wrapped;
+    }
+    const entry: LaunchEntry = { command, args: [...args] };
+    if (env && Object.keys(env).length > 0) entry.env = { ...env };
+    return entry;
+  }
   const pkg = opts.pkg ?? "@yawlabs/mcph@latest";
   const entry: LaunchEntry =
     opts.os === "windows" ? { command: "cmd", args: ["/c", "npx", "-y", pkg] } : { command: "npx", args: ["-y", pkg] };

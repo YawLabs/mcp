@@ -38,6 +38,7 @@ import { parseJsonc } from "./jsonc.js";
 import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
 import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
+import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -53,6 +54,10 @@ export interface DoctorOptions {
   registryFetch?: () => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
+  /** Test hook: replace the fire-and-forget POST for expiry-gc events. */
+  postTryEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
+  /** Test hook: override Date.now() used by the trial GC pass. */
+  now?: () => number;
 }
 
 // Machine-readable shape emitted by `mcph doctor --json`. Mirrors the
@@ -173,6 +178,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // cross-session block in mcp_connect_health, so "flaky" means the
   // same thing whether you check via the LLM or via the CLI.
   await renderReliabilitySection({ home, env, print });
+
+  // Trial GC + live-trial readout. Runs the expired-trial sweep first
+  // so the readout shows the post-GC state (no stale "expired" rows
+  // hanging around). Best-effort: any sweep failure is logged via
+  // try-cmd's debug logger; doctor itself never errors out on it.
+  await renderTrialsSection({ home, env, print, postEvent: opts.postTryEvent, now: opts.now });
 
   // Background HTTP posters (analytics, tool-report) fire-and-forget by
   // design, but a 401/403 there means the user's token has lost write
@@ -526,6 +537,36 @@ async function renderReliabilitySection(opts: {
     const rate = Math.round((usage.succeeded / usage.dispatched) * 100);
     const age = formatRelativeAge(now - usage.lastUsedAt);
     print(`  ${namespace} — ${usage.dispatched} calls, ${rate}% success, last used ${age} ago`);
+  }
+  print("");
+}
+
+// Trials section — runs the expired-trial GC pass first (peels each
+// expired entry out of its client config + deletes the marker + fires
+// the expiry-gc telemetry event), then renders the still-live trials
+// with their countdown. Section is OMITTED when there are no trials
+// at all so healthy installs stay quiet. Mirrors the silence-on-empty
+// convention of the reliability and background-posters sections.
+async function renderTrialsSection(opts: {
+  home: string;
+  env: NodeJS.ProcessEnv;
+  print: (s?: string) => void;
+  postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
+  now?: () => number;
+}): Promise<void> {
+  const { home, env, print, postEvent, now } = opts;
+  const gc = await gcExpiredTrials({ home, env, postEvent, now }).catch(() => ({ cleared: 0, failed: 0 }));
+  const scan = await scanTrials({ home, now });
+  if (scan.live.length === 0 && gc.cleared === 0 && scan.malformed.length === 0) return;
+  print("TRIALS (mcph try)");
+  if (gc.cleared > 0) {
+    print(`  swept ${gc.cleared} expired trial${gc.cleared === 1 ? "" : "s"} this run`);
+  }
+  for (const { marker, msUntilExpiry } of scan.live) {
+    print(`  ${marker.slug} -> ${marker.clientName} (${marker.clientPath}) — expires in ${formatTtl(msUntilExpiry)}`);
+  }
+  for (const path of scan.malformed) {
+    print(`  ! malformed marker at ${path} (delete by hand)`);
   }
   print("");
 }

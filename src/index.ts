@@ -10,6 +10,7 @@ import { log } from "./logger.js";
 import { RESET_LEARNING_USAGE, parseResetLearningArgs, runResetLearning } from "./reset-learning-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
+import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
 // Known subcommands for fuzzy-match feedback on typos. Anything not in
@@ -25,6 +26,8 @@ const KNOWN_SUBCOMMANDS = [
   "bundles",
   "completion",
   "upgrade",
+  "try",
+  "try-cleanup",
   "help",
   "--help",
   "-h",
@@ -108,6 +111,20 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   runUpgrade(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "try") {
+  const parsed = parseTryArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runTry(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "try-cleanup") {
+  const parsed = parseTryCleanupArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runTryCleanup(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   mcph — one install, every MCP server, managed from the cloud.
@@ -124,6 +141,10 @@ if (subcommand === "compliance") {
     install --list           List which MCP clients are installed on this
                              machine (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
+    try <slug>               Wire a one-off trial of an upstream MCP server
+                             into your AI client. No account needed; expires
+                             after --ttl (default 1h). Doctor GCs it after.
+    try-cleanup <slug>       Remove a wired trial early.
 
   Inspection:
     doctor                   Diagnose setup: config, token, clients, learning,
@@ -173,6 +194,8 @@ if (subcommand === "compliance") {
                                upgraded in the background).
     MCPH_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
     MCPH_DISABLE_PERSISTENCE   Disable cross-session learning state.
+    MCPH_BASE_URL              Override the host \`mcph try\` queries for
+                               /api/explore/:slug (default https://mcp.hosting).
 
   Config resolution (highest precedence first):
     1. MCPH_TOKEN / MCPH_URL env vars
