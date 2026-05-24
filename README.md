@@ -54,7 +54,7 @@ On top of the ranker, mcph applies three client-side signals to dispatch scores:
 ### One command (recommended)
 
 ```bash
-npx -y @yawlabs/mcph install <claude-code|claude-desktop|cursor|vscode> --token mcp_pat_your_token_here
+npx -y @yawlabs/mcph@latest install <claude-code|claude-desktop|cursor|vscode> --token mcp_pat_your_token_here
 ```
 
 This:
@@ -86,8 +86,8 @@ Or [edit the JSON by hand](#manual-install) if you'd rather.
 ### Diagnose problems — `mcph doctor`
 
 ```bash
-npx -y @yawlabs/mcph doctor          # human-readable report
-npx -y @yawlabs/mcph doctor --json   # machine-readable snapshot for pipelines
+npx -y @yawlabs/mcph@latest doctor          # human-readable report
+npx -y @yawlabs/mcph@latest doctor --json   # machine-readable snapshot for pipelines
 ```
 
 Prints the loaded config files, your token's source + fingerprint (last 4 chars), the API base URL, installed clients, env overrides, persisted learning state, flaky-namespace reliability rollup, shell-history "shadow" hits (CLIs you run that an MCP server could replace), and an upgrade check against the npm registry. Exits `0` healthy / `1` no token / `2` warnings (e.g. world-readable token file). Paste the text output into a support ticket; the `--json` blob is the same data as a structured snapshot, so dashboards and CI scripts can `jq` instead of parsing the text layout.
@@ -140,7 +140,7 @@ If you'd rather edit the config files yourself, the JSON shapes are:
   "mcpServers": {
     "mcp.hosting": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/mcph"]
+      "args": ["-y", "@yawlabs/mcph@latest"]
     }
   }
 }
@@ -153,13 +153,13 @@ If you'd rather edit the config files yourself, the JSON shapes are:
   "servers": {
     "mcp.hosting": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/mcph"]
+      "args": ["-y", "@yawlabs/mcph@latest"]
     }
   }
 }
 ```
 
-**Windows** — `command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcph"]` (the `cmd /c` wrapper is required because `npx.cmd` is a shim).
+**Windows** — `command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcph@latest"]` (the `cmd /c` wrapper is required because `npx.cmd` is a shim).
 
 Then put your token in `~/.mcph/config.json` so mcph picks it up at startup:
 
