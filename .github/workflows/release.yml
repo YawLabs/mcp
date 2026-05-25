@@ -64,17 +64,17 @@ jobs:
           OUTPUT=""
           STARTED_AT=$(date +%s)
           for i in $(seq 1 $ATTEMPTS); do
-            if OUTPUT=$(npx -y "@yawlabs/mcph@${VERSION}" --version 2>/dev/null); then
+            if OUTPUT=$(npx -y "@yawlabs/mcp@${VERSION}" --version 2>/dev/null); then
               echo "npx output: $OUTPUT (after $(( $(date +%s) - STARTED_AT ))s)"
               break
             fi
-            echo "Waiting for @yawlabs/mcph@${VERSION} to be installable via npx (attempt $i/$ATTEMPTS, ${SLEEP_SECONDS}s)..."
+            echo "Waiting for @yawlabs/mcp@${VERSION} to be installable via npx (attempt $i/$ATTEMPTS, ${SLEEP_SECONDS}s)..."
             sleep $SLEEP_SECONDS
           done
-          # CLI prints `mcph X.Y.Z` (see src/index.ts handler for --version),
+          # CLI prints `yaw-mcp X.Y.Z` (see src/index.ts handler for --version),
           # not bare semver -- strip the program prefix before comparing.
-          if [ "${OUTPUT#mcph }" != "$VERSION" ]; then
-            echo "Expected 'mcph $VERSION', got '$OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - STARTED_AT ))s)" >&2
+          if [ "${OUTPUT#yaw-mcp }" != "$VERSION" ]; then
+            echo "Expected 'yaw-mcp $VERSION', got '$OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - STARTED_AT ))s)" >&2
             exit 1
           fi
 

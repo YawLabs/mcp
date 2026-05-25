@@ -168,7 +168,7 @@ step 5 "Publish to npm"
 #                                       for the same version. CI is authoritative.
 #   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
 #      path                             with EOTP retry for fresh WebAuthn sessions.
-PUBLISHED_VERSION=$(npm view "@yawlabs/mcph@${VERSION}" version 2>/dev/null || echo "")
+PUBLISHED_VERSION=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm — skipping"
   # Resume-path safety: a prior interrupted run may have published but never
@@ -188,7 +188,7 @@ if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   fi
 elif [ "$IS_CI" = "true" ]; then
   npm publish --access public --provenance
-  info "Published @yawlabs/mcph@${VERSION} to npm (with provenance)"
+  info "Published @yawlabs/mcp@${VERSION} to npm (with provenance)"
 elif [ -f ".github/workflows/release.yml" ] && grep -qE "npm publish|NODE_AUTH_TOKEN|id-token:[[:space:]]*write" .github/workflows/release.yml; then
   info "CI release.yml fires on v* tag push -- workstation hands off to CI"
   # Verify the tag landed on origin BEFORE looking up the CI run. A local
@@ -221,15 +221,15 @@ elif [ -f ".github/workflows/release.yml" ] && grep -qE "npm publish|NODE_AUTH_T
   # than fail when the mirror lags.
   NPM_NOW=""
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    NPM_NOW=$(npm view "@yawlabs/mcph@${VERSION}" version 2>/dev/null || echo "")
+    NPM_NOW=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
     [ "$NPM_NOW" = "$VERSION" ] && break
     sleep 6
   done
   if [ "$NPM_NOW" = "$VERSION" ]; then
-    info "Published @yawlabs/mcph@${VERSION} via CI Release run $RUN_ID"
+    info "Published @yawlabs/mcp@${VERSION} via CI Release run $RUN_ID"
   else
     DISPLAY_NPM="${NPM_NOW:-(not found)}"
-    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/mcph@${VERSION} after 60s. Likely registry propagation lag -- verify with 'npm view @yawlabs/mcph@${VERSION}' in a minute. Publish is authoritative on CI's exit code."
+    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/mcp@${VERSION} after 60s. Likely registry propagation lag -- verify with 'npm view @yawlabs/mcp@${VERSION}' in a minute. Publish is authoritative on CI's exit code."
   fi
 else
   # No CI publish path -- workstation is the publisher. Retry up to 3 times
@@ -256,7 +256,7 @@ else
     ATTEMPT=$((ATTEMPT + 1))
     sleep 30
   done
-  info "Published @yawlabs/mcph@${VERSION} to npm (workstation)"
+  info "Published @yawlabs/mcp@${VERSION} to npm (workstation)"
 fi
 
 step 6 "Create GitHub release"
@@ -279,9 +279,9 @@ fi
 step 7 "Verify"
 sleep 3
 
-NPM_VERSION=$(npm view "@yawlabs/mcph@${VERSION}" version 2>/dev/null || echo "")
+NPM_VERSION=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
-  info "npm: @yawlabs/mcph@${NPM_VERSION}"
+  info "npm: @yawlabs/mcp@${NPM_VERSION}"
 else
   warn "npm shows ${NPM_VERSION:-nothing} (expected $VERSION — may still be propagating)"
 fi
@@ -302,6 +302,6 @@ fi
 echo ""
 echo -e "${GREEN}  v${VERSION} released successfully!${NC}"
 echo ""
-echo -e "  npm: https://www.npmjs.com/package/@yawlabs/mcph"
+echo -e "  npm: https://www.npmjs.com/package/@yawlabs/mcp"
 echo -e "  git: https://github.com/YawLabs/mcph/releases/tag/v${VERSION}"
 echo ""
