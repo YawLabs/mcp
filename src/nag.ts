@@ -61,6 +61,7 @@ export const NAG_ELIGIBLE_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "logout",
   "sync",
   "stats",
+  "secrets",
 ]);
 
 export interface NagState {

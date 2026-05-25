@@ -11,6 +11,7 @@ import { parseLoginArgs, runLogin } from "./login-cmd.js";
 import { parseLogoutArgs, runLogout } from "./logout-cmd.js";
 import { NAG_ELIGIBLE_SUBCOMMANDS, recordTouchPoint, showNagInterstitial } from "./nag.js";
 import { RESET_LEARNING_USAGE, parseResetLearningArgs, runResetLearning } from "./reset-learning-cmd.js";
+import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { parseStatsArgs, runStats } from "./stats-cmd.js";
@@ -38,6 +39,7 @@ const KNOWN_SUBCOMMANDS = [
   "logout",
   "sync",
   "stats",
+  "secrets",
   "help",
   "--help",
   "-h",
@@ -201,6 +203,13 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   runStats(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "secrets") {
+  const parsed = parseSecretsArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runSecrets(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   yaw-mcp — one install, every MCP server, managed from the cloud.

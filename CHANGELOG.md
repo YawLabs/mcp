@@ -4,6 +4,29 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## 0.58.0 -- Rename to Yaw MCP + local-first Free mode + Pro nag + sync client
 
+### Encrypted secret vault (`yaw-mcp secrets`)
+
+New `yaw-mcp secrets <action>` subcommand for managing a passphrase-encrypted vault at `~/.yaw-mcp/secrets.json`. AES-256-GCM with per-entry IVs; key derived from a passphrase via scrypt (N=2^15, r=8, p=1) and cached in process memory for the lifetime of the yaw-mcp invocation.
+
+Actions:
+- `set <name>` -- read value from stdin (TTY: no-echo prompt; piped: raw stdin)
+- `set <name> --value <v>` -- inline value (beware shell history)
+- `get <name>` -- decrypt + print to stdout
+- `list` -- show entry names only (values stay encrypted)
+- `remove <name>` -- delete an entry
+- `lock` -- clear the in-process passphrase cache
+
+Passphrase resolution: `YAW_MCP_VAULT_PASSPHRASE` env var > interactive TTY prompt (raw-mode, no echo) > error.
+
+File format (vault-level salt + per-entry encrypted blobs):
+```
+{ "version": 1, "salt": "<base64>", "entries": { "<name>": { "iv": "<base64>", "ciphertext": "<base64>", "authTag": "<base64>" } } }
+```
+
+New modules: `src/secrets-crypto.ts` (key derivation + encrypt/decrypt primitives), `src/secrets-vault.ts` (file I/O + entry management + in-process key cache), `src/secrets-cmd.ts` (CLI). 31 new tests covering encryption round-trips, tamper detection (ciphertext + auth tag), set/get/list/remove vault ops, passphrase derivation determinism, and parse-arg coverage for all actions.
+
+Phase 6c will add the two missing pieces: sync push|pull to the `mcp_secrets` team-resource on yaw.sh (server gets an opaque ciphertext blob, never plaintext) and spawn-time substitution of `${secret:NAME}` references in bundles.json env values.
+
 ### Stats command (`yaw-mcp stats`)
 
 Pro / Yaw Business buyers get a new `yaw-mcp stats` subcommand that prints a digest of their recent AI tool calls. By default shows the last 7 days, capped at the most-recent 50 events; `--limit N` and `--days N` tune the window; `--json` emits machine-readable output for scripting.
