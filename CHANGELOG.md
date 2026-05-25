@@ -4,6 +4,19 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## 0.58.0 -- Rename to Yaw MCP + local-first Free mode + Pro nag + sync client
 
+### Secrets sync + spawn-time substitution (Phase 6c)
+
+The encrypted vault from Phase 6b now syncs across machines and pipes secrets into spawned MCP servers automatically.
+
+- `yaw-mcp secrets push` / `pull` -- ship the encrypted vault to/from the `mcp_secrets` team-resource on yaw.sh. The server never sees plaintext or the derived key; it stores the salt + ciphertext + IV + auth tag as an opaque blob. Push uses optimistic-concurrency PUT (pull-first-to-learn-version pattern). Pull overwrites the local vault and locks the in-process key cache so the next operation re-prompts.
+- Spawn-time substitution: any `${secret:NAME}` reference inside a server's `env` value gets replaced with the decrypted vault entry at spawn time. Inline composition like `Bearer ${secret:GITHUB}` works -- the regex replaces just the reference span. Missing secrets pass through as literal text so the child process surfaces its own "missing env var" error rather than receiving an empty string.
+
+The spawn path is in `src/upstream.ts:resolveServerEnv`. Requires `YAW_MCP_VAULT_PASSPHRASE` in env because the MCP-server spawn happens in a non-interactive context where prompting on stdin would corrupt the parent's transport. Without the passphrase, refs pass through literally + a warning logs.
+
+### Runtime event emission (Phase 5b)
+
+`recordConnectEvent` now tees out tool-call events to `/api/team/analytics/event` on yaw.sh when a team session is cached, in parallel with the existing legacy mcp.hosting backend POST. Fire-and-forget; auth failures latch a process-lifetime flag so we don't keep hitting the disk after a session expires. Discover / activate / etc. events stay in the legacy buffer only -- only tool_call events flow to team-analytics.
+
 ### Encrypted secret vault (`yaw-mcp secrets`)
 
 New `yaw-mcp secrets <action>` subcommand for managing a passphrase-encrypted vault at `~/.yaw-mcp/secrets.json`. AES-256-GCM with per-entry IVs; key derived from a passphrase via scrypt (N=2^15, r=8, p=1) and cached in process memory for the lifetime of the yaw-mcp invocation.

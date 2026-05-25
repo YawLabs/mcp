@@ -5,11 +5,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { decryptEntry, deriveKey, encryptEntry, generateSalt } from "../secrets-crypto.js";
 import {
   getSecret,
+  hasSecretRefs,
   listKeys,
   loadVault,
   lock,
   newVault,
   removeSecret,
+  resolveSecretRefs,
   saveVault,
   setSecret,
   unlock,
@@ -154,5 +156,63 @@ describe("secrets-vault: set/get/list/remove", () => {
 
   it("vaultPath places secrets.json under ~/.yaw-mcp/", () => {
     expect(vaultPath("/home/jeff")).toMatch(/[/\\]\.yaw-mcp[/\\]secrets\.json$/);
+  });
+});
+
+describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
+  it("hasSecretRefs detects ${secret:NAME} in env values", () => {
+    expect(hasSecretRefs({ FOO: "bar" })).toBe(false);
+    expect(hasSecretRefs({ FOO: "${secret:GITHUB}" })).toBe(true);
+    expect(hasSecretRefs({ FOO: "Bearer ${secret:TOKEN}" })).toBe(true);
+    expect(hasSecretRefs(undefined)).toBe(false);
+    expect(hasSecretRefs({})).toBe(false);
+  });
+
+  it("resolveSecretRefs substitutes a single ref end-to-end", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc123");
+    const { resolved, missing } = resolveSecretRefs({ GITHUB_TOKEN: "${secret:github}" }, vault, key);
+    expect(resolved.GITHUB_TOKEN).toBe("ghp_abc123");
+    expect(missing).toEqual([]);
+  });
+
+  it("resolveSecretRefs preserves surrounding text", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "tok", "abc");
+    const { resolved } = resolveSecretRefs({ AUTH: "Bearer ${secret:tok}" }, vault, key);
+    expect(resolved.AUTH).toBe("Bearer abc");
+  });
+
+  it("resolveSecretRefs reports missing secrets and leaves the literal", async () => {
+    const vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    const { resolved, missing } = resolveSecretRefs({ GITHUB_TOKEN: "${secret:nonesuch}" }, vault, key);
+    expect(resolved.GITHUB_TOKEN).toBe("${secret:nonesuch}");
+    expect(missing).toEqual(["nonesuch"]);
+  });
+
+  it("resolveSecretRefs passes through env values without refs", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    const { resolved } = resolveSecretRefs({ LITERAL: "no refs here", GITHUB_TOKEN: "${secret:github}" }, vault, key);
+    expect(resolved.LITERAL).toBe("no refs here");
+    expect(resolved.GITHUB_TOKEN).toBe("ghp_abc");
+  });
+
+  it("resolveSecretRefs caches decryption across multiple refs to the same secret", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "x", "value-x");
+    const { resolved } = resolveSecretRefs(
+      { A: "${secret:x}", B: "prefix-${secret:x}-suffix", C: "${secret:x}" },
+      vault,
+      key,
+    );
+    expect(resolved.A).toBe("value-x");
+    expect(resolved.B).toBe("prefix-value-x-suffix");
+    expect(resolved.C).toBe("value-x");
   });
 });

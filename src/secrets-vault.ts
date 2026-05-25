@@ -164,3 +164,59 @@ export function getSecret(vault: VaultFile, key: Buffer, name: string): string |
 export function newVault(): VaultFile {
   return emptyVault();
 }
+
+/**
+ * Scan an env map for `${secret:NAME}` references and substitute the
+ * decrypted vault value for each match. Returns the resolved env.
+ *
+ * Behavior on misses:
+ *   - The referenced secret doesn't exist in the vault: leave the
+ *     literal `${secret:NAME}` in place. The child process will then
+ *     surface its own "missing env var" or "invalid token" error,
+ *     which is louder than yaw-mcp silently passing an empty string.
+ *   - The vault entry decrypts cleanly: replace the entire env value
+ *     with the secret. Inline composition (e.g. `Bearer ${secret:GH}`)
+ *     also works -- the regex replaces just the reference span.
+ */
+const SECRET_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
+export function resolveSecretRefs(
+  env: Record<string, string>,
+  vault: VaultFile,
+  key: Buffer,
+): { resolved: Record<string, string>; missing: string[] } {
+  const missing: string[] = [];
+  const decrypted = new Map<string, string>();
+  const resolved: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== "string" || !v.includes("${secret:")) {
+      resolved[k] = v;
+      continue;
+    }
+    resolved[k] = v.replace(SECRET_REF_RE, (full, name: string) => {
+      if (decrypted.has(name)) return decrypted.get(name) as string;
+      const entry = vault.entries[name];
+      if (!entry) {
+        if (!missing.includes(name)) missing.push(name);
+        return full; // leave literal so the child errors cleanly
+      }
+      try {
+        const value = decryptEntry(entry, key);
+        decrypted.set(name, value);
+        return value;
+      } catch {
+        if (!missing.includes(name)) missing.push(name);
+        return full;
+      }
+    });
+  }
+  return { resolved, missing };
+}
+
+/** True iff any env value carries a `${secret:NAME}` reference. */
+export function hasSecretRefs(env: Record<string, string> | undefined): boolean {
+  if (!env) return false;
+  for (const v of Object.values(env)) {
+    if (typeof v === "string" && v.includes("${secret:")) return true;
+  }
+  return false;
+}

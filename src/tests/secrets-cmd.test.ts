@@ -97,4 +97,16 @@ describe("parseSecretsArgs", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/unknown flag "--bogus"/);
   });
+
+  it("push action parses without a name", () => {
+    const r = parseSecretsArgs(["push"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.action).toBe("push");
+  });
+
+  it("pull action parses without a name", () => {
+    const r = parseSecretsArgs(["pull"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.action).toBe("pull");
+  });
 });

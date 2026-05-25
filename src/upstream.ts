@@ -8,6 +8,7 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./logger.js";
+import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, vaultPath } from "./secrets-vault.js";
 import type {
   UpstreamConnection,
   UpstreamPromptDef,
@@ -16,6 +17,52 @@ import type {
   UpstreamToolDef,
 } from "./types.js";
 import { resolveUvSpawn } from "./uv-bootstrap.js";
+
+/**
+ * Resolve `${secret:NAME}` references in an upstream server's env
+ * against the local secret vault.  Best-effort:
+ *   - No refs in env: pass through unchanged (free path, no vault load).
+ *   - Refs present but no vault file: log + pass literals through.
+ *   - Refs present but no passphrase: log + pass literals through.
+ *   - Refs present + vault unlocks: substitute resolved values.
+ *
+ * Phase 6c ships passphrase-from-env only (YAW_MCP_VAULT_PASSPHRASE)
+ * because the spawn happens in a non-interactive MCP-server context
+ * where prompting on stdin would corrupt the parent's transport.
+ * Per-server prompting would require a separate `yaw-mcp unlock`
+ * step that pre-seeds the derived key into a session file -- that
+ * is deferred to a follow-up.
+ */
+async function resolveServerEnv(env: Record<string, string>): Promise<Record<string, string>> {
+  if (!hasSecretRefs(env)) return env;
+  const passphrase = process.env.YAW_MCP_VAULT_PASSPHRASE;
+  if (typeof passphrase !== "string" || passphrase.length === 0) {
+    log("warn", "Server env carries ${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set", {
+      keys: Object.entries(env)
+        .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
+        .map(([k]) => k),
+    });
+    return env;
+  }
+  const vault = await loadVault(vaultPath()).catch(() => null);
+  if (!vault) {
+    log("warn", "Server env carries ${secret:...} refs but no vault exists yet", {});
+    return env;
+  }
+  try {
+    const key = await unlock(vault, passphrase);
+    const { resolved, missing } = resolveSecretRefs(env, vault, key);
+    if (missing.length > 0) {
+      log("warn", "Some ${secret:...} refs could not be resolved", { missing });
+    }
+    return resolved;
+  } catch (err) {
+    log("warn", "Vault unlock failed; passing ${secret:...} refs through literally", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return env;
+  }
+}
 
 declare const __VERSION__: string;
 
@@ -116,10 +163,18 @@ export async function connectToUpstream(
     // stderr tail will be empty, so we fall through to the
     // categorizeSpawnError path with the actual error message.
     const resolved = await resolveUvSpawn(config.command, config.args ?? []);
+
+    // Resolve ${secret:NAME} references in the server's env against
+    // the local secret vault.  Requires YAW_MCP_VAULT_PASSPHRASE in
+    // env to unlock the vault; without it (or with no vault), the
+    // literal `${secret:NAME}` is passed through and the child process
+    // surfaces its own "missing env var" error, which is louder than
+    // silently passing an empty string.
+    const serverEnv = await resolveServerEnv(config.env ?? {});
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
-      env: { ...parentEnv, ...config.env } as Record<string, string>,
+      env: { ...parentEnv, ...serverEnv } as Record<string, string>,
       stderr: "pipe",
     });
     // Attach the stderr listener *before* the transport is started so we
