@@ -50,7 +50,7 @@ let apiUrl = "";
 let token = "";
 
 // Single-slot latch capturing the most recent rejection from EITHER
-// flush path (connect or dispatch) so `mcph doctor` can surface a
+// flush path (connect or dispatch) so `yaw-mcp doctor` can surface a
 // silently-failing analytics pipeline instead of letting the buffer
 // quietly fill and roll over. Cleared on the next successful 2xx flush
 // (from either path) so a transient 4xx doesn't stick forever.
@@ -68,7 +68,7 @@ let lastFailure: AnalyticsFailure | null = null;
 // events arrive, so without these we'd warn-spam every 30s for the
 // life of the process. Reset on a 2xx for the same path and on
 // initAnalytics. The `lastFailure` field above remains the per-event
-// diagnostic surfaced by `mcph doctor`.
+// diagnostic surfaced by `yaw-mcp doctor`.
 let lastLoggedConnectStatus: number | null = null;
 let lastLoggedDispatchStatus: number | null = null;
 
@@ -113,7 +113,7 @@ async function flush(): Promise<void> {
       // 429 (rate-limit). A persistent 401/403 from a revoked or
       // scope-reduced token would otherwise re-queue forever and spam
       // the warn log on every flush interval. Latch is set either way
-      // so `mcph doctor` still surfaces the failure.
+      // so `yaw-mcp doctor` still surfaces the failure.
       const retryable = res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429;
       if (retryable) {
         const room = MAX_BUFFER - buffer.length;

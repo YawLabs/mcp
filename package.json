@@ -1,13 +1,13 @@
 {
-  "name": "@yawlabs/mcph",
-  "version": "0.57.1",
-  "mcpName": "io.github.YawLabs/mcph",
-  "description": "mcp.hosting — one install, all your MCP servers, managed from the cloud",
+  "name": "@yawlabs/mcp",
+  "version": "0.58.0",
+  "mcpName": "io.github.YawLabs/mcp",
+  "description": "Yaw MCP -- MCP servers, managed. Run locally, sync across machines with Pro.",
   "license": "UNLICENSED",
-  "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
+  "author": "Yaw Labs <support@yaw.sh> (https://yaw.sh/mcp)",
   "type": "module",
   "bin": {
-    "mcph": "./dist/index.js"
+    "yaw-mcp": "./dist/index.js"
   },
   "files": [
     "dist",
@@ -49,8 +49,9 @@
     "orchestrator",
     "mcp-server",
     "ai",
-    "mcph",
-    "mcp-hosting"
+    "yaw",
+    "yaw-mcp",
+    "yawlabs"
   ],
   "repository": {
     "type": "git",
@@ -59,5 +60,5 @@
   "bugs": {
     "url": "https://github.com/YawLabs/mcph/issues"
   },
-  "homepage": "https://mcp.hosting"
+  "homepage": "https://yaw.sh/mcp"
 }

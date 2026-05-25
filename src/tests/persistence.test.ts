@@ -11,7 +11,7 @@ describe("persistence.loadState", () => {
   let file: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "mcph-state-"));
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-state-"));
     file = join(dir, "state.json");
   });
 
@@ -99,7 +99,7 @@ describe("persistence.saveState", () => {
   let file: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "mcph-state-"));
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-state-"));
     file = join(dir, "nested", "state.json");
   });
 

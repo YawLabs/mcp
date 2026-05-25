@@ -1,6 +1,6 @@
 // Heuristic detection of "missing credential" failures. When a local
 // upstream fails to start with a stderr tail like "GITHUB_TOKEN is
-// required" or "Missing env var: OPENAI_API_KEY", mcph can prompt the
+// required" or "Missing env var: OPENAI_API_KEY", yaw-mcp can prompt the
 // user for the value directly via MCP elicitation rather than making
 // them hunt for the dashboard. We only ever treat ALL_CAPS names as
 // credentials — anything else is too noisy to infer.

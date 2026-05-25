@@ -16,15 +16,15 @@ export async function runComplianceCommand(argv: string[]): Promise<number> {
 
   if (args.length === 0) {
     process.stderr.write(
-      "\n  Usage: mcph compliance <target> [extraArgs...] [--publish]\n\n" +
+      "\n  Usage: yaw-mcp compliance <target> [extraArgs...] [--publish]\n\n" +
         "  Examples:\n" +
-        '    mcph compliance "npx -y @modelcontextprotocol/server-filesystem /tmp"\n' +
-        "    mcph compliance https://example.com/mcp --publish\n\n",
+        '    yaw-mcp compliance "npx -y @modelcontextprotocol/server-filesystem /tmp"\n' +
+        "    yaw-mcp compliance https://example.com/mcp --publish\n\n",
     );
     return 1;
   }
 
-  const apiUrl = process.env.MCPH_URL ?? "https://mcp.hosting";
+  const apiUrl = process.env.YAW_MCP_URL ?? "https://yaw.sh/mcp";
 
   const report = await runTest(args);
   if (!report) return 1;

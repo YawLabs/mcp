@@ -107,7 +107,7 @@ function getPrivate(server: ConnectServer) {
 describe("rerank client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    initRerank("https://mcp.hosting", "test-token");
+    initRerank("https://yaw.sh/mcp", "test-token");
   });
 
   it("returns null when intent is empty", async () => {
@@ -211,7 +211,7 @@ describe("handleDispatch two-stage ranking", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {

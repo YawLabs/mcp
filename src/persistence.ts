@@ -1,10 +1,10 @@
 // Cross-session persistence for session-scoped signal (learning +
-// detected packs). Stored at `~/.mcph/state.json`. Pure functions —
+// detected packs). Stored at `~/.yaw-mcp/state.json`. Pure functions —
 // ConnectServer owns the load/save lifecycle.
 //
 // Design principles:
 //   - Silent failure. A corrupt or unreadable state file must never
-//     prevent mcph from starting. Missing file returns empty state;
+//     prevent yaw-mcp from starting. Missing file returns empty state;
 //     parse errors log once and also return empty state.
 //   - Schema-versioned. A version mismatch drops the old state
 //     entirely rather than trying to migrate — the signal is small and
@@ -69,7 +69,7 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
     };
   } catch (err) {
     if (isFileNotFound(err)) return emptyState();
-    log("warn", "Failed to load mcph state, starting fresh", { error: errorMessage(err) });
+    log("warn", "Failed to load yaw-mcp state, starting fresh", { error: errorMessage(err) });
     return emptyState();
   }
 }
@@ -82,7 +82,7 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
 // Chaining via this promise serializes the writes; the .catch reset
 // keeps a failed save from poisoning the chain for subsequent callers.
 //
-// The cross-process race (two mcph instances writing the same file) is
+// The cross-process race (two yaw-mcp instances writing the same file) is
 // a separate problem that needs an OS-level file lock; not handled here.
 let saveChain: Promise<void> = Promise.resolve();
 
@@ -107,7 +107,7 @@ async function doSaveState(state: Pick<PersistedState, "learning" | "packHistory
   try {
     await atomicWriteFile(filePath, JSON.stringify(payload, null, 2));
   } catch (err) {
-    log("warn", "Failed to save mcph state", { error: errorMessage(err) });
+    log("warn", "Failed to save yaw-mcp state", { error: errorMessage(err) });
   }
 }
 

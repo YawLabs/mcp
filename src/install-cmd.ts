@@ -1,6 +1,6 @@
-// `mcph install <client> [flags]` — auto-edits the chosen MCP client's
+// `yaw-mcp install <client> [flags]` — auto-edits the chosen MCP client's
 // config file so the user doesn't have to hand-write JSON or hunt for
-// per-OS file paths. Also ensures ~/.mcph/config.json carries the token so
+// per-OS file paths. Also ensures ~/.yaw-mcp/config.json carries the token so
 // subsequent `install` invocations on other clients don't re-prompt.
 //
 // Two files are touched per run:
@@ -9,7 +9,7 @@
 //      preserving any other `mcpServers` / `servers` keys the user
 //      already has, plus every sibling along the container key path
 //      (Claude Code local scope nests under projects[<absDir>].mcpServers).
-//   2. ~/.mcph/config.json (user-global) — created if missing, the token is
+//   2. ~/.yaw-mcp/config.json (user-global) — created if missing, the token is
 //      written here so the launch entry stays env-free. Single source
 //      of truth for token rotation across all clients.
 //
@@ -50,7 +50,7 @@ export interface InstallCommandOptions {
   scope?: InstallScope;
   os?: InstallOS;
   projectDir?: string;
-  /** Token to write to ~/.mcph/config.json. If absent, uses existing token there. */
+  /** Token to write to ~/.yaw-mcp/config.json. If absent, uses existing token there. */
   token?: string;
   /** Overwrite an existing mcp.hosting entry without prompting. */
   force?: boolean;
@@ -58,7 +58,7 @@ export interface InstallCommandOptions {
   skip?: boolean;
   /** Print the changes that would be made and exit without writing. */
   dryRun?: boolean;
-  /** When true, do not write/update ~/.mcph/config.json — only the client config. */
+  /** When true, do not write/update ~/.yaw-mcp/config.json — only the client config. */
   skipMcphConfig?: boolean;
   /** Read-only: enumerate clients and show which scopes already host an mcp.hosting entry. */
   listOnly?: boolean;
@@ -99,11 +99,11 @@ export interface InstallResult {
 }
 
 const USAGE =
-  "Usage: mcph install <claude-code|claude-desktop|cursor|vscode> [--scope user|project|local]\n" +
+  "Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode> [--scope user|project|local]\n" +
   "                       [--token <mcp_pat_…>] [--project-dir <path>] [--os macos|linux|windows]\n" +
-  "                       [--force | --skip] [--dry-run] [--no-mcph-config]\n" +
-  "       mcph install --list                       (detect clients; no writes)\n" +
-  "       mcph install --all  [--token <mcp_pat_…>] (install into every detected client)";
+  "                       [--force | --skip] [--dry-run] [--no-yaw-mcp-config]\n" +
+  "       yaw-mcp install --list                       (detect clients; no writes)\n" +
+  "       yaw-mcp install --all  [--token <mcp_pat_…>] (install into every detected client)";
 
 export async function runInstall(opts: InstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
@@ -119,7 +119,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   };
 
   if (opts.listOnly && opts.all) {
-    err("mcph install: --list and --all are mutually exclusive");
+    err("yaw-mcp install: --list and --all are mutually exclusive");
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
@@ -127,18 +127,18 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   if (opts.all) return runInstallAll(opts, log, err);
 
   if (opts.force && opts.skip) {
-    err("mcph install: --force and --skip are mutually exclusive");
+    err("yaw-mcp install: --force and --skip are mutually exclusive");
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
   if (!opts.clientId) {
-    err(`mcph install: client argument required\n${USAGE}`);
+    err(`yaw-mcp install: client argument required\n${USAGE}`);
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
   const target = INSTALL_TARGETS.find((t) => t.clientId === opts.clientId);
   if (!target) {
-    err(`mcph install: unknown client ${opts.clientId}\n${USAGE}`);
+    err(`yaw-mcp install: unknown client ${opts.clientId}\n${USAGE}`);
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
@@ -148,7 +148,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       target.clientId === "claude-desktop" && os === "linux"
         ? "Anthropic ships Claude Desktop on macOS and Windows only. Install Claude Code or Cursor instead."
         : "Pick a different client or pass --os to override.";
-    err(`mcph install: ${target.label} is not available on ${os}.\n  ${fix}`);
+    err(`yaw-mcp install: ${target.label} is not available on ${os}.\n  ${fix}`);
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
@@ -159,7 +159,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const scopeSpec = target.scopes.find((s) => s.scope === scope);
   if (!scopeSpec) {
     err(
-      `mcph install: ${target.label} does not support scope "${scope}". Available: ${target.scopes.map((s) => s.scope).join(", ")}`,
+      `yaw-mcp install: ${target.label} does not support scope "${scope}". Available: ${target.scopes.map((s) => s.scope).join(", ")}`,
     );
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
@@ -176,7 +176,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       claudeConfigDir: opts.claudeConfigDir,
     });
   } catch (e) {
-    err(`mcph install: ${(e as Error).message}`);
+    err(`yaw-mcp install: ${(e as Error).message}`);
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
@@ -184,19 +184,21 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   log(`File:   ${resolved.absolute}`);
 
   // Resolve the token. Source precedence (highest first):
-  //   --token flag > existing ~/.mcph/config.json token > error.
+  //   --token flag > existing ~/.yaw-mcp/config.json token > null (local mode).
+  // Missing token is NOT an error -- yaw-mcp runs in local mode without
+  // one, loading servers from ~/.yaw-mcp/bundles.json instead of the
+  // backend. The launch entry just omits YAW_MCP_TOKEN; buildLaunchEntry
+  // handles this at install-targets.ts:339.
   let token: string | null = opts.token ?? null;
   if (!token) {
     const cfg = await loadMcphConfig({ home: opts.home, cwd: process.cwd(), env: {} });
     token = cfg.token;
   }
   if (!token) {
-    err(
-      "\nmcph install: no token available.\n" +
-        "  Pass one with --token mcp_pat_…, or run `mcph install` with --token once to seed ~/.mcph/config.json,\n" +
-        "  or create the token at https://mcp.hosting → Settings → API Tokens.",
+    log(
+      "yaw-mcp install: no token resolved -- configuring for local mode (Free).\n" +
+        "  Add servers by editing ~/.yaw-mcp/bundles.json, or re-run with --token mcp_pat_... to use a Yaw MCP account.",
     );
-    return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
 
   // Read + merge existing client config.
@@ -209,7 +211,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     try {
       raw = await readFile(resolved.absolute, "utf8");
     } catch (e) {
-      err(`mcph install: cannot read ${resolved.absolute}: ${(e as Error).message}`);
+      err(`yaw-mcp install: cannot read ${resolved.absolute}: ${(e as Error).message}`);
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
     if (raw.trim().length > 0) {
@@ -217,14 +219,14 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         const parsed = parseJsonc(raw);
         if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
           err(
-            `mcph install: ${resolved.absolute} is not a JSON object — refusing to overwrite. Edit by hand or rename the file and re-run.`,
+            `yaw-mcp install: ${resolved.absolute} is not a JSON object — refusing to overwrite. Edit by hand or rename the file and re-run.`,
           );
           return { written: [], wouldWrite: [], messages, exitCode: 1 };
         }
         existing = parsed as Record<string, unknown>;
       } catch (e) {
         err(
-          `mcph install: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite. Fix the file or rename it and re-run.`,
+          `yaw-mcp install: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite. Fix the file or rename it and re-run.`,
         );
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }
@@ -244,7 +246,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       decision = await promptCollision(resolved.absolute, opts.io);
     } else {
       err(
-        `mcph install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry and stdin is not a TTY.\n  Re-run with --force to overwrite, --skip to leave it, or --dry-run to preview.`,
+        `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry and stdin is not a TTY.\n  Re-run with --force to overwrite, --skip to leave it, or --dry-run to preview.`,
       );
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
@@ -262,19 +264,22 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const merged = mergeClientConfig(existing, containerPath, newEntry);
   const clientJson = `${JSON.stringify(merged, null, 2)}\n`;
 
-  const writeMcphConfig = !opts.skipMcphConfig;
+  // Skip ~/.yaw-mcp/config.json writes in local mode -- there's no token
+  // to seed, and the file is only meaningful for cross-client token
+  // sharing. Local-mode users edit ~/.yaw-mcp/bundles.json instead.
+  const writeMcphConfig = !opts.skipMcphConfig && token !== null;
   const home = opts.home ?? homedir();
   const mcphConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
-  const mcphConfigComposed = await composeMcphConfig(mcphConfigPath, token);
-  if (mcphConfigComposed.backupPath) {
+  const mcphConfigComposed = writeMcphConfig ? await composeMcphConfig(mcphConfigPath, token as string) : { json: "" };
+  if ("backupPath" in mcphConfigComposed && mcphConfigComposed.backupPath) {
     log(
-      `mcph install: existing ${mcphConfigPath} was malformed; original bytes backed up to ${mcphConfigComposed.backupPath} before overwriting.`,
+      `yaw-mcp install: existing ${mcphConfigPath} was malformed; original bytes backed up to ${mcphConfigComposed.backupPath} before overwriting.`,
     );
   }
   const mcphConfigJson = mcphConfigComposed.json;
 
   // Claude Code: also ensure `permissions.allow` carries our pattern so
-  // the user isn't re-prompted for every mcph tool call. No-op for other
+  // the user isn't re-prompted for every yaw-mcp tool call. No-op for other
   // clients (Claude Desktop / Cursor / VS Code have their own permission
   // models). Preserves all existing settings — we only union the pattern
   // into `permissions.allow` and write the file back verbatim otherwise.
@@ -303,7 +308,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   const written: string[] = [];
 
-  // Write ~/.mcph/config.json FIRST. If the second write (client config)
+  // Write ~/.yaw-mcp/config.json FIRST. If the second write (client config)
   // fails, at least the token is captured here for the next install --
   // otherwise the user would have a launch entry pointing at a token
   // we never recorded, and would be re-prompted on every other client.
@@ -319,7 +324,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         }
       }
     } catch (e) {
-      err(`mcph install: failed to write ${mcphConfigPath}: ${(e as Error).message}`);
+      err(`yaw-mcp install: failed to write ${mcphConfigPath}: ${(e as Error).message}`);
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
     log(`Wrote ${mcphConfigPath}`);
@@ -332,7 +337,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   try {
     await atomicWriteFile(resolved.absolute, clientJson);
   } catch (e) {
-    err(`mcph install: failed to write ${resolved.absolute}: ${(e as Error).message}`);
+    err(`yaw-mcp install: failed to write ${resolved.absolute}: ${(e as Error).message}`);
     return { written, wouldWrite: [], messages, exitCode: 1 };
   }
   log(`Wrote ${resolved.absolute}`);
@@ -348,7 +353,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       written.push(settingsPatch.path);
     } catch (e) {
       err(
-        `mcph install: warning — failed to patch ${settingsPatch.path}: ${(e as Error).message}. You may be re-prompted for each mcph tool call; add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow to silence.`,
+        `yaw-mcp install: warning — failed to patch ${settingsPatch.path}: ${(e as Error).message}. You may be re-prompted for each yaw-mcp tool call; add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow to silence.`,
       );
     }
   }
@@ -359,7 +364,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 }
 
 /** Read `settings.json` (or settings.local.json) for the given scope,
- *  compute the next version with the mcph allow-pattern unioned into
+ *  compute the next version with the yaw-mcp allow-pattern unioned into
  *  `permissions.allow`, and return both the path and the rendered JSON.
  *  Returns `changed: false` when the pattern is already present — caller
  *  can skip the write entirely. Returns null for scopes that have no
@@ -464,9 +469,9 @@ export function readNested(root: Record<string, unknown>, containerPath: string[
  *  does not mutate. For Claude Code local scope, containerPath is
  *  ["projects", <absDir>, "mcpServers"] and this preserves every other
  *  project's settings + every other top-level key in ~/.claude.json.
- *  `entryName` defaults to ENTRY_NAME (the canonical mcph.hosting entry);
- *  `mcph try` overrides it with `mcph-try-<slug>` so the trial entry sits
- *  next to a real mcph install without colliding. */
+ *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp.hosting entry);
+ *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
+ *  next to a real yaw-mcp install without colliding. */
 export function mergeClientConfig(
   existing: Record<string, unknown>,
   containerPath: string[],
@@ -498,8 +503,8 @@ export function mergeClientConfig(
 /** Remove `entryName` from the container at `existing[...containerPath]`,
  *  preserving every sibling at every level. Returns a new object; does not
  *  mutate. If the container or entry doesn't exist, returns `existing`
- *  unchanged (caller can detect via reference equality). Used by `mcph
- *  try-cleanup` and doctor's trial-GC pass to peel a `mcph-try-<slug>`
+ *  unchanged (caller can detect via reference equality). Used by `yaw-mcp
+ *  try-cleanup` and doctor's trial-GC pass to peel a `yaw-mcp-try-<slug>`
  *  entry back out of the client config without touching anything else. */
 export function removeFromClientConfig(
   existing: Record<string, unknown>,
@@ -532,7 +537,7 @@ export function removeFromClientConfig(
   return out;
 }
 
-/** Compose the ~/.mcph/config.json contents — preserves any existing fields,
+/** Compose the ~/.yaw-mcp/config.json contents — preserves any existing fields,
  *  upserts the token, ensures `version` is set. When the existing file is
  *  unparseable, the original bytes are saved to `${path}.bak-<ts>` first
  *  so the user can recover their token by hand if anything else of value
@@ -626,7 +631,7 @@ export function parseInstallArgs(argv: string[]):
       case "--dry-run":
         opts.dryRun = true;
         break;
-      case "--no-mcph-config":
+      case "--no-yaw-mcp-config":
         opts.skipMcphConfig = true;
         break;
       case "--list":
@@ -651,7 +656,7 @@ export function parseInstallArgs(argv: string[]):
     if (positional.length > 0) {
       return {
         ok: false,
-        error: `mcph install: ${opts.listOnly ? "--list" : "--all"} does not take a client argument.\n${USAGE}`,
+        error: `yaw-mcp install: ${opts.listOnly ? "--list" : "--all"} does not take a client argument.\n${USAGE}`,
       };
     }
     return { ok: true, options: opts as InstallCommandOptions };
@@ -670,7 +675,7 @@ export function parseInstallArgs(argv: string[]):
   return { ok: true, options: opts as InstallCommandOptions };
 }
 
-/** `mcph install --list` — print every client/scope combo for the current
+/** `yaw-mcp install --list` — print every client/scope combo for the current
  *  OS and whether mcp.hosting is already wired up. Read-only: never
  *  touches a file, never hits the network, works without a token. The
  *  exit code is always 0; this is diagnostic, not gating. */
@@ -713,8 +718,8 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
     );
   }
   log("");
-  log("Install into a specific client: `mcph install <client> [--scope user|project|local]`");
-  log("Install into every available user-scope client: `mcph install --all`");
+  log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
+  log("Install into every available user-scope client: `yaw-mcp install --all`");
   return { written: [], wouldWrite: [], messages: [], exitCode: 0 };
 }
 
@@ -735,7 +740,7 @@ function displayPath(abs: string, home: string): string {
   return abs;
 }
 
-/** `mcph install --all` — install into every client/scope combo that
+/** `yaw-mcp install --all` — install into every client/scope combo that
  *  makes sense without ambiguity: user-scope for everyone that supports
  *  it, plus any project/workspace scope when --project-dir is passed.
  *  Aggregates results; exit code 0 only if every attempted install
@@ -749,7 +754,7 @@ async function runInstallAll(
   const os = opts.os ?? CURRENT_OS;
   const targets = INSTALL_TARGETS.filter((t) => t.availableOn.includes(os));
   if (targets.length === 0) {
-    err(`mcph install --all: no installable clients on ${os}.`);
+    err(`yaw-mcp install --all: no installable clients on ${os}.`);
     return { written: [], wouldWrite: [], messages: [], exitCode: 1 };
   }
 

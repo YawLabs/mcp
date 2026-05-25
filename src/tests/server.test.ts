@@ -89,7 +89,7 @@ describe("ConnectServer", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -243,7 +243,7 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).toContain("https://mcp.hosting/explore");
+      expect(text).toContain("https://yaw.sh/mcp/explore");
       expect(text).toContain("within 60s");
     });
 
@@ -261,7 +261,7 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).not.toContain("https://mcp.hosting/explore");
+      expect(text).not.toContain("https://yaw.sh/mcp/explore");
     });
 
     it("includes the marketplace pointer in the empty-state message", () => {
@@ -273,7 +273,7 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("No servers installed");
-      expect(text).toContain("https://mcp.hosting/explore");
+      expect(text).toContain("https://yaw.sh/mcp/explore");
     });
   });
 
@@ -458,7 +458,7 @@ describe("ConnectServer", () => {
       expect(result.isError).toBe(true);
       const text = result.content[0].text;
       expect(text).toContain("installed but disabled");
-      expect(text).toContain("https://mcp.hosting");
+      expect(text).toContain("https://yaw.sh/mcp");
     });
 
     it("skips already-active servers", async () => {
@@ -533,13 +533,13 @@ describe("ConnectServer", () => {
 
   describe("compliance-aware routing", () => {
     // vi.unstubAllEnvs() restores every stubbed env var after each case so
-    // an errant MCPH_MIN_COMPLIANCE can't leak into later suites.
+    // an errant YAW_MCP_MIN_COMPLIANCE can't leak into later suites.
     afterEach(() => {
       vi.unstubAllEnvs();
     });
 
     it("refuses to activate a below-grade server with a clear error", async () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "B");
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "D" })]);
 
@@ -548,15 +548,15 @@ describe("ConnectServer", () => {
       const text = result.content[0].text;
       expect(text).toContain('Refused to load "gh"');
       expect(text).toContain("grade D");
-      expect(text).toContain("MCPH_MIN_COMPLIANCE=B");
-      expect(text).toContain("Unset MCPH_MIN_COMPLIANCE");
+      expect(text).toContain("YAW_MCP_MIN_COMPLIANCE=B");
+      expect(text).toContain("Unset YAW_MCP_MIN_COMPLIANCE");
       // No upstream spawn — the gate must short-circuit before activation.
       expect(connectToUpstream).not.toHaveBeenCalled();
       expect(priv.connections.has("gh")).toBe(false);
     });
 
     it("allows activation when the grade meets the minimum", async () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "B");
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "A" })]);
       vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
@@ -568,7 +568,7 @@ describe("ConnectServer", () => {
     });
 
     it("allows activation for ungraded servers even when the filter is on (don't punish unknown)", async () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "A");
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "A");
       const priv = getPrivate(server);
       // No complianceGrade on this config — mirrors today's backend.
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
@@ -579,8 +579,8 @@ describe("ConnectServer", () => {
       expect(priv.connections.has("gh")).toBe(true);
     });
 
-    it("does not filter anything when MCPH_MIN_COMPLIANCE is unset", async () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "");
+    it("does not filter anything when YAW_MCP_MIN_COMPLIANCE is unset", async () => {
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "");
       const priv = getPrivate(server);
       // Even an F-grade server is activatable with the filter disabled.
       priv.config = makeConfig([makeServerConfig({ namespace: "bad", name: "Bad", complianceGrade: "F" })]);
@@ -592,7 +592,7 @@ describe("ConnectServer", () => {
     });
 
     it("annotates below-grade servers in discover output and emits a filter header", () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "B");
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
       const priv = getPrivate(server);
       priv.config = makeConfig([
         makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "A" }),
@@ -602,12 +602,12 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).toContain("Compliance filter active: MCPH_MIN_COMPLIANCE=B");
+      expect(text).toContain("Compliance filter active: YAW_MCP_MIN_COMPLIANCE=B");
       // Passing grade is surfaced inline as `[A]`.
       expect(text).toMatch(/gh — GitHub.*\[A\]/);
       // Failing server is surfaced in place with the refusal reason.
       expect(text).toContain("bad — Bad Server");
-      expect(text).toContain("(grade D — below MCPH_MIN_COMPLIANCE=B, won't auto-activate)");
+      expect(text).toContain("(grade D — below YAW_MCP_MIN_COMPLIANCE=B, won't auto-activate)");
       // Ungraded server gets no annotation — avoids cluttering every
       // current deploy where nothing is scored yet.
       expect(text).not.toMatch(/raw — Ungraded.*\[[A-F]\]/);
@@ -615,7 +615,7 @@ describe("ConnectServer", () => {
     });
 
     it("shows `[grade]` tags even when the filter env is unset (trust signal is always on)", () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "");
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "");
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "B" })]);
 
@@ -630,7 +630,7 @@ describe("ConnectServer", () => {
     });
 
     it("leaves ungraded servers unannotated with the filter unset", () => {
-      vi.stubEnv("MCPH_MIN_COMPLIANCE", "");
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "");
       const priv = getPrivate(server);
       // No complianceGrade on this config — mirrors unscored catalog entries.
       priv.config = makeConfig([makeServerConfig({ namespace: "raw", name: "Ungraded" })]);
@@ -1650,7 +1650,7 @@ describe("ConnectServer", () => {
       expect(text).toContain("Bundles partially installed:");
       expect(text).toContain("devops-incident");
       expect(text).toContain("missing: pagerduty");
-      expect(text).toContain("https://mcp.hosting/explore");
+      expect(text).toContain("https://yaw.sh/mcp/explore");
     });
 
     it("routes meta-tool exec through a two-step pipeline with $ref binding", async () => {
@@ -1735,7 +1735,7 @@ describe("ConnectServer", () => {
     });
   });
 
-  describe("MCPH_POLL_INTERVAL env var", () => {
+  describe("YAW_MCP_POLL_INTERVAL env var", () => {
     // vi.unstubAllEnvs() restores every stubbed env var after each case so
     // test order can't leak into unrelated suites.
     afterEach(() => {
@@ -1743,7 +1743,7 @@ describe("ConnectServer", () => {
     });
 
     it("defaults to a ~60s poll when the env var is unset", () => {
-      vi.stubEnv("MCPH_POLL_INTERVAL", "");
+      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "");
       const priv = getPrivate(server);
       priv.startPolling();
       expect(priv.pollTimer).not.toBeNull();
@@ -1751,8 +1751,8 @@ describe("ConnectServer", () => {
       priv.pollTimer = null;
     });
 
-    it("respects a custom interval when MCPH_POLL_INTERVAL is set to a positive integer", () => {
-      vi.stubEnv("MCPH_POLL_INTERVAL", "300");
+    it("respects a custom interval when YAW_MCP_POLL_INTERVAL is set to a positive integer", () => {
+      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "300");
       const priv = getPrivate(server);
       priv.startPolling();
       expect(priv.pollTimer).not.toBeNull();
@@ -1760,8 +1760,8 @@ describe("ConnectServer", () => {
       priv.pollTimer = null;
     });
 
-    it("disables polling entirely when MCPH_POLL_INTERVAL=0", () => {
-      vi.stubEnv("MCPH_POLL_INTERVAL", "0");
+    it("disables polling entirely when YAW_MCP_POLL_INTERVAL=0", () => {
+      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "0");
       const priv = getPrivate(server);
       priv.pollTimer = null;
       priv.startPolling();
@@ -1769,7 +1769,7 @@ describe("ConnectServer", () => {
     });
 
     it("falls back to the default when the env var is garbage", () => {
-      vi.stubEnv("MCPH_POLL_INTERVAL", "not-a-number");
+      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "not-a-number");
       const priv = getPrivate(server);
       priv.startPolling();
       expect(priv.pollTimer).not.toBeNull();
@@ -1778,7 +1778,7 @@ describe("ConnectServer", () => {
     });
 
     it("falls back to the default when the env var is negative", () => {
-      vi.stubEnv("MCPH_POLL_INTERVAL", "-30");
+      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "-30");
       const priv = getPrivate(server);
       priv.startPolling();
       expect(priv.pollTimer).not.toBeNull();
@@ -1813,7 +1813,7 @@ describe("argsEqual (via reconcileConfig)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -1877,7 +1877,7 @@ describe("activateOne dedup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -1935,7 +1935,7 @@ describe("fetchAndApplyConfig atomicity", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -1990,7 +1990,7 @@ describe("handleToolCall route snapshot", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -2029,7 +2029,7 @@ describe("guide resource + session tracking", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -2042,24 +2042,24 @@ describe("guide resource + session tracking", () => {
     expect(priv.getBuiltinResources()).toEqual([]);
   });
 
-  it("surfaces mcph://guide when either guide is present", () => {
+  it("surfaces yaw-mcp://guide when either guide is present", () => {
     const priv = getPrivate(server);
     priv.guides = {
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
       project: null,
     };
     const builtins = priv.getBuiltinResources();
     expect(builtins.length).toBe(1);
-    expect(builtins[0].uri).toBe("mcph://guide");
+    expect(builtins[0].uri).toBe("yaw-mcp://guide");
     expect(builtins[0].mimeType).toBe("text/markdown");
-    expect(builtins[0].name).toBe("mcph guide");
+    expect(builtins[0].name).toBe("yaw-mcp guide");
   });
 
   it("builtin read() returns the rendered body and flips guideRead", () => {
     const priv = getPrivate(server);
     priv.guides = {
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
-      project: { scope: "project", path: "/p/.mcph/MCPH.md", content: "p-body" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u-body" },
+      project: { scope: "project", path: "/p/.yaw-mcp/YAW-MCP.md", content: "p-body" },
     };
     expect(priv.guideRead).toBe(false);
     const builtin = priv.getBuiltinResources()[0];
@@ -2075,24 +2075,24 @@ describe("guide resource + session tracking", () => {
   it("builtin map exposes the same guide entry by URI", () => {
     const priv = getPrivate(server);
     priv.guides = {
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
       project: null,
     };
     const map = priv.getBuiltinResourceMap();
     expect(map.size).toBe(1);
-    expect(map.get("mcph://guide")?.uri).toBe("mcph://guide");
+    expect(map.get("yaw-mcp://guide")?.uri).toBe("yaw-mcp://guide");
   });
 
   it("attaches a one-shot guide nudge to meta-tool responses when guide is loaded but unread", () => {
     const priv = getPrivate(server);
     priv.guides = {
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
       project: null,
     };
     const res1 = priv.attachGuideNudge({ content: [{ type: "text", text: "discover-body" }] });
     expect(res1.content[0].text).toContain("discover-body");
-    expect(res1.content[0].text).toContain("mcph://guide");
-    expect(res1.content[0].text).toContain("/h/.mcph/MCPH.md");
+    expect(res1.content[0].text).toContain("yaw-mcp://guide");
+    expect(res1.content[0].text).toContain("/h/.yaw-mcp/YAW-MCP.md");
     // One-shot: a second call does NOT add the nudge again.
     const res2 = priv.attachGuideNudge({ content: [{ type: "text", text: "second-body" }] });
     expect(res2.content[0].text).toBe("second-body");
@@ -2108,7 +2108,7 @@ describe("guide resource + session tracking", () => {
   it("does NOT nudge once the guide has been read", () => {
     const priv = getPrivate(server);
     priv.guides = {
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
       project: null,
     };
     priv.guideRead = true;
@@ -2119,7 +2119,7 @@ describe("guide resource + session tracking", () => {
   it("reading the guide via the builtin flips guideRead and suppresses the nudge", () => {
     const priv = getPrivate(server);
     priv.guides = {
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
       project: null,
     };
     expect(priv.guideRead).toBe(false);
@@ -2136,7 +2136,7 @@ describe("handleImport path validation", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -2207,7 +2207,7 @@ describe("handleInstall", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -2242,7 +2242,7 @@ describe("handleInstall", () => {
     const errorBody = {
       code: "plan_limit_exceeded",
       error: "You've reached the 3-server limit on the free plan.",
-      upgradeUrl: "https://mcp.hosting/dashboard/billing",
+      upgradeUrl: "https://yaw.sh/mcp/dashboard/billing",
     };
     mockInstallResponse(403, errorBody);
     const priv = getPrivate(server);
@@ -2251,7 +2251,7 @@ describe("handleInstall", () => {
     // The full JSON body must be in the text so the model can show
     // the upgrade URL; this is the load-bearing bit of the contract.
     expect(result.content[0].text).toContain("plan_limit_exceeded");
-    expect(result.content[0].text).toContain("https://mcp.hosting/dashboard/billing");
+    expect(result.content[0].text).toContain("https://yaw.sh/mcp/dashboard/billing");
   });
 
   it("returns a namespace-collision message on 409", async () => {
@@ -2350,7 +2350,7 @@ describe("prewarmDormantServers", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -2455,7 +2455,7 @@ describe("auto-load on startup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://mcp.hosting", "test-token");
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
   afterEach(async () => {
@@ -2463,26 +2463,26 @@ describe("auto-load on startup", () => {
     await server.shutdown();
   });
 
-  it("is disabled by default when MCPH_AUTO_LOAD is unset", () => {
-    vi.stubEnv("MCPH_AUTO_LOAD", "");
+  it("is disabled by default when YAW_MCP_AUTO_LOAD is unset", () => {
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "");
     expect(isAutoLoadEnabled()).toBe(false);
   });
 
   it("accepts '1' and 'true' but not other values", () => {
-    vi.stubEnv("MCPH_AUTO_LOAD", "1");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     expect(isAutoLoadEnabled()).toBe(true);
-    vi.stubEnv("MCPH_AUTO_LOAD", "true");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "true");
     expect(isAutoLoadEnabled()).toBe(true);
-    vi.stubEnv("MCPH_AUTO_LOAD", "TRUE");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "TRUE");
     expect(isAutoLoadEnabled()).toBe(true);
-    vi.stubEnv("MCPH_AUTO_LOAD", "0");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "0");
     expect(isAutoLoadEnabled()).toBe(false);
-    vi.stubEnv("MCPH_AUTO_LOAD", "yes");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "yes");
     expect(isAutoLoadEnabled()).toBe(false);
   });
 
   it("activates every namespace in the top recurring pack when all are installed", async () => {
-    vi.stubEnv("MCPH_AUTO_LOAD", "1");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -2516,7 +2516,7 @@ describe("auto-load on startup", () => {
   });
 
   it("does not activate anything when some pack namespaces aren't installed", async () => {
-    vi.stubEnv("MCPH_AUTO_LOAD", "1");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     const priv = getPrivate(server);
     // Only `gh` is installed — the {gh, slack} pack can't be activated
     // as a whole, so we must skip it entirely. Activating just `gh`
@@ -2538,7 +2538,7 @@ describe("auto-load on startup", () => {
   });
 
   it("is a silent no-op when pack history is empty", async () => {
-    vi.stubEnv("MCPH_AUTO_LOAD", "1");
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",

@@ -17,14 +17,14 @@ describe("loadUserGuide", () => {
   let home: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-guide-home-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-home-"));
   });
 
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("returns null when ~/.mcph/MCPH.md doesn't exist", async () => {
+  it("returns null when ~/.yaw-mcp/YAW-MCP.md doesn't exist", async () => {
     expect(await loadUserGuide(home)).toBeNull();
   });
 
@@ -51,11 +51,11 @@ describe("loadProjectGuide", () => {
   let project: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-guide-home-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-home-"));
     // Nest project INSIDE home so the walk-up in findProjectConfigDir
     // terminates at the synthetic home boundary — otherwise it keeps
     // walking past tmpdir into the real user dir and finds whatever
-    // `~/.mcph/MCPH.md` the dev machine actually has, which makes
+    // `~/.yaw-mcp/YAW-MCP.md` the dev machine actually has, which makes
     // "no guide" assertions flap depending on who's running the tests.
     project = mkdtempSync(join(home, "proj-"));
   });
@@ -65,11 +65,11 @@ describe("loadProjectGuide", () => {
     rmSync(project, { recursive: true, force: true });
   });
 
-  it("returns null when no .mcph/ exists in the tree", async () => {
+  it("returns null when no .yaw-mcp/ exists in the tree", async () => {
     expect(await loadProjectGuide(project, home)).toBeNull();
   });
 
-  it("loads a project guide from the cwd's .mcph/ dir", async () => {
+  it("loads a project guide from the cwd's .yaw-mcp/ dir", async () => {
     writeGuide(join(project, CONFIG_DIRNAME), "project notes");
     const g = await loadProjectGuide(project, home);
     expect(g?.scope).toBe("project");
@@ -86,7 +86,7 @@ describe("loadProjectGuide", () => {
     expect(g?.path).toBe(join(cfgDir, GUIDE_FILENAME));
   });
 
-  it("returns null when .mcph/ exists but MCPH.md doesn't", async () => {
+  it("returns null when .yaw-mcp/ exists but YAW-MCP.md doesn't", async () => {
     // A project can have config.json without a guide — perfectly valid.
     mkdirSync(join(project, CONFIG_DIRNAME));
     expect(await loadProjectGuide(project, home)).toBeNull();
@@ -98,11 +98,11 @@ describe("loadGuides", () => {
   let project: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-guide-home-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-home-"));
     // Nest project INSIDE home so the walk-up in findProjectConfigDir
     // terminates at the synthetic home boundary — otherwise it keeps
     // walking past tmpdir into the real user dir and finds whatever
-    // `~/.mcph/MCPH.md` the dev machine actually has, which makes
+    // `~/.yaw-mcp/YAW-MCP.md` the dev machine actually has, which makes
     // "no guide" assertions flap depending on who's running the tests.
     project = mkdtempSync(join(home, "proj-"));
   });
@@ -134,11 +134,11 @@ describe("renderGuide", () => {
 
   it("returns just the user guide when only user is set", () => {
     const out = renderGuide({
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u-body" },
       project: null,
     });
     expect(out).toContain("u-body");
-    expect(out).toContain("/h/.mcph/MCPH.md");
+    expect(out).toContain("/h/.yaw-mcp/YAW-MCP.md");
     expect(out).not.toContain("---");
   });
 
@@ -146,8 +146,8 @@ describe("renderGuide", () => {
     // Order matters: project goes last so its guidance is what the
     // reader sees most recently. See comment in renderGuide().
     const out = renderGuide({
-      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
-      project: { scope: "project", path: "/p/.mcph/MCPH.md", content: "p-body" },
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u-body" },
+      project: { scope: "project", path: "/p/.yaw-mcp/YAW-MCP.md", content: "p-body" },
     });
     const userIdx = out!.indexOf("u-body");
     const projIdx = out!.indexOf("p-body");
@@ -159,7 +159,7 @@ describe("renderGuide", () => {
   it("appends an 'Installed servers' auto-section when installed servers carry shadows", () => {
     const out = renderGuide(
       {
-        user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
+        user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u-body" },
         project: null,
       },
       [
@@ -176,7 +176,7 @@ describe("renderGuide", () => {
   it("omits the auto-section when no installed server shadows any CLI", () => {
     const out = renderGuide(
       {
-        user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
+        user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u-body" },
         project: null,
       },
       [{ namespace: "linear", name: "Linear" }],
@@ -185,7 +185,7 @@ describe("renderGuide", () => {
   });
 
   it("returns the auto-section alone when no human-authored guide exists", () => {
-    // User has no MCPH.md but an installed npmjs server — the guide
+    // User has no YAW-MCP.md but an installed npmjs server — the guide
     // resource still carries signal, so we surface it.
     const out = renderGuide({ user: null, project: null }, [{ namespace: "npmjs", name: "npm registry" }]);
     expect(out).toContain("Installed MCP servers");

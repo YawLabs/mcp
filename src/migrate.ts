@@ -1,13 +1,13 @@
 // Legacy-path migration: fold pre-0.12 flat config dotfiles into the
-// new `.mcph/` directory layout on startup.
+// new `.yaw-mcp/` directory layout on startup.
 //
-// Pre-0.12, mcph read three flat files at the root:
+// Pre-0.12, yaw-mcp read three flat files at the root:
 //
-//   ~/.mcph.json                 (user-global)
-//   <project>/.mcph.json         (project-shared)
-//   <project>/.mcph.local.json   (machine-local, gitignored)
+//   ~/.yaw-mcp.json                 (user-global)
+//   <project>/.yaw-mcp.json         (project-shared)
+//   <project>/.yaw-mcp.local.json   (machine-local, gitignored)
 //
-// 0.12 moved these under `.mcph/` so all mcph state lives in one
+// 0.12 moved these under `.yaw-mcp/` so all yaw-mcp state lives in one
 // predictable dir. Existing 0.11.x users would otherwise see their token
 // silently disappear on upgrade. This migrator fixes that:
 //
@@ -24,9 +24,9 @@ import { dirname, join } from "node:path";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
 
-export const LEGACY_GLOBAL_FILENAME = ".mcph.json";
-export const LEGACY_PROJECT_FILENAME = ".mcph.json";
-export const LEGACY_LOCAL_FILENAME = ".mcph.local.json";
+export const LEGACY_GLOBAL_FILENAME = ".yaw-mcp.json";
+export const LEGACY_PROJECT_FILENAME = ".yaw-mcp.json";
+export const LEGACY_LOCAL_FILENAME = ".yaw-mcp.local.json";
 
 const NEW_CONFIG_FILENAME = "config.json";
 const NEW_LOCAL_FILENAME = "config.local.json";
@@ -42,7 +42,7 @@ async function exists(path: string): Promise<boolean> {
 
 // Move legacy → new, but only if the new path is empty. Ensures the
 // parent dir exists first (the whole point of this migration is that
-// `.mcph/` may not have been created yet). Logs on move, logs on skip
+// `.yaw-mcp/` may not have been created yet). Logs on move, logs on skip
 // due to an already-populated target, logs on error.
 async function migrateFile(legacy: string, target: string, scope: string): Promise<void> {
   if (!(await exists(legacy))) return;
@@ -52,7 +52,7 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
     // but warn so the user knows the legacy is orphaned and can delete
     // it manually. We do NOT silently overwrite the new file; that
     // would lose whatever the user wrote there.
-    log("warn", "mcph config: legacy file exists alongside new location — legacy is ignored", {
+    log("warn", "yaw-mcp config: legacy file exists alongside new location — legacy is ignored", {
       scope,
       legacy,
       target,
@@ -64,13 +64,13 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
   try {
     await mkdir(dirname(target), { recursive: true });
     await rename(legacy, target);
-    log("info", "mcph config: migrated legacy file into .mcph/ directory", {
+    log("info", "yaw-mcp config: migrated legacy file into .yaw-mcp/ directory", {
       scope,
       from: legacy,
       to: target,
     });
   } catch (err) {
-    log("warn", "mcph config: legacy migration failed — leaving file in place", {
+    log("warn", "yaw-mcp config: legacy migration failed — leaving file in place", {
       scope,
       legacy,
       target,
@@ -91,19 +91,19 @@ export interface MigrateOptions {
 export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<void> {
   const { cwd, home } = opts;
 
-  // User-global: ~/.mcph.json → ~/.mcph/config.json
+  // User-global: ~/.yaw-mcp.json → ~/.yaw-mcp/config.json
   const legacyGlobal = join(home, LEGACY_GLOBAL_FILENAME);
   const newGlobal = join(userConfigDir(home), NEW_CONFIG_FILENAME);
   await migrateFile(legacyGlobal, newGlobal, "global");
 
   // Project scope: find the nearest legacy file by walking up from cwd.
   // We use a dedicated walker rather than findProjectConfigDir because
-  // the legacy layout has no `.mcph/` marker — the file IS the marker.
+  // the legacy layout has no `.yaw-mcp/` marker — the file IS the marker.
   const legacyProjectRoot = await findLegacyProjectRoot(cwd, home);
   if (legacyProjectRoot) {
     // A project dir found by the legacy walker is ALSO a valid target
-    // for a `.mcph/` directory. findProjectConfigDir will discover the
-    // `.mcph/` we're about to create on the next startup, so this is a
+    // for a `.yaw-mcp/` directory. findProjectConfigDir will discover the
+    // `.yaw-mcp/` we're about to create on the next startup, so this is a
     // one-shot conversion.
     const newDir = join(legacyProjectRoot, CONFIG_DIRNAME);
 
@@ -117,8 +117,8 @@ export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<vo
   }
 }
 
-// Walk up from `cwd` looking for either a legacy `.mcph.json` or
-// `.mcph.local.json`, stopping EXCLUSIVELY before $HOME so a file at
+// Walk up from `cwd` looking for either a legacy `.yaw-mcp.json` or
+// `.yaw-mcp.local.json`, stopping EXCLUSIVELY before $HOME so a file at
 // $HOME is handled by the global migration path alone. Returns the
 // directory that contains the legacy file(s), or null if none found.
 async function findLegacyProjectRoot(cwd: string, home: string): Promise<string | null> {

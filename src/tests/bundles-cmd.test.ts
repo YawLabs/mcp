@@ -66,7 +66,7 @@ describe("parseBundlesArgs", () => {
   it("--help returns the usage string", () => {
     const r = parseBundlesArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("Usage: mcph bundles");
+    if (!r.ok) expect(r.error).toContain("Usage: yaw-mcp bundles");
   });
 });
 
@@ -119,7 +119,7 @@ describe("runBundlesCommand — match", () => {
   let home: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-bundles-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-"));
     mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(
       join(home, CONFIG_DIRNAME, "config.json"),

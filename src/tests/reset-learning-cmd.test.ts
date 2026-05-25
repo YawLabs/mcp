@@ -7,14 +7,14 @@ import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { parseResetLearningArgs, runResetLearning } from "../reset-learning-cmd.js";
 
 // All tests use an isolated fake home dir so we never touch the real
-// user's ~/.mcph/state.json. userConfigDir(home) joins home + ".mcph".
+// user's ~/.yaw-mcp/state.json. userConfigDir(home) joins home + ".yaw-mcp".
 describe("runResetLearning", () => {
   let home: string;
   let mcphDir: string;
   let stateFile: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-reset-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-reset-"));
     mcphDir = join(home, CONFIG_DIRNAME);
     stateFile = join(mcphDir, STATE_FILENAME);
     mkdirSync(mcphDir, { recursive: true });
@@ -94,7 +94,7 @@ describe("runResetLearning", () => {
     expect(combined).toContain("pack history entries removed: 0");
   });
 
-  it("is a no-op when MCPH_DISABLE_PERSISTENCE=1 (leaves the file alone)", async () => {
+  it("is a no-op when YAW_MCP_DISABLE_PERSISTENCE=1 (leaves the file alone)", async () => {
     const payload = {
       version: STATE_SCHEMA_VERSION,
       savedAt: Date.now(),
@@ -106,7 +106,7 @@ describe("runResetLearning", () => {
     const io = captureIO();
     const r = await runResetLearning({
       home,
-      env: { MCPH_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
       out: io.push,
       err: io.pushErr,
     });
@@ -120,12 +120,12 @@ describe("runResetLearning", () => {
     expect(combined).toContain("nothing to clear");
   });
 
-  it("also treats MCPH_DISABLE_PERSISTENCE=true as disabled", async () => {
+  it("also treats YAW_MCP_DISABLE_PERSISTENCE=true as disabled", async () => {
     writeFileSync(stateFile, "{}", "utf8");
     const io = captureIO();
     const r = await runResetLearning({
       home,
-      env: { MCPH_DISABLE_PERSISTENCE: "true" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "true" },
       out: io.push,
       err: io.pushErr,
     });
@@ -134,7 +134,7 @@ describe("runResetLearning", () => {
     expect(existsSync(stateFile)).toBe(true);
   });
 
-  it("treats MCPH_DISABLE_PERSISTENCE empty string as not-disabled", async () => {
+  it("treats YAW_MCP_DISABLE_PERSISTENCE empty string as not-disabled", async () => {
     // Matches the same logic as renderStateSection in doctor-cmd.ts:
     // unset OR empty string means the flag isn't active.
     writeFileSync(
@@ -151,7 +151,7 @@ describe("runResetLearning", () => {
     const io = captureIO();
     const r = await runResetLearning({
       home,
-      env: { MCPH_DISABLE_PERSISTENCE: "" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "" },
       out: io.push,
       err: io.pushErr,
     });
@@ -166,8 +166,8 @@ describe("runResetLearning", () => {
     expect(r.path).toBe(stateFile);
   });
 
-  it("returns exit code 0 when the ~/.mcph dir itself is missing", async () => {
-    // Fresh home with no ~/.mcph/ at all — the common case on a
+  it("returns exit code 0 when the ~/.yaw-mcp dir itself is missing", async () => {
+    // Fresh home with no ~/.yaw-mcp/ at all — the common case on a
     // brand-new install where the user is just poking at CLI commands.
     rmSync(mcphDir, { recursive: true, force: true });
     const io = captureIO();
@@ -219,7 +219,7 @@ describe("parseResetLearningArgs", () => {
     expect(r.kind).toBe("error");
     if (r.kind === "error") {
       expect(r.error).toContain("--bogus");
-      expect(r.error).toContain("Usage: mcph reset-learning");
+      expect(r.error).toContain("Usage: yaw-mcp reset-learning");
     }
   });
 

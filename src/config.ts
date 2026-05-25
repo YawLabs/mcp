@@ -46,7 +46,7 @@ export async function fetchConfig(
   if (res.statusCode === 401) {
     await res.body.text().catch(() => {});
     throw new ConfigError(
-      `Token rejected (HTTP 401) — the token ${tokenFingerprint(token)} is invalid or revoked.\n  Generate a new token at https://mcp.hosting/dashboard/settings/tokens,\n  then re-run \`mcph install <client> --token mcp_pat_...\` or set MCPH_TOKEN.`,
+      `Token rejected (HTTP 401) — the token ${tokenFingerprint(token)} is invalid or revoked.\n  Generate a new token at https://yaw.sh/mcp/dashboard/settings/tokens,\n  then re-run \`yaw-mcp install <client> --token mcp_pat_...\` or set YAW_MCP_TOKEN.`,
       true,
     );
   }
@@ -54,7 +54,7 @@ export async function fetchConfig(
   if (res.statusCode === 403) {
     await res.body.text().catch(() => {});
     throw new ConfigError(
-      `Access denied (HTTP 403) — the token ${tokenFingerprint(token)} was accepted but lacks permission to read this account's servers.\n  The account may be suspended or the token scope reduced — check\n  https://mcp.hosting/dashboard/settings/tokens, or reach support@mcp.hosting.`,
+      `Access denied (HTTP 403) — the token ${tokenFingerprint(token)} was accepted but lacks permission to read this account's servers.\n  The account may be suspended or the token scope reduced — check\n  https://yaw.sh/mcp/dashboard/settings/tokens, or reach support@mcp.hosting.`,
       true,
     );
   }

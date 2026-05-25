@@ -8,7 +8,7 @@ describe("atomicWriteFile", () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "mcph-atomic-"));
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-atomic-"));
   });
 
   afterEach(() => {

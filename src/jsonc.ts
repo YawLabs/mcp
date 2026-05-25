@@ -3,7 +3,7 @@
 // to JSON.parse. String literals are tracked so `//` inside "https://…"
 // or a dollar sign inside a comment-like token are preserved verbatim.
 //
-// Why hand-roll instead of depending on `jsonc-parser`: we want mcph's
+// Why hand-roll instead of depending on `jsonc-parser`: we want yaw-mcp's
 // dependency surface to stay small (currently 4 production deps) and the
 // stripping logic is <50 LOC. A full comment-preserving parser isn't
 // needed — we only read config, never rewrite it as JSONC.

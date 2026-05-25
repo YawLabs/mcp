@@ -50,7 +50,7 @@ describe("parseServersArgs", () => {
   it("--help returns the usage string as an error", () => {
     const r = parseServersArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("Usage: mcph servers");
+    if (!r.ok) expect(r.error).toContain("Usage: yaw-mcp servers");
   });
 
   it("accepts a positional namespace filter", () => {
@@ -80,7 +80,7 @@ describe("runServersCommand", () => {
   let home: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-servers-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-servers-"));
     mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
     // Seed a global config with a token so the fetcher branch is reached.
     writeFileSync(
@@ -235,14 +235,14 @@ describe("runServersCommand", () => {
       err: io.pushErr,
       fetcher: async () => {
         throw new Error(
-          "Token rejected (HTTP 401) — the token mcp_pat_…abcd is invalid or revoked.\n  Generate a new token at https://mcp.hosting/dashboard/settings/tokens,\n  then re-run `mcph install <client> --token mcp_pat_...` or set MCPH_TOKEN.",
+          "Token rejected (HTTP 401) — the token mcp_pat_…abcd is invalid or revoked.\n  Generate a new token at https://yaw.sh/mcp/dashboard/settings/tokens,\n  then re-run `yaw-mcp install <client> --token mcp_pat_...` or set YAW_MCP_TOKEN.",
         );
       },
     });
     expect(r.exitCode).toBe(2);
     const combinedErr = io.err.join("");
     expect(combinedErr).toContain("Token rejected");
-    expect(combinedErr).toContain("https://mcp.hosting/dashboard/settings/tokens");
+    expect(combinedErr).toContain("https://yaw.sh/mcp/dashboard/settings/tokens");
   });
 
   it("exits 2 on an unexpected 304 (null response)", async () => {

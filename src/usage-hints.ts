@@ -12,11 +12,11 @@ import type { DetectedPack } from "./pack-detect.js";
 //      you usually had Y loaded too." Populated by successful proxied
 //      tool calls across ≥2 distinct namespaces within a short gap.
 //
-// Both signals persist across mcph restarts via ~/.mcph/state.json
+// Both signals persist across yaw-mcp restarts via ~/.yaw-mcp/state.json
 // (see persistence.ts) so a freshly-started session still knows which
 // servers the user has been relying on. Counts reflect cumulative
 // successful use since persistence started, not just the live process.
-// Set MCPH_DISABLE_PERSISTENCE=1 to keep signals session-local only.
+// Set YAW_MCP_DISABLE_PERSISTENCE=1 to keep signals session-local only.
 
 // Cap on peers per hint. Keeps the discover() line length bounded —
 // more than ~3 peers quickly drowns out the rest of the server card.
@@ -24,7 +24,7 @@ const MAX_PEERS = 3;
 const MIN_SUCCESS_TO_SHOW = 1;
 
 // Thresholds for the dormant-reliability hint. Exported so
-// handleHealth and `mcph doctor` can share the same "what counts as
+// handleHealth and `yaw-mcp doctor` can share the same "what counts as
 // flaky" definition — otherwise the various views would disagree about
 // which namespaces qualify and the LLM / operator ends up confused.
 export const RELIABILITY_MIN_OBSERVATIONS = 3;
@@ -101,7 +101,7 @@ export interface FlakyNamespaceEntry {
 }
 
 // Shared selector for the flaky-namespace lists shown by handleHealth
-// and `mcph doctor`'s RELIABILITY section. Filter rules are the same as
+// and `yaw-mcp doctor`'s RELIABILITY section. Filter rules are the same as
 // formatReliabilityWarning; sort is worst-rate first, tie-break by most
 // calls (more evidence = more credible), then alphabetical so output is
 // deterministic. Caller passes any pre-filter (e.g., handleHealth

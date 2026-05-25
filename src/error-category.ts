@@ -31,7 +31,7 @@ export type ErrorCategory = (typeof ERROR_CATEGORIES)[number];
 // - MCP error -32001: "Request timed out"
 // - JSON-RPC -32601: "Method not found", "Unknown tool"
 // - HTTP-ish: 401/403/429/404 status codes, "unauthorized", "rate limit"
-// - mcph's own auto-reconnect message: "disconnected and auto-reconnect failed"
+// - yaw-mcp's own auto-reconnect message: "disconnected and auto-reconnect failed"
 //
 // Order matters -- the first match wins. The exact precedence is:
 //
@@ -65,7 +65,7 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
     return "timeout";
   }
 
-  // Validation: zod / JSON schema -- mcph sees these as -32602 from
+  // Validation: zod / JSON schema -- yaw-mcp sees these as -32602 from
   // upstream servers and as raw zod issues from its own validators.
   if (
     t.includes("-32602") ||
@@ -83,7 +83,7 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
     return "unknown_tool";
   }
 
-  // Connection lost: mcph's auto-reconnect failure string -- this one
+  // Connection lost: yaw-mcp's auto-reconnect failure string -- this one
   // is precise enough that we don't need a generic "disconnected"
   // catch (which would also match upstream tool descriptions).
   if (t.includes("auto-reconnect failed") || t.includes("connection closed")) {

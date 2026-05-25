@@ -1,4 +1,4 @@
-// Per-client, per-OS config file metadata for `mcph install <client>`.
+// Per-client, per-OS config file metadata for `yaw-mcp install <client>`.
 // This is the authoritative mapping of {client, scope, OS} → file path +
 // JSON shape; the dashboard's install UI at mcp-hosting/dashboard/src/
 // components/onboarding/mcphInstall.ts is the visual mirror of this and
@@ -28,7 +28,7 @@
 //     file the app will never read.
 //   • On Windows, `npx` is a `.cmd` shim; MCP clients that spawn it
 //     directly get ENOENT. The launch entry must be
-//     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcph"] }`.
+//     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp"] }`.
 
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -287,22 +287,22 @@ function pathFor(
 export interface BuildLaunchEntryOptions {
   os: InstallOS;
   /** Optional token to embed in env. Omit to keep env empty (preferred:
-   *  token lives in ~/.mcph/config.json, not in the client config). */
+   *  token lives in ~/.yaw-mcp/config.json, not in the client config). */
   token?: string;
   /** Optional override for the `args` binary (defaults to
-   *  @yawlabs/mcph@latest -- the `@latest` tag makes `npx` re-resolve
+   *  @yawlabs/mcp@latest -- the `@latest` tag makes `npx` re-resolve
    *  the newest version on every spawn, so a client restart is all it
    *  takes to pick up a new release). */
   pkg?: string;
   /** Optional upstream-shape override: when set, the entry is built for
-   *  an arbitrary upstream MCP server (used by `mcph try` to wire a
+   *  an arbitrary upstream MCP server (used by `yaw-mcp try` to wire a
    *  one-off trial entry pointing directly at the upstream's launcher,
-   *  bypassing mcph). When `os === "windows"`, the upstream command +
+   *  bypassing yaw-mcp). When `os === "windows"`, the upstream command +
    *  args are wrapped with `cmd /c` to dodge the same `.cmd` shim trap
-   *  that bit the default mcph launcher — keep this path going through
+   *  that bit the default yaw-mcp launcher — keep this path going through
    *  buildLaunchEntry so the wrapping logic stays in one place.
    *  Mutually exclusive with `pkg`/`token` (those tune the default
-   *  mcph entry; with `upstream` they're ignored). */
+   *  yaw-mcp entry; with `upstream` they're ignored). */
   upstream?: {
     command: string;
     args: string[];
@@ -319,7 +319,7 @@ export interface LaunchEntry {
 
 export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   if (opts.upstream) {
-    // Upstream-shape entry (mcph try): preserve the upstream command +
+    // Upstream-shape entry (yaw-mcp try): preserve the upstream command +
     // args verbatim, but wrap on Windows so a `.cmd` shim launcher
     // (npx.cmd, uvx.cmd, pipx.cmd) doesn't ENOENT when the client
     // spawns it directly.
@@ -333,10 +333,10 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
     if (env && Object.keys(env).length > 0) entry.env = { ...env };
     return entry;
   }
-  const pkg = opts.pkg ?? "@yawlabs/mcph@latest";
+  const pkg = opts.pkg ?? "@yawlabs/mcp@latest";
   const entry: LaunchEntry =
     opts.os === "windows" ? { command: "cmd", args: ["/c", "npx", "-y", pkg] } : { command: "npx", args: ["-y", pkg] };
-  if (opts.token) entry.env = { MCPH_TOKEN: opts.token };
+  if (opts.token) entry.env = { YAW_MCP_TOKEN: opts.token };
   return entry;
 }
 
@@ -346,7 +346,7 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
 export const ENTRY_NAME = "mcp.hosting";
 
 /** Pattern added to Claude Code's `permissions.allow` on install so the
- *  user isn't re-prompted for each mcph MCP tool call. Only matters for
+ *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
  *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).
  *  Keep in sync with the tool-name prefix our proxy exposes. */
 export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp_hosting__*";

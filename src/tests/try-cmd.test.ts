@@ -26,7 +26,7 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "mcph-try-home-"));
+  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-try-home-"));
   synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
 
@@ -228,18 +228,18 @@ describe("runTry — happy path", () => {
     const marker = JSON.parse(readFileSync(markerPath, "utf8")) as TrialMarker;
     expect(marker.slug).toBe("demo");
     expect(marker.expiresAt).toBe(1_700_000_000_000 + 3_600_000);
-    expect(marker.entryName).toBe("mcph-try-demo");
+    expect(marker.entryName).toBe("yaw-mcp-try-demo");
     expect(marker.clientName).toBe("claude-code");
 
-    // Client config has the entry with upstream command/args (NOT mcph's
+    // Client config has the entry with upstream command/args (NOT yaw-mcp's
     // npx invocation -- this is the spec contract).
     const clientPath = join(synthHome, ".claude.json");
     expect(existsSync(clientPath)).toBe(true);
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
-    const entry = client.mcpServers["mcph-try-demo"];
+    const entry = client.mcpServers["yaw-mcp-try-demo"];
     expect(entry.command).toBe("npx");
     expect(entry.args).toEqual(["-y", "@demo/mcp"]);
-    // The canonical mcph.hosting entry is NOT created by `try`.
+    // The canonical yaw-mcp.hosting entry is NOT created by `try`.
     expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
 
     // anonId seeded.
@@ -261,7 +261,7 @@ describe("runTry — happy path", () => {
   it("reuses buildLaunchEntry's Windows cmd /c wrap for the trial entry", async () => {
     // Same upstream shape, OS=windows; entry must be { command: 'cmd',
     // args: ['/c', <command>, ...<args>] } -- the exact pattern
-    // buildLaunchEntry encodes for the canonical mcph launcher.
+    // buildLaunchEntry encodes for the canonical yaw-mcp launcher.
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
@@ -279,11 +279,11 @@ describe("runTry — happy path", () => {
 
     const clientPath = join(synthHome, ".claude.json");
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
-    const entry = client.mcpServers["mcph-try-demo"];
+    const entry = client.mcpServers["yaw-mcp-try-demo"];
     expect(entry.command).toBe("cmd");
     expect(entry.args).toEqual(["/c", "npx", "-y", "@demo/mcp"]);
 
-    // Sanity: same wrapping the canonical mcph entry uses.
+    // Sanity: same wrapping the canonical yaw-mcp entry uses.
     const canonical = buildLaunchEntry({ os: "windows" });
     expect(entry.command).toBe(canonical.command);
   });
@@ -329,7 +329,7 @@ describe("runTry — missing env vars", () => {
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(client.mcpServers["mcph-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
+    expect(client.mcpServers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
   });
 });
 
@@ -391,7 +391,7 @@ describe("runTry — fetch failure", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => {
-        throw new Error('mcph try: no server with slug "demo"');
+        throw new Error('yaw-mcp try: no server with slug "demo"');
       },
       postEvent: async () => undefined,
     });
@@ -403,14 +403,14 @@ describe("runTry — fetch failure", () => {
 
 describe("runTry — preserves existing client config siblings", () => {
   it("does not stomp the canonical mcp.hosting entry or any other server", async () => {
-    // Pre-populate ~/.claude.json with the canonical mcph entry and an
+    // Pre-populate ~/.claude.json with the canonical yaw-mcp entry and an
     // unrelated server.
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({
         model: "claude-opus-4-7",
         mcpServers: {
-          [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcph@latest"] },
+          [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
           other: { command: "node", args: ["other.js"] },
         },
       }),
@@ -431,9 +431,9 @@ describe("runTry — preserves existing client config siblings", () => {
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.model).toBe("claude-opus-4-7");
-    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "npx", args: ["-y", "@yawlabs/mcph@latest"] });
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "npx", args: ["-y", "@yawlabs/mcp@latest"] });
     expect(client.mcpServers.other).toEqual({ command: "node", args: ["other.js"] });
-    expect(client.mcpServers["mcph-try-demo"]).toBeDefined();
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeDefined();
   });
 });
 
@@ -470,7 +470,7 @@ describe("runTryCleanup", () => {
     expect(r.exitCode).toBe(0);
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(client.mcpServers["mcph-try-demo"]).toBeUndefined();
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
     expect(events).toHaveLength(1);
     expect(events[0].action).toBe("cleanup");
   });
@@ -503,7 +503,7 @@ describe("scanTrials + gcExpiredTrials", () => {
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
       containerPath: ["mcpServers"],
-      entryName: "mcph-try-old",
+      entryName: "yaw-mcp-try-old",
       createdAt: baseNow - 3_600_000,
     };
     const liveMarker: TrialMarker = {
@@ -511,7 +511,7 @@ describe("scanTrials + gcExpiredTrials", () => {
       slug: "new",
       name: "New MCP",
       expiresAt: baseNow + 1_800_000,
-      entryName: "mcph-try-new",
+      entryName: "yaw-mcp-try-new",
     };
     writeFileSync(trialMarkerPath("old", synthHome), JSON.stringify(expiredMarker));
     writeFileSync(trialMarkerPath("new", synthHome), JSON.stringify(liveMarker));
@@ -535,8 +535,8 @@ describe("scanTrials + gcExpiredTrials", () => {
       join(synthHome, ".claude.json"),
       JSON.stringify({
         mcpServers: {
-          [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcph@latest"] },
-          "mcph-try-old": { command: "npx", args: ["-y", "@old/mcp"] },
+          [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+          "yaw-mcp-try-old": { command: "npx", args: ["-y", "@old/mcp"] },
         },
       }),
     );
@@ -549,7 +549,7 @@ describe("scanTrials + gcExpiredTrials", () => {
       clientPath: join(synthHome, ".claude.json"),
       clientName: "claude-code",
       containerPath: ["mcpServers"],
-      entryName: "mcph-try-old",
+      entryName: "yaw-mcp-try-old",
       createdAt: baseNow - 3_600_000,
     };
     writeFileSync(trialMarkerPath("old", synthHome), JSON.stringify(expiredMarker));
@@ -568,8 +568,8 @@ describe("scanTrials + gcExpiredTrials", () => {
 
     // Entry peeled out.
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
-    expect(client.mcpServers["mcph-try-old"]).toBeUndefined();
-    // Canonical mcph entry untouched.
+    expect(client.mcpServers["yaw-mcp-try-old"]).toBeUndefined();
+    // Canonical yaw-mcp entry untouched.
     expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
     // Marker file deleted.
     expect(existsSync(trialMarkerPath("old", synthHome))).toBe(false);

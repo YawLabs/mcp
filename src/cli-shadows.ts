@@ -2,7 +2,7 @@
 //
 // Used by:
 //   - discover: surface "this server shadows `<cli>`" per candidate
-//   - guide: auto-generated "Installed servers" section appended to MCPH.md
+//   - guide: auto-generated "Installed servers" section appended to YAW-MCP.md
 //   - doctor: scan shell history for shadowed-CLI invocations
 //
 // Covers every slug in the mcp.hosting Explore catalog so a user who
@@ -12,7 +12,7 @@
 // a user who renamed the server on import still matches. For custom
 // namespaces, a tool-name heuristic (shared lowercase prefix across
 // three or more tool-cache entries) catches the common CLI prefixes.
-// Beyond that, the user can document the mapping in their MCPH.md and
+// Beyond that, the user can document the mapping in their YAW-MCP.md and
 // that copy is authoritative.
 
 import type { UpstreamServerConfig } from "./types.js";

@@ -1,4 +1,4 @@
-// `mcph reset-learning` — delete ~/.mcph/state.json so cross-session
+// `yaw-mcp reset-learning` — delete ~/.yaw-mcp/state.json so cross-session
 // learning starts fresh. Pairs with the doctor RELIABILITY section (see
 // doctor-cmd.ts) and the dispatch penalty branch (learning.ts):
 // once doctor has flagged a namespace as flaky, its penalty keeps
@@ -23,9 +23,9 @@ import { join } from "node:path";
 import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, loadState } from "./persistence.js";
 
-export const RESET_LEARNING_USAGE = `Usage: mcph reset-learning
+export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
-  Delete ~/.mcph/state.json so cross-session learning starts fresh.
+  Delete ~/.yaw-mcp/state.json so cross-session learning starts fresh.
   Use this after fixing the root cause of a flaky upstream (token
   rotated, account swapped, server replaced) so the routing penalty
   doesn't keep suppressing it.
@@ -37,14 +37,14 @@ export type ParsedResetLearning =
   | { kind: "error"; error: string }
   | { kind: "ok"; options: Record<string, never> };
 
-// Argv parser. Crucially, this exists so `mcph reset-learning --help`
+// Argv parser. Crucially, this exists so `yaw-mcp reset-learning --help`
 // doesn't fall through to runResetLearning() and silently delete state.
 export function parseResetLearningArgs(argv: string[]): ParsedResetLearning {
   for (const arg of argv) {
     if (arg === "-h" || arg === "--help") return { kind: "help" };
     return {
       kind: "error",
-      error: `mcph reset-learning: unknown argument "${arg}"\n\n${RESET_LEARNING_USAGE}`,
+      error: `yaw-mcp reset-learning: unknown argument "${arg}"\n\n${RESET_LEARNING_USAGE}`,
     };
   }
   return { kind: "ok", options: {} };
@@ -86,7 +86,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
 
   const filePath = join(userConfigDir(home), STATE_FILENAME);
 
-  // When persistence is disabled, the running mcph session isn't
+  // When persistence is disabled, the running yaw-mcp session isn't
   // reading or writing state.json anyway. A stale file on disk could
   // still exist from a prior session when the env wasn't set — we
   // leave it alone. Rationale: the env flag is usually a temporary
@@ -94,10 +94,10 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // someone runs this command under the flag would surprise users who
   // expected their opt-out to be non-destructive. If they really want
   // the file gone they can unset the flag and re-run.
-  const raw = env.MCPH_DISABLE_PERSISTENCE;
+  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
   const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
   if (disabled) {
-    print("mcph reset-learning: persistence is disabled (MCPH_DISABLE_PERSISTENCE) — nothing to clear.");
+    print("yaw-mcp reset-learning: persistence is disabled (YAW_MCP_DISABLE_PERSISTENCE) — nothing to clear.");
     return { exitCode: 0, lines, removed: false, path: filePath };
   }
 
@@ -115,16 +115,16 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
     await unlink(filePath);
   } catch (err) {
     if (isFileNotFound(err)) {
-      print("mcph reset-learning: no persisted state to reset.");
+      print("yaw-mcp reset-learning: no persisted state to reset.");
       print(`  path: ${filePath}`);
       return { exitCode: 0, lines, removed: false, path: filePath };
     }
     const msg = err instanceof Error ? err.message : String(err);
-    printErr(`mcph reset-learning: failed to remove ${filePath}: ${msg}`);
+    printErr(`yaw-mcp reset-learning: failed to remove ${filePath}: ${msg}`);
     return { exitCode: 1, lines, removed: false, path: filePath };
   }
 
-  print("mcph reset-learning: cleared persisted state.");
+  print("yaw-mcp reset-learning: cleared persisted state.");
   print(`  path: ${filePath}`);
   print(`  learning entries removed:     ${learningCount}`);
   print(`  pack history entries removed: ${packCount}`);

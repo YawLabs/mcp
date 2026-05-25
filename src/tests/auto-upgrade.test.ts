@@ -11,15 +11,15 @@ import { maybeAutoUpgrade } from "../auto-upgrade.js";
 // ═══════════════════════════════════════════════════════════════════════
 
 // argv[1] paths that detectInstallMethod (upgrade-cmd.ts) classifies.
-const GLOBAL_NPM_PATH = "/usr/local/lib/node_modules/@yawlabs/mcph/dist/index.js";
-const NPX_PATH = "/home/u/.npm/_npx/abc123/node_modules/@yawlabs/mcph/dist/index.js";
-const LOCAL_NODE_MODULES_PATH = "/home/u/myproject/node_modules/@yawlabs/mcph/dist/index.js";
+const GLOBAL_NPM_PATH = "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js";
+const NPX_PATH = "/home/u/.npm/_npx/abc123/node_modules/@yawlabs/mcp/dist/index.js";
+const LOCAL_NODE_MODULES_PATH = "/home/u/myproject/node_modules/@yawlabs/mcp/dist/index.js";
 const UNKNOWN_PATH = "/tmp/some/random/launch/path.js";
 
 describe("maybeAutoUpgrade", () => {
-  it("does nothing when MCPH_AUTO_UPGRADE=0 (opt-out short-circuits before fetch/spawn)", async () => {
-    const prev = process.env.MCPH_AUTO_UPGRADE;
-    process.env.MCPH_AUTO_UPGRADE = "0";
+  it("does nothing when YAW_MCP_AUTO_UPGRADE=0 (opt-out short-circuits before fetch/spawn)", async () => {
+    const prev = process.env.YAW_MCP_AUTO_UPGRADE;
+    process.env.YAW_MCP_AUTO_UPGRADE = "0";
     try {
       const fetchLatestImpl = vi.fn();
       const spawnImpl = vi.fn();
@@ -33,14 +33,14 @@ describe("maybeAutoUpgrade", () => {
       expect(spawnImpl).not.toHaveBeenCalled();
     } finally {
       // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
-      if (prev === undefined) delete process.env.MCPH_AUTO_UPGRADE;
-      else process.env.MCPH_AUTO_UPGRADE = prev;
+      if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
+      else process.env.YAW_MCP_AUTO_UPGRADE = prev;
     }
   });
 
-  it("MCPH_AUTO_UPGRADE=false also opts out (matches the =0 escape hatch)", async () => {
-    const prev = process.env.MCPH_AUTO_UPGRADE;
-    process.env.MCPH_AUTO_UPGRADE = "false";
+  it("YAW_MCP_AUTO_UPGRADE=false also opts out (matches the =0 escape hatch)", async () => {
+    const prev = process.env.YAW_MCP_AUTO_UPGRADE;
+    process.env.YAW_MCP_AUTO_UPGRADE = "false";
     try {
       const spawnImpl = vi.fn();
       await maybeAutoUpgrade({
@@ -52,14 +52,14 @@ describe("maybeAutoUpgrade", () => {
       expect(spawnImpl).not.toHaveBeenCalled();
     } finally {
       // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
-      if (prev === undefined) delete process.env.MCPH_AUTO_UPGRADE;
-      else process.env.MCPH_AUTO_UPGRADE = prev;
+      if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
+      else process.env.YAW_MCP_AUTO_UPGRADE = prev;
     }
   });
 
-  it("MCPH_AUTO_UPGRADE=FALSE (uppercase) opts out -- contract is case-insensitive", async () => {
-    const prev = process.env.MCPH_AUTO_UPGRADE;
-    process.env.MCPH_AUTO_UPGRADE = "FALSE";
+  it("YAW_MCP_AUTO_UPGRADE=FALSE (uppercase) opts out -- contract is case-insensitive", async () => {
+    const prev = process.env.YAW_MCP_AUTO_UPGRADE;
+    process.env.YAW_MCP_AUTO_UPGRADE = "FALSE";
     try {
       const fetchLatestImpl = vi.fn();
       const spawnImpl = vi.fn();
@@ -73,19 +73,19 @@ describe("maybeAutoUpgrade", () => {
       expect(spawnImpl).not.toHaveBeenCalled();
     } finally {
       // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
-      if (prev === undefined) delete process.env.MCPH_AUTO_UPGRADE;
-      else process.env.MCPH_AUTO_UPGRADE = prev;
+      if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
+      else process.env.YAW_MCP_AUTO_UPGRADE = prev;
     }
   });
 
-  it("MCPH_AUTO_UPGRADE=1 / =true does NOT opt out -- only `0`/`false` disable", async () => {
+  it("YAW_MCP_AUTO_UPGRADE=1 / =true does NOT opt out -- only `0`/`false` disable", async () => {
     // Defends the opt-OUT contract against a user who reads the env var
     // as opt-in and sets `1`/`true` expecting it to enable -- the
     // feature is already on by default, and these values must NOT
     // accidentally suppress it.
     for (const value of ["1", "true", "yes", "on"]) {
-      const prev = process.env.MCPH_AUTO_UPGRADE;
-      process.env.MCPH_AUTO_UPGRADE = value;
+      const prev = process.env.YAW_MCP_AUTO_UPGRADE;
+      process.env.YAW_MCP_AUTO_UPGRADE = value;
       try {
         const spawnImpl = vi.fn();
         await maybeAutoUpgrade({
@@ -97,12 +97,12 @@ describe("maybeAutoUpgrade", () => {
         expect(spawnImpl, `value=${value} should NOT opt out`).toHaveBeenCalledWith("npm", [
           "install",
           "-g",
-          "@yawlabs/mcph@latest",
+          "@yawlabs/mcp@latest",
         ]);
       } finally {
         // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
-        if (prev === undefined) delete process.env.MCPH_AUTO_UPGRADE;
-        else process.env.MCPH_AUTO_UPGRADE = prev;
+        if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
+        else process.env.YAW_MCP_AUTO_UPGRADE = prev;
       }
     }
   });
@@ -146,12 +146,12 @@ describe("maybeAutoUpgrade", () => {
       spawnImpl,
     });
     expect(spawnImpl).toHaveBeenCalledTimes(1);
-    expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcph@latest"]);
+    expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
   });
 
   it("does NOT spawn for a stale npx install (npx self-heals via the @latest config)", async () => {
-    // npx installs are upgraded by the `@yawlabs/mcph@latest` entry that
-    // `mcph install` writes -- there is nothing safe to spawn from here.
+    // npx installs are upgraded by the `@yawlabs/mcp@latest` entry that
+    // `yaw-mcp install` writes -- there is nothing safe to spawn from here.
     const spawnImpl = vi.fn();
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
@@ -163,7 +163,7 @@ describe("maybeAutoUpgrade", () => {
   });
 
   it("does NOT spawn for a stale local-node-modules install (project owns its own tree)", async () => {
-    // If a project has @yawlabs/mcph as a local dep, this process must
+    // If a project has @yawlabs/mcp as a local dep, this process must
     // never run `npm install -g` against the user's environment -- the
     // project's lockfile owns that version. Locks the switch arm in
     // maybeAutoUpgrade so a future refactor can't flip the default.
@@ -192,7 +192,7 @@ describe("maybeAutoUpgrade", () => {
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
-  it("only whitelists `npm install -g @yawlabs/mcph@latest` -- never arbitrary commands", async () => {
+  it("only whitelists `npm install -g @yawlabs/mcp@latest` -- never arbitrary commands", async () => {
     const calls: [string, string[]][] = [];
     await maybeAutoUpgrade({
       currentVersion: "0.40.0",
@@ -200,6 +200,6 @@ describe("maybeAutoUpgrade", () => {
       fetchLatestImpl: async () => "0.47.8",
       spawnImpl: (cmd, args) => calls.push([cmd, args]),
     });
-    expect(calls).toEqual([["npm", ["install", "-g", "@yawlabs/mcph@latest"]]]);
+    expect(calls).toEqual([["npm", ["install", "-g", "@yawlabs/mcp@latest"]]]);
   });
 });

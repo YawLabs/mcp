@@ -30,7 +30,7 @@ describe("reportRuntimes", () => {
   });
 
   it("posts to /api/connect/runtimes when initialized", async () => {
-    initRuntimeDetect("https://mcp.hosting", "tok");
+    initRuntimeDetect("https://yaw.sh/mcp", "tok");
     vi.mocked(request).mockResolvedValue({
       statusCode: 200,
       body: { text: vi.fn().mockResolvedValue("") },
@@ -50,13 +50,13 @@ describe("reportRuntimes", () => {
   });
 
   it("swallows network errors silently", async () => {
-    initRuntimeDetect("https://mcp.hosting", "tok");
+    initRuntimeDetect("https://yaw.sh/mcp", "tok");
     vi.mocked(request).mockRejectedValue(new Error("ECONNRESET"));
     await expect(reportRuntimes()).resolves.toBeUndefined();
   });
 
   it("does not throw on 404 (older mcp.hosting deploy)", async () => {
-    initRuntimeDetect("https://mcp.hosting", "tok");
+    initRuntimeDetect("https://yaw.sh/mcp", "tok");
     vi.mocked(request).mockResolvedValue({
       statusCode: 404,
       body: { text: vi.fn().mockResolvedValue("") },
@@ -65,7 +65,7 @@ describe("reportRuntimes", () => {
   });
 
   it("does not throw on 5xx", async () => {
-    initRuntimeDetect("https://mcp.hosting", "tok");
+    initRuntimeDetect("https://yaw.sh/mcp", "tok");
     vi.mocked(request).mockResolvedValue({
       statusCode: 500,
       body: { text: vi.fn().mockResolvedValue("internal error") },

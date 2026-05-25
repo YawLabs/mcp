@@ -2,18 +2,18 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_SERVER_CAP, evaluateServerCap, resolveServerCap } from "../server-cap.js";
 
 describe("resolveServerCap", () => {
-  const originalEnv = process.env.MCPH_SERVER_CAP;
+  const originalEnv = process.env.YAW_MCP_SERVER_CAP;
 
   beforeEach(() => {
     // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
-    delete process.env.MCPH_SERVER_CAP;
+    delete process.env.YAW_MCP_SERVER_CAP;
   });
   afterEach(() => {
     if (originalEnv === undefined) {
       // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
-      delete process.env.MCPH_SERVER_CAP;
+      delete process.env.YAW_MCP_SERVER_CAP;
     } else {
-      process.env.MCPH_SERVER_CAP = originalEnv;
+      process.env.YAW_MCP_SERVER_CAP = originalEnv;
     }
   });
 
@@ -22,20 +22,20 @@ describe("resolveServerCap", () => {
   });
 
   it("returns the default when env is empty string", () => {
-    expect(resolveServerCap({ MCPH_SERVER_CAP: "" })).toBe(DEFAULT_SERVER_CAP);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "" })).toBe(DEFAULT_SERVER_CAP);
   });
 
   it("honors a valid positive override", () => {
-    expect(resolveServerCap({ MCPH_SERVER_CAP: "12" })).toBe(12);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "12" })).toBe(12);
   });
 
   it("honors 0 as 'disabled'", () => {
-    expect(resolveServerCap({ MCPH_SERVER_CAP: "0" })).toBe(0);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "0" })).toBe(0);
   });
 
   it("falls back to the default on invalid input rather than erroring", () => {
-    expect(resolveServerCap({ MCPH_SERVER_CAP: "abc" })).toBe(DEFAULT_SERVER_CAP);
-    expect(resolveServerCap({ MCPH_SERVER_CAP: "-2" })).toBe(DEFAULT_SERVER_CAP);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "abc" })).toBe(DEFAULT_SERVER_CAP);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "-2" })).toBe(DEFAULT_SERVER_CAP);
   });
 });
 
@@ -73,7 +73,7 @@ describe("evaluateServerCap", () => {
     const decision = evaluateServerCap("new", [{ namespace: "a", idleCount: 0 }], 1);
     expect(decision.message).toContain("mcp_connect_deactivate");
     expect(decision.message).toContain("mcp_connect_read_tool");
-    expect(decision.message).toContain("MCPH_SERVER_CAP");
+    expect(decision.message).toContain("YAW_MCP_SERVER_CAP");
   });
 
   it("lists loaded servers by descending idle count so the cheapest drop shows first", () => {

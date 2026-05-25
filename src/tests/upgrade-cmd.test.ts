@@ -48,7 +48,7 @@ describe("parseUpgradeArgs", () => {
   it("--help returns usage as error", () => {
     const r = parseUpgradeArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("Usage: mcph upgrade");
+    if (!r.ok) expect(r.error).toContain("Usage: yaw-mcp upgrade");
   });
 });
 
@@ -58,47 +58,47 @@ describe("detectInstallMethod", () => {
   });
 
   it("detects npx cache on linux/macos", () => {
-    expect(detectInstallMethod("/home/user/.npm/_npx/abc123/node_modules/@yawlabs/mcph/dist/index.js")).toBe("npx");
+    expect(detectInstallMethod("/home/user/.npm/_npx/abc123/node_modules/@yawlabs/mcp/dist/index.js")).toBe("npx");
   });
 
   it("detects npx cache on windows", () => {
     expect(
       detectInstallMethod(
-        "C:\\Users\\jeff\\AppData\\Local\\npm-cache\\_npx\\abc\\node_modules\\@yawlabs\\mcph\\dist\\index.js",
+        "C:\\Users\\jeff\\AppData\\Local\\npm-cache\\_npx\\abc\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
       ),
     ).toBe("npx");
   });
 
   it("detects linux global install under /usr/lib/node_modules", () => {
-    expect(detectInstallMethod("/usr/lib/node_modules/@yawlabs/mcph/dist/index.js")).toBe("global-npm");
+    expect(detectInstallMethod("/usr/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
   });
 
   it("detects macos homebrew-style /usr/local/lib/node_modules", () => {
-    expect(detectInstallMethod("/usr/local/lib/node_modules/@yawlabs/mcph/dist/index.js")).toBe("global-npm");
+    expect(detectInstallMethod("/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
   });
 
   it("detects windows global npm under AppData/Roaming/npm", () => {
     expect(
-      detectInstallMethod("C:\\Users\\jeff\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcph\\dist\\index.js"),
+      detectInstallMethod("C:\\Users\\jeff\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcp\\dist\\index.js"),
     ).toBe("global-npm");
   });
 
   it("detects nvm-style /home/u/.nvm/versions/node/.../lib/node_modules as global", () => {
-    expect(
-      detectInstallMethod("/home/u/.nvm/versions/node/v22.11.0/lib/node_modules/@yawlabs/mcph/dist/index.js"),
-    ).toBe("global-npm");
+    expect(detectInstallMethod("/home/u/.nvm/versions/node/v22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "global-npm",
+    );
   });
 
   it("detects a project-local node_modules install", () => {
-    expect(detectInstallMethod("/proj/app/node_modules/@yawlabs/mcph/dist/index.js")).toBe("local-node-modules");
+    expect(detectInstallMethod("/proj/app/node_modules/@yawlabs/mcp/dist/index.js")).toBe("local-node-modules");
   });
 
   it("detects dev checkout (src/)", () => {
-    expect(detectInstallMethod("/home/jeff/yaw/mcph/src/index.ts")).toBe("dev-checkout");
+    expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/src/index.ts")).toBe("dev-checkout");
   });
 
   it("detects dev checkout (dist/)", () => {
-    expect(detectInstallMethod("/home/jeff/yaw/mcph/dist/index.js")).toBe("dev-checkout");
+    expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBe("dev-checkout");
   });
 });
 
@@ -108,7 +108,7 @@ describe("buildUpgradePlan", () => {
   it("flags stale=true when current < latest", () => {
     const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("global-npm") });
     expect(plan.stale).toBe(true);
-    expect(plan.command).toBe("npm install -g @yawlabs/mcph@latest");
+    expect(plan.command).toBe("npm install -g @yawlabs/mcp@latest");
   });
 
   it("flags stale=false when current === latest", () => {
@@ -129,7 +129,7 @@ describe("buildUpgradePlan", () => {
 
   it("uses plain `npm install` for local node_modules", () => {
     const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("local-node-modules") });
-    expect(plan.command).toBe("npm install @yawlabs/mcph@latest");
+    expect(plan.command).toBe("npm install @yawlabs/mcp@latest");
   });
 
   it("suggests git pull for dev checkouts", () => {
@@ -145,7 +145,7 @@ describe("runUpgrade", () => {
     const io = captureIO();
     const r = await runUpgrade({
       currentVersion: "0.45.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       out: io.push,
       err: io.pushErr,
@@ -162,20 +162,20 @@ describe("runUpgrade", () => {
     const io = captureIO();
     const r = await runUpgrade({
       currentVersion: "0.40.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       out: io.push,
       err: io.pushErr,
     });
     expect(r.exitCode).toBe(1);
-    expect(io.out.join("\n")).toContain("npm install -g @yawlabs/mcph@latest");
+    expect(io.out.join("\n")).toContain("npm install -g @yawlabs/mcp@latest");
   });
 
   it("tells npx users to restart the MCP client (exit 0, no command)", async () => {
     const io = captureIO();
     const r = await runUpgrade({
       currentVersion: "0.40.0",
-      argvPath: "/home/u/.npm/_npx/abc/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/home/u/.npm/_npx/abc/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       out: io.push,
       err: io.pushErr,
@@ -192,7 +192,7 @@ describe("runUpgrade", () => {
     const r = await runUpgrade({
       run: true,
       currentVersion: "0.40.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       spawnImpl: async (cmd, args) => {
         spawned.push({ cmd, args });
@@ -203,8 +203,8 @@ describe("runUpgrade", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(spawned).toHaveLength(1);
-    expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcph@latest"] });
-    expect(io.out.join("\n")).toContain("Upgraded @yawlabs/mcph to 0.45.0");
+    expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
+    expect(io.out.join("\n")).toContain("Upgraded @yawlabs/mcp to 0.45.0");
   });
 
   it("with --run, propagates the child exit code as 3 on failure", async () => {
@@ -212,7 +212,7 @@ describe("runUpgrade", () => {
     const r = await runUpgrade({
       run: true,
       currentVersion: "0.40.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       spawnImpl: async () => 42,
       out: io.push,
@@ -228,7 +228,7 @@ describe("runUpgrade", () => {
     const r = await runUpgrade({
       run: true,
       currentVersion: "0.40.0",
-      argvPath: "/proj/app/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       spawnImpl: async () => {
         didSpawn = true;
@@ -246,7 +246,7 @@ describe("runUpgrade", () => {
     const io = captureIO();
     const r = await runUpgrade({
       currentVersion: "0.40.0",
-      argvPath: "/proj/app/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       out: io.push,
       err: io.pushErr,
@@ -262,7 +262,7 @@ describe("runUpgrade", () => {
     const r = await runUpgrade({
       json: true,
       currentVersion: "0.40.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       out: io.push,
       err: io.pushErr,
@@ -274,7 +274,7 @@ describe("runUpgrade", () => {
       latest: "0.45.0",
       stale: true,
       method: "global-npm",
-      command: "npm install -g @yawlabs/mcph@latest",
+      command: "npm install -g @yawlabs/mcp@latest",
     });
     // Never contains the human-readable summary lines.
     expect(io.out.join("\n")).not.toContain("Current: 0.40.0");
@@ -284,7 +284,7 @@ describe("runUpgrade", () => {
     const io = captureIO();
     const r = await runUpgrade({
       currentVersion: "0.40.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => null,
       out: io.push,
       err: io.pushErr,
@@ -293,7 +293,7 @@ describe("runUpgrade", () => {
     const out = io.out.join("\n");
     expect(out).toMatch(/couldn't reach/i);
     // Still prints the suggested command so the user can copy it.
-    expect(out).toContain("npm install -g @yawlabs/mcph@latest");
+    expect(out).toContain("npm install -g @yawlabs/mcp@latest");
   });
 
   it("--json + offline emits plan with latest: null", async () => {
@@ -301,7 +301,7 @@ describe("runUpgrade", () => {
     const r = await runUpgrade({
       json: true,
       currentVersion: "0.40.0",
-      argvPath: "/usr/lib/node_modules/@yawlabs/mcph/dist/index.js",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => null,
       out: io.push,
       err: io.pushErr,

@@ -114,7 +114,7 @@ describe("buildToolList — deferred tools from inactive-but-cached servers", ()
     // Permissive placeholder — the upstream's real schema is unknown
     // until first activation, so any-object is the safest stand-in.
     expect(entry?.inputSchema).toEqual({ type: "object", properties: {}, additionalProperties: true });
-    // Cached description is preserved; a bracketed mcph note is appended
+    // Cached description is preserved; a bracketed yaw-mcp note is appended
     // so the client knows activation hasn't happened yet.
     expect(entry?.description).toContain("open a new issue");
     expect(entry?.description).toContain("not yet connected");
@@ -192,20 +192,20 @@ describe("buildResourceList / buildResourceRoutes", () => {
 
 describe("buildResourceList — builtins", () => {
   const guideBuiltin: BuiltinResource = {
-    uri: "mcph://guide",
-    name: "mcph guide",
-    description: "Project + user guidance from MCPH.md",
+    uri: "yaw-mcp://guide",
+    name: "yaw-mcp guide",
+    description: "Project + user guidance from YAW-MCP.md",
     mimeType: "text/markdown",
-    read: async () => ({ contents: [{ uri: "mcph://guide", text: "hello", mimeType: "text/markdown" }] }),
+    read: async () => ({ contents: [{ uri: "yaw-mcp://guide", text: "hello", mimeType: "text/markdown" }] }),
   };
 
   it("returns just builtins when no upstream connections exist", () => {
     const resources = buildResourceList(new Map(), [guideBuiltin]);
     expect(resources).toEqual([
       {
-        uri: "mcph://guide",
-        name: "mcph guide",
-        description: "Project + user guidance from MCPH.md",
+        uri: "yaw-mcp://guide",
+        name: "yaw-mcp guide",
+        description: "Project + user guidance from YAW-MCP.md",
         mimeType: "text/markdown",
       },
     ]);
@@ -216,7 +216,7 @@ describe("buildResourceList — builtins", () => {
     connections.set("db", makeConnection("db", [], ["db://tables"]));
     const resources = buildResourceList(connections, [guideBuiltin]);
     expect(resources.length).toBe(2);
-    expect(resources[0].uri).toBe("mcph://guide");
+    expect(resources[0].uri).toBe("yaw-mcp://guide");
     expect(resources[1].uri).toBe("connect://db/db://tables");
   });
 
@@ -232,31 +232,31 @@ describe("buildResourceList — builtins", () => {
 describe("routeResourceRead — builtins", () => {
   it("serves a builtin from the builtins map without touching upstream", async () => {
     const builtins = new Map<string, BuiltinResource>();
-    builtins.set("mcph://guide", {
-      uri: "mcph://guide",
-      read: () => ({ contents: [{ uri: "mcph://guide", text: "guide-body" }] }),
+    builtins.set("yaw-mcp://guide", {
+      uri: "yaw-mcp://guide",
+      read: () => ({ contents: [{ uri: "yaw-mcp://guide", text: "guide-body" }] }),
     });
-    const result = await routeResourceRead("mcph://guide", new Map(), new Map(), builtins);
+    const result = await routeResourceRead("yaw-mcp://guide", new Map(), new Map(), builtins);
     expect(result.contents[0].text).toBe("guide-body");
   });
 
   it("awaits an async builtin reader", async () => {
     const builtins = new Map<string, BuiltinResource>();
-    builtins.set("mcph://guide", {
-      uri: "mcph://guide",
+    builtins.set("yaw-mcp://guide", {
+      uri: "yaw-mcp://guide",
       read: async () => {
         await new Promise((r) => setTimeout(r, 1));
-        return { contents: [{ uri: "mcph://guide", text: "async-body" }] };
+        return { contents: [{ uri: "yaw-mcp://guide", text: "async-body" }] };
       },
     });
-    const result = await routeResourceRead("mcph://guide", new Map(), new Map(), builtins);
+    const result = await routeResourceRead("yaw-mcp://guide", new Map(), new Map(), builtins);
     expect(result.contents[0].text).toBe("async-body");
   });
 
   it("returns a graceful error text when a builtin reader throws (does NOT propagate)", async () => {
     const builtins = new Map<string, BuiltinResource>();
-    builtins.set("mcph://guide", {
-      uri: "mcph://guide",
+    builtins.set("yaw-mcp://guide", {
+      uri: "yaw-mcp://guide",
       read: () => {
         throw new Error("read exploded");
       },
@@ -264,15 +264,15 @@ describe("routeResourceRead — builtins", () => {
     // An MCP client that gets a thrown exception here would see a
     // generic JSON-RPC failure; by returning a text body we can surface
     // the actual error to the user without crashing the session.
-    const result = await routeResourceRead("mcph://guide", new Map(), new Map(), builtins);
+    const result = await routeResourceRead("yaw-mcp://guide", new Map(), new Map(), builtins);
     expect(result.contents[0].text).toContain("read exploded");
   });
 
   it("falls through to upstream routing when URI is not a builtin", async () => {
     const builtins = new Map<string, BuiltinResource>();
-    builtins.set("mcph://guide", {
-      uri: "mcph://guide",
-      read: () => ({ contents: [{ uri: "mcph://guide", text: "builtin" }] }),
+    builtins.set("yaw-mcp://guide", {
+      uri: "yaw-mcp://guide",
+      read: () => ({ contents: [{ uri: "yaw-mcp://guide", text: "builtin" }] }),
     });
     // No matching upstream route either → the "Unknown resource" text path.
     const result = await routeResourceRead("connect://unknown/x", new Map(), new Map(), builtins);
@@ -280,33 +280,33 @@ describe("routeResourceRead — builtins", () => {
   });
 
   it("works with undefined builtins (back-compat)", async () => {
-    const result = await routeResourceRead("mcph://guide", new Map(), new Map());
+    const result = await routeResourceRead("yaw-mcp://guide", new Map(), new Map());
     // No builtins, no upstream route → unknown resource.
     expect(result.contents[0].text).toContain("Unknown resource");
   });
 
   it("builtin takes precedence even when an upstream resource has the same URI", async () => {
-    // An upstream server accidentally registers `mcph://guide` as one of
-    // its resources. The builtin should still win — mcph is canonical
+    // An upstream server accidentally registers `yaw-mcp://guide` as one of
+    // its resources. The builtin should still win — yaw-mcp is canonical
     // for its own namespace.
     const connections = new Map<string, UpstreamConnection>();
     const fakeClient = {
-      readResource: async () => ({ contents: [{ uri: "mcph://guide", text: "upstream-body" }] }),
+      readResource: async () => ({ contents: [{ uri: "yaw-mcp://guide", text: "upstream-body" }] }),
     };
-    const conn = makeConnection("evil", [], ["mcph://guide"]);
+    const conn = makeConnection("evil", [], ["yaw-mcp://guide"]);
     (conn as any).client = fakeClient;
     connections.set("evil", conn);
 
     const routes = new Map();
-    routes.set("mcph://guide", { namespace: "evil", originalUri: "mcph://guide" });
+    routes.set("yaw-mcp://guide", { namespace: "evil", originalUri: "yaw-mcp://guide" });
 
     const builtins = new Map<string, BuiltinResource>();
-    builtins.set("mcph://guide", {
-      uri: "mcph://guide",
-      read: () => ({ contents: [{ uri: "mcph://guide", text: "builtin-body" }] }),
+    builtins.set("yaw-mcp://guide", {
+      uri: "yaw-mcp://guide",
+      read: () => ({ contents: [{ uri: "yaw-mcp://guide", text: "builtin-body" }] }),
     });
 
-    const result = await routeResourceRead("mcph://guide", routes, connections, builtins);
+    const result = await routeResourceRead("yaw-mcp://guide", routes, connections, builtins);
     expect(result.contents[0].text).toBe("builtin-body");
   });
 });

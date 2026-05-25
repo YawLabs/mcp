@@ -18,10 +18,10 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "mcph-cfg-home-"));
+  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-cfg-home-"));
   // synthCwd lives INSIDE synthHome so walk-up terminates at the
   // synthetic home boundary rather than escaping past tmpdir into the
-  // real user dir — where a real ~/.mcph/ on dev machines would
+  // real user dir — where a real ~/.yaw-mcp/ on dev machines would
   // otherwise get claimed as the project config and leak into assertions.
   synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
@@ -31,7 +31,7 @@ afterEach(() => {
   rmSync(synthCwd, { recursive: true, force: true });
 });
 
-// Writes <root>/.mcph/<filename> with the given JSON object.
+// Writes <root>/.yaw-mcp/<filename> with the given JSON object.
 // Default perms 0o600 on POSIX so fixtures don't trip the loose-perms
 // warning. Tests that need 644 call chmodSync after this.
 function writeConfig(root: string, filename: string, obj: unknown): string {
@@ -57,18 +57,18 @@ describe("loadMcphConfig — defaults & env-only", () => {
     const r = await loadMcphConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.token).toBeNull();
     expect(r.tokenSource).toBe("missing");
-    expect(r.apiBase).toBe("https://mcp.hosting");
+    expect(r.apiBase).toBe("https://yaw.sh/mcp");
     expect(r.apiBaseSource).toBe("default");
     expect(r.loadedFiles).toEqual([]);
     expect(r.warnings).toEqual([]);
     expect(r.projectConfigDir).toBeNull();
   });
 
-  it("reads MCPH_TOKEN + MCPH_URL from env when no files exist", async () => {
+  it("reads YAW_MCP_TOKEN + YAW_MCP_URL from env when no files exist", async () => {
     const r = await loadMcphConfig({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_env_aaaa", MCPH_URL: "https://staging.mcp.hosting" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_env_aaaa", YAW_MCP_URL: "https://staging.mcp.hosting" },
     });
     expect(r.token).toBe("mcp_pat_env_aaaa");
     expect(r.tokenSource).toBe("env");
@@ -77,7 +77,7 @@ describe("loadMcphConfig — defaults & env-only", () => {
   });
 });
 
-describe("loadMcphConfig — global ~/.mcph/config.json", () => {
+describe("loadMcphConfig — global ~/.yaw-mcp/config.json", () => {
   it("loads token + apiBase from user-global when env is empty", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, {
       version: 1,
@@ -97,7 +97,7 @@ describe("loadMcphConfig — global ~/.mcph/config.json", () => {
     const r = await loadMcphConfig({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_env_bbbb" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_env_bbbb" },
     });
     expect(r.token).toBe("mcp_pat_env_bbbb");
     expect(r.tokenSource).toBe("env");
@@ -136,7 +136,7 @@ describe("loadMcphConfig — precedence", () => {
     const envWins = await loadMcphConfig({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_URL: "https://env.example" },
+      env: { YAW_MCP_URL: "https://env.example" },
     });
     expect(envWins.apiBase).toBe("https://env.example");
     expect(envWins.apiBaseSource).toBe("env");
@@ -162,7 +162,7 @@ describe("loadMcphConfig — JSONC support", () => {
   // user-global config with comments
   "version": 1,
   "token": "mcp_pat_jsonc_aaaa", /* end-of-line block */
-  "apiBase": "https://mcp.hosting"
+  "apiBase": "https://yaw.sh/mcp"
 }`,
     );
     const r = await loadMcphConfig({ cwd: synthCwd, home: synthHome, env: {} });
@@ -172,7 +172,7 @@ describe("loadMcphConfig — JSONC support", () => {
 });
 
 describe("loadMcphConfig — schema versioning", () => {
-  it("warns when a file declares a newer schema version than this mcph supports", async () => {
+  it("warns when a file declares a newer schema version than this yaw-mcp supports", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { version: CURRENT_SCHEMA_VERSION + 1, token: "mcp_pat_aaaa" });
     const r = await loadMcphConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.token).toBe("mcp_pat_aaaa");
@@ -233,7 +233,7 @@ describe("loadMcphConfig — servers/blocked merging", () => {
 });
 
 describe("loadMcphConfig — walk-up project discovery", () => {
-  it("finds .mcph/ in a parent directory", async () => {
+  it("finds .yaw-mcp/ in a parent directory", async () => {
     writeConfig(synthCwd, CONFIG_FILENAME, { apiBase: "https://parent.example" });
     const deep = join(synthCwd, "apps", "web", "src");
     mkdirSync(deep, { recursive: true });
@@ -243,8 +243,8 @@ describe("loadMcphConfig — walk-up project discovery", () => {
     expect(r.projectConfigDir).toBe(join(synthCwd, CONFIG_DIRNAME));
   });
 
-  it("does not treat ~/.mcph/ as a project dir when cwd is under $HOME", async () => {
-    // A `.mcph/` at $HOME is the user-global scope. findProjectConfigDir
+  it("does not treat ~/.yaw-mcp/ as a project dir when cwd is under $HOME", async () => {
+    // A `.yaw-mcp/` at $HOME is the user-global scope. findProjectConfigDir
     // stops exclusive of $HOME, so even cwd deep inside $HOME shouldn't
     // claim it as project.
     writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_global_aaaa" });
@@ -304,7 +304,7 @@ describe("loadMcphConfig — empty/invalid string fields are ignored", () => {
   it("non-string apiBase is ignored", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { apiBase: 123 });
     const r = await loadMcphConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.apiBase).toBe("https://mcp.hosting");
+    expect(r.apiBase).toBe("https://yaw.sh/mcp");
     expect(r.apiBaseSource).toBe("default");
   });
 });

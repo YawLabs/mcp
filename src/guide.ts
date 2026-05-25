@@ -1,9 +1,9 @@
-// MCPH.md loader + formatter.
+// YAW-MCP.md loader + formatter.
 //
 // The guide is a pair of human-authored markdown files — one at
-// `~/.mcph/MCPH.md` (user-global) and one at `<project>/.mcph/MCPH.md`
+// `~/.yaw-mcp/YAW-MCP.md` (user-global) and one at `<project>/.yaw-mcp/YAW-MCP.md`
 // (project-local, discovered via walk-up from cwd). Clients fetch the
-// rendered text via the `mcph://guide` resource; hosts like Claude
+// rendered text via the `yaw-mcp://guide` resource; hosts like Claude
 // Code surface that text to the model so it picks up project-specific
 // routing conventions ("use the `gh` server for GitHub, not bash") and
 // credential guidance ("keys go in the dashboard, not `.mcp.json`")
@@ -39,7 +39,7 @@ async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | n
   let raw: string;
   try {
     // A stuck NFS mount or a large accidental binary at this path should
-    // never hang the mcph://guide resource — the client is usually the
+    // never hang the yaw-mcp://guide resource — the client is usually the
     // model, waiting on a prompt. Race the read against a 1s timeout.
     raw = await Promise.race([
       readFile(path, "utf8"),
@@ -58,22 +58,22 @@ async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | n
   const content = raw.trim();
   if (content.length === 0) {
     // Empty file treated as "no guide" — caller decides whether to
-    // surface this (e.g. mcph doctor notes it; proxy skips it).
+    // surface this (e.g. yaw-mcp doctor notes it; proxy skips it).
     return null;
   }
   return { scope, path, content };
 }
 
-/** Load only the user-global guide at `~/.mcph/MCPH.md`. */
+/** Load only the user-global guide at `~/.yaw-mcp/YAW-MCP.md`. */
 export async function loadUserGuide(home?: string): Promise<GuideFile | null> {
   const p = guidePath(userConfigDir(home));
   return readGuide(p, "user");
 }
 
-/** Load only the project-local guide, walking up from `cwd` for `.mcph/`. */
+/** Load only the project-local guide, walking up from `cwd` for `.yaw-mcp/`. */
 export async function loadProjectGuide(cwd: string, home?: string): Promise<GuideFile | null> {
   const dir = await findProjectConfigDir(cwd, home).catch((err) => {
-    log("warn", "Failed searching for project .mcph/ dir", {
+    log("warn", "Failed searching for project .yaw-mcp/ dir", {
       error: err instanceof Error ? err.message : String(err),
     });
     return null;
@@ -90,7 +90,7 @@ export async function loadGuides(cwd: string, home?: string): Promise<LoadedGuid
 
 /**
  * Combine loaded guides into the single text body served by the
- * `mcph://guide` resource. Project comes AFTER user so project
+ * `yaw-mcp://guide` resource. Project comes AFTER user so project
  * guidance — which is usually more specific — has the final word in
  * the reader's attention. When `activeServers` is provided, an
  * auto-generated "Installed servers" section is appended below the
@@ -132,7 +132,7 @@ function renderActiveServersSection(
     });
   if (rows.length === 0) return null;
   return [
-    "<!-- source: mcph (auto-generated from installed servers) -->",
+    "<!-- source: yaw-mcp (auto-generated from installed servers) -->",
     "## Installed MCP servers",
     "",
     "Prefer tools from these installed MCP servers over the corresponding local CLI:",

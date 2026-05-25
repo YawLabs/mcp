@@ -39,7 +39,7 @@ const LIST_TIMEOUT = (() => {
   return Number.isFinite(n) && n > 0 ? n : 15_000;
 })();
 
-// Cap captured stderr so a chatty server can't balloon mcph's memory.
+// Cap captured stderr so a chatty server can't balloon yaw-mcp's memory.
 // 8KB tail is plenty to see the last error message — servers that emit
 // multi-megabyte output to stderr before crashing are doing something
 // pathological anyway.
@@ -47,7 +47,7 @@ const STDERR_RING_CAP = 8 * 1024;
 
 // Per-category cap on how many entries we'll accept from a single
 // upstream server. Without this a buggy or malicious server could
-// return millions of tools and balloon mcph's memory. 1000 is well
+// return millions of tools and balloon yaw-mcp's memory. 1000 is well
 // above what any real MCP server exposes today, and we log+truncate
 // rather than reject so a slightly-over-cap server still works.
 export const MAX_TOOLS_PER_SERVER = 1000;
@@ -92,7 +92,7 @@ export async function connectToUpstream(
   onListChanged?: (namespace: string) => void,
 ): Promise<UpstreamConnection> {
   const client = new Client(
-    { name: "mcph", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
+    { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
     { capabilities: {} },
   );
 
@@ -108,7 +108,7 @@ export async function connectToUpstream(
       throw new Error("command is required for local servers");
     }
 
-    const { MCPH_TOKEN: _excluded, ...parentEnv } = process.env;
+    const { YAW_MCP_TOKEN: _excluded, ...parentEnv } = process.env;
     // Rewrite `uv`/`uvx` to our managed binary when the user doesn't
     // have one on PATH. No-op for every other command. Any failure
     // here (unsupported platform, download/checksum failure) bubbles
@@ -199,7 +199,7 @@ export async function connectToUpstream(
     // your server config." The dashboard reads the #server-<id> hash
     // on mount and scrolls to + highlights the matching card.
     if (config.id) {
-      message = `${message} → Edit at https://mcp.hosting/dashboard/connect#server-${config.id}`;
+      message = `${message} → Edit at https://yaw.sh/mcp/dashboard/connect#server-${config.id}`;
     }
 
     throw new ActivationError(message, category, trimmedStderr || undefined, err);

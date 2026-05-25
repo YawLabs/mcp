@@ -1,4 +1,4 @@
-// `mcph bundles [list|match]` — CLI counterpart to the `mcp_connect_bundles`
+// `yaw-mcp bundles [list|match]` — CLI counterpart to the `mcp_connect_bundles`
 // meta-tool (v0.28.0). The LLM-facing tool has always been the primary
 // surface, but users ask "what bundles exist?" in support threads often
 // enough that surfacing them in the CLI is worth it: a human can skim the
@@ -58,7 +58,7 @@ export interface ParsedBundlesArgs {
   json: boolean;
 }
 
-export const BUNDLES_USAGE = `Usage: mcph bundles [list|match] [--json]
+export const BUNDLES_USAGE = `Usage: yaw-mcp bundles [list|match] [--json]
 
   Curated multi-server bundles — hand-picked stacks you can activate in one step.
 
@@ -80,12 +80,15 @@ export function parseBundlesArgs(
       return { ok: false, error: BUNDLES_USAGE };
     } else if (a === "list" || a === "match") {
       if (actionSet) {
-        return { ok: false, error: `mcph bundles: action already set to "${action}" (got "${a}")\n\n${BUNDLES_USAGE}` };
+        return {
+          ok: false,
+          error: `yaw-mcp bundles: action already set to "${action}" (got "${a}")\n\n${BUNDLES_USAGE}`,
+        };
       }
       action = a;
       actionSet = true;
     } else {
-      return { ok: false, error: `mcph bundles: unknown argument "${a}"\n\n${BUNDLES_USAGE}` };
+      return { ok: false, error: `yaw-mcp bundles: unknown argument "${a}"\n\n${BUNDLES_USAGE}` };
     }
   }
   return { ok: true, options: { action, json } };
@@ -123,7 +126,9 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   });
 
   if (!config.token) {
-    printErr("mcph bundles match: no token resolved. Run `mcph install <client> --token mcp_pat_…` or set MCPH_TOKEN.");
+    printErr(
+      "yaw-mcp bundles match: no token resolved. Run `yaw-mcp install <client> --token mcp_pat_…` or set YAW_MCP_TOKEN.",
+    );
     return { exitCode: 1, lines };
   }
 
@@ -133,12 +138,12 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
     backend = await fetcher(config.apiBase, config.token);
   } catch (err) {
     const msg = err instanceof ConfigError || err instanceof Error ? err.message : String(err);
-    printErr(`mcph bundles match: ${msg}`);
+    printErr(`yaw-mcp bundles match: ${msg}`);
     return { exitCode: 2, lines };
   }
 
   if (!backend) {
-    printErr("mcph bundles match: backend returned no data (unexpected 304).");
+    printErr("yaw-mcp bundles match: backend returned no data (unexpected 304).");
     return { exitCode: 2, lines };
   }
 
@@ -188,7 +193,7 @@ function renderMatch(match: BundleMatchResult, installed: string[], print: (s?: 
 
   if (match.ready.length === 0 && match.partial.length === 0) {
     print("No curated bundles match your current config.");
-    print("Run `mcph bundles list` to see the full catalog.");
+    print("Run `yaw-mcp bundles list` to see the full catalog.");
     return;
   }
 

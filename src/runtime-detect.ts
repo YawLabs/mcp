@@ -7,7 +7,7 @@ import { log } from "./logger.js";
 // before adding a server whose runtime is missing locally — fewer
 // "command not found" surprises at first activation.
 //
-// We deliberately don't require any of these — mcph itself runs on
+// We deliberately don't require any of these — yaw-mcp itself runs on
 // Node, but a user might only run JS-based servers, so missing python
 // is just informational. The detection is best-effort: if a probe
 // hangs or errors, we record the runtime as absent and move on.
@@ -158,7 +158,7 @@ export async function detectRuntimes(): Promise<Record<string, string | boolean>
 
 // Detect locally then POST to mcp.hosting. Failure is non-fatal — the
 // dashboard simply doesn't show a runtime warning, which is the same
-// behavior as the user never having installed a recent mcph version.
+// behavior as the user never having installed a recent yaw-mcp version.
 export async function reportRuntimes(): Promise<void> {
   if (!apiUrl || !token) return;
   let runtimes: Record<string, string | boolean>;

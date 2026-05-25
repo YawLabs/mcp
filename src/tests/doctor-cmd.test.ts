@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 function writeMcphConfig(root: string, filename: string, obj: unknown): void {
-  mkdirSync(join(root, ".mcph"), { recursive: true });
-  writeFileSync(join(root, ".mcph", filename), JSON.stringify(obj));
+  mkdirSync(join(root, ".yaw-mcp"), { recursive: true });
+  writeFileSync(join(root, ".yaw-mcp", filename), JSON.stringify(obj));
 }
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
@@ -15,10 +15,10 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "mcph-doctor-home-"));
+  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-doctor-home-"));
   // synthCwd lives INSIDE synthHome so walk-up terminates at the
   // synthetic home boundary rather than escaping into the real user
-  // dir, where a real ~/.mcph/config.json would otherwise get claimed.
+  // dir, where a real ~/.yaw-mcp/config.json would otherwise get claimed.
   synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
 
@@ -48,7 +48,7 @@ describe("runDoctor — exit codes", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
     });
@@ -69,7 +69,7 @@ describe("runDoctor — output content", () => {
   it("fingerprints the token (never prints raw)", async () => {
     const cap = captureOut();
     const raw = "mcp_pat_supersecret_DO_NOT_LEAK_aaaa1234";
-    await runDoctor({ cwd: synthCwd, home: synthHome, env: { MCPH_TOKEN: raw }, os: "linux", out: cap.out });
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: { YAW_MCP_TOKEN: raw }, os: "linux", out: cap.out });
     const txt = cap.text();
     expect(txt).not.toContain("supersecret");
     expect(txt).not.toContain("DO_NOT_LEAK");
@@ -105,7 +105,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
     });
@@ -118,7 +118,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
     });
@@ -133,7 +133,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
     });
@@ -141,24 +141,24 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).toMatch(/JSON is malformed/);
   });
 
-  it("suggests a `mcph install` command when a configured-looking file lacks the entry", async () => {
+  it("suggests a `yaw-mcp install` command when a configured-looking file lacks the entry", async () => {
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { other: { command: "x" } } }));
     const cap = captureOut();
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
     });
-    expect(cap.text()).toMatch(/run `mcph install claude-code`/);
+    expect(cap.text()).toMatch(/run `yaw-mcp install claude-code`/);
   });
 
   it("under CLAUDE_CONFIG_DIR, probes <DIR>/.claude.json — not the home file", async () => {
     // Sets up the trap: home has the entry, wrapper dir does NOT.
     // Doctor must report claude-code user as "not configured" (not "OK"),
     // matching what `claude mcp list` actually sees in this session.
-    const wrapperDir = mkdtempSync(join(tmpdir(), "mcph-doctor-wrapper-"));
+    const wrapperDir = mkdtempSync(join(tmpdir(), "yaw-mcp-doctor-wrapper-"));
     try {
       writeFileSync(
         join(synthHome, ".claude.json"),
@@ -168,7 +168,7 @@ describe("runDoctor — client detection", () => {
       const r = await runDoctor({
         cwd: synthCwd,
         home: synthHome,
-        env: { MCPH_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
+        env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
         os: "linux",
         out: cap.out,
       });
@@ -181,7 +181,7 @@ describe("runDoctor — client detection", () => {
   });
 
   it("under CLAUDE_CONFIG_DIR, finds the entry when it lives in <DIR>/.claude.json", async () => {
-    const wrapperDir = mkdtempSync(join(tmpdir(), "mcph-doctor-wrapper-found-"));
+    const wrapperDir = mkdtempSync(join(tmpdir(), "yaw-mcp-doctor-wrapper-found-"));
     try {
       writeFileSync(
         join(wrapperDir, ".claude.json"),
@@ -191,7 +191,7 @@ describe("runDoctor — client detection", () => {
       const r = await runDoctor({
         cwd: synthCwd,
         home: synthHome,
-        env: { MCPH_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
+        env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
         os: "linux",
         out: cap.out,
       });
@@ -278,7 +278,7 @@ describe("runDoctor — surfaces config-loader warnings", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_env_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_env_aaaa" },
       os: "linux",
       out: cap.out,
     });
@@ -294,7 +294,7 @@ describe("runDoctor — STATE section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -305,9 +305,9 @@ describe("runDoctor — STATE section", () => {
   });
 
   it("reports counts and last-saved age when state.json exists", async () => {
-    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
-      join(synthHome, ".mcph", STATE_FILENAME),
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
       JSON.stringify({
         version: STATE_SCHEMA_VERSION,
         savedAt: Date.now() - 5 * 60 * 1000, // 5 minutes ago
@@ -325,7 +325,7 @@ describe("runDoctor — STATE section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -337,24 +337,24 @@ describe("runDoctor — STATE section", () => {
     expect(txt).toMatch(/last saved: +5m ago/);
   });
 
-  it("shows 'disabled via MCPH_DISABLE_PERSISTENCE' and skips the file read", async () => {
+  it("shows 'disabled via YAW_MCP_DISABLE_PERSISTENCE' and skips the file read", async () => {
     // Seed a state file so we can verify doctor doesn't read its contents.
-    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
-      join(synthHome, ".mcph", STATE_FILENAME),
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
       JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning: {}, packHistory: [] }),
     );
     const cap = captureOut();
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
     });
     const txt = cap.text();
-    expect(txt).toMatch(/disabled via MCPH_DISABLE_PERSISTENCE/);
+    expect(txt).toMatch(/disabled via YAW_MCP_DISABLE_PERSISTENCE/);
     expect(txt).not.toMatch(/learning entries/);
     expect(txt).not.toMatch(/last saved/);
   });
@@ -362,9 +362,9 @@ describe("runDoctor — STATE section", () => {
 
 describe("runDoctor — RELIABILITY section", () => {
   it("omits the section entirely when no namespace qualifies", async () => {
-    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
-      join(synthHome, ".mcph", STATE_FILENAME),
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
       JSON.stringify({
         version: STATE_SCHEMA_VERSION,
         savedAt: Date.now(),
@@ -379,7 +379,7 @@ describe("runDoctor — RELIABILITY section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -389,7 +389,7 @@ describe("runDoctor — RELIABILITY section", () => {
 
   it("surfaces flaky namespaces sorted worst-rate first, capped at 5", async () => {
     const now = Date.now();
-    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     const learning: Record<string, { dispatched: number; succeeded: number; lastUsedAt: number }> = {
       solid: { dispatched: 10, succeeded: 10, lastUsedAt: now },
       mild: { dispatched: 10, succeeded: 7, lastUsedAt: now - 60_000 }, // 70%
@@ -398,14 +398,14 @@ describe("runDoctor — RELIABILITY section", () => {
       zzz: { dispatched: 6, succeeded: 3, lastUsedAt: now }, // 50%
     };
     writeFileSync(
-      join(synthHome, ".mcph", STATE_FILENAME),
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
       JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: now, learning, packHistory: [] }),
     );
     const cap = captureOut();
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -427,10 +427,10 @@ describe("runDoctor — RELIABILITY section", () => {
     expect(txt).toMatch(/dead — 4 calls, 0% success, last used/);
   });
 
-  it("is skipped when MCPH_DISABLE_PERSISTENCE is set", async () => {
-    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+  it("is skipped when YAW_MCP_DISABLE_PERSISTENCE is set", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
-      join(synthHome, ".mcph", STATE_FILENAME),
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
       JSON.stringify({
         version: STATE_SCHEMA_VERSION,
         savedAt: Date.now(),
@@ -442,7 +442,7 @@ describe("runDoctor — RELIABILITY section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -457,7 +457,7 @@ describe("runDoctor — ENVIRONMENT section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -467,11 +467,11 @@ describe("runDoctor — ENVIRONMENT section", () => {
     // Every tracked var must be listed so support can see at a glance
     // whether the user set it. Default-hint strings prove the row is
     // rendered with the "(not set — …)" form rather than a raw value.
-    expect(txt).toMatch(/MCPH_POLL_INTERVAL\s+\(not set — default 60s\)/);
-    expect(txt).toMatch(/MCPH_SERVER_CAP\s+\(not set — default 6\)/);
-    expect(txt).toMatch(/MCPH_MIN_COMPLIANCE\s+\(not set — filter inactive\)/);
-    expect(txt).toMatch(/MCPH_AUTO_LOAD\s+\(not set — auto-load inactive\)/);
-    expect(txt).toMatch(/MCPH_PRUNE_RESPONSES\s+\(not set — pruning active\)/);
+    expect(txt).toMatch(/YAW_MCP_POLL_INTERVAL\s+\(not set — default 60s\)/);
+    expect(txt).toMatch(/YAW_MCP_SERVER_CAP\s+\(not set — default 6\)/);
+    expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+\(not set — filter inactive\)/);
+    expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+\(not set — auto-load inactive\)/);
+    expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set — pruning active\)/);
   });
 
   it("prints the raw value (not the default hint) when a var is set", async () => {
@@ -480,22 +480,22 @@ describe("runDoctor — ENVIRONMENT section", () => {
       cwd: synthCwd,
       home: synthHome,
       env: {
-        MCPH_TOKEN: "mcp_pat_aaaa",
-        MCPH_SERVER_CAP: "10",
-        MCPH_MIN_COMPLIANCE: "B",
-        MCPH_AUTO_LOAD: "1",
+        YAW_MCP_TOKEN: "mcp_pat_aaaa",
+        YAW_MCP_SERVER_CAP: "10",
+        YAW_MCP_MIN_COMPLIANCE: "B",
+        YAW_MCP_AUTO_LOAD: "1",
       },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
     });
     const txt = cap.text();
-    expect(txt).toMatch(/MCPH_SERVER_CAP\s+10/);
-    expect(txt).toMatch(/MCPH_MIN_COMPLIANCE\s+B/);
-    expect(txt).toMatch(/MCPH_AUTO_LOAD\s+1/);
+    expect(txt).toMatch(/YAW_MCP_SERVER_CAP\s+10/);
+    expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+B/);
+    expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+1/);
     // Unset vars should still show their default hint.
-    expect(txt).toMatch(/MCPH_POLL_INTERVAL\s+\(not set/);
-    expect(txt).toMatch(/MCPH_PRUNE_RESPONSES\s+\(not set/);
+    expect(txt).toMatch(/YAW_MCP_POLL_INTERVAL\s+\(not set/);
+    expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set/);
   });
 });
 
@@ -527,7 +527,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -554,7 +554,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: raw },
+      env: { YAW_MCP_TOKEN: raw },
       os: "linux",
       out: cap.out,
       json: true,
@@ -605,12 +605,12 @@ describe("runDoctor — --json", () => {
     expect(parsed.loadedFiles[0].schemaAhead).toBe(true);
   });
 
-  it("reports state.disabled when MCPH_DISABLE_PERSISTENCE is set", async () => {
+  it("reports state.disabled when YAW_MCP_DISABLE_PERSISTENCE is set", async () => {
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -623,9 +623,9 @@ describe("runDoctor — --json", () => {
   });
 
   it("includes reliability entries for flaky persisted namespaces", async () => {
-    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
-      join(synthHome, ".mcph", STATE_FILENAME),
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
       JSON.stringify({
         version: STATE_SCHEMA_VERSION,
         savedAt: Date.now() - 60_000,
@@ -640,7 +640,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -658,16 +658,16 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_SERVER_CAP: "12" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_SERVER_CAP: "12" },
       os: "linux",
       out: cap.out,
       json: true,
       skipRegistryCheck: true,
     });
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.env.MCPH_SERVER_CAP).toBe("12");
-    expect(parsed.env.MCPH_POLL_INTERVAL).toBeNull();
-    expect(parsed.env).toHaveProperty("MCPH_AUTO_LOAD");
+    expect(parsed.env.YAW_MCP_SERVER_CAP).toBe("12");
+    expect(parsed.env.YAW_MCP_POLL_INTERVAL).toBeNull();
+    expect(parsed.env).toHaveProperty("YAW_MCP_AUTO_LOAD");
   });
 
   it("upgrade.stale is true when registry reports a newer version", async () => {
@@ -678,7 +678,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -694,7 +694,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
       os: "linux",
       out: cap.out,
       json: true,

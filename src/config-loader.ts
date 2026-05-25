@@ -1,17 +1,17 @@
-// mcph config loader for token, apiBase, version, servers, blocked.
+// yaw-mcp config loader for token, apiBase, version, servers, blocked.
 //
 // Config lives in three optional files, highest-precedence first:
 //
-//   1. <project>/.mcph/config.local.json  — machine-local override; gitignore by convention
-//   2. <project>/.mcph/config.json        — project-shared file (committed); MUST NOT contain a token
-//   3. ~/.mcph/config.json                — user-global default
+//   1. <project>/.yaw-mcp/config.local.json  — machine-local override; gitignore by convention
+//   2. <project>/.yaw-mcp/config.json        — project-shared file (committed); MUST NOT contain a token
+//   3. ~/.yaw-mcp/config.json                — user-global default
 //
-// The project `.mcph/` directory is discovered by walking up from cwd
+// The project `.yaw-mcp/` directory is discovered by walking up from cwd
 // (see paths.ts findProjectConfigDir), stopping exclusively before $HOME
-// so a `.mcph/` sitting at $HOME is treated as user-global only.
+// so a `.yaw-mcp/` sitting at $HOME is treated as user-global only.
 //
-// Token precedence:    MCPH_TOKEN env  >  local  >  global   (project never holds a token)
-// apiBase precedence:  MCPH_URL env    >  local  >  project  >  global  >  https://mcp.hosting
+// Token precedence:    YAW_MCP_TOKEN env  >  local  >  global   (project never holds a token)
+// apiBase precedence:  YAW_MCP_URL env    >  local  >  project  >  global  >  https://yaw.sh/mcp
 //
 // servers/blocked merging: allow-list picks the most specific scope that
 // sets it (local > project > global); deny-list unions across all scopes.
@@ -27,7 +27,7 @@ import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js"
 export const CONFIG_FILENAME = "config.json";
 export const LOCAL_CONFIG_FILENAME = "config.local.json";
 /** Schema version we currently emit. Older files load fine; newer files
- *  trigger a warning so a user running an old mcph doesn't silently
+ *  trigger a warning so a user running an old yaw-mcp doesn't silently
  *  ignore fields it doesn't understand. */
 export const CURRENT_SCHEMA_VERSION = 1;
 
@@ -55,11 +55,11 @@ export interface ResolvedConfig {
   servers?: string[];
   /** Deny-list (union across all scopes that set it). */
   blocked?: string[];
-  /** Absolute path to the discovered project `.mcph/` dir, or null if none. */
+  /** Absolute path to the discovered project `.yaw-mcp/` dir, or null if none. */
   projectConfigDir: string | null;
   /** Files actually read + parsed (in load order). */
   loadedFiles: LoadedConfigFile[];
-  /** Soft problems that don't fail loading. Surface in `mcph doctor`. */
+  /** Soft problems that don't fail loading. Surface in `yaw-mcp doctor`. */
   warnings: string[];
 }
 
@@ -72,7 +72,7 @@ export interface LoadConfigOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-const DEFAULT_API_BASE = "https://mcp.hosting";
+const DEFAULT_API_BASE = "https://yaw.sh/mcp";
 
 async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]): Promise<LoadedConfigFile | null> {
   let raw: string;
@@ -99,7 +99,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   const version = typeof obj.version === "number" ? obj.version : undefined;
   if (version !== undefined && version > CURRENT_SCHEMA_VERSION) {
     warnings.push(
-      `${path}: schema version ${version} is newer than this mcph (${CURRENT_SCHEMA_VERSION}); upgrade with \`npm i -g @yawlabs/mcph@latest\`. Loading best-effort.`,
+      `${path}: schema version ${version} is newer than this yaw-mcp (${CURRENT_SCHEMA_VERSION}); upgrade with \`npm i -g @yawlabs/mcp@latest\`. Loading best-effort.`,
     );
   }
 
@@ -169,14 +169,14 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
   const warnings: string[] = [];
   const loadedFiles: LoadedConfigFile[] = [];
 
-  // Fold any pre-0.12 flat config dotfiles into `.mcph/` before the
+  // Fold any pre-0.12 flat config dotfiles into `.yaw-mcp/` before the
   // resolver runs — otherwise a user who upgrades from 0.11.x would
   // silently lose their token until they moved the file by hand.
   // Fail-open: migration errors are logged, never thrown.
   await migrateLegacyConfigPaths({ cwd, home });
 
   const projectConfigDir = await findProjectConfigDir(cwd, home).catch((err) => {
-    log("warn", "Failed searching for project .mcph/ dir", {
+    log("warn", "Failed searching for project .yaw-mcp/ dir", {
       error: err instanceof Error ? err.message : String(err),
     });
     return null;
@@ -202,8 +202,8 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
 
   let token: string | null = null;
   let tokenSource: TokenSource = "missing";
-  if (typeof env.MCPH_TOKEN === "string" && env.MCPH_TOKEN.length > 0) {
-    token = env.MCPH_TOKEN;
+  if (typeof env.YAW_MCP_TOKEN === "string" && env.YAW_MCP_TOKEN.length > 0) {
+    token = env.YAW_MCP_TOKEN;
     tokenSource = "env";
   } else if (local?.token) {
     token = local.token;
@@ -215,8 +215,8 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
 
   let apiBase = DEFAULT_API_BASE;
   let apiBaseSource: ApiBaseSource = "default";
-  if (typeof env.MCPH_URL === "string" && env.MCPH_URL.length > 0) {
-    apiBase = env.MCPH_URL;
+  if (typeof env.YAW_MCP_URL === "string" && env.YAW_MCP_URL.length > 0) {
+    apiBase = env.YAW_MCP_URL;
     apiBaseSource = "env";
   } else if (local?.apiBase) {
     apiBase = local.apiBase;
@@ -242,7 +242,7 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
   };
 }
 
-/** Last-4-of-token fingerprint for safe display in `mcph doctor`. */
+/** Last-4-of-token fingerprint for safe display in `yaw-mcp doctor`. */
 export function tokenFingerprint(token: string | null): string {
   if (!token) return "(none)";
   if (token.length <= 8) return `***${token.slice(-2)}`;

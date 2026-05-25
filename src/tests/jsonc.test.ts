@@ -30,8 +30,8 @@ describe("stripJsoncComments", () => {
   });
 
   it("preserves // inside strings", () => {
-    const src = '{"url": "https://mcp.hosting"}';
-    expect(parseJsonc(src)).toEqual({ url: "https://mcp.hosting" });
+    const src = '{"url": "https://yaw.sh/mcp"}';
+    expect(parseJsonc(src)).toEqual({ url: "https://yaw.sh/mcp" });
   });
 
   it("preserves /* inside strings", () => {

@@ -6,7 +6,7 @@
 // is "ungraded" and passes.
 //
 // Policy (matches README + activate tool description):
-//   - Graded server:   must be >= the configured MCPH_MIN_COMPLIANCE.
+//   - Graded server:   must be >= the configured YAW_MCP_MIN_COMPLIANCE.
 //   - Ungraded server: always passes. We don't punish absent.
 //   - Server with an unrecognized grade string ("Z", "AAA", typos): when
 //     a min is set, fail closed with a one-shot warn. We treat a present-
@@ -55,7 +55,7 @@ let invalidWarned = false;
 const unrecognizedServerWarned = new Set<string>();
 
 /**
- * Parse the MCPH_MIN_COMPLIANCE env value into a canonical uppercase
+ * Parse the YAW_MCP_MIN_COMPLIANCE env value into a canonical uppercase
  * grade, or null when the filter is disabled. Empty/undefined disables.
  * Invalid values log a single warning per process and are treated as
  * unset -- we never fail closed on a typo in an env var.
@@ -70,7 +70,7 @@ export function parseMinCompliance(raw: string | undefined): ComplianceGrade | n
   }
   if (!invalidWarned) {
     invalidWarned = true;
-    log("warn", "Invalid MCPH_MIN_COMPLIANCE; filter disabled", { value: raw });
+    log("warn", "Invalid YAW_MCP_MIN_COMPLIANCE; filter disabled", { value: raw });
   }
   return null;
 }
@@ -99,7 +99,7 @@ export function passesMinCompliance(serverGrade: string | undefined | null, min:
   if (c.kind === "unrecognized") {
     if (!unrecognizedServerWarned.has(c.raw)) {
       unrecognizedServerWarned.add(c.raw);
-      log("warn", "Unrecognized server compliance grade; failing closed under MCPH_MIN_COMPLIANCE", {
+      log("warn", "Unrecognized server compliance grade; failing closed under YAW_MCP_MIN_COMPLIANCE", {
         grade: c.raw,
         min,
       });

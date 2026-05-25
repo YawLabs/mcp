@@ -2,7 +2,7 @@ import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
-// Per-platform cache root for anything mcph fetches at runtime (uv
+// Per-platform cache root for anything yaw-mcp fetches at runtime (uv
 // binary today; potentially more later). Matches the conventions each
 // OS uses for non-essential, regenerable data so users who wipe their
 // home can recover without losing config.
@@ -10,33 +10,33 @@ export function cacheDir(): string {
   if (process.platform === "win32") {
     const localAppData = process.env.LOCALAPPDATA;
     const base = localAppData && localAppData.length > 0 ? localAppData : path.join(homedir(), "AppData", "Local");
-    return path.join(base, "mcph", "Cache");
+    return path.join(base, "yaw-mcp", "Cache");
   }
   if (process.platform === "darwin") {
-    return path.join(homedir(), "Library", "Caches", "mcph");
+    return path.join(homedir(), "Library", "Caches", "yaw-mcp");
   }
   const xdg = process.env.XDG_CACHE_HOME;
-  return path.join(xdg && xdg.length > 0 ? xdg : path.join(homedir(), ".cache"), "mcph");
+  return path.join(xdg && xdg.length > 0 ? xdg : path.join(homedir(), ".cache"), "yaw-mcp");
 }
 
-// Directory that holds all mcph config + guidance files. Mirrors the
+// Directory that holds all yaw-mcp config + guidance files. Mirrors the
 // `.git/`, `.vscode/`, `.claude/` convention so everything related to
-// mcph lives under one predictable folder a user can grep, gitignore,
+// yaw-mcp lives under one predictable folder a user can grep, gitignore,
 // or blow away atomically.
-export const CONFIG_DIRNAME = ".mcph";
+export const CONFIG_DIRNAME = ".yaw-mcp";
 
-// User-global mcph config dir: `~/.mcph/`. Always this; no XDG
-// variation — config is small, human-edited, and lives next to shell
+// User-global yaw-mcp config dir: `~/.yaw-mcp/`. Always this; no XDG
+// variation -- config is small, human-edited, and lives next to shell
 // dotfiles like `.gitconfig` rather than under a cache root.
 export function userConfigDir(home: string = homedir()): string {
   return path.join(home, CONFIG_DIRNAME);
 }
 
-// Walks up from `start` looking for a `.mcph/` directory, stopping
+// Walks up from `start` looking for a `.yaw-mcp/` directory, stopping
 // just BEFORE $HOME (exclusive) or the filesystem root. Returns the
-// absolute path to the `.mcph/` directory, or null if none was found.
+// absolute path to the `.yaw-mcp/` directory, or null if none was found.
 //
-// Why exclusive of $HOME: a `.mcph/` sitting at $HOME is the
+// Why exclusive of $HOME: a `.yaw-mcp/` sitting at $HOME is the
 // user-global scope (handled separately by userConfigDir). Returning
 // it here would double-load it as both project and user-global.
 export async function findProjectConfigDir(start: string, home: string = homedir()): Promise<string | null> {
@@ -58,11 +58,11 @@ export async function findProjectConfigDir(start: string, home: string = homedir
   return null;
 }
 
-// Name of the human-authored guidance file mcph surfaces to clients via
-// the mcph://guide resource. Lives next to config.json inside `.mcph/`.
-export const GUIDE_FILENAME = "MCPH.md";
+// Name of the human-authored guidance file yaw-mcp surfaces to clients via
+// the yaw-mcp://guide resource. Lives next to config.json inside `.yaw-mcp/`.
+export const GUIDE_FILENAME = "YAW-MCP.md";
 
-// Absolute path to the MCPH.md file inside a given `.mcph/` directory.
+// Absolute path to the YAW-MCP.md file inside a given `.yaw-mcp/` directory.
 export function guidePath(configDir: string): string {
   return path.join(configDir, GUIDE_FILENAME);
 }

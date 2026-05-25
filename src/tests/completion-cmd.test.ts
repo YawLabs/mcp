@@ -53,7 +53,7 @@ describe("parseCompletionArgs", () => {
 describe("renderScript — bash", () => {
   it("contains the complete -F registration", () => {
     const s = renderScript("bash");
-    expect(s).toContain("complete -F _mcph mcph");
+    expect(s).toContain("complete -F _mcph yaw-mcp");
     expect(s).toContain("_mcph()");
   });
 
@@ -83,7 +83,7 @@ describe("renderScript — bash", () => {
 describe("renderScript — zsh", () => {
   it("starts with #compdef directive", () => {
     const s = renderScript("zsh");
-    expect(s.startsWith("#compdef mcph")).toBe(true);
+    expect(s.startsWith("#compdef yaw-mcp")).toBe(true);
   });
 
   it("declares the _mcph function", () => {
@@ -100,9 +100,9 @@ describe("renderScript — zsh", () => {
 });
 
 describe("renderScript — fish", () => {
-  it("uses complete -c mcph lines", () => {
+  it("uses complete -c yaw-mcp lines", () => {
     const s = renderScript("fish");
-    expect(s).toMatch(/complete -c mcph/);
+    expect(s).toMatch(/complete -c yaw-mcp/);
   });
 
   it("registers every subcommand under __fish_use_subcommand", () => {
@@ -119,10 +119,10 @@ describe("renderScript — fish", () => {
 });
 
 describe("renderScript — powershell", () => {
-  it("registers ArgumentCompleter for mcph", () => {
+  it("registers ArgumentCompleter for yaw-mcp", () => {
     const s = renderScript("powershell");
     expect(s).toContain("Register-ArgumentCompleter");
-    expect(s).toContain("-CommandName mcph");
+    expect(s).toContain("-CommandName yaw-mcp");
   });
 
   it("covers every subcommand in the switch block", () => {
@@ -138,7 +138,7 @@ describe("runCompletion", () => {
     const io = capture();
     const r = await runCompletion({ shell: "bash", out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
-    expect(io.out.join("\n")).toContain("complete -F _mcph mcph");
+    expect(io.out.join("\n")).toContain("complete -F _mcph yaw-mcp");
     expect(io.err).toEqual([]);
   });
 

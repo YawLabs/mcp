@@ -21,7 +21,7 @@
 //   - Penalty beats boost when both could apply: a namespace with 10
 //     successes but a 50% overall success rate is flaky, not useful —
 //     the rate-based signal trumps the count-based one.
-//   - Snapshots persist to ~/.mcph/state.json across restarts
+//   - Snapshots persist to ~/.yaw-mcp/state.json across restarts
 //     (see persistence.ts); ConnectServer handles the load/save
 //     lifecycle via exportSnapshot/loadSnapshot.
 

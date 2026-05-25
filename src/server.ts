@@ -35,6 +35,7 @@ import {
 import { initHeartbeat, reportHeartbeat } from "./heartbeat.js";
 import { HISTORY_LIMIT, type ToolCallRecord, adaptiveThreshold, pushToolCall } from "./idle-ttl.js";
 import { LearningStore } from "./learning.js";
+import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES, buildInstallPayload } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
@@ -73,7 +74,7 @@ declare const __VERSION__: string;
 // Poll interval for fetching config from mcp.hosting (milliseconds).
 //
 // Resolution order:
-//   1. MCPH_POLL_INTERVAL env var (integer seconds). 0 disables polling
+//   1. YAW_MCP_POLL_INTERVAL env var (integer seconds). 0 disables polling
 //      entirely — config is fetched once at startup and never again; users
 //      must restart their MCP client to pick up dashboard changes.
 //   2. Default: 60 seconds. Matches the server-side `Cache-Control:
@@ -81,50 +82,50 @@ declare const __VERSION__: string;
 //      hits the ETag short-circuit (304) or returns a body once per
 //      minute.
 //
-// Users who want a quieter client set e.g. MCPH_POLL_INTERVAL=300 (5min)
-// or MCPH_POLL_INTERVAL=0 (one-shot at startup only).
+// Users who want a quieter client set e.g. YAW_MCP_POLL_INTERVAL=300 (5min)
+// or YAW_MCP_POLL_INTERVAL=0 (one-shot at startup only).
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 
 function resolvePollIntervalMs(): number {
-  const raw = process.env.MCPH_POLL_INTERVAL;
+  const raw = process.env.YAW_MCP_POLL_INTERVAL;
   if (raw === undefined || raw === "") return DEFAULT_POLL_INTERVAL_MS;
   const seconds = Number.parseInt(raw, 10);
   if (!Number.isFinite(seconds) || seconds < 0) {
-    log("warn", "Invalid MCPH_POLL_INTERVAL; falling back to 60s default", { value: raw });
+    log("warn", "Invalid YAW_MCP_POLL_INTERVAL; falling back to 60s default", { value: raw });
     return DEFAULT_POLL_INTERVAL_MS;
   }
   return seconds * 1000;
 }
 
-// Opt-out for cross-session persistence. Set MCPH_DISABLE_PERSISTENCE=1
+// Opt-out for cross-session persistence. Set YAW_MCP_DISABLE_PERSISTENCE=1
 // (or "true") to keep learning + pack-history scoped to the current
 // process — nothing is loaded at start, nothing is written on shutdown.
-// Intended for users running mcph in ephemeral/shared environments
+// Intended for users running yaw-mcp in ephemeral/shared environments
 // (CI runners, containers, on-call relief boxes) where a stale state
 // file would lie about recent usage patterns.
 export function isPersistenceDisabled(): boolean {
-  const raw = process.env.MCPH_DISABLE_PERSISTENCE;
+  const raw = process.env.YAW_MCP_DISABLE_PERSISTENCE;
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
 }
 
-// Current minimum compliance filter, parsed from MCPH_MIN_COMPLIANCE.
+// Current minimum compliance filter, parsed from YAW_MCP_MIN_COMPLIANCE.
 // Re-read on every call so tests can stub the env between cases. Null
 // means "filter disabled" — every server passes regardless of grade.
 // Invalid values log a one-shot warning (see parseMinCompliance) and
 // fall back to disabled so a typo never hides the user's whole catalog.
 export function resolveMinCompliance(): ComplianceGrade | null {
-  return parseMinCompliance(process.env.MCPH_MIN_COMPLIANCE);
+  return parseMinCompliance(process.env.YAW_MCP_MIN_COMPLIANCE);
 }
 
-// Opt-in auto-load. Set MCPH_AUTO_LOAD=1 (or "true") to pre-activate the
+// Opt-in auto-load. Set YAW_MCP_AUTO_LOAD=1 (or "true") to pre-activate the
 // top recurring pack from persisted history on startup — no LLM round
 // trip required. Default off: auto-activation normally rides on an
-// explicit discover() call (see MCPH_AUTO_ACTIVATE). This is for users
+// explicit discover() call (see YAW_MCP_AUTO_ACTIVATE). This is for users
 // who know their workflow starts the same way every session and want
 // to skip the discover step entirely.
 export function isAutoLoadEnabled(): boolean {
-  const raw = process.env.MCPH_AUTO_LOAD;
+  const raw = process.env.YAW_MCP_AUTO_LOAD;
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
 }
@@ -238,11 +239,11 @@ export class ConnectServer {
   // same namespace, on deactivate, and on config reconcile.
   private toolFilters = new Map<string, Set<string>>();
   private profile: Profile | null = null;
-  // Loaded MCPH.md guides (user-global + project-local). Null until
+  // Loaded YAW-MCP.md guides (user-global + project-local). Null until
   // start() has run the loader; fail-open if either file is missing,
   // unreadable, or empty.
   private guides: LoadedGuides = { user: null, project: null };
-  // Tracks whether the client has actually READ `mcph://guide` this
+  // Tracks whether the client has actually READ `yaw-mcp://guide` this
   // session. meta-tools.ts uses this to fire a one-shot nudge in the
   // next tool response reminding the client to read the guide — but
   // only if (a) at least one guide is present and (b) the client
@@ -271,8 +272,8 @@ export class ConnectServer {
     Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }>
   >();
   // Usage learning — nudges dispatch toward namespaces that have been
-  // genuinely useful. Counts persist across mcph restarts via state.json
-  // (see persistence.ts). MCPH_DISABLE_PERSISTENCE=1 makes it session
+  // genuinely useful. Counts persist across yaw-mcp restarts via state.json
+  // (see persistence.ts). YAW_MCP_DISABLE_PERSISTENCE=1 makes it session
   // -scoped only. See learning.ts.
   private readonly learning = new LearningStore();
   // Session-scoped chain detection — watches proxied tool calls across
@@ -315,7 +316,7 @@ export class ConnectServer {
 
   // Cross-session persistence state (learning + pack history).
   // `persistenceReady` gates the save path so unit tests — which
-  // never call start() — don't write to ~/.mcph/state.json. The
+  // never call start() — don't write to ~/.yaw-mcp/state.json. The
   // debounced timer collapses bursts of record*/recordCall into a
   // single write; flushed synchronously on shutdown.
   private persistenceReady = false;
@@ -324,10 +325,10 @@ export class ConnectServer {
 
   constructor(
     private apiUrl: string,
-    private token: string,
+    private token: string | null,
   ) {
     this.server = new Server(
-      { name: "mcph", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
+      { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
       {
         capabilities: {
           tools: { listChanged: true },
@@ -336,15 +337,24 @@ export class ConnectServer {
         },
       },
     );
-    // mcph itself does not handle elicitation or sampling requests; it
+    // yaw-mcp itself does not handle elicitation or sampling requests; it
     // originates them. The capability declaration for originated features
-    // is implicit — the client advertises whether IT supports receiving
+    // is implicit -- the client advertises whether IT supports receiving
     // them, which we check via getClientCapabilities() before prompting.
     this.setupHandlers();
   }
 
-  // Builtin resources served directly by mcph (not proxied from an
-  // upstream). Today: just `mcph://guide`. Rebuilt each request so the
+  /** True when no token was resolved at startup. In local mode the
+   *  config source is `~/.yaw-mcp/bundles.json` and all backend POSTs
+   *  (analytics, heartbeat, rerank, runtime-detect, tool-report,
+   *  /api/connect/install, /api/connect/import) are skipped or return
+   *  a clear error. */
+  private get localMode(): boolean {
+    return this.token === null;
+  }
+
+  // Builtin resources served directly by yaw-mcp (not proxied from an
+  // upstream). Today: just `yaw-mcp://guide`. Rebuilt each request so the
   // list reflects the latest loaded guides — start() populates
   // `this.guides` once, but tests and future hot-reload code paths may
   // mutate it, and the cost of rebuilding is negligible.
@@ -353,10 +363,10 @@ export class ConnectServer {
     if (!body) return [];
     return [
       {
-        uri: "mcph://guide",
-        name: "mcph guide",
+        uri: "yaw-mcp://guide",
+        name: "yaw-mcp guide",
         description:
-          "Project + user guidance from MCPH.md. Read this to learn how THIS user/project routes MCP work (which servers to prefer, where credentials live, gotchas).",
+          "Project + user guidance from YAW-MCP.md. Read this to learn how THIS user/project routes MCP work (which servers to prefer, where credentials live, gotchas).",
         mimeType: "text/markdown",
         read: () => {
           // Flip the session flag — the meta-tools one-shot nudge keys
@@ -366,7 +376,7 @@ export class ConnectServer {
           // set, not the one at list time.
           this.guideRead = true;
           const text = renderGuide(this.guides, this.getProfiledActiveServers()) ?? "";
-          return { contents: [{ uri: "mcph://guide", text, mimeType: "text/markdown" }] };
+          return { contents: [{ uri: "yaw-mcp://guide", text, mimeType: "text/markdown" }] };
         },
       },
     ];
@@ -479,22 +489,22 @@ export class ConnectServer {
   }
 
   async start(): Promise<void> {
-    // Hydrate learning + pack-history state from ~/.mcph/state.json
+    // Hydrate learning + pack-history state from ~/.yaw-mcp/state.json
     // before anything else so subsequent record* writes land on top of
     // the restored signal rather than replacing it. loadState() never
     // throws — missing/corrupt files yield an empty snapshot.
     //
-    // MCPH_DISABLE_PERSISTENCE=1 keeps `persistenceReady` false, which
+    // YAW_MCP_DISABLE_PERSISTENCE=1 keeps `persistenceReady` false, which
     // silently no-ops both the debounced scheduleStateSave() and the
     // shutdown flush — the whole pathway disappears in one toggle.
     if (isPersistenceDisabled()) {
-      log("info", "Cross-session persistence disabled via MCPH_DISABLE_PERSISTENCE");
+      log("info", "Cross-session persistence disabled via YAW_MCP_DISABLE_PERSISTENCE");
     } else {
       const persisted = await loadState();
       if (Object.keys(persisted.learning).length > 0 || persisted.packHistory.length > 0) {
         this.learning.loadSnapshot(persisted.learning);
         this.packDetector.loadSnapshot(persisted.packHistory);
-        log("info", "Restored mcph state", {
+        log("info", "Restored yaw-mcp state", {
           learningEntries: Object.keys(persisted.learning).length,
           packHistoryEntries: persisted.packHistory.length,
         });
@@ -502,9 +512,9 @@ export class ConnectServer {
       this.persistenceReady = true;
     }
 
-    // Load the effective profile (allow/deny lists from .mcph/config.*
-    // files). Walks up from cwd for a project-local .mcph/ dir and also
-    // consults ~/.mcph/config.json (user-global). Local beats project
+    // Load the effective profile (allow/deny lists from .yaw-mcp/config.*
+    // files). Walks up from cwd for a project-local .yaw-mcp/ dir and also
+    // consults ~/.yaw-mcp/config.json (user-global). Local beats project
     // beats global for the allow-list; denies union. Failure is silent
     // — fail-open so a bad config doesn't brick the session.
     this.profile = await loadEffectiveProfile(process.cwd()).catch(() => null);
@@ -517,39 +527,62 @@ export class ConnectServer {
       });
     }
 
-    // Load MCPH.md guides (user-global + project-local). Fail-open:
+    // Load YAW-MCP.md guides (user-global + project-local). Fail-open:
     // loadGuides() swallows I/O errors internally, so the worst case
     // is `this.guides` stays { user: null, project: null } and the
-    // `mcph://guide` builtin simply isn't listed.
+    // `yaw-mcp://guide` builtin simply isn't listed.
     this.guides = await loadGuides(process.cwd()).catch(() => ({ user: null, project: null }));
     if (this.guides.user || this.guides.project) {
-      log("info", "Loaded MCPH.md guide", {
+      log("info", "Loaded YAW-MCP.md guide", {
         user: this.guides.user?.path ?? null,
         project: this.guides.project?.path ?? null,
       });
     }
 
-    // Fetch config — non-fatal errors allow startup with empty config
-    try {
-      await this.fetchAndApplyConfig();
-    } catch (err: any) {
-      if (err instanceof ConfigError && err.fatal) {
-        throw err;
+    // Load config -- backend in account mode, bundles.json in local mode.
+    // Non-fatal errors allow startup with an empty config in either path.
+    if (this.localMode) {
+      const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
+        log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
+        return { config: null, path: null, warnings: [] };
+      });
+      for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
+      this.config = result.config ?? { servers: [], configVersion: "" };
+      this.configVersion = this.config.configVersion;
+      log("info", "Local mode: loaded bundles", {
+        path: result.path,
+        serverCount: this.config.servers.length,
+      });
+      // Reconcile so the loaded servers populate the routing state.
+      await this.reconcileConfig(this.config);
+    } else {
+      try {
+        await this.fetchAndApplyConfig();
+      } catch (err: any) {
+        if (err instanceof ConfigError && err.fatal) {
+          throw err;
+        }
+        log("warn", "Initial config fetch failed, starting with empty config", { error: err.message });
+        this.config = { servers: [], configVersion: "" };
       }
-      log("warn", "Initial config fetch failed, starting with empty config", { error: err.message });
-      this.config = { servers: [], configVersion: "" };
     }
 
-    initAnalytics(this.apiUrl, this.token);
-    initToolReport(this.apiUrl, this.token);
-    initRerank(this.apiUrl, this.token);
-    initRuntimeDetect(this.apiUrl, this.token);
-    initHeartbeat(this.apiUrl, this.token);
-    // Background runtime probe — fire-and-forget, the dashboard just
-    // ignores stale snapshots. Subsequent reports happen on each new
-    // mcph startup, which is sufficient for "what runtimes are
-    // installed" since it changes rarely.
-    reportRuntimes().catch((err: Error) => log("warn", "reportRuntimes failed", { error: err?.message }));
+    // Backend telemetry only when an account is attached. The init
+    // functions store apiUrl + token in module state; later report*
+    // calls short-circuit when either is empty, so skipping the inits
+    // here makes every downstream telemetry call a no-op in local mode.
+    if (!this.localMode) {
+      initAnalytics(this.apiUrl, this.token as string);
+      initToolReport(this.apiUrl, this.token as string);
+      initRerank(this.apiUrl, this.token as string);
+      initRuntimeDetect(this.apiUrl, this.token as string);
+      initHeartbeat(this.apiUrl, this.token as string);
+      // Background runtime probe -- fire-and-forget, the dashboard just
+      // ignores stale snapshots. Subsequent reports happen on each new
+      // yaw-mcp startup, which is sufficient for "what runtimes are
+      // installed" since it changes rarely.
+      reportRuntimes().catch((err: Error) => log("warn", "reportRuntimes failed", { error: err?.message }));
+    }
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
     // awaits the same in-flight promise rather than triggering a
@@ -598,7 +631,7 @@ export class ConnectServer {
     maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
 
     // Opt-in auto-load of the top recurring pack. Requires persistence
-    // (so there IS a history to learn from) AND MCPH_AUTO_LOAD=1. Runs
+    // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
     // after prewarm so both paths see the same config snapshot; they're
     // independent (prewarm populates toolCache for dashboard-toggled
     // servers, this one spins up the recurring workflow's servers for
@@ -607,14 +640,14 @@ export class ConnectServer {
       this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
     }
 
-    log("info", "mcph started", {
+    log("info", "yaw-mcp started", {
       apiUrl: this.apiUrl,
       servers: this.config?.servers.length ?? 0,
     });
   }
 
   // Auto-activate the single highest-ranked pack whose every namespace
-  // is installed. Opt-in via MCPH_AUTO_LOAD. Silent no-op when there's
+  // is installed. Opt-in via YAW_MCP_AUTO_LOAD. Silent no-op when there's
   // no history or no matching pack — the value is "skip discover when
   // my workflow starts the same way every time," not "noisy on every
   // startup." Sequential activateOne (not parallel) so the cap logic
@@ -722,8 +755,8 @@ export class ConnectServer {
     }
   }
 
-  // One-shot nudge: if an MCPH.md guide was loaded at startup but the
-  // client hasn't read `mcph://guide` yet, append a short reminder to
+  // One-shot nudge: if an YAW-MCP.md guide was loaded at startup but the
+  // client hasn't read `yaw-mcp://guide` yet, append a short reminder to
   // the next meta-tool response. We only fire once per session — after
   // that the flag latches and we shut up. This is deliberately gentle
   // (a hint, not an error) because the guide is advisory; clients that
@@ -734,7 +767,7 @@ export class ConnectServer {
     if (!this.guides.user && !this.guides.project) return result;
     this.guideNudgeFired = true;
     const sources = [this.guides.user?.path, this.guides.project?.path].filter(Boolean).join(", ");
-    const text = `\n\n[mcph] Tip: read the \`mcph://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
+    const text = `\n\n[yaw-mcp] Tip: read the \`yaw-mcp://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
     const last = result.content[result.content.length - 1];
     if (last && last.type === "text") {
       last.text = `${last.text}${text}`;
@@ -1008,7 +1041,7 @@ export class ConnectServer {
       // Prune the response before it hits the LLM. Rules are
       // conservative (drop null / undefined / empty collections,
       // collapse runs of blank lines) so we trim obvious dead weight
-      // without changing meaning. Disable with MCPH_PRUNE_RESPONSES=0
+      // without changing meaning. Disable with YAW_MCP_PRUNE_RESPONSES=0
       // if a caller needs the exact upstream bytes through.
       if (!result.isError && Array.isArray(result.content)) {
         try {
@@ -1186,9 +1219,9 @@ export class ConnectServer {
   // Auto-warm confidence gate — applied to discover(context) so a single
   // clearly-winning server gets activated without the LLM needing to
   // follow up with a separate activate call. Default ON; flip off with
-  // MCPH_AUTO_ACTIVATE=0 if it causes surprise.
+  // YAW_MCP_AUTO_ACTIVATE=0 if it causes surprise.
   private static readonly AUTO_ACTIVATE_ENABLED = (() => {
-    const raw = process.env.MCPH_AUTO_ACTIVATE;
+    const raw = process.env.YAW_MCP_AUTO_ACTIVATE;
     return raw === undefined || raw === "" || raw === "1" || raw.toLowerCase() === "true";
   })();
   // Top score must clear this floor AND the gap over the runner-up must
@@ -1293,7 +1326,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No servers installed. Browse the mcph catalog at https://mcp.hosting/explore — add any server from there to your mcph account and it will appear here within 60s.",
+            text: "No servers installed. Browse the yaw-mcp catalog at https://yaw.sh/mcp/explore — add any server from there to your yaw-mcp account and it will appear here within 60s.",
           },
         ],
       };
@@ -1328,14 +1361,14 @@ export class ConnectServer {
       lines.push(`Auto-loaded "${sorted[0].namespace}" — top match for your query.\n`);
     }
 
-    // Compliance filter banner. When MCPH_MIN_COMPLIANCE is active, the
+    // Compliance filter banner. When YAW_MCP_MIN_COMPLIANCE is active, the
     // per-server lines below will annotate any below-grade server with a
     // "won't auto-activate" marker; this header tells the model WHY
     // those markers are there so it doesn't try to activate them and
     // get a refusal surprise.
     const minCompliance = resolveMinCompliance();
     if (minCompliance !== null) {
-      lines.push(`Compliance filter active: MCPH_MIN_COMPLIANCE=${minCompliance}\n`);
+      lines.push(`Compliance filter active: YAW_MCP_MIN_COMPLIANCE=${minCompliance}\n`);
     }
 
     // Compact "Matches your query" summary. Prepended when context is
@@ -1437,7 +1470,7 @@ export class ConnectServer {
       // Compliance annotation — the grade is a trust signal, so it's
       // shown unconditionally whenever the backend has scored this
       // server (A–F). Passing graded server → `[A]` tag. When
-      // MCPH_MIN_COMPLIANCE is set and the grade is below it, replace
+      // YAW_MCP_MIN_COMPLIANCE is set and the grade is below it, replace
       // the tag with an inline refusal reason so the model knows why
       // the line is surfaced but won't be activated. Ungraded servers
       // stay unannotated — don't punish unknown on a catalog where
@@ -1445,7 +1478,7 @@ export class ConnectServer {
       let complianceLabel = "";
       if (server.complianceGrade) {
         if (minCompliance !== null && !passesMinCompliance(server.complianceGrade, minCompliance)) {
-          complianceLabel = ` (grade ${server.complianceGrade} — below MCPH_MIN_COMPLIANCE=${minCompliance}, won't auto-activate)`;
+          complianceLabel = ` (grade ${server.complianceGrade} — below YAW_MCP_MIN_COMPLIANCE=${minCompliance}, won't auto-activate)`;
         } else {
           complianceLabel = ` [${server.complianceGrade}]`;
         }
@@ -1475,7 +1508,7 @@ export class ConnectServer {
 
       // Inline usage hint — cumulative success count + who tends to
       // get loaded alongside this server. Counts come from state.json
-      // (persistence.ts) so they carry across mcph restarts. Silent
+      // (persistence.ts) so they carry across yaw-mcp restarts. Silent
       // when neither signal has evidence yet. See usage-hints.ts.
       const usageHint = formatUsageHint(this.learning.get(server.namespace), coUsageMap.get(server.namespace) ?? []);
       if (usageHint) lines.push(`    ${usageHint}`);
@@ -1549,12 +1582,12 @@ export class ConnectServer {
     // Marketplace hint — steer sparse-config users to the catalog without
     // nagging power users. Threshold counts installed servers (active +
     // inactive) in the user's config; anyone under the cutoff gets a
-    // one-line pointer at https://mcp.hosting/explore. No backend API is
+    // one-line pointer at https://yaw.sh/mcp/explore. No backend API is
     // hit — the catalog is a human-browsable SPA, so this is a URL hint,
     // not a full meta-tool.
     if (this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
       lines.push(
-        "Browse the mcph catalog at https://mcp.hosting/explore — add any server from there to your mcph account and it will appear here within 60s.",
+        "Browse the yaw-mcp catalog at https://yaw.sh/mcp/explore — add any server from there to your yaw-mcp account and it will appear here within 60s.",
       );
     }
 
@@ -1630,7 +1663,7 @@ export class ConnectServer {
       return {
         ok: false,
         isChanged: false,
-        message: `"${namespace}" is installed but disabled. Enable it at https://mcp.hosting to activate.`,
+        message: `"${namespace}" is installed but disabled. Enable it at https://yaw.sh/mcp to activate.`,
       };
     }
     const serverConfig = anyMatch;
@@ -1660,7 +1693,7 @@ export class ConnectServer {
     }
 
     // Merge any session-elicited env over the server's configured env.
-    // Elicited values only apply inside this mcph process lifetime.
+    // Elicited values only apply inside this yaw-mcp process lifetime.
     const elicited = this.elicitedEnv.get(namespace);
     const effectiveConfig = elicited ? { ...serverConfig, env: { ...serverConfig.env, ...elicited } } : serverConfig;
 
@@ -1779,7 +1812,7 @@ export class ConnectServer {
       properties[key] = {
         type: "string",
         title: key,
-        description: `The value for ${key} required by "${namespace}". Stored only for this mcph session.`,
+        description: `The value for ${key} required by "${namespace}". Stored only for this yaw-mcp session.`,
       };
     }
 
@@ -1878,7 +1911,7 @@ export class ConnectServer {
     let anyChanged = false;
     let anyError = false;
 
-    // Compliance gate. When MCPH_MIN_COMPLIANCE is set, refuse to
+    // Compliance gate. When YAW_MCP_MIN_COMPLIANCE is set, refuse to
     // activate any server whose reported grade is below the floor.
     // Ungraded servers always pass — see passesMinCompliance. Parsed
     // once per handleActivate call so a mid-session env change takes
@@ -1893,7 +1926,7 @@ export class ConnectServer {
         const cfg = this.config?.servers.find((s) => s.namespace === namespace);
         if (cfg && !passesMinCompliance(cfg.complianceGrade, minCompliance)) {
           const grade = cfg.complianceGrade ?? "unknown";
-          const message = `Refused to load "${namespace}": compliance grade ${grade} is below MCPH_MIN_COMPLIANCE=${minCompliance}. Unset MCPH_MIN_COMPLIANCE (or lower it) to override.`;
+          const message = `Refused to load "${namespace}": compliance grade ${grade} is below YAW_MCP_MIN_COMPLIANCE=${minCompliance}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
           results.push(message);
           anyError = true;
           continue;
@@ -1931,7 +1964,7 @@ export class ConnectServer {
   }
 
   // Smart-routing meta-tool. The LLM describes the task in plain English
-  // ("create a github issue for this bug"); mcph ranks configured servers
+  // ("create a github issue for this bug"); yaw-mcp ranks configured servers
   // with BM25 and activates the top N, then lets the LLM call the now-
   // exposed tools normally. Default budget is 1 because over-activating
   // pollutes the tool list in the LLM's context with noise.
@@ -2004,7 +2037,7 @@ export class ConnectServer {
     // Sampling tiebreak: when BM25+rerank+health rank the top-2
     // candidates within a close margin, ask the client LLM to choose.
     // Uses the same model the user is already running — no extra
-    // provider key, no extra cost from mcph's side. Silently skips if
+    // provider key, no extra cost from yaw-mcp's side. Silently skips if
     // the client doesn't advertise the sampling capability.
     if (budget === 1 && shouldTiebreak(ranked)) {
       progress?.("Top candidates close — asking LLM to pick…");
@@ -2164,17 +2197,25 @@ export class ConnectServer {
   }
 
   private async fetchAndApplyConfig(): Promise<void> {
+    // Local mode has no backend to poll -- bundles.json is loaded once
+    // at start() and never refreshed within the session. Restart yaw-mcp
+    // (or the MCP client that launched it) to pick up bundles.json
+    // edits. Defense-in-depth: startPolling() already skips in local
+    // mode, but the import/install handlers also call this in their
+    // post-write refresh path.
+    if (this.localMode) return;
+
     // Evict expired activation failures. healthFactor() checks the TTL
-    // at read-time, so stale entries never produce a wrong penalty —
+    // at read-time, so stale entries never produce a wrong penalty --
     // but without a sweep the map grows unbounded across a long
     // session. Piggyback the sweep on each poll so it costs nothing
     // extra.
     this.pruneExpiredActivationFailures();
 
     // Pass the known configVersion so the server can short-circuit with
-    // 304 Not Modified when nothing changed — saves DB query, JSON
+    // 304 Not Modified when nothing changed -- saves DB query, JSON
     // serialization, and response body on the hot 60s poll path.
-    const newConfig = await fetchConfig(this.apiUrl, this.token, this.configVersion ?? undefined);
+    const newConfig = await fetchConfig(this.apiUrl, this.token as string, this.configVersion ?? undefined);
 
     if (newConfig === null) {
       return; // 304 Not Modified — keep current config
@@ -2264,9 +2305,14 @@ export class ConnectServer {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
     }
+    // No backend to poll in local mode -- bundles.json is read-once.
+    if (this.localMode) {
+      log("info", "Local mode: polling disabled (no backend). Restart yaw-mcp to pick up bundles.json edits.");
+      return;
+    }
     const intervalMs = resolvePollIntervalMs();
     if (intervalMs === 0) {
-      log("info", "Config polling disabled (MCPH_POLL_INTERVAL=0). Restart mcph to pick up dashboard changes.");
+      log("info", "Config polling disabled (YAW_MCP_POLL_INTERVAL=0). Restart yaw-mcp to pick up dashboard changes.");
       return;
     }
     const poll = async () => {
@@ -2281,7 +2327,7 @@ export class ConnectServer {
       // oninitialized fires only once; without this refresh the badge
       // reverts to "no AI client connected" ~3 min into every session.
       // isRefresh=true so the backend bumps last_seen_at without
-      // inflating initialize_count. mcph is a stdio child of the AI
+      // inflating initialize_count. yaw-mcp is a stdio child of the AI
       // client, so when the client closes this loop dies with it and
       // last_seen_at goes stale on schedule -- which is the desired
       // "client disconnected" signal.
@@ -2300,6 +2346,17 @@ export class ConnectServer {
   private async handleImport(
     filepath: string,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    if (this.localMode) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "mcp_connect_import is not available in local mode. Add servers by editing ~/.yaw-mcp/bundles.json directly, or set YAW_MCP_TOKEN to use a Yaw MCP account.",
+          },
+        ],
+        isError: true,
+      };
+    }
     if (!filepath) {
       return { content: [{ type: "text", text: "filepath is required." }], isError: true };
     }
@@ -2382,7 +2439,7 @@ export class ConnectServer {
       for (const [key, value] of Object.entries(mcpServers)) {
         if (!value || typeof value !== "object") continue;
         // Skip ourselves
-        if (key === "mcph" || key === "mcp.hosting" || key === "mcp-connect") continue;
+        if (key === "yaw-mcp" || key === "mcp.hosting" || key === "mcp-connect") continue;
 
         const namespace = key
           .toLowerCase()
@@ -2479,6 +2536,17 @@ export class ConnectServer {
   private async handleInstall(
     args: Record<string, unknown>,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    if (this.localMode) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "mcp_connect_install is not available in local mode. Add servers by editing ~/.yaw-mcp/bundles.json directly, or set YAW_MCP_TOKEN to use a Yaw MCP account.",
+          },
+        ],
+        isError: true,
+      };
+    }
     const built = buildInstallPayload(args);
     if (!built.ok) {
       return { content: [{ type: "text", text: built.message }], isError: true };
@@ -2506,7 +2574,7 @@ export class ConnectServer {
 
       // Plan-cap: forward the backend's structured body so the model can
       // render the upgrade URL. Returning the JSON verbatim is the
-      // load-bearing bit of the mcph install-tool contract — see
+      // load-bearing bit of the yaw-mcp install-tool contract — see
       // buildPlanLimitExceededError in mcp-hosting/src/lib/plans.ts.
       if (res.statusCode === 403 && body && body.code === "plan_limit_exceeded") {
         return {
@@ -2580,7 +2648,7 @@ export class ConnectServer {
       } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
         text = "Couldn't reach mcp.hosting (network unreachable or DNS failure). Check your connection and retry.";
       } else {
-        text = "Install failed unexpectedly. Check mcph logs on this machine for the underlying error.";
+        text = "Install failed unexpectedly. Check yaw-mcp logs on this machine for the underlying error.";
       }
       log("warn", "handleInstall error", {
         error: err instanceof Error ? err.message : String(err),
@@ -2746,7 +2814,7 @@ export class ConnectServer {
     // loaded namespaces with rich per-call telemetry; this surfaces
     // history for servers we AREN'T currently talking to so the LLM /
     // operator knows which ones have been unreliable before reloading
-    // them. Threshold + sort shared with `mcph doctor` via
+    // them. Threshold + sort shared with `yaw-mcp doctor` via
     // selectFlakyNamespaces (see usage-hints.ts).
     const now = Date.now();
     const flaky = selectFlakyNamespaces(
@@ -2791,7 +2859,7 @@ export class ConnectServer {
     });
 
     const lines: string[] = [
-      // Pack history carries across mcph restarts (see persistence.ts),
+      // Pack history carries across yaw-mcp restarts (see persistence.ts),
       // so "recurring" isn't scoped to the live process — don't over
       // -claim with "this session" here.
       `Detected ${ranked.length} recurring server pack${ranked.length === 1 ? "" : "s"}:\n`,
@@ -2842,7 +2910,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No curated bundles match your currently installed servers. Browse https://mcp.hosting/explore to add the servers a bundle needs, then re-run mcp_connect_bundles.",
+            text: "No curated bundles match your currently installed servers. Browse https://yaw.sh/mcp/explore to add the servers a bundle needs, then re-run mcp_connect_bundles.",
           },
         ],
       };
@@ -2866,7 +2934,7 @@ export class ConnectServer {
         const { bundle, have, missing } = entry;
         lines.push(`  ${bundle.id} — ${bundle.description}`);
         lines.push(`    have: ${have.join(", ")}`);
-        lines.push(`    missing: ${missing.join(", ")} (install from https://mcp.hosting/explore)`);
+        lines.push(`    missing: ${missing.join(", ")} (install from https://yaw.sh/mcp/explore)`);
       }
     }
 
@@ -3051,7 +3119,7 @@ export class ConnectServer {
   }
 
   async shutdown(): Promise<void> {
-    log("info", "Shutting down mcph");
+    log("info", "Shutting down yaw-mcp");
 
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
@@ -3077,14 +3145,14 @@ export class ConnectServer {
 
     await this.server.close();
 
-    log("info", "mcph shutdown complete");
+    log("info", "yaw-mcp shutdown complete");
   }
 
   // Debounced save trigger. Called after every learning/pack-detector
   // write — the timer collapses bursts into one write so a busy session
   // isn't writing the state file 10×/sec. Silently no-ops until start()
   // has hydrated state, which keeps unit tests that skip start() from
-  // touching the user's ~/.mcph/state.json.
+  // touching the user's ~/.yaw-mcp/state.json.
   private scheduleStateSave(): void {
     if (!this.persistenceReady) return;
     if (this.stateSaveTimer) clearTimeout(this.stateSaveTimer);

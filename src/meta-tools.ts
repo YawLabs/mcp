@@ -2,7 +2,7 @@ export const META_TOOLS = {
   discover: {
     name: "mcp_connect_discover",
     description:
-      'List the MCP servers installed on the user\'s mcp.hosting account and ready to use. Call this when browsing what\'s available or when the task isn\'t specific yet. If the task is already clear ("file a github issue", "query postgres", "post to slack"), prefer `mcp_connect_dispatch` — it picks the right server and loads its tools in one call. Load only the servers the CURRENT task needs; each one adds tools to your context. Shows names, namespaces, tool counts, a token-cost estimate per server (e.g. "22 tools, ~2.8k tokens") so you can budget context before activating — tilde values are estimates based on cached tool metadata, unprefixed values reflect live tool schemas. Scored servers carry an inline `[A]`–`[F]` compliance grade from the mcp.hosting test suite — treat it as a trust signal and prefer higher-graded alternatives when otherwise equivalent (ungraded servers are unmarked, not penalized). Also surfaces whether each server is loaded, any local CLI it shadows (prefer the MCP tools over the CLI when a shadow is listed), and usage hints ("used Nx" or "often loaded with X") when the signals are present (counts persist across mcph restarts). Recurring packs that have been loaded together ≥2 times get their own block at the top with a ready-to-run `activate` call — skip the extra `mcp_connect_suggest` round-trip when the signal is already there. If a `mcph://guide` resource is listed, read it FIRST: it carries project/user-specific routing rules and credential conventions that override generic defaults.',
+      'List the MCP servers installed on the user\'s mcp.hosting account and ready to use. Call this when browsing what\'s available or when the task isn\'t specific yet. If the task is already clear ("file a github issue", "query postgres", "post to slack"), prefer `mcp_connect_dispatch` — it picks the right server and loads its tools in one call. Load only the servers the CURRENT task needs; each one adds tools to your context. Shows names, namespaces, tool counts, a token-cost estimate per server (e.g. "22 tools, ~2.8k tokens") so you can budget context before activating — tilde values are estimates based on cached tool metadata, unprefixed values reflect live tool schemas. Scored servers carry an inline `[A]`–`[F]` compliance grade from the mcp.hosting test suite — treat it as a trust signal and prefer higher-graded alternatives when otherwise equivalent (ungraded servers are unmarked, not penalized). Also surfaces whether each server is loaded, any local CLI it shadows (prefer the MCP tools over the CLI when a shadow is listed), and usage hints ("used Nx" or "often loaded with X") when the signals are present (counts persist across yaw-mcp restarts). Recurring packs that have been loaded together ≥2 times get their own block at the top with a ready-to-run `activate` call — skip the extra `mcp_connect_suggest` round-trip when the signal is already there. If a `yaw-mcp://guide` resource is listed, read it FIRST: it carries project/user-specific routing rules and credential conventions that override generic defaults.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -24,7 +24,7 @@ export const META_TOOLS = {
   activate: {
     name: "mcp_connect_activate",
     description:
-      'Load one or more installed MCP servers\' tools into the current session by namespace. Each server adds its tools to your context, so load only what the current task needs. When you move on, unload servers you\'re done with via `mcp_connect_deactivate` before loading new ones. Tools are prefixed by namespace (e.g., "gh_create_issue"). Pass "server" for one or "servers" for multiple. Optionally pass `tools: [...]` to expose only those tools by name — the rest stay proxyable via mcp_connect_dispatch. If `MCPH_MIN_COMPLIANCE` is set, activation refuses servers whose reported grade is below the floor (ungraded servers always pass); the refusal message names the grade and the env var to unset.',
+      'Load one or more installed MCP servers\' tools into the current session by namespace. Each server adds its tools to your context, so load only what the current task needs. When you move on, unload servers you\'re done with via `mcp_connect_deactivate` before loading new ones. Tools are prefixed by namespace (e.g., "gh_create_issue"). Pass "server" for one or "servers" for multiple. Optionally pass `tools: [...]` to expose only those tools by name — the rest stay proxyable via mcp_connect_dispatch. If `YAW_MCP_MIN_COMPLIANCE` is set, activation refuses servers whose reported grade is below the floor (ungraded servers always pass); the refusal message names the grade and the env var to unset.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -56,7 +56,7 @@ export const META_TOOLS = {
   deactivate: {
     name: "mcp_connect_deactivate",
     description:
-      'Unload one or more MCP servers\' tools from the current session to free context. The server stays installed on the account and can be reloaded via `mcp_connect_activate` when needed again. Unload servers you\'re done with; mcph also auto-unloads any server idle for 10+ tool calls to other servers. Pass "server" for one or "servers" for multiple.',
+      'Unload one or more MCP servers\' tools from the current session to free context. The server stays installed on the account and can be reloaded via `mcp_connect_activate` when needed again. Unload servers you\'re done with; yaw-mcp also auto-unloads any server idle for 10+ tool calls to other servers. Pass "server" for one or "servers" for multiple.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -120,7 +120,7 @@ export const META_TOOLS = {
   dispatch: {
     name: "mcp_connect_dispatch",
     description:
-      'PREFERRED entry point when the task is already concrete. Picks the best-matching installed MCP server(s) for a natural-language task and loads their tools in ONE call — no separate discover + load step. Describe what you want to do ("create a github issue for the login bug", "post a summary to slack", "query the prod postgres") and mcph will rank the user\'s installed servers with BM25, load the top match into the session, and expose its tools so you can call them. Use `mcp_connect_discover` only when browsing what\'s installed without a specific task. When an installed MCP server shadows a local CLI (e.g. npmjs shadows `npm`, tailscale shadows `tailscale`, github shadows `gh`), prefer dispatching to the server over running the CLI via Bash. Default budget is 1 to keep the tool list focused; raise it only if the task genuinely spans multiple servers. If `mcph://guide` is listed as a resource, read it first — the project may have explicit routing rules (e.g. "use `gh` not bash for GitHub").',
+      'PREFERRED entry point when the task is already concrete. Picks the best-matching installed MCP server(s) for a natural-language task and loads their tools in ONE call — no separate discover + load step. Describe what you want to do ("create a github issue for the login bug", "post a summary to slack", "query the prod postgres") and yaw-mcp will rank the user\'s installed servers with BM25, load the top match into the session, and expose its tools so you can call them. Use `mcp_connect_discover` only when browsing what\'s installed without a specific task. When an installed MCP server shadows a local CLI (e.g. npmjs shadows `npm`, tailscale shadows `tailscale`, github shadows `gh`), prefer dispatching to the server over running the CLI via Bash. Default budget is 1 to keep the tool list focused; raise it only if the task genuinely spans multiple servers. If `yaw-mcp://guide` is listed as a resource, read it first — the project may have explicit routing rules (e.g. "use `gh` not bash for GitHub").',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -148,7 +148,7 @@ export const META_TOOLS = {
   install: {
     name: "mcp_connect_install",
     description:
-      'Install a new MCP server on the user\'s mcp.hosting account so it shows up in `mcp_connect_discover` and is ready to use. Call this when the user asks to install/add a server they don\'t already have (check `mcp_connect_discover` first — if the namespace is already listed, the server is already installed; use `mcp_connect_activate` to load its tools into this session). Fill the install spec from your knowledge of the server: for most official Model Context Protocol servers this is `{ type: "local", command: "npx", args: ["-y", "@modelcontextprotocol/server-<name>"] }`; for uvx/python it\'s `{ command: "uvx", args: ["mcp-server-<name>"] }`; for remote HTTP it\'s `{ type: "remote", url: "https://..." }`. Namespace must match /^[a-z][a-z0-9_]{0,29}$/ and must not collide with one the user already has. If the server needs secrets (API tokens, etc.) pass them in `env` — they are stored encrypted and never logged. On 403 with `code: "plan_limit_exceeded"` the user is on the free tier cap (3 servers); surface the returned error body verbatim so they see the upgrade URL. After install mcph auto-refreshes its server list — the new namespace becomes callable without a restart.',
+      'Install a new MCP server on the user\'s mcp.hosting account so it shows up in `mcp_connect_discover` and is ready to use. Call this when the user asks to install/add a server they don\'t already have (check `mcp_connect_discover` first — if the namespace is already listed, the server is already installed; use `mcp_connect_activate` to load its tools into this session). Fill the install spec from your knowledge of the server: for most official Model Context Protocol servers this is `{ type: "local", command: "npx", args: ["-y", "@modelcontextprotocol/server-<name>"] }`; for uvx/python it\'s `{ command: "uvx", args: ["mcp-server-<name>"] }`; for remote HTTP it\'s `{ type: "remote", url: "https://..." }`. Namespace must match /^[a-z][a-z0-9_]{0,29}$/ and must not collide with one the user already has. If the server needs secrets (API tokens, etc.) pass them in `env` — they are stored encrypted and never logged. On 403 with `code: "plan_limit_exceeded"` the user is on the free tier cap (3 servers); surface the returned error body verbatim so they see the upgrade URL. After install yaw-mcp auto-refreshes its server list — the new namespace becomes callable without a restart.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -206,7 +206,7 @@ export const META_TOOLS = {
   read_tool: {
     name: "mcp_connect_read_tool",
     description:
-      "Return one tool's full input schema without loading its server into the session. Use this when you need to inspect an MCP tool's arguments before deciding whether to activate its server, or to compare schemas across two tools. For already-loaded servers this is free (schema is in memory). For not-loaded servers mcph spawns a transient upstream connection, reads the schema, and tears the connection down — no tools are added to your context, and `mcp_connect_health` will not show the server as loaded. When you're ready to actually call the tool, pass the server namespace to `mcp_connect_activate` (or use `mcp_connect_dispatch` with the task intent).",
+      "Return one tool's full input schema without loading its server into the session. Use this when you need to inspect an MCP tool's arguments before deciding whether to activate its server, or to compare schemas across two tools. For already-loaded servers this is free (schema is in memory). For not-loaded servers yaw-mcp spawns a transient upstream connection, reads the schema, and tears the connection down — no tools are added to your context, and `mcp_connect_health` will not show the server as loaded. When you're ready to actually call the tool, pass the server namespace to `mcp_connect_activate` (or use `mcp_connect_dispatch` with the task intent).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -233,7 +233,7 @@ export const META_TOOLS = {
   suggest: {
     name: "mcp_connect_suggest",
     description:
-      "Surface recurring multi-server tool-call patterns as suggested 'packs' to activate in one step. Observation-only — this never loads or unloads anything. When the same 2-3 servers get used together in short bursts more than once, the pattern is surfaced here so the next workflow can call `mcp_connect_activate` once with the whole pack's namespaces instead of juggling discover + load for each server. Patterns persist across mcph restarts (via ~/.mcph/state.json) so a fresh process already knows what you usually use together. As a general rule: prefer loaded MCP servers over matching local CLIs (a loaded `npmjs` server replaces `npm audit`, `tailscale` replaces the `tailscale` CLI, etc.) — see `mcp_connect_discover` for which CLIs each installed server shadows. Returns a friendly 'no patterns yet' message when nothing has recurred.",
+      "Surface recurring multi-server tool-call patterns as suggested 'packs' to activate in one step. Observation-only — this never loads or unloads anything. When the same 2-3 servers get used together in short bursts more than once, the pattern is surfaced here so the next workflow can call `mcp_connect_activate` once with the whole pack's namespaces instead of juggling discover + load for each server. Patterns persist across yaw-mcp restarts (via ~/.yaw-mcp/state.json) so a fresh process already knows what you usually use together. As a general rule: prefer loaded MCP servers over matching local CLIs (a loaded `npmjs` server replaces `npm audit`, `tailscale` replaces the `tailscale` CLI, etc.) — see `mcp_connect_discover` for which CLIs each installed server shadows. Returns a friendly 'no patterns yet' message when nothing has recurred.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -321,7 +321,7 @@ export const META_TOOLS = {
   },
 } as const;
 
-// Namespaces must match this on both mcph's side and the backend so the
+// Namespaces must match this on both yaw-mcp's side and the backend so the
 // local validation message matches what the server would return (saves
 // a round trip and gives the model a clean retry target).
 const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
@@ -387,7 +387,7 @@ export function buildInstallPayload(args: Record<string, unknown>): InstallPaylo
     // Remote MCP servers carry bearer tokens / session cookies. A
     // plaintext http:// URL leaks those on any untrusted network hop,
     // so require https:// — with the single exception of loopback,
-    // so `mcph install` can wire up a dev server on localhost.
+    // so `yaw-mcp install` can wire up a dev server on localhost.
     if (parsed.protocol === "https:") {
       // ok
     } else if (parsed.protocol === "http:") {

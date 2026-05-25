@@ -16,45 +16,45 @@ describe("cacheDir", () => {
   it("uses LOCALAPPDATA on Windows when set", () => {
     Object.defineProperty(process, "platform", { value: "win32" });
     vi.stubEnv("LOCALAPPDATA", "C:\\Users\\test\\AppData\\Local");
-    expect(cacheDir()).toMatch(/mcph[\\/]Cache$/);
+    expect(cacheDir()).toMatch(/yaw-mcp[\\/]Cache$/);
     expect(cacheDir().startsWith("C:\\Users\\test\\AppData\\Local")).toBe(true);
   });
 
   it("falls back to homedir on Windows when LOCALAPPDATA missing", () => {
     Object.defineProperty(process, "platform", { value: "win32" });
     vi.stubEnv("LOCALAPPDATA", "");
-    expect(cacheDir()).toMatch(/AppData[\\/]Local[\\/]mcph[\\/]Cache$/);
+    expect(cacheDir()).toMatch(/AppData[\\/]Local[\\/]yaw-mcp[\\/]Cache$/);
   });
 
   it("uses ~/Library/Caches on darwin", () => {
     Object.defineProperty(process, "platform", { value: "darwin" });
-    expect(cacheDir()).toMatch(/Library[\\/]Caches[\\/]mcph$/);
+    expect(cacheDir()).toMatch(/Library[\\/]Caches[\\/]yaw-mcp$/);
   });
 
   it("honors XDG_CACHE_HOME on linux", () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     vi.stubEnv("XDG_CACHE_HOME", "/custom/cache");
     // path.join uses the host separator — tests run on Windows during
-    // dev, Linux in CI — so match flexibly on "custom/cache/mcph".
-    expect(cacheDir()).toMatch(/custom[\\/]cache[\\/]mcph$/);
+    // dev, Linux in CI — so match flexibly on "custom/cache/yaw-mcp".
+    expect(cacheDir()).toMatch(/custom[\\/]cache[\\/]yaw-mcp$/);
   });
 
   it("falls back to ~/.cache on linux when XDG_CACHE_HOME missing", () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     vi.stubEnv("XDG_CACHE_HOME", "");
-    expect(cacheDir()).toMatch(/\.cache[\\/]mcph$/);
+    expect(cacheDir()).toMatch(/\.cache[\\/]yaw-mcp$/);
   });
 
   it("ignores empty XDG_CACHE_HOME", () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     vi.stubEnv("XDG_CACHE_HOME", "");
-    expect(cacheDir()).toMatch(/\.cache[\\/]mcph$/);
+    expect(cacheDir()).toMatch(/\.cache[\\/]yaw-mcp$/);
   });
 });
 
 describe("userConfigDir", () => {
-  it("returns <home>/.mcph", () => {
-    expect(userConfigDir("/home/alice")).toMatch(/^[/\\]home[/\\]alice[/\\]\.mcph$/);
+  it("returns <home>/.yaw-mcp", () => {
+    expect(userConfigDir("/home/alice")).toMatch(/^[/\\]home[/\\]alice[/\\]\.yaw-mcp$/);
   });
 
   it("uses os.homedir() when no arg passed", () => {
@@ -64,8 +64,8 @@ describe("userConfigDir", () => {
 });
 
 describe("guidePath", () => {
-  it("returns <dir>/MCPH.md", () => {
-    expect(guidePath("/tmp/.mcph")).toMatch(/[/\\]\.mcph[/\\]MCPH\.md$/);
+  it("returns <dir>/YAW-MCP.md", () => {
+    expect(guidePath("/tmp/.yaw-mcp")).toMatch(/[/\\]\.yaw-mcp[/\\]YAW-MCP\.md$/);
   });
 
   it("uses the GUIDE_FILENAME constant", () => {
@@ -78,11 +78,11 @@ describe("findProjectConfigDir", () => {
   let root: string;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "mcph-paths-home-"));
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-paths-home-"));
     // Root of the synthetic project tree lives INSIDE `home` so the
     // walk-up terminates at the synthetic `home` boundary rather than
     // escaping past tmpdir into the real user dir — where a real
-    // ~/.mcph/ on dev machines would otherwise get claimed as the
+    // ~/.yaw-mcp/ on dev machines would otherwise get claimed as the
     // project config.
     root = mkdtempSync(join(home, "proj-"));
   });
@@ -92,13 +92,13 @@ describe("findProjectConfigDir", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("returns null when no .mcph/ exists anywhere up to home", async () => {
+  it("returns null when no .yaw-mcp/ exists anywhere up to home", async () => {
     const sub = join(root, "a", "b", "c");
     mkdirSync(sub, { recursive: true });
     expect(await findProjectConfigDir(sub, home)).toBeNull();
   });
 
-  it("finds a .mcph/ at the starting directory", async () => {
+  it("finds a .yaw-mcp/ at the starting directory", async () => {
     const cfgDir = join(root, CONFIG_DIRNAME);
     mkdirSync(cfgDir);
     expect(await findProjectConfigDir(root, home)).toBe(cfgDir);
@@ -112,8 +112,8 @@ describe("findProjectConfigDir", () => {
     expect(await findProjectConfigDir(deep, home)).toBe(cfgDir);
   });
 
-  it("stops BEFORE $HOME — a .mcph/ in home is NOT returned as a project dir", async () => {
-    // .mcph/ lives at $HOME. That's the user-global scope, handled
+  it("stops BEFORE $HOME — a .yaw-mcp/ in home is NOT returned as a project dir", async () => {
+    // .yaw-mcp/ lives at $HOME. That's the user-global scope, handled
     // separately by userConfigDir(). findProjectConfigDir must not
     // claim it, or the config loader would double-load the same file
     // as both project and user-global.
@@ -123,7 +123,7 @@ describe("findProjectConfigDir", () => {
     expect(await findProjectConfigDir(sub, home)).toBeNull();
   });
 
-  it("prefers the nearest .mcph/ when multiple exist on the path", async () => {
+  it("prefers the nearest .yaw-mcp/ when multiple exist on the path", async () => {
     mkdirSync(join(root, CONFIG_DIRNAME));
     const innerProject = join(root, "apps", "web");
     mkdirSync(innerProject, { recursive: true });

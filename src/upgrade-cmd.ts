@@ -1,8 +1,8 @@
-// `mcph upgrade` — tells the user (or the shell) how to install the
-// newest version of `@yawlabs/mcph`. Detects the invocation mode from
-// process.argv[1] so the suggested command matches how mcph is
+// `yaw-mcp upgrade` — tells the user (or the shell) how to install the
+// newest version of `@yawlabs/mcp`. Detects the invocation mode from
+// process.argv[1] so the suggested command matches how yaw-mcp is
 // actually reaching this process:
-//   - global npm (`npm install -g @yawlabs/mcph`)  → `npm install -g @yawlabs/mcph@latest`
+//   - global npm (`npm install -g @yawlabs/mcp`)  → `npm install -g @yawlabs/mcp@latest`
 //   - npx cache                                     → restart the MCP client; `npx -y` always pulls the latest
 //   - unknown / dev checkout                        → print both and let the user decide
 //
@@ -18,9 +18,9 @@
 //   2  usage error (unknown flag)
 //   3  --run attempted the upgrade and the child process failed
 //
-// `mcph doctor` shows the same staleness status — upgrade is purely
+// `yaw-mcp doctor` shows the same staleness status — upgrade is purely
 // the "what do I type to fix it" surface. Kept separate so scripts
-// that already run doctor can chain into `mcph upgrade --run` and
+// that already run doctor can chain into `yaw-mcp upgrade --run` and
 // have the shell do the right thing deterministically.
 
 import { spawn } from "node:child_process";
@@ -62,9 +62,9 @@ export interface UpgradePlan {
   command: string | null;
 }
 
-export const UPGRADE_USAGE = `Usage: mcph upgrade [--run] [--json]
+export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
 
-  Show (or execute) the command to upgrade @yawlabs/mcph to the latest version.
+  Show (or execute) the command to upgrade @yawlabs/mcp to the latest version.
 
   --run     If this install is global (npm install -g), spawn the upgrade
             command. No-op for npx installs — they always fetch the latest.
@@ -79,36 +79,37 @@ export function parseUpgradeArgs(
     if (a === "--run") opts.run = true;
     else if (a === "--json") opts.json = true;
     else if (a === "--help" || a === "-h") return { ok: false, error: UPGRADE_USAGE };
-    else return { ok: false, error: `mcph upgrade: unknown argument "${a}"\n\n${UPGRADE_USAGE}` };
+    else return { ok: false, error: `yaw-mcp upgrade: unknown argument "${a}"\n\n${UPGRADE_USAGE}` };
   }
   return { ok: true, options: opts };
 }
 
-/** Classify how mcph is being invoked. The argv[1] path is the most
+/** Classify how yaw-mcp is being invoked. The argv[1] path is the most
  *  reliable signal — npm/npx land it in distinct directories. Falls
  *  through to `unknown` rather than guessing, which lets --json
  *  consumers branch without false positives.  */
 export function detectInstallMethod(argvPath: string | undefined): InstallMethod {
   if (!argvPath) return "unknown";
   const normalized = argvPath.replace(/\\/g, "/");
-  // `npx -y @yawlabs/mcph` stages packages under ~/.npm/_npx/ (or
+  // `npx -y @yawlabs/mcp` stages packages under ~/.npm/_npx/ (or
   // platform equivalent with a hash dir). On Windows the cache is
   // under npm-cache/_npx/... — same marker works.
   if (/\/_npx\//.test(normalized)) return "npx";
   // npm i -g writes to the global prefix. Can be detected by
-  // "npm/node_modules/@yawlabs/mcph" or "/usr/local/lib/node_modules"
+  // "npm/node_modules/@yawlabs/mcp" or "/usr/local/lib/node_modules"
   // style paths, or the npm global prefix (varies). Most dependable
   // signal: the path lives under a `node_modules` that is NOT inside
   // the current project's node_modules. Since we can't reliably tell
   // global vs local from argv alone, use the npm prefix marker on
   // common platforms and a `\\npm\\node_modules\\` Windows marker.
-  if (/\/npm\/node_modules\/@yawlabs\/mcph\//.test(normalized)) return "global-npm";
-  if (/\/lib\/node_modules\/@yawlabs\/mcph\//.test(normalized)) return "global-npm";
-  if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcph\//.test(normalized)) return "global-npm";
-  if (/\/node_modules\/@yawlabs\/mcph\//.test(normalized)) return "local-node-modules";
-  // `npm run dev` or direct `node ./dist/index.js` from a checkout —
-  // not installed at all.
-  if (/\/mcph\/(dist|src)\//.test(normalized)) return "dev-checkout";
+  if (/\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  if (/\/lib\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  if (/\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "local-node-modules";
+  // `npm run dev` or direct `node ./dist/index.js` from a checkout --
+  // not installed at all. Match either yaw-mcp (renamed dir) or mcph
+  // (legacy on-disk dir name, repo stays at github.com/YawLabs/mcph).
+  if (/\/(yaw-mcp|mcph)\/(dist|src)\//.test(normalized)) return "dev-checkout";
   return "unknown";
 }
 
@@ -125,19 +126,19 @@ export function buildUpgradePlan(input: {
   let command: string | null;
   switch (method) {
     case "global-npm":
-      command = "npm install -g @yawlabs/mcph@latest";
+      command = "npm install -g @yawlabs/mcp@latest";
       break;
     case "npx":
       command = null; // npx -y refreshes on its own; nothing to run.
       break;
     case "local-node-modules":
-      command = "npm install @yawlabs/mcph@latest";
+      command = "npm install @yawlabs/mcp@latest";
       break;
     case "dev-checkout":
       command = "git pull && npm run build";
       break;
     default:
-      command = "npm install -g @yawlabs/mcph@latest";
+      command = "npm install -g @yawlabs/mcp@latest";
       break;
   }
   return { current, latest, stale, method, command };
@@ -165,7 +166,7 @@ async function defaultFetchLatest(): Promise<string | null> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 3000);
   try {
-    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcph/latest", {
+    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcp/latest", {
       signal: ac.signal,
       headers: { accept: "application/json" },
     });
@@ -222,7 +223,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // Offline or registry unreachable — still useful to print the method +
   // suggested command so the user can run it when they're back online.
   if (latest === null) {
-    print("mcph upgrade: couldn't reach the npm registry (offline? firewall?).");
+    print("yaw-mcp upgrade: couldn't reach the npm registry (offline? firewall?).");
     if (plan.command) {
       print(`When you're back online, run:\n  ${plan.command}`);
     } else {
@@ -270,20 +271,20 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // pass arbitrary user input into a shell.
   if (!autoRunnable) {
     printErr(
-      `mcph upgrade --run: install method "${method}" can't be upgraded automatically. Run manually:\n  ${plan.command}`,
+      `yaw-mcp upgrade --run: install method "${method}" can't be upgraded automatically. Run manually:\n  ${plan.command}`,
     );
     return { exitCode: 2, lines };
   }
 
   const runner = opts.spawnImpl ?? defaultSpawn;
   print(`Running: ${plan.command}`);
-  const code = await runner("npm", ["install", "-g", "@yawlabs/mcph@latest"]);
+  const code = await runner("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
   if (code === 0) {
     print("");
-    print(`✓ Upgraded @yawlabs/mcph to ${latest}.`);
+    print(`✓ Upgraded @yawlabs/mcp to ${latest}.`);
     return { exitCode: 0, lines };
   }
-  printErr(`mcph upgrade: npm exited ${code}. Try running the command manually.`);
+  printErr(`yaw-mcp upgrade: npm exited ${code}. Try running the command manually.`);
   return { exitCode: 3, lines };
 }
 

@@ -1,20 +1,20 @@
-// `mcph try <slug>` — one-shot trial: fetches the canonical launch
+// `yaw-mcp try <slug>` — one-shot trial: fetches the canonical launch
 // shape for an MCP server from mcp.hosting's /api/explore/:slug, wires
-// it into the user's AI client config under a `mcph-try-<slug>` entry
-// (NOT through mcph -- the trial entry points DIRECTLY at the upstream
+// it into the user's AI client config under a `yaw-mcp-try-<slug>` entry
+// (NOT through yaw-mcp -- the trial entry points DIRECTLY at the upstream
 // MCP server's command + args), drops a trial marker file under
-// ~/.mcph/trials/<slug>.json so the doctor's GC pass can sweep it
+// ~/.yaw-mcp/trials/<slug>.json so the doctor's GC pass can sweep it
 // after expiry, and prints a 3-line "trial wired" nudge.
 //
 // Design notes:
 //   - The trial entry is upstream-shape so the user can evaluate the
-//     server end-to-end without onboarding mcph first. The whole point
+//     server end-to-end without onboarding yaw-mcp first. The whole point
 //     of `try` is that a 30-second eval should not require account
-//     creation; mcph's value-add (centralized auth, learning, compliance
+//     creation; yaw-mcp's value-add (centralized auth, learning, compliance
 //     gating) is offered AFTER the user has decided the server is worth
 //     keeping (the 3-line nudge at the end is the signup hint).
 //   - The Windows `cmd /c` wrap is delegated to `buildLaunchEntry` —
-//     same code path the canonical `mcph install` flow uses, so a
+//     same code path the canonical `yaw-mcp install` flow uses, so a
 //     future fix to the wrapping logic propagates to trials for free.
 //   - Trial marker fields are versioned (`schemaVersion`) so the GC
 //     pass can refuse to delete entries it doesn't understand.
@@ -49,15 +49,15 @@ import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 
-export const TRY_USAGE = `Usage: mcph try <slug> [flags]
+export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   Wire a one-off trial of an MCP server into your AI client. No account
   needed; the trial points directly at the upstream server and expires
-  after --ttl. Run \`mcph try-cleanup <slug>\` to remove it sooner.
+  after --ttl. Run \`yaw-mcp try-cleanup <slug>\` to remove it sooner.
 
   --client <name>      claude-code | claude-desktop | cursor | vscode
                        (default: auto-detect, prefers the first installed
-                       client in the order probed by \`mcph install --list\`)
+                       client in the order probed by \`yaw-mcp install --list\`)
   --ttl <duration>     How long the trial lives before doctor GCs it
                        (default: 1h; accepts e.g. 30m, 2h, 7d)
   --env KEY=value      Set an env var on the trial entry. Repeatable.
@@ -65,12 +65,12 @@ export const TRY_USAGE = `Usage: mcph try <slug> [flags]
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
   --base <url>         Override the explore endpoint base (default:
-                       \$MCPH_BASE_URL or https://mcp.hosting).`;
+                       \$YAW_MCP_BASE_URL or https://yaw.sh/mcp).`;
 
-export const TRY_CLEANUP_USAGE = `Usage: mcph try-cleanup <slug>
+export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
-  Remove a previously-wired trial: peels the mcph-try-<slug> entry out of
-  the AI client config and deletes the marker under ~/.mcph/trials/. Safe
+  Remove a previously-wired trial: peels the yaw-mcp-try-<slug> entry out of
+  the AI client config and deletes the marker under ~/.yaw-mcp/trials/. Safe
   to run after the trial expires (no-op if nothing is wired).`;
 
 export const TRIAL_SCHEMA_VERSION = 1;
@@ -82,7 +82,7 @@ export interface ExploreServerResponse {
   name: string;
   command: string;
   args: string[];
-  /** Names of env vars the server needs to function. mcph try refuses
+  /** Names of env vars the server needs to function. yaw-mcp try refuses
    *  to wire the trial if any of these are missing from both --env and
    *  process.env, so the user sees the requirement up front instead of
    *  a silent runtime failure in the client. */
@@ -105,7 +105,7 @@ export interface TrialMarker {
    *  trial entry was written. Doctor needs this to GC the entry from
    *  the right scope (especially Claude Code local-scope under projects). */
   containerPath: string[];
-  /** Entry name in the container — almost always `mcph-try-<slug>` but
+  /** Entry name in the container — almost always `yaw-mcp-try-<slug>` but
    *  persisted so a future rename doesn't orphan old markers. */
   entryName: string;
   /** Epoch ms when the trial was created. Diagnostic. */
@@ -160,10 +160,10 @@ export interface TryCommandResult {
   marker?: TrialMarker;
 }
 
-const DEFAULT_BASE_URL = "https://mcp.hosting";
+const DEFAULT_BASE_URL = "https://yaw.sh/mcp";
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1h
 
-/** Parse argv slice for `mcph try`. Exported for tests. */
+/** Parse argv slice for `yaw-mcp try`. Exported for tests. */
 export function parseTryArgs(argv: string[]): { ok: true; options: TryCommandOptions } | { ok: false; error: string } {
   if (argv.length === 0) return { ok: false, error: TRY_USAGE };
   const positional: string[] = [];
@@ -264,7 +264,7 @@ export function parseDurationMs(s: string): number | null {
   return n * factor;
 }
 
-/** Trials root: `~/.mcph/trials/`. */
+/** Trials root: `~/.yaw-mcp/trials/`. */
 export function trialsDir(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, TRIALS_DIRNAME);
 }
@@ -330,10 +330,10 @@ async function defaultFetchExplore(baseUrl: string, slug: string): Promise<Explo
   try {
     const res = await fetch(url, { signal: ac.signal, headers: { accept: "application/json" } });
     if (res.status === 404) {
-      throw new Error(`mcph try: no server with slug "${slug}" — check ${baseUrl}/explore for the catalog.`);
+      throw new Error(`yaw-mcp try: no server with slug "${slug}" — check ${baseUrl}/explore for the catalog.`);
     }
     if (!res.ok) {
-      throw new Error(`mcph try: ${url} returned HTTP ${res.status}`);
+      throw new Error(`yaw-mcp try: ${url} returned HTTP ${res.status}`);
     }
     const body = (await res.json()) as unknown;
     return validateExploreResponse(body, slug);
@@ -344,14 +344,14 @@ async function defaultFetchExplore(baseUrl: string, slug: string): Promise<Explo
 
 function validateExploreResponse(body: unknown, slug: string): ExploreServerResponse {
   if (!body || typeof body !== "object") {
-    throw new Error(`mcph try: /api/explore/${slug} returned a non-object response.`);
+    throw new Error(`yaw-mcp try: /api/explore/${slug} returned a non-object response.`);
   }
   const b = body as Record<string, unknown>;
   if (typeof b.slug !== "string" || typeof b.name !== "string" || typeof b.command !== "string") {
-    throw new Error(`mcph try: /api/explore/${slug} missing required string fields (slug/name/command).`);
+    throw new Error(`yaw-mcp try: /api/explore/${slug} missing required string fields (slug/name/command).`);
   }
   if (!Array.isArray(b.args) || !b.args.every((x) => typeof x === "string")) {
-    throw new Error(`mcph try: /api/explore/${slug} has invalid args (expected string[]).`);
+    throw new Error(`yaw-mcp try: /api/explore/${slug} has invalid args (expected string[]).`);
   }
   const req: string[] = Array.isArray(b.requiredEnvVars)
     ? (b.requiredEnvVars as unknown[]).filter((x): x is string => typeof x === "string")
@@ -386,7 +386,7 @@ async function defaultPostEvent(baseUrl: string, body: TryEventBody): Promise<vo
 }
 
 /** Auto-detect which AI client to install the trial into. Probes in the
- *  same order as `mcph install --list` (claude-code -> claude-desktop ->
+ *  same order as `yaw-mcp install --list` (claude-code -> claude-desktop ->
  *  cursor -> vscode, per INSTALL_TARGETS), picking the first one whose
  *  config file already exists OR whose user-scope directory is writable.
  *  Falls back to claude-code (the most likely target) when nothing
@@ -431,7 +431,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // hosting backend exposes as catalog ids. Keeps the entry-name and
   // marker-filename free of shell-special chars.
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
-    printErr(`mcph try: invalid slug "${slug}" (lowercase letters, digits, and dashes only).`);
+    printErr(`yaw-mcp try: invalid slug "${slug}" (lowercase letters, digits, and dashes only).`);
     return { exitCode: 2, written: [] };
   }
 
@@ -440,7 +440,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const cwd = opts.cwd ?? process.cwd();
   const os = opts.os ?? CURRENT_OS;
   const now = opts.now ? opts.now() : Date.now();
-  const baseUrl = opts.baseUrl ?? env.MCPH_BASE_URL ?? DEFAULT_BASE_URL;
+  const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   const ttlMs = opts.ttl ? (parseDurationMs(opts.ttl) ?? DEFAULT_TTL_MS) : DEFAULT_TTL_MS;
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
 
@@ -468,7 +468,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   try {
     resolved = resolveInstallPath({ clientId, scope, os, home, projectDir, claudeConfigDir });
   } catch (e) {
-    printErr(`mcph try: ${(e as Error).message}`);
+    printErr(`yaw-mcp try: ${(e as Error).message}`);
     return { exitCode: 1, written: [] };
   }
 
@@ -479,17 +479,17 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
   const missing = (server.requiredEnvVars ?? []).filter((k) => !supplied[k] || supplied[k] === "");
   if (missing.length > 0) {
-    printErr(`mcph try: ${server.name} needs the following env var(s) before it can run:`);
+    printErr(`yaw-mcp try: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
     printErr("");
     printErr("Set them via --env KEY=value (repeatable) or your shell, then re-run:");
     const example = missing.map((k) => `--env ${k}=...`).join(" ");
-    printErr(`  mcph try ${slug} ${example}`);
+    printErr(`  yaw-mcp try ${slug} ${example}`);
     if (server.docUrl) printErr(`Docs: ${server.docUrl}`);
     return { exitCode: 1, written: [] };
   }
 
-  // Step 5: build the trial entry — upstream-shape, NOT through mcph.
+  // Step 5: build the trial entry — upstream-shape, NOT through yaw-mcp.
   // Reuse buildLaunchEntry so the Windows `cmd /c` wrap stays in one
   // place. Only carry the env vars the upstream actually wants (from
   // requiredEnvVars + any --env overrides the user supplied); we don't
@@ -513,7 +513,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     },
   });
 
-  const entryName = `mcph-try-${slug}`;
+  const entryName = `yaw-mcp-try-${slug}`;
   const expiresAt = now + ttlMs;
   const marker: TrialMarker = {
     schemaVersion: TRIAL_SCHEMA_VERSION,
@@ -537,12 +537,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
           existing = parsed as Record<string, unknown>;
         } else {
-          printErr(`mcph try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
+          printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
           return { exitCode: 1, written: [] };
         }
       }
     } catch (e) {
-      printErr(`mcph try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`);
+      printErr(`yaw-mcp try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`);
       return { exitCode: 1, written: [] };
     }
   }
@@ -550,13 +550,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // If a previous trial of the same slug is wired, overwrite it (the
   // user is re-running `try`, presumably with a different --ttl or env).
   // We never collide with the canonical "mcp.hosting" entry — trials
-  // live under their own `mcph-try-<slug>` name.
+  // live under their own `yaw-mcp-try-<slug>` name.
   const merged = mergeClientConfig(existing, resolved.containerPath, entry, entryName);
   const clientJson = `${JSON.stringify(merged, null, 2)}\n`;
   const markerJson = `${JSON.stringify(marker, null, 2)}\n`;
 
   if (opts.dryRun) {
-    print(`mcph try (dry-run): would write ${resolved.absolute}`);
+    print(`yaw-mcp try (dry-run): would write ${resolved.absolute}`);
     print(`  entry name: ${entryName}`);
     print(`  command:    ${entry.command} ${entry.args.join(" ")}`);
     if (entry.env) print(`  env keys:   ${Object.keys(entry.env).join(", ")}`);
@@ -574,7 +574,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     await atomicWriteFile(trialMarkerPath(slug, home), markerJson);
     written.push(trialMarkerPath(slug, home));
   } catch (e) {
-    printErr(`mcph try: failed to write trial marker: ${(e as Error).message}`);
+    printErr(`yaw-mcp try: failed to write trial marker: ${(e as Error).message}`);
     return { exitCode: 1, written: [] };
   }
 
@@ -582,7 +582,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     await atomicWriteFile(resolved.absolute, clientJson);
     written.push(resolved.absolute);
   } catch (e) {
-    printErr(`mcph try: failed to write ${resolved.absolute}: ${(e as Error).message}`);
+    printErr(`yaw-mcp try: failed to write ${resolved.absolute}: ${(e as Error).message}`);
     // Best-effort marker rollback so doctor doesn't think a trial is
     // active when its launch entry was never written.
     await unlink(trialMarkerPath(slug, home)).catch(() => undefined);
@@ -596,8 +596,8 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
 
   // Step 9: nudge.
   const ttlPretty = formatTtl(ttlMs);
-  print(`Trial wired: ${server.name} via mcph-try-${slug} -> ${resolved.absolute}`);
-  print(`Expires in ${ttlPretty}; remove sooner with: mcph try-cleanup ${slug}`);
+  print(`Trial wired: ${server.name} via yaw-mcp-try-${slug} -> ${resolved.absolute}`);
+  print(`Expires in ${ttlPretty}; remove sooner with: yaw-mcp try-cleanup ${slug}`);
   print(`Liking it? Sign up at ${baseUrl}/signup to keep ${server.name} on every machine.`);
   return { exitCode: 0, written, marker };
 }
@@ -614,17 +614,17 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   }
   const slug = opts.slug;
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
-    printErr(`mcph try-cleanup: invalid slug "${slug}".`);
+    printErr(`yaw-mcp try-cleanup: invalid slug "${slug}".`);
     return { exitCode: 2, written: [] };
   }
 
   const env = opts.env ?? process.env;
   const home = opts.home ?? homedir();
-  const baseUrl = opts.baseUrl ?? env.MCPH_BASE_URL ?? DEFAULT_BASE_URL;
+  const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   const markerPath = trialMarkerPath(slug, home);
 
   if (!existsSync(markerPath)) {
-    print(`mcph try-cleanup: no trial marker for "${slug}" (nothing to do).`);
+    print(`yaw-mcp try-cleanup: no trial marker for "${slug}" (nothing to do).`);
     return { exitCode: 0, written: [] };
   }
 
@@ -637,7 +637,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     }
     marker = parsed;
   } catch (e) {
-    printErr(`mcph try-cleanup: marker at ${markerPath} is unreadable (${(e as Error).message}).`);
+    printErr(`yaw-mcp try-cleanup: marker at ${markerPath} is unreadable (${(e as Error).message}).`);
     return { exitCode: 1, written: [] };
   }
 
@@ -661,7 +661,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
       }
     } catch (e) {
       printErr(
-        `mcph try-cleanup: warning — couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
+        `yaw-mcp try-cleanup: warning — couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
       );
       // Continue — still drop the marker so doctor stops surfacing it.
     }
@@ -671,7 +671,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   try {
     await unlink(markerPath);
   } catch (e) {
-    printErr(`mcph try-cleanup: couldn't delete marker ${markerPath} (${(e as Error).message}).`);
+    printErr(`yaw-mcp try-cleanup: couldn't delete marker ${markerPath} (${(e as Error).message}).`);
     return { exitCode: 1, written: [] };
   }
 
@@ -767,7 +767,7 @@ export async function gcExpiredTrials(opts: {
 }): Promise<{ cleared: number; failed: number }> {
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
-  const baseUrl = opts.baseUrl ?? env.MCPH_BASE_URL ?? DEFAULT_BASE_URL;
+  const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   const postEvent = opts.postEvent ?? defaultPostEvent;
   const scan = await scanTrials({ home, now: opts.now });
   if (scan.expired.length === 0) return { cleared: 0, failed: 0 };

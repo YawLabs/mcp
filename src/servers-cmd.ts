@@ -1,19 +1,19 @@
-// `mcph servers` — lists the servers configured for this account in the
+// `yaw-mcp servers` — lists the servers configured for this account in the
 // mcp.hosting dashboard (i.e., what `/api/connect/config` returns right
-// now). Complements `mcph doctor`, which only reads local state (config
+// now). Complements `yaw-mcp doctor`, which only reads local state (config
 // files, clients, state.json). Together they give the full picture:
 //   doctor   → "what does my local machine look like?"
 //   servers  → "what does the backend think I have?"
 //
 // Common uses:
 //   - Sanity-check the dashboard after editing: did my add/remove take?
-//   - Support tickets: paste `mcph servers --json` output for diagnosis.
-//   - Scripts: pick one up-front so `mcph compliance <target>` or
-//     `mcph install <client>` can feed a chosen namespace in a pipeline.
+//   - Support tickets: paste `yaw-mcp servers --json` output for diagnosis.
+//   - Scripts: pick one up-front so `yaw-mcp compliance <target>` or
+//     `yaw-mcp install <client>` can feed a chosen namespace in a pipeline.
 //
 // Exit codes:
 //   0  listed successfully
-//   1  no token resolved (same signal as `mcph` with no token)
+//   1  no token resolved (same signal as `yaw-mcp` with no token)
 //   2  fetch failed (network, auth rejected, non-2xx response)
 
 import { loadMcphConfig } from "./config-loader.js";
@@ -28,7 +28,7 @@ export interface ServersCommandOptions {
   json?: boolean;
   /**
    * Case-insensitive substring filter on namespace. When set, only servers
-   * whose namespace contains this string are rendered. `mcph servers git`
+   * whose namespace contains this string are rendered. `yaw-mcp servers git`
    * matches both `github` and `gitlab`. Missing ⇒ no filter (show all).
    */
   filter?: string;
@@ -51,7 +51,7 @@ export interface ParsedServersArgs {
   filter?: string;
 }
 
-// Split out so index.ts can validate `mcph servers <typo>` early and
+// Split out so index.ts can validate `yaw-mcp servers <typo>` early and
 // emit a usage error instead of silently ignoring unknown flags.
 export function parseServersArgs(
   argv: string[],
@@ -64,22 +64,22 @@ export function parseServersArgs(
     } else if (a === "--help" || a === "-h") {
       return { ok: false, error: SERVERS_USAGE };
     } else if (a.startsWith("-")) {
-      return { ok: false, error: `mcph servers: unknown argument "${a}"\n\n${SERVERS_USAGE}` };
+      return { ok: false, error: `yaw-mcp servers: unknown argument "${a}"\n\n${SERVERS_USAGE}` };
     } else if (filter === undefined) {
       filter = a;
     } else {
-      return { ok: false, error: `mcph servers: unexpected extra argument "${a}"\n\n${SERVERS_USAGE}` };
+      return { ok: false, error: `yaw-mcp servers: unexpected extra argument "${a}"\n\n${SERVERS_USAGE}` };
     }
   }
   return { ok: true, options: { json, ...(filter !== undefined ? { filter } : {}) } };
 }
 
-export const SERVERS_USAGE = `Usage: mcph servers [<namespace-filter>] [--json]
+export const SERVERS_USAGE = `Usage: yaw-mcp servers [<namespace-filter>] [--json]
 
   List the servers configured in your mcp.hosting dashboard.
 
   <namespace-filter>   Case-insensitive substring filter on namespace (e.g.,
-                       \`mcph servers git\` matches github + gitlab).
+                       \`yaw-mcp servers git\` matches github + gitlab).
   --json               Emit machine-readable JSON instead of a table.`;
 
 export async function runServersCommand(opts: ServersCommandOptions = {}): Promise<ServersCommandResult> {
@@ -102,7 +102,9 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   });
 
   if (!config.token) {
-    printErr("mcph servers: no token resolved. Run `mcph install <client> --token mcp_pat_…` or set MCPH_TOKEN.");
+    printErr(
+      "yaw-mcp servers: no token resolved. Run `yaw-mcp install <client> --token mcp_pat_…` or set YAW_MCP_TOKEN.",
+    );
     return { exitCode: 1, lines };
   }
 
@@ -111,13 +113,13 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   let backend: ConnectConfig | null;
   try {
     // Always pass undefined for currentVersion so we get a 200 with full
-    // body, not a 304. `mcph servers` is a user-interactive command —
+    // body, not a 304. `yaw-mcp servers` is a user-interactive command —
     // caching on an etag would just mean "stale output" with no way to
     // refresh, which is surprising.
     backend = await fetcher(config.apiBase, config.token);
   } catch (err) {
     const msg = err instanceof ConfigError || err instanceof Error ? err.message : String(err);
-    printErr(`mcph servers: ${msg}`);
+    printErr(`yaw-mcp servers: ${msg}`);
     return { exitCode: 2, lines };
   }
 
@@ -125,7 +127,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   // currentVersion was passed, so this branch shouldn't fire. Defensive
   // handling: treat null the same as an empty response and fall through.
   if (!backend) {
-    printErr("mcph servers: backend returned no data (unexpected 304).");
+    printErr("yaw-mcp servers: backend returned no data (unexpected 304).");
     return { exitCode: 2, lines };
   }
 
@@ -147,7 +149,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   }
 
   if (opts.filter && filtered.servers.length === 0) {
-    print(`No servers match "${opts.filter}". Run \`mcph servers\` to see the full list.`);
+    print(`No servers match "${opts.filter}". Run \`yaw-mcp servers\` to see the full list.`);
     return { exitCode: 0, lines };
   }
 
@@ -158,7 +160,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
 function renderTable(cfg: ConnectConfig, print: (s?: string) => void): void {
   const servers = cfg.servers;
   if (servers.length === 0) {
-    print("No servers configured yet. Visit https://mcp.hosting to add one.");
+    print("No servers configured yet. Visit https://yaw.sh/mcp to add one.");
     return;
   }
 

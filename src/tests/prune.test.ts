@@ -11,45 +11,45 @@ import { isPruneEnabled, pruneContent } from "../prune.js";
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("isPruneEnabled", () => {
-  const originalEnv = process.env.MCPH_PRUNE_RESPONSES;
+  const originalEnv = process.env.YAW_MCP_PRUNE_RESPONSES;
   afterEach(() => {
     // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" which would leave "undefined" as the string value
-    if (originalEnv === undefined) delete process.env.MCPH_PRUNE_RESPONSES;
-    else process.env.MCPH_PRUNE_RESPONSES = originalEnv;
+    if (originalEnv === undefined) delete process.env.YAW_MCP_PRUNE_RESPONSES;
+    else process.env.YAW_MCP_PRUNE_RESPONSES = originalEnv;
   });
 
   it("defaults to enabled when env is unset", () => {
     // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
-    delete process.env.MCPH_PRUNE_RESPONSES;
+    delete process.env.YAW_MCP_PRUNE_RESPONSES;
     expect(isPruneEnabled()).toBe(true);
   });
 
   it("disables on '0'", () => {
-    process.env.MCPH_PRUNE_RESPONSES = "0";
+    process.env.YAW_MCP_PRUNE_RESPONSES = "0";
     expect(isPruneEnabled()).toBe(false);
   });
 
   it("disables on 'false' (case-insensitive)", () => {
-    process.env.MCPH_PRUNE_RESPONSES = "False";
+    process.env.YAW_MCP_PRUNE_RESPONSES = "False";
     expect(isPruneEnabled()).toBe(false);
   });
 
   it("enables on '1'", () => {
-    process.env.MCPH_PRUNE_RESPONSES = "1";
+    process.env.YAW_MCP_PRUNE_RESPONSES = "1";
     expect(isPruneEnabled()).toBe(true);
   });
 });
 
 describe("pruneContent", () => {
-  const originalEnv = process.env.MCPH_PRUNE_RESPONSES;
+  const originalEnv = process.env.YAW_MCP_PRUNE_RESPONSES;
   beforeEach(() => {
     // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
-    delete process.env.MCPH_PRUNE_RESPONSES;
+    delete process.env.YAW_MCP_PRUNE_RESPONSES;
   });
   afterEach(() => {
     // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
-    if (originalEnv === undefined) delete process.env.MCPH_PRUNE_RESPONSES;
-    else process.env.MCPH_PRUNE_RESPONSES = originalEnv;
+    if (originalEnv === undefined) delete process.env.YAW_MCP_PRUNE_RESPONSES;
+    else process.env.YAW_MCP_PRUNE_RESPONSES = originalEnv;
   });
 
   it("strips null keys from a JSON body", () => {
@@ -118,8 +118,8 @@ describe("pruneContent", () => {
     expect(r.bytesPruned).toBe(r.bytesRaw);
   });
 
-  it("passes through when MCPH_PRUNE_RESPONSES=0", () => {
-    process.env.MCPH_PRUNE_RESPONSES = "0";
+  it("passes through when YAW_MCP_PRUNE_RESPONSES=0", () => {
+    process.env.YAW_MCP_PRUNE_RESPONSES = "0";
     const raw = JSON.stringify({
       data: [1],
       nothing: null,

@@ -20,7 +20,7 @@
 //     return the original untouched — the re-serialization cost isn't
 //     worth a marginal win.
 //
-// Opt-out: set MCPH_PRUNE_RESPONSES=0 to disable entirely and keep
+// Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 to disable entirely and keep
 // the original bytes. In that mode responseBytesPruned == responseBytesRaw.
 
 const MIN_SAVINGS_RATIO = 0.02;
@@ -38,7 +38,7 @@ export interface PruneResult {
 }
 
 export function isPruneEnabled(): boolean {
-  const raw = process.env.MCPH_PRUNE_RESPONSES;
+  const raw = process.env.YAW_MCP_PRUNE_RESPONSES;
   if (raw === undefined || raw === "") return true;
   return raw !== "0" && raw.toLowerCase() !== "false";
 }

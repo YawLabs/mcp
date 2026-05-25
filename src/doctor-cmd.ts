@@ -1,15 +1,15 @@
-// `mcph doctor` — prints a one-screen diagnostic of the user's mcph setup.
+// `yaw-mcp doctor` — prints a one-screen diagnostic of the user's yaw-mcp setup.
 // Goal: when a support ticket comes in ("nothing is working"), the user
 // pastes the doctor output and we can usually pinpoint the issue from
 // it alone (no token / wrong token source / wrong API base / which
-// clients have mcph wired up vs. don't / file permissions).
+// clients have yaw-mcp wired up vs. don't / file permissions).
 //
 // The output is plain text so it survives Discord / Slack pasting.
 // Tokens are always fingerprinted (first-8…last-4) — never raw.
 //
 // Exit codes:
 //   0  healthy (token present, no warnings)
-//   1  fatal   (no token resolvable — mcph won't start)
+//   1  fatal   (no token resolvable — yaw-mcp won't start)
 //   2  warnings (e.g., schema-version mismatch, loose file permissions)
 
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -50,7 +50,7 @@ export interface DoctorOptions {
   out?: (s: string) => void;
   /** Disable the npm registry freshness check (tests, offline use). */
   skipRegistryCheck?: boolean;
-  /** Test hook: return the latest-version string for @yawlabs/mcph. */
+  /** Test hook: return the latest-version string for @yawlabs/mcp. */
   registryFetch?: () => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
@@ -60,7 +60,7 @@ export interface DoctorOptions {
   now?: () => number;
 }
 
-// Machine-readable shape emitted by `mcph doctor --json`. Mirrors the
+// Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
 // text sections 1:1 so support / dashboard consumers can pick fields
 // with jq. The raw token is NEVER included — only its fingerprint.
 export interface DoctorJsonSnapshot {
@@ -134,8 +134,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   const os = opts.os ?? CURRENT_OS;
   const env = opts.env ?? process.env;
 
-  print(`mcph doctor — ${new Date().toISOString()}`);
-  print(`mcph version: ${VERSION}`);
+  print(`yaw-mcp doctor — ${new Date().toISOString()}`);
+  print(`yaw-mcp version: ${VERSION}`);
   print(`platform: ${os}`);
   print("");
 
@@ -161,14 +161,14 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   print(`  source: ${config.apiBaseSource}`);
   print("");
 
-  // Behavior-modifier env vars that mcph actually reads at runtime.
+  // Behavior-modifier env vars that yaw-mcp actually reads at runtime.
   // Surfaced here so support diagnostics can see at a glance whether an
   // override is active (e.g., "my auto-load isn't working" — doctor
   // says AUTO_LOAD is not set). TOKEN / URL / DISABLE_PERSISTENCE have
   // their own dedicated sections and are intentionally omitted.
   renderEnvSection({ env, print });
 
-  // Persisted cross-session state — ~/.mcph/state.json. Shows whether
+  // Persisted cross-session state — ~/.yaw-mcp/state.json. Shows whether
   // persistence is disabled by env, and otherwise reports the file path
   // + how fresh the snapshot is + how much signal it carries.
   await renderStateSection({ home, env, print });
@@ -203,12 +203,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     const status = c.unavailable
       ? "unavailable on this OS"
       : c.malformed
-        ? "exists but JSON is malformed — fix or rerun `mcph install`"
+        ? "exists but JSON is malformed — fix or rerun `yaw-mcp install`"
         : c.hasMcphEntry
           ? `OK — has "${ENTRY_NAME}" entry`
           : c.exists
-            ? `present, no "${ENTRY_NAME}" entry — run \`mcph install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}\``
-            : `not configured — run \`mcph install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}\``;
+            ? `present, no "${ENTRY_NAME}" entry — run \`yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}\``
+            : `not configured — run \`yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}\``;
     const label = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
     print(`  ${label} (${c.scope}): ${status}`);
     print(`    ${c.path}`);
@@ -251,8 +251,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   if (staleHint) {
     print("UPGRADE AVAILABLE");
     print(`  Running ${VERSION}; npm latest is ${staleHint}.`);
-    print("  Run `mcph upgrade` to see the exact command for your install, or");
-    print("  `mcph upgrade --run` to execute it (global-npm installs only).");
+    print("  Run `yaw-mcp upgrade` to see the exact command for your install, or");
+    print("  `yaw-mcp upgrade --run` to execute it (global-npm installs only).");
     print("");
   }
 
@@ -260,15 +260,17 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   if (config.token === null) {
     exitCode = 1;
     print("DIAGNOSIS");
-    print("  No token resolved — mcph cannot start.");
-    print("  Run `mcph install <client> --token mcp_pat_…` to seed ~/.mcph/config.json.");
+    print("  No token resolved — yaw-mcp cannot start.");
+    print("  Run `yaw-mcp install <client> --token mcp_pat_…` to seed ~/.yaw-mcp/config.json.");
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     print("DIAGNOSIS");
     print("  Token present, but warnings above need attention.");
   } else {
     print("DIAGNOSIS");
-    print(staleHint ? "  Healthy, but an upgrade is available (see above)." : "  All good. mcph should start cleanly.");
+    print(
+      staleHint ? "  Healthy, but an upgrade is available (see above)." : "  All good. yaw-mcp should start cleanly.",
+    );
   }
 
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
@@ -293,12 +295,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
 
   const envVarNames = [
-    "MCPH_POLL_INTERVAL",
-    "MCPH_SERVER_CAP",
-    "MCPH_MIN_COMPLIANCE",
-    "MCPH_AUTO_LOAD",
-    "MCPH_AUTO_ACTIVATE",
-    "MCPH_PRUNE_RESPONSES",
+    "YAW_MCP_POLL_INTERVAL",
+    "YAW_MCP_SERVER_CAP",
+    "YAW_MCP_MIN_COMPLIANCE",
+    "YAW_MCP_AUTO_LOAD",
+    "YAW_MCP_AUTO_ACTIVATE",
+    "YAW_MCP_PRUNE_RESPONSES",
   ] as const;
   const envOverrides: Record<string, string | null> = {};
   for (const name of envVarNames) {
@@ -306,9 +308,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     envOverrides[name] = raw === undefined || raw === "" ? null : raw;
   }
 
-  // STATE section data. Mirrors renderStateSection: MCPH_DISABLE_PERSISTENCE
+  // STATE section data. Mirrors renderStateSection: YAW_MCP_DISABLE_PERSISTENCE
   // short-circuits, otherwise we peek the file.
-  const persistRaw = env.MCPH_DISABLE_PERSISTENCE;
+  const persistRaw = env.YAW_MCP_DISABLE_PERSISTENCE;
   const persistDisabled =
     persistRaw !== undefined && persistRaw !== "" && (persistRaw === "1" || persistRaw.toLowerCase() === "true");
   const state: DoctorJsonSnapshot["state"] = persistDisabled
@@ -356,12 +358,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   let summary: string;
   if (config.token === null) {
     exitCode = 1;
-    summary = "No token resolved — mcph cannot start.";
+    summary = "No token resolved — yaw-mcp cannot start.";
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     summary = "Token present, but warnings need attention.";
   } else {
-    summary = stale ? "Healthy, but an upgrade is available." : "All good. mcph should start cleanly.";
+    summary = stale ? "Healthy, but an upgrade is available." : "All good. yaw-mcp should start cleanly.";
   }
 
   const snapshotJson: DoctorJsonSnapshot = {
@@ -396,7 +398,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // Prints the STATE section. Broken out so the control flow in
 // runDoctor stays linear — this is already the third file-reading
 // section (config, client probes, history scan).
-// Enumerates the behavior-modifier env vars mcph actually reads so a
+// Enumerates the behavior-modifier env vars yaw-mcp actually reads so a
 // support ticket can paste doctor output and we can tell at a glance
 // which knobs are turned on. Leaves TOKEN / URL / DISABLE_PERSISTENCE
 // to their dedicated sections (they have richer context there).
@@ -409,12 +411,12 @@ function renderEnvSection(opts: {
 }): void {
   const { env, print } = opts;
   const vars: Array<{ name: string; defaultHint: string }> = [
-    { name: "MCPH_POLL_INTERVAL", defaultHint: "default 60s" },
-    { name: "MCPH_SERVER_CAP", defaultHint: "default 6" },
-    { name: "MCPH_MIN_COMPLIANCE", defaultHint: "filter inactive" },
-    { name: "MCPH_AUTO_LOAD", defaultHint: "auto-load inactive" },
-    { name: "MCPH_AUTO_ACTIVATE", defaultHint: "default on" },
-    { name: "MCPH_PRUNE_RESPONSES", defaultHint: "pruning active" },
+    { name: "YAW_MCP_POLL_INTERVAL", defaultHint: "default 60s" },
+    { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
+    { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
+    { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
+    { name: "YAW_MCP_AUTO_ACTIVATE", defaultHint: "default on" },
+    { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
   ];
   const widest = vars.reduce((m, v) => Math.max(m, v.name.length), 0);
   print("ENVIRONMENT (behavior overrides)");
@@ -432,11 +434,11 @@ async function renderStateSection(opts: {
   print: (s?: string) => void;
 }): Promise<void> {
   const { home, env, print } = opts;
-  const raw = env.MCPH_DISABLE_PERSISTENCE;
+  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
   const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
   print("STATE");
   if (disabled) {
-    print("  status: disabled via MCPH_DISABLE_PERSISTENCE");
+    print("  status: disabled via YAW_MCP_DISABLE_PERSISTENCE");
     print("");
     return;
   }
@@ -450,14 +452,14 @@ async function renderStateSection(opts: {
   const peek = await peekStateFile(filePath);
   if (peek.kind === "malformed") {
     print("  status: corrupt -- file exists but JSON is unparseable");
-    print(`  fix:    \`mcph reset-learning\` to clear, or open ${filePath} and fix by hand`);
+    print(`  fix:    \`yaw-mcp reset-learning\` to clear, or open ${filePath} and fix by hand`);
     print(`  detail: ${peek.message}`);
     print("");
     return;
   }
   if (peek.kind === "stale-version") {
-    print(`  status: schema mismatch (file is v${peek.version ?? "?"}, this mcph reads v${peek.expected})`);
-    print("  fix:    `mcph reset-learning` to drop the old file -- learning will rebuild on use");
+    print(`  status: schema mismatch (file is v${peek.version ?? "?"}, this yaw-mcp reads v${peek.expected})`);
+    print("  fix:    `yaw-mcp reset-learning` to drop the old file -- learning will rebuild on use");
     print("");
     return;
   }
@@ -519,7 +521,7 @@ async function renderReliabilitySection(opts: {
   print: (s?: string) => void;
 }): Promise<void> {
   const { home, env, print } = opts;
-  const raw = env.MCPH_DISABLE_PERSISTENCE;
+  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
   const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
   if (disabled) return;
 
@@ -558,7 +560,7 @@ async function renderTrialsSection(opts: {
   const gc = await gcExpiredTrials({ home, env, postEvent, now }).catch(() => ({ cleared: 0, failed: 0 }));
   const scan = await scanTrials({ home, now });
   if (scan.live.length === 0 && gc.cleared === 0 && scan.malformed.length === 0) return;
-  print("TRIALS (mcph try)");
+  print("TRIALS (yaw-mcp try)");
   if (gc.cleared > 0) {
     print(`  swept ${gc.cleared} expired trial${gc.cleared === 1 ? "" : "s"} this run`);
   }
@@ -614,7 +616,7 @@ export function formatRelativeAge(ms: number): string {
 function schemaSuffix(f: LoadedConfigFile): string {
   if (f.version === undefined) return "";
   if (f.version > CURRENT_SCHEMA_VERSION)
-    return ` (schema v${f.version}, this mcph supports v${CURRENT_SCHEMA_VERSION})`;
+    return ` (schema v${f.version}, this yaw-mcp supports v${CURRENT_SCHEMA_VERSION})`;
   return ` (schema v${f.version})`;
 }
 
@@ -624,7 +626,7 @@ interface ProbeOptions {
   cwd: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`. When set, claude-code probes hit
    *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
-   *  `mcph install --list` see the same file Claude Code reads. */
+   *  `yaw-mcp install --list` see the same file Claude Code reads. */
   claudeConfigDir?: string;
 }
 
@@ -774,7 +776,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
   return result;
 }
 
-// Hit the public npm registry for the latest `@yawlabs/mcph` version.
+// Hit the public npm registry for the latest `@yawlabs/mcp` version.
 // Intentionally thin: on ANY error (offline, timeout, rate-limited,
 // corp proxy) we return null and doctor just skips the upgrade section.
 // This function is NEVER awaited on a hot path — it only runs in doctor,
@@ -790,7 +792,7 @@ async function fetchLatestVersion(override?: () => Promise<string | null>): Prom
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 2000);
   try {
-    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcph/latest", {
+    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcp/latest", {
       signal: ac.signal,
       headers: { accept: "application/json" },
     });

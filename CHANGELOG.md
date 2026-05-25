@@ -1,6 +1,90 @@
 # Changelog
 
-All notable changes to `@yawlabs/mcph` are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm.
+All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm.
+
+## 0.58.0 -- Rename to Yaw MCP + local-first Free mode + Pro nag + sync client
+
+### Sync client (bundles)
+
+Three new subcommands for Yaw Business + Yaw MCP Pro buyers:
+
+- `yaw-mcp login --key <license-key>` -- sign in with the license key emailed at purchase. Persists an HMAC-signed `yaw_team` cookie at `~/.yaw-mcp/team-session.json` (mode 0600 on POSIX, user-profile ACLs on Windows). Same cookie + same `/api/team/session` endpoint as Yaw Terminal Business -- one license key unlocks both surfaces.
+- `yaw-mcp logout` -- best-effort POST to `/api/team/session/logout`, then clears the local file.
+- `yaw-mcp sync push | pull | status` -- replicate `~/.yaw-mcp/bundles.json` across machines via the `mcp_bundles` team-resource:
+  - `push` strips env VALUES (preserves keys), PUTs the schema. The server never sees secret values; Phase 6b will add an encrypted `mcp_secrets` vault for syncing those.
+  - `pull` GETs `mcp_bundles`, merges env values from the local file where namespaces overlap (so a machine's local API keys aren't wiped by a pull from a machine that didn't have them), writes the result to `~/.yaw-mcp/bundles.json`.
+  - `status` shows sign-in state, remote version, and a coarse local-vs-remote diff (servers added/removed; env not compared).
+
+All three accept `--json` for scripted use.
+
+Free mode is unchanged -- no account required, no sign-in. The nag interstitial now also suppresses when a team-session cookie is present (signed-in user is not Free), in addition to the existing token-set suppression.
+
+New module: `src/team-sync.ts` (CLI adapter of `yaw/src/team-sync.ts` from Yaw Terminal). New env: `YAW_MCP_TEAM_BASE_URL` (overrides `https://yaw.sh` for Netlify-preview testing).
+
+
+
+### Free-tier nag interstitial
+
+Free-mode `yaw-mcp` users now see a one-shot interstitial roughly every 2-4 human-initiated subcommand invocations, capped at one per 1.5 days. The CLI analogue of Yaw Terminal's click-to-close toast -- same product family, same nudge cadence. Pitches Pro ($9/mo or $90/yr) and Yaw Business ($10/seat/mo or $99/seat/yr) and requires a keypress (Enter) to continue.
+
+Touch points (human-driven subcommands that count toward the cadence):
+- `yaw-mcp install`, `yaw-mcp doctor`, `yaw-mcp servers`, `yaw-mcp bundles`, `yaw-mcp compliance`, `yaw-mcp upgrade`, `yaw-mcp try`, `yaw-mcp try-cleanup`, `yaw-mcp reset-learning`
+
+Suppressed when:
+- A token resolves (account mode -- Pro/Business already paying)
+- Either stdin or stdout is not a TTY (CI, piped output, MCP-client subprocess)
+- `YAW_MCP_NO_NAG=1` is set (escape hatch; intentionally not advertised in help)
+- The bare server invocation (no subcommand) -- the AI client launching yaw-mcp must never be interrupted by a keypress prompt mid-tool-call
+
+State persists at `~/.yaw-mcp/nag-state.json` (separate from `state.json` so `YAW_MCP_DISABLE_PERSISTENCE=1` doesn't dodge the nag, and so the schema stays trivial: 3 numeric fields, no migration path needed). No grace period; counting starts at touch #1. No escalation; cadence stays constant regardless of how many prior nags the user has dismissed.
+
+
+
+**Breaking change.** The package is renamed from `@yawlabs/mcph` to `@yawlabs/mcp`, the binary from `mcph` to `yaw-mcp`. Part of a broader rebrand to Yaw MCP, a product under the Yaw Labs umbrella alongside Yaw Terminal and Yaw Mode. See `plans-v2.md` in the mcp-hosting repo for the strategy doc.
+
+### Local-first Free mode
+
+`yaw-mcp` no longer requires an account. When `YAW_MCP_TOKEN` is unset and `~/.yaw-mcp/config.json` carries no token, the server starts in **local mode**:
+
+- Server definitions load from `~/.yaw-mcp/bundles.json` (user-global) or `<project>/.yaw-mcp/bundles.json` (project-local; takes priority over user-global, no merge)
+- No backend polling, no telemetry, no heartbeat -- nothing leaves the machine
+- `mcp_connect_install` and `mcp_connect_import` return a clear "not available in local mode -- edit bundles.json directly" message
+- `yaw-mcp install <client>` works without `--token`; the launch entry just omits the env var and the client launches yaw-mcp in local mode
+
+The `bundles.json` schema mirrors the existing dashboard server config (id, name, namespace, type, transport, command, args, env, url, isActive, description). Minimal example:
+
+```json
+{
+  "version": 1,
+  "servers": [
+    {
+      "namespace": "github",
+      "name": "GitHub",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_..." }
+    }
+  ]
+}
+```
+
+Account mode (token set) is unchanged: polls `/api/connect/config` from the backend, runs all the telemetry + heartbeat paths, dashboard is the source of truth.
+
+### Rename details
+
+What changes for users on upgrade:
+
+- **Install command**: `npm install -g @yawlabs/mcp` (was `@yawlabs/mcph`). The old package is deprecated with a pointer to the new one.
+- **Binary name**: `yaw-mcp` (was `mcph`). All subcommands invoke the same way: `yaw-mcp install`, `yaw-mcp doctor`, `yaw-mcp servers`, `yaw-mcp bundles`, etc.
+- **Env var prefix**: `YAW_MCP_*` (was `MCPH_*`). Affects `YAW_MCP_TOKEN`, `YAW_MCP_URL`, `YAW_MCP_POLL_INTERVAL`, `YAW_MCP_SERVER_CAP`, `YAW_MCP_MIN_COMPLIANCE`, `YAW_MCP_AUTO_LOAD`, `YAW_MCP_AUTO_ACTIVATE`, `YAW_MCP_AUTO_UPGRADE`, `YAW_MCP_PRUNE_RESPONSES`, `YAW_MCP_DISABLE_PERSISTENCE`, `YAW_MCP_BASE_URL`.
+- **Config dir**: `~/.yaw-mcp/` (was `~/.mcph/`). Project-local: `<project>/.yaw-mcp/`. Existing config files at the old path are not auto-migrated yet (planned in 0.59).
+- **Guide file**: `YAW-MCP.md` inside the config dir (was `MCPH.md`).
+- **Default API base**: `https://yaw.sh/mcp` (was `https://mcp.hosting`). Set `YAW_MCP_URL` to override. `mcp.hosting` will 301 to `yaw.sh/mcp` once the new backend is live.
+- **MCP resource scheme**: `yaw-mcp://guide` (was `mcph://guide`).
+
+Internal code identifiers (`loadMcphConfig`, `composeMcphConfig`, `mcphConfigPath` locals) retain `Mcph` in their names -- those are not user-visible and will be normalized in a follow-up code-hygiene pass.
+
+The dev-checkout regex in `detectInstallMethod` now matches either `/yaw-mcp/(dist|src)/` or `/mcph/(dist|src)/` so the dev path keeps working before the repo dir is renamed.
 
 ## 0.47.2 — 2026-05-01
 

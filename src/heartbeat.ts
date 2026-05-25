@@ -2,14 +2,14 @@ import { request } from "undici";
 import { log } from "./logger.js";
 
 // POST /api/connect/heartbeat — fires when an MCP client (Claude Code,
-// Cursor, Claude Desktop, VS Code, ...) attaches to mcph via stdio and
+// Cursor, Claude Desktop, VS Code, ...) attaches to yaw-mcp via stdio and
 // sends an `initialize` request. Lets mcp.hosting tell apart
-// "mcph polling standalone" (CLI started, no AI client wired) from
-// "AI client driving mcph" (the wiring step is done) — the gap between
+// "yaw-mcp polling standalone" (CLI started, no AI client wired) from
+// "AI client driving yaw-mcp" (the wiring step is done) — the gap between
 // stage 4 and stage 5 in the activation funnel.
 //
 // Two call sites, distinguished by `isRefresh`:
-//   - Attach beacon (isRefresh false): fires once per mcph process on
+//   - Attach beacon (isRefresh false): fires once per yaw-mcp process on
 //     the FIRST `initialize`. The backend increments initialize_count.
 //   - Liveness refresh (isRefresh true): fires on every config-poll
 //     cycle (~60s) for as long as a client stays attached. The backend

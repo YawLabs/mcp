@@ -43,7 +43,7 @@ describe("classifyError", () => {
     ["HTTP 404", "Resource returned 404", "not_found"],
     ["bare not found", "Subscription not found in store", "not_found"],
     [
-      "mcph auto-reconnect failed",
+      "yaw-mcp auto-reconnect failed",
       'Server "ssh" disconnected and auto-reconnect failed: ECONNREFUSED. Use mcp_connect_activate with server "ssh" to reload it manually.',
       "connection_lost",
     ],

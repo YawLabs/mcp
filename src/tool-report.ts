@@ -8,13 +8,13 @@ import { log } from "./logger.js";
 // any user-visible flow.
 //
 // Tolerates a 404 from the backend so older mcp.hosting deployments
-// that don't ship this endpoint stay usable with the new mcph client.
+// that don't ship this endpoint stay usable with the new yaw-mcp client.
 
 let apiUrl = "";
 let token = "";
 
 // Single-slot latch capturing the most recent rejection from the
-// dashboard so `mcph doctor` can surface lost-write-scope (e.g., a
+// dashboard so `yaw-mcp doctor` can surface lost-write-scope (e.g., a
 // rotated token) instead of letting the failure rot silently in the
 // logger. Cleared on the next successful (2xx) post -- a transient 4xx
 // must not pollute doctor output forever. Diagnostic-only: never POSTed

@@ -9,7 +9,7 @@
 //
 // Default is 6 — large enough for the common "2-3 task areas, each
 // with 1-2 servers" shape, small enough to keep tool-list tokens
-// bounded. Ops can raise or lower via MCPH_SERVER_CAP.
+// bounded. Ops can raise or lower via YAW_MCP_SERVER_CAP.
 
 export const DEFAULT_SERVER_CAP = 6;
 
@@ -17,7 +17,7 @@ export const DEFAULT_SERVER_CAP = 6;
 // overrides the default. Invalid values fall back to the default
 // rather than erroring — a typo in env shouldn't brick activations.
 export function resolveServerCap(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.MCPH_SERVER_CAP;
+  const raw = env.YAW_MCP_SERVER_CAP;
   if (raw === undefined || raw === "") return DEFAULT_SERVER_CAP;
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n < 0) return DEFAULT_SERVER_CAP;
@@ -57,6 +57,6 @@ export function evaluateServerCap(namespace: string, loaded: LoadedSlot[], cap: 
 
   return {
     allow: false,
-    message: `Cannot load "${namespace}" — already at the ${cap}-server concurrent cap. Loaded: ${list}. Free a slot with mcp_connect_deactivate, or use mcp_connect_read_tool to inspect one tool without loading its server. Ops can change the limit via MCPH_SERVER_CAP.`,
+    message: `Cannot load "${namespace}" — already at the ${cap}-server concurrent cap. Loaded: ${list}. Free a slot with mcp_connect_deactivate, or use mcp_connect_read_tool to inspect one tool without loading its server. Ops can change the limit via YAW_MCP_SERVER_CAP.`,
   };
 }

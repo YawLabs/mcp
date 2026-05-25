@@ -110,7 +110,7 @@ describe("resolveInstallPath — Claude Code with CLAUDE_CONFIG_DIR override", (
   // Locks the v0.47.2 fix: when Claude Code runs under a wrapper that sets
   // CLAUDE_CONFIG_DIR (Yaw Mode, dev containers, sandboxed sessions), the
   // user-scope `.claude.json` it reads moves to <DIR>/.claude.json. If
-  // mcph install ignores the env, the entry lands in ~/.claude.json while
+  // yaw-mcp install ignores the env, the entry lands in ~/.claude.json while
   // Claude Code is reading from somewhere else — `claude mcp list` shows
   // nothing despite a "successful" install.
 
@@ -330,7 +330,7 @@ describe("buildLaunchEntry", () => {
     const e = buildLaunchEntry({ os: "windows" });
     expect(e.command).toBe("cmd");
     // @latest so npx re-resolves the newest release on every spawn.
-    expect(e.args).toEqual(["/c", "npx", "-y", "@yawlabs/mcph@latest"]);
+    expect(e.args).toEqual(["/c", "npx", "-y", "@yawlabs/mcp@latest"]);
     expect(e.env).toBeUndefined();
   });
 
@@ -338,23 +338,23 @@ describe("buildLaunchEntry", () => {
     for (const os of ["macos", "linux"] as const) {
       const e = buildLaunchEntry({ os });
       expect(e.command).toBe("npx");
-      expect(e.args).toEqual(["-y", "@yawlabs/mcph@latest"]);
+      expect(e.args).toEqual(["-y", "@yawlabs/mcp@latest"]);
     }
   });
 
-  it("embeds MCPH_TOKEN only when token is explicitly passed", () => {
+  it("embeds YAW_MCP_TOKEN only when token is explicitly passed", () => {
     const withToken = buildLaunchEntry({ os: "macos", token: "mcp_pat_abc" });
-    expect(withToken.env).toEqual({ MCPH_TOKEN: "mcp_pat_abc" });
+    expect(withToken.env).toEqual({ YAW_MCP_TOKEN: "mcp_pat_abc" });
     const without = buildLaunchEntry({ os: "macos" });
     expect(without.env).toBeUndefined();
   });
 });
 
 describe("ENTRY_NAME", () => {
-  it("is the stable key mcph writes under mcpServers / servers", () => {
+  it("is the stable key yaw-mcp writes under mcpServers / servers", () => {
     // Doctor depends on this constant to detect an existing install.
-    // If we ever rename it (e.g., "yawlabs-mcph"), user installs collide
-    // until they re-run `mcph install` — document before changing.
+    // If we ever rename it (e.g., "yawlabs-yaw-mcp"), user installs collide
+    // until they re-run `yaw-mcp install` — document before changing.
     expect(ENTRY_NAME).toBe("mcp.hosting");
   });
 });

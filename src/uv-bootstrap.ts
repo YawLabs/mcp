@@ -8,7 +8,7 @@ import { request } from "undici";
 import { log } from "./logger.js";
 import { cacheDir } from "./paths.js";
 
-// Ship the default catalog on the premise that "if mcph runs, every
+// Ship the default catalog on the premise that "if yaw-mcp runs, every
 // server in Explore runs." That means we have to handle Python-based
 // servers (sqlite, time, sentry, and other uvx-launched entries)
 // without forcing users to install `uv` first. On first encounter

@@ -26,7 +26,7 @@ const DEFERRED_INPUT_SCHEMA: Record<string, unknown> = {
 
 function deferredDescription(server: UpstreamServerConfig, cachedDesc: string | undefined): string {
   const base = cachedDesc?.trim();
-  const suffix = `[mcph: server "${server.namespace}" not yet connected — first call activates it]`;
+  const suffix = `[yaw-mcp: server "${server.namespace}" not yet connected — first call activates it]`;
   return base ? `${base}\n\n${suffix}` : suffix;
 }
 
@@ -44,11 +44,11 @@ export type ResourceContents = {
   contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }>;
 };
 
-// A resource mcph itself provides — not proxied from an upstream server.
-// Today the only one is `mcph://guide` (rendered MCPH.md), but the shape
-// is general so future hosts like `mcph://config` or `mcph://health`
+// A resource yaw-mcp itself provides — not proxied from an upstream server.
+// Today the only one is `yaw-mcp://guide` (rendered YAW-MCP.md), but the shape
+// is general so future hosts like `yaw-mcp://config` or `yaw-mcp://health`
 // can slot in the same way. Keeping the read side as a closure means
-// callers (e.g. server.ts) can capture session state without mcph
+// callers (e.g. server.ts) can capture session state without yaw-mcp
 // having to thread request context into proxy.ts.
 export interface BuiltinResource {
   uri: string;
@@ -175,7 +175,7 @@ export function buildToolRoutes(
   return routes;
 }
 
-// Builtins come FIRST in the list — they come from mcph itself and are
+// Builtins come FIRST in the list — they come from yaw-mcp itself and are
 // always present regardless of which servers are activated, so clients
 // that scan the list top-down (Claude Code does) see the guide before
 // the upstream noise.
@@ -248,10 +248,10 @@ export async function routeResourceRead(
   activeConnections: Map<string, UpstreamConnection>,
   builtins?: Map<string, BuiltinResource>,
 ): Promise<ResourceContents> {
-  // Builtin resources are served directly by mcph and never route to an
+  // Builtin resources are served directly by yaw-mcp and never route to an
   // upstream — check them first. A builtin's URI intentionally SHADOWS
   // an upstream URI with the same string, since the builtin is the
-  // canonical answer for mcph-namespaced content (e.g. `mcph://guide`).
+  // canonical answer for yaw-mcp-namespaced content (e.g. `yaw-mcp://guide`).
   const builtin = builtins?.get(uri);
   if (builtin) {
     try {
