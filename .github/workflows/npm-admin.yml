@@ -1,0 +1,74 @@
+name: NPM Admin
+
+# Manual one-shots for npm write ops (deprecate, undeprecate). Auth via
+# the org-level NPM_TOKEN automation secret, which bypasses 2FA --
+# necessary because the local `npm` CLI fires WebAuthn on every write
+# op and EOTPs in non-TTY shells.
+#
+# Trigger from `gh`:
+#   gh workflow run npm-admin.yml \
+#     -f action=deprecate \
+#     -f package=@yawlabs/mcph \
+#     -f message='renamed to @yawlabs/mcp -- install that instead'
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Operation: deprecate | undeprecate'
+        required: true
+        type: choice
+        options:
+          - deprecate
+          - undeprecate
+      package:
+        description: 'Package name, e.g. @yawlabs/mcph'
+        required: true
+      message:
+        description: 'Deprecation message (empty for undeprecate)'
+        required: false
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: ${{ inputs.action }} ${{ inputs.package }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${{ inputs.action }}" in
+            deprecate)
+              npm deprecate "${{ inputs.package }}" "${{ inputs.message }}"
+              ;;
+            undeprecate)
+              # npm uses empty-string message to clear deprecation.
+              npm deprecate "${{ inputs.package }}" ""
+              ;;
+            *)
+              echo "Unknown action: ${{ inputs.action }}" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          # Pull latest version's deprecated field from the registry --
+          # confirms the write landed without exposing the token.
+          LATEST=$(npm view "${{ inputs.package }}" version 2>/dev/null || echo "")
+          DEPRECATED=$(npm view "${{ inputs.package }}@${LATEST}" deprecated 2>/dev/null || echo "")
+          echo "Latest version: $LATEST"
+          echo "Deprecated field on latest: $DEPRECATED"
+          if [ "${{ inputs.action }}" = "deprecate" ] && [ -z "$DEPRECATED" ]; then
+            echo "Expected a non-empty deprecated field after deprecate; got empty" >&2
+            exit 1
+          fi
