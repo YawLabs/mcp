@@ -55,10 +55,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YawLabs/mcph.git"
+    "url": "git+https://github.com/YawLabs/mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/YawLabs/mcph/issues"
+    "url": "https://github.com/YawLabs/mcp/issues"
   },
   "homepage": "https://yaw.sh/mcp"
 }

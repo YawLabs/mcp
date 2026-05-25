@@ -108,7 +108,7 @@ export function detectInstallMethod(argvPath: string | undefined): InstallMethod
   if (/\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "local-node-modules";
   // `npm run dev` or direct `node ./dist/index.js` from a checkout --
   // not installed at all. Match either yaw-mcp (renamed dir) or mcph
-  // (legacy on-disk dir name, repo stays at github.com/YawLabs/mcph).
+  // (legacy on-disk dir name, repo at github.com/YawLabs/mcp (renamed from /mcph 2026-05-25)).
   if (/\/(yaw-mcp|mcph)\/(dist|src)\//.test(normalized)) return "dev-checkout";
   return "unknown";
 }

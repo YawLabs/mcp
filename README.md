@@ -374,4 +374,4 @@ If you find a security issue in mcph itself, email `support@mcp.hosting` — det
 - [mcp.hosting](https://mcp.hosting) — Dashboard and server management
 - [@yawlabs/mcp-compliance](https://www.npmjs.com/package/@yawlabs/mcp-compliance) — Test your MCP servers for spec compliance
 - [CHANGELOG](./CHANGELOG.md) — Release notes
-- [GitHub](https://github.com/YawLabs/mcph) — Source code and issues
+- [GitHub](https://github.com/YawLabs/mcp) — Source code and issues
