@@ -4,6 +4,18 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## 0.58.0 -- Rename to Yaw MCP + local-first Free mode + Pro nag + sync client
 
+### Stats command (`yaw-mcp stats`)
+
+Pro / Yaw Business buyers get a new `yaw-mcp stats` subcommand that prints a digest of their recent AI tool calls. By default shows the last 7 days, capped at the most-recent 50 events; `--limit N` and `--days N` tune the window; `--json` emits machine-readable output for scripting.
+
+Aggregates: by server (calls / success / errors / avg latency) and by AI client (Claude Code, Cursor, Claude Desktop, etc.). Each event records server-stamped `ts` + `seat_email`, plus the client-supplied `tool_namespace`, `tool_name`, `status`, optional `latency_ms`, `error_category`, `client_name`, and `client_version`.
+
+Free users running `yaw-mcp stats` get an upsell pointer instead of empty output -- analytics requires an account.
+
+Phase 5a ships read-only (the command reads `/api/team/analytics` on yaw.sh). Phase 5b will wire runtime event emission from `mcp_connect_dispatch` / `mcp_connect_activate` so events flow automatically; until then only events explicitly POSTed via the team-sync client surface in `yaw-mcp stats`.
+
+New module: `src/stats-cmd.ts`. `team-sync.ts` exports `postAnalyticsEvent` + `listAnalyticsEvents` against the new yaw.sh `mcp_analytics` endpoint.
+
 ### Sync client (bundles)
 
 Three new subcommands for Yaw Business + Yaw MCP Pro buyers:

@@ -383,6 +383,79 @@ export async function putResource<T>(
   };
 }
 
+// ---------------------------------------------------------------------
+// Analytics (Pro / Yaw Business): mcp_analytics endpoint
+// ---------------------------------------------------------------------
+
+export interface AnalyticsEvent {
+  /** Server-assigned on POST. Read-only on GET. */
+  ts: number;
+  /** Server-assigned on POST. */
+  seat_email: string;
+  tool_namespace: string;
+  tool_name: string;
+  status: "success" | "error";
+  latency_ms?: number;
+  error_category?: string;
+  client_name?: string;
+  client_version?: string;
+}
+
+export interface AnalyticsList {
+  events: AnalyticsEvent[];
+  cap: number;
+  order_id: string;
+}
+
+/** POST a single analytics event to the team-analytics endpoint.
+ *  Server stamps `ts` + `seat_email` from the session -- client-supplied
+ *  values are ignored. Returns immediately on auth failure (treats
+ *  401 as "Free user, no telemetry" rather than throwing). */
+export async function postAnalyticsEvent(
+  event: Omit<AnalyticsEvent, "ts" | "seat_email">,
+  opts: BaseOpts = {},
+): Promise<{ ok: boolean }> {
+  const filePath = opts.filePath ?? sessionStatePath(opts.home);
+  const state = await loadStoredState(filePath);
+  if (!state) return { ok: false };
+  const res = await httpJson<{ ok?: boolean; ts?: number; error?: string }>({
+    method: "POST",
+    path: "/api/team/analytics/event",
+    body: event,
+    cookie: state.cookie,
+    baseUrl: opts.baseUrl,
+  });
+  if (res.status === 401) {
+    await clearStoredState(filePath);
+    return { ok: false };
+  }
+  return { ok: res.status === 200 };
+}
+
+/** GET the recent analytics events for the current order. Throws on
+ *  auth failure (caller is `yaw-mcp stats` which surfaces a clear
+ *  "sign in first" message). */
+export async function listAnalyticsEvents(opts: BaseOpts = {}): Promise<AnalyticsList> {
+  const filePath = opts.filePath ?? sessionStatePath(opts.home);
+  const state = await loadStoredState(filePath);
+  if (!state) throw new TeamSyncAuthError();
+  const res = await httpJson<AnalyticsList & { error?: string }>({
+    method: "GET",
+    path: "/api/team/analytics",
+    cookie: state.cookie,
+    baseUrl: opts.baseUrl,
+  });
+  if (res.status === 401) {
+    await clearStoredState(filePath);
+    throw new TeamSyncAuthError();
+  }
+  if (res.status !== 200) {
+    if (res.body.error) log("warn", "team analytics list failed", { status: res.status, error: res.body.error });
+    throw new Error(`Team analytics fetch failed (${res.status}).`);
+  }
+  return { events: res.body.events ?? [], cap: res.body.cap ?? 0, order_id: res.body.order_id ?? "" };
+}
+
 /** Test-only: reset module-scoped state caches. */
 export function _resetForTests(): void {
   invalidateState();
