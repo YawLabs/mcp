@@ -1,4 +1,6 @@
-# mcph Roadmap
+# yaw-mcp Roadmap
+
+> Renamed from `mcph` -> `yaw-mcp` in 0.58.0. Historical env-var names (`MCPH_*`) below are kept as-is for accuracy against the release they shipped in; the current names are `YAW_MCP_*`.
 
 ## Phase 1 — v0.1 (Complete)
 
