@@ -12,7 +12,7 @@ import { getSession } from "./team-sync.js";
 // Two backend paths in this build:
 //
 //   Path A (preferred):  yaw.sh `/api/team/rerank`, authed via the
-//                        yaw_team cookie.  Pro / Yaw Business buyers
+//                        yaw_team cookie.  Pro / Yaw Team buyers
 //                        get rerank automatically once signed in.
 //                        Document embeddings are precomputed at
 //                        catalog-export time and shipped inside the

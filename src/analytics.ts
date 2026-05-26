@@ -83,7 +83,7 @@ export function recordConnectEvent(event: Omit<ConnectAnalyticsEvent, "timestamp
   if (buffer.length >= FLUSH_SIZE) {
     flush().catch(() => {});
   }
-  // Tee-out to team-analytics for Pro / Yaw Business buyers. Fire-and-
+  // Tee-out to team-analytics for Pro / Yaw Team buyers. Fire-and-
   // forget; postAnalyticsEvent no-ops when no team session is cached
   // (Free users + legacy account-mode-only buyers without a yaw_team
   // cookie). Only tool_call events flow to team-analytics -- the

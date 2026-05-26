@@ -1,7 +1,7 @@
 // Nag interstitial for Free-mode users. Fires every 2-4 human-initiated
 // `yaw-mcp` subcommand invocations, capped at one per 1.5 days. The CLI
 // analogue of Yaw Terminal's click-to-close toast -- same product family
-// nudges users toward Pro / Yaw Business when they're getting real value
+// nudges users toward Pro / Yaw Team when they're getting real value
 // out of the Free tier.
 //
 // Two key non-features:
@@ -11,7 +11,7 @@
 //     dismissed 1 nag or 100. Escalation reads as hostile.
 //
 // Suppressed entirely when:
-//   - Token is set (account mode -- Pro/Business already paying)
+//   - Token is set (account mode -- Pro/Team already paying)
 //   - stdout/stdin is not a TTY (CI, piped output, MCP-client subprocess)
 //   - YAW_MCP_NO_NAG=1 (escape hatch; not advertised in help)
 //   - The invoking subcommand is the server itself (no subcommand, no -h,
@@ -239,13 +239,13 @@ export async function showNagInterstitial(opts: ShowNagOpts = {}): Promise<void>
     "|                                                          |",
     "|  You're using Yaw MCP free.                              |",
     "|                                                          |",
-    "|  Pro ($9/mo or $90/yr) adds:                             |",
+    "|  Pro ($5/mo or $50/yr) adds:                             |",
     "|    * sync bundles + secrets across machines              |",
     "|    * encrypted secret vault (never logged)               |",
     "|    * 90-day analytics on AI tool usage                   |",
     "|    * `yaw-mcp stats` command                             |",
     "|                                                          |",
-    "|  Yaw Business ($10/seat/mo or $99/seat/yr) adds:         |",
+    "|  Yaw Team ($15/seat/mo or $150/seat/yr) adds:         |",
     "|    * everything in Pro, per seat                         |",
     "|    * shared team bundles                                 |",
     "|    * shared org secrets                                  |",

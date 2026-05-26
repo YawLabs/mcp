@@ -1,4 +1,4 @@
-// `yaw-mcp login --key <license-key>` -- sign in to a Yaw Business or
+// `yaw-mcp login --key <license-key>` -- sign in to a Yaw Team or
 // Yaw MCP Pro account. Persists a session cookie at
 // ~/.yaw-mcp/team-session.json so subsequent `yaw-mcp sync` calls run
 // without re-prompting.
@@ -10,7 +10,7 @@ import { TeamSyncAuthError, signIn } from "./team-sync.js";
 
 export const LOGIN_USAGE = `Usage: yaw-mcp login --key <license-key>
 
-  Sign in to your Yaw Business or Yaw MCP Pro account. Your license
+  Sign in to your Yaw Team or Yaw MCP Pro account. Your license
   key was emailed after purchase.
 
   --key <license-key>   Required. The license key from your purchase email.

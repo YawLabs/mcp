@@ -1,8 +1,8 @@
 // Team-sync client for yaw-mcp -- adapts yaw/src/team-sync.ts (the
 // Electron version used by Yaw Terminal) to a Node.js CLI. Same backend
 // (yaw.sh /api/team/*), same yaw_team cookie, same HMAC session payload.
-// Yaw Business buyers get one license that grants access to both
-// surfaces (Terminal + MCP); see plans-v2.md "Yaw Business bundling".
+// Yaw Team buyers get one license that grants access to both
+// surfaces (Terminal + MCP); see plans-v2.md "Yaw Team bundling".
 //
 // Persistence: ~/.yaw-mcp/team-session.json with mode 0600 on POSIX
 // (Windows relies on user-profile ACLs). No safeStorage equivalent in
@@ -229,7 +229,7 @@ export interface SignInOpts {
   baseUrl?: string;
 }
 
-/** Sign in with a Yaw Business or Yaw MCP Pro license key. POSTs to
+/** Sign in with a Yaw Team or Yaw MCP Pro license key. POSTs to
  *  /api/team/session, parses the yaw_team cookie, fetches the session
  *  detail (to learn `exp` and `can_edit`), persists locally. Returns
  *  the resolved session. */
@@ -384,7 +384,7 @@ export async function putResource<T>(
 }
 
 // ---------------------------------------------------------------------
-// Analytics (Pro / Yaw Business): mcp_analytics endpoint
+// Analytics (Pro / Yaw Team): mcp_analytics endpoint
 // ---------------------------------------------------------------------
 
 export interface AnalyticsEvent {

@@ -13,7 +13,7 @@ import { type AnalyticsEvent, TeamSyncAuthError, getSession, listAnalyticsEvents
 export const STATS_USAGE = `Usage: yaw-mcp stats [--json] [--limit N] [--days N]
 
   Print a digest of recent AI tool calls recorded against your Yaw MCP
-  Pro or Yaw Business account.
+  Pro or Yaw Team account.
 
   --limit N   Show the most recent N events (default 50, max 1000).
   --days N    Restrict to events from the last N days (default 7).
@@ -170,9 +170,9 @@ export async function runStats(
   const session = await getSession({ home, baseUrl: opts.baseUrl });
   if (!session) {
     const msg =
-      "Not signed in. Yaw MCP analytics requires a Pro or Yaw Business account.\n" +
-      "  - Pro: $9/mo or $90/yr -- https://yaw.sh/mcp#pricing\n" +
-      "  - Yaw Business: $10/seat/mo (includes Yaw Terminal Business)\n" +
+      "Not signed in. Yaw MCP analytics requires a Pro or Yaw Team account.\n" +
+      "  - Pro: $5/mo or $50/yr -- https://yaw.sh/mcp#pricing\n" +
+      "  - Yaw Team: $15/seat/mo (includes Yaw Terminal team features)\n" +
       "Sign in with: yaw-mcp login --key <license-key>";
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: "Not signed in.", upsell: msg })}\n`);
     else io.err(`yaw-mcp stats: ${msg}\n`);

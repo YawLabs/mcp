@@ -63,7 +63,7 @@ const subcommand = process.argv[2];
 // confuse the agent and the user. See plans-v2.md "Nag mechanic".
 if (subcommand && NAG_ELIGIBLE_SUBCOMMANDS.has(subcommand) && process.env.YAW_MCP_NO_NAG !== "1") {
   // Account mode = ANY of: env token, config.json token, or an active
-  // team-session cookie (Pro or Yaw Business buyer who ran `yaw-mcp
+  // team-session cookie (Pro or Yaw Team buyer who ran `yaw-mcp
   // login`). Check the cheapest signal first so the common case skips
   // the heavier loads.
   const envHasToken = typeof process.env.YAW_MCP_TOKEN === "string" && process.env.YAW_MCP_TOKEN.length > 0;

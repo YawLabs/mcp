@@ -219,7 +219,7 @@ describe("showNagInterstitial", () => {
     await p;
     expect(written).toContain("Yaw MCP");
     expect(written).toContain("Pro");
-    expect(written).toContain("Yaw Business");
+    expect(written).toContain("Yaw Team");
     expect(written).toContain("https://yaw.sh/mcp");
   });
 });
