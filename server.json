@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/mcp",
   "description": "mcp.hosting — one install, all your MCP servers, managed from the cloud",
-  "version": "0.57.1",
+  "version": "0.58.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/mcp",
-      "version": "0.57.1",
+      "version": "0.58.1",
       "transport": {
         "type": "stdio"
       }
