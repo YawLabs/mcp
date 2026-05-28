@@ -11,8 +11,6 @@ Yaw MCP (the `yaw-mcp` CLI, package `@yawlabs/mcp`) is an MCP server that fronts
 
 If you use one client on one machine with a handful of servers, `claude mcp add` or hand-editing `mcp.json` is fine -- yaw-mcp's value shows up when that setup stops scaling.
 
-> **Renamed from `@yawlabs/mcph`** (0.58.0). The old binary `mcph`, env-var prefix `MCPH_*`, config dir `~/.mcph/`, and guide file `MCPH.md` are all renamed -- see [CHANGELOG](./CHANGELOG.md) for the full migration list. The `mcph` package is deprecated with a pointer here.
-
 ## How it works
 
 ```
@@ -338,8 +336,6 @@ Rotate a credential in one place (the dashboard), every machine picks up the new
 | `MCP_CONNECT_TIMEOUT` | No | Connection timeout in ms for upstream servers (default: `15000`) |
 | `MCP_CONNECT_IDLE_THRESHOLD` | No | Baseline for idle auto-unload (default: `10`). The per-namespace adaptive cap is `[5, 50]` -- bursty namespaces extend past the baseline, long-idle ones unload at it. |
 
-> Legacy `MCPH_*` env vars are no longer read. If a script still sets `MCPH_TOKEN`, rename it to `YAW_MCP_TOKEN`. The migration is in [CHANGELOG](./CHANGELOG.md) under 0.58.0.
-
 ## Runtime detection
 
 On startup, yaw-mcp probes your machine for `node`, `npx`, `python`, `uvx`, and `docker` and reports the snapshot to yaw.sh/mcp. The dashboard uses this to warn before you add a catalog server whose runtime isn't installed (e.g., adding the Sentry server when Python isn't on your PATH). No prompt, no LLM round-trip -- just a yellow banner on the Add Server form.
@@ -380,5 +376,5 @@ If you find a security issue in yaw-mcp itself, report it via [GitHub's private 
 
 - [yaw.sh/mcp](https://yaw.sh/mcp) -- Dashboard and server management
 - [@yawlabs/mcp-compliance](https://www.npmjs.com/package/@yawlabs/mcp-compliance) -- Test your MCP servers for spec compliance
-- [CHANGELOG](./CHANGELOG.md) -- Release notes (0.58.0 is the rename from `@yawlabs/mcph`)
+- [CHANGELOG](./CHANGELOG.md) -- Release notes
 - [GitHub](https://github.com/YawLabs/mcp) -- Source code and issues
