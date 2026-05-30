@@ -82,7 +82,7 @@ export const META_TOOLS = {
   import_config: {
     name: "mcp_connect_import",
     description:
-      "Install MCP servers on the user's mcp.hosting account by importing an existing client config (Claude Desktop, Cursor, VS Code, etc.). Reads the file, parses the mcpServers section, and creates matching entries on the account so they show up in `mcp_connect_discover`. Supported files: claude_desktop_config.json, mcp.json, settings.json. Env vars are NOT imported — set them in the dashboard.",
+      "Install MCP servers on the user's Yaw MCP account by importing an existing client config (Claude Desktop, Cursor, VS Code, etc.). Reads the file, parses the mcpServers section, and creates matching entries on the account so they show up in `mcp_connect_discover`. Supported files: claude_desktop_config.json, mcp.json, settings.json. Env vars are NOT imported — set them in the dashboard.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -181,7 +181,7 @@ export const META_TOOLS = {
           type: "object",
           additionalProperties: { type: "string" },
           description:
-            "Environment variables the server needs (API tokens, connection strings). Stored encrypted on mcp.hosting. Max 50 keys.",
+            "Environment variables the server needs (API tokens, connection strings). Stored encrypted on yaw.sh/mcp. Max 50 keys.",
         },
         url: {
           type: "string",

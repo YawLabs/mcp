@@ -412,9 +412,16 @@ async function prepareClaudeCodeSettingsPatch(opts: {
   return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true };
 }
 
+/** Allow-pattern that pre-rename installs wrote into Claude Code's
+ *  `permissions.allow`. Stripped on upgrade so a dead wildcard doesn't
+ *  accumulate forever — no live tool name can match it now that
+ *  ENTRY_NAME is "yaw-mcp". */
+const LEGACY_CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp_hosting__*";
+
 /** Union `patterns` into `existing.permissions.allow`, preserving every
  *  other key. Deduplicates by string equality so repeated installs don't
- *  grow the list. Exported for tests. */
+ *  grow the list. Also drops any pre-rename legacy patterns first so
+ *  upgraded installs don't keep a dead wildcard around. Exported for tests. */
 export function mergePermissionsAllow(existing: Record<string, unknown>, patterns: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = { ...existing };
   const prev = out.permissions;
@@ -422,7 +429,7 @@ export function mergePermissionsAllow(existing: Record<string, unknown>, pattern
     typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
   const prevAllow = perms.allow;
   const allow: string[] = Array.isArray(prevAllow)
-    ? (prevAllow as unknown[]).filter((x): x is string => typeof x === "string")
+    ? (prevAllow as unknown[]).filter((x): x is string => typeof x === "string" && x !== LEGACY_CLAUDE_CODE_ALLOW_PATTERN)
     : [];
   for (const p of patterns) {
     if (!allow.includes(p)) allow.push(p);
@@ -676,7 +683,7 @@ export function parseInstallArgs(argv: string[]):
 }
 
 /** `yaw-mcp install --list` — print every client/scope combo for the current
- *  OS and whether mcp.hosting is already wired up. Read-only: never
+ *  OS and whether yaw-mcp is already wired up. Read-only: never
  *  touches a file, never hits the network, works without a token. The
  *  exit code is always 0; this is diagnostic, not gating. */
 async function runInstallList(opts: InstallCommandOptions, log: (s: string) => void): Promise<InstallResult> {
@@ -694,7 +701,7 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
 
   const installed = probes.filter((p) => p.hasMcphEntry).length;
   const available = probes.filter((p) => !p.unavailable).length;
-  log(`${installed}/${available} client scopes have mcp.hosting configured on ${os}.`);
+  log(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
   log("");
 
   const widths = {

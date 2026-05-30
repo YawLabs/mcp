@@ -76,7 +76,7 @@ export function parseServersArgs(
 
 export const SERVERS_USAGE = `Usage: yaw-mcp servers [<namespace-filter>] [--json]
 
-  List the servers configured in your mcp.hosting dashboard.
+  List the servers configured in your yaw.sh/mcp dashboard.
 
   <namespace-filter>   Case-insensitive substring filter on namespace (e.g.,
                        \`yaw-mcp servers git\` matches github + gitlab).

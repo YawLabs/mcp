@@ -234,7 +234,7 @@ if (subcommand === "compliance") {
   Inspection:
     doctor                   Diagnose setup: config, token, clients, learning,
                              upgrade, flaky-namespace reliability rollup.
-    servers [<filter>]       List servers in your mcp.hosting dashboard; the
+    servers [<filter>]       List servers in your yaw.sh/mcp dashboard; the
                              positional arg substring-filters by namespace.
     bundles [list|match]     Browse curated multi-server bundles. \`list\` shows
                              all; \`match\` partitions against your enabled
@@ -252,7 +252,7 @@ if (subcommand === "compliance") {
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP
                              server. --publish posts the report to
-                             mcp.hosting and prints the public URL.
+                             yaw.sh/mcp and prints the public URL.
     help, --help, -h         Show this help.
     --version, -V            Print yaw-mcp version.
 

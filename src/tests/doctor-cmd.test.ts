@@ -96,7 +96,7 @@ describe("runDoctor — output content", () => {
 });
 
 describe("runDoctor — client detection", () => {
-  it("reports Claude Code as configured when an mcp.hosting entry exists in ~/.claude.json", async () => {
+  it("reports Claude Code as configured when a yaw-mcp entry exists in ~/.claude.json", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }),

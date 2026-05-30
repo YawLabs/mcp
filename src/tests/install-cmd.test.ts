@@ -454,7 +454,7 @@ describe("runInstall — VS Code servers shape", () => {
 });
 
 describe("runInstall — preserves existing entries", () => {
-  it("does not clobber unrelated mcpServers when adding mcp.hosting", async () => {
+  it("does not clobber unrelated mcpServers when adding yaw-mcp", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({ model: "claude-opus-4-7", mcpServers: { spend: { url: "https://x" } } }, null, 2),
@@ -814,7 +814,7 @@ describe("runInstall --list (read-only)", () => {
     expect(out).toContain("0/");
   });
 
-  it("detects an installed mcp.hosting entry in ~/.claude.json", async () => {
+  it("detects an installed yaw-mcp entry in ~/.claude.json", async () => {
     // Seed Claude Code user-scope config with the entry.
     writeFileSync(
       join(synthHome, ".claude.json"),
@@ -833,7 +833,7 @@ describe("runInstall --list (read-only)", () => {
     const out = cap.stdout();
     expect(out).toMatch(/Claude Code\s+user\s+~[\\/].claude\.json\s+installed/);
     // At least one scope is configured; headline reflects that.
-    expect(out).toMatch(/^\d+\/\d+ client scopes have mcp\.hosting configured on linux\./m);
+    expect(out).toMatch(/^\d+\/\d+ client scopes have yaw-mcp configured on linux\./m);
   });
 
   it("reports `malformed` for unparseable client config", async () => {

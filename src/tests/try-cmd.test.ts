@@ -402,7 +402,7 @@ describe("runTry — fetch failure", () => {
 });
 
 describe("runTry — preserves existing client config siblings", () => {
-  it("does not stomp the canonical mcp.hosting entry or any other server", async () => {
+  it("does not stomp the canonical yaw-mcp entry or any other server", async () => {
     // Pre-populate ~/.claude.json with the canonical yaw-mcp entry and an
     // unrelated server.
     writeFileSync(

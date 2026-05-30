@@ -1982,7 +1982,7 @@ export class ConnectServer {
     }
     if (!this.config || this.config.servers.length === 0) {
       return {
-        content: [{ type: "text", text: "No servers installed. Add servers at mcp.hosting to get started." }],
+        content: [{ type: "text", text: "No servers installed. Add servers at yaw.sh/mcp to get started." }],
         isError: true,
       };
     }
@@ -1996,7 +1996,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `No servers enabled${note}. Enable servers at mcp.hosting or re-run mcp_connect_discover.`,
+            text: `No servers enabled${note}. Enable servers at yaw.sh/mcp or re-run mcp_connect_discover.`,
           },
         ],
         isError: true,
@@ -2027,7 +2027,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `No installed server matches "${trimmed}". Use mcp_connect_discover to see what's installed, or add a relevant server at mcp.hosting.`,
+            text: `No installed server matches "${trimmed}". Use mcp_connect_discover to see what's installed, or add a relevant server at yaw.sh/mcp.`,
           },
         ],
         isError: true,
@@ -2516,7 +2516,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `Imported ${body.imported || 0} servers (${namespaceList})${body.skipped ? `, ${body.skipped} skipped (already exist)` : ""} from ${resolved}.${collisionWarning}\n\nNote: environment variables (API keys, tokens) were NOT imported for security — set them at mcp.hosting.\nUse mcp_connect_discover to see imported servers.`,
+            text: `Imported ${body.imported || 0} servers (${namespaceList})${body.skipped ? `, ${body.skipped} skipped (already exist)` : ""} from ${resolved}.${collisionWarning}\n\nNote: environment variables (API keys, tokens) were NOT imported for security — set them at yaw.sh/mcp.\nUse mcp_connect_discover to see imported servers.`,
           },
         ],
       };
@@ -2644,9 +2644,9 @@ export class ConnectServer {
           : undefined;
       let text: string;
       if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
-        text = "Install timed out talking to mcp.hosting. Retry in a moment.";
+        text = "Install timed out talking to yaw.sh/mcp. Retry in a moment.";
       } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
-        text = "Couldn't reach mcp.hosting (network unreachable or DNS failure). Check your connection and retry.";
+        text = "Couldn't reach yaw.sh/mcp (network unreachable or DNS failure). Check your connection and retry.";
       } else {
         text = "Install failed unexpectedly. Check yaw-mcp logs on this machine for the underlying error.";
       }
