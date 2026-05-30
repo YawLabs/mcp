@@ -154,6 +154,49 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).toMatch(/run `yaw-mcp install claude-code`/);
   });
 
+  it("surfaces a legacy `mcp.hosting` entry alongside the new one as a trim hint", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "npx" },
+          "mcp.hosting": { command: "npx" },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+    });
+    const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(userScope?.hasMcphEntry).toBe(true);
+    expect(userScope?.hasLegacyEntry).toBe(true);
+    expect(cap.text()).toMatch(/legacy "mcp\.hosting" entry also present/);
+  });
+
+  it("suggests `install` to migrate when only a legacy `mcp.hosting` entry is present", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx" } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+    });
+    const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(userScope?.hasMcphEntry).toBe(false);
+    expect(userScope?.hasLegacyEntry).toBe(true);
+    expect(cap.text()).toMatch(/legacy "mcp\.hosting" entry present .* run `yaw-mcp install claude-code`/);
+  });
+
   it("under CLAUDE_CONFIG_DIR, probes <DIR>/.claude.json — not the home file", async () => {
     // Sets up the trap: home has the entry, wrapper dir does NOT.
     // Doctor must report claude-code user as "not configured" (not "OK"),

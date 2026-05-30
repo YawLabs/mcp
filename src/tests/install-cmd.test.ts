@@ -216,6 +216,15 @@ describe("mergePermissionsAllow", () => {
     expect(perms.additionalDirectories).toEqual(["/tmp"]);
     expect(perms.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
   });
+
+  it("strips the pre-rename mcp__mcp_hosting__* legacy pattern on upgrade", () => {
+    const existing = { permissions: { allow: ["Bash(git *)", "mcp__mcp_hosting__*"] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    const allow = (merged.permissions as { allow: string[] }).allow;
+    expect(allow).not.toContain("mcp__mcp_hosting__*");
+    expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    expect(allow).toContain("Bash(git *)");
+  });
 });
 
 describe("runInstall — settings.json merge edge cases (claude-code)", () => {
@@ -321,6 +330,28 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
 
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(settings.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+
+  it("warns when a legacy `mcp.hosting` entry is present in the client config", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx", args: ["-y", "@yawlabs/mcp"] } } }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry detected/);
+    // New entry written without removing the legacy one (commit chose no auto-migration).
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(client.mcpServers["mcp.hosting"]).toBeDefined();
   });
 });
 

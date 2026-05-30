@@ -345,6 +345,12 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
  *  collisions deterministically. */
 export const ENTRY_NAME = "yaw-mcp";
 
+/** Entry key pre-rename installs wrote under. Doctor + install detect this
+ *  so users upgrading from a pre-rename install get a visible nudge instead
+ *  of silently ending up with two parallel yaw-mcp processes spawning from
+ *  the same client config. Nothing in the runtime writes this key anymore. */
+export const LEGACY_ENTRY_NAME = "mcp.hosting";
+
 /** Pattern added to Claude Code's `permissions.allow` on install so the
  *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
  *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).

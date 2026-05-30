@@ -37,6 +37,7 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  LEGACY_ENTRY_NAME,
   buildLaunchEntry,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
@@ -233,7 +234,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     }
     const container = readNested(existing, containerPath);
     if (typeof container === "object" && container !== null && !Array.isArray(container)) {
-      existingHasEntry = ENTRY_NAME in (container as Record<string, unknown>);
+      const c = container as Record<string, unknown>;
+      existingHasEntry = ENTRY_NAME in c;
+      if (LEGACY_ENTRY_NAME in c) {
+        log(
+          `Note: legacy "${LEGACY_ENTRY_NAME}" entry detected at ${resolved.absolute}. Remove it by hand after this install to avoid two yaw-mcp processes spawning.`,
+        );
+      }
     }
   }
 

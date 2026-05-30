@@ -32,6 +32,7 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  LEGACY_ENTRY_NAME,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -98,6 +99,10 @@ export interface ClientProbeResult {
   path: string;
   exists: boolean;
   hasMcphEntry: boolean;
+  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced so
+   *  upgraded users know to trim by hand — nothing in the runtime writes
+   *  this key anymore. */
+  hasLegacyEntry: boolean;
   malformed: boolean;
   unavailable: boolean;
 }
@@ -200,15 +205,20 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
+    const installCmd = `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
     const status = c.unavailable
       ? "unavailable on this OS"
       : c.malformed
         ? "exists but JSON is malformed — fix or rerun `yaw-mcp install`"
         : c.hasMcphEntry
-          ? `OK — has "${ENTRY_NAME}" entry`
-          : c.exists
-            ? `present, no "${ENTRY_NAME}" entry — run \`yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}\``
-            : `not configured — run \`yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}\``;
+          ? c.hasLegacyEntry
+            ? `OK — has "${ENTRY_NAME}" entry; legacy "${LEGACY_ENTRY_NAME}" entry also present — remove it to avoid dual-spawn`
+            : `OK — has "${ENTRY_NAME}" entry`
+          : c.hasLegacyEntry
+            ? `legacy "${LEGACY_ENTRY_NAME}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`
+            : c.exists
+              ? `present, no "${ENTRY_NAME}" entry — run \`${installCmd}\``
+              : `not configured — run \`${installCmd}\``;
     const label = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
     print(`  ${label} (${c.scope}): ${status}`);
     print(`    ${c.path}`);
@@ -641,6 +651,7 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         path: "(n/a)",
         exists: false,
         hasMcphEntry: false,
+        hasLegacyEntry: false,
         malformed: false,
         unavailable: true,
       });
@@ -667,6 +678,7 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
       }
       const exists = existsSync(resolved.absolute);
       let hasMcphEntry = false;
+      let hasLegacyEntry = false;
       let malformed = false;
       if (exists) {
         try {
@@ -679,7 +691,10 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
             const parsed = parseJsonc(raw);
             if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
               const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
-              if (container) hasMcphEntry = ENTRY_NAME in container;
+              if (container) {
+                hasMcphEntry = ENTRY_NAME in container;
+                hasLegacyEntry = LEGACY_ENTRY_NAME in container;
+              }
             } else {
               malformed = true;
             }
@@ -694,6 +709,7 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         path: resolved.absolute,
         exists,
         hasMcphEntry,
+        hasLegacyEntry,
         malformed,
         unavailable: false,
       });
@@ -729,6 +745,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         path: "(n/a)",
         exists: false,
         hasMcphEntry: false,
+        hasLegacyEntry: false,
         malformed: false,
         unavailable: true,
       });
@@ -745,6 +762,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
       });
       const exists = existsSync(resolved.absolute);
       let hasMcphEntry = false;
+      let hasLegacyEntry = false;
       let malformed = false;
       if (exists) {
         try {
@@ -753,7 +771,10 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
             const parsed = parseJsonc(raw);
             if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
               const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
-              if (container) hasMcphEntry = ENTRY_NAME in container;
+              if (container) {
+                hasMcphEntry = ENTRY_NAME in container;
+                hasLegacyEntry = LEGACY_ENTRY_NAME in container;
+              }
             } else {
               malformed = true;
             }
@@ -768,6 +789,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         path: resolved.absolute,
         exists,
         hasMcphEntry,
+        hasLegacyEntry,
         malformed,
         unavailable: false,
       });
