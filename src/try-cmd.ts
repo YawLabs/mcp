@@ -549,7 +549,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
 
   // If a previous trial of the same slug is wired, overwrite it (the
   // user is re-running `try`, presumably with a different --ttl or env).
-  // We never collide with the canonical "mcp.hosting" entry — trials
+  // We never collide with the canonical "yaw-mcp" entry — trials
   // live under their own `yaw-mcp-try-<slug>` name.
   const merged = mergeClientConfig(existing, resolved.containerPath, entry, entryName);
   const clientJson = `${JSON.stringify(merged, null, 2)}\n`;

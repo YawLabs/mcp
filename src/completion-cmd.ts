@@ -171,7 +171,7 @@ function renderZsh(): string {
   const subcommandDescriptions: Record<string, string> = {
     install: "Auto-edit an MCP client's config",
     doctor: "Print diagnostic of yaw-mcp setup",
-    servers: "List servers in your mcp.hosting dashboard",
+    servers: "List servers in your yaw.sh/mcp dashboard",
     bundles: "Browse curated multi-server bundles",
     compliance: "Run the compliance suite against a server",
     "reset-learning": "Clear cross-session learning history",

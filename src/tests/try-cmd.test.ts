@@ -239,7 +239,7 @@ describe("runTry — happy path", () => {
     const entry = client.mcpServers["yaw-mcp-try-demo"];
     expect(entry.command).toBe("npx");
     expect(entry.args).toEqual(["-y", "@demo/mcp"]);
-    // The canonical yaw-mcp.hosting entry is NOT created by `try`.
+    // The canonical yaw-mcp entry is NOT created by `try`.
     expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
 
     // anonId seeded.

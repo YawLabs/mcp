@@ -13,7 +13,7 @@
 //   match   Pulls the user's installed server namespaces from the backend
 //           and partitions the bundles into "ready to activate" vs
 //           "partially installed" vs "ignored" (zero overlap). Requires
-//           a resolvable token and a working connection to mcp.hosting.
+//           a resolvable token and a working connection to yaw.sh/mcp.
 //
 // Output is human-readable text by default. `--json` on either action
 // emits a machine-readable shape for pipeline use.

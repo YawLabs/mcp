@@ -5,7 +5,7 @@
 //   - guide: auto-generated "Installed servers" section appended to YAW-MCP.md
 //   - doctor: scan shell history for shadowed-CLI invocations
 //
-// Covers every slug in the mcp.hosting Explore catalog so a user who
+// Covers every slug in the yaw.sh/mcp Explore catalog so a user who
 // imports from the catalog with the default namespace gets the hint
 // with no configuration. Namespace keys are lowercased at lookup time.
 // Well-known alias namespaces (gh, k8s, pg, …) are also registered so

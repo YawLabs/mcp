@@ -1,5 +1,5 @@
 // Curated multi-server bundles — static client-side data, not fetched from
-// mcp.hosting. Each bundle is a "stack" of namespaces that commonly ship
+// yaw.sh/mcp. Each bundle is a "stack" of namespaces that commonly ship
 // together for a known workflow (on-call triage, PR review, etc.). The
 // `mcp_connect_bundles` meta-tool surfaces these so the model can activate
 // a coherent preset in one step instead of juggling discover + load.

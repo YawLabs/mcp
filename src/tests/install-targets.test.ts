@@ -353,8 +353,6 @@ describe("buildLaunchEntry", () => {
 describe("ENTRY_NAME", () => {
   it("is the stable key yaw-mcp writes under mcpServers / servers", () => {
     // Doctor depends on this constant to detect an existing install.
-    // If we ever rename it (e.g., "yawlabs-yaw-mcp"), user installs collide
-    // until they re-run `yaw-mcp install` — document before changing.
-    expect(ENTRY_NAME).toBe("mcp.hosting");
+    expect(ENTRY_NAME).toBe("yaw-mcp");
   });
 });

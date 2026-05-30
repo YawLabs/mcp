@@ -5,7 +5,7 @@
 //
 // Two files are touched per run:
 //   1. The client's config file (e.g., ~/.claude.json for Claude Code
-//      user scope) — the "mcp.hosting" launch entry is merged in,
+//      user scope) — the "yaw-mcp" launch entry is merged in,
 //      preserving any other `mcpServers` / `servers` keys the user
 //      already has, plus every sibling along the container key path
 //      (Claude Code local scope nests under projects[<absDir>].mcpServers).
@@ -15,7 +15,7 @@
 //
 // Failure semantics:
 //   - Existing client file with malformed JSON  → refuse, point at the file.
-//   - Existing `mcp.hosting` entry              → prompt (TTY) or refuse
+//   - Existing `yaw-mcp` entry                  → prompt (TTY) or refuse
 //                                                  with --force/--skip flag.
 //   - No token anywhere + non-TTY               → refuse with usage hint.
 //   - --dry-run                                  → print the would-be diff
@@ -52,15 +52,15 @@ export interface InstallCommandOptions {
   projectDir?: string;
   /** Token to write to ~/.yaw-mcp/config.json. If absent, uses existing token there. */
   token?: string;
-  /** Overwrite an existing mcp.hosting entry without prompting. */
+  /** Overwrite an existing yaw-mcp entry without prompting. */
   force?: boolean;
-  /** Leave an existing mcp.hosting entry untouched (exit 0). */
+  /** Leave an existing yaw-mcp entry untouched (exit 0). */
   skip?: boolean;
   /** Print the changes that would be made and exit without writing. */
   dryRun?: boolean;
   /** When true, do not write/update ~/.yaw-mcp/config.json — only the client config. */
   skipMcphConfig?: boolean;
-  /** Read-only: enumerate clients and show which scopes already host an mcp.hosting entry. */
+  /** Read-only: enumerate clients and show which scopes already host a yaw-mcp entry. */
   listOnly?: boolean;
   /** Install into every client available on this OS in one shot. */
   all?: boolean;
@@ -469,7 +469,7 @@ export function readNested(root: Record<string, unknown>, containerPath: string[
  *  does not mutate. For Claude Code local scope, containerPath is
  *  ["projects", <absDir>, "mcpServers"] and this preserves every other
  *  project's settings + every other top-level key in ~/.claude.json.
- *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp.hosting entry);
+ *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp entry);
  *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
  *  next to a real yaw-mcp install without colliding. */
 export function mergeClientConfig(

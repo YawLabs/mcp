@@ -310,7 +310,7 @@ export interface BuildLaunchEntryOptions {
   };
 }
 
-/** The MCP client `mcpServers["mcp.hosting"]` entry — what `install` writes. */
+/** The MCP client `mcpServers["yaw-mcp"]` entry — what `install` writes. */
 export interface LaunchEntry {
   command: string;
   args: string[];
@@ -343,13 +343,15 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
 /** The entry key we write into `mcpServers` (Claude Code / Desktop / Cursor)
  *  or `servers` (VS Code). Stable across clients so doctor can detect
  *  collisions deterministically. */
-export const ENTRY_NAME = "mcp.hosting";
+export const ENTRY_NAME = "yaw-mcp";
 
 /** Pattern added to Claude Code's `permissions.allow` on install so the
  *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
  *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).
- *  Keep in sync with the tool-name prefix our proxy exposes. */
-export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp_hosting__*";
+ *  Keep in sync with the tool-name prefix our proxy exposes -- Claude Code
+ *  derives the prefix from ENTRY_NAME by replacing non-alphanumeric chars
+ *  with underscores, so "yaw-mcp" becomes "mcp__yaw_mcp__". */
+export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__yaw_mcp__*";
 
 /** Resolve the Claude Code settings.json file that holds `permissions.allow`.
  *  Different from the mcpServers path (`~/.claude.json`): permissions live
