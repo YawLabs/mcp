@@ -176,6 +176,7 @@ describe("runDoctor — client detection", () => {
     expect(userScope?.hasMcphEntry).toBe(true);
     expect(userScope?.hasLegacyEntry).toBe(true);
     expect(cap.text()).toMatch(/legacy "mcp\.hosting" entry also present/);
+    expect(cap.text()).toMatch(/running yaw-mcp twice/);
   });
 
   it("suggests `install` to migrate when only a legacy `mcp.hosting` entry is present", async () => {

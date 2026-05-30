@@ -347,11 +347,58 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry detected/);
+    expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry remains/);
+    expect(cap.stdout()).toMatch(/running yaw-mcp twice/);
     // New entry written without removing the legacy one (commit chose no auto-migration).
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
     expect(client.mcpServers["mcp.hosting"]).toBeDefined();
+  });
+
+  it("--dry-run with a legacy entry says `would remain`, not `remains`", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx" } } }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      dryRun: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry .* would remain/);
+    // File is untouched on dry-run.
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
+  });
+
+  it("--skip on existing yaw-mcp entry does not log the legacy hint", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "npx" },
+          "mcp.hosting": { command: "npx" },
+        },
+      }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      skip: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).not.toMatch(/legacy "mcp\.hosting"/);
   });
 });
 

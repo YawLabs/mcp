@@ -206,19 +206,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
     const installCmd = `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
-    const status = c.unavailable
-      ? "unavailable on this OS"
-      : c.malformed
-        ? "exists but JSON is malformed — fix or rerun `yaw-mcp install`"
-        : c.hasMcphEntry
-          ? c.hasLegacyEntry
-            ? `OK — has "${ENTRY_NAME}" entry; legacy "${LEGACY_ENTRY_NAME}" entry also present — remove it to avoid dual-spawn`
-            : `OK — has "${ENTRY_NAME}" entry`
-          : c.hasLegacyEntry
-            ? `legacy "${LEGACY_ENTRY_NAME}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`
-            : c.exists
-              ? `present, no "${ENTRY_NAME}" entry — run \`${installCmd}\``
-              : `not configured — run \`${installCmd}\``;
+    const status = renderClientStatus(c, installCmd);
     const label = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
     print(`  ${label} (${c.scope}): ${status}`);
     print(`    ${c.path}`);
@@ -628,6 +616,23 @@ function schemaSuffix(f: LoadedConfigFile): string {
   if (f.version > CURRENT_SCHEMA_VERSION)
     return ` (schema v${f.version}, this yaw-mcp supports v${CURRENT_SCHEMA_VERSION})`;
   return ` (schema v${f.version})`;
+}
+
+/** One-line status string for the CLIENTS section of doctor output.
+ *  Centralises the per-state wording so the renderer in `runDoctor`
+ *  doesn't carry a nested ternary tree as more states get added. */
+function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
+  if (c.unavailable) return "unavailable on this OS";
+  if (c.malformed) return "exists but JSON is malformed — fix or rerun `yaw-mcp install`";
+  if (c.hasMcphEntry && c.hasLegacyEntry) {
+    return `OK — has "${ENTRY_NAME}" entry; legacy "${LEGACY_ENTRY_NAME}" entry also present — remove it to avoid running yaw-mcp twice`;
+  }
+  if (c.hasMcphEntry) return `OK — has "${ENTRY_NAME}" entry`;
+  if (c.hasLegacyEntry) {
+    return `legacy "${LEGACY_ENTRY_NAME}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
+  }
+  if (c.exists) return `present, no "${ENTRY_NAME}" entry — run \`${installCmd}\``;
+  return `not configured — run \`${installCmd}\``;
 }
 
 interface ProbeOptions {

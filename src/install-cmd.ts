@@ -207,6 +207,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
   let existingHasEntry = false;
+  let legacyPresent = false;
   if (existsSync(resolved.absolute)) {
     let raw: string;
     try {
@@ -236,11 +237,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     if (typeof container === "object" && container !== null && !Array.isArray(container)) {
       const c = container as Record<string, unknown>;
       existingHasEntry = ENTRY_NAME in c;
-      if (LEGACY_ENTRY_NAME in c) {
-        log(
-          `Note: legacy "${LEGACY_ENTRY_NAME}" entry detected at ${resolved.absolute}. Remove it by hand after this install to avoid two yaw-mcp processes spawning.`,
-        );
-      }
+      legacyPresent = LEGACY_ENTRY_NAME in c;
     }
   }
 
@@ -306,6 +303,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     if (writeMcphConfig) log(`# ${mcphConfigPath}\n${mcphConfigJson}`);
     log(`\n# ${resolved.absolute}\n${clientJson}`);
     if (settingsPatch?.changed) log(`# ${settingsPatch.path}\n${settingsPatch.nextJson}`);
+    if (legacyPresent) {
+      log(
+        `Note: legacy "${LEGACY_ENTRY_NAME}" entry at ${resolved.absolute} would remain — remove it to avoid running yaw-mcp twice.`,
+      );
+    }
     const wouldWrite: string[] = [];
     if (writeMcphConfig) wouldWrite.push(mcphConfigPath);
     wouldWrite.push(resolved.absolute);
@@ -366,6 +368,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
 
   if (target.notes) log(`Note: ${target.notes}`);
+  if (legacyPresent) {
+    log(
+      `Note: legacy "${LEGACY_ENTRY_NAME}" entry remains at ${resolved.absolute}. Remove it to avoid running yaw-mcp twice.`,
+    );
+  }
   log(`\n✓ ${target.label} is configured. Restart it to pick up the new MCP server.`);
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }
@@ -436,7 +443,9 @@ export function mergePermissionsAllow(existing: Record<string, unknown>, pattern
     typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
   const prevAllow = perms.allow;
   const allow: string[] = Array.isArray(prevAllow)
-    ? (prevAllow as unknown[]).filter((x): x is string => typeof x === "string" && x !== LEGACY_CLAUDE_CODE_ALLOW_PATTERN)
+    ? (prevAllow as unknown[]).filter(
+        (x): x is string => typeof x === "string" && x !== LEGACY_CLAUDE_CODE_ALLOW_PATTERN,
+      )
     : [];
   for (const p of patterns) {
     if (!allow.includes(p)) allow.push(p);
