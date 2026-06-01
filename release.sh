@@ -31,24 +31,36 @@ TOTAL_STEPS=7
 # tool's OUTPUT -- not the exit code -- is authoritative:
 #   1. real findings in the output ($3) => hard fail, even on this box;
 #   2. clean exit 0                      => pass;
-#   3. 139/SIGSEGV or 134/SIGABRT on the ARM64 box with no findings (and the
-#      optional completion marker $4 present, when given) => tolerate + warn;
+#   3. 139/SIGSEGV or 134/SIGABRT on the ARM64 box => tolerate ONLY after
+#      confirming the tool actually ran clean: a completion marker ($4) in the
+#      captured output, OR a direct re-run ($5, bypassing the npm-run wrapper)
+#      that exits 0.  A segfault with neither evidence is a hard fail -- the
+#      tool may have crashed before doing its work (tsc prints nothing on a
+#      clean run, so it has no marker and relies on the $5 re-run).
 #   4. anything else                     => fail.
 # On every other platform a non-zero exit is a hard failure -- no tolerance.
-# $1 label  $2 npm script  $3 ERE matching a real failure  $4 (opt) ERE
-# proving the tool actually ran.
+# $1 label  $2 npm script  $3 ERE matching a real failure  $4 (opt) ERE proving
+# the tool ran  $5 (opt) direct verify command (NOT via `npm run`) re-run when
+# tolerating a tool that prints no completion marker (e.g. `npx tsc --noEmit`).
 run_npm_check() {
-  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" out rc
+  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc
   out=$(npm run "$script" 2>&1); rc=$?
   printf '%s\n' "$out"
   if echo "$out" | grep -qE "$fail_re"; then
     fail "$label failed"
   fi
   [ "$rc" -eq 0 ] && return 0
-  if [ "$IS_MINGW_ARM64" = true ] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; } \
-     && { [ -z "$done_re" ] || echo "$out" | grep -qE "$done_re"; }; then
-    warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault) but the tool reported no findings -- tolerating"
-    return 0
+  if [ "$IS_MINGW_ARM64" = true ] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; }; then
+    if [ -n "$done_re" ] && echo "$out" | grep -qE "$done_re"; then
+      warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault) but the tool completed with no findings -- tolerating"
+      return 0
+    fi
+    # No completion marker -> re-run the check directly (no npm-run wrapper, so
+    # no segfault) to prove it's actually clean before tolerating.
+    if [ -n "$verify_cmd" ] && $verify_cmd >/dev/null 2>&1; then
+      warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault); a direct re-run is clean -- tolerating"
+      return 0
+    fi
   fi
   fail "$label failed (exit $rc)"
 }
@@ -141,7 +153,7 @@ fi
 
 step 1 "Lint"
 run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'
-run_npm_check "Type check" typecheck 'error TS[0-9]'
+run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 info "Lint passed"
 
 step 2 "Test"
