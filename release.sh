@@ -25,6 +25,34 @@ fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
+# Run an `npm run <script>` single-tool check (lint / typecheck) that may hit
+# the MINGW64-ARM64 npm-run cleanup segfault (see IS_MINGW_ARM64 below). The
+# crash fires AFTER the tool has finished and printed its full report, so the
+# tool's OUTPUT -- not the exit code -- is authoritative:
+#   1. real findings in the output ($3) => hard fail, even on this box;
+#   2. clean exit 0                      => pass;
+#   3. 139/SIGSEGV or 134/SIGABRT on the ARM64 box with no findings (and the
+#      optional completion marker $4 present, when given) => tolerate + warn;
+#   4. anything else                     => fail.
+# On every other platform a non-zero exit is a hard failure -- no tolerance.
+# $1 label  $2 npm script  $3 ERE matching a real failure  $4 (opt) ERE
+# proving the tool actually ran.
+run_npm_check() {
+  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" out rc
+  out=$(npm run "$script" 2>&1); rc=$?
+  printf '%s\n' "$out"
+  if echo "$out" | grep -qE "$fail_re"; then
+    fail "$label failed"
+  fi
+  [ "$rc" -eq 0 ] && return 0
+  if [ "$IS_MINGW_ARM64" = true ] && { [ "$rc" -eq 139 ] || [ "$rc" -eq 134 ]; } \
+     && { [ -z "$done_re" ] || echo "$out" | grep -qE "$done_re"; }; then
+    warn "$label: npm exited $rc (ARM64 npm-run cleanup segfault) but the tool reported no findings -- tolerating"
+    return 0
+  fi
+  fail "$label failed (exit $rc)"
+}
+
 # Parse args. Supports a leading -y/--yes for non-interactive mode (used
 # when mcp-hosting's release.sh delegates here at the synced-version step --
 # the parent script has already confirmed the release).
@@ -62,6 +90,17 @@ echo -e "${CYAN}Pre-flight checks...${NC}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# This MINGW64 build on Windows ARM64 intermittently segfaults in npm's own
+# exit cleanup AFTER an `npm run <script>` tool has finished and printed its
+# report -- corrupting only the exit code (139/SIGSEGV, sometimes 134/SIGABRT)
+# on an otherwise-clean run. run_npm_check() tolerates that signature on THIS
+# box only. `uname -m` reports x86_64 under emulation, so key off the ARM64
+# marker in `uname -s`, not -m.
+IS_MINGW_ARM64=false
+case "$(uname -s 2>/dev/null)" in
+  MINGW*ARM64* | MSYS*ARM64* | CYGWIN*ARM64*) IS_MINGW_ARM64=true ;;
+esac
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
@@ -101,8 +140,8 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ] && [ "$SKIP_CONFIRM" != "
 fi
 
 step 1 "Lint"
-npm run lint || fail "Lint failed"
-npm run typecheck || fail "Type check failed"
+run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'
+run_npm_check "Type check" typecheck 'error TS[0-9]'
 info "Lint passed"
 
 step 2 "Test"
