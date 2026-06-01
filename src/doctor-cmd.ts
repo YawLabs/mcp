@@ -256,10 +256,16 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
 
   let exitCode = 0;
   if (config.token === null) {
-    exitCode = 1;
+    // No token is NOT an error: yaw-mcp runs in local/Free mode, serving
+    // whatever is in ~/.yaw-mcp/bundles.json. runServer() (index.ts) treats
+    // a missing token as non-fatal, so doctor must agree -- reporting
+    // "cannot start" here was a false alarm that the Yaw MCP panel surfaced
+    // as a blocking ATTENTION banner.
     print("DIAGNOSIS");
-    print("  No token resolved — yaw-mcp cannot start.");
-    print("  Run `yaw-mcp install <client> --token mcp_pat_…` to seed ~/.yaw-mcp/config.json.");
+    print("  Local mode (Free) — no account token resolved. yaw-mcp runs fine and serves");
+    print("  whatever servers are configured locally in ~/.yaw-mcp/bundles.json.");
+    print("  Sign in with `yaw-mcp login` (or set YAW_MCP_TOKEN) to add account-synced");
+    print("  servers and compliance grades.");
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     print("DIAGNOSIS");
@@ -355,8 +361,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   let exitCode = 0;
   let summary: string;
   if (config.token === null) {
-    exitCode = 1;
-    summary = "No token resolved — yaw-mcp cannot start.";
+    // Local/Free mode -- not an error (see runDoctor's text branch).
+    summary =
+      "Local mode (Free) — running without an account token. Sign in with `yaw-mcp login` for account-synced servers.";
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     summary = "Token present, but warnings need attention.";

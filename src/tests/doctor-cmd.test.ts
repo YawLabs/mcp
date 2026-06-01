@@ -36,11 +36,11 @@ function captureOut() {
 }
 
 describe("runDoctor — exit codes", () => {
-  it("exits 1 when no token is anywhere", async () => {
+  it("exits 0 in local (Free) mode when no token is anywhere", async () => {
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
-    expect(r.exitCode).toBe(1);
-    expect(cap.text()).toMatch(/No token resolved/);
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/Local mode \(Free\)/);
   });
 
   it("exits 0 when a token is in env and there are no warnings", async () => {
@@ -612,7 +612,7 @@ describe("runDoctor — --json", () => {
     expect(parsed.token.fingerprint).not.toContain("DO_NOT_LEAK");
   });
 
-  it("exit code in diagnosis matches returned exitCode (no token)", async () => {
+  it("exit code in diagnosis matches returned exitCode (local mode, no token)", async () => {
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -623,10 +623,10 @@ describe("runDoctor — --json", () => {
       json: true,
       skipRegistryCheck: true,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(0);
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.diagnosis.exitCode).toBe(1);
-    expect(parsed.diagnosis.summary).toMatch(/No token/);
+    expect(parsed.diagnosis.exitCode).toBe(0);
+    expect(parsed.diagnosis.summary).toMatch(/Local mode/);
     expect(parsed.token.fingerprint).toBe("(none)");
   });
 
