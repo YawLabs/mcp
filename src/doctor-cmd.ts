@@ -262,10 +262,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     // "cannot start" here was a false alarm that the Yaw MCP panel surfaced
     // as a blocking ATTENTION banner.
     print("DIAGNOSIS");
-    print("  Local mode (Free) — no account token resolved. yaw-mcp runs fine and serves");
+    print("  Local mode (Free) -- fully functional, no account needed. yaw-mcp serves");
     print("  whatever servers are configured locally in ~/.yaw-mcp/bundles.json.");
-    print("  Sign in with `yaw-mcp login` (or set YAW_MCP_TOKEN) to add account-synced");
-    print("  servers and compliance grades.");
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     print("DIAGNOSIS");
@@ -362,8 +360,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   let summary: string;
   if (config.token === null) {
     // Local/Free mode -- not an error (see runDoctor's text branch).
-    summary =
-      "Local mode (Free) — running without an account token. Sign in with `yaw-mcp login` for account-synced servers.";
+    summary = "Local mode (Free) -- fully functional, no account needed.";
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     summary = "Token present, but warnings need attention.";

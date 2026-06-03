@@ -71,7 +71,7 @@ import { ensureUv } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
 
-// Poll interval for fetching config from mcp.hosting (milliseconds).
+// Poll interval for fetching config from Yaw MCP (milliseconds).
 //
 // Resolution order:
 //   1. YAW_MCP_POLL_INTERVAL env var (integer seconds). 0 disables polling
@@ -258,7 +258,7 @@ export class ConnectServer {
   private activationFailures = new Map<string, ActivationFailure>();
   // Session-scoped credential overrides supplied by the user via MCP
   // elicitation when a server's stderr indicated a missing env var.
-  // Cleared on shutdown — persistence belongs in the mcp.hosting
+  // Cleared on shutdown — persistence belongs in the Yaw MCP
   // dashboard, these are a "get me running now" shortcut.
   private elicitedEnv = new Map<string, Record<string, string>>();
   // In-flight activation promises, keyed by namespace. Dedupes
@@ -1648,7 +1648,7 @@ export class ConnectServer {
     if (!anyMatch) {
       // Split "not found" from "disabled" so the caller knows whether to
       // (a) fix a typo / install the server or (b) flip the toggle at
-      // mcp.hosting. Fuzzy suggestions only when the input is a clear
+      // Yaw MCP. Fuzzy suggestions only when the input is a clear
       // near-miss — noise-free by construction (closestNames returns []
       // otherwise).
       const allNamespaces = this.config?.servers.map((s) => s.namespace) ?? [];
@@ -2457,7 +2457,7 @@ export class ConnectServer {
         if ((value as any).command && typeof (value as any).command === "string")
           entry.command = (value as any).command;
         if (Array.isArray((value as any).args)) entry.args = (value as any).args;
-        // env vars deliberately NOT sent — set them in the mcp.hosting dashboard
+        // env vars deliberately NOT sent — set them in the Yaw MCP dashboard
         if ((value as any).url && typeof (value as any).url === "string") entry.url = (value as any).url;
 
         servers.push(entry);
@@ -2525,7 +2525,7 @@ export class ConnectServer {
     }
   }
 
-  // Install a new MCP server on the user's mcp.hosting account. Validates
+  // Install a new MCP server on the user's Yaw MCP account. Validates
   // via the shared buildInstallPayload helper so local/remote + namespace
   // shape errors fail here with a clear message instead of burning a
   // round-trip to the backend. On 403 plan-limit we forward the structured

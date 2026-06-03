@@ -15,7 +15,7 @@ export interface UpstreamServerConfig {
   url?: string;
   isActive: boolean;
   // Free-text summary used by the BM25 ranker for dispatch + context-aware
-  // discover. Set in the mcp.hosting dashboard; absent on older deployments.
+  // discover. Set in the Yaw MCP dashboard; absent on older deployments.
   description?: string;
   // Tools yaw-mcp reported back after the first activation in some earlier
   // session — used to rank servers that aren't currently connected, so
@@ -23,7 +23,7 @@ export interface UpstreamServerConfig {
   // every candidate.
   toolCache?: Array<{ name: string; description?: string }>;
   /**
-   * A–F grade reported by the mcp.hosting compliance pipeline. Absent
+   * A–F grade reported by the Yaw MCP compliance pipeline. Absent
    * on older backends or servers that haven't been scored yet. When
    * absent, the server is treated as "ungraded" and passes filters by
    * default (we don't punish unknown).

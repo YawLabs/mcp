@@ -6,7 +6,7 @@ import { getSession, signOut } from "./team-sync.js";
 
 export const LOGOUT_USAGE = `Usage: yaw-mcp logout
 
-  Sign out of your Yaw Team or Yaw MCP Pro account. Clears the
+  Sign out of your Yaw Team account. Clears the
   local session cookie at ~/.yaw-mcp/team-session.json. Free mode
   resumes on the next yaw-mcp invocation if no YAW_MCP_TOKEN is set.
 
