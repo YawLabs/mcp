@@ -229,7 +229,7 @@ export interface SignInOpts {
   baseUrl?: string;
 }
 
-/** Sign in with a Yaw Team or Yaw MCP Pro license key. POSTs to
+/** Sign in with a Yaw Team license key. POSTs to
  *  /api/team/session, parses the yaw_team cookie, fetches the session
  *  detail (to learn `exp` and `can_edit`), persists locally. Returns
  *  the resolved session. */

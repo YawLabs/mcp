@@ -1,6 +1,6 @@
 // `yaw-mcp stats` -- print a digest of the AI tool calls the team-
-// analytics endpoint has recorded for the current account. Pro-only:
-// Free users (no team session) get an upsell pointer instead.
+// analytics endpoint has recorded for the current account. Requires a
+// Yaw Team account: free users get an upsell pointer instead.
 //
 // Phase 5a ships read-only; runtime event-emission from the proxy
 // layer is Phase 5b. Until that wires up, the events list will be
@@ -12,15 +12,15 @@ import { type AnalyticsEvent, TeamSyncAuthError, getSession, listAnalyticsEvents
 
 export const STATS_USAGE = `Usage: yaw-mcp stats [--json] [--limit N] [--days N]
 
-  Print a digest of recent AI tool calls recorded against your Yaw MCP
-  Pro or Yaw Team account.
+  Print a digest of recent AI tool calls recorded against your Yaw
+  Team account.
 
   --limit N   Show the most recent N events (default 50, max 1000).
   --days N    Restrict to events from the last N days (default 7).
   --json      Emit machine-readable JSON (the full event list + summary).
 
   Requires sign-in: \`yaw-mcp login --key <license-key>\`. Free users
-  get a pointer to Pro instead -- analytics requires an account.`;
+  get a pointer to Yaw Team instead -- analytics requires an account.`;
 
 export interface StatsCommandOptions {
   limit?: number;
@@ -170,9 +170,8 @@ export async function runStats(
   const session = await getSession({ home, baseUrl: opts.baseUrl });
   if (!session) {
     const msg =
-      "Not signed in. Yaw MCP analytics requires a Pro or Yaw Team account.\n" +
-      "  - Pro: $5/mo or $50/yr -- https://yaw.sh/mcp#pricing\n" +
-      "  - Yaw Team: $15/seat/mo (includes Yaw Terminal team features)\n" +
+      "Not signed in. Yaw MCP analytics requires a Yaw Team account.\n" +
+      "  - Yaw Team: $15/seat/mo or $150/seat/yr -- https://yaw.sh/mcp\n" +
       "Sign in with: yaw-mcp login --key <license-key>";
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: "Not signed in.", upsell: msg })}\n`);
     else io.err(`yaw-mcp stats: ${msg}\n`);

@@ -1,7 +1,7 @@
 // Nag interstitial for Free-mode users. Fires every 2-4 human-initiated
 // `yaw-mcp` subcommand invocations, capped at one per 1.5 days. The CLI
 // analogue of Yaw Terminal's click-to-close toast -- same product family
-// nudges users toward Pro / Yaw Team when they're getting real value
+// nudges users toward Yaw Team when they're getting real value
 // out of the Free tier.
 //
 // Two key non-features:
@@ -231,33 +231,27 @@ export async function showNagInterstitial(opts: ShowNagOpts = {}): Promise<void>
     opts.isTTY ?? ((stdout as { isTTY?: boolean }).isTTY === true && (stdin as { isTTY?: boolean }).isTTY === true);
   if (!tty) return;
 
-  const lines = [
+  const content = [
+    "Yaw MCP -- support the project",
     "",
-    "+----------------------------------------------------------+",
-    "|                    Yaw MCP -- support the project        |",
-    "+----------------------------------------------------------+",
-    "|                                                          |",
-    "|  You're using Yaw MCP free.                              |",
-    "|                                                          |",
-    "|  Pro ($5/mo or $50/yr) adds:                             |",
-    "|    * sync bundles + secrets across machines              |",
-    "|    * encrypted secret vault (never logged)               |",
-    "|    * 90-day analytics on AI tool usage                   |",
-    "|    * `yaw-mcp stats` command                             |",
-    "|                                                          |",
-    "|  Yaw Team ($15/seat/mo or $150/seat/yr) adds:         |",
-    "|    * everything in Pro, per seat                         |",
-    "|    * shared team bundles                                 |",
-    "|    * shared org secrets                                  |",
-    "|    * per-seat audit log                                  |",
-    "|    * SSO                                                 |",
-    "|                                                          |",
-    "|  Learn more:  https://yaw.sh/mcp                         |",
-    "|                                                          |",
-    "|  Press Enter to continue (Ctrl-C to quit).               |",
-    "+----------------------------------------------------------+",
+    "You're using Yaw MCP free -- all features included.",
     "",
+    "Working with a team? Yaw Team ($15/seat/mo or",
+    "$150/seat/yr) adds:",
+    "  * shared team bundles across every seat",
+    "  * shared org secrets",
+    "  * per-seat audit log",
+    "  * SSO",
+    "",
+    "Learn more:  https://yaw.sh/mcp",
+    "",
+    "Press Enter to continue (Ctrl-C to quit).",
   ];
+  const PAD = 2;
+  const inner = Math.max(...content.map((l) => l.length));
+  const border = `+${"-".repeat(inner + PAD * 2)}+`;
+  const boxed = content.map((l) => `|${" ".repeat(PAD)}${l.padEnd(inner)}${" ".repeat(PAD)}|`);
+  const lines = ["", border, ...boxed, border, ""];
   stdout.write(`${lines.join("\n")}\n`);
 
   await new Promise<void>((resolve) => {

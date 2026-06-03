@@ -33,7 +33,7 @@ import type { UpstreamServerConfig } from "./types.js";
 export const SYNC_USAGE = `Usage: yaw-mcp sync <push|pull|status> [--json]
 
   Replicate ~/.yaw-mcp/bundles.json across machines via your Yaw
-  Team or Yaw MCP Pro account.
+  Team account.
 
   push    Strip env values from the local bundles and upload the
           schema to mcp_bundles. Env values stay machine-local.

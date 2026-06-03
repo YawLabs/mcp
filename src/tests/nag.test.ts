@@ -218,7 +218,7 @@ describe("showNagInterstitial", () => {
     stdin.write("\n");
     await p;
     expect(written).toContain("Yaw MCP");
-    expect(written).toContain("Pro");
+    expect(written).toContain("free");
     expect(written).toContain("Yaw Team");
     expect(written).toContain("https://yaw.sh/mcp");
   });
