@@ -3,7 +3,7 @@ import { log } from "./logger.js";
 
 // POST /api/connect/heartbeat — fires when an MCP client (Claude Code,
 // Cursor, Claude Desktop, VS Code, ...) attaches to yaw-mcp via stdio and
-// sends an `initialize` request. Lets mcp.hosting tell apart
+// sends an `initialize` request. Lets Yaw MCP tell apart
 // "yaw-mcp polling standalone" (CLI started, no AI client wired) from
 // "AI client driving yaw-mcp" (the wiring step is done) — the gap between
 // stage 4 and stage 5 in the activation funnel.
@@ -20,7 +20,7 @@ import { log } from "./logger.js";
 // The backend upsert's COALESCE keeps repeated calls safe.
 //
 // Fail-open everywhere: network errors, 4xx (e.g., 404 on older
-// mcp.hosting deploys), or absence of init credentials all silently
+// Yaw MCP deploys), or absence of init credentials all silently
 // no-op. The CLI never blocks on this — telemetry, not control flow.
 
 const HEARTBEAT_PATH = "/api/connect/heartbeat";
@@ -83,7 +83,7 @@ export async function reportHeartbeat(
       if (!isRefresh) {
         // Only the once-per-process attach beacon is logged. The refresh
         // ping fires on every config poll (~60s); logging each would spam.
-        log("info", "Reported AI client connect to mcp.hosting", {
+        log("info", "Reported AI client connect to Yaw MCP", {
           clientName: clientName ?? null,
           clientVersion: clientVersion ?? null,
         });

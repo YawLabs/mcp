@@ -50,7 +50,7 @@ const KNOWN_SUBCOMMANDS = [
 declare const __VERSION__: string;
 
 // Subcommand dispatcher. `yaw-mcp` with no args (or with flags only) runs as
-// the MCP server that talks to mcp.hosting. Known subcommands branch off
+// the MCP server that talks to Yaw MCP. Known subcommands branch off
 // before the YAW_MCP_TOKEN check so local-only commands like `compliance`,
 // `install`, and `doctor` don't require an account.
 const subcommand = process.argv[2];

@@ -1,5 +1,5 @@
 // Coarse classification of failed tool calls. Sent alongside
-// `success: false` analytics events so the mcp.hosting dashboard's
+// `success: false` analytics events so the Yaw MCP dashboard's
 // Recent failures table can show "12 unauthorized" instead of "(no
 // message)" 12 times.
 //

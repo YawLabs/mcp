@@ -91,7 +91,7 @@ async function probe(name: string, p: Probe): Promise<string | boolean> {
         // node/npx/uvx arrive as `npx.cmd` in PATH, and native spawn
         // with shell:false only resolves .exe. Without this, probes
         // falsely report `npx: false` on every Windows machine and
-        // mcp.hosting's Test button pre-flight short-circuits with
+        // Yaw MCP's Test button pre-flight short-circuits with
         // "npx not detected" even though upstream activation (which
         // goes through cross-spawn in the MCP SDK) would work fine.
         // All probe args are fixed `--version` strings with no shell
@@ -156,7 +156,7 @@ export async function detectRuntimes(): Promise<Record<string, string | boolean>
   return out;
 }
 
-// Detect locally then POST to mcp.hosting. Failure is non-fatal — the
+// Detect locally then POST to Yaw MCP. Failure is non-fatal — the
 // dashboard simply doesn't show a runtime warning, which is the same
 // behavior as the user never having installed a recent yaw-mcp version.
 export async function reportRuntimes(): Promise<void> {
@@ -183,7 +183,7 @@ export async function reportRuntimes(): Promise<void> {
     if (res.statusCode >= 400 && res.statusCode !== 404) {
       log("warn", "Runtime report failed", { status: res.statusCode });
     } else {
-      log("info", "Reported runtimes to mcp.hosting", { runtimes });
+      log("info", "Reported runtimes to Yaw MCP", { runtimes });
     }
   } catch (err: any) {
     log("warn", "Runtime report error", { error: err?.message });

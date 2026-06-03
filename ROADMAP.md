@@ -21,7 +21,7 @@
 - [x] **Usage pattern hints** — Track which servers are frequently loaded together and surface suggestions in discover() ("based on your last 3 calls, you probably need github next")
 - [x] **Suggested load** — Orchestrator infers what to load based on recent tool call patterns, LLM confirms. Two surfaces: (a) `mcp_connect_suggest` returns explicit recommendations with ready-to-run `activate` calls; (b) `mcp_connect_discover` inlines a "Recurring packs" block at the top of its output so the model can act without the extra round-trip
 - [x] **Automatic load** — Pre-load servers based on learned patterns without LLM confirmation (opt-in). `MCPH_AUTO_LOAD=1` activates every namespace in the top recurring pack (by frequency, tie-break recency) from persisted pack-history on startup, provided every namespace is installed. Silent no-op otherwise.
-- [x] **Routing analytics upload** — Send tool call patterns, load/unload events, and error rates to mcp.hosting dashboard
+- [x] **Routing analytics upload** — Send tool call patterns, load/unload events, and error rates to Yaw MCP dashboard
 - [x] **Error tracking in discover()** — Show server health in discover results ("npm: last 3 calls failed, might be down")
 - [x] **Concurrent server cap** — Limit max loaded servers (default 6, `MCPH_SERVER_CAP` override) as both a business lever and context protection
 - [x] **Resource proxying** — Proxy MCP resources from upstream servers, not just tools

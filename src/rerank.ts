@@ -18,7 +18,7 @@ import { getSession } from "./team-sync.js";
 //                        catalog-export time and shipped inside the
 //                        Netlify Function bundle.
 //
-//   Path B (legacy):     mcp.hosting `/api/connect/rerank`, authed
+//   Path B (legacy):     Yaw MCP `/api/connect/rerank`, authed
 //                        via MCPH_TOKEN/YAW_MCP_TOKEN. Retained as a
 //                        fallback for the account-mode users that
 //                        haven't yet migrated to the new cookie. Will

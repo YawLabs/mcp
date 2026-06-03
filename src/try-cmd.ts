@@ -1,5 +1,5 @@
 // `yaw-mcp try <slug>` — one-shot trial: fetches the canonical launch
-// shape for an MCP server from mcp.hosting's /api/explore/:slug, wires
+// shape for an MCP server from Yaw MCP's /api/explore/:slug, wires
 // it into the user's AI client config under a `yaw-mcp-try-<slug>` entry
 // (NOT through yaw-mcp -- the trial entry points DIRECTLY at the upstream
 // MCP server's command + args), drops a trial marker file under

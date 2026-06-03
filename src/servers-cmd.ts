@@ -1,5 +1,5 @@
 // `yaw-mcp servers` — lists the servers configured for this account in the
-// mcp.hosting dashboard (i.e., what `/api/connect/config` returns right
+// Yaw MCP dashboard (i.e., what `/api/connect/config` returns right
 // now). Complements `yaw-mcp doctor`, which only reads local state (config
 // files, clients, state.json). Together they give the full picture:
 //   doctor   → "what does my local machine look like?"

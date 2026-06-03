@@ -4,7 +4,7 @@ import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
 /**
- * Fetch the config from mcp.hosting.
+ * Fetch the config from Yaw MCP.
  *
  * Optionally pass `currentVersion` (the configVersion from the previously
  * fetched config) to enable conditional GETs via If-None-Match. When the

@@ -2,12 +2,12 @@ import { request } from "undici";
 import { log } from "./logger.js";
 
 // Reports the tool list a server exposed on first activation back to
-// mcp.hosting so the BM25 ranker can score inactive servers on cold
+// Yaw MCP so the BM25 ranker can score inactive servers on cold
 // starts. Fire-and-forget: failures are logged and swallowed because
 // missing cache data only degrades ranking quality, it doesn't break
 // any user-visible flow.
 //
-// Tolerates a 404 from the backend so older mcp.hosting deployments
+// Tolerates a 404 from the backend so older Yaw MCP deployments
 // that don't ship this endpoint stay usable with the new yaw-mcp client.
 
 let apiUrl = "";
@@ -54,7 +54,7 @@ export async function reportTools(
     });
     // Drain body so the connection can be reused
     await res.body.text().catch(() => {});
-    // 404 is expected on mcp.hosting deployments predating this endpoint —
+    // 404 is expected on Yaw MCP deployments predating this endpoint —
     // skip the warn to keep logs clean. Any other non-2xx is genuine.
     if (res.statusCode >= 400 && res.statusCode !== 404) {
       log("warn", "Tool report failed", { serverId, status: res.statusCode });
