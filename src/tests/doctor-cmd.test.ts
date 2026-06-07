@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-function writeMcphConfig(root: string, filename: string, obj: unknown): void {
+function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
   mkdirSync(join(root, ".yaw-mcp"), { recursive: true });
   writeFileSync(join(root, ".yaw-mcp", filename), JSON.stringify(obj));
 }
@@ -57,7 +57,7 @@ describe("runDoctor — exit codes", () => {
   });
 
   it("exits 2 when token is present but warnings exist (newer schema)", async () => {
-    writeMcphConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
+    writeYawMcpConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(r.exitCode).toBe(2);
@@ -77,7 +77,7 @@ describe("runDoctor — output content", () => {
   });
 
   it("reports the source for token and apiBase", async () => {
-    writeMcphConfig(synthHome, "config.json", { token: "mcp_pat_aaaa", apiBase: "https://corp.example" });
+    writeYawMcpConfig(synthHome, "config.json", { token: "mcp_pat_aaaa", apiBase: "https://corp.example" });
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(cap.text()).toMatch(/source: global/);
@@ -85,8 +85,8 @@ describe("runDoctor — output content", () => {
   });
 
   it("lists each loaded config file with scope", async () => {
-    writeMcphConfig(synthHome, "config.json", { token: "mcp_pat_aaaa" });
-    writeMcphConfig(synthCwd, "config.json", { apiBase: "https://example" });
+    writeYawMcpConfig(synthHome, "config.json", { token: "mcp_pat_aaaa" });
+    writeYawMcpConfig(synthCwd, "config.json", { apiBase: "https://example" });
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
@@ -109,7 +109,7 @@ describe("runDoctor — client detection", () => {
       os: "linux",
       out: cap.out,
     });
-    expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.hasMcphEntry).toBe(true);
+    expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.hasMcpEntry).toBe(true);
     expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
   });
 
@@ -173,7 +173,7 @@ describe("runDoctor — client detection", () => {
       out: cap.out,
     });
     const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
-    expect(userScope?.hasMcphEntry).toBe(true);
+    expect(userScope?.hasMcpEntry).toBe(true);
     expect(userScope?.hasLegacyEntry).toBe(true);
     expect(cap.text()).toMatch(/legacy "mcp\.hosting" entry also present/);
     expect(cap.text()).toMatch(/running yaw-mcp twice/);
@@ -193,7 +193,7 @@ describe("runDoctor — client detection", () => {
       out: cap.out,
     });
     const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
-    expect(userScope?.hasMcphEntry).toBe(false);
+    expect(userScope?.hasMcpEntry).toBe(false);
     expect(userScope?.hasLegacyEntry).toBe(true);
     expect(cap.text()).toMatch(/legacy "mcp\.hosting" entry present .* run `yaw-mcp install claude-code`/);
   });
@@ -217,7 +217,7 @@ describe("runDoctor — client detection", () => {
         out: cap.out,
       });
       const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
-      expect(userScope?.hasMcphEntry).toBe(false);
+      expect(userScope?.hasMcpEntry).toBe(false);
       expect(userScope?.path).toBe(join(wrapperDir, ".claude.json"));
     } finally {
       rmSync(wrapperDir, { recursive: true, force: true });
@@ -240,7 +240,7 @@ describe("runDoctor — client detection", () => {
         out: cap.out,
       });
       const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
-      expect(userScope?.hasMcphEntry).toBe(true);
+      expect(userScope?.hasMcpEntry).toBe(true);
       expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
     } finally {
       rmSync(wrapperDir, { recursive: true, force: true });
@@ -317,7 +317,7 @@ describe("scanShellHistoryForShadows", () => {
 
 describe("runDoctor — surfaces config-loader warnings", () => {
   it("relays the project-token warning into doctor output", async () => {
-    writeMcphConfig(synthCwd, "config.json", { token: "mcp_pat_committed_aaaa" });
+    writeYawMcpConfig(synthCwd, "config.json", { token: "mcp_pat_committed_aaaa" });
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -631,7 +631,7 @@ describe("runDoctor — --json", () => {
   });
 
   it("surfaces warnings in the JSON snapshot", async () => {
-    writeMcphConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
+    writeYawMcpConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,

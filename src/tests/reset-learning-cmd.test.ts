@@ -10,14 +10,14 @@ import { parseResetLearningArgs, runResetLearning } from "../reset-learning-cmd.
 // user's ~/.yaw-mcp/state.json. userConfigDir(home) joins home + ".yaw-mcp".
 describe("runResetLearning", () => {
   let home: string;
-  let mcphDir: string;
+  let yawMcpDir: string;
   let stateFile: string;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-reset-"));
-    mcphDir = join(home, CONFIG_DIRNAME);
-    stateFile = join(mcphDir, STATE_FILENAME);
-    mkdirSync(mcphDir, { recursive: true });
+    yawMcpDir = join(home, CONFIG_DIRNAME);
+    stateFile = join(yawMcpDir, STATE_FILENAME);
+    mkdirSync(yawMcpDir, { recursive: true });
   });
 
   afterEach(() => {
@@ -169,7 +169,7 @@ describe("runResetLearning", () => {
   it("returns exit code 0 when the ~/.yaw-mcp dir itself is missing", async () => {
     // Fresh home with no ~/.yaw-mcp/ at all — the common case on a
     // brand-new install where the user is just poking at CLI commands.
-    rmSync(mcphDir, { recursive: true, force: true });
+    rmSync(yawMcpDir, { recursive: true, force: true });
     const io = captureIO();
     const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);

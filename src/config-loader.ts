@@ -161,7 +161,7 @@ function unionBlocked(files: LoadedConfigFile[]): string[] | undefined {
   return touched ? [...set] : undefined;
 }
 
-export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<ResolvedConfig> {
+export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<ResolvedConfig> {
   const cwd = resolve(opts.cwd ?? process.cwd());
   const home = resolve(opts.home ?? homedir());
   const env = opts.env ?? process.env;
@@ -293,10 +293,10 @@ export function toProfile(config: ResolvedConfig): Profile | null {
 }
 
 /** Load the effective profile for a session. Thin wrapper around
- *  loadMcphConfig + toProfile — kept as a named function so server.ts
+ *  loadYawMcpConfig + toProfile — kept as a named function so server.ts
  *  can import it without reaching into ResolvedConfig internals. */
 export async function loadEffectiveProfile(cwd: string, home?: string): Promise<Profile | null> {
-  const config = await loadMcphConfig({ cwd, home });
+  const config = await loadYawMcpConfig({ cwd, home });
   return toProfile(config);
 }
 

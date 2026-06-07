@@ -30,7 +30,7 @@ import {
   bundleActivateHint,
   matchBundles,
 } from "./bundles.js";
-import { loadMcphConfig } from "./config-loader.js";
+import { loadYawMcpConfig } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import type { ConnectConfig } from "./types.js";
 
@@ -119,7 +119,7 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   }
 
   // action === "match" — needs a token + backend.
-  const config = await loadMcphConfig({
+  const config = await loadYawMcpConfig({
     cwd: opts.cwd,
     home: opts.home,
     env: opts.env,

@@ -53,8 +53,8 @@ describe("parseCompletionArgs", () => {
 describe("renderScript — bash", () => {
   it("contains the complete -F registration", () => {
     const s = renderScript("bash");
-    expect(s).toContain("complete -F _mcph yaw-mcp");
-    expect(s).toContain("_mcph()");
+    expect(s).toContain("complete -F _yaw-mcp yaw-mcp");
+    expect(s).toContain("_yaw-mcp()");
   });
 
   it("includes every known subcommand in the top-level compgen", () => {
@@ -86,9 +86,9 @@ describe("renderScript — zsh", () => {
     expect(s.startsWith("#compdef yaw-mcp")).toBe(true);
   });
 
-  it("declares the _mcph function", () => {
+  it("declares the _yaw-mcp function", () => {
     const s = renderScript("zsh");
-    expect(s).toContain("_mcph()");
+    expect(s).toContain("_yaw-mcp()");
   });
 
   it("lists every subcommand as a _values candidate", () => {
@@ -138,7 +138,7 @@ describe("runCompletion", () => {
     const io = capture();
     const r = await runCompletion({ shell: "bash", out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
-    expect(io.out.join("\n")).toContain("complete -F _mcph yaw-mcp");
+    expect(io.out.join("\n")).toContain("complete -F _yaw-mcp yaw-mcp");
     expect(io.err).toEqual([]);
   });
 

@@ -27,4 +27,4 @@ Only the latest published version receives security updates.
 
 ## Contact
 
-For security matters that can't go through GitHub's reporting: **support@mcp.hosting**
+For security matters that can't go through GitHub's reporting: **support@yaw.sh**

@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
-import { CONFIG_FILENAME, CURRENT_SCHEMA_VERSION, loadMcphConfig } from "./config-loader.js";
+import { CONFIG_FILENAME, CURRENT_SCHEMA_VERSION, loadYawMcpConfig } from "./config-loader.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
   CLAUDE_CODE_ALLOW_PATTERN,
@@ -37,8 +37,8 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
-  LEGACY_ENTRY_NAME,
   buildLaunchEntry,
+  findLegacyEntry,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "./install-targets.js";
@@ -60,7 +60,7 @@ export interface InstallCommandOptions {
   /** Print the changes that would be made and exit without writing. */
   dryRun?: boolean;
   /** When true, do not write/update ~/.yaw-mcp/config.json — only the client config. */
-  skipMcphConfig?: boolean;
+  skipYawMcpConfig?: boolean;
   /** Read-only: enumerate clients and show which scopes already host a yaw-mcp entry. */
   listOnly?: boolean;
   /** Install into every client available on this OS in one shot. */
@@ -192,7 +192,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // handles this at install-targets.ts:339.
   let token: string | null = opts.token ?? null;
   if (!token) {
-    const cfg = await loadMcphConfig({ home: opts.home, cwd: process.cwd(), env: {} });
+    const cfg = await loadYawMcpConfig({ home: opts.home, cwd: process.cwd(), env: {} });
     token = cfg.token;
   }
   if (!token) {
@@ -207,7 +207,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
   let existingHasEntry = false;
-  let legacyPresent = false;
+  let legacyEntry: string | null = null;
   if (existsSync(resolved.absolute)) {
     let raw: string;
     try {
@@ -237,7 +237,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     if (typeof container === "object" && container !== null && !Array.isArray(container)) {
       const c = container as Record<string, unknown>;
       existingHasEntry = ENTRY_NAME in c;
-      legacyPresent = LEGACY_ENTRY_NAME in c;
+      legacyEntry = findLegacyEntry(c);
     }
   }
 
@@ -271,16 +271,18 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // Skip ~/.yaw-mcp/config.json writes in local mode -- there's no token
   // to seed, and the file is only meaningful for cross-client token
   // sharing. Local-mode users edit ~/.yaw-mcp/bundles.json instead.
-  const writeMcphConfig = !opts.skipMcphConfig && token !== null;
+  const writeYawMcpConfig = !opts.skipYawMcpConfig && token !== null;
   const home = opts.home ?? homedir();
-  const mcphConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
-  const mcphConfigComposed = writeMcphConfig ? await composeMcphConfig(mcphConfigPath, token as string) : { json: "" };
-  if ("backupPath" in mcphConfigComposed && mcphConfigComposed.backupPath) {
+  const yawMcpConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
+  const yawMcpConfigComposed = writeYawMcpConfig
+    ? await composeYawMcpConfig(yawMcpConfigPath, token as string)
+    : { json: "" };
+  if ("backupPath" in yawMcpConfigComposed && yawMcpConfigComposed.backupPath) {
     log(
-      `yaw-mcp install: existing ${mcphConfigPath} was malformed; original bytes backed up to ${mcphConfigComposed.backupPath} before overwriting.`,
+      `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; original bytes backed up to ${yawMcpConfigComposed.backupPath} before overwriting.`,
     );
   }
-  const mcphConfigJson = mcphConfigComposed.json;
+  const yawMcpConfigJson = yawMcpConfigComposed.json;
 
   // Claude Code: also ensure `permissions.allow` carries our pattern so
   // the user isn't re-prompted for every yaw-mcp tool call. No-op for other
@@ -300,16 +302,16 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   if (opts.dryRun) {
     log("\n--- dry run: would write the following ---");
-    if (writeMcphConfig) log(`# ${mcphConfigPath}\n${mcphConfigJson}`);
+    if (writeYawMcpConfig) log(`# ${yawMcpConfigPath}\n${yawMcpConfigJson}`);
     log(`\n# ${resolved.absolute}\n${clientJson}`);
     if (settingsPatch?.changed) log(`# ${settingsPatch.path}\n${settingsPatch.nextJson}`);
-    if (legacyPresent) {
+    if (legacyEntry) {
       log(
-        `Note: legacy "${LEGACY_ENTRY_NAME}" entry at ${resolved.absolute} would remain — remove it to avoid running yaw-mcp twice.`,
+        `Note: legacy "${legacyEntry}" entry at ${resolved.absolute} would remain — remove it to avoid running yaw-mcp twice.`,
       );
     }
     const wouldWrite: string[] = [];
-    if (writeMcphConfig) wouldWrite.push(mcphConfigPath);
+    if (writeYawMcpConfig) wouldWrite.push(yawMcpConfigPath);
     wouldWrite.push(resolved.absolute);
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
@@ -321,23 +323,23 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // fails, at least the token is captured here for the next install --
   // otherwise the user would have a launch entry pointing at a token
   // we never recorded, and would be re-prompted on every other client.
-  if (writeMcphConfig) {
+  if (writeYawMcpConfig) {
     try {
-      await atomicWriteFile(mcphConfigPath, mcphConfigJson);
+      await atomicWriteFile(yawMcpConfigPath, yawMcpConfigJson);
       // Best-effort POSIX permissions tighten — ignored on Windows.
       if (process.platform !== "win32") {
         try {
-          await chmod(mcphConfigPath, 0o600);
+          await chmod(yawMcpConfigPath, 0o600);
         } catch {
           // chmod not supported on this filesystem; not fatal.
         }
       }
     } catch (e) {
-      err(`yaw-mcp install: failed to write ${mcphConfigPath}: ${(e as Error).message}`);
+      err(`yaw-mcp install: failed to write ${yawMcpConfigPath}: ${(e as Error).message}`);
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
-    log(`Wrote ${mcphConfigPath}`);
-    written.push(mcphConfigPath);
+    log(`Wrote ${yawMcpConfigPath}`);
+    written.push(yawMcpConfigPath);
   }
 
   // Write client config atomically. ~/.claude.json carries every
@@ -368,9 +370,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
 
   if (target.notes) log(`Note: ${target.notes}`);
-  if (legacyPresent) {
+  if (legacyEntry) {
     log(
-      `Note: legacy "${LEGACY_ENTRY_NAME}" entry remains at ${resolved.absolute}. Remove it to avoid running yaw-mcp twice.`,
+      `Note: legacy "${legacyEntry}" entry remains at ${resolved.absolute}. Remove it to avoid running yaw-mcp twice.`,
     );
   }
   log(`\n✓ ${target.label} is configured. Restart it to pick up the new MCP server.`);
@@ -426,11 +428,11 @@ async function prepareClaudeCodeSettingsPatch(opts: {
   return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true };
 }
 
-/** Allow-pattern that pre-rename installs wrote into Claude Code's
- *  `permissions.allow`. Stripped on upgrade so a dead wildcard doesn't
- *  accumulate forever — no live tool name can match it now that
- *  ENTRY_NAME is "yaw-mcp". */
-const LEGACY_CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp_hosting__*";
+/** Allow-patterns earlier installers wrote into Claude Code's
+ *  `permissions.allow` (the dead mcp.hosting brand and the interim yaw-mcp
+ *  key). Stripped on upgrade so dead wildcards don't accumulate forever —
+ *  no live tool name can match them now that ENTRY_NAME is "mcp". */
+const LEGACY_CLAUDE_CODE_ALLOW_PATTERNS = ["mcp__mcp_hosting__*", "mcp__yaw_mcp__*"];
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every
  *  other key. Deduplicates by string equality so repeated installs don't
@@ -444,7 +446,7 @@ export function mergePermissionsAllow(existing: Record<string, unknown>, pattern
   const prevAllow = perms.allow;
   const allow: string[] = Array.isArray(prevAllow)
     ? (prevAllow as unknown[]).filter(
-        (x): x is string => typeof x === "string" && x !== LEGACY_CLAUDE_CODE_ALLOW_PATTERN,
+        (x): x is string => typeof x === "string" && !LEGACY_CLAUDE_CODE_ALLOW_PATTERNS.includes(x),
       )
     : [];
   for (const p of patterns) {
@@ -566,7 +568,7 @@ export function removeFromClientConfig(
  *  so the user can recover their token by hand if anything else of value
  *  was in there. Backup is best-effort; if it fails, we proceed without
  *  it rather than blocking the install. */
-async function composeMcphConfig(path: string, token: string): Promise<{ json: string; backupPath?: string }> {
+async function composeYawMcpConfig(path: string, token: string): Promise<{ json: string; backupPath?: string }> {
   let existing: Record<string, unknown> = {};
   let backupPath: string | undefined;
   if (existsSync(path)) {
@@ -655,7 +657,7 @@ export function parseInstallArgs(argv: string[]):
         opts.dryRun = true;
         break;
       case "--no-yaw-mcp-config":
-        opts.skipMcphConfig = true;
+        opts.skipYawMcpConfig = true;
         break;
       case "--list":
         opts.listOnly = true;
@@ -715,7 +717,7 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
     status: statusFor(p),
   }));
 
-  const installed = probes.filter((p) => p.hasMcphEntry).length;
+  const installed = probes.filter((p) => p.hasMcpEntry).length;
   const available = probes.filter((p) => !p.unavailable).length;
   log(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
   log("");
@@ -749,7 +751,7 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
 function statusFor(p: ClientProbeResult): string {
   if (p.unavailable) return "unavailable";
   if (p.malformed) return "malformed";
-  if (p.hasMcphEntry) return "installed";
+  if (p.hasMcpEntry) return "installed";
   if (p.exists) return "other-entries";
   return "not installed";
 }

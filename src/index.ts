@@ -1,7 +1,7 @@
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
-import { loadMcphConfig, tokenFingerprint } from "./config-loader.js";
+import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
 import { ConfigError } from "./config.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { closestNames } from "./fuzzy.js";
@@ -70,7 +70,7 @@ if (subcommand && NAG_ELIGIBLE_SUBCOMMANDS.has(subcommand) && process.env.YAW_MC
   let inAccountMode = envHasToken;
   if (!inAccountMode) {
     try {
-      const cfg = await loadMcphConfig();
+      const cfg = await loadYawMcpConfig();
       inAccountMode = Boolean(cfg.token);
     } catch {
       inAccountMode = false;
@@ -328,7 +328,7 @@ async function runServer(): Promise<void> {
   // where server definitions come from ~/.yaw-mcp/bundles.json instead
   // of the backend. Empty bundles.json + no token also fine; yaw-mcp
   // starts with an empty server list.
-  const config = await loadMcphConfig();
+  const config = await loadYawMcpConfig();
 
   // Surface non-fatal config warnings on startup so the user sees them
   // (e.g., loose file perms, schema-version mismatch). Doctor shows the

@@ -84,7 +84,7 @@ export interface MigrateOptions {
   home: string;
 }
 
-// Runs all three migrations. Called from loadMcphConfig before any
+// Runs all three migrations. Called from loadYawMcpConfig before any
 // file resolution so the rest of the loader only ever sees the new
 // layout. Intentionally does NOT return anything — failures are
 // absorbed via log so a bad filesystem state can't brick startup.

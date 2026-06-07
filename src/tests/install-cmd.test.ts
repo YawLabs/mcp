@@ -91,7 +91,7 @@ describe("parseInstallArgs", () => {
       expect(r.options.projectDir).toBe("/tmp/repo");
       expect(r.options.force).toBe(true);
       expect(r.options.dryRun).toBe(true);
-      expect(r.options.skipMcphConfig).toBe(true);
+      expect(r.options.skipYawMcpConfig).toBe(true);
     }
   });
 
@@ -312,10 +312,10 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
     expect(r.written.length).toBe(3);
 
     const clientPath = join(synthHome, ".claude.json");
-    const mcphPath = join(synthHome, ".yaw-mcp", "config.json");
+    const yawMcpPath = join(synthHome, ".yaw-mcp", "config.json");
     const settingsPath = join(synthHome, ".claude", "settings.json");
     expect(existsSync(clientPath)).toBe(true);
-    expect(existsSync(mcphPath)).toBe(true);
+    expect(existsSync(yawMcpPath)).toBe(true);
     expect(existsSync(settingsPath)).toBe(true);
 
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
@@ -324,9 +324,9 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
     // Token is NOT embedded in client config — lives in ~/.yaw-mcp/config.json instead.
     expect(client.mcpServers[ENTRY_NAME].env).toBeUndefined();
 
-    const mcphCfg = JSON.parse(readFileSync(mcphPath, "utf8"));
-    expect(mcphCfg.token).toBe("mcp_pat_fresh_aaaa");
-    expect(mcphCfg.version).toBe(1);
+    const yawMcpCfg = JSON.parse(readFileSync(yawMcpPath, "utf8"));
+    expect(yawMcpCfg.token).toBe("mcp_pat_fresh_aaaa");
+    expect(yawMcpCfg.version).toBe(1);
 
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(settings.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
@@ -768,7 +768,7 @@ describe("runInstall — --no-yaw-mcp-config", () => {
       os: "linux",
       home: synthHome,
       token: "mcp_pat_aaaa",
-      skipMcphConfig: true,
+      skipYawMcpConfig: true,
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -965,8 +965,8 @@ describe("runInstall --all", () => {
     expect(out).toContain("skip vscode");
     expect(out).toMatch(/✓ \d+\/\d+ clients installed successfully\./);
     // Token written to global yaw-mcp config exactly once.
-    const mcphCfg = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "config.json"), "utf8"));
-    expect(mcphCfg.token).toBe("mcp_pat_all");
+    const yawMcpCfg = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "config.json"), "utf8"));
+    expect(yawMcpCfg.token).toBe("mcp_pat_all");
   });
 
   it("refuses with exit 1 when no clients are installable on the OS", async () => {

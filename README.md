@@ -69,7 +69,7 @@ Helpful flags:
 
 - `--scope user|project|local` -- which file to write (Claude Code + Cursor support project/local; VS Code is workspace-only; Claude Desktop is user-only).
 - `--dry-run` -- print the diff and exit without writing.
-- `--force` / `--skip` -- overwrite or leave an existing `mcp.hosting` entry. Without either, yaw-mcp prompts (TTY) or refuses (non-TTY).
+- `--force` / `--skip` -- overwrite or leave an existing `mcp` entry. Without either, yaw-mcp prompts (TTY) or refuses (non-TTY).
 - `--no-yaw-mcp-config` -- write only the client config; leave `~/.yaw-mcp/config.json` untouched.
 
 Or install into every detected client at once:
@@ -83,7 +83,7 @@ yaw-mcp install --all --token mcp_pat_...   # one-shot: install into every user-
 
 Or [edit the JSON by hand](#manual-install) if you'd rather.
 
-> The launch entry written into each client's config is still keyed as `"mcp.hosting"` for backwards compatibility with existing installs. The CLI, package, env vars, and config dir all moved to `yaw-mcp`; the JSON key is the one user-visible thing that didn't.
+> The launch entry is keyed as `"mcp"` in the client config, so its tools surface under the `mcp__mcp__` namespace. Installs created before the rename used `"mcp.hosting"` / `"yaw-mcp"`; `yaw-mcp install` (and Yaw Terminal) detect and migrate those to `"mcp"`.
 
 ### Diagnose problems -- `yaw-mcp doctor`
 
@@ -140,7 +140,7 @@ If you'd rather edit the config files yourself, the JSON shapes are:
 ```json
 {
   "mcpServers": {
-    "mcp.hosting": {
+    "mcp": {
       "command": "npx",
       "args": ["-y", "@yawlabs/mcp@latest"]
     }
@@ -153,7 +153,7 @@ If you'd rather edit the config files yourself, the JSON shapes are:
 ```json
 {
   "servers": {
-    "mcp.hosting": {
+    "mcp": {
       "command": "npx",
       "args": ["-y", "@yawlabs/mcp@latest"]
     }

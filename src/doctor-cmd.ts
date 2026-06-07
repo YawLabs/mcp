@@ -22,7 +22,7 @@ import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
   type ResolvedConfig,
-  loadMcphConfig,
+  loadYawMcpConfig,
   tokenFingerprint,
 } from "./config-loader.js";
 import {
@@ -32,7 +32,7 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
-  LEGACY_ENTRY_NAME,
+  findLegacyEntry,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -98,11 +98,14 @@ export interface ClientProbeResult {
   scope: InstallScope;
   path: string;
   exists: boolean;
-  hasMcphEntry: boolean;
+  hasMcpEntry: boolean;
   /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced so
    *  upgraded users know to trim by hand — nothing in the runtime writes
    *  this key anymore. */
   hasLegacyEntry: boolean;
+  /** The specific legacy entry key found (e.g. "mcp.hosting" / "yaw-mcp"), or
+   *  null. Lets the status line name the stale key in the trim hint. */
+  legacyEntryName: string | null;
   malformed: boolean;
   unavailable: boolean;
 }
@@ -144,7 +147,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   print(`platform: ${os}`);
   print("");
 
-  const config = await loadMcphConfig({ cwd, home, env });
+  const config = await loadYawMcpConfig({ cwd, home, env });
 
   print("CONFIG FILES");
   if (config.loadedFiles.length === 0) {
@@ -292,7 +295,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const env = opts.env ?? process.env;
 
   const timestamp = new Date().toISOString();
-  const config = await loadMcphConfig({ cwd, home, env });
+  const config = await loadYawMcpConfig({ cwd, home, env });
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
 
@@ -628,12 +631,12 @@ function schemaSuffix(f: LoadedConfigFile): string {
 function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.unavailable) return "unavailable on this OS";
   if (c.malformed) return "exists but JSON is malformed — fix or rerun `yaw-mcp install`";
-  if (c.hasMcphEntry && c.hasLegacyEntry) {
-    return `OK — has "${ENTRY_NAME}" entry; legacy "${LEGACY_ENTRY_NAME}" entry also present — remove it to avoid running yaw-mcp twice`;
+  if (c.hasMcpEntry && c.hasLegacyEntry) {
+    return `OK — has "${ENTRY_NAME}" entry; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
   }
-  if (c.hasMcphEntry) return `OK — has "${ENTRY_NAME}" entry`;
+  if (c.hasMcpEntry) return `OK — has "${ENTRY_NAME}" entry`;
   if (c.hasLegacyEntry) {
-    return `legacy "${LEGACY_ENTRY_NAME}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
+    return `legacy "${c.legacyEntryName}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
   }
   if (c.exists) return `present, no "${ENTRY_NAME}" entry — run \`${installCmd}\``;
   return `not configured — run \`${installCmd}\``;
@@ -659,8 +662,9 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         scope: target.scopes[0].scope,
         path: "(n/a)",
         exists: false,
-        hasMcphEntry: false,
+        hasMcpEntry: false,
         hasLegacyEntry: false,
+        legacyEntryName: null,
         malformed: false,
         unavailable: true,
       });
@@ -686,8 +690,9 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         continue;
       }
       const exists = existsSync(resolved.absolute);
-      let hasMcphEntry = false;
+      let hasMcpEntry = false;
       let hasLegacyEntry = false;
+      let legacyEntryName: string | null = null;
       let malformed = false;
       if (exists) {
         try {
@@ -701,8 +706,9 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
             if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
               const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
               if (container) {
-                hasMcphEntry = ENTRY_NAME in container;
-                hasLegacyEntry = LEGACY_ENTRY_NAME in container;
+                hasMcpEntry = ENTRY_NAME in container;
+                legacyEntryName = findLegacyEntry(container);
+                hasLegacyEntry = legacyEntryName !== null;
               }
             } else {
               malformed = true;
@@ -717,8 +723,9 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         scope: scope.scope,
         path: resolved.absolute,
         exists,
-        hasMcphEntry,
+        hasMcpEntry,
         hasLegacyEntry,
+        legacyEntryName,
         malformed,
         unavailable: false,
       });
@@ -753,8 +760,9 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         scope: target.scopes[0].scope,
         path: "(n/a)",
         exists: false,
-        hasMcphEntry: false,
+        hasMcpEntry: false,
         hasLegacyEntry: false,
+        legacyEntryName: null,
         malformed: false,
         unavailable: true,
       });
@@ -770,8 +778,9 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         claudeConfigDir: opts.claudeConfigDir,
       });
       const exists = existsSync(resolved.absolute);
-      let hasMcphEntry = false;
+      let hasMcpEntry = false;
       let hasLegacyEntry = false;
+      let legacyEntryName: string | null = null;
       let malformed = false;
       if (exists) {
         try {
@@ -781,8 +790,9 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
             if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
               const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
               if (container) {
-                hasMcphEntry = ENTRY_NAME in container;
-                hasLegacyEntry = LEGACY_ENTRY_NAME in container;
+                hasMcpEntry = ENTRY_NAME in container;
+                legacyEntryName = findLegacyEntry(container);
+                hasLegacyEntry = legacyEntryName !== null;
               }
             } else {
               malformed = true;
@@ -797,8 +807,9 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         scope: scope.scope,
         path: resolved.absolute,
         exists,
-        hasMcphEntry,
+        hasMcpEntry,
         hasLegacyEntry,
+        legacyEntryName,
         malformed,
         unavailable: false,
       });

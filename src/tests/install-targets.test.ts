@@ -351,8 +351,8 @@ describe("buildLaunchEntry", () => {
 });
 
 describe("ENTRY_NAME", () => {
-  it("is the stable key yaw-mcp writes under mcpServers / servers", () => {
+  it("is the stable key the installer writes under mcpServers / servers", () => {
     // Doctor depends on this constant to detect an existing install.
-    expect(ENTRY_NAME).toBe("yaw-mcp");
+    expect(ENTRY_NAME).toBe("mcp");
   });
 });

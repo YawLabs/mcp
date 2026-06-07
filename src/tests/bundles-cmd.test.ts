@@ -100,7 +100,7 @@ describe("runBundlesCommand — list", () => {
 
   it("does not hit the network or require a token", async () => {
     const io = captureIO();
-    // Note: no home/env seed — if `list` tried to call loadMcphConfig+fetcher,
+    // Note: no home/env seed — if `list` tried to call loadYawMcpConfig+fetcher,
     // it would either error or block. This test proves it's fully static.
     const r = await runBundlesCommand({
       action: "list",

@@ -16,7 +16,7 @@
 //   1  no token resolved (same signal as `yaw-mcp` with no token)
 //   2  fetch failed (network, auth rejected, non-2xx response)
 
-import { loadMcphConfig } from "./config-loader.js";
+import { loadYawMcpConfig } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import type { ConnectConfig } from "./types.js";
 
@@ -95,7 +95,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     writeErr(`${s}\n`);
   };
 
-  const config = await loadMcphConfig({
+  const config = await loadYawMcpConfig({
     cwd: opts.cwd,
     home: opts.home,
     env: opts.env,

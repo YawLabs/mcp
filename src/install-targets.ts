@@ -1,8 +1,7 @@
 // Per-client, per-OS config file metadata for `yaw-mcp install <client>`.
 // This is the authoritative mapping of {client, scope, OS} → file path +
-// JSON shape; the dashboard's install UI at mcp-hosting/dashboard/src/
-// components/onboarding/mcphInstall.ts is the visual mirror of this and
-// should stay in sync. The tests in install-targets.test.ts lock the
+// JSON shape. (A pre-rename dashboard install mirror has been archived; this
+// file is now the sole source of truth.) The tests in install-targets.test.ts lock the
 // specifics (file names, JSON root keys) that would silently break the
 // install flow if regressed.
 //
@@ -343,21 +342,27 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
 /** The entry key we write into `mcpServers` (Claude Code / Desktop / Cursor)
  *  or `servers` (VS Code). Stable across clients so doctor can detect
  *  collisions deterministically. */
-export const ENTRY_NAME = "yaw-mcp";
+export const ENTRY_NAME = "mcp";
 
-/** Entry key pre-rename installs wrote under. Doctor + install detect this
- *  so users upgrading from a pre-rename install get a visible nudge instead
- *  of silently ending up with two parallel yaw-mcp processes spawning from
- *  the same client config. Nothing in the runtime writes this key anymore. */
-export const LEGACY_ENTRY_NAME = "mcp.hosting";
+/** Entry keys earlier installers wrote under: the dead `mcp.hosting` / `mcph`
+ *  brand and the interim `yaw-mcp` key. Doctor + install detect these so users
+ *  upgrading get a visible nudge instead of silently running two parallel
+ *  servers from the same client config. Nothing writes these keys anymore. */
+export const LEGACY_ENTRY_NAMES = ["mcp.hosting", "mcph", "yaw-mcp"] as const;
+
+/** The legacy entry key present in `container`, or null -- lets the upgrade
+ *  nudge name the actual stale key it found. */
+export function findLegacyEntry(container: Record<string, unknown>): string | null {
+  return LEGACY_ENTRY_NAMES.find((n) => n in container) ?? null;
+}
 
 /** Pattern added to Claude Code's `permissions.allow` on install so the
  *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
  *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).
  *  Keep in sync with the tool-name prefix our proxy exposes -- Claude Code
  *  derives the prefix from ENTRY_NAME by replacing non-alphanumeric chars
- *  with underscores, so "yaw-mcp" becomes "mcp__yaw_mcp__". */
-export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__yaw_mcp__*";
+ *  with underscores, so "mcp" becomes "mcp__mcp__". */
+export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp__*";
 
 /** Resolve the Claude Code settings.json file that holds `permissions.allow`.
  *  Different from the mcpServers path (`~/.claude.json`): permissions live
