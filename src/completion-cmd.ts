@@ -44,15 +44,25 @@ export const COMPLETION_USAGE = `Usage: yaw-mcp completion <bash|zsh|fish|powers
 // elsewhere shows up in all four completions without hand-edits.
 interface SubcommandSpec {
   name: string;
+  /** One-line description. Used by the zsh generator (and kept here as the
+   *  single source so descriptions can't drift from the spec). Keep it free of
+   *  ':' and parentheses -- zsh `_values` treats ':' as the value/desc
+   *  separator. */
+  description: string;
   positional?: string[];
   flags: string[];
 }
 
 const INSTALL_CLIENTS = ["claude-code", "claude-desktop", "cursor", "vscode"] as const;
 
-const SUBCOMMAND_SPEC: SubcommandSpec[] = [
+// Single source of truth for shell completion across bash/zsh/fish/powershell.
+// MUST stay in sync with the dispatch in index.ts (KNOWN_SUBCOMMANDS) -- the
+// completion test asserts every dispatched subcommand appears here.
+export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
+  // Setup -- connect a client to yaw-mcp.
   {
     name: "install",
+    description: "Connect an MCP client to yaw-mcp",
     positional: [...INSTALL_CLIENTS],
     flags: [
       "--scope",
@@ -67,14 +77,59 @@ const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       "--all",
     ],
   },
-  { name: "doctor", flags: ["--json", "--help"] },
-  { name: "servers", flags: ["--json", "--help"] },
-  { name: "bundles", positional: ["list", "match"], flags: ["--json", "--help"] },
-  { name: "compliance", flags: ["--publish", "--help"] },
-  { name: "reset-learning", flags: ["--help"] },
-  { name: "completion", positional: ["bash", "zsh", "fish", "powershell"], flags: ["--help"] },
-  { name: "upgrade", flags: ["--run", "--json", "--help"] },
-  { name: "help", flags: [] },
+  // Local servers -- manage ~/.yaw-mcp/bundles.json (no account).
+  {
+    name: "add",
+    description: "Add a catalog server to bundles.json",
+    positional: ["<slug>"],
+    flags: ["--env", "--dry-run", "--json", "--catalog", "--help"],
+  },
+  { name: "remove", description: "Remove a local server", positional: ["<slug-or-namespace>"], flags: ["--help"] },
+  { name: "list", description: "List the servers yaw-mcp loads locally", flags: ["--json", "--help"] },
+  {
+    name: "try",
+    description: "Wire a one-off trial of a catalog server",
+    positional: ["<slug>"],
+    flags: ["--client", "--ttl", "--env", "--dry-run", "--base", "--help"],
+  },
+  { name: "try-cleanup", description: "Remove a wired trial", positional: ["<slug>"], flags: ["--base", "--help"] },
+  // Inspection.
+  { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
+  { name: "servers", description: "List servers in your yaw.sh/mcp dashboard", flags: ["--json", "--help"] },
+  {
+    name: "bundles",
+    description: "Browse curated multi-server bundles",
+    positional: ["list", "match"],
+    flags: ["--json", "--help"],
+  },
+  // Maintenance.
+  { name: "upgrade", description: "Upgrade @yawlabs/mcp to the latest version", flags: ["--run", "--json", "--help"] },
+  { name: "reset-learning", description: "Clear cross-session learning history", flags: ["--help"] },
+  {
+    name: "completion",
+    description: "Print a shell completion script",
+    positional: ["bash", "zsh", "fish", "powershell"],
+    flags: ["--help"],
+  },
+  // Account / sync (Pro + Team).
+  { name: "login", description: "Authenticate with a Yaw MCP account", flags: ["--key", "--json", "--help"] },
+  { name: "logout", description: "Sign out of your account", flags: ["--json", "--help"] },
+  {
+    name: "sync",
+    description: "Sync bundles across machines",
+    positional: ["push", "pull", "status"],
+    flags: ["--key", "--json", "--help"],
+  },
+  { name: "stats", description: "Show usage statistics", flags: ["--key", "--limit", "--days", "--json", "--help"] },
+  {
+    name: "secrets",
+    description: "Manage stored secrets",
+    positional: ["set", "get", "list", "remove", "lock", "push", "pull"],
+    flags: ["--key", "--value", "--stdin", "--json", "--help"],
+  },
+  // Other.
+  { name: "compliance", description: "Run the compliance suite against a server", flags: ["--publish", "--help"] },
+  { name: "help", description: "Show usage", flags: [] },
 ];
 
 export function parseCompletionArgs(
@@ -168,20 +223,9 @@ complete -F _yaw-mcp yaw-mcp
 }
 
 function renderZsh(): string {
-  const subcommandDescriptions: Record<string, string> = {
-    install: "Auto-edit an MCP client's config",
-    doctor: "Print diagnostic of yaw-mcp setup",
-    servers: "List servers in your yaw.sh/mcp dashboard",
-    bundles: "Browse curated multi-server bundles",
-    compliance: "Run the compliance suite against a server",
-    "reset-learning": "Clear cross-session learning history",
-    completion: "Print a shell completion script",
-    upgrade: "Upgrade @yawlabs/mcp to the latest version",
-    help: "Show usage",
-  };
-  const subcommandList = SUBCOMMAND_SPEC.map((s) => `    '${s.name}:${subcommandDescriptions[s.name] ?? ""}'`).join(
-    "\n",
-  );
+  // Descriptions come straight from the spec (single source of truth), so a
+  // newly-added subcommand can never render with a blank zsh description.
+  const subcommandList = SUBCOMMAND_SPEC.map((s) => `    '${s.name}:${s.description}'`).join("\n");
 
   const argsCases = SUBCOMMAND_SPEC.map((spec) => {
     const lines = [`      ${spec.name})`];
@@ -239,7 +283,10 @@ complete -c yaw-mcp -f`;
       }
     }
     for (const f of spec.flags) {
-      const long = f.replace(/^--/, "");
+      // `-l` takes a LONG option name (no dashes). Only emit for `--` flags;
+      // a single-dash flag (e.g. `-V`) would produce invalid `-l -V` syntax.
+      if (!f.startsWith("--")) continue;
+      const long = f.slice(2);
       flagLines.push(`complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}" -l ${long}`);
     }
   }

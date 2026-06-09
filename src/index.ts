@@ -6,6 +6,7 @@ import { ConfigError } from "./config.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { closestNames } from "./fuzzy.js";
 import { parseInstallArgs, runInstall } from "./install-cmd.js";
+import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { log } from "./logger.js";
 import { parseLoginArgs, runLogin } from "./login-cmd.js";
 import { parseLogoutArgs, runLogout } from "./logout-cmd.js";
@@ -27,6 +28,9 @@ import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 const KNOWN_SUBCOMMANDS = [
   "compliance",
   "install",
+  "add",
+  "remove",
+  "list",
   "doctor",
   "reset-learning",
   "servers",
@@ -175,6 +179,27 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   runTryCleanup(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "add") {
+  const parsed = parseAddArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runAdd(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "remove") {
+  const parsed = parseRemoveArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runRemove(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "list") {
+  const parsed = parseListArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runList(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "login") {
   const parsed = parseLoginArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -219,16 +244,26 @@ if (subcommand === "compliance") {
     2. Install yaw-mcp     yaw-mcp install claude-code --token mcp_pat_...
     3. Verify setup     yaw-mcp doctor
 
-  Setup:
-    install <client>         Configure one MCP client to launch yaw-mcp.
-                             <client> is one of: claude-code, claude-desktop,
-                             cursor, vscode.
+  Setup (connect a client to yaw-mcp):
+    install <client>         Connect one MCP client to yaw-mcp. This wires the
+                             aggregator into the client; it does NOT add a
+                             server (for that, see \`add\` below). <client> is
+                             one of: claude-code, claude-desktop, cursor, vscode.
     install --list           List which MCP clients are installed on this
                              machine (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
-    try <slug>               Wire a one-off trial of an upstream MCP server
-                             into your AI client. No account needed; expires
-                             after --ttl (default 1h). Doctor GCs it after.
+
+  Local servers (no account):
+    add <slug>               Add an MCP server from the yaw.sh/mcp catalog to
+                             your local ~/.yaw-mcp/bundles.json so yaw-mcp loads
+                             it. Pass required env with --env KEY=value.
+    remove <slug>            Remove a server (by slug or namespace) from
+                             bundles.json.
+    list                     List the servers yaw-mcp loads locally.
+    try <slug>               Wire a one-off trial of a catalog MCP server
+                             directly into your AI client (bypassing yaw-mcp).
+                             No account needed; expires after --ttl (default
+                             1h). Doctor GCs it after.
     try-cleanup <slug>       Remove a wired trial early.
 
   Inspection:
@@ -248,6 +283,17 @@ if (subcommand === "compliance") {
     completion <shell>       Print a shell completion script for bash, zsh,
                              fish, or powershell. Redirect to your
                              completions directory to install.
+
+  Account / sync (Pro + Team):
+    login                    Authenticate this machine with a Yaw MCP account
+                             (Pro/Team). --key <license> to pass the key inline.
+    logout                   Sign this machine out of the account.
+    sync <push|pull|status>  Replicate your local bundles.json to/from the
+                             account store (env values stripped on push).
+    secrets <action>         Manage synced secret VALUES: set, get, list,
+                             remove, lock, push, pull.
+    stats                    Show your account usage statistics
+                             (--limit, --days, --json).
 
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP
@@ -279,8 +325,10 @@ if (subcommand === "compliance") {
                                upgraded in the background).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
-    YAW_MCP_BASE_URL              Override the host \`yaw-mcp try\` queries for
-                               /api/explore/:slug (default https://yaw.sh/mcp).
+    YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
+                               against (default https://yaw.sh/data/mcp-catalog.json).
+    YAW_MCP_BASE_URL              Base URL for \`yaw-mcp try\` signup/telemetry
+                               links (default https://yaw.sh/mcp).
 
   Config resolution (highest precedence first):
     1. YAW_MCP_TOKEN / YAW_MCP_URL env vars

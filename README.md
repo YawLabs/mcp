@@ -94,6 +94,36 @@ npx -y @yawlabs/mcp@latest doctor --json   # machine-readable snapshot for pipel
 
 Prints the loaded config files, your token's source + fingerprint (last 4 chars), the API base URL, installed clients, env overrides, persisted learning state, flaky-namespace reliability rollup, shell-history "shadow" hits (CLIs you run that an MCP server could replace), and an upgrade check against the npm registry. Exits `0` healthy / `1` no token / `2` warnings (e.g. world-readable token file). Paste the text output into a support ticket; the `--json` blob is the same data as a structured snapshot, so dashboards and CI scripts can `jq` instead of parsing the text layout.
 
+### Add servers locally (no account) -- `add` / `remove` / `list`
+
+In Free (no-account) mode, yaw-mcp loads servers from `~/.yaw-mcp/bundles.json`.
+Manage that set from the catalog at [yaw.sh/mcp/catalog](https://yaw.sh/mcp/catalog/):
+
+```bash
+yaw-mcp add <slug>                       # resolve a catalog server and write it into bundles.json
+yaw-mcp add github --env GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...   # supply a required env value
+yaw-mcp add <slug> --dry-run [--json]    # preview the entry without writing
+yaw-mcp remove <slug-or-namespace>       # drop a server from bundles.json
+yaw-mcp list [--json]                    # list the servers yaw-mcp loads locally
+```
+
+`add` is NOT `install`: `install <client>` connects an AI client to yaw-mcp;
+`add <slug>` adds an MCP server to yaw-mcp itself. Required env keys are seeded
+empty and only a value passed via `--env` is written to disk (yaw-mcp inherits
+your shell env when it spawns the server, so an ambient secret reaches it at
+runtime without being persisted). The same one-click lives on the website as
+the "Add to Yaw MCP" button.
+
+### Try a server for an hour -- `try`
+
+```bash
+yaw-mcp try <slug> [--client <name>] [--ttl 1h] [--env KEY=value]   # wire a one-off trial directly into your AI client
+yaw-mcp try-cleanup <slug>               # remove a wired trial early (doctor GCs expired ones)
+```
+
+`try` points the AI client straight at the upstream server (bypassing yaw-mcp)
+so you can evaluate it without an account; the entry expires after `--ttl`.
+
 ### Other CLI subcommands
 
 ```bash
@@ -104,6 +134,16 @@ yaw-mcp completion <bash|zsh|fish|powershell>   # print shell completion script
 yaw-mcp upgrade [--run] [--json]         # show (or execute) the command that bumps @yawlabs/mcp
 yaw-mcp compliance <target> [--publish]  # run the compliance suite against an MCP server
 yaw-mcp --version                        # print version
+```
+
+Account / sync (Pro + Team -- a license key unlocks cross-machine bundle sync):
+
+```bash
+yaw-mcp login [--key <license>]          # authenticate this machine with a Yaw MCP account
+yaw-mcp logout                           # sign this machine out
+yaw-mcp sync <push|pull|status> [--json] # replicate bundles.json to/from the account store (env values stripped on push)
+yaw-mcp secrets <set|get|list|remove|lock|push|pull>   # manage synced secret VALUES
+yaw-mcp stats [--limit N] [--days N] [--json]          # account usage statistics
 ```
 
 Every CLI that reads state has a `--json` mode for pipeline use. `yaw-mcp servers` hits the backend; `yaw-mcp bundles list` and `yaw-mcp completion` are fully static (no network, no token). `yaw-mcp bundles match` partitions the curated set against your enabled servers so you see the same ready-to-activate vs. partially-installed view the LLM-facing `mcp_connect_bundles` meta-tool produces.

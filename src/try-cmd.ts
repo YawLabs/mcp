@@ -1,5 +1,5 @@
 // `yaw-mcp try <slug>` — one-shot trial: fetches the canonical launch
-// shape for an MCP server from Yaw MCP's /api/explore/:slug, wires
+// shape for an MCP server from the yaw.sh/mcp catalog (catalog.ts), wires
 // it into the user's AI client config under a `yaw-mcp-try-<slug>` entry
 // (NOT through yaw-mcp -- the trial entry points DIRECTLY at the upstream
 // MCP server's command + args), drops a trial marker file under
@@ -35,6 +35,7 @@ import { homedir, hostname, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { request } from "undici";
 import { atomicWriteFile } from "./atomic-write.js";
+import { resolveCatalogSlug } from "./catalog.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
 import { mergeClientConfig, readNested, removeFromClientConfig } from "./install-cmd.js";
 import {
@@ -64,8 +65,9 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        Required env vars not supplied here AND not in your
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
-  --base <url>         Override the explore endpoint base (default:
-                       \$YAW_MCP_BASE_URL or https://yaw.sh/mcp).`;
+  --base <url>         Base URL for the signup/telemetry links (default:
+                       \$YAW_MCP_BASE_URL or https://yaw.sh/mcp). The catalog
+                       itself is set via \$YAW_MCP_CATALOG_URL.`;
 
 export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
@@ -323,47 +325,22 @@ export async function loadOrCreateAnonId(home: string = homedir()): Promise<stri
   return id;
 }
 
-async function defaultFetchExplore(baseUrl: string, slug: string): Promise<ExploreServerResponse> {
-  const url = `${baseUrl.replace(/\/$/, "")}/api/explore/${encodeURIComponent(slug)}`;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 10_000);
-  try {
-    const res = await fetch(url, { signal: ac.signal, headers: { accept: "application/json" } });
-    if (res.status === 404) {
-      throw new Error(`yaw-mcp try: no server with slug "${slug}" — check ${baseUrl}/explore for the catalog.`);
-    }
-    if (!res.ok) {
-      throw new Error(`yaw-mcp try: ${url} returned HTTP ${res.status}`);
-    }
-    const body = (await res.json()) as unknown;
-    return validateExploreResponse(body, slug);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function validateExploreResponse(body: unknown, slug: string): ExploreServerResponse {
-  if (!body || typeof body !== "object") {
-    throw new Error(`yaw-mcp try: /api/explore/${slug} returned a non-object response.`);
-  }
-  const b = body as Record<string, unknown>;
-  if (typeof b.slug !== "string" || typeof b.name !== "string" || typeof b.command !== "string") {
-    throw new Error(`yaw-mcp try: /api/explore/${slug} missing required string fields (slug/name/command).`);
-  }
-  if (!Array.isArray(b.args) || !b.args.every((x) => typeof x === "string")) {
-    throw new Error(`yaw-mcp try: /api/explore/${slug} has invalid args (expected string[]).`);
-  }
-  const req: string[] = Array.isArray(b.requiredEnvVars)
-    ? (b.requiredEnvVars as unknown[]).filter((x): x is string => typeof x === "string")
-    : [];
+// Resolve the launch shape from the SAME static catalog the website and the
+// Yaw Terminal app read (catalog.ts), so `try <slug>` accepts the exact slug
+// set the catalog shows. (The old /api/explore/:slug endpoint was never
+// deployed -- this is the path that actually works.) `baseUrl` is retained
+// only for the signup/telemetry links; the catalog URL is overridden via
+// YAW_MCP_CATALOG_URL.
+async function defaultFetchExplore(_baseUrl: string, slug: string): Promise<ExploreServerResponse> {
+  const resolved = await resolveCatalogSlug(slug, { catalogUrl: process.env.YAW_MCP_CATALOG_URL });
   const out: ExploreServerResponse = {
-    slug: b.slug,
-    name: b.name,
-    command: b.command,
-    args: b.args as string[],
-    requiredEnvVars: req,
+    slug: resolved.slug,
+    name: resolved.name,
+    command: resolved.command,
+    args: resolved.args,
+    requiredEnvVars: resolved.requiredEnvKeys,
   };
-  if (typeof b.docUrl === "string") out.docUrl = b.docUrl;
+  if (resolved.docUrl) out.docUrl = resolved.docUrl;
   return out;
 }
 
