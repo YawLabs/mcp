@@ -7,7 +7,7 @@
   "author": "Yaw Labs <support@yaw.sh> (https://yaw.sh/mcp)",
   "type": "module",
   "bin": {
-    "yaw-mcp": "./dist/index.js"
+    "yaw-mcp": "dist/index.js"
   },
   "files": [
     "dist",
