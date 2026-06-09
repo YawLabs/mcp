@@ -49,6 +49,9 @@ const FLOOR_MS = 36 * 60 * 60 * 1000; // 1.5 days
  *  (quick checks, often scripted). */
 export const NAG_ELIGIBLE_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "install",
+  "add",
+  "remove",
+  "list",
   "doctor",
   "servers",
   "bundles",

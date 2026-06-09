@@ -1,5 +1,38 @@
 import { describe, expect, it } from "vitest";
-import { COMPLETION_USAGE, parseCompletionArgs, renderScript, runCompletion } from "../completion-cmd.js";
+import {
+  COMPLETION_USAGE,
+  SUBCOMMAND_SPEC,
+  parseCompletionArgs,
+  renderScript,
+  runCompletion,
+} from "../completion-cmd.js";
+
+const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
+
+// Ground-truth dispatched subcommands (index.ts). Pinned here so dropping one
+// from SUBCOMMAND_SPEC -- which would silently shrink every shell's
+// completion -- fails this test loudly. Update both together by design.
+const EXPECTED_SUBCOMMANDS = [
+  "install",
+  "add",
+  "remove",
+  "list",
+  "try",
+  "try-cleanup",
+  "doctor",
+  "servers",
+  "bundles",
+  "upgrade",
+  "reset-learning",
+  "completion",
+  "login",
+  "logout",
+  "sync",
+  "stats",
+  "secrets",
+  "compliance",
+  "help",
+];
 
 function capture(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
   const out: string[] = [];
@@ -57,9 +90,9 @@ describe("renderScript — bash", () => {
     expect(s).toContain("_yaw-mcp()");
   });
 
-  it("includes every known subcommand in the top-level compgen", () => {
+  it("includes every spec'd subcommand in the top-level compgen", () => {
     const s = renderScript("bash");
-    for (const sub of ["install", "doctor", "servers", "bundles", "compliance", "reset-learning", "completion"]) {
+    for (const sub of SUBCOMMAND_NAMES) {
       expect(s).toContain(sub);
     }
   });
@@ -91,10 +124,13 @@ describe("renderScript — zsh", () => {
     expect(s).toContain("_yaw-mcp()");
   });
 
-  it("lists every subcommand as a _values candidate", () => {
+  it("lists every subcommand as a _values candidate with a non-blank description", () => {
     const s = renderScript("zsh");
-    for (const sub of ["install", "doctor", "servers", "bundles", "compliance"]) {
-      expect(s).toContain(`'${sub}:`);
+    for (const spec of SUBCOMMAND_SPEC) {
+      // Each entry renders as 'name:description' -- description must be present
+      // (regression guard for the old hardcoded-map gap that blanked new cmds).
+      expect(s).toContain(`'${spec.name}:${spec.description}'`);
+      expect(spec.description.length).toBeGreaterThan(0);
     }
   });
 });
@@ -105,9 +141,9 @@ describe("renderScript — fish", () => {
     expect(s).toMatch(/complete -c yaw-mcp/);
   });
 
-  it("registers every subcommand under __fish_use_subcommand", () => {
+  it("registers every spec'd subcommand under __fish_use_subcommand", () => {
     const s = renderScript("fish");
-    for (const sub of ["install", "doctor", "servers", "bundles", "completion"]) {
+    for (const sub of SUBCOMMAND_NAMES) {
       expect(s).toContain(`-a ${sub}`);
     }
   });
@@ -125,10 +161,22 @@ describe("renderScript — powershell", () => {
     expect(s).toContain("-CommandName yaw-mcp");
   });
 
-  it("covers every subcommand in the switch block", () => {
+  it("covers every spec'd subcommand in the switch block", () => {
     const s = renderScript("powershell");
-    for (const sub of ["install", "doctor", "servers", "bundles", "completion"]) {
+    for (const sub of SUBCOMMAND_NAMES) {
       expect(s).toContain(`'${sub}'`);
+    }
+  });
+});
+
+describe("SUBCOMMAND_SPEC coverage", () => {
+  it("matches the dispatched subcommand set exactly (no drift vs index.ts)", () => {
+    expect([...SUBCOMMAND_NAMES].sort()).toEqual([...EXPECTED_SUBCOMMANDS].sort());
+  });
+
+  it("includes the local-server + account commands that were previously missing", () => {
+    for (const sub of ["add", "remove", "list", "try", "try-cleanup", "login", "logout", "sync", "stats", "secrets"]) {
+      expect(SUBCOMMAND_NAMES).toContain(sub);
     }
   });
 });

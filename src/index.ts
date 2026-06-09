@@ -284,6 +284,17 @@ if (subcommand === "compliance") {
                              fish, or powershell. Redirect to your
                              completions directory to install.
 
+  Account / sync (Pro + Team):
+    login                    Authenticate this machine with a Yaw MCP account
+                             (Pro/Team). --key <license> to pass the key inline.
+    logout                   Sign this machine out of the account.
+    sync <push|pull|status>  Replicate your local bundles.json to/from the
+                             account store (env values stripped on push).
+    secrets <action>         Manage synced secret VALUES: set, get, list,
+                             remove, lock, push, pull.
+    stats                    Show your account usage statistics
+                             (--limit, --days, --json).
+
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP
                              server. --publish posts the report to
