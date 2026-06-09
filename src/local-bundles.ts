@@ -14,15 +14,17 @@
 // When yaw-mcp starts WITHOUT a token, bundles.json IS the source. If
 // neither file exists, yaw-mcp starts with an empty server list and
 // surfaces the "no servers configured" hint pointing at
-// `yaw-mcp install <slug>`.
+// `yaw-mcp add <slug>` (NOT `install`, which connects a CLIENT to yaw-mcp).
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { atomicWriteFile } from "./atomic-write.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
-import { CONFIG_DIRNAME, findProjectConfigDir } from "./paths.js";
+import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
 import type { ConnectConfig, UpstreamServerConfig } from "./types.js";
 
 /** Canonical filename for the local bundles file. */
@@ -236,4 +238,116 @@ export async function loadLocalBundles(
     path: sourcePath,
     warnings,
   };
+}
+
+// --- Write path (used by `yaw-mcp add` / `remove`) --------------------------
+//
+// These mutate the USER-GLOBAL ~/.yaw-mcp/bundles.json. They are the only
+// writers of local server definitions in the CLI. A project-local
+// <cwd>/.yaw-mcp/bundles.json FULLY overrides user-global on load (see
+// loadLocalBundles), so the add/remove commands warn separately when a
+// project file would shadow the write -- they don't silently target it.
+
+/**
+ * Derive a namespace from a server's DISPLAY NAME. This MUST stay
+ * byte-for-byte identical to the Yaw Terminal app's deriveNamespace
+ * (yaw-install-handler.ts) -- both write to the same ~/.yaw-mcp/bundles.json,
+ * so a divergent algorithm would make the same catalog server land under two
+ * different namespaces (CLI-added vs app/badge-added), duplicating tool
+ * prefixes and breaking cross-path dedup + the app's "installed" check.
+ *
+ * Algorithm (identical to the app): lowercase, strip ALL non-alphanumerics,
+ * 's'-prefix a leading non-letter (so "1Password" -> "s1password"), cap at 30,
+ * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
+ * valid string (never null), so callers don't need a failure branch.
+ */
+export function deriveNamespace(name: string): string {
+  let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (ns.length === 0) return "server";
+  if (!/^[a-z]/.test(ns)) ns = `s${ns}`;
+  if (ns.length > 30) ns = ns.slice(0, 30);
+  return ns;
+}
+
+/**
+ * Read the RAW user-global bundles.json (no validate/coerce) so a save
+ * round-trips fields validateEntry would otherwise drop. Returns a fresh
+ * skeleton when the file is absent; THROWS when present-but-malformed so a
+ * write never clobbers a file the user hand-edited into an invalid state.
+ */
+async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
+  const path = localBundlesPath(userConfigDir(home));
+  if (!existsSync(path)) {
+    return { version: CURRENT_BUNDLES_SCHEMA_VERSION, servers: [] };
+  }
+  const warnings: string[] = [];
+  const r = await readBundlesAt(path, warnings);
+  if (!r.file) {
+    const detail = warnings.length > 0 ? ` (${warnings.join("; ")})` : "";
+    throw new Error(`${path} is malformed${detail}; fix it by hand before adding servers.`);
+  }
+  return { version: r.file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION, servers: r.file.servers };
+}
+
+/**
+ * Insert or replace a server entry in the user-global bundles.json. An
+ * existing entry matches by namespace OR display name -- the name fallback
+ * mirrors the app's deduper (yaw-install-handler.ts doInstall) so a server
+ * added on the other path (e.g. a legacy entry written without a namespace)
+ * isn't duplicated. Atomic write. Returns the path written and whether an
+ * existing entry was replaced (vs a fresh add).
+ */
+export async function upsertUserBundle(
+  entry: Partial<UpstreamServerConfig>,
+  opts: { home?: string } = {},
+): Promise<{ path: string; replaced: boolean }> {
+  const home = opts.home ?? homedir();
+  const path = localBundlesPath(userConfigDir(home));
+  const file = await readRawUserBundles(home);
+  const idx = file.servers.findIndex(
+    (s) => s?.namespace === entry.namespace || (entry.name != null && s?.name === entry.name),
+  );
+  const replaced = idx >= 0;
+  if (replaced) file.servers[idx] = entry;
+  else file.servers.push(entry);
+  // Preserve a newer on-disk schema version rather than downgrading it; only
+  // stamp CURRENT when the file had none (readRawUserBundles guarantees a
+  // numeric version when the file existed, so this only fills the fresh case).
+  file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`);
+  return { path, replaced };
+}
+
+/**
+ * Remove a server entry (by namespace) from the user-global bundles.json.
+ * No-op (removed:false) when the file or the namespace is absent. Atomic
+ * write when a removal actually happens.
+ */
+export async function removeUserBundle(
+  namespace: string,
+  opts: { home?: string } = {},
+): Promise<{ path: string; removed: boolean }> {
+  const home = opts.home ?? homedir();
+  const path = localBundlesPath(userConfigDir(home));
+  if (!existsSync(path)) return { path, removed: false };
+  const file = await readRawUserBundles(home);
+  const before = file.servers.length;
+  file.servers = file.servers.filter((s) => s?.namespace !== namespace);
+  if (file.servers.length === before) return { path, removed: false };
+  // Preserve a newer on-disk schema version rather than downgrading it.
+  file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`);
+  return { path, removed: true };
+}
+
+/**
+ * Does a project-local bundles.json exist that would shadow a user-global
+ * write? `add`/`remove` warn when this returns a path, since a write to
+ * user-global won't load while the project file is present.
+ */
+export async function findShadowingProjectBundles(cwd: string, home: string = homedir()): Promise<string | null> {
+  const projectDir = await findProjectConfigDir(cwd, home).catch(() => null);
+  if (!projectDir) return null;
+  const projectPath = localBundlesPath(projectDir);
+  return existsSync(projectPath) ? projectPath : null;
 }
