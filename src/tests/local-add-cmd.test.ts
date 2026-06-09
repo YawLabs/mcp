@@ -223,6 +223,26 @@ describe("runAdd", () => {
     expect(loaded.config).toBeNull();
   });
 
+  it("--dry-run --json emits the same wrapper shape as a real add --json", async () => {
+    const io = captureIO();
+    await runAdd({
+      slug: "fetch",
+      dryRun: true,
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.ok).toBe(true);
+    expect(parsed.dryRun).toBe(true);
+    expect(parsed.namespace).toBe("fetch");
+    expect(parsed.entry.command).toBe("npx");
+  });
+
   it("reports replaced on a second add of the same slug", async () => {
     const base = { home: synthHome, cwd: synthCwd, env: {}, fetchCatalog, out: () => {}, err: () => {} };
     await runAdd({ ...base, slug: "fetch" });
@@ -438,6 +458,24 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(io.errText()).toMatch(/shadows/i);
+  });
+
+  it("explains the shadow on a no-op remove when a project file is in effect", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    // A project-local file exists, but the target isn't in user-global.
+    mkdirSync(join(synthCwd, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthCwd, ".yaw-mcp", "bundles.json"), JSON.stringify({ servers: [] }));
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/nothing to do/);
+    expect(io.errText()).toMatch(/project-local/i);
   });
 
   it("removeUserBundle is a no-op on a missing namespace", async () => {

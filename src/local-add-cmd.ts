@@ -191,7 +191,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
 
   if (opts.dryRun) {
     if (opts.json) {
-      print(JSON.stringify(entry, null, 2));
+      // Same wrapper shape as the real add below, with dryRun:true, so a
+      // script parsing `add --json` sees one consistent shape either way.
+      print(JSON.stringify({ ok: true, dryRun: true, namespace, entry }, null, 2));
     } else {
       print(`yaw-mcp add (dry-run): would write ${server.name} as namespace "${namespace}"`);
       print(`  command: ${entry.command} ${(entry.args ?? []).join(" ")}`);
@@ -216,8 +218,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   }
 
   // Honest warning: a project-local bundles.json shadows the user-global file.
+  // Goes to stderr, so it surfaces even under --json without corrupting the
+  // JSON on stdout that a script is parsing.
   const shadow = await findShadowingProjectBundles(cwd, home).catch(() => null);
-  if (shadow && !opts.json) {
+  if (shadow) {
     printErr(
       `Note: ${shadow} overrides your user-global bundles.json, so this entry won't load until you add it there or remove that file.`,
     );
@@ -304,6 +308,15 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   if (!res || !res.removed) {
     // No-op exits 0 (like try-cleanup): "make it absent" succeeded.
     print(`yaw-mcp remove: no server matching "${opts.target}" in ${res?.path ?? "bundles.json"} (nothing to do).`);
+    // `list` reads the project-local bundles.json when present (it overrides
+    // user-global), but `remove` only manages user-global -- so a server the
+    // user just saw in `list` can be "not found" here. Explain when that's why.
+    const shadow = await findShadowingProjectBundles(cwd, home).catch(() => null);
+    if (shadow) {
+      printErr(
+        `Note: a project-local ${shadow} is in effect; \`remove\` only manages your user-global bundles.json, so a server defined there must be removed from that file directly.`,
+      );
+    }
     return { exitCode: 0, written: [] };
   }
   print(`Removed "${matched}" from ${res.path}. Restart your MCP client to apply.`);
