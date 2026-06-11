@@ -25,6 +25,7 @@ import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, statSync } fr
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import esbuild from 'esbuild';
+import { inject } from 'postject';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
@@ -83,28 +84,26 @@ if (!isWin) chmodSync(outExe, 0o755);
 // macOS: strip the carrier node binary's existing signature BEFORE injecting,
 // so postject doesn't leave a CORRUPT signature (which is worse than none --
 // arm64 SIGKILLs a bad-sig binary at exec). We ad-hoc re-sign after step 4.
+// Best-effort: an already-unsigned carrier makes `--remove-signature` exit
+// non-zero, which must NOT abort the build -- the --force re-sign is what
+// actually matters.
 if (process.platform === 'darwin') {
-  run('codesign', ['--remove-signature', outExe]);
+  try {
+    run('codesign', ['--remove-signature', outExe]);
+  } catch {
+    console.log('(carrier had no signature to remove -- continuing)');
+  }
 }
 
-// 4. Inject the blob with postject (fetched on demand into the global npx
-//    cache -- does NOT touch the project node_modules). Invoke npm's npx-cli.js
-//    via the running node binary so no .cmd shim or shell is involved.
-const postjectArgs = [
-  outExe,
-  'NODE_SEA_BLOB',
-  blobPath,
-  '--sentinel-fuse',
-  'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
-];
-if (process.platform === 'darwin') {
-  postjectArgs.push('--macho-segment-name', 'NODE_SEA');
-}
-const npxCli = resolve(
-  dirname(process.execPath),
-  'node_modules/npm/bin/npx-cli.js',
-);
-run(process.execPath, [npxCli, '--yes', 'postject', ...postjectArgs]);
+// 4. Inject the SEA blob via postject's JS API (pinned devDep). NOT the npx
+//    CLI: locating npx-cli.js off the node binary is Windows-only (Unix keeps
+//    npm under ../lib/node_modules, not ./node_modules), and npx-on-demand
+//    adds a network dependency to every CI build. The API is cross-platform.
+await inject(outExe, 'NODE_SEA_BLOB', readFileSync(blobPath), {
+  sentinelFuse: 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2',
+  machoSegmentName: process.platform === 'darwin' ? 'NODE_SEA' : undefined,
+});
+console.log('injection done');
 
 // 5. macOS: ad-hoc re-sign AFTER injection. Apple Silicon refuses to exec a
 //    Mach-O with no/invalid signature ("killed: 9"); `--sign -` is the free
