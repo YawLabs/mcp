@@ -36,6 +36,10 @@ const { version } = pkg;
 // Binary name = the package's first `bin` command, so this script is
 // copy-paste generic across @yawlabs/* servers -- no per-repo rename.
 const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
+// Bundle the SOURCE behind the bin's dist entry (src/index.ts, src/server.ts,
+// src/runner.ts, ...) so this works regardless of the server's entry filename.
+const binEntry = Object.values(pkg.bin ?? {})[0] ?? pkg.main ?? 'dist/index.js';
+const srcEntry = binEntry.replace(/^\.\//, '').replace(/^dist\//, 'src/').replace(/\.[cm]?js$/, '.ts');
 
 const platformDir = `${process.platform}-${process.arch}`;
 const binDir = join(repoRoot, 'bin', platformDir);
@@ -64,7 +68,7 @@ mkdirSync(binDir, { recursive: true });
 // `node bin/esbuild` would feed a binary to the JS parser and die. The API
 // also takes the __VERSION__ define as data -- no shell-quoting games.
 await esbuild.build({
-  entryPoints: [join(repoRoot, 'src/index.ts')],
+  entryPoints: [join(repoRoot, srcEntry)],
   bundle: true,
   platform: 'node',
   format: 'cjs',
