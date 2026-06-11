@@ -100,8 +100,15 @@ describe("runAudit", () => {
     expect(io.out.join("\n")).toContain("Grade: A");
   });
 
-  it("emits JSON with --json", async () => {
-    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: ["x.js"] }]);
+  it("emits PURE JSON with --json (no human preamble)", async () => {
+    // The Yaw MCP panel parses this stdout directly, so in --json mode the
+    // ENTIRE output must be the JSON object -- no "Auditing..." preamble. A
+    // preamble whose text could contain a brace (a server arg like
+    // --config={...}) would otherwise corrupt brace-based extraction and
+    // misreport a passing audit as a failure. Pins that fix.
+    home = makeHome([
+      { namespace: "ctxlint", type: "local", command: "node", args: ['--config={"port":1}'] },
+    ]);
     const io = captureIO();
     const r = await runAudit({
       namespace: "ctxlint",
@@ -113,10 +120,10 @@ describe("runAudit", () => {
       runner: async () => ({ grade: "B", score: 80 }),
     });
     expect(r.exitCode).toBe(0);
-    // The first line is the human "Auditing..." note; the JSON is the rest.
-    const jsonLine = io.out.find((l) => l.trim().startsWith("{"));
-    expect(jsonLine).toBeDefined();
-    const parsed = JSON.parse(io.out.slice(io.out.indexOf(jsonLine!)).join("\n"));
+    const stdout = io.out.join("\n");
+    expect(stdout).not.toContain("Auditing");
+    // The whole stdout parses as JSON directly -- no leading lines to skip.
+    const parsed = JSON.parse(stdout);
     expect(parsed).toMatchObject({ namespace: "ctxlint", grade: "B", score: 80 });
   });
 
