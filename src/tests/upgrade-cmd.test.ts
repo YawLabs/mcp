@@ -84,6 +84,19 @@ describe("detectInstallMethod", () => {
     ).toBe("global-npm");
   });
 
+  it("detects scoop/volta-style <prefix>/bin/node_modules as global", () => {
+    expect(
+      detectInstallMethod(
+        "C:\\Users\\jeff\\scoop\\persist\\nodejs22\\bin\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+      ),
+    ).toBe("global-npm");
+    expect(
+      detectInstallMethod(
+        "C:\\Users\\jeff\\scoop\\apps\\nodejs22\\current\\bin\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+      ),
+    ).toBe("global-npm");
+  });
+
   it("detects nvm-style /home/u/.nvm/versions/node/.../lib/node_modules as global", () => {
     expect(detectInstallMethod("/home/u/.nvm/versions/node/v22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
       "global-npm",

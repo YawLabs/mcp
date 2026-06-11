@@ -116,6 +116,13 @@ export function detectInstallMethod(argvPath: string | undefined): InstallMethod
   if (/\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   if (/\/lib\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  // Windows npm prefixes that live in a `bin` dir (scoop's nodejs persist
+  // dir, volta, custom prefixes): globals land at <prefix>/node_modules
+  // with <prefix> itself named `bin`. A project tree whose root dir is
+  // literally named `bin` is rare enough that this marker is safe, and
+  // misclassifying these as local-node-modules made `upgrade --run`
+  // npm-install into the node prefix instead of upgrading the global.
+  if (/\/bin\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   if (/\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "local-node-modules";
   // `npm run dev` or direct `node ./dist/index.js` from a checkout --
   // not installed at all. Match either yaw-mcp (renamed dir) or mcph
