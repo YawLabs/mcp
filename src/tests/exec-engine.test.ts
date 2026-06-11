@@ -291,6 +291,41 @@ describe("exec-engine: validateExecRequest", () => {
     });
     expect(r.ok).toBe(true);
   });
+
+  it("fix#1: accepts return pointing at a positional index for an unnamed step", () => {
+    // Steps without an explicit id bind under String(index) ("0", "1", ...).
+    // validateExecRequest was only tracking explicit ids, so `return: "0"`
+    // for an unnamed step always failed with 'unknown step id'.
+    const r = validateExecRequest({
+      steps: [{ tool: "x" }, { tool: "y" }],
+      return: "1",
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("fix#1: rejects return pointing at a position that is out of range", () => {
+    const r = validateExecRequest({
+      steps: [{ tool: "x" }],
+      return: "5",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("unknown step id");
+  });
+
+  it("fix#1: positional keys do not shadow explicit ids -- both are valid targets", () => {
+    // Mix: step 0 has no id (binds as "0"); step 1 has id "b".
+    // return: "0" should be valid (positional), return: "b" also valid (explicit).
+    const r0 = validateExecRequest({
+      steps: [{ tool: "x" }, { id: "b", tool: "y" }],
+      return: "0",
+    });
+    expect(r0.ok).toBe(true);
+    const rb = validateExecRequest({
+      steps: [{ tool: "x" }, { id: "b", tool: "y" }],
+      return: "b",
+    });
+    expect(rb.ok).toBe(true);
+  });
 });
 
 describe("exec-engine: stepBindingKey", () => {

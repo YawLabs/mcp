@@ -62,6 +62,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -101,6 +105,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "servers") {
   const parsed = parseServersArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -108,6 +116,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "bundles") {
   const parsed = parseBundlesArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -115,6 +127,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "completion") {
   const parsed = parseCompletionArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -122,6 +138,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "upgrade") {
   const parsed = parseUpgradeArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -129,6 +149,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "try") {
   const parsed = parseTryArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -136,6 +160,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "try-cleanup") {
   const parsed = parseTryCleanupArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -201,9 +229,10 @@ if (subcommand === "compliance") {
   yaw-mcp — one install, every MCP server, managed from the cloud.
 
   Quickstart:
-    1. Get a token      https://yaw.sh/mcp/dashboard/settings/tokens
-    2. Install yaw-mcp     yaw-mcp install claude-code --token mcp_pat_...
-    3. Verify setup     yaw-mcp doctor
+    1. Install yaw-mcp     yaw-mcp install claude-code
+    2. Verify setup     yaw-mcp doctor
+    3. Yaw Team (optional)  yaw-mcp login --key <license-key>
+                            https://yaw.sh/mcp/dashboard/settings/tokens
 
   Setup (connect a client to yaw-mcp):
     install <client>         Connect one MCP client to yaw-mcp. This wires the
@@ -302,7 +331,7 @@ if (subcommand === "compliance") {
   (or kill yaw-mcp; the client will respawn it) after editing any config.
 
   Docs:   https://yaw.sh/mcp
-  Source: https://github.com/YawLabs/yaw-mcp
+  Source: https://github.com/YawLabs/mcp
 
 `);
   process.exit(0);

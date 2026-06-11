@@ -44,6 +44,20 @@ vi.mock("../tool-report.js", () => ({
   reportTools: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Mock team-sync so we can spy on getCachedCookie without disk I/O.
+// Important: getSession must always return a thenable (Promise) because
+// rerank.ts calls it as `getSession().catch(...)`. A vi.fn() reset by
+// vi.clearAllMocks() returns undefined which breaks .catch(). We use a
+// stable default implementation that always returns a resolved Promise.
+vi.mock("../team-sync.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return {
+    ...actual,
+    getSession: vi.fn().mockImplementation(() => Promise.resolve(null)),
+    getCachedCookie: vi.fn().mockReturnValue(null),
+  };
+});
+
 import { request } from "undici";
 import { initRerank, rerank } from "../rerank.js";
 import { ConnectServer } from "../server.js";
@@ -315,6 +329,50 @@ describe("handleDispatch two-stage ranking", () => {
     expect(result.isError).toBeUndefined();
     expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("gh");
+  });
+
+  // ---------------------------------------------------------------
+  // Fix: readTeamCookie uses getCachedCookie (no duplicate disk read)
+  // ---------------------------------------------------------------
+  it("readTeamCookie calls getCachedCookie (not a second readFile) after getSession warms the cache", async () => {
+    // team-sync is mocked at module level (vi.mock above). Both getSession
+    // and getCachedCookie are vi.fn() on the same mock instance that
+    // rerank.ts's lazy import("./team-sync.js") resolves to.
+    //
+    // The fixed rerank.ts path:
+    //   rerank() calls getSession() [static import] -> session truthy
+    //   -> callTeamRerank() -> readTeamCookie() -> getCachedCookie() [dynamic import]
+    //   NO second getSession() inside readTeamCookie.
+    const teamSync = await import("../team-sync.js");
+
+    // getSession returns a valid session so Path A runs.
+    // Use mockImplementationOnce so the default (null) is restored for the
+    // next test -- vi.clearAllMocks() preserves implementations, not results.
+    vi.mocked(teamSync.getSession).mockImplementationOnce(() =>
+      Promise.resolve({
+        email: "u@example.com",
+        role: "member" as const,
+        order_id: "ord",
+        exp: Date.now() + 86400_000,
+      }),
+    );
+    // getCachedCookie returns a real cookie so callTeamRerank proceeds.
+    vi.mocked(teamSync.getCachedCookie).mockReturnValueOnce("test-cookie");
+
+    // Stub the team-rerank HTTP call (Path A hits yaw.sh/api/team/rerank).
+    vi.mocked(request).mockResolvedValueOnce({
+      statusCode: 200,
+      body: {
+        text: vi.fn().mockResolvedValue(""),
+        json: vi.fn().mockResolvedValue({ results: [{ id: "srv-id", score: 0.9 }] }),
+      },
+    } as any);
+
+    await rerank("test intent", ["srv-id"]);
+
+    // getCachedCookie must have been called (the new code path)
+    // rather than a raw readFile inside readTeamCookie.
+    expect(vi.mocked(teamSync.getCachedCookie)).toHaveBeenCalled();
   });
 
   it("sorts reranked candidates above non-reranked BM25 survivors", async () => {

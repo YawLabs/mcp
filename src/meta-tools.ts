@@ -131,6 +131,7 @@ export const META_TOOLS = {
         },
         budget: {
           type: "number",
+          default: 1,
           description:
             "How many top-ranked servers to load into the session. Defaults to 1. Cap is 10. Raise only when one task genuinely spans multiple servers.",
         },

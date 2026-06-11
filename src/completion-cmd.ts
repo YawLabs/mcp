@@ -134,9 +134,9 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
 
 export function parseCompletionArgs(
   argv: string[],
-): { ok: true; options: { shell: CompletionShell } } | { ok: false; error: string } {
+): { ok: true; options: { shell: CompletionShell } } | { ok: false; error: string; help?: boolean } {
   if (argv.includes("--help") || argv.includes("-h")) {
-    return { ok: false, error: COMPLETION_USAGE };
+    return { ok: false, error: COMPLETION_USAGE, help: true };
   }
   const positional = argv.filter((a) => !a.startsWith("-"));
   if (positional.length === 0) {

@@ -48,13 +48,17 @@ Actions:
                           Requires \`yaw-mcp login\` first.
   pull                    Download the vault from mcp_secrets and write
                           it locally. Overwrites local vault. Requires
-                          \`yaw-mcp login\` first.
+                          \`yaw-mcp login\` first. Refuses when the local
+                          vault has a different salt (different passphrase
+                          lineage) unless --force is passed.
 
 Flags:
   --json                  Machine-readable output (where applicable).
   --value <v>             Inline secret value (set only). Beware shell
                           history -- prefer the default stdin prompt.
   --stdin                 Read the secret from raw stdin (set only).
+  --force                 (pull only) Overwrite even when the local vault
+                          salt differs from the remote. Back up first.
 
 Passphrase:
   Set YAW_MCP_VAULT_PASSPHRASE in the env, or you will be prompted on
@@ -68,6 +72,8 @@ export interface SecretsCommandOptions {
   value?: string;
   fromStdin?: boolean;
   json?: boolean;
+  /** For `pull`: overwrite even when the local vault salt differs from remote. */
+  force?: boolean;
   /** Test hooks. */
   home?: string;
   passphrase?: string;
@@ -92,6 +98,10 @@ export function parseSecretsArgs(
     }
     if (a === "--stdin") {
       opts.fromStdin = true;
+      continue;
+    }
+    if (a === "--force") {
+      opts.force = true;
       continue;
     }
     if (a === "--value") {
@@ -416,11 +426,34 @@ async function runSecretsPull(
   }
   try {
     const remote = await getResource<VaultFile>(MCP_SECRETS_RESOURCE, { home, baseUrl: opts.baseUrl });
-    if (!remote.data || !remote.data.salt || !remote.data.entries) {
+    // Treat remote as empty when: no data, no salt, OR entries present but
+    // empty ({}) with no salt -- an entries:{} + missing/empty salt shape is
+    // an uninitialised stub, not a real vault worth overwriting local data.
+    const remoteEntries = remote.data?.entries;
+    const remoteHasEntries =
+      remoteEntries !== undefined &&
+      remoteEntries !== null &&
+      typeof remoteEntries === "object" &&
+      Object.keys(remoteEntries).length > 0;
+    if (!remote.data || !remote.data.salt || !remoteHasEntries) {
       const msg = "Remote mcp_secrets is empty. Push from this machine to seed it.";
       if (opts.json) io.out(`${JSON.stringify({ ok: true, empty: true })}\n`);
       else io.out(`${msg}\n`);
       return { exitCode: 0 };
+    }
+    // Salt-conflict guard: if a non-empty local vault exists whose salt
+    // differs from the remote's, refuse -- the two vaults were derived from
+    // different passphrases and overwriting would make local secrets
+    // irrecoverable.  The user must back up and pass --force to proceed.
+    const localVault = await loadVault(path);
+    const localHasEntries = localVault !== null && Object.keys(localVault.entries).length > 0;
+    if (localHasEntries && localVault.salt !== remote.data.salt && !opts.force) {
+      const msg =
+        `Local vault at ${path} has a different salt than the remote (different passphrase lineage). ` +
+        `Back up ${path} first, then re-run with --force to overwrite.`;
+      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+      else io.err(`yaw-mcp secrets pull: ${msg}\n`);
+      return { exitCode: 1 };
     }
     await ensureVaultDir(path);
     await saveVault(path, remote.data);
@@ -434,7 +467,9 @@ async function runSecretsPull(
         `${JSON.stringify({ ok: true, secret_count: count, remote_version: remote.version, written: path }, null, 2)}\n`,
       );
     } else {
-      io.out(`Pulled ${count} secret${count === 1 ? "" : "s"} (encrypted) -> ${path}\n`);
+      io.out(
+        `Local vault replaced with remote copy: ${count} secret${count === 1 ? "" : "s"} (encrypted) -> ${path}\n`,
+      );
       io.out("Vault locked -- next secrets command will prompt for the passphrase.\n");
     }
     return { exitCode: 0 };

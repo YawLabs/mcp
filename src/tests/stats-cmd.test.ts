@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { STATS_USAGE, parseStatsArgs } from "../stats-cmd.js";
+import { STATS_USAGE, formatPlain, parseStatsArgs } from "../stats-cmd.js";
+import type { AnalyticsEvent } from "../team-sync.js";
 
 describe("parseStatsArgs", () => {
   it("defaults to no flags", () => {
@@ -66,5 +67,41 @@ describe("parseStatsArgs", () => {
     const r = parseStatsArgs(["--help"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe(STATS_USAGE);
+  });
+});
+
+function makeEvent(ts: number): AnalyticsEvent {
+  return {
+    ts,
+    seat_email: "test@example.com",
+    tool_namespace: "gh",
+    tool_name: "list_issues",
+    status: "success",
+    latency_ms: 42,
+    client_name: "claude-code",
+    client_version: "1.0.0",
+  };
+}
+
+describe("formatPlain -- showing count respects --limit", () => {
+  it("shows full count when events <= limit (default 50)", () => {
+    const events = Array.from({ length: 5 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, {}, "ord-123", 5);
+    // 5 events, default limit 50 -> renderedCount = min(5, 50) = 5
+    expect(out).toMatch(/^Showing 5 of 5 events/m);
+  });
+
+  it("shows limit count when events > limit", () => {
+    const events = Array.from({ length: 100 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, { limit: 10 }, "ord-123", 100);
+    // 100 events, limit 10 -> renderedCount = min(100, 10) = 10
+    expect(out).toMatch(/^Showing 10 of 100 events/m);
+  });
+
+  it("default limit 50 caps rendering when events > 50", () => {
+    const events = Array.from({ length: 80 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, {}, "ord-123", 80);
+    // 80 events, default limit 50 -> renderedCount = min(80, 50) = 50
+    expect(out).toMatch(/^Showing 50 of 80 events/m);
   });
 });

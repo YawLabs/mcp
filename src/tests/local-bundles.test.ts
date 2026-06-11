@@ -1,8 +1,14 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BUNDLES_FILENAME, loadLocalBundles, localBundlesPath } from "../local-bundles.js";
+import {
+  BUNDLES_FILENAME,
+  loadLocalBundles,
+  localBundlesPath,
+  removeUserBundle,
+  upsertUserBundle,
+} from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
 let synthHome: string;
@@ -10,12 +16,14 @@ let synthCwd: string;
 
 beforeEach(() => {
   synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-"));
-  synthCwd = mkdtempSync(join(tmpdir(), "yaw-mcp-cwd-"));
+  // synthCwd lives INSIDE synthHome so findProjectConfigDir's walk-up stops at
+  // the synthetic home boundary and never reaches the real ~/.yaw-mcp/ on the
+  // developer's machine -- matching the isolation pattern in config-loader.test.ts.
+  synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
 
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
-  rmSync(synthCwd, { recursive: true, force: true });
 });
 
 function writeBundles(dir: string, content: unknown) {
@@ -208,5 +216,100 @@ describe("loadLocalBundles", () => {
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config).toBeNull();
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
+  });
+});
+
+// Fix 1: readBundlesAt -- ENOENT/EISDIR -> exists:false; other errors -> exists:true
+describe("readBundlesAt error discrimination (fix 1)", () => {
+  it.skipIf(process.platform === "win32")(
+    "EPERM/EACCES on project file does NOT fall through to user-global",
+    async () => {
+      // Write a valid user-global so a fallthrough would succeed.
+      writeBundles(synthHome, {
+        version: 1,
+        servers: [{ namespace: "global", name: "Global", command: "npx" }],
+      });
+      // Write a valid project file, then revoke all permissions on it.
+      writeBundles(synthCwd, {
+        version: 1,
+        servers: [{ namespace: "project", name: "Project", command: "npx" }],
+      });
+      const projectBundlesPath = localBundlesPath(join(synthCwd, CONFIG_DIRNAME));
+      chmodSync(projectBundlesPath, 0o000);
+      try {
+        const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+        // exists:true committed to project path -- config is null (unreadable),
+        // but the global file must NOT have been loaded.
+        expect(r.config).toBeNull();
+        expect(r.config?.servers?.some((s) => s.namespace === "global")).toBeFalsy();
+        // A warning must be present for the unreadable file.
+        expect(r.warnings.some((w) => w.includes("could not read"))).toBe(true);
+      } finally {
+        // Restore perms so afterEach rmSync can clean up.
+        chmodSync(projectBundlesPath, 0o644);
+      }
+    },
+  );
+
+  it("ENOENT (no file) still returns exists:false and falls through to global", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "global", name: "Global", command: "npx" }],
+    });
+    // No project bundles.json -- pure fallthrough expected.
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].namespace).toBe("global");
+    expect(r.warnings).toHaveLength(0);
+  });
+});
+
+// Fix 2: bundleWriteChain serializer -- concurrent calls must not lose writes
+describe("upsertUserBundle / removeUserBundle serializer (fix 2)", () => {
+  it("concurrent upserts do not lose any entry", async () => {
+    const namespaces = ["aaa", "bbb", "ccc", "ddd", "eee"];
+    // Fan out all writes without awaiting between them.
+    await Promise.all(
+      namespaces.map((ns) =>
+        upsertUserBundle(
+          { namespace: ns, name: ns.toUpperCase(), command: "npx", args: [], isActive: true },
+          { home: synthHome },
+        ),
+      ),
+    );
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const writtenNs = (r.config?.servers ?? []).map((s) => s.namespace).sort();
+    expect(writtenNs).toEqual([...namespaces].sort());
+  });
+
+  it("interleaved upsert then remove serializes correctly", async () => {
+    // Add three servers concurrently, then remove one concurrently with an add.
+    await Promise.all([
+      upsertUserBundle(
+        { namespace: "alpha", name: "Alpha", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+      upsertUserBundle(
+        { namespace: "beta", name: "Beta", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+      upsertUserBundle(
+        { namespace: "gamma", name: "Gamma", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+    ]);
+    // Now concurrently remove beta and add delta.
+    await Promise.all([
+      removeUserBundle("beta", { home: synthHome }),
+      upsertUserBundle(
+        { namespace: "delta", name: "Delta", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+    ]);
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const writtenNs = (r.config?.servers ?? []).map((s) => s.namespace).sort();
+    expect(writtenNs).toContain("alpha");
+    expect(writtenNs).toContain("gamma");
+    expect(writtenNs).toContain("delta");
+    expect(writtenNs).not.toContain("beta");
   });
 });

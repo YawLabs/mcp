@@ -55,14 +55,14 @@ export interface ParsedServersArgs {
 // emit a usage error instead of silently ignoring unknown flags.
 export function parseServersArgs(
   argv: string[],
-): { ok: true; options: ParsedServersArgs } | { ok: false; error: string } {
+): { ok: true; options: ParsedServersArgs } | { ok: false; error: string; help?: boolean } {
   let json = false;
   let filter: string | undefined;
   for (const a of argv) {
     if (a === "--json") {
       json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: SERVERS_USAGE };
+      return { ok: false, error: SERVERS_USAGE, help: true };
     } else if (a.startsWith("-")) {
       return { ok: false, error: `yaw-mcp servers: unknown argument "${a}"\n\n${SERVERS_USAGE}` };
     } else if (filter === undefined) {

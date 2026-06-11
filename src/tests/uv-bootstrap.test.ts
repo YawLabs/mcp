@@ -6,6 +6,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // here (it's exercised by the integration test gated on
 // MCPH_TEST_UV_DOWNLOAD=1) because pulling a 20MB binary over
 // GitHub during CI is noisy and slow.
+//
+// NOTE: fix-1 (shell:true on win32) and fix-2 (memo clear on rejection)
+// are pinned in uv-bootstrap-fixes.test.ts, which mocks node:child_process
+// at module level to control spawn without ESM limitations.
 // ═══════════════════════════════════════════════════════════════════════
 
 vi.mock("../logger.js", () => ({ log: vi.fn() }));

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { LOGIN_USAGE, parseLoginArgs } from "../login-cmd.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LOGIN_USAGE, parseLoginArgs, runLogin } from "../login-cmd.js";
 
 describe("parseLoginArgs", () => {
   it("accepts --key <license-key>", () => {
@@ -39,5 +39,49 @@ describe("parseLoginArgs", () => {
     const r = parseLoginArgs(["--help"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe(LOGIN_USAGE);
+  });
+});
+
+// -----------------------------------------------------------------------
+// runLogin -- exit code discrimination (fix: non-auth errors exit 2, not 1)
+// -----------------------------------------------------------------------
+
+vi.mock("../team-sync.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, signIn: vi.fn() };
+});
+
+import { TeamSyncAuthError } from "../team-sync.js";
+import { signIn } from "../team-sync.js";
+
+describe("runLogin exit codes", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+
+  beforeEach(() => {
+    io.out.mockReset();
+    io.err.mockReset();
+  });
+
+  it("exits 1 on TeamSyncAuthError (bad license key)", async () => {
+    vi.mocked(signIn).mockRejectedValue(new TeamSyncAuthError("Sign in failed."));
+    const result = await runLogin({ key: "bad-key" }, io);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("exits 2 on non-auth errors (network failure, unexpected)", async () => {
+    vi.mocked(signIn).mockRejectedValue(new Error("ECONNREFUSED"));
+    const result = await runLogin({ key: "lk_test" }, io);
+    expect(result.exitCode).toBe(2);
+  });
+
+  it("exits 0 on success", async () => {
+    vi.mocked(signIn).mockResolvedValue({
+      email: "user@example.com",
+      role: "member",
+      order_id: "order-1",
+      exp: Date.now() + 86400_000,
+    });
+    const result = await runLogin({ key: "lk_valid" }, io);
+    expect(result.exitCode).toBe(0);
   });
 });

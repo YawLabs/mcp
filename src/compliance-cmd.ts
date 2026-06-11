@@ -80,7 +80,7 @@ function runTest(args: string[]): Promise<ComplianceReport | null> {
 function printSummary(report: ComplianceReport): void {
   const { grade, score, summary, url } = report;
   process.stdout.write(
-    `\nCompliance: ${grade} (${score.toFixed(1)}%) — ${summary.passed}/${summary.total} passed, ` +
+    `\nCompliance: ${grade} (${score.toFixed(1)}%) -- ${summary.passed}/${summary.total} passed, ` +
       `${summary.requiredPassed}/${summary.required} required\n` +
       `Target: ${url}\n`,
   );

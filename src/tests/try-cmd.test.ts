@@ -438,7 +438,7 @@ describe("runTry — preserves existing client config siblings", () => {
 });
 
 describe("runTryCleanup", () => {
-  it("removes the entry + marker + fires cleanup event", async () => {
+  it("removes the entry + marker + fires cleanup event, written contains client path", async () => {
     // Wire a trial first.
     const cap1 = captureIO();
     await runTry({
@@ -473,6 +473,39 @@ describe("runTryCleanup", () => {
     expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
     expect(events).toHaveLength(1);
     expect(events[0].action).toBe("cleanup");
+    // written must contain the client path because the entry was actually removed.
+    expect(r.written).toContain(join(synthHome, ".claude.json"));
+  });
+
+  it("written is empty when the client config has no entry to remove", async () => {
+    // Create a marker that points at a config file that no longer has the entry.
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "demo",
+      name: "Demo MCP",
+      expiresAt: Date.now() + 3_600_000,
+      clientPath: join(synthHome, ".claude.json"),
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-demo",
+      createdAt: Date.now(),
+    };
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(marker));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    // Nothing was written because the entry was already absent.
+    expect(r.written).toEqual([]);
   });
 
   it("is a clean no-op when no trial is wired", async () => {

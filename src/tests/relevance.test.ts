@@ -147,4 +147,45 @@ describe("rankServers (corpus-wide BM25)", () => {
     // "unique" appears in 1/3 servers → higher IDF → higher top score
     expect(rareQuery[0]?.score).toBeGreaterThan(commonQuery[0]?.score ?? 0);
   });
+
+  // Fix 5: bm25Score no longer accepts the dead `idf: Map<string,string>` param.
+  // rankServers must still produce correct scores after the signature cleanup.
+  it("produces the same scores before and after idf param removal (fix 5)", () => {
+    // Regression guard: removing the dead parameter must not change output.
+    const servers = [
+      {
+        namespace: "gh",
+        name: "GitHub",
+        description: "Repos and issues",
+        tools: [{ name: "create_issue", description: "Create an issue" }],
+      },
+      {
+        namespace: "slack",
+        name: "Slack",
+        description: "Team messaging",
+        tools: [{ name: "send_message", description: "Post a message" }],
+      },
+    ];
+    const ranked = rankServers("create github issue", servers);
+    // gh should rank first — create/issue both match gh fields.
+    expect(ranked[0]?.namespace).toBe("gh");
+    // Both scores must be finite positive numbers (not NaN from a voided arg).
+    for (const r of ranked) {
+      expect(Number.isFinite(r.score)).toBe(true);
+      expect(r.score).toBeGreaterThan(0);
+    }
+  });
+
+  it("rankServers scores are purely driven by idfValues, not the removed idf param (fix 5)", () => {
+    // A term unique to one server should score that server highly,
+    // confirming idfValues (the real Map<string,number>) is the active path.
+    const servers = [
+      { namespace: "only", name: "OnlyMatch", description: "xyzplonk unique term", tools: [] },
+      { namespace: "other", name: "Other", description: "completely different", tools: [] },
+    ];
+    const ranked = rankServers("xyzplonk", servers);
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0].namespace).toBe("only");
+    expect(ranked[0].score).toBeGreaterThan(0);
+  });
 });

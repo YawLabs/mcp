@@ -84,7 +84,10 @@ async function onPath(cmd: string): Promise<boolean> {
     try {
       child = spawn(cmd, ["--version"], {
         stdio: "ignore",
-        shell: false,
+        // Windows needs a shell for PATHEXT shim resolution (.cmd/.exe)
+        // so `uv --version` finds uv.cmd without an ENOENT false-negative.
+        // Mirrors the PROBES spawn options in runtime-detect.ts.
+        shell: process.platform === "win32",
         windowsHide: process.platform === "win32",
       });
     } catch {
@@ -193,7 +196,14 @@ let pending: Promise<string> | null = null;
 // platforms or download/verify failures so `upstream.ts` can wrap the
 // error into an ActivationError with a useful message.
 export function ensureUv(): Promise<string> {
-  pending ??= resolveUv();
+  if (!pending) {
+    // Clear the memo on rejection so the next call retries rather than
+    // returning the same rejected promise for the process lifetime.
+    pending = resolveUv().catch((err: unknown) => {
+      pending = null;
+      return Promise.reject(err);
+    });
+  }
   return pending;
 }
 

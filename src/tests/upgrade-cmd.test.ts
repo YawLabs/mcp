@@ -289,6 +289,7 @@ describe("runUpgrade", () => {
     expect(out).toContain("Latest:  0.45.0");
     expect(out).toContain("Install: global-npm");
     expect(out).toContain("latest version");
+    expect(out).toContain("OK:");
   });
 
   it("exits 1 and prints the command when stale and --run not passed (global-npm)", async () => {
@@ -337,7 +338,7 @@ describe("runUpgrade", () => {
     expect(r.exitCode).toBe(0);
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
-    expect(io.out.join("\n")).toContain("Upgraded @yawlabs/mcp to 0.45.0");
+    expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
   });
 
   it("with --run, propagates the child exit code as 3 on failure", async () => {
@@ -373,7 +374,7 @@ describe("runUpgrade", () => {
     expect(r.exitCode).toBe(0);
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: "/proj/app" });
-    expect(io.out.join("\n")).toContain("Upgraded @yawlabs/mcp to 0.45.0");
+    expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
   });
 
   it("with --run on a pnpm global store, spawns pnpm (never npm-installs into the store)", async () => {
@@ -416,6 +417,28 @@ describe("runUpgrade", () => {
     const err = io.err.join("\n");
     expect(err).toContain("can't be upgraded automatically");
     expect(err).toContain("git pull && npm run build");
+  });
+
+  it("without --run on a local-node-modules install, prints 'in <root>:' above the command", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    const out = io.out.join("\n");
+    expect(out).toContain("in /proj/app:");
+    // Command must be on its own line with no trailing punctuation.
+    const cmdLine = io.out.find((l) => l.includes("npm install @yawlabs/mcp@latest"));
+    expect(cmdLine).toBeDefined();
+    expect(cmdLine!.trimEnd()).toMatch(/@latest$/);
+    // The 'in <root>:' line must appear before the command line.
+    const rootIdx = io.out.findIndex((l) => l.includes("in /proj/app:"));
+    const cmdIdx = io.out.findIndex((l) => l.includes("npm install @yawlabs/mcp@latest"));
+    expect(rootIdx).toBeLessThan(cmdIdx);
   });
 
   it("without --run on a dev checkout, prints the command and notes --run won't work", async () => {

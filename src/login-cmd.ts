@@ -90,6 +90,6 @@ export async function runLogin(
     } else {
       io.err(`yaw-mcp login: ${message}\n`);
     }
-    return { exitCode: err instanceof TeamSyncAuthError ? 1 : 1 };
+    return { exitCode: err instanceof TeamSyncAuthError ? 1 : 2 };
   }
 }

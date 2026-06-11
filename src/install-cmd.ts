@@ -375,7 +375,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       `Note: legacy "${legacyEntry}" entry remains at ${resolved.absolute}. Remove it to avoid running yaw-mcp twice.`,
     );
   }
-  log(`\n✓ ${target.label} is configured. Restart it to pick up the new MCP server.`);
+  log(`\nDone: ${target.label} is configured. Restart it to pick up the new MCP server.`);
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }
 
@@ -613,7 +613,7 @@ export function parseInstallArgs(argv: string[]):
       ok: true;
       options: InstallCommandOptions;
     }
-  | { ok: false; error: string } {
+  | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: USAGE };
   const positional: string[] = [];
   const opts: Partial<InstallCommandOptions> = {};
@@ -667,7 +667,7 @@ export function parseInstallArgs(argv: string[]):
         break;
       case "-h":
       case "--help":
-        return { ok: false, error: USAGE };
+        return { ok: false, error: USAGE, help: true };
       default:
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${USAGE}` };
         positional.push(a);
@@ -840,7 +840,7 @@ async function runInstallAll(
 
   const totalPlanned = plans.length;
   if (failed === 0) {
-    log(`✓ ${succeeded}/${totalPlanned} clients installed successfully.`);
+    log(`Done: ${succeeded}/${totalPlanned} clients installed successfully.`);
     return {
       written: aggregateWritten,
       wouldWrite: aggregateWouldWrite,

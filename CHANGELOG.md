@@ -2,6 +2,12 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
+## 0.60.3 -- npm-prefix refinement + pnpm/bun self-upgrade
+
+- `refineInstallMethod` now probes `npm prefix -g` (3s timeout) and normalises the result through `realpathSync` so junctioned prefixes (scoop's `current` symlink, Volta shims) resolve to the real path before comparison. When the running entrypoint lives under the npm global prefix, ambiguous `local-node-modules` / `unknown` detections are promoted to `global-npm` -- fixes exotic prefix setups the path-marker list doesn't know.
+- The probe is wired into both `yaw-mcp upgrade` and `yaw-mcp doctor` via the shared `refineInstallMethod` call in `runUpgrade` / `runDoctor`.
+- `maybeAutoUpgrade` (the fire-and-forget startup check) now acts on stale pnpm and bun global installs with `pnpm add -g` / `bun add -g @yawlabs/mcp@latest` in addition to the existing `npm install -g` path. The background spawn log messages interpolate the actual tool name instead of hardcoding `npm`.
+
 ## 0.60.2 -- pnpm/bun global stores upgrade with their owning tool
 
 - `yaw-mcp upgrade` now detects pnpm global stores (`<pnpm-home>/global/<n>/node_modules/...`) and bun global installs (`~/.bun/install/global/...`) as their own install methods. `--run` spawns `pnpm add -g` / `bun add -g @yawlabs/mcp@latest` instead of misclassifying them as local node_modules trees -- which would have npm-installed a foreign package-lock + node_modules into the tool manager's internal store.

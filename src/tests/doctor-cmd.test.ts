@@ -327,7 +327,7 @@ describe("runDoctor — surfaces config-loader warnings", () => {
       out: cap.out,
     });
     // Token resolved (env), but the warning about committed-file token still surfaces.
-    expect(cap.text()).toMatch(/should not appear in a project-shared file/);
+    expect(cap.text()).toMatch(/project-shared config file is IGNORED/);
     expect(r.exitCode).toBe(2);
   });
 });

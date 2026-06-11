@@ -252,7 +252,16 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
     if (typeof ret !== "string" || ret.length === 0) {
       return { ok: false, message: "`return` must be a non-empty step id string" };
     }
-    if (!seenIds.has(ret)) {
+    // Build the full set of valid binding keys: explicit ids AND positional
+    // fallback keys ("0", "1", ...) for steps that have no explicit id.
+    const allBindingKeys = new Set(seenIds);
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i] as Record<string, unknown>;
+      if (typeof s.id !== "string" || s.id.length === 0) {
+        allBindingKeys.add(String(i));
+      }
+    }
+    if (!allBindingKeys.has(ret)) {
       return { ok: false, message: `\`return\` references unknown step id "${ret}"` };
     }
   }

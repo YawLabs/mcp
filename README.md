@@ -367,7 +367,7 @@ Rotate a credential in one place (the dashboard), every machine picks up the new
 | `LOG_LEVEL` | No | Log verbosity: `debug`, `info`, `warn`, `error` (default: `info`) |
 | `YAW_MCP_POLL_INTERVAL` | No | Config-poll interval in seconds. `0` disables polling (config fetched once at startup). Default: `60` |
 | `YAW_MCP_AUTO_ACTIVATE` | No | When `discover` is called with a context string and one server clearly wins, auto-load it. Set to `0` to disable. Default: enabled |
-| `YAW_MCP_AUTO_UPGRADE` | No | When yaw-mcp starts as a server, runs a non-blocking background check for a newer global-npm install and upgrades quietly. Set to `0` to disable. Default: enabled. |
+| `YAW_MCP_AUTO_UPGRADE` | No | When yaw-mcp starts as a server, runs a non-blocking background check for a newer npm/pnpm/bun global install and upgrades quietly with the owning tool. Set to `0` to disable. Default: enabled. |
 | `YAW_MCP_SERVER_CAP` | No | Hard cap on concurrently activated servers. Default: `6`. Set to `0` to disable. |
 | `YAW_MCP_PRUNE_RESPONSES` | No | Conservative response pruning (redact large file blobs etc. before returning to the client). Set to `0` or `false` to disable. Default: enabled. |
 | `YAW_MCP_DISABLE_PERSISTENCE` | No | Set to `1` or `true` to keep learning + pack-history scoped to the current process -- nothing loaded at start, nothing written on shutdown. Intended for ephemeral / shared environments (CI, containers). Default: cross-session persistence enabled at `~/.yaw-mcp/state.json`. |
@@ -410,7 +410,7 @@ If you find a security issue in yaw-mcp itself, report it via [GitHub's private 
 ## Requirements
 
 - Node.js 18+
-- A [yaw.sh/mcp](https://yaw.sh/mcp) account
+- No account required for core features. A Yaw Team license key is needed only for sync and shared bundles (yaw.sh/mcp).
 
 ## Links
 

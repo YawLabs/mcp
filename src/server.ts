@@ -269,7 +269,7 @@ export class ConnectServer {
   // settles (success or failure).
   private activationInflight = new Map<
     string,
-    Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }>
+    Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }>
   >();
   // Usage learning — nudges dispatch toward namespaces that have been
   // genuinely useful. Counts persist across yaw-mcp restarts via state.json
@@ -945,7 +945,7 @@ export class ConnectServer {
           content: [
             {
               type: "text",
-              text: `Tool "${name}" is no longer available after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to see current tools.`,
+              text: `Tool "${name}" is no longer available after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
             },
           ],
           isError: true,
@@ -1611,7 +1611,7 @@ export class ConnectServer {
   private activateOne(
     namespace: string,
     progress?: ProgressReporter,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
     const inflight = this.activationInflight.get(namespace);
     if (inflight) {
       progress?.(`"${namespace}" load already in flight — awaiting existing attempt`);
@@ -1632,7 +1632,7 @@ export class ConnectServer {
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
       progress?.(`"${namespace}" already loaded`);
@@ -1689,7 +1689,12 @@ export class ConnectServer {
     }
     const capDecision = evaluateServerCap(namespace, loadedSlots, this.serverCap);
     if (!capDecision.allow) {
-      return { ok: false, isChanged: false, message: capDecision.message ?? "Concurrent server cap reached." };
+      return {
+        ok: false,
+        isChanged: false,
+        capped: true,
+        message: capDecision.message ?? "Concurrent server cap reached.",
+      };
     }
 
     // Merge any session-elicited env over the server's configured env.
@@ -1959,7 +1964,7 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
-      isError: anyError && !anyChanged ? true : undefined,
+      isError: anyError ? true : undefined,
     };
   }
 
@@ -2071,7 +2076,9 @@ export class ConnectServer {
       const r = await this.activateOne(winner.namespace, progress);
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
       if (r.isChanged) anyChanged = true;
-      if (!r.ok) anyError = true;
+      // Cap refusals are expected when the budget exceeds the concurrent
+      // server cap -- informational, not a failure the model must retry.
+      if (!r.ok && !r.capped) anyError = true;
       // Activation success is NOT recorded as a learning signal — that
       // would inflate "this server worked" into "every activation
       // counts as a successful tool call," which collapses the
@@ -2090,7 +2097,7 @@ export class ConnectServer {
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
     return {
       content: [{ type: "text", text: header + results.join("\n") }],
-      isError: anyError && !anyChanged ? true : undefined,
+      isError: anyError ? true : undefined,
     };
   }
 
@@ -2130,7 +2137,6 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
-      isError: !anyChanged ? true : undefined,
     };
   }
 
@@ -2941,6 +2947,34 @@ export class ConnectServer {
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 
+  // Extract the semantic payload from a successful MCP tool result for use
+  // as a step binding in exec pipelines. The MCP wire format wraps every
+  // result in `{ content: [{type, text}, ...], isError? }`, but the exec
+  // tool description promises `$ref` targets that behave like the tool's
+  // actual output -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number)`.
+  //
+  // Rules, in order:
+  //   1. Single text item whose text is valid JSON -> the parsed JSON value.
+  //   2. Single text item (non-JSON) -> the raw text string.
+  //   3. Everything else (multi-item, non-text, empty) -> the content array.
+  //
+  // This is intentionally simple and loss-free: callers can still reach
+  // the full wire payload via the `partial` / `steps` objects if needed.
+  private static parseStepPayload(result: {
+    content?: Array<{ type: string; text?: string }>;
+    isError?: boolean;
+  }): unknown {
+    const content = result.content;
+    if (!Array.isArray(content) || content.length !== 1) return content ?? [];
+    const item = content[0];
+    if (item.type !== "text" || typeof item.text !== "string") return content;
+    try {
+      return JSON.parse(item.text);
+    } catch {
+      return item.text;
+    }
+  }
+
   // Declarative pipeline executor. Runs N tool calls in order, binding
   // each output under the step's id (or positional index), and lets
   // later steps splice those outputs into their args via
@@ -3094,7 +3128,7 @@ export class ConnectServer {
         };
       }
 
-      bindings[key] = stepResult;
+      bindings[key] = ConnectServer.parseStepPayload(stepResult);
     }
 
     const returnKey = explicitReturn ?? stepKeys[stepKeys.length - 1];

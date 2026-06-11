@@ -121,7 +121,10 @@ function sanitizeLearning(input: unknown): Record<string, PersistedLearningUsage
     if (typeof u.dispatched !== "number" || !Number.isFinite(u.dispatched) || u.dispatched < 0) continue;
     if (typeof u.succeeded !== "number" || !Number.isFinite(u.succeeded) || u.succeeded < 0) continue;
     if (typeof u.lastUsedAt !== "number" || !Number.isFinite(u.lastUsedAt) || u.lastUsedAt < 0) continue;
-    out[k] = { dispatched: u.dispatched, succeeded: u.succeeded, lastUsedAt: u.lastUsedAt };
+    // succeeded cannot exceed dispatched — clamp rather than reject so we
+    // salvage otherwise-valid entries from corrupted/hand-edited state files.
+    const succeeded = Math.min(u.succeeded, u.dispatched);
+    out[k] = { dispatched: u.dispatched, succeeded, lastUsedAt: u.lastUsedAt };
   }
   return out;
 }
