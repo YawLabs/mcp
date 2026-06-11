@@ -1,19 +1,20 @@
 #!/usr/bin/env node
-// Regenerate the Scoop manifest (scoop-yaw/bucket/mcp.json) and Homebrew
-// formula (homebrew-yaw/Formula/yaw-mcp.rb) for a published release, filling in
+// Regenerate the Scoop manifest (scoop-yaw/bucket/<pkg>.json) and Homebrew
+// formula (homebrew-yaw/Formula/<cmd>.rb) for a published release, filling in
 // the version + per-arch sha256s from the GitHub Release's `.sha256` sidecars.
 //
-// Mirrors the Yaw Terminal release.sh sibling-repo pattern: the manifest repos
-// are checked out next to this one and pushed with the gh_woods SSH key -- no
-// CI cross-repo token. The binary BUILD is CI (release.yml on tag push); this
-// manifest BUMP is run locally after the release assets land.
+// Everything repo-specific is DERIVED from package.json (command name, repo
+// slug, license, description), so this script is copy-paste across @yawlabs/*
+// servers -- only the sibling-repo dirs are flags. Mirrors the Yaw Terminal
+// release.sh pattern: the manifest repos are checked out next to this one and
+// pushed with the gh_woods SSH key -- no CI cross-repo token. The binary BUILD
+// is CI (release.yml on tag push); this manifest BUMP runs locally after.
 //
-//   node scripts/update-manifests.mjs --version 0.60.4 \
+//   node scripts/update-manifests.mjs --version 0.60.6 \
 //     [--scoop-dir ~/yaw/scoop-yaw] [--homebrew-dir ~/yaw/homebrew-yaw] [--push]
 //
-// Hashes are pulled from the release with `gh release download v<version>
-// -p '*.sha256'` (needs gh auth). Without --push it writes the files and
-// prints the git commands for review.
+// Hashes are pulled with `gh release download v<version> -p '*.sha256'` (needs
+// gh auth). Without --push it writes the files and prints the git commands.
 
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -37,21 +38,33 @@ const scoopDir = resolve(expand(arg('scoop-dir', '~/yaw/scoop-yaw')));
 const homebrewDir = resolve(expand(arg('homebrew-dir', '~/yaw/homebrew-yaw')));
 const push = process.argv.includes('--push');
 
-const REPO = 'https://github.com/YawLabs/mcp';
+// --- everything below is derived from package.json (copy-paste generic) ------
+const pkgShort = pkg.name.split('/').pop(); // scoop install name + bucket file
+const cmd = Object.keys(pkg.bin ?? {})[0] ?? pkgShort; // the on-PATH command
+const repoSlug =
+  (pkg.repository?.url ?? '')
+    .replace(/^git\+/, '')
+    .replace(/^https?:\/\/github\.com\//, '')
+    .replace(/\.git$/, '') || `YawLabs/${pkgShort}`;
+const REPO = `https://github.com/${repoSlug}`;
+const homepage = pkg.homepage || REPO;
+// CamelCase the command for the Homebrew class (yaw-mcp -> YawMcp).
+const className = cmd.split(/[-_]/).map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join('');
+const proprietary = !pkg.license || pkg.license === 'UNLICENSED';
 const dl = (asset) => `${REPO}/releases/download/${tag}/${asset}`;
 
-// Per-arch asset names (must match stage-release-asset.mjs).
+// Per-arch asset names (must match stage-release-asset.mjs: <cmd>-<plat>-<arch>).
 const ASSETS = {
-  winX64: 'yaw-mcp-win32-x64.exe',
-  winArm64: 'yaw-mcp-win32-arm64.exe',
-  macArm64: 'yaw-mcp-darwin-arm64',
-  macX64: 'yaw-mcp-darwin-x64',
-  linuxX64: 'yaw-mcp-linux-x64',
+  winX64: `${cmd}-win32-x64.exe`,
+  winArm64: `${cmd}-win32-arm64.exe`,
+  macArm64: `${cmd}-darwin-arm64`,
+  macX64: `${cmd}-darwin-x64`,
+  linuxX64: `${cmd}-linux-x64`,
 };
 
 // 1. Pull every .sha256 sidecar from the release into a temp dir, parse hashes.
-const shaDir = mkdtempSync(join(tmpdir(), 'yaw-mcp-sha-'));
-execFileSync('gh', ['release', 'download', tag, '--repo', 'YawLabs/mcp', '-p', '*.sha256', '-D', shaDir], {
+const shaDir = mkdtempSync(join(tmpdir(), `${cmd}-sha-`));
+execFileSync('gh', ['release', 'download', tag, '--repo', repoSlug, '-p', '*.sha256', '-D', shaDir], {
   stdio: 'inherit',
 });
 const hashes = {};
@@ -69,11 +82,11 @@ function hashFor(asset) {
 const scoopManifest = {
   version,
   description: pkg.description,
-  homepage: pkg.homepage,
-  license: { identifier: 'Proprietary', url: 'https://yaw.sh' },
+  homepage,
+  license: { identifier: proprietary ? 'Proprietary' : pkg.license, url: 'https://yaw.sh' },
   architecture: {
-    '64bit': { url: dl(ASSETS.winX64), hash: hashFor(ASSETS.winX64), bin: [[ASSETS.winX64, 'yaw-mcp']] },
-    arm64: { url: dl(ASSETS.winArm64), hash: hashFor(ASSETS.winArm64), bin: [[ASSETS.winArm64, 'yaw-mcp']] },
+    '64bit': { url: dl(ASSETS.winX64), hash: hashFor(ASSETS.winX64), bin: [[ASSETS.winX64, cmd]] },
+    arm64: { url: dl(ASSETS.winArm64), hash: hashFor(ASSETS.winArm64), bin: [[ASSETS.winArm64, cmd]] },
   },
   // Belt-and-suspenders: strip any Mark-of-the-Web so SmartScreen never fires
   // (Scoop's own fetch usually leaves none, but a proxied download might).
@@ -87,12 +100,13 @@ const scoopManifest = {
   },
 };
 
-// 3. Homebrew formula (CLI -> formula, NOT cask). Proprietary -> :cannot_represent.
-const formula = `class YawMcp < Formula
-  desc "${pkg.description.replace(/"/g, '\\"')}"
-  homepage "${pkg.homepage}"
+// 3. Homebrew formula (CLI -> formula, NOT cask).
+const licenseLine = proprietary ? 'license :cannot_represent' : `license "${pkg.license}"`;
+const formula = `class ${className} < Formula
+  desc "${(pkg.description ?? '').replace(/"/g, '\\"')}"
+  homepage "${homepage}"
   version "${version}"
-  license :cannot_represent
+  ${licenseLine}
 
   on_macos do
     on_arm do
@@ -114,18 +128,20 @@ const formula = `class YawMcp < Formula
 
   def install
     # Each per-arch release asset is a single bare binary; rename to the command.
-    bin.install Dir["*"].first => "yaw-mcp"
+    bin.install Dir["*"].first => "${cmd}"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/yaw-mcp --version")
+    assert_match version.to_s, shell_output("#{bin}/${cmd} --version")
   end
 end
 `;
 
 // 4. Write both manifests into the sibling repos.
-const scoopPath = join(scoopDir, 'bucket', 'mcp.json');
-const formulaPath = join(homebrewDir, 'Formula', 'yaw-mcp.rb');
+const scoopRel = `bucket/${pkgShort}.json`;
+const formulaRel = `Formula/${cmd}.rb`;
+const scoopPath = join(scoopDir, scoopRel);
+const formulaPath = join(homebrewDir, formulaRel);
 mkdirSync(dirname(scoopPath), { recursive: true });
 mkdirSync(dirname(formulaPath), { recursive: true });
 writeFileSync(scoopPath, `${JSON.stringify(scoopManifest, null, 2)}\n`);
@@ -143,11 +159,11 @@ function commitPush(dir, file, msg) {
   git('push', 'origin', 'main');
 }
 if (push) {
-  commitPush(scoopDir, 'bucket/mcp.json', `yaw-mcp ${version}`);
-  commitPush(homebrewDir, 'Formula/yaw-mcp.rb', `yaw-mcp ${version}`);
+  commitPush(scoopDir, scoopRel, `${cmd} ${version}`);
+  commitPush(homebrewDir, formulaRel, `${cmd} ${version}`);
   console.log('pushed scoop-yaw + homebrew-yaw');
 } else {
   console.log('\n--push not set. Review, then:');
-  console.log(`  git -C ${scoopDir} add bucket/mcp.json && git -C ${scoopDir} commit -m "yaw-mcp ${version}" && git -C ${scoopDir} push`);
-  console.log(`  git -C ${homebrewDir} add Formula/yaw-mcp.rb && git -C ${homebrewDir} commit -m "yaw-mcp ${version}" && git -C ${homebrewDir} push`);
+  console.log(`  git -C ${scoopDir} add ${scoopRel} && git -C ${scoopDir} commit -m "${cmd} ${version}" && git -C ${scoopDir} push`);
+  console.log(`  git -C ${homebrewDir} add ${formulaRel} && git -C ${homebrewDir} commit -m "${cmd} ${version}" && git -C ${homebrewDir} push`);
 }
