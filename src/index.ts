@@ -1,3 +1,4 @@
+import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
@@ -25,6 +26,7 @@ import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 // starting as an MCP server and opaquely erroring on the missing token.
 const KNOWN_SUBCOMMANDS = [
   "compliance",
+  "audit",
   "install",
   "add",
   "remove",
@@ -59,6 +61,13 @@ const subcommand = process.argv[2];
 
 if (subcommand === "compliance") {
   runComplianceCommand(process.argv.slice(3)).then((code) => process.exit(code));
+} else if (subcommand === "audit") {
+  const parsed = parseAuditArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runAudit(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -321,6 +330,10 @@ if (subcommand === "compliance") {
     compliance <target>      Run the 88-test compliance suite against an MCP
                              server. --publish posts the report to
                              yaw.sh/mcp and prints the public URL.
+    audit <namespace>        Run the compliance suite against a stdio server
+                             from your bundles.json and cache its A-F grade in
+                             ~/.yaw-mcp/grades.json (shown in \`servers\` + the
+                             Yaw Terminal MCP panel).
     help, --help, -h         Show this help.
     --version, -V            Print yaw-mcp version.
 

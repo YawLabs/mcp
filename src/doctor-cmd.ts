@@ -40,7 +40,13 @@ import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
 import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
 import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
-import { buildUpgradePlan, detectInstallMethod, refineInstallMethod } from "./upgrade-cmd.js";
+import {
+  BINARY_DOWNLOAD_URL,
+  buildUpgradePlan,
+  detectInstallMethod,
+  detectSea,
+  refineInstallMethod,
+} from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -269,7 +275,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     // Refinement consults `npm prefix -g` for the ambiguous methods
     // (auto-skipped under vitest; see refineInstallMethod).
     const effectiveArgvPath = opts.argvPath ?? process.argv[1];
-    const method = await refineInstallMethod(detectInstallMethod(effectiveArgvPath), effectiveArgvPath);
+    const method = (await detectSea())
+      ? "binary"
+      : await refineInstallMethod(detectInstallMethod(effectiveArgvPath), effectiveArgvPath);
     print("UPGRADE AVAILABLE");
     if (method === "bundled-app") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This copy ships inside`);
@@ -277,6 +285,10 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     } else if (method === "npx") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. npx fetches the latest`);
       print("  on each spawn — restart your MCP client to pick it up.");
+    } else if (method === "binary") {
+      print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This is a standalone`);
+      print("  binary — download the latest build and replace the executable:");
+      print(`    ${BINARY_DOWNLOAD_URL}`);
     } else if (
       method === "global-npm" ||
       method === "pnpm-global" ||

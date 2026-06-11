@@ -3,6 +3,7 @@ import {
   type InstallMethod,
   buildUpgradePlan,
   detectInstallMethod,
+  detectSea,
   localInstallRoot,
   parseUpgradeArgs,
   refineInstallMethod,
@@ -148,6 +149,26 @@ describe("detectInstallMethod", () => {
   });
 });
 
+describe("detectSea", () => {
+  it("returns false when ELECTRON_RUN_AS_NODE is set (Electron is never a SEA)", async () => {
+    const prev = process.env.ELECTRON_RUN_AS_NODE;
+    process.env.ELECTRON_RUN_AS_NODE = "1";
+    try {
+      expect(await detectSea()).toBe(false);
+    } finally {
+      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
+      if (prev === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+      else process.env.ELECTRON_RUN_AS_NODE = prev;
+    }
+  });
+
+  it("returns false on an ordinary node run (execPath basename is node; no SEA blob)", async () => {
+    // Vitest runs under plain node, so the basename gate (and isSea()) yield
+    // false -- this pins that detectSea() never false-positives on real node.
+    expect(await detectSea()).toBe(false);
+  });
+});
+
 describe("refineInstallMethod", () => {
   it("reclassifies local-node-modules as global-npm when the entrypoint lives under npm's prefix", async () => {
     // Windows layout: globals at <prefix>/node_modules.
@@ -278,6 +299,12 @@ describe("buildUpgradePlan", () => {
     // user a sensible copy-paste command.
     const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("unknown") });
     expect(plan.command).toBe("npm install -g @yawlabs/mcp@latest");
+    expect(plan.stale).toBe(true);
+  });
+
+  it("returns null command for a standalone binary (replace the executable, no package manager)", () => {
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("binary") });
+    expect(plan.command).toBeNull();
     expect(plan.stale).toBe(true);
   });
 });
@@ -629,5 +656,77 @@ describe("runUpgrade", () => {
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toEqual({ cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"], cwd: undefined });
     expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
+  });
+
+  it("tells a standalone-binary user to download the latest build (exit 1, no npm)", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    const out = io.out.join("\n");
+    expect(out).toContain("Install: binary");
+    expect(out).toContain("standalone binary");
+    expect(out).toContain("github.com/YawLabs/mcp/releases");
+    expect(out).not.toContain("npm install");
+  });
+
+  it("with --run on a binary, refuses with exit 2 (no package manager to run)", async () => {
+    const io = captureIO();
+    let didSpawn = false;
+    const r = await runUpgrade({
+      run: true,
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async () => {
+        didSpawn = true;
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(didSpawn).toBe(false);
+    expect(io.out.join("\n")).not.toContain("npm install");
+  });
+
+  it("--json reports method: binary with a null command", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      json: true,
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed).toMatchObject({ method: "binary", command: null, stale: true });
+  });
+
+  it("offline + binary points at the release page, not the npx restart message", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => null,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = io.out.join("\n");
+    expect(out).toContain("standalone binary");
+    expect(out).toContain("releases/latest");
+    expect(out).not.toContain("npx");
   });
 });

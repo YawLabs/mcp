@@ -29,7 +29,7 @@
 
 import { spawn } from "node:child_process";
 import { log } from "./logger.js";
-import { buildUpgradePlan, detectInstallMethod } from "./upgrade-cmd.js";
+import { buildUpgradePlan, detectInstallMethod, detectSea } from "./upgrade-cmd.js";
 
 declare const __VERSION__: string;
 
@@ -63,6 +63,8 @@ export interface AutoUpgradeDeps {
   fetchLatestImpl?: () => Promise<string | null>;
   /** Test hook: replace the background npm spawn. */
   spawnImpl?: (cmd: string, args: string[]) => void;
+  /** Test hook: force single-executable (SEA binary) detection. */
+  isSeaImpl?: () => boolean | Promise<boolean>;
 }
 
 function defaultSpawn(cmd: string, args: string[]): void {
@@ -123,7 +125,9 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // An unbuilt checkout has no real version to compare; never touch it.
   if (current === "dev") return;
 
-  const method = detectInstallMethod(deps.argvPath ?? process.argv[1]);
+  const method = (deps.isSeaImpl ? await deps.isSeaImpl() : await detectSea())
+    ? "binary"
+    : detectInstallMethod(deps.argvPath ?? process.argv[1]);
 
   const latest = await (deps.fetchLatestImpl ?? fetchLatestVersion)();
   // Offline / registry unreachable / malformed response -- no-op.
@@ -157,6 +161,13 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     // can refresh it, so there is nothing to spawn and nothing to ask of
     // the user beyond keeping the app current.
     log("info", "yaw-mcp (bundled with Yaw Terminal) is behind npm; it updates with the app", { current, latest });
+    return;
+  }
+
+  if (method === "binary") {
+    // A standalone binary has no package manager to self-upgrade -- the user
+    // replaces the executable. Nothing safe to spawn; log it and move on.
+    log("info", "yaw-mcp (standalone binary) is behind npm; download the latest build to update", { current, latest });
     return;
   }
 

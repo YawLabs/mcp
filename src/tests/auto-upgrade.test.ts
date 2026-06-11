@@ -212,6 +212,19 @@ describe("maybeAutoUpgrade", () => {
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
+  it("does NOT spawn for a standalone binary (no package manager to self-upgrade)", async () => {
+    // A SEA binary has no package manager; the user replaces the executable.
+    // isSeaImpl forces the binary classification regardless of the argv path.
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      isSeaImpl: () => true,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
   it("only whitelists `npm install -g @yawlabs/mcp@latest` -- never arbitrary commands", async () => {
     const calls: [string, string[]][] = [];
     await maybeAutoUpgrade({

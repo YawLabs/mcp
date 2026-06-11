@@ -338,4 +338,79 @@ describe("runServersCommand", () => {
     expect(r.exitCode).toBe(0);
     expect(io.out.join("\n")).toContain('No servers match "stripe"');
   });
+
+  it("overlays a cached grade onto the server row (json)", async () => {
+    const io = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => ({
+        configVersion: "v1",
+        servers: [makeServer({ namespace: "ctxlint", name: "ctxlint" })],
+      }),
+      gradesReader: async () => ({ ctxlint: { grade: "A", score: 100, gradedAt: "t" } }),
+    });
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.servers[0].complianceGrade).toBe("A");
+  });
+
+  it("cached grade wins over the backend's grade", async () => {
+    const io = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => ({
+        configVersion: "v1",
+        servers: [makeServer({ namespace: "x", complianceGrade: "C" })],
+      }),
+      gradesReader: async () => ({ x: { grade: "A", score: 100, gradedAt: "t" } }),
+    });
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.servers[0].complianceGrade).toBe("A");
+  });
+
+  it("servers without a cached grade keep the backend value", async () => {
+    const io = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => ({
+        configVersion: "v1",
+        servers: [makeServer({ namespace: "graded", complianceGrade: "B" }), makeServer({ namespace: "ungraded" })],
+      }),
+      gradesReader: async () => ({ other: { grade: "A", score: 100, gradedAt: "t" } }),
+    });
+    const parsed = JSON.parse(io.out.join("\n"));
+    const byNs = Object.fromEntries(
+      parsed.servers.map((s: { namespace: string; complianceGrade?: string }) => [s.namespace, s.complianceGrade]),
+    );
+    expect(byNs.graded).toBe("B");
+    expect(byNs.ungraded).toBeUndefined();
+  });
+
+  it("renders the cached grade in the table grade column", async () => {
+    const io = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => ({
+        configVersion: "v1",
+        servers: [makeServer({ namespace: "ctxlint", name: "ctxlint" })],
+      }),
+      gradesReader: async () => ({ ctxlint: { grade: "A", score: 100, gradedAt: "t" } }),
+    });
+    // The grade column should show "A" (not "-") for the cached namespace.
+    expect(io.out.join("\n")).toMatch(/ctxlint.*\bA\b/);
+  });
 });

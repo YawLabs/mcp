@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp",
-  "version": "0.60.3",
+  "version": "0.60.5",
   "mcpName": "io.github.YawLabs/mcp",
   "description": "Yaw MCP -- MCP servers, managed. Free to run locally; Yaw Team adds cross-machine sync.",
   "license": "UNLICENSED",
@@ -28,6 +28,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@yawlabs/mcp-compliance": "^0.16.1",
     "undici": "^7.8.0"
   },
   "overrides": {
@@ -39,7 +40,7 @@
     "@types/node": "^22.0.0",
     "tsup": "^8.4.0",
     "typescript": "^5.8.3",
-    "vitest": "^3.1.1"
+    "vitest": "^3.2.6"
   },
   "engines": {
     "node": ">=18.3"
