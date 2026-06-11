@@ -393,9 +393,14 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const shellShadows = scanShellHistoryForShadows({ home, env });
 
-  const skipCheck = opts.skipRegistryCheck === true || Boolean(process.env.VITEST);
+  // Mirrors the text path's hook handling (see runDoctor): an explicit
+  // registryFetch bypasses the VITEST guard, and currentVersion overrides
+  // the build-time VERSION. opts.argvPath is intentionally unused here --
+  // the JSON snapshot's upgrade block carries no install method.
+  const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
   const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
-  const stale = latest !== null && VERSION !== "dev" && compareSemver(VERSION, latest) < 0;
+  const effectiveVersion = opts.currentVersion ?? VERSION;
+  const stale = latest !== null && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0;
 
   let exitCode = 0;
   let summary: string;
@@ -427,7 +432,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     reliability,
     clients,
     shellShadows,
-    upgrade: { current: VERSION, latest, stale },
+    upgrade: { current: effectiveVersion, latest, stale },
     diagnosis: { exitCode, summary },
   };
 

@@ -560,8 +560,7 @@ describe("runUpgrade", () => {
 
   it("--json --run emits JSON and never calls spawnImpl (report-only snapshot)", async () => {
     // Pins that --json is a report-only snapshot: combining it with --run
-    // must NOT spawn the upgrade. Exit code follows the stale-without-run
-    // rule (1 when stale), not the run-succeeded rule (0).
+    // must NOT spawn the upgrade.
     const io = captureIO();
     let didSpawn = false;
     const r = await runUpgrade({
@@ -578,18 +577,15 @@ describe("runUpgrade", () => {
       err: io.pushErr,
     });
     expect(didSpawn).toBe(false);
-    // JSON branch emits the plan and exits per stale state, ignoring --run.
+    // JSON branch emits the plan and exits per upgrade-cmd.ts's
+    // `plan.stale && !opts.run ? 1 : 0`: with opts.run set (but ignored
+    // for spawning), the exit code is 0.
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed.stale).toBe(true);
-    // With --run set but ignored, exit code is still 1 (stale, no spawn).
-    // The JSON branch exits 0 only when stale === false or opts.run is also set.
-    // Re: upgrade-cmd.ts:354 -- exitCode = plan.stale && !opts.run ? 1 : 0.
-    // Since opts.run IS set, the JSON branch exits 0 (it treats --run as
-    // "acknowledge I know about --run" not as "do the spawn").
     expect(r.exitCode).toBe(0);
   });
 
-  it("--json --run offline (fetchLatest null) with bundled-app argvPath: prints app-update hint, never spawns, exit 0", async () => {
+  it("offline (fetchLatest null) with bundled-app argvPath: prints the app-update hint, never spawns, exit 0", async () => {
     // Item 3: offline + bundled-app must print the app-update hint, never
     // an npm command, and always exit 0.
     const io = captureIO();
