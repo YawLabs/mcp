@@ -271,6 +271,12 @@ describe("buildUpgradePlan", () => {
     // dev is always non-stale because the version string doesn't parse.
     expect(plan.stale).toBe(false);
   });
+
+  it("returns null command for a standalone binary (replace the executable, no package manager)", () => {
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("binary") });
+    expect(plan.command).toBeNull();
+    expect(plan.stale).toBe(true);
+  });
 });
 
 describe("runUpgrade", () => {
@@ -524,5 +530,77 @@ describe("runUpgrade", () => {
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed.latest).toBeNull();
     expect(parsed.stale).toBe(false);
+  });
+
+  it("tells a standalone-binary user to download the latest build (exit 1, no npm)", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    const out = io.out.join("\n");
+    expect(out).toContain("Install: binary");
+    expect(out).toContain("standalone binary");
+    expect(out).toContain("github.com/YawLabs/mcp/releases");
+    expect(out).not.toContain("npm install");
+  });
+
+  it("with --run on a binary, refuses with exit 2 (no package manager to run)", async () => {
+    const io = captureIO();
+    let didSpawn = false;
+    const r = await runUpgrade({
+      run: true,
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async () => {
+        didSpawn = true;
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(didSpawn).toBe(false);
+    expect(io.out.join("\n")).not.toContain("npm install");
+  });
+
+  it("--json reports method: binary with a null command", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      json: true,
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed).toMatchObject({ method: "binary", command: null, stale: true });
+  });
+
+  it("offline + binary points at the release page, not the npx restart message", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      isSea: () => true,
+      currentVersion: "0.40.0",
+      argvPath: "/opt/yaw-mcp/yaw-mcp",
+      fetchLatest: async () => null,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = io.out.join("\n");
+    expect(out).toContain("standalone binary");
+    expect(out).toContain("releases/latest");
+    expect(out).not.toContain("npx");
   });
 });

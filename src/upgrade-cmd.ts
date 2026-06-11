@@ -7,6 +7,7 @@
 //   - local node_modules                           → `npm install @yawlabs/mcp@latest` in that tree's root
 //   - npx cache                                    → restart the MCP client; `npx -y` always pulls the latest
 //   - bundled inside Yaw Terminal (asar.unpacked)  → nothing to run; it updates with the app
+//   - standalone SEA binary                        → download the latest build; replace the executable
 //   - unknown / dev checkout                       → print the command and let the user decide
 //
 // The --run flag spawns the owning tool for the global-npm, pnpm-global,
@@ -54,6 +55,8 @@ export interface UpgradeCommandOptions {
   /** Test hook: replace the `npm prefix -g` probe used to refine
    *  ambiguous install-method detections. */
   npmPrefix?: () => Promise<string | null>;
+  /** Test hook: force single-executable (SEA binary) detection. */
+  isSea?: () => boolean;
 }
 
 export interface UpgradeCommandResult {
@@ -69,6 +72,7 @@ export type InstallMethod =
   | "local-node-modules"
   | "bundled-app"
   | "dev-checkout"
+  | "binary"
   | "unknown";
 
 export interface UpgradePlan {
@@ -271,6 +275,9 @@ export function buildUpgradePlan(input: {
     case "dev-checkout":
       command = "git pull && npm run build";
       break;
+    case "binary":
+      command = null; // standalone binary — replace the executable manually.
+      break;
     default:
       command = "npm install -g @yawlabs/mcp@latest";
       break;
@@ -322,6 +329,25 @@ async function defaultSpawn(cmd: string, args: string[], cwd?: string): Promise<
   });
 }
 
+/** True when this process is a Single Executable Application (Node SEA)
+ *  blob -- i.e. yaw-mcp was compiled into a standalone binary. Two cheap
+ *  gates first so ordinary runs never import node:sea (which is
+ *  experimental and would warn): a SEA's execPath is the app binary, never
+ *  `node`, and Electron-as-node is never a SEA. node:sea exists only on
+ *  Node >= 20.12 and isSea() is true only inside a SEA, so a missing module
+ *  or a thrown call both mean "not a binary". */
+export async function detectSea(): Promise<boolean> {
+  if (process.env.ELECTRON_RUN_AS_NODE) return false;
+  const exe = process.execPath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  if (exe === "node" || exe === "node.exe") return false;
+  try {
+    const sea = (await import("node:sea")) as { isSea?: () => boolean };
+    return typeof sea.isSea === "function" && sea.isSea() === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<UpgradeCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
@@ -338,7 +364,14 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   const fetcher = opts.fetchLatest ?? defaultFetchLatest;
   const current = opts.currentVersion ?? readCurrentVersion();
   const argvPath = opts.argvPath ?? process.argv[1];
-  const method = await refineInstallMethod(detectInstallMethod(argvPath), argvPath, opts.npmPrefix);
+  // A standalone SEA binary has no package manager and no script path in
+  // argv[1] (it'd be the first user arg), so path-based detection would
+  // mislabel it `unknown` and suggest a bogus `npm install -g`. Detect the
+  // SEA blob first and short-circuit to the binary method.
+  const sea = opts.isSea ? opts.isSea() : await detectSea();
+  const method = sea
+    ? "binary"
+    : await refineInstallMethod(detectInstallMethod(argvPath), argvPath, opts.npmPrefix);
 
   let latest: string | null;
   try {
@@ -364,6 +397,9 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       print(`  ${plan.command}`);
     } else if (method === "bundled-app") {
       print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app — nothing to run.");
+    } else if (method === "binary") {
+      print("yaw-mcp is a standalone binary — download the latest build and replace");
+      print("this executable: https://github.com/YawLabs/mcp/releases/latest");
     } else {
       print("Your install uses `npx -y` — just restart the MCP client when you're back online.");
     }
@@ -390,6 +426,14 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app —");
     print("there is nothing to run here. Update Yaw Terminal to get the new version.");
     return { exitCode: 0, lines };
+  }
+
+  if (method === "binary") {
+    print("yaw-mcp is running as a standalone binary — there's no package manager");
+    print("to upgrade it. Download the latest build and replace this executable:");
+    print("");
+    print("  https://github.com/YawLabs/mcp/releases/latest");
+    return { exitCode: opts.run ? 2 : 1, lines };
   }
 
   if (!plan.command) {
