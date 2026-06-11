@@ -261,7 +261,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     } else if (method === "npx") {
       print(`  Running ${VERSION}; npm latest is ${staleHint}. npx fetches the latest`);
       print("  on each spawn — restart your MCP client to pick it up.");
-    } else if (method === "global-npm" || method === "local-node-modules") {
+    } else if (
+      method === "global-npm" ||
+      method === "pnpm-global" ||
+      method === "bun-global" ||
+      method === "local-node-modules"
+    ) {
       print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade in place:`);
       print("");
       print("    yaw-mcp upgrade --run");

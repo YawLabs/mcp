@@ -3,16 +3,18 @@
 // process.argv[1] so the action matches how yaw-mcp is actually
 // reaching this process:
 //   - global npm (`npm install -g @yawlabs/mcp`)  → `npm install -g @yawlabs/mcp@latest`
+//   - pnpm / bun global store                      → `pnpm add -g` / `bun add -g @yawlabs/mcp@latest`
 //   - local node_modules                           → `npm install @yawlabs/mcp@latest` in that tree's root
 //   - npx cache                                    → restart the MCP client; `npx -y` always pulls the latest
 //   - bundled inside Yaw Terminal (asar.unpacked)  → nothing to run; it updates with the app
 //   - unknown / dev checkout                       → print the command and let the user decide
 //
-// The --run flag spawns the command for the global-npm and
-// local-node-modules cases; for "npx" there is nothing to do and --run
-// just prints the "restart your client" hint. Never spawns destructive
-// commands — only `npm install [-g] <exactly-our-package>@latest` is
-// allowed, and stdout/stderr stream through to the caller unchanged.
+// The --run flag spawns the owning tool for the global-npm, pnpm-global,
+// bun-global, and local-node-modules cases; for "npx" there is nothing
+// to do and --run just prints the "restart your client" hint. Never
+// spawns destructive commands — only `npm install [-g]` / `pnpm add -g` /
+// `bun add -g` of exactly our package is allowed, and stdout/stderr
+// stream through to the caller unchanged.
 //
 // Exit codes:
 //   0  already on the latest version, OR there is nothing to run (npx /
@@ -55,7 +57,15 @@ export interface UpgradeCommandResult {
   lines: string[];
 }
 
-export type InstallMethod = "global-npm" | "npx" | "local-node-modules" | "bundled-app" | "dev-checkout" | "unknown";
+export type InstallMethod =
+  | "global-npm"
+  | "pnpm-global"
+  | "bun-global"
+  | "npx"
+  | "local-node-modules"
+  | "bundled-app"
+  | "dev-checkout"
+  | "unknown";
 
 export interface UpgradePlan {
   current: string;
@@ -117,12 +127,21 @@ export function detectInstallMethod(argvPath: string | undefined): InstallMethod
   if (/\/lib\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   // Windows npm prefixes that live in a `bin` dir (scoop's nodejs persist
-  // dir, volta, custom prefixes): globals land at <prefix>/node_modules
-  // with <prefix> itself named `bin`. A project tree whose root dir is
+  // dir, custom prefixes): globals land at <prefix>/node_modules with
+  // <prefix> itself named `bin`. A project tree whose root dir is
   // literally named `bin` is rare enough that this marker is safe, and
   // misclassifying these as local-node-modules made `upgrade --run`
   // npm-install into the node prefix instead of upgrading the global.
   if (/\/bin\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  // pnpm / bun global stores look like local node_modules trees but are
+  // internally managed -- running plain `npm install` inside them writes
+  // a foreign package-lock + node_modules into the tool's store. Detect
+  // them BEFORE the generic node_modules marker and upgrade with the
+  // owning tool instead. pnpm: <pnpm-home>/global/<n>/node_modules/...
+  // (~/.local/share/pnpm, ~/AppData/Local/pnpm, ~/Library/pnpm); bun:
+  // ~/.bun/install/global/node_modules/...
+  if (/\/pnpm\/global\/\d+\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "pnpm-global";
+  if (/\/\.bun\/install\/global\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "bun-global";
   if (/\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "local-node-modules";
   // `npm run dev` or direct `node ./dist/index.js` from a checkout --
   // not installed at all. Match either yaw-mcp (renamed dir) or mcph
@@ -158,6 +177,12 @@ export function buildUpgradePlan(input: {
   switch (method) {
     case "global-npm":
       command = "npm install -g @yawlabs/mcp@latest";
+      break;
+    case "pnpm-global":
+      command = "pnpm add -g @yawlabs/mcp@latest";
+      break;
+    case "bun-global":
+      command = "bun add -g @yawlabs/mcp@latest";
       break;
     case "npx":
       command = null; // npx -y refreshes on its own; nothing to run.
@@ -297,15 +322,25 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     return { exitCode: 0, lines };
   }
 
-  // global-npm and local-node-modules are auto-runnable (whitelisted npm
-  // install of exactly our package). dev-checkout stays manual — the user
-  // owns that tree and the right command depends on their setup. unknown
-  // stays manual because we don't know which install we'd be mutating.
+  // Auto-runnable methods spawn the OWNING tool with whitelisted args for
+  // exactly our package: npm for global/local npm trees, pnpm/bun for
+  // their global stores. dev-checkout stays manual — the user owns that
+  // tree and the right command depends on their setup. unknown stays
+  // manual because we don't know which install we'd be mutating.
   const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath) : null;
-  const autoRunnable = method === "global-npm" || (method === "local-node-modules" && installRoot !== null);
+  const runSpec: { cmd: string; args: string[]; cwd?: string } | null =
+    method === "global-npm"
+      ? { cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] }
+      : method === "pnpm-global"
+        ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
+        : method === "bun-global"
+          ? { cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"] }
+          : method === "local-node-modules" && installRoot !== null
+            ? { cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: installRoot }
+            : null;
 
   if (!opts.run) {
-    if (autoRunnable) {
+    if (runSpec) {
       print("Run `yaw-mcp upgrade --run` to upgrade in place, or run it yourself:");
     } else {
       print("Run it yourself (--run can't safely automate this install method):");
@@ -317,7 +352,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
 
   // --run: attempt the upgrade. Only whitelisted commands — never
   // pass arbitrary user input into a shell.
-  if (!autoRunnable) {
+  if (!runSpec) {
     printErr(`yaw-mcp upgrade --run: a "${method}" install can't be upgraded automatically. Run it yourself:`);
     printErr("");
     printErr(`  ${plan.command}`);
@@ -325,22 +360,20 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
 
   const runner = opts.spawnImpl ?? defaultSpawn;
-  const npmArgs =
-    method === "global-npm" ? ["install", "-g", "@yawlabs/mcp@latest"] : ["install", "@yawlabs/mcp@latest"];
-  if (installRoot) {
-    print(`Running in ${installRoot}:`);
+  if (runSpec.cwd) {
+    print(`Running in ${runSpec.cwd}:`);
   } else {
     print("Running:");
   }
   print(`  ${plan.command}`);
   print("");
-  const code = await runner("npm", npmArgs, installRoot ?? undefined);
+  const code = await runner(runSpec.cmd, runSpec.args, runSpec.cwd);
   if (code === 0) {
     print("");
     print(`✓ Upgraded @yawlabs/mcp to ${latest}`);
     return { exitCode: 0, lines };
   }
-  printErr(`yaw-mcp upgrade: npm exited ${code}. Try running the command yourself:`);
+  printErr(`yaw-mcp upgrade: ${runSpec.cmd} exited ${code}. Try running the command yourself:`);
   printErr("");
   printErr(`  ${plan.command}`);
   return { exitCode: 3, lines };

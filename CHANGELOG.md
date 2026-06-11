@@ -2,6 +2,23 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm.
 
+## 0.60.2 -- pnpm/bun global stores upgrade with their owning tool
+
+- `yaw-mcp upgrade` now detects pnpm global stores (`<pnpm-home>/global/<n>/node_modules/...`) and bun global installs (`~/.bun/install/global/...`) as their own install methods. `--run` spawns `pnpm add -g` / `bun add -g @yawlabs/mcp@latest` instead of misclassifying them as local node_modules trees -- which would have npm-installed a foreign package-lock + node_modules into the tool manager's internal store.
+- `yaw-mcp doctor`'s UPGRADE AVAILABLE hint includes pnpm/bun globals in the "`yaw-mcp upgrade --run` works here" set.
+
+## 0.60.1 -- scoop/custom-prefix npm globals detected correctly
+
+- npm prefixes that live in a `bin` directory (scoop's nodejs persist dir, custom prefixes) put globals at `<prefix>/node_modules` with no `npm`/`lib`/`AppData` marker in the path, so they misclassified as `local-node-modules` -- `upgrade --run` then refused (pre-0.60.0) or npm-installed into the node prefix instead of upgrading the global. New `/bin/node_modules/` marker classifies them as `global-npm`.
+
+## 0.60.0 -- nag removed; `upgrade --run` actually upgrades
+
+- **The free-tier nag interstitial is gone.** Yaw MCP is free (the Pro tier is retired); `src/nag.ts`, its state file handling, and the dispatch gate were deleted. `YAW_MCP_NO_NAG` no longer has any effect -- there is nothing left to suppress. Remaining Pro references in help text, README, and the package description now read Yaw Team.
+- **`yaw-mcp upgrade --run` upgrades local node_modules installs in place** instead of refusing and printing another command: it derives the package-tree root from the running entrypoint's path and runs `npm install @yawlabs/mcp@latest` there.
+- **New `bundled-app` install method** for the copy that ships inside Yaw Terminal (`app.asar.unpacked`): upgrade/doctor say plainly that it updates with the app instead of suggesting an npm command that can never affect it.
+- **Method-aware `doctor` upgrade hints**: the UPGRADE AVAILABLE section prints the user's terminal action for their install method, never a command that turns around and prints another command.
+- Upgrade/doctor output puts commands on their own line with no trailing punctuation so they copy cleanly.
+
 ## 0.58.0 -- Rename to Yaw MCP + local-first Free mode + Pro nag + sync client
 
 ### Secrets sync + spawn-time substitution (Phase 6c)

@@ -107,6 +107,24 @@ describe("detectInstallMethod", () => {
     expect(detectInstallMethod("/proj/app/node_modules/@yawlabs/mcp/dist/index.js")).toBe("local-node-modules");
   });
 
+  it("detects pnpm global stores on linux/macos/windows", () => {
+    expect(detectInstallMethod("/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "pnpm-global",
+    );
+    expect(detectInstallMethod("/Users/u/Library/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "pnpm-global",
+    );
+    expect(
+      detectInstallMethod("C:\\Users\\u\\AppData\\Local\\pnpm\\global\\5\\node_modules\\@yawlabs\\mcp\\dist\\index.js"),
+    ).toBe("pnpm-global");
+  });
+
+  it("detects bun global installs", () => {
+    expect(detectInstallMethod("/home/u/.bun/install/global/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "bun-global",
+    );
+  });
+
   it("detects the Yaw Terminal bundled copy (asar.unpacked) over the node_modules marker", () => {
     expect(
       detectInstallMethod(
@@ -176,6 +194,15 @@ describe("buildUpgradePlan", () => {
   it("uses plain `npm install` for local node_modules", () => {
     const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("local-node-modules") });
     expect(plan.command).toBe("npm install @yawlabs/mcp@latest");
+  });
+
+  it("uses the owning tool for pnpm/bun global stores", () => {
+    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("pnpm-global") }).command).toBe(
+      "pnpm add -g @yawlabs/mcp@latest",
+    );
+    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("bun-global") }).command).toBe(
+      "bun add -g @yawlabs/mcp@latest",
+    );
   });
 
   it("returns null command for the Yaw Terminal bundled copy (updates with the app)", () => {
@@ -293,6 +320,26 @@ describe("runUpgrade", () => {
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: "/proj/app" });
     expect(io.out.join("\n")).toContain("Upgraded @yawlabs/mcp to 0.45.0");
+  });
+
+  it("with --run on a pnpm global store, spawns pnpm (never npm-installs into the store)", async () => {
+    const io = captureIO();
+    const spawned: Array<{ cmd: string; args: string[]; cwd?: string }> = [];
+    const r = await runUpgrade({
+      run: true,
+      currentVersion: "0.40.0",
+      argvPath: "/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async (cmd, args, cwd) => {
+        spawned.push({ cmd, args, cwd });
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toEqual({ cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"], cwd: undefined });
   });
 
   it("with --run on a dev checkout, refuses with exit 2 and prints the command", async () => {
