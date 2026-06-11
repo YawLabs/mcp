@@ -2,7 +2,7 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
-## Unreleased -- audit-fix wave
+## 0.61.0 -- audit-fix wave: exec binding payloads (BREAKING), live-bug fixes, 50+ hardening items
 
 - **BREAKING: `mcp_connect_exec` step bindings now hold the step's semantic payload, not the raw MCP wire wrapper.** A single-text-item JSON response binds as the parsed value, a non-JSON text response binds as the string, and anything else binds as the content array. `$ref` paths written against the old wire shape -- e.g. `"stepId.content[0].text"` -- now throw a RefError; migrate to `"stepId"` (whole value) or `"stepId.field"` (a specific field). This matches what the tool description always promised.
 - `mcp_connect_activate` / `mcp_connect_dispatch` set `isError` whenever a real activation failure occurs (partial successes no longer mask failures); concurrent-server-cap refusals are flagged internally and stay informational in both. Deactivating an already-unloaded namespace is now an idempotent success.
