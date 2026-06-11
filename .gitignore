@@ -10,3 +10,6 @@ dist/
 # per-host build artifacts, not source. build-binary.mjs + the docs ARE tracked.
 bin/
 build-tmp/
+
+# Staged release assets (binary + sha256 sidecar)
+dist-release/

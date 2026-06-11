@@ -78,6 +78,13 @@ console.log(`blob:   ${fmtSize(blobPath)}`);
 rmSync(outExe, { force: true });
 copyFileSync(process.execPath, outExe);
 
+// macOS: strip the carrier node binary's existing signature BEFORE injecting,
+// so postject doesn't leave a CORRUPT signature (which is worse than none --
+// arm64 SIGKILLs a bad-sig binary at exec). We ad-hoc re-sign after step 4.
+if (process.platform === 'darwin') {
+  run('codesign', ['--remove-signature', outExe]);
+}
+
 // 4. Inject the blob with postject (fetched on demand into the global npx
 //    cache -- does NOT touch the project node_modules). Invoke npm's npx-cli.js
 //    via the running node binary so no .cmd shim or shell is involved.
@@ -96,6 +103,23 @@ const npxCli = resolve(
   'node_modules/npm/bin/npx-cli.js',
 );
 run(process.execPath, [npxCli, '--yes', 'postject', ...postjectArgs]);
+
+// 5. macOS: ad-hoc re-sign AFTER injection. Apple Silicon refuses to exec a
+//    Mach-O with no/invalid signature ("killed: 9"); `--sign -` is the free
+//    ad-hoc identity (no cert, no notarization). Distribution is via the
+//    Homebrew TAP (a formula), whose curl fetch sets no com.apple.quarantine,
+//    so Gatekeeper never blocks it -- ad-hoc is sufficient. `--force` replaces
+//    any residual signature; `--timestamp=none` keeps it offline/reproducible.
+if (process.platform === 'darwin') {
+  run('codesign', ['--sign', '-', '--force', '--timestamp=none', outExe]);
+  run('codesign', ['--verify', '--verbose', outExe]);
+  // --verify proves the signature is intact, NOT that the binary launches.
+  // arm64 SIGKILLs a bad-sig Mach-O only at exec, so actually run it -- this
+  // is the real check the whole remove/re-sign dance defends. (CI also smoke-
+  // tests, but a standalone `node scripts/build-binary.mjs` on a Mac should
+  // catch a non-launching binary too.)
+  run(outExe, ['--version']);
+}
 
 console.log('');
 console.log(`OK  ${outExe}`);
