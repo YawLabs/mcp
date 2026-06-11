@@ -20,9 +20,12 @@ const repoRoot = resolve(__dirname, '..');
 const isWin = process.platform === 'win32';
 const ext = isWin ? '.exe' : '';
 
+const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
+// Binary name = first `bin` command -- keeps this generic across servers.
+const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
 const platformArch = `${process.platform}-${process.arch}`;
-const builtExe = join(repoRoot, 'bin', platformArch, `yaw-mcp${ext}`);
-const assetName = `yaw-mcp-${platformArch}${ext}`;
+const builtExe = join(repoRoot, 'bin', platformArch, `${binName}${ext}`);
+const assetName = `${binName}-${platformArch}${ext}`;
 
 const outDir = join(repoRoot, 'dist-release');
 const outAsset = join(outDir, assetName);

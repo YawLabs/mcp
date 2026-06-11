@@ -31,15 +31,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
 const isWin = process.platform === 'win32';
 
+const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
+const { version } = pkg;
+// Binary name = the package's first `bin` command, so this script is
+// copy-paste generic across @yawlabs/* servers -- no per-repo rename.
+const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
+
 const platformDir = `${process.platform}-${process.arch}`;
 const binDir = join(repoRoot, 'bin', platformDir);
 const tmpDir = join(repoRoot, 'build-tmp');
-const bundlePath = join(tmpDir, 'yaw-mcp.cjs');
-const blobPath = join(tmpDir, 'yaw-mcp.blob');
-const exeName = isWin ? 'yaw-mcp.exe' : 'yaw-mcp';
+const bundlePath = join(tmpDir, 'sea-bundle.cjs');
+const blobPath = join(tmpDir, 'sea-bundle.blob');
+const exeName = isWin ? `${binName}.exe` : binName;
 const outExe = join(binDir, exeName);
-
-const { version } = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
 
 function run(cmd, args, opts = {}) {
   console.log(`> ${cmd} ${args.join(' ')}`);

@@ -231,17 +231,22 @@ the binary (or a different packager) -- not a clean single-binary target.
 
 Checklist to adopt:
 
-1. Copy `.github/workflows/release.yml`, `scripts/build-binary.mjs`,
-   `scripts/stage-release-asset.mjs`, `scripts/update-manifests.mjs`, and
-   `sea-config.json` into the target repo. Rename `yaw-mcp` -> the target's
-   command throughout (asset names, the Scoop `bin` tuple, the Homebrew
-   `bin.install` target, the formula class).
-2. Confirm `src/index.ts` (or the target's entry) bundles clean under esbuild
-   with all deps inlined (no native addons).
-3. Add `esbuild` + `postject` as devDeps.
-4. Point `update-manifests.mjs` at the target's scoop-yaw `bucket/<name>.json`
-   + homebrew-yaw `Formula/<name>.rb` (or its own bucket/tap).
-5. Tag `v*` to fire the build; run `update-manifests.mjs --push` after.
+1. Copy the four build files AS-IS -- `.github/workflows/release.yml`,
+   `scripts/build-binary.mjs`, `scripts/stage-release-asset.mjs`,
+   `sea-config.json`. They derive the binary name from the package's `bin`
+   field, so **no rename is needed**.
+2. Add `postject` as a devDep (`esbuild` is already one on these servers).
+3. Confirm `src/index.ts` (the target's entry) bundles clean under esbuild
+   with all deps inlined (no native addons). `node scripts/build-binary.mjs`
+   locally is the check.
+4. Copy `scripts/update-manifests.mjs` and edit its per-repo values: the
+   `REPO` URL (`YawLabs/<repo>`), the `ASSETS` names, and the Scoop/Homebrew
+   command name -- it targets scoop-yaw `bucket/<name>.json` + homebrew-yaw
+   `Formula/<name>.rb`.
+5. `chmod +x` the build artifacts via the scripts (already handled); gitignore
+   `bin/ build-tmp/ dist-release/`.
+6. Tag `v*` to fire the build; run `update-manifests.mjs --version <v> --push`
+   after the release lands.
 
 This is the copy-paste path that closes the "make the JS sidecars bundle like
 the Go `micro` editor" goal for each server.
