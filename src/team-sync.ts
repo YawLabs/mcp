@@ -426,7 +426,11 @@ export async function postAnalyticsEvent(
     baseUrl: opts.baseUrl,
   });
   if (res.status === 401) {
-    await clearStoredState(filePath);
+    // Analytics is fire-and-forget and is never authoritative for session
+    // validity.  A 401 here could be a transient server-side token refresh;
+    // clearing the stored state would silently log the user out mid-workflow.
+    // Session-expiry detection is the responsibility of the explicit
+    // getSession() paths (getResource, putResource, listAnalyticsEvents).
     return { ok: false };
   }
   return { ok: res.status === 200 };
@@ -454,6 +458,20 @@ export async function listAnalyticsEvents(opts: BaseOpts = {}): Promise<Analytic
     throw new Error(`Team analytics fetch failed (${res.status}).`);
   }
   return { events: res.body.events ?? [], cap: res.body.cap ?? 0, order_id: res.body.order_id ?? "" };
+}
+
+/** Return the raw yaw_team cookie value from the in-memory cache.
+ *  Callers that have already called getSession() pay nothing extra --
+ *  the state is cached at module scope and this is a synchronous read
+ *  of that same slot.  Returns null when no valid session exists. */
+export function getCachedCookie(home: string = homedir()): string | null {
+  // cachedState is populated by any prior loadStoredState() call (which
+  // getSession, getResource, putResource, etc. all trigger).  If the
+  // session is valid the slot is non-null; if expired or absent it is
+  // { state: null }.  Either way no disk I/O.
+  void home; // the in-process cache is process-global; home is unused here
+  const s = cachedState?.state ?? null;
+  return s ? s.cookie : null;
 }
 
 /** Test-only: reset module-scoped state caches. */

@@ -103,7 +103,6 @@ function termFreq(tokens: string[], term: string): number {
 function bm25Score(
   queryTerms: string[],
   fields: DocFields,
-  idf: Map<string, string>,
   avgFieldLen: Record<keyof DocFields, number>,
   idfValues: Map<string, number>,
 ): number {
@@ -130,9 +129,6 @@ function bm25Score(
     }
   }
 
-  // Use the idf map only to let tests assert corpus properties — unused in
-  // scoring itself, suppress the unused-parameter lint.
-  void idf;
   return score;
 }
 
@@ -199,7 +195,7 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
 
   const results: RankedResult[] = [];
   for (const { server, fields } of docsWithFields) {
-    const score = bm25Score(queryTerms, fields, new Map(), avgFieldLen, idfValues);
+    const score = bm25Score(queryTerms, fields, avgFieldLen, idfValues);
     if (score > 0) {
       results.push({ namespace: server.namespace, score });
     }

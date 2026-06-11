@@ -33,7 +33,7 @@ export interface StatsCommandOptions {
 
 export function parseStatsArgs(
   argv: string[],
-): { ok: true; options: StatsCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: StatsCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: StatsCommandOptions = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -52,7 +52,7 @@ export function parseStatsArgs(
     } else if (a === "--json") {
       opts.json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: STATS_USAGE };
+      return { ok: false, error: STATS_USAGE, help: true };
     } else {
       return { ok: false, error: `yaw-mcp stats: unknown argument "${a}"\n\n${STATS_USAGE}` };
     }
@@ -115,11 +115,18 @@ function aggregate(events: AnalyticsEvent[]): {
   return { byNamespace, byClient };
 }
 
-function formatPlain(events: AnalyticsEvent[], opts: StatsCommandOptions, orderId: string, total: number): string {
+/** Exported for tests only. */
+export function formatPlain(
+  events: AnalyticsEvent[],
+  opts: StatsCommandOptions,
+  orderId: string,
+  total: number,
+): string {
   const lines: string[] = [];
   lines.push(`Signed in to order ${orderId}.`);
+  const renderedCount = Math.min(events.length, opts.limit ?? 50);
   lines.push(
-    `Showing ${events.length} of ${total} event${total === 1 ? "" : "s"} from the last ${opts.days ?? 7} day${opts.days === 1 ? "" : "s"}.`,
+    `Showing ${renderedCount} of ${total} event${total === 1 ? "" : "s"} from the last ${opts.days ?? 7} day${opts.days === 1 ? "" : "s"}.`,
   );
   if (events.length === 0) {
     lines.push("");

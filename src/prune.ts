@@ -16,9 +16,11 @@
 //     ("error": "" meaning success, "deleted": false, etc.).
 //   * Text-mode: strip trailing whitespace per line and collapse runs
 //     of 3+ blank lines into 2. No content is removed, just formatting.
-//   * If pruning doesn't save at least MIN_SAVINGS_RATIO of bytes, we
-//     return the original untouched — the re-serialization cost isn't
-//     worth a marginal win.
+//   * If pruning doesn't save at least MIN_SAVINGS_RATIO of the total
+//     serialized bytes across the entire content array, we return the
+//     original untouched — the re-serialization cost isn't worth a
+//     marginal win. The ratio is measured over the whole array
+//     (JSON.stringify(content)), not per individual content item.
 //
 // Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 to disable entirely and keep
 // the original bytes. In that mode responseBytesPruned == responseBytesRaw.
@@ -94,12 +96,16 @@ function pruneJson(value: unknown): unknown {
   if (value === null || value === undefined) return undefined;
 
   if (Array.isArray(value)) {
-    const cleaned: unknown[] = [];
-    for (const el of value) {
+    if (value.length === 0) return undefined;
+    // Never drop array elements — dropping shifts indices and breaks any
+    // caller that relies on positional access (e.g. list data returned to
+    // the model). Pruned elements become null so positions are stable;
+    // only object VALUES get pruned away entirely.
+    const cleaned: unknown[] = value.map((el) => {
       const pv = pruneJson(el);
-      if (pv !== undefined) cleaned.push(pv);
-    }
-    return cleaned.length === 0 ? undefined : cleaned;
+      return pv !== undefined ? pv : null;
+    });
+    return cleaned;
   }
 
   if (typeof value === "object") {

@@ -106,9 +106,7 @@ describe("runAudit", () => {
     // preamble whose text could contain a brace (a server arg like
     // --config={...}) would otherwise corrupt brace-based extraction and
     // misreport a passing audit as a failure. Pins that fix.
-    home = makeHome([
-      { namespace: "ctxlint", type: "local", command: "node", args: ['--config={"port":1}'] },
-    ]);
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: ['--config={"port":1}'] }]);
     const io = captureIO();
     const r = await runAudit({
       namespace: "ctxlint",

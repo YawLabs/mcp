@@ -40,7 +40,13 @@ import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
 import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
 import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
-import { BINARY_DOWNLOAD_URL, buildUpgradePlan, detectInstallMethod, detectSea, refineInstallMethod } from "./upgrade-cmd.js";
+import {
+  BINARY_DOWNLOAD_URL,
+  buildUpgradePlan,
+  detectInstallMethod,
+  detectSea,
+  refineInstallMethod,
+} from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -60,6 +66,14 @@ export interface DoctorOptions {
   postTryEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   /** Test hook: override Date.now() used by the trial GC pass. */
   now?: () => number;
+  /** Test hook: override the current version used for the staleness comparison
+   *  and UPGRADE AVAILABLE hint. Defaults to VERSION (the build-time constant).
+   *  Used ONLY in the upgrade-hint comparison and hint rendering; all other
+   *  version references in doctor output continue to use the constant. */
+  currentVersion?: string;
+  /** Test hook: override process.argv[1] used for install-method detection in
+   *  the UPGRADE AVAILABLE hint. Defaults to process.argv[1]. */
+  argvPath?: string;
 }
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
@@ -247,26 +261,32 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // block the diagnostic. Times out after 2s to keep doctor snappy.
   // Auto-skipped under vitest (check process.env directly since tests
   // pass a stripped `env: {}`).
-  const skipCheck = opts.skipRegistryCheck === true || Boolean(process.env.VITEST);
+  // skipRegistryCheck=true or VITEST env both suppress the real registry
+  // fetch. But if a registryFetch hook is explicitly provided (test hook
+  // for the upgrade-hint branches), we honour it regardless of VITEST so
+  // the hint branches are actually reachable under vitest.
+  const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
   const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
-  const staleHint = latest && VERSION !== "dev" && compareSemver(VERSION, latest) < 0 ? latest : null;
+  const effectiveVersion = opts.currentVersion ?? VERSION;
+  const staleHint = latest && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0 ? latest : null;
   if (staleHint) {
     // Method-aware so the hint is always the user's TERMINAL action --
     // never a command that turns around and prints another command.
     // Refinement consults `npm prefix -g` for the ambiguous methods
     // (auto-skipped under vitest; see refineInstallMethod).
+    const effectiveArgvPath = opts.argvPath ?? process.argv[1];
     const method = (await detectSea())
       ? "binary"
-      : await refineInstallMethod(detectInstallMethod(process.argv[1]), process.argv[1]);
+      : await refineInstallMethod(detectInstallMethod(effectiveArgvPath), effectiveArgvPath);
     print("UPGRADE AVAILABLE");
     if (method === "bundled-app") {
-      print(`  Running ${VERSION}; npm latest is ${staleHint}. This copy ships inside`);
+      print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This copy ships inside`);
       print("  Yaw Terminal and updates with the app — update Yaw Terminal to get it.");
     } else if (method === "npx") {
-      print(`  Running ${VERSION}; npm latest is ${staleHint}. npx fetches the latest`);
+      print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. npx fetches the latest`);
       print("  on each spawn — restart your MCP client to pick it up.");
     } else if (method === "binary") {
-      print(`  Running ${VERSION}; npm latest is ${staleHint}. This is a standalone`);
+      print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This is a standalone`);
       print("  binary — download the latest build and replace the executable:");
       print(`    ${BINARY_DOWNLOAD_URL}`);
     } else if (
@@ -275,12 +295,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
       method === "bun-global" ||
       method === "local-node-modules"
     ) {
-      print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade in place:`);
+      print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. To upgrade in place:`);
       print("");
       print("    yaw-mcp upgrade --run");
     } else {
-      const plan = buildUpgradePlan({ current: VERSION, latest: staleHint, method });
-      print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade:`);
+      const plan = buildUpgradePlan({ current: effectiveVersion, latest: staleHint, method });
+      print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. To upgrade:`);
       print("");
       print(`    ${plan.command ?? "npm install -g @yawlabs/mcp@latest"}`);
     }
@@ -385,9 +405,14 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const shellShadows = scanShellHistoryForShadows({ home, env });
 
-  const skipCheck = opts.skipRegistryCheck === true || Boolean(process.env.VITEST);
+  // Mirrors the text path's hook handling (see runDoctor): an explicit
+  // registryFetch bypasses the VITEST guard, and currentVersion overrides
+  // the build-time VERSION. opts.argvPath is intentionally unused here --
+  // the JSON snapshot's upgrade block carries no install method.
+  const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
   const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
-  const stale = latest !== null && VERSION !== "dev" && compareSemver(VERSION, latest) < 0;
+  const effectiveVersion = opts.currentVersion ?? VERSION;
+  const stale = latest !== null && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0;
 
   let exitCode = 0;
   let summary: string;
@@ -419,7 +444,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     reliability,
     clients,
     shellShadows,
-    upgrade: { current: VERSION, latest, stale },
+    upgrade: { current: effectiveVersion, latest, stale },
     diagnosis: { exitCode, summary },
   };
 

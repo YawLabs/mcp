@@ -115,7 +115,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   if (token) {
     if (scope === "project") {
       warnings.push(
-        `${path}: 'token' should not appear in a project-shared file. Move it to ${CONFIG_DIRNAME}/${LOCAL_CONFIG_FILENAME} (gitignored) or ~/${CONFIG_DIRNAME}/${CONFIG_FILENAME}.`,
+        `${path}: 'token' found in a project-shared config file is IGNORED -- yaw-mcp never reads a token from this scope to avoid committing credentials. Move it to ${CONFIG_DIRNAME}/${LOCAL_CONFIG_FILENAME} (machine-local, gitignore by convention) or ~/${CONFIG_DIRNAME}/${CONFIG_FILENAME} (user-global).`,
       );
     }
     await checkPermissions(path, warnings);

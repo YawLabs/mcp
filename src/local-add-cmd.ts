@@ -71,7 +71,9 @@ function parseEnvFlag(v: string | undefined, bag: Record<string, string>): strin
   return null;
 }
 
-export function parseAddArgs(argv: string[]): { ok: true; options: AddCommandOptions } | { ok: false; error: string } {
+export function parseAddArgs(
+  argv: string[],
+): { ok: true; options: AddCommandOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: ADD_USAGE };
   const positional: string[] = [];
   const opts: AddCommandOptions = {};
@@ -99,7 +101,7 @@ export function parseAddArgs(argv: string[]): { ok: true; options: AddCommandOpt
       }
       case "-h":
       case "--help":
-        return { ok: false, error: ADD_USAGE };
+        return { ok: false, error: ADD_USAGE, help: true };
       default:
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${ADD_USAGE}` };
         positional.push(a);
@@ -251,11 +253,11 @@ export interface RemoveCommandOptions {
 
 export function parseRemoveArgs(
   argv: string[],
-): { ok: true; options: RemoveCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: RemoveCommandOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: REMOVE_USAGE };
   const positional: string[] = [];
   for (const a of argv) {
-    if (a === "-h" || a === "--help") return { ok: false, error: REMOVE_USAGE };
+    if (a === "-h" || a === "--help") return { ok: false, error: REMOVE_USAGE, help: true };
     if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${REMOVE_USAGE}` };
     positional.push(a);
   }
@@ -349,10 +351,10 @@ export interface ListCommandOptions {
 
 export function parseListArgs(
   argv: string[],
-): { ok: true; options: ListCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: ListCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: ListCommandOptions = {};
   for (const a of argv) {
-    if (a === "-h" || a === "--help") return { ok: false, error: LIST_USAGE };
+    if (a === "-h" || a === "--help") return { ok: false, error: LIST_USAGE, help: true };
     if (a === "--json") {
       opts.json = true;
       continue;
@@ -364,15 +366,23 @@ export function parseListArgs(
 
 export async function runList(opts: ListCommandOptions): Promise<AddCommandResult> {
   const out = opts.out ?? ((s: string) => process.stdout.write(s));
+  const err = opts.err ?? ((s: string) => process.stderr.write(s));
   const print = (s = ""): void => out(`${s}\n`);
+  const printErr = (s: string): void => err(`${s}\n`);
 
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
   const loaded = await loadLocalBundles({ home, cwd });
   const servers = loaded.config?.servers ?? [];
 
+  // Always surface load warnings so malformed-file problems aren't silently
+  // swallowed. In --json mode they go into the response body; in text mode
+  // they go to stderr before the listing/empty-state so a script can still
+  // parse stdout cleanly while a human sees the diagnostic.
+  for (const w of loaded.warnings) printErr(`warning: ${w}`);
+
   if (opts.json) {
-    print(JSON.stringify({ path: loaded.path, servers }, null, 2));
+    print(JSON.stringify({ path: loaded.path, servers, warnings: loaded.warnings }, null, 2));
     return { exitCode: 0, written: [] };
   }
 

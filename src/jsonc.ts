@@ -8,13 +8,14 @@
 // stripping logic is <50 LOC. A full comment-preserving parser isn't
 // needed — we only read config, never rewrite it as JSONC.
 //
-// Known limitations by design:
-//   - No trailing-comma support. JSON.parse rejects trailing commas,
-//     which is strict JSONC's usual tolerance. Users who want trailing
-//     commas can strip them themselves or use strict JSON. We surface
-//     the parse error with the offending line so the fix is obvious.
-//   - Escape sequences inside strings are honored (`"a\\"` stays closed),
-//     so a literal `"abc // def"` keeps its `//`.
+// Trailing commas (e.g. `[1, 2,]` or `{"a": 1,}`) are stripped before
+// passing to JSON.parse. Hand-edited configs commonly have them; stripping
+// is safe because the pattern only matches commas immediately before a
+// `]` or `}` token (after optional whitespace). We track string context
+// so a quoted value like `"a trailing comma,"` is never touched.
+//
+// Escape sequences inside strings are honored (`"a\\"` stays closed),
+// so a literal `"abc // def"` keeps its `//`.
 
 export function stripJsoncComments(src: string): string {
   let out = "";
@@ -69,6 +70,53 @@ export function stripJsoncComments(src: string): string {
   return out;
 }
 
+// Strip trailing commas before a `]` or `}` token. Operates character-by-
+// character tracking string state so quoted values are never modified.
+// Replaces each trailing comma with a space so JSON.parse line numbers
+// remain accurate.
+export function stripTrailingCommas(src: string): string {
+  let out = "";
+  let i = 0;
+  const len = src.length;
+  let inString = false;
+  let stringChar = "";
+  while (i < len) {
+    const c = src[i];
+    if (inString) {
+      out += c;
+      if (c === "\\" && i + 1 < len) {
+        out += src[i + 1];
+        i += 2;
+        continue;
+      }
+      if (c === stringChar) inString = false;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inString = true;
+      stringChar = c;
+      out += c;
+      i++;
+      continue;
+    }
+    if (c === ",") {
+      // Peek ahead past whitespace — if the next non-whitespace char is
+      // `]` or `}`, this is a trailing comma; replace with a space.
+      let j = i + 1;
+      while (j < len && (src[j] === " " || src[j] === "\t" || src[j] === "\r" || src[j] === "\n")) j++;
+      if (j < len && (src[j] === "]" || src[j] === "}")) {
+        out += " "; // replace comma with space, preserving column count
+        i++;
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 // Parse JSONC → unknown. Throws SyntaxError with the original source line
 // context when JSON.parse fails (so "bad JSON on line 7" works even after
 // we strip comments).
@@ -78,6 +126,6 @@ export function parseJsonc(src: string): unknown {
   // saves it back produces a file JSON.parse rejects. The strip lives in the
   // wrapper so stripJsoncComments stays focused on comments/strings.
   const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
-  const stripped = stripJsoncComments(debommed);
+  const stripped = stripTrailingCommas(stripJsoncComments(debommed));
   return JSON.parse(stripped);
 }

@@ -76,12 +76,20 @@ export class LearningStore {
     const u = this.usage.get(namespace);
     if (!u) return 1.0;
 
+    // Coerce: succeeded can exceed dispatched when recordSuccess is called
+    // without a prior recordDispatch (e.g. a caller that only records outcomes
+    // and not the initial dispatch). Treat dispatched as at least succeeded so
+    // the rate computation stays in [0, 1] and the penalty branch is not
+    // triggered by a perfectly-successful namespace that happened to bypass the
+    // dispatch counter.
+    const dispatched = Math.max(u.dispatched, u.succeeded);
+
     // Penalty branch — flaky history shrinks the score so dispatch
     // prefers an equivalent healthy alternative. Rate-based signal;
     // positive success counts can't rescue a server whose overall
     // record is poor.
-    if (u.dispatched >= LEARNING_MIN_OBSERVATIONS) {
-      const rate = u.succeeded / u.dispatched;
+    if (dispatched >= LEARNING_MIN_OBSERVATIONS) {
+      const rate = u.succeeded / dispatched;
       if (rate < PENALTY_RATE_THRESHOLD) {
         const distance = Math.min(1, (PENALTY_RATE_THRESHOLD - rate) / PENALTY_RATE_THRESHOLD);
         return 1.0 - distance * (1.0 - LEARNING_MIN_BOOST);

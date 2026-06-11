@@ -49,6 +49,21 @@ describe("parseInstallArgs", () => {
     if (!r.ok) expect(r.error).toContain("Usage:");
   });
 
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseInstallArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+
+  it("-h sets help:true", () => {
+    const r = parseInstallArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+
   it("parses positional client", () => {
     const r = parseInstallArgs(["claude-code"]);
     expect(r.ok).toBe(true);
@@ -963,7 +978,7 @@ describe("runInstall --all", () => {
     // VS Code requires project-dir (user-scope unsupported); it's reported as skipped.
     const out = cap.stdout();
     expect(out).toContain("skip vscode");
-    expect(out).toMatch(/✓ \d+\/\d+ clients installed successfully\./);
+    expect(out).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // Token written to global yaw-mcp config exactly once.
     const yawMcpCfg = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "config.json"), "utf8"));
     expect(yawMcpCfg.token).toBe("mcp_pat_all");

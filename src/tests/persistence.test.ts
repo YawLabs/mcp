@@ -74,6 +74,54 @@ describe("persistence.loadState", () => {
     expect(Object.keys(s.learning)).toEqual(["good"]);
   });
 
+  it("sanitizeLearning rejects an entry with negative lastUsedAt", async () => {
+    // persistence.ts sanitizeLearning: lastUsedAt < 0 must be rejected (dropped).
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: 0,
+      learning: {
+        valid: { dispatched: 2, succeeded: 1, lastUsedAt: 10 },
+        negLastUsed: { dispatched: 3, succeeded: 2, lastUsedAt: -1 },
+      },
+      packHistory: [],
+    };
+    writeFileSync(file, JSON.stringify(payload), "utf8");
+    const s = await loadState(file);
+    // "valid" survives; "negLastUsed" is dropped.
+    expect(s.learning.valid).toBeDefined();
+    expect(s.learning.negLastUsed).toBeUndefined();
+    expect(Object.keys(s.learning)).toEqual(["valid"]);
+  });
+
+  // Fix 3: succeeded must not exceed dispatched -- clamp on load.
+  it("clamps succeeded to dispatched when succeeded > dispatched (fix 3)", async () => {
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: 0,
+      learning: {
+        // Corrupted/hand-edited entry: succeeded exceeds dispatched.
+        overcount: { dispatched: 3, succeeded: 7, lastUsedAt: 10 },
+        // Normal entry should be untouched.
+        normal: { dispatched: 5, succeeded: 4, lastUsedAt: 20 },
+        // Equal is fine.
+        equal: { dispatched: 2, succeeded: 2, lastUsedAt: 30 },
+      },
+      packHistory: [],
+    };
+    writeFileSync(file, JSON.stringify(payload), "utf8");
+    const s = await loadState(file);
+    // Overcount entry is kept but succeeded is clamped.
+    expect(s.learning.overcount).toBeDefined();
+    expect(s.learning.overcount.succeeded).toBe(3);
+    expect(s.learning.overcount.dispatched).toBe(3);
+    // Normal entry is unchanged.
+    expect(s.learning.normal.succeeded).toBe(4);
+    expect(s.learning.normal.dispatched).toBe(5);
+    // Equal entry is unchanged.
+    expect(s.learning.equal.succeeded).toBe(2);
+    expect(s.learning.equal.dispatched).toBe(2);
+  });
+
   it("sanitizes invalid pack history entries", async () => {
     const payload = {
       version: STATE_SCHEMA_VERSION,

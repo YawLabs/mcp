@@ -99,6 +99,51 @@ describe("parseAddArgs", () => {
     expect(parseAddArgs(["github", "--bogus"]).ok).toBe(false);
     expect(parseAddArgs(["a", "b"]).ok).toBe(false);
   });
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseAddArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseAddArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+});
+
+describe("parseRemoveArgs (help flag)", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseRemoveArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseRemoveArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+});
+
+describe("parseListArgs (help flag)", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseListArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseListArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
 });
 
 describe("runAdd", () => {
@@ -314,7 +359,7 @@ describe("runRemove", () => {
 describe("runList", () => {
   it("shows an empty hint when nothing is configured", async () => {
     const io = captureIO();
-    const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s) });
+    const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
     expect(r.exitCode).toBe(0);
     expect(io.text()).toMatch(/No local servers/);
   });
@@ -330,7 +375,7 @@ describe("runList", () => {
       err: () => {},
     });
     const io = captureIO();
-    const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s) });
+    const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
     expect(r.exitCode).toBe(0);
     expect(io.text()).toMatch(/fetch/);
     expect(io.text()).toMatch(/NAMESPACE/);
@@ -347,10 +392,70 @@ describe("runList", () => {
       err: () => {},
     });
     const io = captureIO();
-    await runList({ json: true, home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s) });
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
     const parsed = JSON.parse(io.text());
     expect(parsed.servers).toHaveLength(1);
     expect(parseListArgs(["--bogus"]).ok).toBe(false);
+  });
+
+  // Fix 3: malformed bundles.json -- warnings printed to stderr, not silently dropped
+  it("prints load warnings to stderr when bundles.json is malformed (fix 3)", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
+    const io = captureIO();
+    const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
+    expect(r.exitCode).toBe(0);
+    // The empty-state hint appears on stdout (same as no-file), but warnings go to stderr.
+    expect(io.text()).toMatch(/No local servers/);
+    expect(io.errText()).toMatch(/invalid JSON/);
+  });
+
+  it("--json includes warnings array when bundles.json is malformed (fix 3)", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(Array.isArray(parsed.warnings)).toBe(true);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+    expect(parsed.warnings.some((w: string) => w.includes("invalid JSON"))).toBe(true);
+  });
+
+  it("--json includes empty warnings array on clean load (fix 3)", async () => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(Array.isArray(parsed.warnings)).toBe(true);
+    expect(parsed.warnings).toHaveLength(0);
   });
 });
 
@@ -361,7 +466,7 @@ describe("upsertUserBundle round-trip", () => {
     writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
     await expect(
       upsertUserBundle({ namespace: "x", name: "X", command: "npx", args: [], isActive: true }, { home: synthHome }),
-    ).rejects.toThrow(/malformed/);
+    ).rejects.toThrow(/could not be parsed/);
   });
 
   it("dedups a name-matched legacy entry (no second copy) [#1 cross-path]", async () => {

@@ -80,7 +80,7 @@ function runTest(args: string[]): Promise<ComplianceReport | null> {
 function printSummary(report: ComplianceReport): void {
   const { grade, score, summary, url } = report;
   process.stdout.write(
-    `\nCompliance: ${grade} (${score.toFixed(1)}%) — ${summary.passed}/${summary.total} passed, ` +
+    `\nCompliance: ${grade} (${score.toFixed(1)}%) -- ${summary.passed}/${summary.total} passed, ` +
       `${summary.requiredPassed}/${summary.required} required\n` +
       `Target: ${url}\n`,
   );
@@ -98,7 +98,7 @@ async function publishReport(
     });
     if (res.statusCode !== 200) {
       const body = await res.body.text().catch(() => "");
-      process.stderr.write(`\nPublish failed: HTTP ${res.statusCode}${body ? ` — ${body}` : ""}\n`);
+      process.stderr.write(`\nPublish failed: HTTP ${res.statusCode}${body ? ` -- ${body}` : ""}\n`);
       return null;
     }
     const parsed = (await res.body.json()) as {

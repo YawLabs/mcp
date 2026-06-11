@@ -14,6 +14,12 @@ export interface UpstreamServerConfig {
   env?: Record<string, string>;
   url?: string;
   isActive: boolean;
+  /**
+   * Per-server connect timeout in milliseconds, as set in the dashboard.
+   * Overrides the global MCP_CONNECT_TIMEOUT env var for this specific server.
+   * Absent means "use the global default".
+   */
+  connectTimeoutMs?: number;
   // Free-text summary used by the BM25 ranker for dispatch + context-aware
   // discover. Set in the Yaw MCP dashboard; absent on older deployments.
   description?: string;

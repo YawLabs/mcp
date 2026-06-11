@@ -105,7 +105,7 @@ export function matchBundles(installedNamespaces: Iterable<string>): BundleMatch
  * so the model has a ready-to-run call site without a second round-trip.
  */
 export function bundleActivateHint(bundle: CuratedBundle): string {
-  return `mcp_connect_activate({ namespaces: ${JSON.stringify(bundle.namespaces)} })`;
+  return `mcp_connect_activate({ servers: ${JSON.stringify(bundle.namespaces)} })`;
 }
 
 /**

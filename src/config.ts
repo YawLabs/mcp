@@ -1,5 +1,6 @@
 import { request } from "undici";
 import { tokenFingerprint } from "./config-loader.js";
+import { NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
@@ -54,7 +55,7 @@ export async function fetchConfig(
   if (res.statusCode === 403) {
     await res.body.text().catch(() => {});
     throw new ConfigError(
-      `Access denied (HTTP 403) — the token ${tokenFingerprint(token)} was accepted but lacks permission to read this account's servers.\n  The account may be suspended or the token scope reduced — check\n  https://yaw.sh/mcp/dashboard/settings/tokens, or reach support@mcp.hosting.`,
+      `Access denied (HTTP 403) -- the token ${tokenFingerprint(token)} was accepted but lacks permission to read this account's servers.\n  The account may be suspended or the token scope reduced -- check\n  https://yaw.sh/mcp/dashboard/settings/tokens, or reach support@yaw.sh.`,
       true,
     );
   }
@@ -80,7 +81,6 @@ export async function fetchConfig(
   });
 
   // Filter out servers with invalid namespaces
-  const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
   data.servers = data.servers.filter((s) => {
     if (!s.namespace || !NAMESPACE_RE.test(s.namespace)) {
       log("warn", "Skipping server with invalid namespace", { namespace: s.namespace, name: s.name });

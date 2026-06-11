@@ -529,6 +529,43 @@ describe("ConnectServer", () => {
       expect(result.isError).toBeUndefined();
       expect(priv.connections.size).toBe(2);
     });
+
+    it("fix#3: all-failed activation still sets isError true", async () => {
+      // anyError=true and anyChanged=false. The old code's condition was
+      // `anyError && !anyChanged ? true : undefined`; the fix simplifies
+      // to `anyError ? true : undefined` so the model always sees failures.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "bad" })]);
+      vi.mocked(connectToUpstream).mockRejectedValue(new Error("bad server down"));
+
+      const result = await priv.handleActivate(["bad"]);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("bad server down");
+    });
+
+    it("fix#3: compliance-refusal partial success also sets isError true", async () => {
+      // Compliance refusal is synchronous (no retry delay). Use it to
+      // exercise the anyError && anyChanged=true branch without a 1s wait.
+      const { default: process } = await import("node:process");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh" }),
+        makeServerConfig({ namespace: "bad", complianceGrade: "D" }),
+      ]);
+      // Only gh will be activated (bad is blocked by compliance).
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+      process.env.YAW_MCP_MIN_COMPLIANCE = "B";
+      try {
+        const result = await priv.handleActivate(["gh", "bad"]);
+        // anyError=true (bad refused), anyChanged=true (gh loaded).
+        // Old logic: isError = anyError && !anyChanged = false -> undefined.
+        // New logic: isError = anyError ? true : undefined -> true.
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("Refused");
+      } finally {
+        delete process.env.YAW_MCP_MIN_COMPLIANCE;
+      }
+    });
   });
 
   describe("compliance-aware routing", () => {
@@ -767,10 +804,12 @@ describe("ConnectServer", () => {
       expect(result.isError).toBe(true);
     });
 
-    it("reports when server is not loaded", async () => {
+    it("reports when server is not loaded (idempotent -- not an error)", async () => {
+      // Already-unloaded is a no-op success, not an error, so idempotent
+      // callers don't have to special-case "wasn't loaded" responses.
       const priv = getPrivate(server);
       const result = await priv.handleDeactivate(["unknown"]);
-      expect(result.isError).toBe(true);
+      expect(result.isError).toBeUndefined();
       expect(result.content[0].text).toContain("wasn't loaded");
     });
 
@@ -797,6 +836,28 @@ describe("ConnectServer", () => {
       expect(priv.connections.size).toBe(0);
       expect(result.content[0].text).toContain("gh");
       expect(result.content[0].text).toContain("slack");
+    });
+
+    it("fix#4: deactivating a mix of loaded and already-unloaded succeeds (idempotent)", async () => {
+      // The tool is annotated idempotent; returning isError for an
+      // already-unloaded namespace breaks retry loops. A mixed call
+      // (one loaded, one not) must succeed overall.
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh"));
+      // "slack" is not loaded.
+
+      const result = await priv.handleDeactivate(["gh", "slack"]);
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("Unloaded");
+      expect(result.content[0].text).toContain("wasn't loaded");
+    });
+
+    it("fix#4: deactivating only already-unloaded namespaces succeeds (idempotent)", async () => {
+      const priv = getPrivate(server);
+      // Nothing is loaded.
+      const result = await priv.handleDeactivate(["ghost"]);
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("wasn't loaded");
     });
   });
 
@@ -1225,6 +1286,27 @@ describe("ConnectServer", () => {
       expect(priv.connections.has("c")).toBe(false);
     });
 
+    it("cap refusal beside a successful load is informational (isError undefined)", async () => {
+      // One namespace loads (filling the last cap slot), the next is
+      // cap-refused. The call did useful work, so the cap message stays
+      // informational -- only an all-refused call signals isError.
+      const priv = getPrivate(server);
+      priv.serverCap = 2;
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "a" }),
+        makeServerConfig({ id: "2", namespace: "b" }),
+        makeServerConfig({ id: "3", namespace: "c" }),
+      ]);
+      priv.connections.set("a", makeConnection("a"));
+      vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("b"));
+
+      const result = await priv.handleActivate(["b", "c"]);
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain('Cannot load "c"');
+      expect(priv.connections.has("b")).toBe(true);
+      expect(priv.connections.has("c")).toBe(false);
+    });
+
     it("allows reactivating an already-loaded namespace even at cap", async () => {
       const priv = getPrivate(server);
       priv.serverCap = 2;
@@ -1646,7 +1728,7 @@ describe("ConnectServer", () => {
       const text = result.content[0].text;
       expect(text).toContain("Bundles ready to activate now:");
       expect(text).toContain("pr-review");
-      expect(text).toContain('activate: mcp_connect_activate({ namespaces: ["github","linear"] })');
+      expect(text).toContain('activate: mcp_connect_activate({ servers: ["github","linear"] })');
       expect(text).toContain("Bundles partially installed:");
       expect(text).toContain("devops-incident");
       expect(text).toContain("missing: pagerduty");
@@ -1654,9 +1736,11 @@ describe("ConnectServer", () => {
     });
 
     it("routes meta-tool exec through a two-step pipeline with $ref binding", async () => {
-      // Exec threads the first tool's output into the second tool's
-      // args via {"$ref": "first.content[0].text"}. Proves the server
-      // wires the exec-engine resolver to the real dispatch path.
+      // Exec threads the first tool's parsed output into the second
+      // tool's args via {"$ref": "first"}. After fix #2 the step binding
+      // holds the PARSED payload, not the raw MCP wrapper -- so a single-
+      // text-item response whose text is a plain string binds as that
+      // string directly, not as {content:[{type,text}]}.
       const priv = getPrivate(server);
       const conn = makeConnection("gh", ["list_prs", "get_pr"]);
       const callTool = vi
@@ -1674,7 +1758,9 @@ describe("ConnectServer", () => {
           {
             id: "second",
             tool: "gh_get_pr",
-            args: { number: { $ref: "first.content[0].text" } },
+            // After parseStepPayload: "first" is the string "42", not the
+            // MCP wrapper. Ref directly to the step id.
+            args: { number: { $ref: "first" } },
           },
         ],
         return: "second",
@@ -1682,14 +1768,16 @@ describe("ConnectServer", () => {
       expect(result.isError).toBeUndefined();
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.ok).toBe(true);
-      expect(parsed.result.content[0].text).toBe("PR #42 body");
+      // "second" step output: single text item -> parsed as string.
+      expect(parsed.result).toBe("PR #42 body");
       // Both steps should have landed in the output map.
       expect(Object.keys(parsed.steps).sort()).toEqual(["first", "second"]);
       // The second upstream call must have received the resolved value,
-      // not the raw $ref marker — otherwise the resolver never fired.
+      // not the raw $ref marker -- otherwise the resolver never fired.
+      // "42" parses as the number 42 via JSON.parse, so number (not string).
       expect(callTool).toHaveBeenNthCalledWith(2, {
         name: "get_pr",
-        arguments: { number: "42" },
+        arguments: { number: 42 },
       });
     });
 
@@ -1717,7 +1805,9 @@ describe("ConnectServer", () => {
       expect(parsed.error).toContain("upstream boom");
       // The first step ran and its output survives in `partial` so the
       // caller knows how far the pipeline got before the failure.
-      expect(parsed.partial.first.content[0].text).toBe("ok step 1");
+      // After fix #2 the binding holds the parsed payload (string), not
+      // the MCP wrapper.
+      expect(parsed.partial.first).toBe("ok step 1");
       expect(parsed.partial.second).toBeUndefined();
     });
 
@@ -1732,6 +1822,96 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("mcp_connect_exec", { steps });
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("too many steps");
+    });
+
+    it("fix#1: return can point to a positional-index key for unnamed steps", async () => {
+      // validateExecRequest was only tracking explicit ids in seenIds, so
+      // `return: "0"` for a step without an `id` always failed with
+      // "unknown step id". The fix adds String(i) to allBindingKeys for
+      // unnamed steps.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["list_prs"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "result" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      // No `id` on the step; `return: "0"` uses the positional key.
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [{ tool: "gh_list_prs", args: {} }],
+        return: "0",
+      });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ok).toBe(true);
+    });
+
+    it("fix#2: parseStepPayload -- JSON text binds as parsed value", async () => {
+      // When the upstream returns a single text item whose text is valid
+      // JSON, the binding should hold the parsed object, not the wrapper.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["list_prs", "get_pr"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: JSON.stringify([{ number: 7 }]) }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: JSON.stringify({ title: "bug fix" }) }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "list", tool: "gh_list_prs", args: {} },
+          { id: "get", tool: "gh_get_pr", args: { number: { $ref: "list[0].number" } } },
+        ],
+        return: "get",
+      });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ok).toBe(true);
+      // The parsed object from the second call.
+      expect(parsed.result).toEqual({ title: "bug fix" });
+      // The upstream received the resolved number from the first step.
+      expect(conn.client.callTool).toHaveBeenNthCalledWith(2, {
+        name: "get_pr",
+        arguments: { number: 7 },
+      });
+    });
+
+    it("fix#2: parseStepPayload -- non-JSON text binds as string", async () => {
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["list_prs"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "plain text" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [{ id: "a", tool: "gh_list_prs", args: {} }],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.steps.a).toBe("plain text");
+    });
+
+    it("fix#2: parseStepPayload -- multi-content result binds as content array", async () => {
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["list_prs"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        content: [
+          { type: "text", text: "line1" },
+          { type: "text", text: "line2" },
+        ],
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [{ id: "a", tool: "gh_list_prs", args: {} }],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(Array.isArray(parsed.steps.a)).toBe(true);
+      expect(parsed.steps.a).toHaveLength(2);
     });
   });
 
@@ -2548,5 +2728,265 @@ describe("auto-load on startup", () => {
     await priv.autoLoadRecurringPack();
 
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  describe("fix#5: dispatch budget schema declares default: 1", () => {
+    it("budget property carries default: 1 in the JSON schema", async () => {
+      // The description text says 'Default budget is 1' but the JSON schema
+      // property had no `default` annotation. Both must agree with the
+      // runtime behaviour (server.ts line 795: defaults to 1 when omitted).
+      const { META_TOOLS } = await import("../meta-tools.js");
+      const budgetProp = (META_TOOLS.dispatch.inputSchema.properties as Record<string, unknown>).budget as Record<
+        string,
+        unknown
+      >;
+      expect(budgetProp).toBeDefined();
+      expect(budgetProp.default).toBe(1);
+    });
+  });
+
+  describe("fix#6: deferred-route miss error names mcp_connect_discover", () => {
+    it("names mcp_connect_discover in the 'tool vanished' error message", async () => {
+      // When a deferred-route activation succeeds but the tool is no
+      // longer in the live schema, the error must name the recovery call
+      // so the model knows what to do next.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      // Set up a deferred route for gh_stale_tool.
+      priv.toolRoutes = new Map([
+        [
+          "gh_stale_tool",
+          {
+            namespace: "gh",
+            originalName: "stale_tool",
+            namespacedName: "gh_stale_tool",
+            deferred: true,
+          },
+        ],
+      ]);
+      // connectToUpstream succeeds but returns a connection without stale_tool.
+      const conn = makeConnection("gh", ["create_issue"]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+
+      const result = await priv.handleToolCall("gh_stale_tool", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("mcp_connect_discover");
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bug #2: prewarm race -- explicit activate during prewarm inflight must
+// claim the connection so prewarm skips its teardown disconnect.
+// ─────────────────────────────────────────────────────────────────────────
+describe("prewarm race: explicit activate during prewarm inflight", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("connection survives when an explicit activate joins the prewarm inflight promise", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+    // Hold the connect open so the explicit activate can enqueue before it resolves.
+    let resolveConnect: (conn: UpstreamConnection) => void = () => {};
+    const connectPromise = new Promise<UpstreamConnection>((r) => {
+      resolveConnect = r;
+    });
+    vi.mocked(connectToUpstream).mockReturnValueOnce(connectPromise);
+
+    // Launch prewarm -- this starts the inflight, marks gh as prewarm-only.
+    const prewarmPromise = priv.prewarmDormantServers();
+
+    // Explicit activate joins before the connect resolves -- this should
+    // claim the namespace (remove it from prewarmNamespaces).
+    const activatePromise = priv.activateOne("gh");
+
+    // Resolve the upstream -- both waiters see ok=true.
+    resolveConnect(makeConnection("gh", ["create_issue"]));
+    await Promise.all([prewarmPromise, activatePromise]);
+
+    // Prewarm must NOT have disconnected the connection that the explicit
+    // activate claimed -- the user's next tool call must still work.
+    expect(priv.connections.has("gh")).toBe(true);
+    // Only one actual spawn happened (dedup guarantee still holds).
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+  });
+
+  it("prewarm still disconnects when it is the sole caller (no explicit activate)", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+    await priv.prewarmDormantServers();
+
+    // No explicit activate was called, so prewarm should disconnect.
+    expect(priv.connections.has("gh")).toBe(false);
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bug #3: upstream.ts fetchToolsFromUpstream listTools failure must
+// surface as ActivationError(category="protocol_error").
+// ─────────────────────────────────────────────────────────────────────────
+describe("fetchToolsFromUpstream propagates protocol_error on listTools failure", () => {
+  it("throws ActivationError with category=protocol_error when listTools rejects", async () => {
+    // Import directly from the module -- the vi.mock at the top of this file
+    // replaces connectToUpstream/disconnectFromUpstream but leaves
+    // fetchToolsFromUpstream and ActivationError as real implementations
+    // because the mock uses importOriginal and spreads the actual module.
+    const { fetchToolsFromUpstream, ActivationError } = await import("../upstream.js");
+    const client = { listTools: vi.fn().mockRejectedValue(new Error("JSON-RPC parse error")) } as any;
+
+    await expect(fetchToolsFromUpstream(client, "testns")).rejects.toMatchObject({
+      name: "ActivationError",
+      category: "protocol_error",
+      message: expect.stringContaining("JSON-RPC parse error"),
+    });
+  });
+
+  it("includes the namespace in the error message for context", async () => {
+    const { fetchToolsFromUpstream } = await import("../upstream.js");
+    const client = { listTools: vi.fn().mockRejectedValue(new Error("timeout")) } as any;
+
+    let caught: Error | null = null;
+    try {
+      await fetchToolsFromUpstream(client, "my-ns");
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toContain("my-ns");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bug #4: reconcileConfig must detect type and connectTimeoutMs changes.
+// ─────────────────────────────────────────────────────────────────────────
+describe("reconcileConfig: detects type and connectTimeoutMs changes", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("disconnects when server type changes from local to remote", async () => {
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh");
+    conn.config = makeServerConfig({ namespace: "gh", type: "local" });
+    priv.connections.set("gh", conn);
+
+    await priv.reconcileConfig(
+      makeConfig([makeServerConfig({ namespace: "gh", type: "remote", url: "https://example.com/mcp" })]),
+    );
+    expect(priv.connections.has("gh")).toBe(false);
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalled();
+  });
+
+  it("keeps connection when type is unchanged", async () => {
+    const priv = getPrivate(server);
+    const config = makeServerConfig({ namespace: "gh", type: "local" });
+    const conn = makeConnection("gh");
+    conn.config = config;
+    priv.connections.set("gh", conn);
+
+    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", type: "local" })]));
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("disconnects when connectTimeoutMs changes", async () => {
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh");
+    conn.config = makeServerConfig({ namespace: "gh", connectTimeoutMs: 5000 });
+    priv.connections.set("gh", conn);
+
+    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", connectTimeoutMs: 10000 })]));
+    expect(priv.connections.has("gh")).toBe(false);
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalled();
+  });
+
+  it("disconnects when connectTimeoutMs is added (was undefined)", async () => {
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh");
+    conn.config = makeServerConfig({ namespace: "gh" }); // no connectTimeoutMs
+    priv.connections.set("gh", conn);
+
+    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", connectTimeoutMs: 8000 })]));
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("keeps connection when connectTimeoutMs is unchanged", async () => {
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh");
+    conn.config = makeServerConfig({ namespace: "gh", connectTimeoutMs: 7500 });
+    priv.connections.set("gh", conn);
+
+    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", connectTimeoutMs: 7500 })]));
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bug #6: ConnectServer.parseStepPayload unit tests (three branches).
+// ─────────────────────────────────────────────────────────────────────────
+describe("ConnectServer.parseStepPayload", () => {
+  // Access the private static via cast.
+  function parseStepPayload(result: { content?: Array<{ type: string; text?: string }>; isError?: boolean }): unknown {
+    return (ConnectServer as any).parseStepPayload(result);
+  }
+
+  it("branch 1: single text item whose text is valid JSON -> the parsed JSON value", () => {
+    const input = { content: [{ type: "text", text: '{"id":42,"name":"test"}' }] };
+    expect(parseStepPayload(input)).toEqual({ id: 42, name: "test" });
+  });
+
+  it("branch 1b: JSON array is also parsed and returned as-is", () => {
+    const input = { content: [{ type: "text", text: "[1,2,3]" }] };
+    expect(parseStepPayload(input)).toEqual([1, 2, 3]);
+  });
+
+  it("branch 2: single text item (non-JSON) -> the raw text string", () => {
+    const input = { content: [{ type: "text", text: "plain text result" }] };
+    expect(parseStepPayload(input)).toBe("plain text result");
+  });
+
+  it("branch 3a: multi-item content -> the content array itself", () => {
+    const input = {
+      content: [
+        { type: "text", text: "first" },
+        { type: "text", text: "second" },
+      ],
+    };
+    expect(parseStepPayload(input)).toBe(input.content);
+  });
+
+  it("branch 3b: empty content array -> the empty array itself", () => {
+    const input = { content: [] };
+    expect(parseStepPayload(input)).toEqual([]);
+  });
+
+  it("branch 3c: no content field -> empty array fallback", () => {
+    const input = {};
+    expect(parseStepPayload(input)).toEqual([]);
+  });
+
+  it("branch 3d: single non-text item -> the content array", () => {
+    const input = { content: [{ type: "image" }] };
+    expect(parseStepPayload(input)).toBe(input.content);
   });
 });

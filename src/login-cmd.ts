@@ -29,7 +29,7 @@ export interface LoginCommandOptions {
 
 export function parseLoginArgs(
   argv: string[],
-): { ok: true; options: LoginCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: LoginCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: LoginCommandOptions = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -40,7 +40,7 @@ export function parseLoginArgs(
     } else if (a === "--json") {
       opts.json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: LOGIN_USAGE };
+      return { ok: false, error: LOGIN_USAGE, help: true };
     } else {
       return { ok: false, error: `yaw-mcp login: unknown argument "${a}"\n\n${LOGIN_USAGE}` };
     }
@@ -90,6 +90,6 @@ export async function runLogin(
     } else {
       io.err(`yaw-mcp login: ${message}\n`);
     }
-    return { exitCode: err instanceof TeamSyncAuthError ? 1 : 1 };
+    return { exitCode: err instanceof TeamSyncAuthError ? 1 : 2 };
   }
 }

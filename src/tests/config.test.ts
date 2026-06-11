@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ConfigError } from "../config.js";
+import { NAMESPACE_RE } from "../local-bundles.js";
 
 describe("ConfigError", () => {
   it("has fatal property", () => {
@@ -17,8 +18,6 @@ describe("ConfigError", () => {
 });
 
 describe("namespace validation regex", () => {
-  const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
-
   it("accepts valid namespaces", () => {
     expect(NAMESPACE_RE.test("gh")).toBe(true);
     expect(NAMESPACE_RE.test("slack")).toBe(true);

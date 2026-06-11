@@ -21,11 +21,11 @@ export interface LogoutCommandOptions {
 
 export function parseLogoutArgs(
   argv: string[],
-): { ok: true; options: LogoutCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: LogoutCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: LogoutCommandOptions = {};
   for (const a of argv) {
     if (a === "--json") opts.json = true;
-    else if (a === "--help" || a === "-h") return { ok: false, error: LOGOUT_USAGE };
+    else if (a === "--help" || a === "-h") return { ok: false, error: LOGOUT_USAGE, help: true };
     else return { ok: false, error: `yaw-mcp logout: unknown argument "${a}"\n\n${LOGOUT_USAGE}` };
   }
   return { ok: true, options: opts };

@@ -2,6 +2,18 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
+## Unreleased -- audit-fix wave
+
+- **BREAKING: `mcp_connect_exec` step bindings now hold the step's semantic payload, not the raw MCP wire wrapper.** A single-text-item JSON response binds as the parsed value, a non-JSON text response binds as the string, and anything else binds as the content array. `$ref` paths written against the old wire shape -- e.g. `"stepId.content[0].text"` -- now throw a RefError; migrate to `"stepId"` (whole value) or `"stepId.field"` (a specific field). This matches what the tool description always promised.
+- `mcp_connect_activate` / `mcp_connect_dispatch` set `isError` whenever a real activation failure occurs (partial successes no longer mask failures); concurrent-server-cap refusals are flagged internally and stay informational in both. Deactivating an already-unloaded namespace is now an idempotent success.
+- ~30 further fixes from a full-implementation audit: bundles.json write serialization + ENOENT-only absence handling, `list` surfaces parse warnings, analytics 401 no longer clears the team session, `secrets pull` refuses cross-passphrase overwrites without `--force`, uv probe/retry fixes on Windows, stable array positions in pruned tool output, `--help` exits 0 on stdout across subcommands, ASCII-safe terminal output, and assorted copy corrections.
+
+## 0.60.3 -- npm-prefix refinement + pnpm/bun self-upgrade
+
+- `refineInstallMethod` now probes `npm prefix -g` (3s timeout) and normalises the result through `realpathSync` so junctioned prefixes (scoop's `current` symlink, Volta shims) resolve to the real path before comparison. When the running entrypoint lives under the npm global prefix, ambiguous `local-node-modules` / `unknown` detections are promoted to `global-npm` -- fixes exotic prefix setups the path-marker list doesn't know.
+- The probe is wired into both `yaw-mcp upgrade` and `yaw-mcp doctor` via the shared `refineInstallMethod` call in `runUpgrade` / `runDoctor`.
+- `maybeAutoUpgrade` (the fire-and-forget startup check) now acts on stale pnpm and bun global installs with `pnpm add -g` / `bun add -g @yawlabs/mcp@latest` in addition to the existing `npm install -g` path. The background spawn log messages interpolate the actual tool name instead of hardcoding `npm`.
+
 ## 0.60.2 -- pnpm/bun global stores upgrade with their owning tool
 
 - `yaw-mcp upgrade` now detects pnpm global stores (`<pnpm-home>/global/<n>/node_modules/...`) and bun global installs (`~/.bun/install/global/...`) as their own install methods. `--run` spawns `pnpm add -g` / `bun add -g @yawlabs/mcp@latest` instead of misclassifying them as local node_modules trees -- which would have npm-installed a foreign package-lock + node_modules into the tool manager's internal store.

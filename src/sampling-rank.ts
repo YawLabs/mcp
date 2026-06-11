@@ -42,7 +42,7 @@ export function buildTiebreakPrompt(intent: string, candidates: TiebreakCandidat
             .map((t) => t.name)
             .join(", ")
         : "(no tool metadata yet)";
-    return `${i + 1}. ${c.namespace}${c.description ? ` — ${c.description}` : ""}\n   tools: ${toolLine}`;
+    return `${i + 1}. ${c.namespace}${c.description ? ` -- ${c.description}` : ""}\n   tools: ${toolLine}`;
   });
   return [
     "You are a router picking the best MCP server for a user task.",

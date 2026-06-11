@@ -149,7 +149,19 @@ describe("loadYawMcpConfig — precedence", () => {
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.token).toBeNull();
     expect(r.tokenSource).toBe("missing");
-    expect(r.warnings.some((w) => w.includes("project-shared file"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("project-shared"))).toBe(true);
+  });
+
+  // Fix 4: warning wording must explicitly say the token is IGNORED and where to move it.
+  it("project-file token warning says IGNORED and names valid destinations (fix 4)", async () => {
+    writeConfig(synthCwd, CONFIG_FILENAME, { token: "mcp_pat_project_aaaa" });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    const w = r.warnings.find((w) => w.includes("token"));
+    expect(w).toBeDefined();
+    // Must say the token is ignored, not just "should not appear".
+    expect(w).toMatch(/IGNORED/i);
+    // Must name at least one valid destination so the user knows what to do.
+    expect(w).toMatch(/config\.local\.json|user-global/i);
   });
 });
 

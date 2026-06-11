@@ -84,7 +84,10 @@ async function onPath(cmd: string): Promise<boolean> {
     try {
       child = spawn(cmd, ["--version"], {
         stdio: "ignore",
-        shell: false,
+        // Windows needs a shell for PATHEXT shim resolution (.cmd/.exe)
+        // so `uv --version` finds uv.cmd without an ENOENT false-negative.
+        // Mirrors the PROBES spawn options in runtime-detect.ts.
+        shell: process.platform === "win32",
         windowsHide: process.platform === "win32",
       });
     } catch {
@@ -113,6 +116,14 @@ async function onPath(cmd: string): Promise<boolean> {
 
 // GitHub release URLs redirect to objects.githubusercontent.com.
 // undici doesn't follow redirects by default — walk up to 5 hops.
+//
+// Trade-off: the entire archive is buffered in memory before being
+// written to disk (~20 MB for the uv binary today). This is a
+// deliberate choice: sha256 verification (below) requires the full
+// buffer to be in memory before we write anything, so streaming
+// directly to disk would leave a partially-written, unverified file
+// if the process is killed mid-download. The one-shot memory cost is
+// acceptable given that this path runs at most once per uv version.
 async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
   let current = url;
   for (let i = 0; i < maxHops; i++) {
@@ -193,7 +204,14 @@ let pending: Promise<string> | null = null;
 // platforms or download/verify failures so `upstream.ts` can wrap the
 // error into an ActivationError with a useful message.
 export function ensureUv(): Promise<string> {
-  pending ??= resolveUv();
+  if (!pending) {
+    // Clear the memo on rejection so the next call retries rather than
+    // returning the same rejected promise for the process lifetime.
+    pending = resolveUv().catch((err: unknown) => {
+      pending = null;
+      return Promise.reject(err);
+    });
+  }
   return pending;
 }
 

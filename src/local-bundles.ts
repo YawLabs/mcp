@@ -47,7 +47,10 @@ export function localBundlesPath(configDir: string): string {
   return join(configDir, BUNDLES_FILENAME);
 }
 
-const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
+/** Canonical regex for valid MCP server namespaces. Exported so all
+ *  consumers (config.ts, local-bundles.ts, tests) share the same
+ *  definition instead of maintaining independent copies. */
+export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 
 /** Coerce a raw entry from bundles.json into a strict UpstreamServerConfig.
  *  Returns null when required fields are missing or malformed so the loader
@@ -133,8 +136,18 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
-  } catch {
-    return { exists: false, file: null };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EISDIR") {
+      return { exists: false, file: null };
+    }
+    // Any other error (EPERM, EACCES, ...) means the file likely exists but
+    // we can't read it.  Return exists:true so the caller stays committed to
+    // this path instead of silently falling through to the user-global file.
+    const msg = err instanceof Error ? err.message : String(err);
+    warnings.push(`${path}: could not read file (${msg}) -- skipping`);
+    log("warn", "Could not read bundles.json", { path, error: msg, code });
+    return { exists: true, file: null };
   }
   let parsed: unknown;
   try {
@@ -247,6 +260,14 @@ export async function loadLocalBundles(
 // <cwd>/.yaw-mcp/bundles.json FULLY overrides user-global on load (see
 // loadLocalBundles), so the add/remove commands warn separately when a
 // project file would shadow the write -- they don't silently target it.
+//
+// In-process serializer: concurrent upsert/remove calls on the same file
+// would race -- both would read the same on-disk snapshot, both would
+// produce a different modified copy, and the loser's write would silently
+// overwrite the winner's. Gate both functions through a shared promise chain
+// (same pattern as saveState in persistence.ts) so they execute one at a
+// time within a single process.
+let bundleWriteChain: Promise<void> = Promise.resolve();
 
 /**
  * Derive a namespace from a server's DISPLAY NAME. This MUST stay
@@ -283,8 +304,19 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
   const warnings: string[] = [];
   const r = await readBundlesAt(path, warnings);
   if (!r.file) {
-    const detail = warnings.length > 0 ? ` (${warnings.join("; ")})` : "";
-    throw new Error(`${path} is malformed${detail}; fix it by hand before adding servers.`);
+    // Branch on the warning content to give the user the most actionable
+    // message: a read error (EPERM / EACCES) hints at permissions; a parse
+    // failure hints at invalid JSON. readBundlesAt populates warnings with
+    // the OS error string for read failures and with "invalid JSON" for
+    // parse failures, so we sniff those keywords here.
+    const warningText = warnings.join("; ");
+    const isReadError = /EPERM|EACCES|could not read/i.test(warningText);
+    if (isReadError) {
+      throw new Error(`${path} could not be read (${warningText}) -- check file permissions before adding servers.`);
+    }
+    // Default: parse failure or structural mismatch.
+    const detail = warnings.length > 0 ? ` (${warningText})` : "";
+    throw new Error(`${path} could not be parsed -- fix the JSON${detail} before adding servers.`);
   }
   return { version: r.file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION, servers: r.file.servers };
 }
@@ -296,10 +328,24 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
  * added on the other path (e.g. a legacy entry written without a namespace)
  * isn't duplicated. Atomic write. Returns the path written and whether an
  * existing entry was replaced (vs a fresh add).
+ *
+ * Serialized via bundleWriteChain so concurrent calls don't lose writes.
  */
-export async function upsertUserBundle(
+export function upsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string } = {},
+): Promise<{ path: string; replaced: boolean }> {
+  const result = bundleWriteChain.then(() => doUpsertUserBundle(entry, opts));
+  bundleWriteChain = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function doUpsertUserBundle(
+  entry: Partial<UpstreamServerConfig>,
+  opts: { home?: string },
 ): Promise<{ path: string; replaced: boolean }> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
@@ -322,10 +368,24 @@ export async function upsertUserBundle(
  * Remove a server entry (by namespace) from the user-global bundles.json.
  * No-op (removed:false) when the file or the namespace is absent. Atomic
  * write when a removal actually happens.
+ *
+ * Serialized via bundleWriteChain so concurrent calls don't lose writes.
  */
-export async function removeUserBundle(
+export function removeUserBundle(
   namespace: string,
   opts: { home?: string } = {},
+): Promise<{ path: string; removed: boolean }> {
+  const result = bundleWriteChain.then(() => doRemoveUserBundle(namespace, opts));
+  bundleWriteChain = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function doRemoveUserBundle(
+  namespace: string,
+  opts: { home?: string },
 ): Promise<{ path: string; removed: boolean }> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));

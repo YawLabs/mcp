@@ -68,31 +68,48 @@ export interface AutoUpgradeDeps {
 }
 
 function defaultSpawn(cmd: string, args: string[]): void {
+  // Track whether the error handler already fired so the close handler
+  // stays silent after it -- both handlers fire for ENOENT, but the
+  // error handler has the right message and fires first.
+  let errorFired = false;
+
+  // Build the corrective command the user should run for their tool.
+  // Only npm gets the EACCES/sudo hint -- pnpm and bun manage their own
+  // permissions and the sudo suggestion doesn't apply to them.
+  const correctiveCmd =
+    cmd === "npm"
+      ? `npm install -g @yawlabs/mcp@latest`
+      : cmd === "pnpm"
+        ? `pnpm add -g @yawlabs/mcp@latest`
+        : `bun add -g @yawlabs/mcp@latest`;
+
   const child = spawn(cmd, args, {
     stdio: "ignore",
     // Stay a child of this process (not detached) so it dies with yaw-mcp
-    // if yaw-mcp exits mid-install -- a half-finished `npm i -g` is fine
-    // (npm is atomic per package) and a re-run next startup completes it.
+    // if yaw-mcp exits mid-install -- a half-finished install is fine
+    // (npm/pnpm/bun are atomic per package) and a re-run next startup completes it.
     detached: false,
     shell: process.platform === "win32",
   });
   child.on("close", (code) => {
+    if (errorFired) return; // error handler already logged; stay silent here.
     if (code === 0) {
       log("info", "yaw-mcp self-upgrade complete; the next client restart will run the new version");
     } else {
-      // stdio is "ignore" so we can't surface the underlying npm error.
-      // The common cause is a non-user-writable global prefix (yaw-mcp
-      // was installed with sudo). Give the user one actionable hint
-      // instead of warning generically on every restart.
+      // stdio is "ignore" so we can't surface the underlying tool error.
+      // The common cause for npm is a non-user-writable global prefix
+      // (yaw-mcp was installed with sudo); pnpm/bun have analogous issues.
+      const hint = cmd === "npm" ? ` (often EACCES on a sudo-installed global -- run with the right permissions)` : "";
       log(
         "warn",
-        "yaw-mcp self-upgrade: npm exited non-zero (often EACCES on a sudo-installed global). Run `npm install -g @yawlabs/mcp@latest` with the right permissions, or set YAW_MCP_AUTO_UPGRADE=0 to silence this.",
+        `yaw-mcp self-upgrade: ${cmd} exited non-zero${hint}. Run \`${correctiveCmd}\` manually, or set YAW_MCP_AUTO_UPGRADE=0 to silence this.`,
         { code },
       );
     }
   });
   child.on("error", (err: Error) => {
-    log("warn", "yaw-mcp self-upgrade: npm spawn failed", { error: err?.message });
+    errorFired = true;
+    log("warn", `yaw-mcp self-upgrade: ${cmd} spawn failed`, { error: err?.message });
   });
 }
 
@@ -108,6 +125,17 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // An unbuilt checkout has no real version to compare; never touch it.
   if (current === "dev") return;
 
+  // NOTE: maybeAutoUpgrade deliberately uses detectInstallMethod (the
+  // fast, synchronous path-pattern heuristic) rather than the async
+  // refineInstallMethod (which runs `npm prefix -g` -- a ~3s npm
+  // subprocess -- to distinguish a real global-npm install from a local
+  // node_modules install that happens to share a path prefix). The serve
+  // hot path must not block on a 3s probe at startup. Consequence: a
+  // custom-prefix global install whose argv[1] pattern doesn't match
+  // the default npm prefix heuristic is classified as "local-node-modules"
+  // (or "unknown") and silently skipped -- no background upgrade fires for
+  // it even when stale. Users in that setup should run `yaw-mcp upgrade
+  // --run` manually, or set the standard npm global prefix.
   const method = (deps.isSeaImpl ? await deps.isSeaImpl() : await detectSea())
     ? "binary"
     : detectInstallMethod(deps.argvPath ?? process.argv[1]);

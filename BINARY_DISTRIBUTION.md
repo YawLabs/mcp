@@ -118,13 +118,29 @@ yaw-mcp 0.60.3                       # exit 0
 undici -- all with no Node and no `node_modules`. It also runs from an
 unrelated cwd (`C:\Windows`), confirming it is location-independent.
 
-### One Windows caveat
+### Windows SmartScreen posture
 
-`postject` invalidates the copied `node.exe` Authenticode signature
-(`warning: The signature seems corrupted!`). Harmless for local runs;
-**for distribution the binary must be re-signed** (`signtool` on Windows,
-`codesign` on macOS) or Defender / Gatekeeper will flag it. That is a
-release-pipeline step, out of scope for this PoC.
+The pipeline has no `signtool` signing step, so the binary carries no
+Authenticode signature. The user experience depends on the install path:
+
+- **Scoop install (supported path):** the Scoop manifest runs
+  `Get-ChildItem "$dir\*.exe" | Unblock-File` as a `post_install` step,
+  which strips the Mark-of-the-Web (MotW) zone identifier that Windows
+  attaches to downloaded files. SmartScreen does **not** fire on the
+  installed binary because MotW is already cleared before first launch.
+
+- **Direct browser download of the raw `.exe`:** the downloaded file
+  carries MotW, so SmartScreen shows its "unrecognized app" warning on
+  first run. Users can click "More info -> Run anyway". This is expected
+  behavior for an unsigned binary and will remain until the release
+  pipeline is extended with an Authenticode code-signing certificate
+  (future work -- needs a cert acquisition and a `signtool` step in
+  `release.yml`).
+
+macOS: `codesign` / notarization is similarly absent; Gatekeeper will
+quarantine a direct download. Homebrew install clears the quarantine
+attribute via `xattr -d com.apple.quarantine` (Homebrew does this
+automatically for `using: :nounzip` formula bottles).
 
 ## How this kills the install-store classification + the `upgrade-cmd.ts` saga
 

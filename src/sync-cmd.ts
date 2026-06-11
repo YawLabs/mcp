@@ -59,7 +59,7 @@ export interface SyncCommandOptions {
 
 export function parseSyncArgs(
   argv: string[],
-): { ok: true; options: SyncCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: SyncCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: SyncCommandOptions = {};
   for (const a of argv) {
     if (a === "push" || a === "pull" || a === "status") {
@@ -69,7 +69,7 @@ export function parseSyncArgs(
     } else if (a === "--json") {
       opts.json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: SYNC_USAGE };
+      return { ok: false, error: SYNC_USAGE, help: true };
     } else {
       return { ok: false, error: `yaw-mcp sync: unknown argument "${a}"\n\n${SYNC_USAGE}` };
     }
@@ -95,7 +95,13 @@ async function readLocalBundles(home: string): Promise<LocalBundlesFile> {
   const path = bundlesPath(home);
   if (!existsSync(path)) return { version: 1, servers: [] };
   const raw = await readFile(path, "utf8");
-  const parsed = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`${path}: invalid JSON -- ${msg}. Fix the file before running sync.`);
+  }
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { servers?: unknown }).servers)) {
     throw new Error(`${path}: malformed -- expected { servers: [...] }`);
   }
@@ -234,7 +240,7 @@ async function syncPull(
     baseUrl: opts.baseUrl,
   });
   const remoteServers = remote.data?.servers ?? [];
-  const local = await readLocalBundles(home).catch(() => ({ servers: [] }) as LocalBundlesFile);
+  const local = await readLocalBundles(home);
   const merged = mergeLocalEnv(remoteServers, local.servers);
   const written = await writeLocalBundles(home, { version: 1, servers: merged });
   if (opts.json) {
@@ -271,7 +277,7 @@ async function syncPush(
     io.out(`${JSON.stringify({ ok: true, serverCount: stripped.length, newVersion: res.version }, null, 2)}\n`);
   } else {
     io.out(`Pushed ${stripped.length} server${stripped.length === 1 ? "" : "s"} -> mcp_bundles v${res.version}.\n`);
-    io.out("Env values stripped before upload; secrets stay machine-local until Phase 6b ships the encrypted vault.\n");
+    io.out("Env values stripped before upload; use `yaw-mcp secrets push` to sync secrets across machines.\n");
   }
   return { exitCode: 0 };
 }

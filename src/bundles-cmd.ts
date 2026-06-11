@@ -69,7 +69,7 @@ export const BUNDLES_USAGE = `Usage: yaw-mcp bundles [list|match] [--json]
 
 export function parseBundlesArgs(
   argv: string[],
-): { ok: true; options: ParsedBundlesArgs } | { ok: false; error: string } {
+): { ok: true; options: ParsedBundlesArgs } | { ok: false; error: string; help?: boolean } {
   let action: BundlesAction = "list";
   let json = false;
   let actionSet = false;
@@ -77,7 +77,7 @@ export function parseBundlesArgs(
     if (a === "--json") {
       json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: BUNDLES_USAGE };
+      return { ok: false, error: BUNDLES_USAGE, help: true };
     } else if (a === "list" || a === "match") {
       if (actionSet) {
         return {

@@ -57,6 +57,12 @@ describe("exec-engine: parseRefPath", () => {
   it("rejects double dots", () => {
     expect(parseRefPath("foo..bar")).toBeNull();
   });
+
+  it("rejects bare identifier glued to closing bracket (foo[0]bar)", () => {
+    // exec-engine.ts:68 -- after ']', the next char must be '.', '[', or EOS.
+    // A bare identifier immediately following ']' is malformed.
+    expect(parseRefPath("foo[0]bar")).toBeNull();
+  });
 });
 
 describe("exec-engine: isRefNode", () => {
@@ -290,6 +296,48 @@ describe("exec-engine: validateExecRequest", () => {
       return: "a",
     });
     expect(r.ok).toBe(true);
+  });
+
+  it("fix#1: accepts return pointing at a positional index for an unnamed step", () => {
+    // Steps without an explicit id bind under String(index) ("0", "1", ...).
+    // validateExecRequest was only tracking explicit ids, so `return: "0"`
+    // for an unnamed step always failed with 'unknown step id'.
+    const r = validateExecRequest({
+      steps: [{ tool: "x" }, { tool: "y" }],
+      return: "1",
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("fix#1: rejects return pointing at a position that is out of range", () => {
+    const r = validateExecRequest({
+      steps: [{ tool: "x" }],
+      return: "5",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("unknown step id");
+  });
+
+  it("rejects a step whose args is an array (Array.isArray guard at exec-engine.ts:247)", () => {
+    // args must be a plain object when provided; an array must be rejected.
+    const r = validateExecRequest({ steps: [{ tool: "t", args: [] }] });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("`args` must be an object");
+  });
+
+  it("fix#1: positional keys do not shadow explicit ids -- both are valid targets", () => {
+    // Mix: step 0 has no id (binds as "0"); step 1 has id "b".
+    // return: "0" should be valid (positional), return: "b" also valid (explicit).
+    const r0 = validateExecRequest({
+      steps: [{ tool: "x" }, { id: "b", tool: "y" }],
+      return: "0",
+    });
+    expect(r0.ok).toBe(true);
+    const rb = validateExecRequest({
+      steps: [{ tool: "x" }, { id: "b", tool: "y" }],
+      return: "b",
+    });
+    expect(rb.ok).toBe(true);
   });
 });
 

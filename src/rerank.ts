@@ -167,28 +167,28 @@ async function callLegacyRerank(payload: {
   }
 }
 
-/** Read the yaw_team cookie value from the local team-sync state file.
- *  Returns null when no session exists. Cheap: team-sync.ts has a
- *  module-scoped memo of the parsed state, so this is a no-op after
- *  the first call. */
+/** Read the yaw_team cookie value from the team-sync in-memory cache.
+ *  Returns null when no session exists.
+ *
+ *  Previously this called getSession() to warm the cache then issued a
+ *  second readFile() of the session-state JSON to extract the cookie
+ *  field (which getSession() strips before returning TeamSession).  That
+ *  caused an unnecessary extra disk read on every rerank call.
+ *
+ *  The caller (rerank()) has already called getSession() to decide whether
+ *  Path A should run.  By the time readTeamCookie() is invoked, the
+ *  module-scoped cachedState slot in team-sync is already warm.
+ *  getCachedCookie() reads that slot synchronously -- no second getSession()
+ *  call, no second readFile(). */
 async function readTeamCookie(): Promise<string | null> {
   // Lazy-import to avoid a hard dep cycle (team-sync imports from
   // atomic-write, logger, paths -- not rerank).
   const teamSync = await import("./team-sync.js");
-  // _resetForTests is the only exported test hook; we don't need it.
-  // Use getSession() to ensure the cookie state is loaded, then read
-  // the cookie field via a tiny re-load.  team-sync caches both.
-  const session = await teamSync.getSession();
-  if (!session) return null;
-  // We can't read the cookie out of getSession() (which returns the
-  // TeamSession only, not the cookie). Read the state file directly
-  // via the same path team-sync.ts uses.
-  const { readFile } = await import("node:fs/promises");
-  try {
-    const raw = await readFile(teamSync.sessionStatePath(), "utf8");
-    const parsed = JSON.parse(raw) as { cookie?: string };
-    return typeof parsed.cookie === "string" && parsed.cookie ? parsed.cookie : null;
-  } catch {
-    return null;
-  }
+  // The caller (rerank()) already called getSession() which populated the
+  // team-sync module-scoped cache.  getCachedCookie() reads that same slot
+  // synchronously -- no extra disk I/O.
+  // Zero-arg call is intentional: getCachedCookie() reads the process-global
+  // in-memory cache; the `home` param used by getSession() for the initial
+  // disk read is irrelevant here -- the cache is already warm.
+  return teamSync.getCachedCookie();
 }

@@ -235,4 +235,19 @@ describe("maybeAutoUpgrade", () => {
     });
     expect(calls).toEqual([["npm", ["install", "-g", "@yawlabs/mcp@latest"]]]);
   });
+
+  it("does NOT spawn for a stale bundled-app (asar.unpacked) argvPath -- distinct from generic no-spawn cases", async () => {
+    // Item 5: auto-upgrade.ts:155 -- the bundled-app branch logs and returns
+    // without calling spawnImpl. This is the same surface as npx/local/unknown
+    // but the code reaches it through the explicit bundled-app guard at line 155
+    // rather than the null-globalSpec fallthrough. Pin that branch explicitly.
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: "/Applications/Yaw.app/Contents/Resources/app.asar.unpacked/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
 });

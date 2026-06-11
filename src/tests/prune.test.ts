@@ -161,4 +161,46 @@ describe("pruneContent", () => {
     // No crash, no JSON mangling; bytes stay ~identical.
     expect(r.content[0].text.length).toBeGreaterThan(2_999_000);
   });
+
+  // Fix 4: array elements that prune to "empty" must NOT be dropped --
+  // dropping shifts indices and breaks positional list data returned to
+  // the model. They become null placeholders instead.
+  it("keeps array positions stable when elements prune to empty (fix 4)", () => {
+    const raw = JSON.stringify([
+      { id: 1, name: "first", extras: null },
+      { id: 2, name: "second", extras: null },
+      { id: 3, name: "third", extras: null },
+    ]);
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    // All three elements must still be present at indices 0, 1, 2.
+    expect(parsed).toHaveLength(3);
+    expect(parsed[0].id).toBe(1);
+    expect(parsed[1].id).toBe(2);
+    expect(parsed[2].id).toBe(3);
+    // The null field should be pruned from each object.
+    expect(parsed[0].extras).toBeUndefined();
+  });
+
+  it("replaces fully-pruned array elements with null, not removes them (fix 4)", () => {
+    // Array elements that are entirely null/empty objects should become null,
+    // not disappear, so indices are preserved.
+    const raw = JSON.stringify([{ keep: "value" }, { drop: null }, { keep: "another" }]);
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed).toHaveLength(3);
+    expect(parsed[0]).toEqual({ keep: "value" });
+    // Index 1 pruned to null (its only key was null-valued), NOT removed.
+    expect(parsed[1]).toBeNull();
+    expect(parsed[2]).toEqual({ keep: "another" });
+  });
+
+  it("still returns undefined for a zero-length array (empty array = no info, fix 4)", () => {
+    // An empty input array has no positional data to preserve — drop it.
+    const raw = JSON.stringify({ results: [], meta: "ok" });
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.results).toBeUndefined();
+    expect(parsed.meta).toBe("ok");
+  });
 });

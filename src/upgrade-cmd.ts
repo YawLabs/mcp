@@ -93,19 +93,22 @@ export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
 
   Show (or execute) the command to upgrade @yawlabs/mcp to the latest version.
 
-  --run     Run the upgrade in place (global and local npm installs).
-            No-op for npx installs — they always fetch the latest.
+  --run     Run the upgrade in place (global npm, pnpm, bun, and local npm
+            installs). No-op for npx installs -- they always fetch the latest.
   --json    Emit a machine-readable snapshot ({ current, latest, stale,
-            method, command }) instead of prose.`;
+            method, command }) instead of prose.
+            NOTE: --json is a report-only snapshot; it never spawns an upgrade
+            even when combined with --run. Use --run without --json to
+            actually perform the upgrade.`;
 
 export function parseUpgradeArgs(
   argv: string[],
-): { ok: true; options: UpgradeCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: UpgradeCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: UpgradeCommandOptions = {};
   for (const a of argv) {
     if (a === "--run") opts.run = true;
     else if (a === "--json") opts.json = true;
-    else if (a === "--help" || a === "-h") return { ok: false, error: UPGRADE_USAGE };
+    else if (a === "--help" || a === "-h") return { ok: false, error: UPGRADE_USAGE, help: true };
     else return { ok: false, error: `yaw-mcp upgrade: unknown argument "${a}"\n\n${UPGRADE_USAGE}` };
   }
   return { ok: true, options: opts };
@@ -375,9 +378,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // mislabel it `unknown` and suggest a bogus `npm install -g`. Detect the
   // SEA blob first and short-circuit to the binary method.
   const sea = opts.isSea ? opts.isSea() : await detectSea();
-  const method = sea
-    ? "binary"
-    : await refineInstallMethod(detectInstallMethod(argvPath), argvPath, opts.npmPrefix);
+  const method = sea ? "binary" : await refineInstallMethod(detectInstallMethod(argvPath), argvPath, opts.npmPrefix);
 
   let latest: string | null;
   try {
@@ -418,7 +419,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
 
   if (!plan.stale) {
     print("");
-    print("✓ You're on the latest version — nothing to do.");
+    print("OK: You're on the latest version -- nothing to do.");
     return { exitCode: 0, lines };
   }
 
@@ -471,6 +472,9 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       print("Run it yourself (--run can't safely automate this install method):");
     }
     print("");
+    if (installRoot) {
+      print(`in ${installRoot}:`);
+    }
     print(`  ${plan.command}`);
     return { exitCode: 1, lines };
   }
@@ -495,7 +499,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   const code = await runner(runSpec.cmd, runSpec.args, runSpec.cwd);
   if (code === 0) {
     print("");
-    print(`✓ Upgraded @yawlabs/mcp to ${latest}`);
+    print(`OK: Upgraded @yawlabs/mcp to ${latest}`);
     return { exitCode: 0, lines };
   }
   printErr(`yaw-mcp upgrade: ${runSpec.cmd} exited ${code}. Try running the command yourself:`);

@@ -269,8 +269,19 @@ export class ConnectServer {
   // settles (success or failure).
   private activationInflight = new Map<
     string,
-    Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }>
+    Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }>
   >();
+  // Tracks namespaces whose current activationInflight was initiated by
+  // prewarmDormantServers. An explicit mcp_connect_activate clears the
+  // namespace from this set, which prevents prewarm from disconnecting a
+  // connection the user just claimed. Without this, the prewarm race is:
+  //   1. prewarm activateOne("foo") -> inflight P1
+  //   2. user activateOne("foo") -> joins P1 (same promise)
+  //   3. P1 resolves ok=true for both callers
+  //   4. prewarm disconnects "foo" — user's next tool call fails
+  // With this set: prewarm only disconnects when the namespace was NOT
+  // claimed by an explicit activate while P1 was in flight.
+  private prewarmNamespaces = new Set<string>();
   // Usage learning — nudges dispatch toward namespaces that have been
   // genuinely useful. Counts persist across yaw-mcp restarts via state.json
   // (see persistence.ts). YAW_MCP_DISABLE_PERSISTENCE=1 makes it session
@@ -726,8 +737,21 @@ export class ConnectServer {
       await Promise.all(
         batch.map(async (server) => {
           try {
-            const result = await this.activateOne(server.namespace);
+            const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) return;
+            // Only disconnect if no explicit activate claimed this namespace
+            // while the inflight promise was in flight. If an explicit activate
+            // joined our shared promise, prewarmNamespaces will no longer
+            // contain this namespace (activateOne with fromPrewarm=false clears
+            // it), so we leave the connection alive for the user.
+            if (!this.prewarmNamespaces.has(server.namespace)) {
+              log("info", "Pre-warm skipping disconnect — namespace claimed by explicit activate", {
+                namespace: server.namespace,
+              });
+              anyPopulated = true;
+              return;
+            }
+            this.prewarmNamespaces.delete(server.namespace);
             // Immediately disconnect — toolCache is already in
             // this.toolCache and reportTools persisted it upstream,
             // so getDeferredServers() surfaces the server without
@@ -945,7 +969,7 @@ export class ConnectServer {
           content: [
             {
               type: "text",
-              text: `Tool "${name}" is no longer available after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to see current tools.`,
+              text: `Tool "${name}" is no longer available after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
             },
           ],
           isError: true,
@@ -1605,18 +1629,37 @@ export class ConnectServer {
   // child process; the second set() would win and the first would leak
   // until its transport noticed. See activationInflight.
   //
+  // `fromPrewarm` marks the inflight as prewarm-initiated so that
+  // prewarmDormantServers can safely disconnect when it is the sole
+  // caller, but skip the disconnect when an explicit activate has also
+  // joined the inflight promise. An explicit call (fromPrewarm=false)
+  // removes the namespace from prewarmNamespaces so prewarm's teardown
+  // code sees it as "claimed" and leaves the connection alive.
+  //
   // Returns:
   //   { ok: true, message } — already connected or newly connected
   //   { ok: false, message, isChanged: false } — failed or not in config
   private activateOne(
     namespace: string,
     progress?: ProgressReporter,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
+    fromPrewarm = false,
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
+    // An explicit (non-prewarm) activation claims the namespace: prewarm
+    // must not tear down a connection the user asked for.
+    if (!fromPrewarm) {
+      this.prewarmNamespaces.delete(namespace);
+    }
+
     const inflight = this.activationInflight.get(namespace);
     if (inflight) {
       progress?.(`"${namespace}" load already in flight — awaiting existing attempt`);
       return inflight;
     }
+
+    if (fromPrewarm) {
+      this.prewarmNamespaces.add(namespace);
+    }
+
     const promise = this.runActivateOne(namespace, progress).finally(() => {
       // Clear only if this promise is still the registered one. If a
       // retry path (maybeElicitAndRetry → activateOne) has already
@@ -1632,7 +1675,7 @@ export class ConnectServer {
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
-  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
       progress?.(`"${namespace}" already loaded`);
@@ -1689,7 +1732,12 @@ export class ConnectServer {
     }
     const capDecision = evaluateServerCap(namespace, loadedSlots, this.serverCap);
     if (!capDecision.allow) {
-      return { ok: false, isChanged: false, message: capDecision.message ?? "Concurrent server cap reached." };
+      return {
+        ok: false,
+        isChanged: false,
+        capped: true,
+        message: capDecision.message ?? "Concurrent server cap reached.",
+      };
     }
 
     // Merge any session-elicited env over the server's configured env.
@@ -1737,6 +1785,9 @@ export class ConnectServer {
         if (attempt === 0) {
           const msg = err instanceof Error ? err.message : String(err);
           log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
+          // Fixed 1s delay before the single retry. The expression `1000 * 2 ** attempt`
+          // evaluates to 1000ms here (attempt=0, 2^0=1) -- this is NOT exponential
+          // backoff; it is one fixed step.
           await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
         }
       }
@@ -1910,6 +1961,7 @@ export class ConnectServer {
     const results: string[] = [];
     let anyChanged = false;
     let anyError = false;
+    let anyCapped = false;
 
     // Compliance gate. When YAW_MCP_MIN_COMPLIANCE is set, refuse to
     // activate any server whose reported grade is below the floor.
@@ -1928,6 +1980,9 @@ export class ConnectServer {
           const grade = cfg.complianceGrade ?? "unknown";
           const message = `Refused to load "${namespace}": compliance grade ${grade} is below YAW_MCP_MIN_COMPLIANCE=${minCompliance}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
           results.push(message);
+          // Deliberately an error even when OTHER namespaces load fine
+          // (unlike cap refusals below): a compliance floor is a hard
+          // policy gate the caller must act on, not expected budgeting.
           anyError = true;
           continue;
         }
@@ -1936,7 +1991,13 @@ export class ConnectServer {
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);
       if (r.isChanged) anyChanged = true;
-      if (!r.ok) anyError = true;
+      // Cap refusals are tracked separately: alongside successes they are
+      // informational (the per-namespace message says what to unload), but
+      // when NOTHING loads the call did no work and must signal an error.
+      if (!r.ok) {
+        if (r.capped) anyCapped = true;
+        else anyError = true;
+      }
     }
     // NB: no trailing "Done" progress notification here. MCP clients
     // delete the progress token synchronously when the response arrives,
@@ -1959,7 +2020,7 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
-      isError: anyError && !anyChanged ? true : undefined,
+      isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
     };
   }
 
@@ -2063,6 +2124,7 @@ export class ConnectServer {
     const results: string[] = [];
     let anyChanged = false;
     let anyError = false;
+    let anyCapped = false;
 
     let i = 0;
     for (const winner of winners) {
@@ -2071,7 +2133,14 @@ export class ConnectServer {
       const r = await this.activateOne(winner.namespace, progress);
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
       if (r.isChanged) anyChanged = true;
-      if (!r.ok) anyError = true;
+      // Cap refusals are expected when the budget exceeds the concurrent
+      // server cap -- informational alongside successes, but if NOTHING
+      // loaded the dispatch did no work and must signal (same rule as
+      // handleActivate).
+      if (!r.ok) {
+        if (r.capped) anyCapped = true;
+        else anyError = true;
+      }
       // Activation success is NOT recorded as a learning signal — that
       // would inflate "this server worked" into "every activation
       // counts as a successful tool call," which collapses the
@@ -2090,7 +2159,7 @@ export class ConnectServer {
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
     return {
       content: [{ type: "text", text: header + results.join("\n") }],
-      isError: anyError && !anyChanged ? true : undefined,
+      isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
     };
   }
 
@@ -2130,7 +2199,6 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
-      isError: !anyChanged ? true : undefined,
     };
   }
 
@@ -2277,13 +2345,15 @@ export class ConnectServer {
         continue;
       }
 
-      // Check if config changed (different command, args, url, etc.)
+      // Check if config changed (different command, args, url, env, type, or timeout)
       const oldConfig = connection.config;
       if (
         oldConfig.command !== newServerConfig.command ||
         !argsEqual(oldConfig.args, newServerConfig.args) ||
         oldConfig.url !== newServerConfig.url ||
-        !envEqual(oldConfig.env, newServerConfig.env)
+        !envEqual(oldConfig.env, newServerConfig.env) ||
+        oldConfig.type !== newServerConfig.type ||
+        oldConfig.connectTimeoutMs !== newServerConfig.connectTimeoutMs
       ) {
         log("info", "Server config changed, deactivating stale connection", { namespace });
         await disconnectFromUpstream(connection);
@@ -2719,6 +2789,16 @@ export class ConnectServer {
     // Slow path: transient connect. Same spawn cost as activate, but
     // we tear down immediately after reading the tool list so the
     // server doesn't linger in the session.
+    //
+    // Accepted race: if an mcp_connect_activate for the same namespace
+    // is in-flight via activateOne, this transient connect spawns a
+    // SECOND upstream process. Both complete independently; the transient
+    // is torn down in the finally block below, while activateOne's
+    // connection is registered normally. The double-spawn is harmless
+    // (two brief children, one wins the connections map) and fixing it
+    // would require routing read_tool through activateOne's inflight
+    // dedup map, which would change its semantics (persistent activation
+    // vs transient inspection). Accepted as-is.
     progress?.(`Inspecting "${serverArg}" (transient — not loading into session)…`);
     let transient: UpstreamConnection | undefined;
     try {
@@ -2891,7 +2971,7 @@ export class ConnectServer {
       const lines: string[] = [`Curated server bundles (${CURATED_BUNDLES.length}):\n`];
       for (const bundle of CURATED_BUNDLES) {
         lines.push(`  ${bundle.id} — ${bundle.description}`);
-        lines.push(`    namespaces: ${JSON.stringify(bundle.namespaces)}`);
+        lines.push(`    servers: ${JSON.stringify(bundle.namespaces)}`);
         lines.push(`    activate: ${bundleActivateHint(bundle)}`);
       }
       lines.push("");
@@ -2922,7 +3002,7 @@ export class ConnectServer {
       lines.push("Bundles ready to activate now:");
       for (const bundle of ready) {
         lines.push(`  ${bundle.id} — ${bundle.description}`);
-        lines.push(`    namespaces: ${JSON.stringify(bundle.namespaces)}`);
+        lines.push(`    servers: ${JSON.stringify(bundle.namespaces)}`);
         lines.push(`    activate: ${bundleActivateHint(bundle)}`);
       }
     }
@@ -2939,6 +3019,34 @@ export class ConnectServer {
     }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // Extract the semantic payload from a successful MCP tool result for use
+  // as a step binding in exec pipelines. The MCP wire format wraps every
+  // result in `{ content: [{type, text}, ...], isError? }`, but the exec
+  // tool description promises `$ref` targets that behave like the tool's
+  // actual output -- e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number)`.
+  //
+  // Rules, in order:
+  //   1. Single text item whose text is valid JSON -> the parsed JSON value.
+  //   2. Single text item (non-JSON) -> the raw text string.
+  //   3. Everything else (multi-item, non-text, empty) -> the content array.
+  //
+  // This is intentionally simple and loss-free: callers can still reach
+  // the full wire payload via the `partial` / `steps` objects if needed.
+  private static parseStepPayload(result: {
+    content?: Array<{ type: string; text?: string }>;
+    isError?: boolean;
+  }): unknown {
+    const content = result.content;
+    if (!Array.isArray(content) || content.length !== 1) return content ?? [];
+    const item = content[0];
+    if (item.type !== "text" || typeof item.text !== "string") return content;
+    try {
+      return JSON.parse(item.text);
+    } catch {
+      return item.text;
+    }
   }
 
   // Declarative pipeline executor. Runs N tool calls in order, binding
@@ -3094,7 +3202,7 @@ export class ConnectServer {
         };
       }
 
-      bindings[key] = stepResult;
+      bindings[key] = ConnectServer.parseStepPayload(stepResult);
     }
 
     const returnKey = explicitReturn ?? stepKeys[stepKeys.length - 1];

@@ -166,7 +166,9 @@ const DEFAULT_BASE_URL = "https://yaw.sh/mcp";
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1h
 
 /** Parse argv slice for `yaw-mcp try`. Exported for tests. */
-export function parseTryArgs(argv: string[]): { ok: true; options: TryCommandOptions } | { ok: false; error: string } {
+export function parseTryArgs(
+  argv: string[],
+): { ok: true; options: TryCommandOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: TRY_USAGE };
   const positional: string[] = [];
   const opts: TryCommandOptions = {};
@@ -215,7 +217,7 @@ export function parseTryArgs(argv: string[]): { ok: true; options: TryCommandOpt
       }
       case "-h":
       case "--help":
-        return { ok: false, error: TRY_USAGE };
+        return { ok: false, error: TRY_USAGE, help: true };
       default:
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_USAGE}` };
         positional.push(a);
@@ -231,13 +233,13 @@ export function parseTryArgs(argv: string[]): { ok: true; options: TryCommandOpt
 
 export function parseTryCleanupArgs(
   argv: string[],
-): { ok: true; options: TryCleanupOptions } | { ok: false; error: string } {
+): { ok: true; options: TryCleanupOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: TRY_CLEANUP_USAGE };
   const opts: TryCleanupOptions = {};
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "-h" || a === "--help") return { ok: false, error: TRY_CLEANUP_USAGE };
+    if (a === "-h" || a === "--help") return { ok: false, error: TRY_CLEANUP_USAGE, help: true };
     if (a === "--base") {
       const v = argv[++i];
       if (!v) return { ok: false, error: "--base requires a URL" };
@@ -619,6 +621,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   }
 
   // Peel the entry out of the client config (no-op if already gone).
+  const written: string[] = [];
   if (existsSync(marker.clientPath)) {
     try {
       const raw = await readFile(marker.clientPath, "utf8");
@@ -632,15 +635,16 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
           );
           if (stripped !== parsed) {
             await atomicWriteFile(marker.clientPath, `${JSON.stringify(stripped, null, 2)}\n`);
+            written.push(marker.clientPath);
             print(`Removed ${marker.entryName} from ${marker.clientPath}`);
           }
         }
       }
     } catch (e) {
       printErr(
-        `yaw-mcp try-cleanup: warning — couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
+        `yaw-mcp try-cleanup: warning -- couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
       );
-      // Continue — still drop the marker so doctor stops surfacing it.
+      // Continue -- still drop the marker so doctor stops surfacing it.
     }
   }
 
@@ -658,7 +662,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   postEvent(baseUrl, { slug, action: "cleanup", anonId }).catch(() => undefined);
 
   print(`Trial for "${slug}" cleaned up.`);
-  return { exitCode: 0, written: [marker.clientPath] };
+  return { exitCode: 0, written };
 }
 
 /** Pretty-print a TTL in ms as `Nh`, `Nm`, or `Nd` for the nudge. */
