@@ -40,6 +40,7 @@ import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
 import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
 import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
+import { buildUpgradePlan, detectInstallMethod } from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -250,10 +251,26 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
   const staleHint = latest && VERSION !== "dev" && compareSemver(VERSION, latest) < 0 ? latest : null;
   if (staleHint) {
+    // Method-aware so the hint is always the user's TERMINAL action --
+    // never a command that turns around and prints another command.
+    const method = detectInstallMethod(process.argv[1]);
     print("UPGRADE AVAILABLE");
-    print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade in place:`);
-    print("");
-    print("    yaw-mcp upgrade --run");
+    if (method === "bundled-app") {
+      print(`  Running ${VERSION}; npm latest is ${staleHint}. This copy ships inside`);
+      print("  Yaw Terminal and updates with the app — update Yaw Terminal to get it.");
+    } else if (method === "npx") {
+      print(`  Running ${VERSION}; npm latest is ${staleHint}. npx fetches the latest`);
+      print("  on each spawn — restart your MCP client to pick it up.");
+    } else if (method === "global-npm" || method === "local-node-modules") {
+      print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade in place:`);
+      print("");
+      print("    yaw-mcp upgrade --run");
+    } else {
+      const plan = buildUpgradePlan({ current: VERSION, latest: staleHint, method });
+      print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade:`);
+      print("");
+      print(`    ${plan.command ?? "npm install -g @yawlabs/mcp@latest"}`);
+    }
     print("");
   }
 

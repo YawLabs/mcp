@@ -15,9 +15,11 @@
 // allowed, and stdout/stderr stream through to the caller unchanged.
 //
 // Exit codes:
-//   0  already on the latest version, OR the suggested action is "restart the client"
+//   0  already on the latest version, OR there is nothing to run (npx /
+//      bundled-app)
 //   1  upgrade available but --run was not passed (human-interactive mode)
-//   2  usage error (unknown flag)
+//   2  usage error (unknown flag), OR --run on an install method that
+//      can't be auto-upgraded (dev-checkout / unknown)
 //   3  --run attempted the upgrade and the child process failed
 //
 // `yaw-mcp doctor` shows the same staleness status — upgrade is purely
@@ -250,7 +252,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   if (latest === null) {
     print("yaw-mcp upgrade: couldn't reach the npm registry (offline? firewall?).");
     if (plan.command) {
-      print(`When you're back online, run:\n  ${plan.command}`);
+      print("When you're back online, run:");
+      print("");
+      print(`  ${plan.command}`);
+    } else if (method === "bundled-app") {
+      print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app — nothing to run.");
     } else {
       print("Your install uses `npx -y` — just restart the MCP client when you're back online.");
     }
