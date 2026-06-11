@@ -565,6 +565,102 @@ describe("formatRelativeAge", () => {
   });
 });
 
+describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
+  // Uses the currentVersion + argvPath test hooks (item 6) to reach the
+  // UPGRADE AVAILABLE branch -- impossible otherwise because VERSION is
+  // "dev" under vitest and the stale check short-circuits on "dev".
+
+  it("bundled-app argvPath shows 'update Yaw Terminal' hint, never an npm command", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/Applications/Yaw.app/Contents/Resources/app.asar.unpacked/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => "0.45.0",
+    });
+    const txt = cap.text();
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    expect(txt).toContain("update Yaw Terminal");
+    expect(txt).not.toContain("npm install");
+    expect(txt).not.toContain("yaw-mcp upgrade --run");
+  });
+
+  it("npx argvPath shows 'restart your MCP client' hint, never an npm command", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/home/u/.npm/_npx/abc123/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => "0.45.0",
+    });
+    const txt = cap.text();
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    expect(txt).toContain("restart your MCP client");
+    expect(txt).not.toContain("npm install");
+  });
+
+  it("global-npm argvPath shows 'yaw-mcp upgrade --run' hint", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => "0.45.0",
+    });
+    const txt = cap.text();
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    expect(txt).toContain("yaw-mcp upgrade --run");
+  });
+
+  it("dev-checkout / unknown argvPath shows the plan command (not 'upgrade --run')", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/home/jeff/yaw/yaw-mcp/dist/index.js",
+      registryFetch: async () => "0.45.0",
+    });
+    const txt = cap.text();
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    // dev-checkout plan command is "git pull && npm run build"
+    expect(txt).toContain("git pull");
+    expect(txt).not.toContain("yaw-mcp upgrade --run");
+  });
+
+  it("unknown argvPath falls back to npm -g install command in hint", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/tmp/some/random/launch/path.js",
+      registryFetch: async () => "0.45.0",
+    });
+    const txt = cap.text();
+    expect(txt).toContain("UPGRADE AVAILABLE");
+    expect(txt).toContain("npm install -g @yawlabs/mcp@latest");
+  });
+});
+
 describe("runDoctor — --json", () => {
   it("emits a single JSON blob with no text sections", async () => {
     const cap = captureOut();

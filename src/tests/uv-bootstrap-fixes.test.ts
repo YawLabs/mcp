@@ -72,6 +72,50 @@ describe("onPath spawn options (fix 1)", () => {
   });
 });
 
+// ── uvTarget: unsupported platform/arch returns null; ensureUv surfaces message ──
+describe("uvTarget unsupported platform/arch (coverage gap)", () => {
+  // We cannot actually change process.platform/arch in a live process, but
+  // we CAN verify the branch that fires when uvTarget() returns null:
+  // resolveUv() throws with 'No prebuilt uv binary' + docs URL.
+  //
+  // Strategy: ensureUv() calls onPath("uv") first (which returns false
+  // because our spawn mock emits error), then calls resolveUv() which
+  // calls uvTarget(). On this machine uvTarget() may return a real string
+  // (supported platform), in which case it tries to download -- but we
+  // mocked undici to reject with "network mocked out". That's fine for
+  // showing the download-attempt branch. The unsupported-platform branch
+  // is verified by importing and calling uvTarget via the internal
+  // logic that rejects with the specific message.
+  //
+  // Because uvTarget is not exported we test the observable outcome:
+  // on a mocked environment that simulates an unsupported arch, resolveUv
+  // throws with the expected message. We do this by temporarily stubbing
+  // process.platform and process.arch.
+  it("ensureUv rejects with 'No prebuilt uv binary' message on unsupported platform/arch", async () => {
+    __resetUvBootstrap();
+
+    // Save originals.
+    const origPlatform = process.platform;
+    const origArch = process.arch;
+
+    // Stub to an unsupported combination.
+    Object.defineProperty(process, "platform", { value: "freebsd", configurable: true });
+    Object.defineProperty(process, "arch", { value: "mips", configurable: true });
+
+    try {
+      const err = await ensureUv().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain("No prebuilt uv binary");
+      expect((err as Error).message).toContain("https://docs.astral.sh/uv/");
+    } finally {
+      // Restore.
+      Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
+      Object.defineProperty(process, "arch", { value: origArch, configurable: true });
+      __resetUvBootstrap();
+    }
+  });
+});
+
 // ── Fix 2: ensureUv clears memo on rejection ──────────────────────────
 describe("ensureUv rejection memo clear (fix 2)", () => {
   it("retries after a transient failure instead of returning the same rejection", async () => {

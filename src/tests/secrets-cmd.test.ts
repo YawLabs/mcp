@@ -134,7 +134,7 @@ describe("parseSecretsArgs", () => {
 
 vi.mock("../team-sync.js", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, getSession: vi.fn(), getResource: vi.fn() };
+  return { ...actual, getSession: vi.fn(), getResource: vi.fn(), putResource: vi.fn() };
 });
 
 import type { VaultFile } from "../secrets-vault.js";
@@ -202,6 +202,7 @@ describe("runSecrets pull -- empty-remote guard", () => {
 });
 
 import { saveVault, vaultPath } from "../secrets-vault.js";
+import { putResource } from "../team-sync.js";
 
 describe("runSecrets pull -- salt-conflict protection", () => {
   const io = { out: vi.fn(), err: vi.fn() };
@@ -311,5 +312,77 @@ describe("runSecrets pull -- salt-conflict protection", () => {
     // Error should name the vault path so the user knows what to back up
     const errOutput = io.err.mock.calls[0][0] as string;
     expect(errOutput).toContain(vaultPath(home));
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets push -- three additional edge-case paths
+// -----------------------------------------------------------------------
+
+describe("runSecrets push -- edge cases", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const home = nodePath.join(os.tmpdir(), `yaw-test-push-${process.pid}`);
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  it("(a) no local vault -> exitCode 1 + 'no local vault' message", async () => {
+    // Ensure vault file is absent.
+    try {
+      await unlink(vaultPath(home));
+    } catch {
+      /* ok */
+    }
+
+    const result = await runSecrets({ action: "push", home }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    expect(errOutput.toLowerCase()).toContain("no local vault");
+  });
+
+  it("(b) putResource throws TeamSyncStaleVersionError -> JSON output carries currentVersion", async () => {
+    // Write a real local vault so loadVault succeeds.
+    await saveVault(vaultPath(home), makeVault("YWFh", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any));
+
+    // getResource resolves so we get past the remote-version fetch.
+    vi.mocked(getResource).mockResolvedValue({
+      version: 3,
+      data: null,
+      updated_at: null,
+      updated_by: null,
+    });
+
+    const { TeamSyncStaleVersionError } = await import("../team-sync.js");
+    vi.mocked(putResource).mockRejectedValue(new TeamSyncStaleVersionError(5));
+
+    const result = await runSecrets({ action: "push", home, json: true }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    const parsed = JSON.parse(errOutput);
+    expect(parsed.currentVersion).toBe(5);
+  });
+
+  it("(c) putResource throws TeamSyncAuthError -> exitCode 1 + session-expired message", async () => {
+    await saveVault(vaultPath(home), makeVault("YWFh", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any));
+
+    vi.mocked(getResource).mockResolvedValue({
+      version: 1,
+      data: null,
+      updated_at: null,
+      updated_by: null,
+    });
+
+    const { TeamSyncAuthError } = await import("../team-sync.js");
+    vi.mocked(putResource).mockRejectedValue(new TeamSyncAuthError());
+
+    const result = await runSecrets({ action: "push", home }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    // Must mention session expiry or re-login.
+    expect(errOutput.toLowerCase()).toMatch(/session expired|login/);
   });
 });

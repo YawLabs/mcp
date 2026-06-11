@@ -177,6 +177,48 @@ describe("getCachedCookie", () => {
     expect(getCachedCookie()).toBeNull();
   });
 
+  it("seconds-shaped exp that is not yet expired validates via getSession", async () => {
+    // expMs() in team-sync.ts converts seconds to ms when exp < 1e12.
+    // Write a session whose exp is expressed in seconds (Unix timestamp style).
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const sessionInSeconds = {
+      cookie: "cookie-seconds",
+      session: {
+        email: "user@example.com",
+        role: "member",
+        order_id: "ord-1",
+        // exp in seconds, not yet expired (valid for 1 day)
+        exp: nowSeconds + 86_400,
+      },
+    };
+    await writeFile(path.join(tmpHome, ".yaw-mcp", "team-session.json"), JSON.stringify(sessionInSeconds));
+
+    // getSession must return a non-null session -- the seconds-shaped exp should
+    // be converted to ms and compare correctly against Date.now().
+    const session = await getSession({ home: tmpHome });
+    expect(session).not.toBeNull();
+    expect(session?.email).toBe("user@example.com");
+  });
+
+  it("seconds-shaped exp that IS expired is rejected by getSession", async () => {
+    // An exp in seconds that is already in the past (even after *1000) must
+    // be treated as expired.
+    const sessionExpiredSeconds = {
+      cookie: "cookie-expired-seconds",
+      session: {
+        email: "expired@example.com",
+        role: "member",
+        order_id: "ord-2",
+        // exp in seconds, clearly in the past (Unix epoch 1000 = Jan 1970)
+        exp: 1000,
+      },
+    };
+    await writeFile(path.join(tmpHome, ".yaw-mcp", "team-session.json"), JSON.stringify(sessionExpiredSeconds));
+
+    const session = await getSession({ home: tmpHome });
+    expect(session).toBeNull();
+  });
+
   it("does not read the session file a second time (cache hit, no new fetch calls)", async () => {
     await writeSession(tmpHome, "cookie-456");
     // Warm the cache.

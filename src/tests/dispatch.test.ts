@@ -241,6 +241,69 @@ describe("handleDispatch", () => {
     expect(vi.mocked(reportTools)).toHaveBeenCalledWith("gh-id", [{ name: "create_issue", description: "Create" }]);
   });
 
+  it("one winner loads, one is cap-refused -- result is not an error (isError undefined)", async () => {
+    // When the budget allows 2 servers but the cap only admits 1 (the first),
+    // the second activation returns capped:true. Since something DID load,
+    // isError must be undefined (not true) -- same rule as handleActivate.
+    const priv = getPrivate(server);
+    // Pre-load one server to fill the cap (serverCap = 1 for this test).
+    priv.serverCap = 1;
+    const ghConfig = makeServerConfig({
+      id: "gh-id",
+      namespace: "gh",
+      name: "GitHub",
+      description: "Repos and issues",
+    });
+    const slackConfig = makeServerConfig({
+      id: "slack-id",
+      namespace: "slack",
+      name: "Slack",
+      description: "Issues and team messages",
+    });
+    priv.config = { configVersion: "v1", servers: [ghConfig, slackConfig] };
+
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one", description: "issues" }]),
+    );
+
+    // budget=2 so dispatch tries both; cap=1 so only the top-ranked loads.
+    const result = await priv.handleDispatch("issues", 2);
+    // At least one loaded (gh), one refused (slack) -- isError must be undefined.
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toMatch(/Loaded "gh"/);
+  });
+
+  it("ALL winners are cap-refused and nothing loads -- isError true", async () => {
+    // Pre-fill the cap by seeding a connection that is already connected
+    // (counts toward the slot), then set serverCap=1 so no new server can load.
+    const priv = getPrivate(server);
+    priv.serverCap = 1;
+    const ghConfig = makeServerConfig({
+      id: "gh-id",
+      namespace: "gh",
+      name: "GitHub",
+      description: "Repos and issues",
+    });
+    const slackConfig = makeServerConfig({
+      id: "slack-id",
+      namespace: "slack",
+      name: "Slack",
+      description: "Issues and team messages",
+    });
+    priv.config = { configVersion: "v1", servers: [ghConfig, slackConfig] };
+    // Pre-load a DIFFERENT server to fill the single slot so both winners are refused.
+    priv.connections.set("other", makeConnection("other", [{ name: "t" }]));
+
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one" }]),
+    );
+
+    const result = await priv.handleDispatch("issues", 2);
+    // Nothing loaded -- anyCapped && !anyChanged => isError true.
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/concurrent.*cap|cap.*concurrent/i);
+  });
+
   it("does not reactivate a server that is already connected", async () => {
     const priv = getPrivate(server);
     const ghConfig = makeServerConfig({

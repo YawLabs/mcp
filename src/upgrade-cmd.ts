@@ -87,7 +87,10 @@ export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
   --run     Run the upgrade in place (global npm, pnpm, bun, and local npm
             installs). No-op for npx installs -- they always fetch the latest.
   --json    Emit a machine-readable snapshot ({ current, latest, stale,
-            method, command }) instead of prose.`;
+            method, command }) instead of prose.
+            NOTE: --json is a report-only snapshot; it never spawns an upgrade
+            even when combined with --run. Use --run without --json to
+            actually perform the upgrade.`;
 
 export function parseUpgradeArgs(
   argv: string[],

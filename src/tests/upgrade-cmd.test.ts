@@ -271,6 +271,15 @@ describe("buildUpgradePlan", () => {
     // dev is always non-stale because the version string doesn't parse.
     expect(plan.stale).toBe(false);
   });
+
+  it("falls back to npm -g command for unknown method", () => {
+    // Item 2: the default switch arm for unknown must return the npm -g
+    // install command so an unrecognized install path still gives the
+    // user a sensible copy-paste command.
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("unknown") });
+    expect(plan.command).toBe("npm install -g @yawlabs/mcp@latest");
+    expect(plan.stale).toBe(true);
+  });
 });
 
 describe("runUpgrade", () => {
@@ -547,5 +556,82 @@ describe("runUpgrade", () => {
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed.latest).toBeNull();
     expect(parsed.stale).toBe(false);
+  });
+
+  it("--json --run emits JSON and never calls spawnImpl (report-only snapshot)", async () => {
+    // Pins that --json is a report-only snapshot: combining it with --run
+    // must NOT spawn the upgrade. Exit code follows the stale-without-run
+    // rule (1 when stale), not the run-succeeded rule (0).
+    const io = captureIO();
+    let didSpawn = false;
+    const r = await runUpgrade({
+      json: true,
+      run: true,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async () => {
+        didSpawn = true;
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(didSpawn).toBe(false);
+    // JSON branch emits the plan and exits per stale state, ignoring --run.
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.stale).toBe(true);
+    // With --run set but ignored, exit code is still 1 (stale, no spawn).
+    // The JSON branch exits 0 only when stale === false or opts.run is also set.
+    // Re: upgrade-cmd.ts:354 -- exitCode = plan.stale && !opts.run ? 1 : 0.
+    // Since opts.run IS set, the JSON branch exits 0 (it treats --run as
+    // "acknowledge I know about --run" not as "do the spawn").
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("--json --run offline (fetchLatest null) with bundled-app argvPath: prints app-update hint, never spawns, exit 0", async () => {
+    // Item 3: offline + bundled-app must print the app-update hint, never
+    // an npm command, and always exit 0.
+    const io = captureIO();
+    let didSpawn = false;
+    const r = await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/Applications/Yaw.app/Contents/Resources/app.asar.unpacked/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => null,
+      spawnImpl: async () => {
+        didSpawn = true;
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(didSpawn).toBe(false);
+    const out = io.out.join("\n");
+    expect(out).toContain("Yaw Terminal");
+    expect(out).not.toContain("npm install");
+    expect(out).not.toContain("npm run");
+  });
+
+  it("with --run on a bun-global argvPath, spawns ['bun', ['add', '-g', '@yawlabs/mcp@latest']]", async () => {
+    // Item 4: mirror the pnpm-global --run test for bun-global.
+    const io = captureIO();
+    const spawned: Array<{ cmd: string; args: string[]; cwd?: string }> = [];
+    const r = await runUpgrade({
+      run: true,
+      currentVersion: "0.40.0",
+      argvPath: "/home/u/.bun/install/global/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async (cmd, args, cwd) => {
+        spawned.push({ cmd, args, cwd });
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toEqual({ cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"], cwd: undefined });
+    expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
   });
 });

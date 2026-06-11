@@ -57,6 +57,12 @@ describe("exec-engine: parseRefPath", () => {
   it("rejects double dots", () => {
     expect(parseRefPath("foo..bar")).toBeNull();
   });
+
+  it("rejects bare identifier glued to closing bracket (foo[0]bar)", () => {
+    // exec-engine.ts:68 -- after ']', the next char must be '.', '[', or EOS.
+    // A bare identifier immediately following ']' is malformed.
+    expect(parseRefPath("foo[0]bar")).toBeNull();
+  });
 });
 
 describe("exec-engine: isRefNode", () => {
@@ -310,6 +316,13 @@ describe("exec-engine: validateExecRequest", () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.message).toContain("unknown step id");
+  });
+
+  it("rejects a step whose args is an array (Array.isArray guard at exec-engine.ts:247)", () => {
+    // args must be a plain object when provided; an array must be rejected.
+    const r = validateExecRequest({ steps: [{ tool: "t", args: [] }] });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("`args` must be an object");
   });
 
   it("fix#1: positional keys do not shadow explicit ids -- both are valid targets", () => {
