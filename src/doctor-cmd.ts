@@ -40,7 +40,7 @@ import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
 import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
 import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
-import { buildUpgradePlan, detectInstallMethod } from "./upgrade-cmd.js";
+import { buildUpgradePlan, detectInstallMethod, refineInstallMethod } from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -253,7 +253,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   if (staleHint) {
     // Method-aware so the hint is always the user's TERMINAL action --
     // never a command that turns around and prints another command.
-    const method = detectInstallMethod(process.argv[1]);
+    // Refinement consults `npm prefix -g` for the ambiguous methods
+    // (auto-skipped under vitest; see refineInstallMethod).
+    const method = await refineInstallMethod(detectInstallMethod(process.argv[1]), process.argv[1]);
     print("UPGRADE AVAILABLE");
     if (method === "bundled-app") {
       print(`  Running ${VERSION}; npm latest is ${staleHint}. This copy ships inside`);

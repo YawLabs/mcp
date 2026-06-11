@@ -30,6 +30,7 @@
 // have the shell do the right thing deterministically.
 
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 
 declare const __VERSION__: string;
 
@@ -50,6 +51,9 @@ export interface UpgradeCommandOptions {
   err?: (s: string) => void;
   /** Test hook: override the spawn invocation (returns exit code). */
   spawnImpl?: (cmd: string, args: string[], cwd?: string) => Promise<number>;
+  /** Test hook: replace the `npm prefix -g` probe used to refine
+   *  ambiguous install-method detections. */
+  npmPrefix?: () => Promise<string | null>;
 }
 
 export interface UpgradeCommandResult {
@@ -163,6 +167,77 @@ export function localInstallRoot(argvPath: string | undefined): string | null {
   return idx > 0 ? argvPath.slice(0, idx) : null;
 }
 
+/** Ask npm where its global prefix actually is. Returns null when npm
+ *  isn't reachable or doesn't answer within 3s — refinement is then
+ *  skipped and the path-marker classification stands. */
+async function defaultNpmPrefix(): Promise<string | null> {
+  // Auto-skip under vitest (mirrors doctor-cmd's registry probe) so unit
+  // tests never spawn a real npm; tests exercising refinement inject
+  // their own probe via opts.npmPrefix.
+  if (process.env.VITEST) return null;
+  return new Promise((resolve) => {
+    const child = spawn("npm", ["prefix", "-g"], {
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let out = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve(null);
+    }, 3000);
+    child.stdout?.on("data", (d) => {
+      out += String(d);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 && out.trim() ? out.trim() : null);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
+/** Resolve symlinks/junctions and normalize a path for comparison.
+ *  realpath matters on Windows tool managers (scoop's `current` is a
+ *  junction into a versioned dir) where the literal argv path and the
+ *  npm prefix point at the same files through different names. */
+function comparablePath(p: string): string {
+  let real = p;
+  try {
+    real = realpathSync(p);
+  } catch {
+    // Nonexistent or unreadable -- compare the literal path instead.
+  }
+  const normalized = real.replace(/\\/g, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/** Second-chance classification for the methods the path markers can't
+ *  distinguish: when an install looks like `local-node-modules` (or
+ *  `unknown`), ask npm for its real global prefix and reclassify as
+ *  `global-npm` when the entrypoint lives inside it. Catches exotic
+ *  prefixes the markers don't know (custom NPM_CONFIG_PREFIX, new tool
+ *  managers) without spawning npm on the unambiguous fast paths. */
+export async function refineInstallMethod(
+  method: InstallMethod,
+  argvPath: string | undefined,
+  npmPrefix: () => Promise<string | null> = defaultNpmPrefix,
+): Promise<InstallMethod> {
+  if (method !== "local-node-modules" && method !== "unknown") return method;
+  if (!argvPath) return method;
+  const prefix = await npmPrefix();
+  if (!prefix) return method;
+  const entry = comparablePath(argvPath);
+  const pfx = comparablePath(prefix);
+  // Windows global layout: <prefix>/node_modules; POSIX: <prefix>/lib/node_modules.
+  if (entry.startsWith(`${pfx}/node_modules/`) || entry.startsWith(`${pfx}/lib/node_modules/`)) {
+    return "global-npm";
+  }
+  return method;
+}
+
 /** Assemble the upgrade plan from method + version info. Single source
  *  of truth for both the prose and --json paths. */
 export function buildUpgradePlan(input: {
@@ -263,7 +338,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   const fetcher = opts.fetchLatest ?? defaultFetchLatest;
   const current = opts.currentVersion ?? readCurrentVersion();
   const argvPath = opts.argvPath ?? process.argv[1];
-  const method = detectInstallMethod(argvPath);
+  const method = await refineInstallMethod(detectInstallMethod(argvPath), argvPath, opts.npmPrefix);
 
   let latest: string | null;
   try {

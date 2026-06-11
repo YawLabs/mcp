@@ -4,8 +4,9 @@
 // detect a stale install and upgrade it in the background so the NEXT
 // spawn (the next time the MCP client restarts) runs the new version.
 //
-// Only the `global-npm` install method is acted on -- `npm install -g
-// @yawlabs/mcp@latest` is a whitelisted, non-destructive command.
+// Global install methods are acted on with their owning tool -- `npm
+// install -g` / `pnpm add -g` / `bun add -g @yawlabs/mcp@latest` are
+// whitelisted, non-destructive commands.
 //   - npx installs self-heal already: `yaw-mcp install` now writes
 //     `@yawlabs/mcp@latest`, so `npx` re-resolves the newest version on
 //     every spawn. A stale npx cache without `@latest` in the client
@@ -13,6 +14,8 @@
 //     inside serve, so it is logged, not acted on.
 //   - local-node-modules / dev-checkout: the user owns that tree; we
 //     never run package installs against it.
+//   - bundled-app (inside Yaw Terminal): only an app update can refresh
+//     it; logged, never touched.
 //
 // Never blocks serving: the registry fetch has a short timeout, the
 // npm spawn's stdio is ignored (no parent I/O contention) and stays a
@@ -112,9 +115,23 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   const plan = buildUpgradePlan({ current, latest, method });
   if (!plan.stale) return;
 
-  if (method === "global-npm") {
-    log("info", "yaw-mcp is out of date; upgrading the global install in the background", { current, latest });
-    (deps.spawnImpl ?? defaultSpawn)("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
+  // Global installs self-upgrade with their OWNING tool -- same whitelist
+  // as `upgrade --run` (exactly our package, fixed args).
+  const globalSpec =
+    method === "global-npm"
+      ? { cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] }
+      : method === "pnpm-global"
+        ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
+        : method === "bun-global"
+          ? { cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"] }
+          : null;
+  if (globalSpec) {
+    log("info", "yaw-mcp is out of date; upgrading the global install in the background", {
+      current,
+      latest,
+      tool: globalSpec.cmd,
+    });
+    (deps.spawnImpl ?? defaultSpawn)(globalSpec.cmd, globalSpec.args);
     return;
   }
 

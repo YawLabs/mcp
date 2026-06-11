@@ -5,6 +5,7 @@ import {
   detectInstallMethod,
   localInstallRoot,
   parseUpgradeArgs,
+  refineInstallMethod,
   runUpgrade,
 } from "../upgrade-cmd.js";
 
@@ -144,6 +145,59 @@ describe("detectInstallMethod", () => {
 
   it("detects dev checkout (dist/)", () => {
     expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBe("dev-checkout");
+  });
+});
+
+describe("refineInstallMethod", () => {
+  it("reclassifies local-node-modules as global-npm when the entrypoint lives under npm's prefix", async () => {
+    // Windows layout: globals at <prefix>/node_modules.
+    expect(
+      await refineInstallMethod(
+        "local-node-modules",
+        "/custom/prefix/node_modules/@yawlabs/mcp/dist/index.js",
+        async () => "/custom/prefix",
+      ),
+    ).toBe("global-npm");
+    // POSIX layout: globals at <prefix>/lib/node_modules.
+    expect(
+      await refineInstallMethod(
+        "local-node-modules",
+        "/custom/prefix/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        async () => "/custom/prefix",
+      ),
+    ).toBe("global-npm");
+  });
+
+  it("leaves a genuine project-local install alone", async () => {
+    expect(
+      await refineInstallMethod(
+        "local-node-modules",
+        "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+        async () => "/custom/prefix",
+      ),
+    ).toBe("local-node-modules");
+  });
+
+  it("skips refinement for unambiguous methods and when npm doesn't answer", async () => {
+    let probed = false;
+    const probe = async () => {
+      probed = true;
+      return "/custom/prefix";
+    };
+    expect(await refineInstallMethod("global-npm", "/x/node_modules/@yawlabs/mcp/dist/index.js", probe)).toBe(
+      "global-npm",
+    );
+    expect(await refineInstallMethod("bundled-app", "/x/node_modules/@yawlabs/mcp/dist/index.js", probe)).toBe(
+      "bundled-app",
+    );
+    expect(probed).toBe(false);
+    expect(
+      await refineInstallMethod(
+        "local-node-modules",
+        "/proj/node_modules/@yawlabs/mcp/dist/index.js",
+        async () => null,
+      ),
+    ).toBe("local-node-modules");
   });
 });
 

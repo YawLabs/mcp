@@ -149,6 +149,26 @@ describe("maybeAutoUpgrade", () => {
     expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
   });
 
+  it("background-upgrades stale pnpm/bun globals with their owning tool", async () => {
+    const pnpmSpawn = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: "/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: pnpmSpawn,
+    });
+    expect(pnpmSpawn).toHaveBeenCalledWith("pnpm", ["add", "-g", "@yawlabs/mcp@latest"]);
+
+    const bunSpawn = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: "/home/u/.bun/install/global/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: bunSpawn,
+    });
+    expect(bunSpawn).toHaveBeenCalledWith("bun", ["add", "-g", "@yawlabs/mcp@latest"]);
+  });
+
   it("does NOT spawn for a stale npx install (npx self-heals via the @latest config)", async () => {
     // npx installs are upgraded by the `@yawlabs/mcp@latest` entry that
     // `yaw-mcp install` writes -- there is nothing safe to spawn from here.
