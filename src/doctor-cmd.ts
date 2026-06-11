@@ -251,9 +251,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   const staleHint = latest && VERSION !== "dev" && compareSemver(VERSION, latest) < 0 ? latest : null;
   if (staleHint) {
     print("UPGRADE AVAILABLE");
-    print(`  Running ${VERSION}; npm latest is ${staleHint}.`);
-    print("  Run `yaw-mcp upgrade` to see the exact command for your install, or");
-    print("  `yaw-mcp upgrade --run` to execute it (global-npm installs only).");
+    print(`  Running ${VERSION}; npm latest is ${staleHint}. To upgrade in place:`);
+    print("");
+    print("    yaw-mcp upgrade --run");
     print("");
   }
 

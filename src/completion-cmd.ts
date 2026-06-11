@@ -111,7 +111,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: ["bash", "zsh", "fish", "powershell"],
     flags: ["--help"],
   },
-  // Account / sync (Pro + Team).
+  // Account / sync (Yaw Team).
   { name: "login", description: "Authenticate with a Yaw MCP account", flags: ["--key", "--json", "--help"] },
   { name: "logout", description: "Sign out of your account", flags: ["--json", "--help"] },
   {

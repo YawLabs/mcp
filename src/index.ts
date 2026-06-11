@@ -10,14 +10,12 @@ import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemov
 import { log } from "./logger.js";
 import { parseLoginArgs, runLogin } from "./login-cmd.js";
 import { parseLogoutArgs, runLogout } from "./logout-cmd.js";
-import { NAG_ELIGIBLE_SUBCOMMANDS, recordTouchPoint, showNagInterstitial } from "./nag.js";
 import { RESET_LEARNING_USAGE, parseResetLearningArgs, runResetLearning } from "./reset-learning-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { parseStatsArgs, runStats } from "./stats-cmd.js";
 import { parseSyncArgs, runSync } from "./sync-cmd.js";
-import { getSession } from "./team-sync.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
@@ -58,43 +56,6 @@ declare const __VERSION__: string;
 // before the YAW_MCP_TOKEN check so local-only commands like `compliance`,
 // `install`, and `doctor` don't require an account.
 const subcommand = process.argv[2];
-
-// Free-tier nag: fires on human-initiated subcommands once every 2-4
-// touch points (floor: 1 per 1.5 days). Suppressed in account mode,
-// when stdout/stdin is not a TTY, or when YAW_MCP_NO_NAG=1 is set.
-// Server-mode (no subcommand) is excluded because it's launched by the
-// AI client -- interrupting a tool call with a keypress prompt would
-// confuse the agent and the user. See plans-v2.md "Nag mechanic".
-if (subcommand && NAG_ELIGIBLE_SUBCOMMANDS.has(subcommand) && process.env.YAW_MCP_NO_NAG !== "1") {
-  // Account mode = ANY of: env token, config.json token, or an active
-  // team-session cookie (a Yaw Team buyer who ran `yaw-mcp
-  // login`). Check the cheapest signal first so the common case skips
-  // the heavier loads.
-  const envHasToken = typeof process.env.YAW_MCP_TOKEN === "string" && process.env.YAW_MCP_TOKEN.length > 0;
-  let inAccountMode = envHasToken;
-  if (!inAccountMode) {
-    try {
-      const cfg = await loadYawMcpConfig();
-      inAccountMode = Boolean(cfg.token);
-    } catch {
-      inAccountMode = false;
-    }
-  }
-  if (!inAccountMode) {
-    try {
-      const session = await getSession();
-      inAccountMode = session !== null;
-    } catch {
-      inAccountMode = false;
-    }
-  }
-  if (!inAccountMode) {
-    const decision = await recordTouchPoint();
-    if (decision.show) {
-      await showNagInterstitial();
-    }
-  }
-}
 
 if (subcommand === "compliance") {
   runComplianceCommand(process.argv.slice(3)).then((code) => process.exit(code));
@@ -284,9 +245,9 @@ if (subcommand === "compliance") {
                              fish, or powershell. Redirect to your
                              completions directory to install.
 
-  Account / sync (Pro + Team):
-    login                    Authenticate this machine with a Yaw MCP account
-                             (Pro/Team). --key <license> to pass the key inline.
+  Account / sync (Yaw Team):
+    login                    Authenticate this machine with a Yaw MCP account.
+                             --key <license> to pass the key inline.
     logout                   Sign this machine out of the account.
     sync <push|pull|status>  Replicate your local bundles.json to/from the
                              account store (env values stripped on push).

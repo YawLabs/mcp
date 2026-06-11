@@ -384,7 +384,7 @@ export async function putResource<T>(
 }
 
 // ---------------------------------------------------------------------
-// Analytics (Pro / Yaw Team): mcp_analytics endpoint
+// Analytics (Yaw Team): mcp_analytics endpoint
 // ---------------------------------------------------------------------
 
 export interface AnalyticsEvent {

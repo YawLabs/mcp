@@ -2,7 +2,7 @@
   "name": "@yawlabs/mcp",
   "version": "0.59.1",
   "mcpName": "io.github.YawLabs/mcp",
-  "description": "Yaw MCP -- MCP servers, managed. Run locally, sync across machines with Pro.",
+  "description": "Yaw MCP -- MCP servers, managed. Free to run locally; Yaw Team adds cross-machine sync.",
   "license": "UNLICENSED",
   "author": "Yaw Labs <support@yaw.sh> (https://yaw.sh/mcp)",
   "type": "module",

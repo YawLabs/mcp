@@ -118,6 +118,14 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     return;
   }
 
+  if (method === "bundled-app") {
+    // The copy Yaw Terminal ships in its resources -- only an app update
+    // can refresh it, so there is nothing to spawn and nothing to ask of
+    // the user beyond keeping the app current.
+    log("info", "yaw-mcp (bundled with Yaw Terminal) is behind npm; it updates with the app", { current, latest });
+    return;
+  }
+
   // npx / local-node-modules / dev-checkout / unknown: nothing safe to
   // spawn from here. Log a one-liner so a stale install is at least
   // visible; the `@latest` client config (written by `yaw-mcp install`)

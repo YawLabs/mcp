@@ -3,6 +3,7 @@ import {
   type InstallMethod,
   buildUpgradePlan,
   detectInstallMethod,
+  localInstallRoot,
   parseUpgradeArgs,
   runUpgrade,
 } from "../upgrade-cmd.js";
@@ -93,12 +94,44 @@ describe("detectInstallMethod", () => {
     expect(detectInstallMethod("/proj/app/node_modules/@yawlabs/mcp/dist/index.js")).toBe("local-node-modules");
   });
 
+  it("detects the Yaw Terminal bundled copy (asar.unpacked) over the node_modules marker", () => {
+    expect(
+      detectInstallMethod(
+        "C:\\Users\\u\\AppData\\Local\\yaw\\resources\\app.asar.unpacked\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+      ),
+    ).toBe("bundled-app");
+    expect(
+      detectInstallMethod(
+        "/Applications/Yaw.app/Contents/Resources/app.asar.unpacked/node_modules/@yawlabs/mcp/dist/index.js",
+      ),
+    ).toBe("bundled-app");
+  });
+
   it("detects dev checkout (src/)", () => {
     expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/src/index.ts")).toBe("dev-checkout");
   });
 
   it("detects dev checkout (dist/)", () => {
     expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBe("dev-checkout");
+  });
+});
+
+describe("localInstallRoot", () => {
+  it("returns the tree root before the first node_modules segment", () => {
+    expect(localInstallRoot("/proj/app/node_modules/@yawlabs/mcp/dist/index.js")).toBe("/proj/app");
+  });
+
+  it("keeps Windows drive letters and backslashes intact", () => {
+    expect(localInstallRoot("C:\\Users\\u\\node_modules\\@yawlabs\\mcp\\dist\\index.js")).toBe("C:\\Users\\u");
+  });
+
+  it("uses the FIRST node_modules segment for nested installs", () => {
+    expect(localInstallRoot("/proj/node_modules/foo/node_modules/@yawlabs/mcp/dist/index.js")).toBe("/proj");
+  });
+
+  it("returns null when no node_modules segment exists", () => {
+    expect(localInstallRoot("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBeNull();
+    expect(localInstallRoot(undefined)).toBeNull();
   });
 });
 
@@ -130,6 +163,12 @@ describe("buildUpgradePlan", () => {
   it("uses plain `npm install` for local node_modules", () => {
     const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("local-node-modules") });
     expect(plan.command).toBe("npm install @yawlabs/mcp@latest");
+  });
+
+  it("returns null command for the Yaw Terminal bundled copy (updates with the app)", () => {
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("bundled-app") });
+    expect(plan.command).toBeNull();
+    expect(plan.stale).toBe(true);
   });
 
   it("suggests git pull for dev checkouts", () => {
@@ -222,13 +261,34 @@ describe("runUpgrade", () => {
     expect(io.err.join("\n")).toContain("npm exited 42");
   });
 
-  it("with --run on a non-global install method, refuses with exit 2", async () => {
+  it("with --run on a local-node-modules install, spawns npm install in the tree root", async () => {
+    const io = captureIO();
+    const spawned: Array<{ cmd: string; args: string[]; cwd?: string }> = [];
+    const r = await runUpgrade({
+      run: true,
+      currentVersion: "0.40.0",
+      argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async (cmd, args, cwd) => {
+        spawned.push({ cmd, args, cwd });
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: "/proj/app" });
+    expect(io.out.join("\n")).toContain("Upgraded @yawlabs/mcp to 0.45.0");
+  });
+
+  it("with --run on a dev checkout, refuses with exit 2 and prints the command", async () => {
     const io = captureIO();
     let didSpawn = false;
     const r = await runUpgrade({
       run: true,
       currentVersion: "0.40.0",
-      argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+      argvPath: "/home/jeff/yaw/yaw-mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       spawnImpl: async () => {
         didSpawn = true;
@@ -239,22 +299,62 @@ describe("runUpgrade", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(didSpawn).toBe(false);
-    expect(io.err.join("\n")).toContain("can't be upgraded automatically");
+    const err = io.err.join("\n");
+    expect(err).toContain("can't be upgraded automatically");
+    expect(err).toContain("git pull && npm run build");
   });
 
-  it("without --run on a non-global method, prints suggested command and notes --run won't work", async () => {
+  it("without --run on a dev checkout, prints the command and notes --run won't work", async () => {
     const io = captureIO();
     const r = await runUpgrade({
       currentVersion: "0.40.0",
-      argvPath: "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+      argvPath: "/home/jeff/yaw/yaw-mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
       out: io.push,
       err: io.pushErr,
     });
     expect(r.exitCode).toBe(1);
     const out = io.out.join("\n");
-    expect(out).toContain("Suggested command");
-    expect(out).toContain("--run only works for global-npm");
+    expect(out).toContain("Run it yourself");
+    expect(out).toContain("git pull && npm run build");
+  });
+
+  it("tells Yaw Terminal bundled-copy users the app updates it (exit 0, no spawn)", async () => {
+    const io = captureIO();
+    let didSpawn = false;
+    const r = await runUpgrade({
+      run: true,
+      currentVersion: "0.40.0",
+      argvPath: "/Applications/Yaw.app/Contents/Resources/app.asar.unpacked/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      spawnImpl: async () => {
+        didSpawn = true;
+        return 0;
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(didSpawn).toBe(false);
+    const out = io.out.join("\n");
+    expect(out).toContain("Update Yaw Terminal");
+    expect(out).not.toContain("npm install");
+  });
+
+  it("command lines carry no trailing punctuation (copy-friendly)", async () => {
+    const io = captureIO();
+    await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    const cmdLines = io.out.filter((l) => l.includes("npm install"));
+    expect(cmdLines.length).toBeGreaterThan(0);
+    for (const line of cmdLines) {
+      expect(line.trimEnd()).toMatch(/@latest$/);
+    }
   });
 
   it("--json emits the plan and exits 1 when stale without --run", async () => {

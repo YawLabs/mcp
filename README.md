@@ -136,7 +136,7 @@ yaw-mcp compliance <target> [--publish]  # run the compliance suite against an M
 yaw-mcp --version                        # print version
 ```
 
-Account / sync (Pro + Team -- a license key unlocks cross-machine bundle sync):
+Account / sync (Yaw Team -- a license key unlocks cross-machine bundle sync):
 
 ```bash
 yaw-mcp login [--key <license>]          # authenticate this machine with a Yaw MCP account
