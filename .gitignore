@@ -6,3 +6,7 @@ dist/
 # Machine-local yaw-mcp overrides (token, per-machine server list). Project
 # .yaw-mcp/config.json + .yaw-mcp/YAW-MCP.md are meant to be checked in.
 .yaw-mcp/config.local.json
+# Single-binary build outputs (Node SEA): the ~76MB exe + intermediates are
+# per-host build artifacts, not source. build-binary.mjs + the docs ARE tracked.
+bin/
+build-tmp/
