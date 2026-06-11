@@ -3,6 +3,7 @@ import {
   type InstallMethod,
   buildUpgradePlan,
   detectInstallMethod,
+  detectSea,
   localInstallRoot,
   parseUpgradeArgs,
   refineInstallMethod,
@@ -145,6 +146,26 @@ describe("detectInstallMethod", () => {
 
   it("detects dev checkout (dist/)", () => {
     expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBe("dev-checkout");
+  });
+});
+
+describe("detectSea", () => {
+  it("returns false when ELECTRON_RUN_AS_NODE is set (Electron is never a SEA)", async () => {
+    const prev = process.env.ELECTRON_RUN_AS_NODE;
+    process.env.ELECTRON_RUN_AS_NODE = "1";
+    try {
+      expect(await detectSea()).toBe(false);
+    } finally {
+      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
+      if (prev === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+      else process.env.ELECTRON_RUN_AS_NODE = prev;
+    }
+  });
+
+  it("returns false on an ordinary node run (execPath basename is node; no SEA blob)", async () => {
+    // Vitest runs under plain node, so the basename gate (and isSea()) yield
+    // false -- this pins that detectSea() never false-positives on real node.
+    expect(await detectSea()).toBe(false);
   });
 });
 

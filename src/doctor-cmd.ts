@@ -40,7 +40,7 @@ import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
 import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
 import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
-import { buildUpgradePlan, detectInstallMethod, detectSea, refineInstallMethod } from "./upgrade-cmd.js";
+import { BINARY_DOWNLOAD_URL, buildUpgradePlan, detectInstallMethod, detectSea, refineInstallMethod } from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -268,7 +268,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     } else if (method === "binary") {
       print(`  Running ${VERSION}; npm latest is ${staleHint}. This is a standalone`);
       print("  binary — download the latest build and replace the executable:");
-      print("    https://github.com/YawLabs/mcp/releases/latest");
+      print(`    ${BINARY_DOWNLOAD_URL}`);
     } else if (
       method === "global-npm" ||
       method === "pnpm-global" ||

@@ -169,7 +169,12 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     env: server.env,
   };
 
-  print(`Auditing "${namespace}" (${target.command}${target.args.length ? ` ${target.args.join(" ")}` : ""})...`);
+  // In --json mode stdout must be pure JSON (the Yaw MCP panel parses it), so
+  // skip the human preamble; print it only for interactive use. (A server arg
+  // containing a brace would otherwise corrupt brace-based JSON extraction.)
+  if (!opts.json) {
+    print(`Auditing "${namespace}" (${target.command}${target.args.length ? ` ${target.args.join(" ")}` : ""})...`);
+  }
 
   const runner = opts.runner ?? defaultRunner;
   let report: { grade: "A" | "B" | "C" | "D" | "F"; score: number };
