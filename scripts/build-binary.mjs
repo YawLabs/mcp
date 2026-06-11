@@ -21,9 +21,10 @@
 // package-lock.json, src/, or node_modules, and it never runs `npm install`.
 
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import esbuild from 'esbuild';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
@@ -52,22 +53,20 @@ function fmtSize(p) {
 mkdirSync(tmpDir, { recursive: true });
 mkdirSync(binDir, { recursive: true });
 
-// 1. Bundle everything into one CJS file (externals included).
-// Call esbuild's JS entry directly with the running node binary. This avoids
-// the .cmd shim (EINVAL under execFileSync on Windows) AND a shell, so the
-// --define value's inner quotes survive verbatim instead of being eaten by
-// cmd.exe quote-mangling.
-const esbuildEntry = join(repoRoot, 'node_modules', 'esbuild', 'bin', 'esbuild');
-run(process.execPath, [
-  esbuildEntry,
-  'src/index.ts',
-  '--bundle',
-  '--platform=node',
-  '--format=cjs',
-  '--target=node20',
-  `--define:__VERSION__="${version}"`,
-  `--outfile=${bundlePath}`,
-]);
+// 1. Bundle everything into one CJS file (externals included) via esbuild's
+// JS API. NOT the CLI bin: on Linux/macOS esbuild swaps node_modules/esbuild/
+// bin/esbuild for the NATIVE binary (only Windows keeps it a JS shim), so
+// `node bin/esbuild` would feed a binary to the JS parser and die. The API
+// also takes the __VERSION__ define as data -- no shell-quoting games.
+await esbuild.build({
+  entryPoints: [join(repoRoot, 'src/index.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node20',
+  define: { __VERSION__: JSON.stringify(version) },
+  outfile: bundlePath,
+});
 console.log(`bundle: ${fmtSize(bundlePath)}`);
 
 // 2. Generate the SEA blob from sea-config.json.
@@ -77,6 +76,9 @@ console.log(`blob:   ${fmtSize(blobPath)}`);
 // 3. Copy the running node binary as the carrier.
 rmSync(outExe, { force: true });
 copyFileSync(process.execPath, outExe);
+// copyFileSync does not reliably carry the executable bit on Unix; the macOS
+// exec-check below and the CI smoke test both need to run this file.
+if (!isWin) chmodSync(outExe, 0o755);
 
 // macOS: strip the carrier node binary's existing signature BEFORE injecting,
 // so postject doesn't leave a CORRUPT signature (which is worse than none --

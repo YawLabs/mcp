@@ -11,7 +11,7 @@
 //   node scripts/stage-release-asset.mjs
 
 import { createHash } from 'node:crypto';
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -31,6 +31,9 @@ const outSha = `${outAsset}.sha256`;
 mkdirSync(outDir, { recursive: true });
 rmSync(outAsset, { force: true });
 copyFileSync(builtExe, outAsset);
+// Preserve the executable bit on Unix (copyFileSync drops it) so the staged
+// asset is runnable for the CI smoke test and after download.
+if (!isWin) chmodSync(outAsset, 0o755);
 
 const hex = createHash('sha256').update(readFileSync(outAsset)).digest('hex');
 // sha256sum format so `sha256sum -c` and Scoop's hash.url sidecar both parse it.
