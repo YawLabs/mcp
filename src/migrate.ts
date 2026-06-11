@@ -20,7 +20,7 @@
 //     can trace where their config went.
 
 import { mkdir, rename, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
 
@@ -122,7 +122,6 @@ export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<vo
 // $HOME is handled by the global migration path alone. Returns the
 // directory that contains the legacy file(s), or null if none found.
 async function findLegacyProjectRoot(cwd: string, home: string): Promise<string | null> {
-  const { resolve, dirname } = await import("node:path");
   const homeResolved = resolve(home);
   let dir = resolve(cwd);
   let prev = "";

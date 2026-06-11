@@ -9,9 +9,11 @@ import {
 
 const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
 
-// Ground-truth dispatched subcommands (index.ts). Pinned here so dropping one
-// from SUBCOMMAND_SPEC -- which would silently shrink every shell's
-// completion -- fails this test loudly. Update both together by design.
+// Ground-truth dispatched subcommands from index.ts KNOWN_SUBCOMMANDS.
+// Keep this list in sync with KNOWN_SUBCOMMANDS in src/index.ts and
+// SUBCOMMAND_SPEC in src/completion-cmd.ts -- the test below catches
+// any three-way drift so none of the lists can diverge silently.
+// Entries here are the non-flag subcommand names only (strip --help/-h/--version/-V).
 const EXPECTED_SUBCOMMANDS = [
   "install",
   "add",
@@ -30,6 +32,7 @@ const EXPECTED_SUBCOMMANDS = [
   "sync",
   "stats",
   "secrets",
+  "audit",
   "compliance",
   "help",
 ];

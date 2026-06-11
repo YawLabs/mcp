@@ -45,7 +45,7 @@ describe("bundleActivateHint", () => {
       namespaces: ["alpha", "beta"],
       category: "dev",
     };
-    expect(bundleActivateHint(bundle)).toBe('mcp_connect_activate({ namespaces: ["alpha","beta"] })');
+    expect(bundleActivateHint(bundle)).toBe('mcp_connect_activate({ servers: ["alpha","beta"] })');
   });
 });
 

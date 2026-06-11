@@ -466,7 +466,7 @@ describe("upsertUserBundle round-trip", () => {
     writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
     await expect(
       upsertUserBundle({ namespace: "x", name: "X", command: "npx", args: [], isActive: true }, { home: synthHome }),
-    ).rejects.toThrow(/could not be read or parsed/);
+    ).rejects.toThrow(/could not be parsed/);
   });
 
   it("dedups a name-matched legacy entry (no second copy) [#1 cross-path]", async () => {

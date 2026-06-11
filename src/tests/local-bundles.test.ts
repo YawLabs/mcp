@@ -263,6 +263,41 @@ describe("readBundlesAt error discrimination (fix 1)", () => {
   });
 });
 
+// Fix 9: readRawUserBundles error branching -- parse vs. read errors get
+// distinct messages so users know whether to fix permissions or JSON.
+describe("readRawUserBundles error message branching (fix 9)", () => {
+  it("throws a parse-error message when bundles.json is invalid JSON", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(localBundlesPath(join(synthHome, CONFIG_DIRNAME)), "{ bad json }");
+    await expect(
+      upsertUserBundle(
+        { namespace: "test", name: "Test", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+    ).rejects.toThrow(/could not be parsed.*fix the JSON/i);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "throws a permissions-error message when bundles.json is unreadable",
+    async () => {
+      mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+      const bundlesFile = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+      writeFileSync(bundlesFile, JSON.stringify({ version: 1, servers: [] }));
+      chmodSync(bundlesFile, 0o000);
+      try {
+        await expect(
+          upsertUserBundle(
+            { namespace: "test", name: "Test", command: "npx", args: [], isActive: true },
+            { home: synthHome },
+          ),
+        ).rejects.toThrow(/could not be read.*check file permissions/i);
+      } finally {
+        chmodSync(bundlesFile, 0o644);
+      }
+    },
+  );
+});
+
 // Fix 2: bundleWriteChain serializer -- concurrent calls must not lose writes
 describe("upsertUserBundle / removeUserBundle serializer (fix 2)", () => {
   it("concurrent upserts do not lose any entry", async () => {

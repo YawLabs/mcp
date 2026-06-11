@@ -125,6 +125,17 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // An unbuilt checkout has no real version to compare; never touch it.
   if (current === "dev") return;
 
+  // NOTE: maybeAutoUpgrade deliberately uses detectInstallMethod (the
+  // fast, synchronous path-pattern heuristic) rather than the async
+  // refineInstallMethod (which runs `npm prefix -g` -- a ~3s npm
+  // subprocess -- to distinguish a real global-npm install from a local
+  // node_modules install that happens to share a path prefix). The serve
+  // hot path must not block on a 3s probe at startup. Consequence: a
+  // custom-prefix global install whose argv[1] pattern doesn't match
+  // the default npm prefix heuristic is classified as "local-node-modules"
+  // (or "unknown") and silently skipped -- no background upgrade fires for
+  // it even when stale. Users in that setup should run `yaw-mcp upgrade
+  // --run` manually, or set the standard npm global prefix.
   const method = (deps.isSeaImpl ? await deps.isSeaImpl() : await detectSea())
     ? "binary"
     : detectInstallMethod(deps.argvPath ?? process.argv[1]);

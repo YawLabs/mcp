@@ -116,6 +116,14 @@ async function onPath(cmd: string): Promise<boolean> {
 
 // GitHub release URLs redirect to objects.githubusercontent.com.
 // undici doesn't follow redirects by default — walk up to 5 hops.
+//
+// Trade-off: the entire archive is buffered in memory before being
+// written to disk (~20 MB for the uv binary today). This is a
+// deliberate choice: sha256 verification (below) requires the full
+// buffer to be in memory before we write anything, so streaming
+// directly to disk would leave a partially-written, unverified file
+// if the process is killed mid-download. The one-shot memory cost is
+// acceptable given that this path runs at most once per uv version.
 async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
   let current = url;
   for (let i = 0; i < maxHops; i++) {

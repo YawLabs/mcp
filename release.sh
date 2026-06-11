@@ -167,10 +167,10 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
 else
   npm version "$VERSION" --no-git-tag-version
   info "package.json bumped"
-  # Keep server.json in sync with package.json. CI also rewrites server.json
-  # via jq at publish time (.github/workflows/release.yml) as a safety net,
-  # but doing it here too means the committed value matches reality between
-  # releases instead of drifting until the next CI publish.
+  # Keep server.json in sync with package.json. This is the ONLY place
+  # server.json is updated -- release.yml is binaries-only and does NOT
+  # rewrite server.json. The committed value therefore always matches the
+  # bumped version from the moment this step runs.
   node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$VERSION"
   info "server.json bumped"
 fi
@@ -321,6 +321,9 @@ else
     CHANGELOG="Initial release"
   fi
 
+  # Binary assets (.exe / bare binaries) are NOT attached here -- they are
+  # attached later by the tag-triggered release.yml build run on GitHub
+  # Actions. This step only creates the release stub with changelog notes.
   gh release create "v${VERSION}" \
     --title "v${VERSION}" \
     --notes "$CHANGELOG"

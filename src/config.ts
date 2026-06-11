@@ -1,5 +1,6 @@
 import { request } from "undici";
 import { tokenFingerprint } from "./config-loader.js";
+import { NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
@@ -80,7 +81,6 @@ export async function fetchConfig(
   });
 
   // Filter out servers with invalid namespaces
-  const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
   data.servers = data.servers.filter((s) => {
     if (!s.namespace || !NAMESPACE_RE.test(s.namespace)) {
       log("warn", "Skipping server with invalid namespace", { namespace: s.namespace, name: s.name });

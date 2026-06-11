@@ -232,6 +232,10 @@ export function initAnalytics(url: string, tok: string): void {
   token = tok;
   lastLoggedConnectStatus = null;
   lastLoggedDispatchStatus = null;
+  // Also reset the team-analytics latch so a user who signs in mid-session
+  // gets team analytics re-enabled (the latch fires on a failed/missing
+  // session, but sign-in produces a fresh valid one).
+  teamAnalyticsDisabled = false;
   flushTimer = setInterval(() => {
     flush().catch(() => {});
     flushDispatch().catch(() => {});

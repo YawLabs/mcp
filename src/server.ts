@@ -271,6 +271,17 @@ export class ConnectServer {
     string,
     Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }>
   >();
+  // Tracks namespaces whose current activationInflight was initiated by
+  // prewarmDormantServers. An explicit mcp_connect_activate clears the
+  // namespace from this set, which prevents prewarm from disconnecting a
+  // connection the user just claimed. Without this, the prewarm race is:
+  //   1. prewarm activateOne("foo") -> inflight P1
+  //   2. user activateOne("foo") -> joins P1 (same promise)
+  //   3. P1 resolves ok=true for both callers
+  //   4. prewarm disconnects "foo" — user's next tool call fails
+  // With this set: prewarm only disconnects when the namespace was NOT
+  // claimed by an explicit activate while P1 was in flight.
+  private prewarmNamespaces = new Set<string>();
   // Usage learning — nudges dispatch toward namespaces that have been
   // genuinely useful. Counts persist across yaw-mcp restarts via state.json
   // (see persistence.ts). YAW_MCP_DISABLE_PERSISTENCE=1 makes it session
@@ -726,8 +737,21 @@ export class ConnectServer {
       await Promise.all(
         batch.map(async (server) => {
           try {
-            const result = await this.activateOne(server.namespace);
+            const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) return;
+            // Only disconnect if no explicit activate claimed this namespace
+            // while the inflight promise was in flight. If an explicit activate
+            // joined our shared promise, prewarmNamespaces will no longer
+            // contain this namespace (activateOne with fromPrewarm=false clears
+            // it), so we leave the connection alive for the user.
+            if (!this.prewarmNamespaces.has(server.namespace)) {
+              log("info", "Pre-warm skipping disconnect — namespace claimed by explicit activate", {
+                namespace: server.namespace,
+              });
+              anyPopulated = true;
+              return;
+            }
+            this.prewarmNamespaces.delete(server.namespace);
             // Immediately disconnect — toolCache is already in
             // this.toolCache and reportTools persisted it upstream,
             // so getDeferredServers() surfaces the server without
@@ -1605,18 +1629,37 @@ export class ConnectServer {
   // child process; the second set() would win and the first would leak
   // until its transport noticed. See activationInflight.
   //
+  // `fromPrewarm` marks the inflight as prewarm-initiated so that
+  // prewarmDormantServers can safely disconnect when it is the sole
+  // caller, but skip the disconnect when an explicit activate has also
+  // joined the inflight promise. An explicit call (fromPrewarm=false)
+  // removes the namespace from prewarmNamespaces so prewarm's teardown
+  // code sees it as "claimed" and leaves the connection alive.
+  //
   // Returns:
   //   { ok: true, message } — already connected or newly connected
   //   { ok: false, message, isChanged: false } — failed or not in config
   private activateOne(
     namespace: string,
     progress?: ProgressReporter,
+    fromPrewarm = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
+    // An explicit (non-prewarm) activation claims the namespace: prewarm
+    // must not tear down a connection the user asked for.
+    if (!fromPrewarm) {
+      this.prewarmNamespaces.delete(namespace);
+    }
+
     const inflight = this.activationInflight.get(namespace);
     if (inflight) {
       progress?.(`"${namespace}" load already in flight — awaiting existing attempt`);
       return inflight;
     }
+
+    if (fromPrewarm) {
+      this.prewarmNamespaces.add(namespace);
+    }
+
     const promise = this.runActivateOne(namespace, progress).finally(() => {
       // Clear only if this promise is still the registered one. If a
       // retry path (maybeElicitAndRetry → activateOne) has already
@@ -1742,6 +1785,9 @@ export class ConnectServer {
         if (attempt === 0) {
           const msg = err instanceof Error ? err.message : String(err);
           log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
+          // Fixed 1s delay before the single retry. The expression `1000 * 2 ** attempt`
+          // evaluates to 1000ms here (attempt=0, 2^0=1) -- this is NOT exponential
+          // backoff; it is one fixed step.
           await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
         }
       }
@@ -2299,13 +2345,15 @@ export class ConnectServer {
         continue;
       }
 
-      // Check if config changed (different command, args, url, etc.)
+      // Check if config changed (different command, args, url, env, type, or timeout)
       const oldConfig = connection.config;
       if (
         oldConfig.command !== newServerConfig.command ||
         !argsEqual(oldConfig.args, newServerConfig.args) ||
         oldConfig.url !== newServerConfig.url ||
-        !envEqual(oldConfig.env, newServerConfig.env)
+        !envEqual(oldConfig.env, newServerConfig.env) ||
+        oldConfig.type !== newServerConfig.type ||
+        oldConfig.connectTimeoutMs !== newServerConfig.connectTimeoutMs
       ) {
         log("info", "Server config changed, deactivating stale connection", { namespace });
         await disconnectFromUpstream(connection);
@@ -2741,6 +2789,16 @@ export class ConnectServer {
     // Slow path: transient connect. Same spawn cost as activate, but
     // we tear down immediately after reading the tool list so the
     // server doesn't linger in the session.
+    //
+    // Accepted race: if an mcp_connect_activate for the same namespace
+    // is in-flight via activateOne, this transient connect spawns a
+    // SECOND upstream process. Both complete independently; the transient
+    // is torn down in the finally block below, while activateOne's
+    // connection is registered normally. The double-spawn is harmless
+    // (two brief children, one wins the connections map) and fixing it
+    // would require routing read_tool through activateOne's inflight
+    // dedup map, which would change its semantics (persistent activation
+    // vs transient inspection). Accepted as-is.
     progress?.(`Inspecting "${serverArg}" (transient — not loading into session)…`);
     let transient: UpstreamConnection | undefined;
     try {

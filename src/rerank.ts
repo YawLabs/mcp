@@ -187,5 +187,8 @@ async function readTeamCookie(): Promise<string | null> {
   // The caller (rerank()) already called getSession() which populated the
   // team-sync module-scoped cache.  getCachedCookie() reads that same slot
   // synchronously -- no extra disk I/O.
+  // Zero-arg call is intentional: getCachedCookie() reads the process-global
+  // in-memory cache; the `home` param used by getSession() for the initial
+  // disk read is irrelevant here -- the cache is already warm.
   return teamSync.getCachedCookie();
 }

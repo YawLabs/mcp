@@ -33,8 +33,17 @@ const expand = (p) => (p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
 const version = arg('version', pkg.version);
 const tag = `v${version}`;
-const scoopDir = resolve(expand(arg('scoop-dir', '~/yaw/scoop-yaw')));
-const homebrewDir = resolve(expand(arg('homebrew-dir', '~/yaw/homebrew-yaw')));
+
+// Manifest repo paths: resolved in priority order:
+//   1. --scoop-dir / --homebrew-dir CLI flags
+//   2. YAW_SCOOP_DIR / YAW_HOMEBREW_DIR env vars
+//   3. Hardcoded personal-machine defaults (~/yaw/scoop-yaw etc.)
+// On a second machine, set the env vars or pass the flags -- the
+// personal defaults only exist on the original dev machine and will
+// produce a "no such file or directory" error rather than silently
+// writing to a wrong location.
+const scoopDir = resolve(expand(arg('scoop-dir', process.env.YAW_SCOOP_DIR ?? '~/yaw/scoop-yaw')));
+const homebrewDir = resolve(expand(arg('homebrew-dir', process.env.YAW_HOMEBREW_DIR ?? '~/yaw/homebrew-yaw')));
 const push = process.argv.includes('--push');
 
 const REPO = 'https://github.com/YawLabs/mcp';

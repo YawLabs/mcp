@@ -417,7 +417,18 @@ export async function fetchPromptsFromUpstream(client: Client, namespace: string
 }
 
 export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {
-  const result = await client.listTools({}, { timeout: LIST_TIMEOUT });
+  let result: Awaited<ReturnType<typeof client.listTools>>;
+  try {
+    result = await client.listTools({}, { timeout: LIST_TIMEOUT });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new ActivationError(
+      `"${namespace}" returned an error on tools/list: ${message}`,
+      "protocol_error",
+      undefined,
+      err,
+    );
+  }
   const raw = result.tools ?? [];
   if (raw.length > MAX_TOOLS_PER_SERVER) {
     log("warn", "Upstream returned more tools than cap; truncating", {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseJsonc, stripJsoncComments } from "../jsonc.js";
+import { parseJsonc, stripJsoncComments, stripTrailingCommas } from "../jsonc.js";
 
 describe("stripJsoncComments", () => {
   it("leaves plain JSON untouched", () => {
@@ -76,5 +76,50 @@ describe("stripJsoncComments", () => {
   it("parseJsonc strips BOM before processing comments", () => {
     const src = `﻿// header\n{"a": 1}`;
     expect(parseJsonc(src)).toEqual({ a: 1 });
+  });
+});
+
+describe("stripTrailingCommas", () => {
+  it("strips trailing comma in an object", () => {
+    expect(stripTrailingCommas('{"a":1,"b":2,}')).toBe('{"a":1,"b":2 }');
+  });
+
+  it("strips trailing comma in an array", () => {
+    expect(stripTrailingCommas("[1,2,3,]")).toBe("[1,2,3 ]");
+  });
+
+  it("strips trailing comma with whitespace before closing brace", () => {
+    expect(stripTrailingCommas('{"a":1,  }')).toBe('{"a":1   }');
+  });
+
+  it("does not touch non-trailing commas", () => {
+    expect(stripTrailingCommas('{"a":1,"b":2}')).toBe('{"a":1,"b":2}');
+  });
+
+  it("does not touch commas inside strings", () => {
+    expect(stripTrailingCommas('{"a":"foo,}"}')).toBe('{"a":"foo,}"}');
+  });
+
+  it("preserves string content unchanged", () => {
+    const src = '{"url":"https://example.com/api,"}';
+    expect(stripTrailingCommas(src)).toBe(src);
+  });
+});
+
+describe("parseJsonc trailing comma integration", () => {
+  it("parses object with trailing comma", () => {
+    expect(parseJsonc('{"a":1,"b":2,}')).toEqual({ a: 1, b: 2 });
+  });
+
+  it("parses array with trailing comma", () => {
+    expect(parseJsonc("[1,2,3,]")).toEqual([1, 2, 3]);
+  });
+
+  it("parses nested trailing commas", () => {
+    expect(parseJsonc('{"a":{"b":1,},"c":[1,2,],}')).toEqual({ a: { b: 1 }, c: [1, 2] });
+  });
+
+  it("parses trailing comma combined with line comments", () => {
+    expect(parseJsonc('{\n  "a": 1, // comment\n  "b": 2,\n}')).toEqual({ a: 1, b: 2 });
   });
 });

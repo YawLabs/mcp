@@ -50,7 +50,16 @@ export async function findProjectConfigDir(start: string, home: string = homedir
       await access(candidate);
       return candidate;
     } catch {
-      // not here, keep walking
+      // Accepted trade-off: we treat ALL errors (ENOENT, EPERM, EACCES,
+      // etc.) as "not found here" and keep walking up the directory tree.
+      // An unreadable .yaw-mcp/ dir is therefore silently skipped rather
+      // than surfaced as an error, which means the walk may reach a
+      // parent-directory config instead of stopping at the unreadable one.
+      // The risk is low in practice (permission errors on .yaw-mcp/ itself
+      // are unusual), and the alternative -- treating access errors as
+      // fatal -- would break startup for the common ENOENT case. Callers
+      // that need stricter semantics (e.g. readBundlesAt in local-bundles.ts)
+      // handle their own permission errors explicitly.
     }
     prev = dir;
     dir = path.dirname(dir);

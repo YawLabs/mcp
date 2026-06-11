@@ -47,7 +47,10 @@ export function localBundlesPath(configDir: string): string {
   return join(configDir, BUNDLES_FILENAME);
 }
 
-const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
+/** Canonical regex for valid MCP server namespaces. Exported so all
+ *  consumers (config.ts, local-bundles.ts, tests) share the same
+ *  definition instead of maintaining independent copies. */
+export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 
 /** Coerce a raw entry from bundles.json into a strict UpstreamServerConfig.
  *  Returns null when required fields are missing or malformed so the loader
@@ -301,11 +304,19 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
   const warnings: string[] = [];
   const r = await readBundlesAt(path, warnings);
   if (!r.file) {
-    // file:null covers BOTH parse failures and read failures (EPERM etc.);
-    // the warning text carries the real cause, so don't claim "malformed"
-    // when the JSON may be fine and the problem is permissions.
-    const detail = warnings.length > 0 ? ` (${warnings.join("; ")})` : "";
-    throw new Error(`${path} could not be read or parsed${detail}; fix it before adding servers.`);
+    // Branch on the warning content to give the user the most actionable
+    // message: a read error (EPERM / EACCES) hints at permissions; a parse
+    // failure hints at invalid JSON. readBundlesAt populates warnings with
+    // the OS error string for read failures and with "invalid JSON" for
+    // parse failures, so we sniff those keywords here.
+    const warningText = warnings.join("; ");
+    const isReadError = /EPERM|EACCES|could not read/i.test(warningText);
+    if (isReadError) {
+      throw new Error(`${path} could not be read (${warningText}) -- check file permissions before adding servers.`);
+    }
+    // Default: parse failure or structural mismatch.
+    const detail = warnings.length > 0 ? ` (${warningText})` : "";
+    throw new Error(`${path} could not be parsed -- fix the JSON${detail} before adding servers.`);
   }
   return { version: r.file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION, servers: r.file.servers };
 }

@@ -16,9 +16,11 @@
 //     ("error": "" meaning success, "deleted": false, etc.).
 //   * Text-mode: strip trailing whitespace per line and collapse runs
 //     of 3+ blank lines into 2. No content is removed, just formatting.
-//   * If pruning doesn't save at least MIN_SAVINGS_RATIO of bytes, we
-//     return the original untouched — the re-serialization cost isn't
-//     worth a marginal win.
+//   * If pruning doesn't save at least MIN_SAVINGS_RATIO of the total
+//     serialized bytes across the entire content array, we return the
+//     original untouched — the re-serialization cost isn't worth a
+//     marginal win. The ratio is measured over the whole array
+//     (JSON.stringify(content)), not per individual content item.
 //
 // Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 to disable entirely and keep
 // the original bytes. In that mode responseBytesPruned == responseBytesRaw.
