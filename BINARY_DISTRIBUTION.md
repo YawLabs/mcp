@@ -1,9 +1,19 @@
 # Single-binary distribution of `@yawlabs/mcp`
 
-Proof-of-concept: ship the sidecar as ONE self-contained per-platform
-executable that runs with no Node, no `node_modules`, and nothing on `PATH`.
-This kills the install-store mess (npm-global / pnpm-global / bun-global / npx
-/ local-node_modules / bundled-app) that `upgrade-cmd.ts` has to classify.
+Ship the sidecar as ONE self-contained per-platform executable that runs with
+no Node, no `node_modules`, and nothing on `PATH`. This kills the install-store
+mess (npm-global / pnpm-global / bun-global / npx / local-node_modules /
+bundled-app) that `upgrade-cmd.ts` has to classify.
+
+> **Status: SHIPPED.** `.github/workflows/release.yml` builds all 5 platforms
+> on tag push (proven by v0.60.6, all legs green) and publishes binaries +
+> sha256 sidecars to GitHub Releases. Installable now via
+> `scoop install mcp` (YawLabs/scoop-yaw) and
+> `brew install yawlabs/yaw/yaw-mcp` (YawLabs/homebrew-yaw). The sections
+> below document the build internals; some originally-PoC notes (e.g. the
+> single win32-arm64 build, "re-sign for distribution is out of scope") are
+> superseded by the workflow + the macOS ad-hoc-codesign step now in
+> `build-binary.mjs`.
 
 ## TL;DR
 
@@ -172,10 +182,66 @@ linux-x64 / darwin-arm64 / win32-x64 artifacts, run the same script on each
 target (a CI matrix), or switch to `bun build --compile --target=...` /
 `deno compile --target=...`, both of which cross-compile from one host.
 
-## Files added by this PoC (no existing files touched)
+## Files in the pipeline
 
-- `scripts/build-binary.mjs` -- the build pipeline.
+- `.github/workflows/release.yml` -- the 5-platform build + publish matrix.
+- `scripts/build-binary.mjs` -- esbuild (JS API) -> SEA blob -> postject (JS
+  API) -> macOS ad-hoc codesign. Builds the host platform only.
+- `scripts/stage-release-asset.mjs` -- rename to `yaw-mcp-<platform>-<arch>`
+  + sha256 sidecar.
+- `scripts/update-manifests.mjs` -- regenerate the Scoop + Homebrew manifests
+  from a release's hashes.
 - `sea-config.json` -- Node SEA config.
-- `bin/<platform>-<arch>/yaw-mcp(.exe)` -- the binary (gitignore-worthy; large).
-- `build-tmp/` -- intermediate bundle + blob (gitignore-worthy).
-- `BINARY_DISTRIBUTION.md` -- this file.
+- `bin/` + `build-tmp/` + `dist-release/` -- build artifacts (gitignored).
+
+## Manifest bump: local vs CI
+
+The binary BUILD is CI (`release.yml` on tag push). The manifest BUMP
+(scoop-yaw `bucket/mcp.json` + homebrew-yaw `Formula/yaw-mcp.rb`) is currently
+**local**: after a release, run
+
+```
+node scripts/update-manifests.mjs --version <X.Y.Z> --push
+```
+
+which pulls the release's `.sha256` sidecars, rewrites both manifests, and
+pushes to the sibling repos over SSH (`gh_woods`). This mirrors Yaw Terminal's
+`release.sh` and needs no cross-repo CI secret.
+
+To make it fully automatic, add a `needs: build` job to `release.yml` that runs
+the same generator and pushes -- but that requires a **cross-repo PAT** secret
+(the default `GITHUB_TOKEN` is scoped to this repo only) with write to
+scoop-yaw + homebrew-yaw. That's a deliberate secret/scope decision; until it's
+made, the local `--push` is the supported path.
+
+## Adopting this pipeline in another `@yawlabs/*` server
+
+The same four files drop into any sibling MCP server that is a public,
+pure-JS CLI (a `bin` entry, no native addons). Per a survey of
+`mcp_servers/`, the candidates are:
+
+> aws-mcp, caddy-mcp, ctxlint, electron-mcp, fetch-mcp, lemonsqueezy-mcp,
+> mcp-compliance, nol-mcp, npmjs-mcp, postgres-mcp, redis-mcp, ssh-mcp,
+> tailscale-mcp, vew-mcp (14 public pure-JS CLIs).
+
+**Blocked:** `lemonsqueezy-webhook-sink` ships a native dep (`better-sqlite3`);
+Node SEA can't embed a `.node` addon, so it needs the addon shipped alongside
+the binary (or a different packager) -- not a clean single-binary target.
+**Skipped:** `ctxlint-bench`, `postgres-mcp-smoke` (private/internal).
+
+Checklist to adopt:
+
+1. Copy `.github/workflows/release.yml`, `scripts/build-binary.mjs`,
+   `scripts/stage-release-asset.mjs`, `scripts/update-manifests.mjs`, and
+   `sea-config.json` into the target repo. Rename `yaw-mcp` -> the target's
+   command throughout (asset names, the Scoop `bin` tuple, the Homebrew
+   `bin.install` target, the formula class).
+2. Confirm `src/index.ts` (or the target's entry) bundles clean under esbuild
+   with all deps inlined (no native addons).
+3. Add `esbuild` + `postject` as devDeps.
+4. Point `update-manifests.mjs` at the target's scoop-yaw `bucket/<name>.json`
+   + homebrew-yaw `Formula/<name>.rb` (or its own bucket/tap).
+5. Tag `v*` to fire the build; run `update-manifests.mjs --push` after.
+
+This is the copy-paste path that closes the "make the JS sidecars bundle like
+the Go `micro` editor" goal for each server.
