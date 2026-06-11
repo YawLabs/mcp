@@ -1915,6 +1915,7 @@ export class ConnectServer {
     const results: string[] = [];
     let anyChanged = false;
     let anyError = false;
+    let anyCapped = false;
 
     // Compliance gate. When YAW_MCP_MIN_COMPLIANCE is set, refuse to
     // activate any server whose reported grade is below the floor.
@@ -1941,7 +1942,13 @@ export class ConnectServer {
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);
       if (r.isChanged) anyChanged = true;
-      if (!r.ok) anyError = true;
+      // Cap refusals are tracked separately: alongside successes they are
+      // informational (the per-namespace message says what to unload), but
+      // when NOTHING loads the call did no work and must signal an error.
+      if (!r.ok) {
+        if (r.capped) anyCapped = true;
+        else anyError = true;
+      }
     }
     // NB: no trailing "Done" progress notification here. MCP clients
     // delete the progress token synchronously when the response arrives,
@@ -1964,7 +1971,7 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
-      isError: anyError ? true : undefined,
+      isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
     };
   }
 
@@ -2068,6 +2075,7 @@ export class ConnectServer {
     const results: string[] = [];
     let anyChanged = false;
     let anyError = false;
+    let anyCapped = false;
 
     let i = 0;
     for (const winner of winners) {
@@ -2077,8 +2085,13 @@ export class ConnectServer {
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
       if (r.isChanged) anyChanged = true;
       // Cap refusals are expected when the budget exceeds the concurrent
-      // server cap -- informational, not a failure the model must retry.
-      if (!r.ok && !r.capped) anyError = true;
+      // server cap -- informational alongside successes, but if NOTHING
+      // loaded the dispatch did no work and must signal (same rule as
+      // handleActivate).
+      if (!r.ok) {
+        if (r.capped) anyCapped = true;
+        else anyError = true;
+      }
       // Activation success is NOT recorded as a learning signal — that
       // would inflate "this server worked" into "every activation
       // counts as a successful tool call," which collapses the
@@ -2097,7 +2110,7 @@ export class ConnectServer {
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
     return {
       content: [{ type: "text", text: header + results.join("\n") }],
-      isError: anyError ? true : undefined,
+      isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
     };
   }
 

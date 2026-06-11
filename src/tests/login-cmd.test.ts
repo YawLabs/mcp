@@ -35,10 +35,18 @@ describe("parseLoginArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/unknown argument "--bogus"/);
   });
 
-  it("--help returns usage", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
     const r = parseLoginArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toBe(LOGIN_USAGE);
+    if (!r.ok) {
+      expect(r.error).toBe(LOGIN_USAGE);
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseLoginArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
   });
 });
 

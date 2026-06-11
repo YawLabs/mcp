@@ -78,10 +78,18 @@ describe("parseSecretsArgs", () => {
     if (r.ok) expect(r.options.json).toBe(true);
   });
 
-  it("--help returns usage", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
     const r = parseSecretsArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toBe(SECRETS_USAGE);
+    if (!r.ok) {
+      expect(r.error).toBe(SECRETS_USAGE);
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseSecretsArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
   });
 
   it("rejects --value without arg", () => {

@@ -171,6 +171,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "add") {
   const parsed = parseAddArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -178,6 +182,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "remove") {
   const parsed = parseRemoveArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -185,6 +193,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "list") {
   const parsed = parseListArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -192,6 +204,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "login") {
   const parsed = parseLoginArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -213,6 +229,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "stats") {
   const parsed = parseStatsArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -220,6 +240,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "secrets") {
   const parsed = parseSecretsArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }

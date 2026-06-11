@@ -1286,6 +1286,27 @@ describe("ConnectServer", () => {
       expect(priv.connections.has("c")).toBe(false);
     });
 
+    it("cap refusal beside a successful load is informational (isError undefined)", async () => {
+      // One namespace loads (filling the last cap slot), the next is
+      // cap-refused. The call did useful work, so the cap message stays
+      // informational -- only an all-refused call signals isError.
+      const priv = getPrivate(server);
+      priv.serverCap = 2;
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "a" }),
+        makeServerConfig({ id: "2", namespace: "b" }),
+        makeServerConfig({ id: "3", namespace: "c" }),
+      ]);
+      priv.connections.set("a", makeConnection("a"));
+      vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("b"));
+
+      const result = await priv.handleActivate(["b", "c"]);
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain('Cannot load "c"');
+      expect(priv.connections.has("b")).toBe(true);
+      expect(priv.connections.has("c")).toBe(false);
+    });
+
     it("allows reactivating an already-loaded namespace even at cap", async () => {
       const priv = getPrivate(server);
       priv.serverCap = 2;

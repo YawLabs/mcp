@@ -33,7 +33,7 @@ export interface StatsCommandOptions {
 
 export function parseStatsArgs(
   argv: string[],
-): { ok: true; options: StatsCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: StatsCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: StatsCommandOptions = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -52,7 +52,7 @@ export function parseStatsArgs(
     } else if (a === "--json") {
       opts.json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: STATS_USAGE };
+      return { ok: false, error: STATS_USAGE, help: true };
     } else {
       return { ok: false, error: `yaw-mcp stats: unknown argument "${a}"\n\n${STATS_USAGE}` };
     }

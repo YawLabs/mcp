@@ -63,10 +63,18 @@ describe("parseStatsArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/unknown argument "--bogus"/);
   });
 
-  it("--help returns usage", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
     const r = parseStatsArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toBe(STATS_USAGE);
+    if (!r.ok) {
+      expect(r.error).toBe(STATS_USAGE);
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseStatsArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
   });
 });
 

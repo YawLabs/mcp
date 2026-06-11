@@ -87,11 +87,11 @@ export interface SecretsCommandOptions {
 
 export function parseSecretsArgs(
   argv: string[],
-): { ok: true; options: SecretsCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: SecretsCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: SecretsCommandOptions = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--help" || a === "-h") return { ok: false, error: SECRETS_USAGE };
+    if (a === "--help" || a === "-h") return { ok: false, error: SECRETS_USAGE, help: true };
     if (a === "--json") {
       opts.json = true;
       continue;

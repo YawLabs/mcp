@@ -99,6 +99,51 @@ describe("parseAddArgs", () => {
     expect(parseAddArgs(["github", "--bogus"]).ok).toBe(false);
     expect(parseAddArgs(["a", "b"]).ok).toBe(false);
   });
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseAddArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseAddArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+});
+
+describe("parseRemoveArgs (help flag)", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseRemoveArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseRemoveArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+});
+
+describe("parseListArgs (help flag)", () => {
+  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+    const r = parseListArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("Usage:");
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+  it("-h sets help:true", () => {
+    const r = parseListArgs(["-h"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
 });
 
 describe("runAdd", () => {
@@ -421,7 +466,7 @@ describe("upsertUserBundle round-trip", () => {
     writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
     await expect(
       upsertUserBundle({ namespace: "x", name: "X", command: "npx", args: [], isActive: true }, { home: synthHome }),
-    ).rejects.toThrow(/malformed/);
+    ).rejects.toThrow(/could not be read or parsed/);
   });
 
   it("dedups a name-matched legacy entry (no second copy) [#1 cross-path]", async () => {

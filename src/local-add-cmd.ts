@@ -71,7 +71,9 @@ function parseEnvFlag(v: string | undefined, bag: Record<string, string>): strin
   return null;
 }
 
-export function parseAddArgs(argv: string[]): { ok: true; options: AddCommandOptions } | { ok: false; error: string } {
+export function parseAddArgs(
+  argv: string[],
+): { ok: true; options: AddCommandOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: ADD_USAGE };
   const positional: string[] = [];
   const opts: AddCommandOptions = {};
@@ -99,7 +101,7 @@ export function parseAddArgs(argv: string[]): { ok: true; options: AddCommandOpt
       }
       case "-h":
       case "--help":
-        return { ok: false, error: ADD_USAGE };
+        return { ok: false, error: ADD_USAGE, help: true };
       default:
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${ADD_USAGE}` };
         positional.push(a);
@@ -251,11 +253,11 @@ export interface RemoveCommandOptions {
 
 export function parseRemoveArgs(
   argv: string[],
-): { ok: true; options: RemoveCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: RemoveCommandOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: REMOVE_USAGE };
   const positional: string[] = [];
   for (const a of argv) {
-    if (a === "-h" || a === "--help") return { ok: false, error: REMOVE_USAGE };
+    if (a === "-h" || a === "--help") return { ok: false, error: REMOVE_USAGE, help: true };
     if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${REMOVE_USAGE}` };
     positional.push(a);
   }
@@ -349,10 +351,10 @@ export interface ListCommandOptions {
 
 export function parseListArgs(
   argv: string[],
-): { ok: true; options: ListCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: ListCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: ListCommandOptions = {};
   for (const a of argv) {
-    if (a === "-h" || a === "--help") return { ok: false, error: LIST_USAGE };
+    if (a === "-h" || a === "--help") return { ok: false, error: LIST_USAGE, help: true };
     if (a === "--json") {
       opts.json = true;
       continue;

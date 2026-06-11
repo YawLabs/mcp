@@ -301,8 +301,11 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
   const warnings: string[] = [];
   const r = await readBundlesAt(path, warnings);
   if (!r.file) {
+    // file:null covers BOTH parse failures and read failures (EPERM etc.);
+    // the warning text carries the real cause, so don't claim "malformed"
+    // when the JSON may be fine and the problem is permissions.
     const detail = warnings.length > 0 ? ` (${warnings.join("; ")})` : "";
-    throw new Error(`${path} is malformed${detail}; fix it by hand before adding servers.`);
+    throw new Error(`${path} could not be read or parsed${detail}; fix it before adding servers.`);
   }
   return { version: r.file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION, servers: r.file.servers };
 }
