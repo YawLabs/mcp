@@ -47,6 +47,14 @@ describe("parseSyncArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/unknown argument "--bogus"/);
   });
 
+  it("--help sets help:true so the dispatcher routes to stdout + exit 0", () => {
+    for (const flag of ["--help", "-h"]) {
+      const r = parseSyncArgs([flag]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+
   it("--help returns usage", () => {
     const r = parseSyncArgs(["--help"]);
     expect(r.ok).toBe(false);

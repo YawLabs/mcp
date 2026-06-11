@@ -1934,6 +1934,9 @@ export class ConnectServer {
           const grade = cfg.complianceGrade ?? "unknown";
           const message = `Refused to load "${namespace}": compliance grade ${grade} is below YAW_MCP_MIN_COMPLIANCE=${minCompliance}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
           results.push(message);
+          // Deliberately an error even when OTHER namespaces load fine
+          // (unlike cap refusals below): a compliance floor is a hard
+          // policy gate the caller must act on, not expected budgeting.
           anyError = true;
           continue;
         }

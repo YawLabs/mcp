@@ -20,6 +20,14 @@ describe("parseLogoutArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/unknown argument "--bogus"/);
   });
 
+  it("--help sets help:true so the dispatcher routes to stdout + exit 0", () => {
+    for (const flag of ["--help", "-h"]) {
+      const r = parseLogoutArgs([flag]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+    }
+  });
+
   it("--help returns usage", () => {
     const r = parseLogoutArgs(["--help"]);
     expect(r.ok).toBe(false);

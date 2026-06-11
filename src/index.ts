@@ -215,6 +215,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "logout") {
   const parsed = parseLogoutArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
@@ -222,6 +226,10 @@ if (subcommand === "compliance") {
 } else if (subcommand === "sync") {
   const parsed = parseSyncArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }

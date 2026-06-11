@@ -59,7 +59,7 @@ export interface SyncCommandOptions {
 
 export function parseSyncArgs(
   argv: string[],
-): { ok: true; options: SyncCommandOptions } | { ok: false; error: string } {
+): { ok: true; options: SyncCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: SyncCommandOptions = {};
   for (const a of argv) {
     if (a === "push" || a === "pull" || a === "status") {
@@ -69,7 +69,7 @@ export function parseSyncArgs(
     } else if (a === "--json") {
       opts.json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: SYNC_USAGE };
+      return { ok: false, error: SYNC_USAGE, help: true };
     } else {
       return { ok: false, error: `yaw-mcp sync: unknown argument "${a}"\n\n${SYNC_USAGE}` };
     }
