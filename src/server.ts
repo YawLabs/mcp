@@ -2971,7 +2971,7 @@ export class ConnectServer {
       const lines: string[] = [`Curated server bundles (${CURATED_BUNDLES.length}):\n`];
       for (const bundle of CURATED_BUNDLES) {
         lines.push(`  ${bundle.id} — ${bundle.description}`);
-        lines.push(`    namespaces: ${JSON.stringify(bundle.namespaces)}`);
+        lines.push(`    servers: ${JSON.stringify(bundle.namespaces)}`);
         lines.push(`    activate: ${bundleActivateHint(bundle)}`);
       }
       lines.push("");
@@ -3002,7 +3002,7 @@ export class ConnectServer {
       lines.push("Bundles ready to activate now:");
       for (const bundle of ready) {
         lines.push(`  ${bundle.id} — ${bundle.description}`);
-        lines.push(`    namespaces: ${JSON.stringify(bundle.namespaces)}`);
+        lines.push(`    servers: ${JSON.stringify(bundle.namespaces)}`);
         lines.push(`    activate: ${bundleActivateHint(bundle)}`);
       }
     }
