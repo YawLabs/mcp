@@ -18,6 +18,7 @@
 
 import { loadYawMcpConfig } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
+import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import type { ConnectConfig } from "./types.js";
 
 export interface ServersCommandOptions {
@@ -38,6 +39,8 @@ export interface ServersCommandOptions {
   err?: (s: string) => void;
   /** Test hook: skip the real backend call. */
   fetcher?: (apiBase: string, token: string) => Promise<ConnectConfig | null>;
+  /** Test hook: supply a grade cache instead of reading ~/.yaw-mcp/grades.json. */
+  gradesReader?: (home?: string) => Promise<GradesCache>;
 }
 
 export interface ServersCommandResult {
@@ -143,8 +146,25 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
       }
     : backend;
 
+  // Overlay locally-cached compliance grades from `yaw-mcp audit` onto each
+  // row. A freshly-audited grade in ~/.yaw-mcp/grades.json is more current
+  // than whatever the backend last computed, so it wins; servers with no
+  // cached grade keep the backend's complianceGrade (which may itself be
+  // absent). readGradesCache never throws -- a missing/garbled cache just
+  // means no overlay. This runs for BOTH json and table output so the two
+  // surfaces (and the MCP panel, which consumes `servers --json`) agree.
+  const gradesReader = opts.gradesReader ?? readGradesCache;
+  const grades = await gradesReader(opts.home).catch(() => ({}) as GradesCache);
+  const merged: ConnectConfig = {
+    ...filtered,
+    servers: filtered.servers.map((s) => {
+      const cached = grades[s.namespace];
+      return cached ? { ...s, complianceGrade: cached.grade } : s;
+    }),
+  };
+
   if (opts.json) {
-    print(JSON.stringify(filtered, null, 2));
+    print(JSON.stringify(merged, null, 2));
     return { exitCode: 0, lines };
   }
 
@@ -153,7 +173,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     return { exitCode: 0, lines };
   }
 
-  renderTable(filtered, print);
+  renderTable(merged, print);
   return { exitCode: 0, lines };
 }
 

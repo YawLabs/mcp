@@ -28,6 +28,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@yawlabs/mcp-compliance": "^0.16.1",
     "undici": "^7.8.0"
   },
   "overrides": {
