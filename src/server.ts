@@ -23,7 +23,15 @@ import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } fr
 import { detectMissingCredentials } from "./credentials.js";
 import { formatRelativeAge } from "./doctor-cmd.js";
 import { classifyError } from "./error-category.js";
-import { type ExecStepInput, RefError, resolveArgs, stepBindingKey, validateExecRequest } from "./exec-engine.js";
+import {
+  type ExecStepInput,
+  RefError,
+  collectRefDeps,
+  resolveArgs,
+  stepBindingKey,
+  validateExecRequest,
+} from "./exec-engine.js";
+import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js";
 import { closestNames } from "./fuzzy.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
 import {
@@ -58,10 +66,12 @@ import {
 } from "./proxy.js";
 import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
-import { type RankableServer, rankServers, scoreRelevance } from "./relevance.js";
+import { RedispatchTracker } from "./redispatch.js";
+import { type RankableServer, rankServers, scoreRelevance, tokenize } from "./relevance.js";
 import { initRerank, rerank } from "./rerank.js";
+import { computeOutcomeReward } from "./reward.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
-import { buildCandidates, shouldTiebreak, tiebreakViaSampling } from "./sampling-rank.js";
+import { bestOfNViaSampling, buildCandidates, parseRouteEffort, shouldSample } from "./sampling-rank.js";
 import { type LoadedSlot, evaluateServerCap, resolveServerCap } from "./server-cap.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
@@ -292,6 +302,12 @@ export class ConnectServer {
   // "packs". Observation-only; never activates anything. Meta-tool calls
   // are deliberately excluded because they aren't user workflow.
   private readonly packDetector = new PackDetector();
+  // Session-scoped re-dispatch tracking — watches for the model abandoning
+  // one server and re-routing a similar intent to another, which is
+  // evidence the first route was wrong. Feeds a negative learning signal
+  // (LearningStore.recordMiss). Not persisted: a re-dispatch window that
+  // spans a restart is meaningless. See redispatch.ts.
+  private readonly redispatch = new RedispatchTracker();
 
   // Short-TTL dedup cache for discover output. Agents often call
   // discover twice in quick succession (e.g. once to list, again after
@@ -819,6 +835,11 @@ export class ConnectServer {
     name: string,
     args: Record<string, unknown>,
     extra?: { sendNotification?: any; _meta?: Record<string, unknown> },
+    // When deferLearning is set (exec steps), the proxy path does NOT record
+    // the cross-session learning signal — handleExec records step-level,
+    // cascading-blame credit instead so a failing consumer doesn't wrongly
+    // sink the upstream that fed it.
+    opts?: { deferLearning?: boolean },
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const progress = createProgressReporter(extra);
     if (name === META_TOOLS.discover.name) {
@@ -831,8 +852,11 @@ export class ConnectServer {
     if (name === META_TOOLS.dispatch.name) {
       const intent = typeof args.intent === "string" ? args.intent : "";
       const budget = typeof args.budget === "number" && Number.isFinite(args.budget) ? args.budget : 1;
+      // Per-call override of the routing effort dial (off|auto|aggressive);
+      // falls back to YAW_MCP_ROUTE_EFFORT when absent. See sampling-rank.ts.
+      const routeEffort = typeof args.routeEffort === "string" ? args.routeEffort : undefined;
       recordConnectEvent({ namespace: null, toolName: null, action: "activate", latencyMs: null, success: true });
-      return this.attachGuideNudge(await this.handleDispatch(intent, budget, progress));
+      return this.attachGuideNudge(await this.handleDispatch(intent, budget, progress, routeEffort));
     }
     if (name === META_TOOLS.activate.name) {
       const namespaces = resolveNamespaces(args);
@@ -1160,15 +1184,23 @@ export class ConnectServer {
           // is strictly best-effort, never fail the tool call for it.
         }
       }
-      // Cross-session learning signal. Every dispatched proxy call
-      // increments the denominator; only non-errored upstream replies
-      // increment the numerator. This is the ground truth that
-      // boostFactor + formatReliabilityWarning + the cross-session
-      // reliability block in handleHealth all read — activation
-      // success is deliberately NOT counted here (see handleDispatch).
-      this.learning.recordDispatch(route.namespace);
-      if (!result.isError) this.learning.recordSuccess(route.namespace);
-      this.scheduleStateSave();
+      // Cross-session learning signal — GRADED, not binary. recordOutcome
+      // records both the dispatch (denominator) and a quality-weighted
+      // credit in [0,1]: a clean-but-empty or error-shaped 200 no longer
+      // banks full credit (see reward.ts/computeOutcomeReward). This is the
+      // ground truth that boostFactor + formatReliabilityWarning + the
+      // cross-session reliability block in handleHealth all read — activation
+      // success is deliberately NOT counted here (see handleDispatch). Exec
+      // steps defer it (opts.deferLearning) for step-level attribution.
+      if (!opts?.deferLearning) {
+        this.learning.recordOutcome(route.namespace, computeOutcomeReward(result));
+        this.scheduleStateSave();
+        // Re-dispatch routing-miss tracking: record whether the server the
+        // model most recently dispatched to produced a clean reply. An
+        // abandoned clean reply becomes a negative signal when a similar
+        // intent later re-routes elsewhere (detectMiss in handleDispatch).
+        this.redispatch.markReply(route.namespace, !result.isError);
+      }
 
       // Only count successful calls toward chain detection. An errored
       // call isn't a real usage signal — the user likely abandons or
@@ -2068,10 +2100,25 @@ export class ConnectServer {
   // with BM25 and activates the top N, then lets the LLM call the now-
   // exposed tools normally. Default budget is 1 because over-activating
   // pollutes the tool list in the LLM's context with noise.
+  // Is A -> B a designed multi-server flow rather than a routing miss? True
+  // when both namespaces co-occur in a curated bundle or a detected usage
+  // pack — those A-then-B sequences are intentional, so re-dispatch from A
+  // to B must NOT penalize A. Used as detectMiss's exclusion predicate.
+  private isLegitChain(a: string, b: string): boolean {
+    for (const bundle of CURATED_BUNDLES) {
+      if (bundle.namespaces.includes(a) && bundle.namespaces.includes(b)) return true;
+    }
+    for (const pack of this.packDetector.detectChains()) {
+      if (pack.namespaces.includes(a) && pack.namespaces.includes(b)) return true;
+    }
+    return false;
+  }
+
   private async handleDispatch(
     intent: string,
     budget: number,
     progress?: ProgressReporter,
+    routeEffortOverride?: string,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const trimmed = intent?.trim?.() ?? "";
     if (trimmed.length === 0) {
@@ -2144,11 +2191,18 @@ export class ConnectServer {
     // because the close runner-up is also in the returned slice — paying the
     // sampling round-trip there buys nothing. Do not "fix" this to fire for
     // budget>1.
-    if (budget === 1 && shouldTiebreak(ranked)) {
+    // The effort dial generalizes the old fixed 10%-tiebreak into an
+    // ambiguity-aware gate (off|auto|aggressive). auto preserves today's
+    // behavior (one sample on genuine ambiguity); aggressive samples
+    // best-of-3 on milder ambiguity. budget>1 still skips — a multi-load
+    // tolerates a wrong primary, so paying the round-trip buys nothing.
+    const effort = parseRouteEffort(routeEffortOverride ?? process.env.YAW_MCP_ROUTE_EFFORT);
+    if (budget === 1 && shouldSample(ranked, effort)) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
       const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, this.toolCache);
-      const picked = await tiebreakViaSampling(this.server, trimmed, candidates);
+      const samples = effort === "aggressive" ? 3 : 1;
+      const picked = await bestOfNViaSampling(this.server, trimmed, candidates, samples);
       if (picked) {
         const winner = ranked.find((r) => r.namespace === picked);
         if (winner) {
@@ -2164,6 +2218,35 @@ export class ConnectServer {
 
     const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
     const winners = ranked.slice(0, safeBudget);
+
+    // Re-dispatch routing-miss + opt-in foundry harvest. The primary winner
+    // is the server this dispatch actually routed to. If a token-similar
+    // intent was recently routed to a DIFFERENT, then-abandoned server, that
+    // earlier choice was the wrong route — penalize it (recordMiss). Then
+    // record this dispatch so a future re-route can be judged against it.
+    const primary = winners[0]?.namespace;
+    if (primary) {
+      const intentTokens = tokenize(trimmed);
+      const now = Date.now();
+      const miss = this.redispatch.detectMiss(primary, intentTokens, now, (a, b) => this.isLegitChain(a, b));
+      if (miss) {
+        this.learning.recordMiss(miss.loser);
+        this.scheduleStateSave();
+      }
+      this.redispatch.push(primary, intentTokens, now);
+      // Privacy-safe, opt-in routing-eval harvest (the "environment foundry").
+      // Disabled unless YAW_MCP_FOUNDRY is set; only a REDACTED token bag plus
+      // candidate namespaces ever leave memory — never the raw intent string.
+      if (isFoundryEnabled()) {
+        const redacted = redactIntent(trimmed);
+        void appendFoundryTrace({
+          tokens: redacted.tokens,
+          redactedCount: redacted.redactedCount,
+          candidates: ranked.slice(0, 5).map((r) => ({ ns: r.namespace, score: r.score })),
+          chosen: primary,
+        });
+      }
+    }
 
     const results: string[] = [];
     let anyChanged = false;
@@ -3139,6 +3222,9 @@ export class ConnectServer {
 
     const bindings: Record<string, unknown> = {};
     const stepKeys: string[] = [];
+    // stepKey -> namespace, built as steps run, so a failing step can
+    // attribute cascading blame to the upstream steps it consumed via $ref.
+    const stepNamespaces = new Map<string, string>();
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -3233,10 +3319,35 @@ export class ConnectServer {
       //
       // `extra` is omitted so exec steps don't fight for the top-level
       // progress token; the exec itself emits no progress.
-      const stepResult = await this.handleToolCall(step.tool, resolvedArgs);
+      // Step-level (process) reward: defer the proxy path's learning signal
+      // and attribute credit per step here, using the $ref dependency graph
+      // so a step that fails on bad INPUT it consumed from an upstream step
+      // shares the blame rather than sinking the upstream alone.
+      const stepNs = this.toolRoutes.get(step.tool)?.namespace;
+      if (stepNs) stepNamespaces.set(key, stepNs);
+      const stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, { deferLearning: true });
 
       if (stepResult.isError) {
         const errText = stepResult.content?.[0]?.text ?? "unknown error";
+        if (stepNs) {
+          // -32602 = invalid params (proxy.ts tags the text "[code=-32602]").
+          // When the failing step consumed $ref data from earlier steps, the
+          // bad input likely came from a producer — split the blame (0.5
+          // each) instead of full-blaming this server. Transport / other
+          // errors are this server's own failure (0.0).
+          const inputShaped = errText.includes("[code=-32602]");
+          const deps = collectRefDeps(step.args);
+          if (inputShaped && deps.length > 0) {
+            this.learning.recordOutcome(stepNs, 0.5);
+            for (const dep of deps) {
+              const depNs = stepNamespaces.get(dep);
+              if (depNs) this.learning.recordOutcome(depNs, 0.5);
+            }
+          } else {
+            this.learning.recordOutcome(stepNs, 0);
+          }
+          this.scheduleStateSave();
+        }
         return {
           content: [
             {
@@ -3257,6 +3368,10 @@ export class ConnectServer {
         };
       }
 
+      if (stepNs) {
+        this.learning.recordOutcome(stepNs, 1);
+        this.scheduleStateSave();
+      }
       bindings[key] = ConnectServer.parseStepPayload(stepResult);
     }
 

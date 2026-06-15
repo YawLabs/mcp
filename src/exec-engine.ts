@@ -192,6 +192,40 @@ export function resolveArgs(args: unknown, bindings: Record<string, unknown>): u
   return args;
 }
 
+// Collect the set of step ids that a step's args depend on via {"$ref": ...}
+// markers. Walks the SAME tree shape resolveArgs walks, finds every $ref
+// leaf, and returns the unique first path-segments (the producer step ids).
+// Used for cascading-blame attribution in exec: if a step fails on bad input
+// it consumed via $ref, the upstream producer shares the blame. Pure; never
+// throws (a malformed ref simply contributes no dep).
+export function collectRefDeps(args: unknown): string[] {
+  const deps = new Set<string>();
+
+  const walk = (node: unknown): void => {
+    if (isRefNode(node)) {
+      const tokens = parseRefPath(node.$ref);
+      // A malformed ref (parseRefPath -> null) contributes no dep. When it
+      // parses, the first token is always the producer step id (a string).
+      if (tokens && tokens.length > 0 && typeof tokens[0] === "string") {
+        deps.add(tokens[0]);
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const v of node) walk(v);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const v of Object.values(node as Record<string, unknown>)) walk(v);
+      return;
+    }
+    // Primitives contribute nothing.
+  };
+
+  walk(args);
+  return Array.from(deps);
+}
+
 // Hard cap on steps per exec. Keeps the pipeline small enough to reason
 // about while still letting the common a→b→c chains through. Tuned by
 // vibes, not measurement — if someone actually needs more, bump it.

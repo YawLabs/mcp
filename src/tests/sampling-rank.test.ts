@@ -1,9 +1,14 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { describe, expect, it, vi } from "vitest";
 import {
+  MAX_SAMPLES,
+  bestOfNViaSampling,
   buildCandidates,
   buildTiebreakPrompt,
+  computeAmbiguity,
+  parseRouteEffort,
   parseTiebreakResponse,
+  shouldSample,
   shouldTiebreak,
   tiebreakViaSampling,
 } from "../sampling-rank.js";
@@ -175,5 +180,220 @@ describe("tiebreakViaSampling", () => {
     const server = mockServer({ sampling: {} }, createMessage);
     const out = await tiebreakViaSampling(server, "intent", candidates);
     expect(out).toBeNull();
+  });
+});
+
+// =============================================================================
+// Effort dial (idea 5)
+// =============================================================================
+
+describe("parseRouteEffort", () => {
+  it("defaults to auto when unset", () => {
+    expect(parseRouteEffort(undefined)).toBe("auto");
+  });
+
+  it("defaults to auto for empty string", () => {
+    expect(parseRouteEffort("")).toBe("auto");
+  });
+
+  it("parses each known value, case- and whitespace-insensitively", () => {
+    expect(parseRouteEffort("off")).toBe("off");
+    expect(parseRouteEffort("OFF")).toBe("off");
+    expect(parseRouteEffort("auto")).toBe("auto");
+    expect(parseRouteEffort("aggressive")).toBe("aggressive");
+    expect(parseRouteEffort("  Aggressive  ")).toBe("aggressive");
+  });
+
+  it("falls back to auto for unknown values", () => {
+    expect(parseRouteEffort("turbo")).toBe("auto");
+    expect(parseRouteEffort("1")).toBe("auto");
+  });
+});
+
+describe("computeAmbiguity", () => {
+  it("returns 0 for fewer than 2 candidates", () => {
+    expect(computeAmbiguity([])).toBe(0);
+    expect(computeAmbiguity([{ namespace: "a", score: 1 }])).toBe(0);
+  });
+
+  it("returns 0 when the leader score is non-positive", () => {
+    expect(
+      computeAmbiguity([
+        { namespace: "a", score: 0 },
+        { namespace: "b", score: 0 },
+      ]),
+    ).toBe(0);
+    expect(
+      computeAmbiguity([
+        { namespace: "a", score: -1 },
+        { namespace: "b", score: -2 },
+      ]),
+    ).toBe(0);
+  });
+
+  it("returns ~1 for tied scores", () => {
+    expect(
+      computeAmbiguity([
+        { namespace: "a", score: 1 },
+        { namespace: "b", score: 1 },
+      ]),
+    ).toBeCloseTo(1, 5);
+  });
+
+  it("returns ~0 for a dominant clear winner", () => {
+    const a = computeAmbiguity([
+      { namespace: "a", score: 10 },
+      { namespace: "b", score: 0.1 },
+    ]);
+    expect(a).toBeLessThan(0.15);
+    expect(a).toBeGreaterThanOrEqual(0);
+  });
+
+  it("stays within [0,1]", () => {
+    const vals = [
+      computeAmbiguity([
+        { namespace: "a", score: 5 },
+        { namespace: "b", score: 4 },
+        { namespace: "c", score: 3 },
+      ]),
+      computeAmbiguity([
+        { namespace: "a", score: 1 },
+        { namespace: "b", score: 0.95 },
+      ]),
+    ];
+    for (const v of vals) {
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+describe("shouldSample", () => {
+  const tied = [
+    { namespace: "a", score: 1 },
+    { namespace: "b", score: 0.95 },
+  ];
+  // Dominant winner relative to runner-up, but not so wide that even the
+  // entropy signal vanishes -- sits in the band aggressive samples, auto does
+  // not (ambiguity ~0.78).
+  const moderate = [
+    { namespace: "a", score: 1 },
+    { namespace: "b", score: 0.3 },
+  ];
+  // Clear winner below every threshold.
+  const clear = [
+    { namespace: "a", score: 10 },
+    { namespace: "b", score: 0.2 },
+  ];
+
+  it("off never samples, even when fully tied", () => {
+    expect(shouldSample(tied, "off")).toBe(false);
+    expect(shouldSample(moderate, "off")).toBe(false);
+  });
+
+  it("auto samples on genuine ambiguity but not a clear winner", () => {
+    expect(shouldSample(tied, "auto")).toBe(true);
+    expect(shouldSample(moderate, "auto")).toBe(false);
+    expect(shouldSample(clear, "auto")).toBe(false);
+  });
+
+  it("aggressive samples on milder ambiguity than auto", () => {
+    expect(shouldSample(tied, "aggressive")).toBe(true);
+    expect(shouldSample(moderate, "aggressive")).toBe(true);
+    expect(shouldSample(clear, "aggressive")).toBe(false);
+  });
+
+  it("never samples with a single candidate at any effort", () => {
+    const one = [{ namespace: "a", score: 1 }];
+    expect(shouldSample(one, "auto")).toBe(false);
+    expect(shouldSample(one, "aggressive")).toBe(false);
+  });
+});
+
+describe("bestOfNViaSampling", () => {
+  function mockServer(
+    caps: { sampling?: object } | undefined,
+    createMessage?: (params: unknown) => Promise<unknown>,
+  ): Server {
+    return {
+      getClientCapabilities: () => caps,
+      createMessage: createMessage ?? (async () => ({})),
+    } as unknown as Server;
+  }
+
+  it("returns null without sampling capability (no calls made)", async () => {
+    const createMessage = vi.fn();
+    const server = mockServer(undefined, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 3);
+    expect(out).toBeNull();
+    expect(createMessage).not.toHaveBeenCalled();
+  });
+
+  it("returns null with fewer than 2 candidates", async () => {
+    const createMessage = vi.fn();
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", [candidates[0]!], 3);
+    expect(out).toBeNull();
+    expect(createMessage).not.toHaveBeenCalled();
+  });
+
+  it("clamps N up to MAX_SAMPLES", async () => {
+    const createMessage = vi.fn().mockResolvedValue({ content: { type: "text", text: "github" } });
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 99);
+    expect(out).toBe("github");
+    expect(createMessage).toHaveBeenCalledTimes(MAX_SAMPLES);
+  });
+
+  it("clamps N up to at least 1", async () => {
+    const createMessage = vi.fn().mockResolvedValue({ content: { type: "text", text: "github" } });
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 0);
+    expect(out).toBe("github");
+    expect(createMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("majority-votes across N samples", async () => {
+    // 3 calls: gitlab, gitlab, github -> gitlab wins 2-1.
+    const replies = ["gitlab", "gitlab", "github"];
+    let i = 0;
+    const createMessage = vi.fn().mockImplementation(async () => ({
+      content: { type: "text", text: replies[i++] },
+    }));
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 3);
+    expect(out).toBe("gitlab");
+    expect(createMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it("breaks vote ties by ranker order (first candidate wins)", async () => {
+    // 2 calls split 1-1; github is first in `candidates`, so it wins the tie.
+    const replies = ["gitlab", "github"];
+    let i = 0;
+    const createMessage = vi.fn().mockImplementation(async () => ({
+      content: { type: "text", text: replies[i++] },
+    }));
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 2);
+    expect(out).toBe("github");
+  });
+
+  it("returns null when no sample names a candidate", async () => {
+    const createMessage = vi.fn().mockResolvedValue({ content: { type: "text", text: "no idea" } });
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 3);
+    expect(out).toBeNull();
+  });
+
+  it("never throws; a failing sample is dropped from the vote", async () => {
+    // First call rejects, remaining two vote github.
+    let i = 0;
+    const createMessage = vi.fn().mockImplementation(async () => {
+      if (i++ === 0) throw new Error("upstream refused");
+      return { content: { type: "text", text: "github" } };
+    });
+    const server = mockServer({ sampling: {} }, createMessage);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 3);
+    expect(out).toBe("github");
   });
 });

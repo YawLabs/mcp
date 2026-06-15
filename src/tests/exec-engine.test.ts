@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_EXEC_STEPS,
   RefError,
+  collectRefDeps,
   isRefNode,
   parseRefPath,
   resolveArgs,
@@ -360,6 +361,64 @@ describe("exec-engine: validateExecRequest", () => {
       ],
     });
     expect(r.ok).toBe(true);
+  });
+});
+
+describe("exec-engine: collectRefDeps", () => {
+  it("returns [] when there are no refs", () => {
+    expect(collectRefDeps({ a: 1, b: "two", c: [3, { d: true }] })).toEqual([]);
+    expect(collectRefDeps(null)).toEqual([]);
+    expect(collectRefDeps("plain string")).toEqual([]);
+    expect(collectRefDeps(undefined)).toEqual([]);
+  });
+
+  it("extracts the producer step id from a single $ref", () => {
+    expect(collectRefDeps({ x: { $ref: "a.content[0].text" } })).toEqual(["a"]);
+  });
+
+  it("treats the whole-args-is-a-ref case", () => {
+    expect(collectRefDeps({ $ref: "b" })).toEqual(["b"]);
+  });
+
+  it("collects unique ids from refs nested in arrays and objects", () => {
+    const args = {
+      payload: {
+        first: { $ref: "a.issue.number" },
+        list: [{ $ref: "b.items[0]" }, "literal", { deep: { $ref: "c.value" } }],
+      },
+      tail: { $ref: "d" },
+    };
+    const deps = collectRefDeps(args).sort();
+    expect(deps).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("dedupes multiple refs to the same step", () => {
+    const args = {
+      a: { $ref: "stepA.x" },
+      b: { $ref: "stepA.y[2]" },
+      c: { $ref: "stepA" },
+    };
+    expect(collectRefDeps(args)).toEqual(["stepA"]);
+  });
+
+  it("excludes malformed refs without throwing", () => {
+    const args = {
+      good: { $ref: "a.valid" },
+      bad1: { $ref: "" },
+      bad2: { $ref: ".leadingDot" },
+      bad3: { $ref: "foo..bar" },
+    };
+    let deps: string[] = [];
+    expect(() => {
+      deps = collectRefDeps(args);
+    }).not.toThrow();
+    expect(deps).toEqual(["a"]);
+  });
+
+  it("ignores $ref-plus-extras (not a real ref node)", () => {
+    // isRefNode requires $ref to be the ONLY key; with extras it is a plain
+    // object and contributes no dep (and its nested $ref string is just a value).
+    expect(collectRefDeps({ $ref: "a.b", default: 0 })).toEqual([]);
   });
 });
 

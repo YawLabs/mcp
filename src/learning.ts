@@ -1,8 +1,14 @@
 // Lightweight usage signal. Tracks how often each namespace's tools
-// were called AND how often the upstream answered without isError,
-// then exposes a bounded boost factor so future dispatches nudge
-// toward servers that have been genuinely useful — and AWAY from
-// servers that have been flaky.
+// were called AND the GRADED quality of those replies (not just
+// "answered without isError"), then exposes a bounded boost factor so
+// future dispatches nudge toward servers that have been genuinely
+// useful — and AWAY from servers that have been flaky.
+//
+// `succeeded` is a SUM of graded rewards in [0,1] (see recordOutcome /
+// reward.ts), so `succeeded / dispatched` is a mean graded reward, not a
+// raw success count. When every reward is exactly 0 or 1 this collapses
+// to the old binary count, which is why the existing boostFactor math and
+// tests carry over unchanged.
 //
 // Recorded on the proxy path in handleToolCall (every routed tool
 // call increments dispatched; non-errored replies also increment
@@ -63,6 +69,38 @@ export class LearningStore {
     this.usage.set(namespace, {
       dispatched: prev?.dispatched ?? 1,
       succeeded: (prev?.succeeded ?? 0) + 1,
+      lastUsedAt: Date.now(),
+    });
+  }
+
+  // Graded outcome in [0,1] for a single dispatched proxy call. This is
+  // the SOUND replacement for the binary recordDispatch + recordSuccess
+  // pair on the proxy path: a 200/empty/error-shaped reply no longer banks
+  // full credit (the reward is computed by reward.ts/computeOutcomeReward).
+  // One call records BOTH the dispatch (denominator) and the graded credit
+  // (numerator), so callers no longer pair recordDispatch with a
+  // conditional recordSuccess. reward is clamped to [0,1].
+  recordOutcome(namespace: string, reward: number): void {
+    const r = Number.isFinite(reward) ? Math.min(1, Math.max(0, reward)) : 0;
+    const prev = this.usage.get(namespace);
+    this.usage.set(namespace, {
+      dispatched: (prev?.dispatched ?? 0) + 1,
+      succeeded: (prev?.succeeded ?? 0) + r,
+      lastUsedAt: Date.now(),
+    });
+  }
+
+  // Synthetic failed observation with NO success credit. Used by the
+  // re-dispatch routing-miss signal (redispatch.ts): when the model
+  // abandons server A and re-routes a similar intent to B, A's earlier
+  // "clean" reply was useless in hindsight, so we depress A's success rate
+  // by one failed observation. Denominator-only — same shape as a
+  // recordDispatch that never sees a matching success.
+  recordMiss(namespace: string): void {
+    const prev = this.usage.get(namespace);
+    this.usage.set(namespace, {
+      dispatched: (prev?.dispatched ?? 0) + 1,
+      succeeded: prev?.succeeded ?? 0,
       lastUsedAt: Date.now(),
     });
   }

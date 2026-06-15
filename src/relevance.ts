@@ -51,7 +51,7 @@ const FIELD_WEIGHTS = {
 // behavior so we don't change recall silently.
 const MIN_TOKEN_LEN = 3;
 
-function tokenize(text: string | undefined): string[] {
+export function tokenize(text: string | undefined): string[] {
   if (!text) return [];
   // Split on any non-alphanumeric run so snake_case, kebab-case, and
   // mixed punctuation all produce the same tokens. This is what lets
