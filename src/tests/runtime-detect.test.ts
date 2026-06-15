@@ -12,7 +12,28 @@ vi.mock("undici", () => ({
 }));
 
 import { request } from "undici";
-import { initRuntimeDetect, reportRuntimes } from "../runtime-detect.js";
+import { detectRuntimes, initRuntimeDetect, reportRuntimes } from "../runtime-detect.js";
+
+describe("detectRuntimes", () => {
+  it("returns a flat snapshot carrying every known runtime key", async () => {
+    const snap = await detectRuntimes();
+    // Optional runtimes stay in the snapshot (as false when absent) so the
+    // dashboard can render the negative case rather than guessing.
+    for (const key of ["node", "npx", "python", "uvx", "docker"]) {
+      expect(snap).toHaveProperty(key);
+    }
+  });
+
+  it("detects python across the per-platform candidate list", async () => {
+    // The candidate list (py -3 / python / python3 on win32; python3 /
+    // python on posix) means python is found even when the hard-coded
+    // legacy name (`python` on win32) is absent. The test runner and all
+    // CI legs ship at least one of these, so a falsey value here is a
+    // real regression in the candidate-walk, not env flake.
+    const snap = await detectRuntimes();
+    expect(snap.python).toBeTruthy();
+  });
+});
 
 describe("reportRuntimes", () => {
   beforeEach(() => {

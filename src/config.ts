@@ -71,7 +71,14 @@ export async function fetchConfig(
     throw new ConfigError("Invalid config response from server", false);
   }
 
-  // Filter out servers missing required fields
+  // Filter out servers missing required fields.
+  //
+  // Intentional schema asymmetry vs. local-bundles.validateEntry: that path
+  // SYNTHESIZES id/name/type from a bare namespace (locally-authored entries
+  // only need a namespace), whereas the backend response is the authoritative
+  // source and is expected to carry all four fields, so we reject (rather than
+  // coerce) anything missing here. The two ingestion paths are deliberately
+  // strict-vs-lenient; do not unify without auditing both callers.
   data.servers = data.servers.filter((s) => {
     if (!s.id || !s.name || !s.namespace || !s.type) {
       log("warn", "Skipping server with missing required fields", { id: s.id, name: s.name, namespace: s.namespace });

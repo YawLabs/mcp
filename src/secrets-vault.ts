@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
@@ -37,7 +37,18 @@ export interface VaultFile {
   version: number;
   salt: string; // base64
   entries: Record<string, EncryptedEntry>;
+  /** Vault-level verification token: a fixed known constant encrypted
+   *  under the derived key. Lets unlock() detect a wrong passphrase
+   *  BEFORE caching the key (instead of silently writing entries under
+   *  a bad key). Optional for back-compat with vaults written before
+   *  this field existed -- absent => legacy vault, see unlock(). */
+  check?: EncryptedEntry;
 }
+
+/** Fixed plaintext encrypted into vault.check. A successful decrypt of
+ *  the stored check proves the derived key matches the one the vault was
+ *  created with -- i.e. the passphrase is correct. */
+export const VAULT_CHECK_PLAINTEXT = "yaw-mcp-vault-v1";
 
 export function vaultPath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SECRETS_FILENAME);
@@ -70,20 +81,37 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const obj = parsed as Record<string, unknown>;
   if (typeof obj.salt !== "string" || !obj.entries || typeof obj.entries !== "object") return null;
+  // Validate each entry's shape up front rather than deferring to decrypt
+  // time -- a malformed entry (missing/non-string iv/ciphertext/authTag) is
+  // a corrupt vault, and surfacing it here gives a clear, named error.
+  const entries = obj.entries as Record<string, unknown>;
+  for (const [name, entry] of Object.entries(entries)) {
+    if (!isEncryptedEntry(entry)) {
+      throw new Error(`vault corrupt at entry ${name}`);
+    }
+  }
+  const check = isEncryptedEntry(obj.check) ? obj.check : undefined;
   return {
     version: typeof obj.version === "number" ? obj.version : SECRETS_SCHEMA_VERSION,
     salt: obj.salt,
     entries: obj.entries as Record<string, EncryptedEntry>,
+    ...(check ? { check } : {}),
   };
 }
 
+/** Structural guard for an EncryptedEntry on the wire (all three fields
+ *  must be strings). Does NOT verify base64 validity or decryptability --
+ *  that is decrypt's job. */
+function isEncryptedEntry(v: unknown): v is EncryptedEntry {
+  if (!v || typeof v !== "object") return false;
+  const e = v as Record<string, unknown>;
+  return typeof e.iv === "string" && typeof e.ciphertext === "string" && typeof e.authTag === "string";
+}
+
 export async function saveVault(path: string, vault: VaultFile): Promise<void> {
-  const tmpDir = dirname(path);
-  // mkdir handled by atomicWriteFile -> writeFileAtomic which doesn't
-  // currently mkdir. atomic-write.ts in this repo wraps fs.rename atop
-  // a temp file in the same dir; if the dir is missing, that fails.
-  // Use atomicWriteFile and let the caller ensure the dir exists.
-  void tmpDir;
+  // atomicWriteFile mkdirs the target dir recursively (atomic-write.ts:19)
+  // before writing the temp file, so the caller does NOT need to create
+  // the directory first.
   await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`);
   if (process.platform !== "win32") {
     try {
@@ -113,14 +141,46 @@ export function lock(): void {
 
 /** Derive the key for the given vault if not cached, else return the
  *  cached one. The salt must match -- if the vault was rotated and the
- *  salt changed, the caller must lock() first to clear the stale key. */
+ *  salt changed, the caller must lock() first to clear the stale key.
+ *
+ *  Verifies the passphrase BEFORE caching the key, so a wrong passphrase
+ *  is rejected loudly instead of silently writing entries under a bad key:
+ *    - vault.check present  -> decrypt it; authTag failure => wrong passphrase.
+ *    - vault.check absent, but entries exist (legacy vault) -> decrypt the
+ *      first entry as a canary; failure => wrong passphrase.
+ *    - neither (fresh/empty vault) -> nothing to verify against; accept.
+ *      The next setSecret stamps vault.check (via ensureCheck) so the
+ *      saved vault carries a token future unlocks verify against. */
 export async function unlock(vault: VaultFile, passphrase: string): Promise<Buffer> {
   if (cachedKey && cachedSalt === vault.salt) return cachedKey;
   const salt = Buffer.from(vault.salt, "base64");
   const key = await deriveKey(passphrase, salt);
+  verifyKey(vault, key);
   cachedKey = key;
   cachedSalt = vault.salt;
   return key;
+}
+
+/** Throw a clear "wrong passphrase" error if `key` does not match the
+ *  vault. Uses vault.check when present (back-compat: falls back to the
+ *  first existing entry as a canary; no-op when the vault is empty). */
+function verifyKey(vault: VaultFile, key: Buffer): void {
+  const canary = vault.check ?? Object.values(vault.entries)[0];
+  if (!canary) return; // fresh/empty vault -- nothing to verify yet
+  try {
+    decryptEntry(canary, key);
+  } catch {
+    throw new Error("wrong passphrase for this vault (decryption failed)");
+  }
+}
+
+/** Return a vault guaranteed to carry a verification token under `key`.
+ *  Encrypts VAULT_CHECK_PLAINTEXT when vault.check is absent; otherwise
+ *  returns the vault unchanged. Called on the mutate path so every saved
+ *  vault has a check future unlocks can verify against. */
+export function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
+  if (vault.check) return vault;
+  return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key) };
 }
 
 /** True iff an unlock has been performed in this process. */
@@ -139,13 +199,18 @@ export function listKeys(vault: VaultFile): string[] {
 
 export function setSecret(vault: VaultFile, key: Buffer, name: string, value: string): VaultFile {
   if (!name) throw new Error("secret name is required");
-  return {
-    ...vault,
-    entries: {
-      ...vault.entries,
-      [name]: encryptEntry(value, key),
+  // ensureCheck stamps vault.check on first save so future unlocks can
+  // verify the passphrase before caching the derived key.
+  return ensureCheck(
+    {
+      ...vault,
+      entries: {
+        ...vault.entries,
+        [name]: encryptEntry(value, key),
+      },
     },
-  };
+    key,
+  );
 }
 
 export function removeSecret(vault: VaultFile, name: string): VaultFile {

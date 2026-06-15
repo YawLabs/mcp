@@ -143,7 +143,7 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   }
 
   if (!backend) {
-    printErr("yaw-mcp bundles match: backend returned no data (unexpected 304).");
+    printErr("yaw-mcp bundles match: backend returned 304 without a conditional request.");
     return { exitCode: 2, lines };
   }
 

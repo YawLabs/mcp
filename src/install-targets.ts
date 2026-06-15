@@ -30,7 +30,7 @@
 //     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp"] }`.
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 export type InstallOS = "macos" | "linux" | "windows";
 export type InstallClientId = "claude-code" | "claude-desktop" | "cursor" | "vscode";
@@ -186,10 +186,22 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
     throw new Error(`Scope ${scope} for ${clientId} requires a project directory`);
   }
 
+  // Claude Code keys local-scope MCP entries by the ABSOLUTE project dir
+  // (projects[<absDir>].mcpServers in ~/.claude.json). A relative
+  // projectDir would produce a key that disagrees with what Claude Code
+  // writes, so install/doctor/list could each compute a different key
+  // and miss the entry. Resolve to absolute here -- the single place all
+  // three callers funnel through -- so the key is stable regardless of
+  // whether the caller pre-resolved. Already-absolute paths (the common
+  // case: callers pass process.cwd() or path.resolve(...)) pass through
+  // unchanged, including POSIX-rooted test fixtures on a Windows runner
+  // (isAbsolute('/x') is true on win32).
+  const absoluteProjectDir = projectDir && !isAbsolute(projectDir) ? resolve(projectDir) : projectDir;
+
   const p = pathFor(clientId, scope, os, {
     home,
     appData,
-    projectDir: projectDir ?? "",
+    projectDir: absoluteProjectDir ?? "",
     claudeConfigDir: claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : undefined,
   });
   return p;

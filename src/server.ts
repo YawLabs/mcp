@@ -559,6 +559,20 @@ export class ConnectServer {
       });
       for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
       this.config = result.config ?? { servers: [], configVersion: "" };
+      // Deduplicate by namespace -- keep first occurrence. Mirrors the
+      // backend-config dedup in fetchAndApplyConfig: reconcileConfig and the
+      // routing state assume one server per namespace, so a duplicate in
+      // bundles.json must be filtered here too (the local-mode path doesn't
+      // go through fetchAndApplyConfig's filter).
+      const seenNs = new Set<string>();
+      this.config.servers = this.config.servers.filter((s) => {
+        if (seenNs.has(s.namespace)) {
+          log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
+          return false;
+        }
+        seenNs.add(s.namespace);
+        return true;
+      });
       this.configVersion = this.config.configVersion;
       log("info", "Local mode: loaded bundles", {
         path: result.path,
@@ -978,9 +992,15 @@ export class ConnectServer {
     }
 
     if (route) {
-      const conn = this.connections.get(route.namespace);
+      // Capture the namespace once: `route` is reassigned by the re-snapshot
+      // below (and is captured in the .find closure), which widens it back to
+      // Route | undefined for the rest of this block. The namespace being
+      // reconnected is invariant across the re-snapshot, so a stable local
+      // keeps the in-block references correctly typed.
+      const ns = route.namespace;
+      const conn = this.connections.get(ns);
       if (conn && conn.status === "error") {
-        const serverConfig = this.config?.servers.find((s) => s.namespace === route.namespace);
+        const serverConfig = this.config?.servers.find((s) => s.namespace === ns);
         if (serverConfig) {
           let reconnected = false;
           let lastErr: unknown;
@@ -999,17 +1019,36 @@ export class ConnectServer {
                 this.onUpstreamDisconnect,
                 this.onUpstreamListChanged,
               );
-              this.connections.set(route.namespace, newConn);
+              this.connections.set(ns, newConn);
               this.rebuildRoutes();
               await this.notifyAllListsChanged();
-              log("info", "Auto-reconnected to upstream", { namespace: route.namespace });
+              log("info", "Auto-reconnected to upstream", { namespace: ns });
               reconnected = true;
+              // rebuildRoutes() replaced this.toolRoutes; re-snapshot so the
+              // dispatch below routes against the fresh map, not the stale
+              // one captured at method entry. If the reconnected upstream no
+              // longer exposes a tool by this name (its tool set changed),
+              // fall through to the same clear "no longer available" message
+              // the deferred path emits above.
+              routes = this.toolRoutes;
+              route = routes.get(name);
+              if (!route || route.deferred) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Tool "${name}" is no longer available after reconnecting "${serverConfig.namespace}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
+                    },
+                  ],
+                  isError: true,
+                };
+              }
               break;
             } catch (err) {
               lastErr = err;
               if (attempt < RECONNECT_ATTEMPTS - 1) {
                 log("warn", "Auto-reconnect attempt failed, retrying", {
-                  namespace: route.namespace,
+                  namespace: ns,
                   error: err instanceof Error ? err.message : String(err),
                 });
               }
@@ -1018,12 +1057,12 @@ export class ConnectServer {
           if (!reconnected) {
             conn.status = "error";
             const lastErrMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
-            log("error", "Auto-reconnect failed", { namespace: route.namespace, error: lastErrMsg });
+            log("error", "Auto-reconnect failed", { namespace: ns, error: lastErrMsg });
             return {
               content: [
                 {
                   type: "text",
-                  text: `Server "${route.namespace}" disconnected and auto-reconnect failed: ${lastErrMsg}. Use mcp_connect_activate with server "${route.namespace}" to reload it manually.`,
+                  text: `Server "${ns}" disconnected and auto-reconnect failed: ${lastErrMsg}. Use mcp_connect_activate with server "${ns}" to reload it manually.`,
                 },
               ],
               isError: true,
@@ -2100,6 +2139,11 @@ export class ConnectServer {
     // Uses the same model the user is already running — no extra
     // provider key, no extra cost from yaw-mcp's side. Silently skips if
     // the client doesn't advertise the sampling capability.
+    // budget === 1 is intentional: the tiebreak only matters when a single
+    // primary is returned. A multi-load (budget>1) tolerates a wrong primary
+    // because the close runner-up is also in the returned slice — paying the
+    // sampling round-trip there buys nothing. Do not "fix" this to fire for
+    // budget>1.
     if (budget === 1 && shouldTiebreak(ranked)) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
@@ -2590,8 +2634,13 @@ export class ConnectServer {
           },
         ],
       };
-    } catch (err: any) {
-      return { content: [{ type: "text", text: `Import error: ${err.message}` }], isError: true };
+    } catch (err: unknown) {
+      const { code, text } = this.mapNetworkError(err, "Import");
+      log("warn", "handleImport error", {
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+      return { content: [{ type: "text", text }], isError: true };
     }
   }
 
@@ -2704,28 +2753,34 @@ export class ConnectServer {
         ],
       };
     } catch (err: unknown) {
-      // Map the raw undici/network error to a user-facing string instead
-      // of leaking `err.message` verbatim to the model. We keep the raw
-      // error in the log for ops debugging but don't surface node error
-      // codes or stack fragments to the LLM/user.
-      const code =
-        typeof err === "object" && err !== null
-          ? (err as { code?: string; cause?: { code?: string } }).code || (err as any).cause?.code
-          : undefined;
-      let text: string;
-      if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
-        text = "Install timed out talking to yaw.sh/mcp. Retry in a moment.";
-      } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
-        text = "Couldn't reach yaw.sh/mcp (network unreachable or DNS failure). Check your connection and retry.";
-      } else {
-        text = "Install failed unexpectedly. Check yaw-mcp logs on this machine for the underlying error.";
-      }
+      const { code, text } = this.mapNetworkError(err, "Install");
       log("warn", "handleInstall error", {
         error: err instanceof Error ? err.message : String(err),
         code,
       });
       return { content: [{ type: "text", text }], isError: true };
     }
+  }
+
+  // Map a raw undici/network error to a user-facing string instead of
+  // leaking `err.message` (e.g. "getaddrinfo ENOTFOUND yaw.sh") verbatim to
+  // the model. Returns the extracted node error code (for ops logging) and a
+  // clean message keyed by the failing operation verb ("Install"/"Import").
+  // Callers keep the raw error in the log; the LLM/user only sees `text`.
+  private mapNetworkError(err: unknown, op: "Install" | "Import"): { code: string | undefined; text: string } {
+    const code =
+      typeof err === "object" && err !== null
+        ? (err as { code?: string; cause?: { code?: string } }).code || (err as any).cause?.code
+        : undefined;
+    let text: string;
+    if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
+      text = `${op} timed out talking to yaw.sh/mcp. Retry in a moment.`;
+    } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
+      text = `Couldn't reach yaw.sh/mcp (network unreachable or DNS failure). Check your connection and retry.`;
+    } else {
+      text = `${op} failed unexpectedly. Check yaw-mcp logs on this machine for the underlying error.`;
+    }
+    return { code, text };
   }
 
   // Signature-on-demand: return one tool's full input schema without

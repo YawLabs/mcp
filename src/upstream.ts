@@ -155,7 +155,19 @@ export async function connectToUpstream(
       throw new Error("command is required for local servers");
     }
 
-    const { YAW_MCP_TOKEN: _excluded, ...parentEnv } = process.env;
+    // Strip yaw-mcp-internal secrets from the child env. These are for
+    // THIS process only and must never leak into spawned upstream servers:
+    //   YAW_MCP_TOKEN            — backend auth token
+    //   YAW_MCP_VAULT_PASSPHRASE — unlocks the local secret vault
+    // Everything else from process.env (PATH, HOME, proxy vars, etc.) is
+    // intentionally forwarded so the child spawns/runs in the user's
+    // normal environment; server-specific secrets come via serverEnv,
+    // resolved from the vault above.
+    const {
+      YAW_MCP_TOKEN: _excludedToken,
+      YAW_MCP_VAULT_PASSPHRASE: _excludedVaultPassphrase,
+      ...parentEnv
+    } = process.env;
     // Rewrite `uv`/`uvx` to our managed binary when the user doesn't
     // have one on PATH. No-op for every other command. Any failure
     // here (unsupported platform, download/checksum failure) bubbles
@@ -210,7 +222,13 @@ export async function connectToUpstream(
     }, CONNECT_TIMEOUT);
   });
   try {
-    await Promise.race([client.connect(transport), timeoutPromise]);
+    // Capture the connect promise so that, on timeout, the orphaned
+    // connect() promise (which Promise.race abandons) has a no-op catch
+    // attached — otherwise a later rejection surfaces as an unhandled
+    // rejection and can kill the process.
+    const connectP = client.connect(transport);
+    connectP.catch(() => {});
+    await Promise.race([connectP, timeoutPromise]);
     clearTimeout(timer);
   } catch (err) {
     clearTimeout(timer);

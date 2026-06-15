@@ -34,8 +34,16 @@ export async function runComplianceCommand(argv: string[]): Promise<number> {
   if (publish) {
     const result = await publishReport(apiUrl, report);
     if (!result) return 1;
-    process.stdout.write(`\nPublished: ${result.reportUrl}\n`);
-    process.stdout.write(`Badge:     ${result.badgeUrl}\n`);
+    // The POST 200 body is cast, not validated -- an unexpected shape would
+    // otherwise print "Published: undefined". Require non-empty url strings.
+    const reportUrl = typeof result.reportUrl === "string" ? result.reportUrl.trim() : "";
+    const badgeUrl = typeof result.badgeUrl === "string" ? result.badgeUrl.trim() : "";
+    if (!reportUrl || !badgeUrl) {
+      process.stderr.write("\nPublish failed: server returned 200 but no report/badge URL.\n");
+      return 1;
+    }
+    process.stdout.write(`\nPublished: ${reportUrl}\n`);
+    process.stdout.write(`Badge:     ${badgeUrl}\n`);
     if (result.deleteToken) {
       process.stdout.write(`\nDelete token (save this): ${result.deleteToken}\n`);
     }
@@ -108,8 +116,9 @@ async function publishReport(
       deleteToken?: string;
     };
     return parsed;
-  } catch (err: any) {
-    process.stderr.write(`\nPublish failed: ${err?.message ?? String(err)}\n`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`\nPublish failed: ${message}\n`);
     return null;
   }
 }

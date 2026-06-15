@@ -12,9 +12,7 @@
 //   3. Error -- no passphrase available
 
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
 import { CONFIG_DIRNAME } from "./paths.js";
 import {
   type VaultFile,
@@ -106,7 +104,7 @@ export function parseSecretsArgs(
     }
     if (a === "--value") {
       const v = argv[++i];
-      if (v === undefined) return { ok: false, error: "yaw-mcp secrets: --value requires a value\n\n" + SECRETS_USAGE };
+      if (v === undefined) return { ok: false, error: `yaw-mcp secrets: --value requires a value\n\n${SECRETS_USAGE}` };
       opts.value = v;
       continue;
     }
@@ -134,7 +132,7 @@ export function parseSecretsArgs(
     }
     return { ok: false, error: `yaw-mcp secrets: unexpected positional argument "${a}"\n\n${SECRETS_USAGE}` };
   }
-  if (!opts.action) return { ok: false, error: "yaw-mcp secrets: missing action\n\n" + SECRETS_USAGE };
+  if (!opts.action) return { ok: false, error: `yaw-mcp secrets: missing action\n\n${SECRETS_USAGE}` };
   if ((opts.action === "set" || opts.action === "get" || opts.action === "remove") && !opts.name) {
     return { ok: false, error: `yaw-mcp secrets ${opts.action}: <name> is required\n\n${SECRETS_USAGE}` };
   }
@@ -149,18 +147,48 @@ export interface SecretsCommandResult {
  *  that disables terminal echo via raw mode. Returns null when no
  *  passphrase can be obtained (non-TTY + no env). */
 async function resolvePassphrase(opts: SecretsCommandOptions): Promise<string | null> {
-  if (opts.passphrase !== undefined) return opts.passphrase;
+  if (opts.passphrase !== undefined) return opts.passphrase.length > 0 ? opts.passphrase : null;
   const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
-  if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
+  // An empty env var ("") is treated the same as absent -- deriving a key
+  // from "" would otherwise silently unlock any vault.
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    if (fromEnv.length < MIN_PASSPHRASE_WARN_LEN) {
+      const stderr = opts.io?.stderr ?? process.stderr;
+      stderr.write(
+        `yaw-mcp secrets: warning -- YAW_MCP_VAULT_PASSPHRASE is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.\n`,
+      );
+    }
+    return fromEnv;
+  }
   const stdin = opts.io?.stdin ?? process.stdin;
   const stdout = opts.io?.stdout ?? process.stdout;
   const isTTY = (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
   if (!isTTY) return null;
-  return readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout);
+  // Reject an empty passphrase (bare Enter / EOF with nothing typed):
+  // deriving a key from "" would otherwise unlock any vault. Re-prompt up
+  // to a few times, then give up so we never spin forever on a closed pipe.
+  for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
+    const entered = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout);
+    if (entered.length > 0) return entered;
+    stdout.write("Passphrase cannot be empty.\n");
+  }
+  return null;
 }
 
-function readPassphraseFromTTY(stdin: NodeJS.ReadStream, stdout: NodeJS.WritableStream): Promise<string> {
-  stdout.write("Vault passphrase: ");
+/** Cap re-prompts for an empty passphrase so a closed/EOF stdin can't
+ *  loop forever. */
+const MAX_PASSPHRASE_PROMPTS = 3;
+
+/** Soft floor for a passphrase: shorter than this triggers a stderr
+ *  warning (never a hard block). */
+const MIN_PASSPHRASE_WARN_LEN = 12;
+
+function readPassphraseFromTTY(
+  stdin: NodeJS.ReadStream,
+  stdout: NodeJS.WritableStream,
+  prompt = "Vault passphrase: ",
+): Promise<string> {
+  stdout.write(prompt);
   return new Promise<string>((resolve) => {
     const chunks: string[] = [];
     const wasRaw = stdin.isRaw === true;
@@ -214,11 +242,6 @@ async function readStdinValue(io?: SecretsCommandOptions["io"]): Promise<string>
   stdin.setEncoding("utf8");
   for await (const chunk of stdin as unknown as AsyncIterable<string>) chunks.push(chunk);
   return chunks.join("").replace(/\r?\n$/, "");
-}
-
-async function ensureVaultDir(path: string): Promise<void> {
-  const dir = dirname(path);
-  if (!existsSync(dir)) await mkdir(dir, { recursive: true });
 }
 
 export async function runSecrets(
@@ -300,7 +323,7 @@ export async function runSecrets(
       return { exitCode: 1 };
     }
     vault = setSecret(vault, key, name, value);
-    await ensureVaultDir(path);
+    // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
     await saveVault(path, vault);
     if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh })}\n`);
     else io.out(`${isFresh ? "Created vault and " : ""}Stored secret "${name}".\n`);
@@ -455,7 +478,7 @@ async function runSecretsPull(
       else io.err(`yaw-mcp secrets pull: ${msg}\n`);
       return { exitCode: 1 };
     }
-    await ensureVaultDir(path);
+    // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
     await saveVault(path, remote.data);
     // Invalidate the in-process key cache -- the salt may have changed,
     // so the next operation must re-derive against the (possibly

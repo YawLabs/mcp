@@ -15,6 +15,14 @@ export async function atomicWriteFile(
   encoding: BufferEncoding = "utf8",
 ): Promise<void> {
   const dir = path.dirname(filePath);
+  // The tmp file is a SIBLING of the target (same directory => same
+  // filesystem), so fs.rename is atomic. Atomicity holds ONLY on the same
+  // filesystem: a cross-device rename throws EXDEV. We never cross devices
+  // here because tmp and target share a dir, but callers must not point
+  // filePath at a special/overlay mount whose dirname resolves to a
+  // different fs than where the tmp would be written -- that would surface
+  // as an EXDEV throw rather than an atomic swap. (If a real cross-device
+  // need ever arises, fall back to writeFile-in-place, losing atomicity.)
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
   await mkdir(dir, { recursive: true });
   try {

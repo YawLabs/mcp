@@ -339,6 +339,28 @@ describe("exec-engine: validateExecRequest", () => {
     });
     expect(rb.ok).toBe(true);
   });
+
+  it("fix#5: rejects an explicit id colliding with an earlier unnamed step's positional slot", () => {
+    // Step 0 is unnamed -> binds as "0". Step 1 has explicit id "0" -> would
+    // overwrite step 0 in the bindings map. Must be rejected.
+    const r = validateExecRequest({
+      steps: [{ tool: "x" }, { id: "0", tool: "y" }],
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("collides with the positional binding key");
+  });
+
+  it("fix#5: accepts an integer-string id when no unnamed step claims that slot", () => {
+    // Both steps are named, so positional slots are never reserved; an id of
+    // "0" is fine here because no unnamed step binds under "0".
+    const r = validateExecRequest({
+      steps: [
+        { id: "0", tool: "x" },
+        { id: "1", tool: "y" },
+      ],
+    });
+    expect(r.ok).toBe(true);
+  });
 });
 
 describe("exec-engine: stepBindingKey", () => {

@@ -273,7 +273,7 @@ describe("runBundlesCommand — match", () => {
       fetcher: async () => null,
     });
     expect(r.exitCode).toBe(2);
-    expect(io.err.join("")).toContain("unexpected 304");
+    expect(io.err.join("")).toContain("backend returned 304 without a conditional request");
   });
 
   it("sorts partial bundles by fewest-missing first", async () => {

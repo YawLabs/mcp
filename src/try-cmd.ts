@@ -456,7 +456,10 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // trial — silent runtime failure inside the client is worse than a
   // clear "you need to set FOO" up front.
   const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
-  const missing = (server.requiredEnvVars ?? []).filter((k) => !supplied[k] || supplied[k] === "");
+  // Trim before the emptiness test so a whitespace-only value (FOO=" ")
+  // counts as missing instead of slipping through and writing a blank-ish
+  // secret into the trial entry.
+  const missing = (server.requiredEnvVars ?? []).filter((k) => (supplied[k] ?? "").trim() === "");
   if (missing.length > 0) {
     printErr(`yaw-mcp try: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
@@ -475,7 +478,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // want to leak every var in the user's shell into the entry.
   const trialEnv: Record<string, string> = {};
   for (const k of server.requiredEnvVars ?? []) {
-    const v = supplied[k];
+    // Use the trimmed value so a padded entry doesn't carry surrounding
+    // whitespace into the secret (the missing-check above already trims).
+    const v = (supplied[k] ?? "").trim();
     if (v) trialEnv[k] = v;
   }
   // Honor any --env overrides for keys NOT in requiredEnvVars too --
@@ -785,5 +790,5 @@ export async function gcExpiredTrials(opts: {
   return { cleared, failed };
 }
 
-// Re-export `readNested` so doctor / tests can use it for inspection.
+// Re-export `readNested` so tests can use it for inspection.
 export { readNested };

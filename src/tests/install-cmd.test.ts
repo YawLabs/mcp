@@ -733,6 +733,32 @@ describe("runInstall — token resolution", () => {
     expect(cap.stdout()).toMatch(/backed up to/);
   });
 
+  it("backs up a valid-JSON-but-non-object ~/.yaw-mcp/config.json before overwriting", async () => {
+    // Valid JSON that isn't an object (here, an array) used to be silently
+    // discarded with NO backup -- only the parse-error path backed up.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const cfgPath = join(synthHome, ".yaw-mcp", "config.json");
+    const nonObjectBytes = '["mcp_pat_old_aaaa"]';
+    writeFileSync(cfgPath, nonObjectBytes, "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_new_bbbb",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    // New config is now a proper object carrying the new token.
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+    expect(cfg.token).toBe("mcp_pat_new_bbbb");
+    // A .bak-* sibling exists with the original non-object bytes.
+    const backups = readdirSync(join(synthHome, ".yaw-mcp")).filter((f) => f.startsWith("config.json.bak-"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(synthHome, ".yaw-mcp", backups[0]), "utf8")).toBe(nonObjectBytes);
+  });
+
   it("--token overrides existing ~/.yaw-mcp/config.json token", async () => {
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(join(synthHome, ".yaw-mcp", "config.json"), JSON.stringify({ token: "mcp_pat_old_aaaa" }));

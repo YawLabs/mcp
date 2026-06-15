@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   ENTRY_NAME,
@@ -96,6 +96,39 @@ describe("resolveInstallPath — Claude Code", () => {
       projectDir: "/home/alice/repo",
     });
     expect(r.absolute).toMatch(/[\\/]\.claude\.json$/);
+    expect(r.containerPath).toEqual(["projects", "/home/alice/repo", "mcpServers"]);
+  });
+
+  it("local scope resolves a RELATIVE projectDir to absolute for the projects[] key", () => {
+    // Claude Code keys local-scope MCP by the absolute project dir it
+    // writes. A relative projectDir would key the entry under a path
+    // Claude Code never uses, so install/doctor/list would disagree.
+    // resolveInstallPath normalizes to absolute so the key is stable.
+    const rel = "some/relative/repo";
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: "/home/alice",
+      projectDir: rel,
+    });
+    const key = r.containerPath[1];
+    expect(isAbsolute(key)).toBe(true);
+    expect(key).toBe(resolve(rel));
+    expect(r.containerPath).toEqual(["projects", resolve(rel), "mcpServers"]);
+  });
+
+  it("local scope leaves an ABSOLUTE projectDir untouched in the projects[] key", () => {
+    // The common case: callers pass process.cwd() / path.resolve(...),
+    // which must pass through verbatim (including POSIX-rooted fixtures
+    // on a Windows runner, where isAbsolute('/...') is true).
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: "/home/alice",
+      projectDir: "/home/alice/repo",
+    });
     expect(r.containerPath).toEqual(["projects", "/home/alice/repo", "mcpServers"]);
   });
 

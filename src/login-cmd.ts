@@ -35,7 +35,7 @@ export function parseLoginArgs(
     const a = argv[i];
     if (a === "--key") {
       const v = argv[++i];
-      if (!v) return { ok: false, error: "yaw-mcp login: --key requires a value\n\n" + LOGIN_USAGE };
+      if (!v) return { ok: false, error: `yaw-mcp login: --key requires a value\n\n${LOGIN_USAGE}` };
       opts.key = v;
     } else if (a === "--json") {
       opts.json = true;
@@ -46,7 +46,7 @@ export function parseLoginArgs(
     }
   }
   if (!opts.key) {
-    return { ok: false, error: "yaw-mcp login: --key is required\n\n" + LOGIN_USAGE };
+    return { ok: false, error: `yaw-mcp login: --key is required\n\n${LOGIN_USAGE}` };
   }
   return { ok: true, options: opts };
 }

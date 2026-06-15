@@ -178,6 +178,14 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   for (const k of server.requiredEnvKeys) entryEnv[k] = "";
   for (const [k, v] of Object.entries(opts.envOverrides ?? {})) entryEnv[k] = v;
 
+  // Required keys that passed the gate ONLY because the value was present in the
+  // ambient shell env (not --env). The persisted entry seeds these EMPTY, so the
+  // server depends on that shell var still being set wherever yaw-mcp launches.
+  const overrides = opts.envOverrides ?? {};
+  const ambientOnlyRequired = server.requiredEnvKeys.filter(
+    (k) => (!overrides[k] || overrides[k] === "") && env[k] != null && env[k] !== "",
+  );
+
   const entry: Partial<UpstreamServerConfig> = {
     id: `local-${namespace}`,
     name: server.name,
@@ -217,6 +225,19 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   } else {
     print(`${res.replaced ? "Updated" : "Added"} ${server.name} (namespace "${namespace}") in ${res.path}`);
     print("Restart your MCP client (or yaw-mcp) to pick it up.");
+  }
+
+  // If a required key was satisfied only by the ambient shell (not --env), its
+  // value is NOT persisted -- the entry seeds it empty. Warn on stderr (so it
+  // survives --json) that the server depends on that var at launch time.
+  if (ambientOnlyRequired.length > 0) {
+    printErr(
+      `Note: ${ambientOnlyRequired.join(", ")} ${
+        ambientOnlyRequired.length === 1 ? "was" : "were"
+      } read from your shell env and NOT persisted; the server depends on ${
+        ambientOnlyRequired.length === 1 ? "that var" : "those vars"
+      } being present wherever yaw-mcp launches. Pass --env ${ambientOnlyRequired[0]}=... to persist a value.`,
+    );
   }
 
   // Honest warning: a project-local bundles.json shadows the user-global file.

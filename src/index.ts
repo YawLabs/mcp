@@ -405,6 +405,10 @@ if (subcommand === "compliance") {
   // to runServer, which would then fail opaquely on the missing token.
   // Flags (anything with a leading `-`) still fall through so server
   // startup can parse them (or ignore unknown ones) as it did before.
+  // INTENTIONAL: an unrecognized leading-dash arg (e.g. a typo'd
+  // `--versionn`) is NOT rejected here — it is silently passed through
+  // and boots MCP server mode. We do not "did you mean?" stray flags to
+  // avoid changing CLI behavior; only bare positional typos are caught.
   const visible = KNOWN_SUBCOMMANDS.filter((s) => !s.startsWith("-") && s !== "help");
   const suggestions = closestNames(subcommand, visible, 3);
   const hint =
@@ -460,6 +464,13 @@ async function runServer(): Promise<void> {
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+
+  // Last-resort net for stray async failures. Without this a single
+  // unhandled rejection (e.g. an orphaned upstream connect that rejects
+  // late) can tear down the stdio transport with no trace. Log and keep
+  // running rather than dying silently.
+  process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
+  process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
 
   server.start().catch((err: unknown) => {
     if (err instanceof ConfigError && err.fatal) {

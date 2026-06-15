@@ -56,9 +56,13 @@ export interface RerankResult {
 // without BM25 having to shortlist first.
 export async function rerank(intent: string, candidateIds?: string[], limit?: number): Promise<RerankResult[] | null> {
   if (!intent?.trim()) return null;
-  // Treat "empty array provided" as "caller has no BM25 shortlist to
-  // narrow against" -- same fallback as no-array. Only skip the call
-  // when the caller explicitly opted into shortlist mode with zero ids.
+  // Three-state contract for `candidateIds` -- pass the right shape:
+  //   undefined    -> rerank the WHOLE catalog (discover's wide mode).
+  //   [] (empty)   -> skip; returns null (NOT "rerank everything").
+  //   non-empty    -> rerank only this shortlist.
+  // A caller wanting whole-catalog rerank must OMIT candidateIds, never
+  // pass []. Treat "empty array provided" as "caller has no BM25
+  // shortlist to narrow against" -- same fallback as no-array.
   if (candidateIds !== undefined && candidateIds.length === 0) return null;
 
   const payload: { intent: string; candidateIds?: string[]; limit?: number } = { intent: intent.trim() };

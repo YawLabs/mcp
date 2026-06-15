@@ -78,10 +78,10 @@ function defaultSpawn(cmd: string, args: string[]): void {
   // permissions and the sudo suggestion doesn't apply to them.
   const correctiveCmd =
     cmd === "npm"
-      ? `npm install -g @yawlabs/mcp@latest`
+      ? "npm install -g @yawlabs/mcp@latest"
       : cmd === "pnpm"
-        ? `pnpm add -g @yawlabs/mcp@latest`
-        : `bun add -g @yawlabs/mcp@latest`;
+        ? "pnpm add -g @yawlabs/mcp@latest"
+        : "bun add -g @yawlabs/mcp@latest";
 
   const child = spawn(cmd, args, {
     stdio: "ignore",
@@ -99,7 +99,7 @@ function defaultSpawn(cmd: string, args: string[]): void {
       // stdio is "ignore" so we can't surface the underlying tool error.
       // The common cause for npm is a non-user-writable global prefix
       // (yaw-mcp was installed with sudo); pnpm/bun have analogous issues.
-      const hint = cmd === "npm" ? ` (often EACCES on a sudo-installed global -- run with the right permissions)` : "";
+      const hint = cmd === "npm" ? " (often EACCES on a sudo-installed global -- run with the right permissions)" : "";
       log(
         "warn",
         `yaw-mcp self-upgrade: ${cmd} exited non-zero${hint}. Run \`${correctiveCmd}\` manually, or set YAW_MCP_AUTO_UPGRADE=0 to silence this.`,
@@ -183,12 +183,27 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   }
 
   // npx / local-node-modules / dev-checkout / unknown: nothing safe to
-  // spawn from here. Log a one-liner so a stale install is at least
-  // visible; the `@latest` client config (written by `yaw-mcp install`)
-  // makes npx self-heal on the next restart anyway.
-  log("info", "yaw-mcp is out of date; restart your MCP client to pick up the latest version", {
-    current,
-    latest,
-    method,
-  });
+  // spawn from here. Log a one-liner so a stale install is at least visible.
+  if (method === "npx") {
+    // For npx the `@latest` client config (written by `yaw-mcp install`)
+    // makes the next restart fetch the newest version, so a restart fixes it.
+    log("info", "yaw-mcp is out of date; restart your MCP client to pick up the latest version", {
+      current,
+      latest,
+      method,
+    });
+  } else {
+    // local-node-modules / unknown: a restart re-runs the SAME stale install
+    // (a custom-prefix global or a pinned local node_modules), so it won't
+    // pick up the new version. Point the user at the manual recovery path.
+    log(
+      "info",
+      "yaw-mcp is out of date; run `yaw-mcp upgrade --run` to update this install (a restart won't refresh a stale global)",
+      {
+        current,
+        latest,
+        method,
+      },
+    );
+  }
 }
