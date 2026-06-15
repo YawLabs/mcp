@@ -43,8 +43,13 @@ TOTAL_STEPS=7
 # the tool ran  $5 (opt) direct verify command (NOT via `npm run`) re-run when
 # tolerating a tool that prints no completion marker (e.g. `npx tsc --noEmit`).
 run_npm_check() {
-  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc
-  out=$(npm run "$script" 2>&1); rc=$?
+  local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc=0
+  # `|| rc=$?` is load-bearing: under `set -e` a bare `out=$(npm run ...)` whose
+  # command substitution exits non-zero aborts the function THERE -- before the
+  # printf/grep below run -- so the captured findings are swallowed and the
+  # ARM64 segfault-tolerance path is unreachable. Catching the status keeps
+  # `set -e` from killing us and lets this function do its own rc analysis.
+  out=$(npm run "$script" 2>&1) || rc=$?
   printf '%s\n' "$out"
   if echo "$out" | grep -qE "$fail_re"; then
     fail "$label failed"
@@ -157,7 +162,15 @@ run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 info "Lint passed"
 
 step 2 "Test"
-npm run build || fail "Build failed"
+# `npm run build` goes through the npm-run wrapper, so on the ARM64 box it can
+# exit 139/134 in npm's cleanup AFTER tsup prints "Build success" -- a bare
+# `npm run build || fail` would false-fail the release there. run_npm_check
+# tolerates that signature only when the success marker is present; a real
+# build error (esbuild "[ERROR]") or a non-success exit still hard-fails.
+# `npm test` is a chained command on a different exit path and is NOT affected
+# by the segfault, so it stays a direct call (wrapping it risks masking a real
+# test failure behind the tolerance).
+run_npm_check "Build" build '\[ERROR\]' 'Build success'
 npm test || fail "Tests failed"
 info "All tests passed"
 
