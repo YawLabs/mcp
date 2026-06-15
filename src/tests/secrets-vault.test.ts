@@ -2,8 +2,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { decryptEntry, deriveKey, encryptEntry, generateSalt } from "../secrets-crypto.js";
+import { type EncryptedEntry, decryptEntry, deriveKey, encryptEntry, generateSalt } from "../secrets-crypto.js";
 import {
+  VAULT_CHECK_PLAINTEXT,
+  type VaultFile,
   getSecret,
   hasSecretRefs,
   listKeys,
@@ -145,13 +147,72 @@ describe("secrets-vault: set/get/list/remove", () => {
     expect(v).toBeNull();
   });
 
-  it("unlock with wrong passphrase derives a non-decrypting key", async () => {
+  it("unlock with wrong passphrase throws before caching the key", async () => {
     let vault = newVault();
     const key = await unlock(vault, "hunter2");
     vault = setSecret(vault, key, "github", "ghp_abc");
     lock();
-    const wrongKey = await unlock(vault, "hunter3");
-    expect(() => getSecret(vault, wrongKey, "github")).toThrow();
+    // setSecret stamps vault.check, so a wrong passphrase is detected at
+    // unlock time (no longer a silent bad-key derivation).
+    await expect(unlock(vault, "hunter3")).rejects.toThrow(/wrong passphrase/i);
+  });
+
+  it("setSecret stamps a vault.check verification token", async () => {
+    let vault = newVault();
+    expect(vault.check).toBeUndefined();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    expect(vault.check).toBeDefined();
+    // The check decrypts to the fixed constant under the correct key.
+    expect(decryptEntry(vault.check as EncryptedEntry, key)).toBe(VAULT_CHECK_PLAINTEXT);
+  });
+
+  it("unlock on a fresh/empty vault accepts any passphrase (nothing to verify)", async () => {
+    const vault = newVault();
+    // No entries, no check -- unlock cannot verify, so it must not throw.
+    await expect(unlock(vault, "anything")).resolves.toBeInstanceOf(Buffer);
+  });
+
+  it("legacy vault (entries, no check) verifies via first-entry canary", async () => {
+    // Build a vault, then strip its check to simulate a pre-check vault.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    const legacy = { version: vault.version, salt: vault.salt, entries: vault.entries };
+    lock();
+    // Correct passphrase: canary decrypts -> resolves.
+    await expect(unlock(legacy, "hunter2")).resolves.toBeInstanceOf(Buffer);
+    lock();
+    // Wrong passphrase: canary fails -> throws.
+    await expect(unlock(legacy, "hunter3")).rejects.toThrow(/wrong passphrase/i);
+  });
+
+  it("loadVault rejects a vault with a malformed entry", async () => {
+    const path = join(synthHome, ".yaw-mcp", "secrets.json");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const corrupt = {
+      version: 1,
+      salt: generateSalt().toString("base64"),
+      entries: { bad: { iv: "x", ciphertext: 123, authTag: "y" } },
+    };
+    writeFileSync(path, `${JSON.stringify(corrupt)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/vault corrupt at entry bad/);
+  });
+
+  it("loadVault preserves a valid check field round-trip", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    const path = join(synthHome, ".yaw-mcp", "secrets.json");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    await saveVault(path, vault);
+    lock();
+    const loaded = await loadVault(path);
+    expect(loaded?.check).toBeDefined();
+    // Wrong passphrase against the loaded vault is rejected via check.
+    await expect(unlock(loaded as VaultFile, "wrongpass")).rejects.toThrow(/wrong passphrase/i);
   });
 
   it("vaultPath places secrets.json under ~/.yaw-mcp/", () => {

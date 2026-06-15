@@ -86,6 +86,9 @@ describe("runSetActive", () => {
     const [, version, data] = (d.putResource as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(version).toBe(5); // the version we GET'd, for optimistic concurrency
     expect((data as Bundles).servers[0].isActive).toBe(true);
+    // FIX B: stamp the bundles-data schema version so set-active and
+    // syncPush agree (both PUT version:1).
+    expect((data as Bundles).version).toBe(1);
     expect(out.join("")).toMatch(/now active/);
   });
 

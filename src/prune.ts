@@ -99,11 +99,16 @@ function pruneJson(value: unknown): unknown {
     if (value.length === 0) return undefined;
     // Never drop array elements — dropping shifts indices and breaks any
     // caller that relies on positional access (e.g. list data returned to
-    // the model). Pruned elements become null so positions are stable;
-    // only object VALUES get pruned away entirely.
+    // the model). Pruned elements stay in place: an OBJECT that prunes to
+    // empty is preserved as `{}` so the row/object SHAPE survives (a list of
+    // rows stays a list of objects, not a list of nulls); anything else that
+    // prunes away (null/undefined/empty primitive collection) becomes null.
     const cleaned: unknown[] = value.map((el) => {
       const pv = pruneJson(el);
-      return pv !== undefined ? pv : null;
+      if (pv !== undefined) return pv;
+      // el pruned to "no information": keep {} for objects to preserve shape.
+      if (el !== null && typeof el === "object" && !Array.isArray(el)) return {};
+      return null;
     });
     return cleaned;
   }

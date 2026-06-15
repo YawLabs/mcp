@@ -41,13 +41,13 @@ export function parseStatsArgs(
       const v = argv[++i];
       const n = Number.parseInt(v ?? "", 10);
       if (!Number.isFinite(n) || n <= 0 || n > 1000)
-        return { ok: false, error: "yaw-mcp stats: --limit must be a positive integer up to 1000\n\n" + STATS_USAGE };
+        return { ok: false, error: `yaw-mcp stats: --limit must be a positive integer up to 1000\n\n${STATS_USAGE}` };
       opts.limit = n;
     } else if (a === "--days") {
       const v = argv[++i];
       const n = Number.parseInt(v ?? "", 10);
       if (!Number.isFinite(n) || n <= 0 || n > 365)
-        return { ok: false, error: "yaw-mcp stats: --days must be a positive integer up to 365\n\n" + STATS_USAGE };
+        return { ok: false, error: `yaw-mcp stats: --days must be a positive integer up to 365\n\n${STATS_USAGE}` };
       opts.days = n;
     } else if (a === "--json") {
       opts.json = true;
@@ -134,10 +134,14 @@ export function formatPlain(
     lines.push("only events explicitly POSTed via `yaw-mcp` will appear here.");
     return `${lines.join("\n")}\n`;
   }
+  // NOTE: the By-server / By-AI-client aggregates below are computed over
+  // the FULL filtered window (every event in the time range), whereas the
+  // "Recent events" list further down is capped at --limit. So the aggregate
+  // call counts can exceed the number of rows shown in the recent list.
   const agg = aggregate(events);
 
   lines.push("");
-  lines.push("By server:");
+  lines.push("By server (full window):");
   const nsCol = Math.max(...agg.byNamespace.map((n) => n.namespace.length), 6);
   for (const n of agg.byNamespace) {
     const success = n.success.toString().padStart(5);
@@ -189,7 +193,10 @@ export async function runStats(
     const result = await listAnalyticsEvents({ home, baseUrl: opts.baseUrl });
     const days = opts.days ?? 7;
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    const filtered = result.events.filter((e) => e.ts >= cutoff);
+    // Sort ascending by ts once so the "newest first" slice(-N) in both the
+    // JSON output and formatPlain is correct -- listAnalyticsEvents makes no
+    // ordering guarantee, and the recent-events slice relies on it.
+    const filtered = result.events.filter((e) => e.ts >= cutoff).sort((a, b) => a.ts - b.ts);
 
     if (opts.json) {
       io.out(

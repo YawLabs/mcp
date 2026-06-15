@@ -13,7 +13,7 @@
 //   2  warnings (e.g., schema-version mismatch, loose file permissions)
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type AnalyticsFailure, getLastAnalyticsFailure } from "./analytics.js";
@@ -142,6 +142,17 @@ export interface DoctorResult {
 declare const __VERSION__: string;
 const VERSION = typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev";
 
+// Single source of truth for the YAW_MCP_DISABLE_PERSISTENCE truthiness
+// predicate. Was open-coded in four places (both STATE/RELIABILITY pairs
+// across the text and json paths); keeping them in lockstep matters since
+// a divergence would have one section reading state.json while another
+// treats persistence as off. persistence.ts has no exported decision to
+// reuse, so this is the local canonical form.
+function isPersistenceDisabled(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
+  return raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
+}
+
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
   if (opts.json) return runDoctorJson(opts);
 
@@ -191,16 +202,30 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // their own dedicated sections and are intentionally omitted.
   renderEnvSection({ env, print });
 
+  // Load state.json ONCE for both the STATE and RELIABILITY sections.
+  // Previously each section re-read the file (peek + loadState in STATE,
+  // loadState again in RELIABILITY = up to 3 reads/run), which was wasted
+  // I/O and opened a small TOCTOU window between reads. Skip the read
+  // entirely when persistence is disabled.
+  const persistenceDisabled = isPersistenceDisabled(env);
+  const stateFilePath = join(userConfigDir(home), STATE_FILENAME);
+  const persistedState = persistenceDisabled ? null : await loadState(stateFilePath);
+
   // Persisted cross-session state — ~/.yaw-mcp/state.json. Shows whether
   // persistence is disabled by env, and otherwise reports the file path
   // + how fresh the snapshot is + how much signal it carries.
-  await renderStateSection({ home, env, print });
+  await renderStateSection({
+    filePath: stateFilePath,
+    disabled: persistenceDisabled,
+    persisted: persistedState,
+    print,
+  });
 
   // Reliability roll-up — pulls flaky namespaces from the same
   // state.json the STATE section introspected. Same definition as the
   // cross-session block in mcp_connect_health, so "flaky" means the
   // same thing whether you check via the LLM or via the CLI.
-  await renderReliabilitySection({ home, env, print });
+  renderReliabilitySection({ disabled: persistenceDisabled, persisted: persistedState, print });
 
   // Trial GC + live-trial readout. Runs the expired-trial sweep first
   // so the readout shows the post-GC state (no stale "expired" rows
@@ -265,6 +290,10 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // fetch. But if a registryFetch hook is explicitly provided (test hook
   // for the upgrade-hint branches), we honour it regardless of VITEST so
   // the hint branches are actually reachable under vitest.
+  // NOTE: this is the ONE deliberate process.env read in doctor (the rest
+  // route through opts.env). Tests pass a stripped `env: {}`, so VITEST
+  // would never be visible via opts.env; reading process.env directly is
+  // what lets the auto-skip fire under vitest. Kept intentional.
   const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
   const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
   const effectiveVersion = opts.currentVersion ?? VERSION;
@@ -363,32 +392,31 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     envOverrides[name] = raw === undefined || raw === "" ? null : raw;
   }
 
-  // STATE section data. Mirrors renderStateSection: YAW_MCP_DISABLE_PERSISTENCE
-  // short-circuits, otherwise we peek the file.
-  const persistRaw = env.YAW_MCP_DISABLE_PERSISTENCE;
-  const persistDisabled =
-    persistRaw !== undefined && persistRaw !== "" && (persistRaw === "1" || persistRaw.toLowerCase() === "true");
-  const state: DoctorJsonSnapshot["state"] = persistDisabled
-    ? { disabled: true, path: null, savedAt: null, learningEntries: null, packHistoryEntries: null }
-    : await (async () => {
-        const filePath = join(userConfigDir(home), STATE_FILENAME);
-        const persisted = await loadState(filePath);
-        const fresh = persisted.savedAt === 0;
-        return {
-          disabled: false,
-          path: filePath,
-          savedAt: fresh ? null : new Date(persisted.savedAt).toISOString(),
-          learningEntries: fresh ? 0 : Object.keys(persisted.learning).length,
-          packHistoryEntries: fresh ? 0 : persisted.packHistory.length,
-        };
-      })();
+  // STATE + RELIABILITY section data. Load state.json ONCE for both
+  // (previously loaded twice here). YAW_MCP_DISABLE_PERSISTENCE
+  // short-circuits to a null read; otherwise we read the file a single
+  // time and thread it into both blocks.
+  const persistDisabled = isPersistenceDisabled(env);
+  const stateFilePath = join(userConfigDir(home), STATE_FILENAME);
+  const persisted = persistDisabled ? null : await loadState(stateFilePath);
+  const state: DoctorJsonSnapshot["state"] =
+    persistDisabled || !persisted
+      ? { disabled: true, path: null, savedAt: null, learningEntries: null, packHistoryEntries: null }
+      : (() => {
+          const fresh = persisted.savedAt === 0;
+          return {
+            disabled: false,
+            path: stateFilePath,
+            savedAt: fresh ? null : new Date(persisted.savedAt).toISOString(),
+            learningEntries: fresh ? 0 : Object.keys(persisted.learning).length,
+            packHistoryEntries: fresh ? 0 : persisted.packHistory.length,
+          };
+        })();
 
   // Reliability rollup — same selectFlakyNamespaces path as renderReliabilitySection
   // and mcp_connect_health, so all three surfaces agree on "flaky."
   const reliability: DoctorJsonSnapshot["reliability"] = [];
-  if (!persistDisabled) {
-    const filePath = join(userConfigDir(home), STATE_FILENAME);
-    const persisted = await loadState(filePath);
+  if (!persistDisabled && persisted) {
     if (persisted.savedAt !== 0) {
       const entries = Object.entries(persisted.learning).map(([namespace, usage]) => ({ namespace, usage }));
       for (const { namespace, usage } of selectFlakyNamespaces(entries, 5)) {
@@ -409,6 +437,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // registryFetch bypasses the VITEST guard, and currentVersion overrides
   // the build-time VERSION. opts.argvPath is intentionally unused here --
   // the JSON snapshot's upgrade block carries no install method.
+  // The process.env.VITEST read here is the same deliberate exception
+  // documented on the text path's skipCheck above (opts.env is stripped
+  // to `{}` under vitest, so VITEST is only visible via process.env).
   const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
   const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
   const effectiveVersion = opts.currentVersion ?? VERSION;
@@ -489,20 +520,19 @@ function renderEnvSection(opts: {
 }
 
 async function renderStateSection(opts: {
-  home: string;
-  env: NodeJS.ProcessEnv;
+  filePath: string;
+  disabled: boolean;
+  /** State loaded once by the caller; null iff persistence is disabled. */
+  persisted: Awaited<ReturnType<typeof loadState>> | null;
   print: (s?: string) => void;
 }): Promise<void> {
-  const { home, env, print } = opts;
-  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
-  const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
+  const { filePath, disabled, persisted, print } = opts;
   print("STATE");
   if (disabled) {
     print("  status: disabled via YAW_MCP_DISABLE_PERSISTENCE");
     print("");
     return;
   }
-  const filePath = join(userConfigDir(home), STATE_FILENAME);
   print(`  path:   ${filePath}`);
   // Peek before delegating to loadState. loadState swallows malformed
   // JSON and version mismatches silently (returns emptyState), which is
@@ -528,8 +558,9 @@ async function renderStateSection(opts: {
     print("");
     return;
   }
-  const persisted = await loadState(filePath);
-  if (persisted.savedAt === 0) {
+  // persisted is non-null here: the caller only passes null when
+  // persistence is disabled, which the `disabled` branch above handled.
+  if (!persisted || persisted.savedAt === 0) {
     print("  (no persisted state yet — will be created on the first tool call)");
   } else {
     print(`  last saved:           ${formatRelativeAge(Date.now() - persisted.savedAt)} ago`);
@@ -575,18 +606,14 @@ async function peekStateFile(filePath: string): Promise<StatePeek> {
 // diagnostic and the LLM-facing health tool agree on what counts as
 // flaky. Silently omitted when persistence is disabled or nothing
 // qualifies — no point printing an empty header.
-async function renderReliabilitySection(opts: {
-  home: string;
-  env: NodeJS.ProcessEnv;
+function renderReliabilitySection(opts: {
+  disabled: boolean;
+  /** State loaded once by the caller; null iff persistence is disabled. */
+  persisted: Awaited<ReturnType<typeof loadState>> | null;
   print: (s?: string) => void;
-}): Promise<void> {
-  const { home, env, print } = opts;
-  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
-  const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
-  if (disabled) return;
-
-  const filePath = join(userConfigDir(home), STATE_FILENAME);
-  const persisted = await loadState(filePath);
+}): void {
+  const { disabled, persisted, print } = opts;
+  if (disabled || !persisted) return;
   if (persisted.savedAt === 0) return;
 
   const entries = Object.entries(persisted.learning).map(([namespace, usage]) => ({ namespace, usage }));
@@ -801,10 +828,11 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
   return cur as Record<string, unknown>;
 }
 
-// Async variant for code paths that prefer non-blocking I/O. Currently
-// unused — doctor runs once and the config files are tiny — but exported
-// so the dashboard could embed doctor output via an API later without
-// blocking the event loop.
+// Async variant for code paths that prefer non-blocking I/O. Used by
+// install-cmd.ts (runInstallList, for `yaw-mcp install --list`) and
+// try-cmd.ts (autoDetectClient, picking a client for a trial) — both
+// async contexts where the synchronous probeClients would block. Doctor
+// itself uses the sync probeClients (it runs once, interactively).
 export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbeResult[]> {
   const result: ClientProbeResult[] = [];
   for (const target of INSTALL_TARGETS) {
@@ -839,6 +867,11 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
       let malformed = false;
       if (exists) {
         try {
+          // stat to confirm it's a file (not a dir) before reading, for
+          // parity with the sync probeClients guard. A directory at the
+          // config path would otherwise throw EISDIR on readFile and get
+          // mislabeled "malformed" instead of being skipped cleanly.
+          await stat(resolved.absolute);
           const raw = await readFile(resolved.absolute, "utf8");
           if (raw.trim().length > 0) {
             const parsed = parseJsonc(raw);

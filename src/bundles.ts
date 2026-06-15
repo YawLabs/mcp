@@ -75,7 +75,7 @@ export interface BundleMatchResult {
  * Partition the curated bundles against a set of installed namespaces.
  *
  * - `ready`: every namespace in the bundle is installed — the caller can
- *   run `mcp_connect_activate namespaces=[...]` verbatim.
+ *   run `mcp_connect_activate({ servers: [...] })` verbatim.
  * - `partial`: at least one namespace is installed AND at least one is
  *   missing — surface the missing list so the user knows what to install.
  *

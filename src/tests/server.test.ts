@@ -563,6 +563,7 @@ describe("ConnectServer", () => {
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toContain("Refused");
       } finally {
+        // biome-ignore lint/performance/noDelete: env-var unset semantics require delete
         delete process.env.YAW_MCP_MIN_COMPLIANCE;
       }
     });

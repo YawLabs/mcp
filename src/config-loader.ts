@@ -193,7 +193,13 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   // Avoid double-loading when the discovered project dir IS the user-global dir.
   // findProjectConfigDir excludes $HOME, so this only triggers if someone passes
   // a non-homedir `home` override that happens to equal the walk-up match.
-  const projectIsGlobal = projectConfigDir !== null && projectConfigDir === globalDir;
+  // Normalize through resolve() (and case-fold on win32) so a case-variant or
+  // unnormalized home override doesn't byte-mismatch and double-load.
+  const normalizeDir = (d: string): string => {
+    const r = resolve(d);
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  };
+  const projectIsGlobal = projectConfigDir !== null && normalizeDir(projectConfigDir) === normalizeDir(globalDir);
   const project = projectIsGlobal || !projectPath ? null : await readConfigAt(projectPath, "project", warnings);
   if (project) loadedFiles.push(project);
 

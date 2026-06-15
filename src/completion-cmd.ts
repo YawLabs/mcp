@@ -120,7 +120,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: ["push", "pull", "status"],
     flags: ["--key", "--json", "--help"],
   },
-  { name: "stats", description: "Show usage statistics", flags: ["--key", "--limit", "--days", "--json", "--help"] },
+  { name: "stats", description: "Show usage statistics", flags: ["--limit", "--days", "--json", "--help"] },
   {
     name: "secrets",
     description: "Manage stored secrets",

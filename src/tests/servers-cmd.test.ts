@@ -321,6 +321,39 @@ describe("runServersCommand", () => {
     expect(parsed.servers[0].namespace).toBe("github");
   });
 
+  it("--json distinguishes filter-matched-nothing from no-servers (fix 9)", async () => {
+    // Case A: filter set, matched nothing -> filter echoed, filterMatched=false.
+    const ioA = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      filter: "stripe",
+      json: true,
+      out: ioA.push,
+      err: ioA.pushErr,
+      fetcher: async () => ({ configVersion: "v1", servers: [makeServer({ namespace: "github" })] }),
+    });
+    const a = JSON.parse(ioA.out.join("\n"));
+    expect(a.servers).toEqual([]);
+    expect(a.filter).toBe("stripe");
+    expect(a.filterMatched).toBe(false);
+
+    // Case B: no filter, account genuinely has no servers -> filter=null.
+    const ioB = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      json: true,
+      out: ioB.push,
+      err: ioB.pushErr,
+      fetcher: async () => ({ configVersion: "v0", servers: [] }),
+    });
+    const b = JSON.parse(ioB.out.join("\n"));
+    expect(b.servers).toEqual([]);
+    expect(b.filter).toBeNull();
+    expect(b.filterMatched).toBeNull();
+  });
+
   it("prints a no-match message when filter matches nothing", async () => {
     const cfg: ConnectConfig = {
       configVersion: "v1",

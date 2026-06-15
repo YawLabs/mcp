@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -16,6 +19,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ═══════════════════════════════════════════════════════════════════════
 
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
+
+// Point cacheDir() at an empty temp dir. Otherwise resolveUv()'s
+// `if (await exists(finalBin)) return finalBin` short-circuit finds a REAL
+// cached uv binary that a previous bootstrap left under the OS cache root
+// (e.g. %LOCALAPPDATA%\yaw-mcp\Cache) and RESOLVES -- defeating the spawn
+// mock and making the rejection-path tests below pass in clean CI but fail
+// on any dev box that has run uv. require() inside the factory because
+// vi.mock is hoisted above the top-level imports.
+vi.mock("../paths.js", () => {
+  const nodeOs = require("node:os");
+  const nodePath = require("node:path");
+  return {
+    cacheDir: () => nodePath.join(nodeOs.tmpdir(), "yaw-mcp-uvbf-test-cache"),
+  };
+});
 
 // Mock undici so resolveUv's download path fails fast rather than hitting
 // the network (which makes the test suite slow and flaky in CI).
@@ -52,8 +70,11 @@ beforeEach(() => {
   __resetUvBootstrap();
 });
 
-afterEach(() => {
+afterEach(async () => {
   __resetUvBootstrap();
+  // resolveUv() mkdir's the (mocked) cache dir before the download fails;
+  // clean the empty tree so we don't litter the OS temp dir.
+  await fs.rm(path.join(os.tmpdir(), "yaw-mcp-uvbf-test-cache"), { recursive: true, force: true }).catch(() => {});
 });
 
 // ── Fix 1: onPath passes the right shell option ───────────────────────

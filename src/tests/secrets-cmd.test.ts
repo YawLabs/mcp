@@ -201,7 +201,7 @@ describe("runSecrets pull -- empty-remote guard", () => {
   });
 });
 
-import { saveVault, vaultPath } from "../secrets-vault.js";
+import { lock, saveVault, vaultPath } from "../secrets-vault.js";
 import { putResource } from "../team-sync.js";
 
 describe("runSecrets pull -- salt-conflict protection", () => {
@@ -384,5 +384,53 @@ describe("runSecrets push -- edge cases", () => {
     const errOutput = io.err.mock.calls[0][0] as string;
     // Must mention session expiry or re-login.
     expect(errOutput.toLowerCase()).toMatch(/session expired|login/);
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets set -- wrong-passphrase and empty-passphrase rejection
+// -----------------------------------------------------------------------
+
+describe("runSecrets set -- passphrase guards", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const home = nodePath.join(os.tmpdir(), `yaw-test-set-${process.pid}`);
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock(); // clear any cached key from a prior test
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+    try {
+      await unlink(vaultPath(home));
+    } catch {
+      /* ok */
+    }
+  });
+
+  it("creates a vault on first set, then rejects a wrong passphrase on a later set", async () => {
+    // First set creates the vault under the correct passphrase.
+    const r1 = await runSecrets(
+      { action: "set", name: "github", value: "ghp_abc", passphrase: "correct-horse", home },
+      io,
+    );
+    expect(r1.exitCode).toBe(0);
+    lock(); // force re-derivation on the next call
+
+    // A second set with the WRONG passphrase must be rejected, not silently
+    // written under a bad key.
+    const r2 = await runSecrets(
+      { action: "set", name: "aws", value: "aws_xyz", passphrase: "wrong-passphrase", home },
+      io,
+    );
+    expect(r2.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput.toLowerCase()).toContain("wrong passphrase");
+  });
+
+  it('rejects an empty passphrase (no silent unlock under key derived from "")', async () => {
+    const r = await runSecrets({ action: "set", name: "github", value: "ghp_abc", passphrase: "", home }, io);
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput.toLowerCase()).toMatch(/passphrase required/);
   });
 });

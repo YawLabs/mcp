@@ -504,8 +504,9 @@ describe("upsertUserBundle round-trip", () => {
 });
 
 describe("runAdd env-at-rest [#3]", () => {
-  it("does NOT persist an ambient shell secret; seeds the key empty", async () => {
+  it("does NOT persist an ambient shell secret; seeds the key empty + warns", async () => {
     // GITHUB_PERSONAL_ACCESS_TOKEN comes from the SHELL (env), not --env.
+    const errLines: string[] = [];
     await runAdd({
       slug: "github",
       home: synthHome,
@@ -513,13 +514,17 @@ describe("runAdd env-at-rest [#3]", () => {
       env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_shell_secret" },
       fetchCatalog,
       out: () => {},
-      err: () => {},
+      err: (s) => errLines.push(s),
     });
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     const entry = loaded.config?.servers.find((s) => s.namespace === "github");
     // Key is present (seeded) but the ambient secret is NOT written to disk.
     expect(entry?.env?.GITHUB_PERSONAL_ACCESS_TOKEN).toBe("");
     expect(JSON.stringify(loaded.config)).not.toContain("ghp_shell_secret");
+    // A note warns that the ambient var is not persisted and is needed at launch.
+    const note = errLines.join("\n");
+    expect(note).toContain("GITHUB_PERSONAL_ACCESS_TOKEN");
+    expect(note).toMatch(/NOT persisted/);
   });
 
   it("DOES persist a value passed explicitly via --env", async () => {

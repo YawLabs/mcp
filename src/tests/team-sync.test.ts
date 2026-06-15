@@ -219,6 +219,35 @@ describe("getCachedCookie", () => {
     expect(session).toBeNull();
   });
 
+  it("does not cross sessions when a second home has a different session file", async () => {
+    // Home A and home B each have their own session file with distinct
+    // cookies/emails. The module-global cache is keyed by filePath, so
+    // loading B after A must NOT return A's cached session.
+    const homeB = path.join(os.tmpdir(), `yaw-team-sync-test-B-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(path.join(homeB, ".yaw-mcp"), { recursive: true });
+
+    await writeSession(tmpHome, "cookie-home-A");
+    await writeFile(
+      path.join(homeB, ".yaw-mcp", "team-session.json"),
+      JSON.stringify({
+        cookie: "cookie-home-B",
+        session: { email: "userB@example.com", role: "member", order_id: "ord-B", exp: Date.now() + 86_400_000 },
+      }),
+    );
+
+    // Warm the cache from home A.
+    const a = await getSession({ home: tmpHome });
+    expect(a?.email).toBe("user@example.com");
+    expect(getCachedCookie()).toBe("cookie-home-A");
+
+    // Loading home B must re-read from B's file, not return A's cached state.
+    const b = await getSession({ home: homeB });
+    expect(b?.email).toBe("userB@example.com");
+    expect(getCachedCookie()).toBe("cookie-home-B");
+
+    await rm(homeB, { recursive: true, force: true });
+  });
+
   it("does not read the session file a second time (cache hit, no new fetch calls)", async () => {
     await writeSession(tmpHome, "cookie-456");
     // Warm the cache.

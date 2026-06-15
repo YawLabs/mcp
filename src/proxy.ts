@@ -276,9 +276,10 @@ export async function routeResourceRead(
   try {
     const result = await connection.client.readResource({ uri: route.originalUri });
     return result as ResourceContents;
-  } catch (err: any) {
-    log("error", "Resource read failed", { uri, namespace: route.namespace, error: err.message });
-    return { contents: [{ uri, text: `Error: ${err.message}` }] };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", "Resource read failed", { uri, namespace: route.namespace, error: message });
+    return { contents: [{ uri, text: `Error: ${message}` }] };
   }
 }
 
@@ -303,9 +304,10 @@ export async function routePromptGet(
   try {
     const result = await connection.client.getPrompt({ name: route.originalName, arguments: args });
     return result as { messages: Array<{ role: string; content: { type: string; text: string } }> };
-  } catch (err: any) {
-    log("error", "Prompt get failed", { name, namespace: route.namespace, error: err.message });
-    return { messages: [{ role: "user", content: { type: "text", text: `Error: ${err.message}` } }] };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("error", "Prompt get failed", { name, namespace: route.namespace, error: message });
+    return { messages: [{ role: "user", content: { type: "text", text: `Error: ${message}` } }] };
   }
 }
 

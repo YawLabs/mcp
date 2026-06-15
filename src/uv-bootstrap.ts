@@ -124,10 +124,29 @@ async function onPath(cmd: string): Promise<boolean> {
 // directly to disk would leave a partially-written, unverified file
 // if the process is killed mid-download. The one-shot memory cost is
 // acceptable given that this path runs at most once per uv version.
+// undici's request() has no default headersTimeout/bodyTimeout, so a
+// stalled GitHub CDN connection would hang ensureUv() (and thus first
+// Python-server activation) indefinitely. Cap both at 30s and surface
+// a clear "uv download timed out" error rather than blocking forever.
+const UV_FETCH_TIMEOUT_MS = 30_000;
+
 async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
   let current = url;
   for (let i = 0; i < maxHops; i++) {
-    const res = await request(current, { method: "GET" });
+    let res: Awaited<ReturnType<typeof request>>;
+    try {
+      res = await request(current, {
+        method: "GET",
+        headersTimeout: UV_FETCH_TIMEOUT_MS,
+        bodyTimeout: UV_FETCH_TIMEOUT_MS,
+      });
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
+        throw new Error(`uv download timed out after ${UV_FETCH_TIMEOUT_MS}ms (${current})`);
+      }
+      throw e;
+    }
     if (res.statusCode >= 300 && res.statusCode < 400) {
       const loc = res.headers.location;
       if (!loc) throw new Error(`Redirect without Location header from ${current}`);
@@ -139,7 +158,15 @@ async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
       await res.body.dump();
       throw new Error(`GET ${current} failed: HTTP ${res.statusCode}`);
     }
-    return Buffer.from(await res.body.arrayBuffer());
+    try {
+      return Buffer.from(await res.body.arrayBuffer());
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
+        throw new Error(`uv download timed out after ${UV_FETCH_TIMEOUT_MS}ms (${current})`);
+      }
+      throw e;
+    }
   }
   throw new Error(`Too many redirects starting at ${url}`);
 }
@@ -150,6 +177,25 @@ async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
 async function extractArchive(archivePath: string, destDir: string): Promise<void> {
   await fs.mkdir(destDir, { recursive: true });
   if (process.platform === "win32") {
+    // SECURITY INVARIANT: archivePath and destDir MUST remain
+    // non-user-controlled. Both derive from cacheDir() + fixed
+    // ("uv"/UV_VERSION/archiveName/extract-<pid>-<ts>) segments -- no
+    // user input flows in. The PowerShell -Command string below
+    // single-quote-escapes them (' -> ''), which is safe ONLY for
+    // single-line, single-quote-free inputs. A newline or an
+    // unescapable construct would break out of the quoted literal, so
+    // we hard-validate here and throw rather than build a command we
+    // can't prove safe. If a future change ever routes user input into
+    // either path, this guard must be revisited (proper arg-array
+    // escaping), not relaxed.
+    for (const [label, p] of [
+      ["archivePath", archivePath],
+      ["destDir", destDir],
+    ] as const) {
+      if (/['\r\n]/.test(p)) {
+        throw new Error(`Refusing to extract uv archive: ${label} contains a quote or newline (${JSON.stringify(p)})`);
+      }
+    }
     await runCommand("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
@@ -249,17 +295,24 @@ async function resolveUv(): Promise<string> {
     yield archiveBuf;
   }, createWriteStream(archivePath));
 
-  const extractDir = path.join(installDir, "extract");
-  await fs.rm(extractDir, { recursive: true, force: true });
-  await extractArchive(archivePath, extractDir);
+  // Extract into a per-attempt unique dir so two concurrent yaw-mcp
+  // processes (separate PIDs) don't clobber each other's mid-extract
+  // files in a shared fixed path. We rm only OUR dir in finally; the
+  // final atomic rename onto finalBin handles winner-takes-all between
+  // the racing processes.
+  const extractDir = path.join(installDir, `extract-${process.pid}-${Date.now()}`);
+  try {
+    await extractArchive(archivePath, extractDir);
 
-  const extracted = await findBinary(extractDir, binName());
-  if (!extracted) throw new Error(`uv binary not found inside ${archiveName}`);
+    const extracted = await findBinary(extractDir, binName());
+    if (!extracted) throw new Error(`uv binary not found inside ${archiveName}`);
 
-  await fs.rename(extracted, finalBin);
-  await fs.chmod(finalBin, 0o755).catch(() => {}); // no-op on Windows
-  await fs.rm(extractDir, { recursive: true, force: true });
-  await fs.rm(archivePath, { force: true });
+    await fs.rename(extracted, finalBin);
+    await fs.chmod(finalBin, 0o755).catch(() => {}); // no-op on Windows
+  } finally {
+    await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(archivePath, { force: true }).catch(() => {});
+  }
 
   log("info", "uv bootstrap complete", { bin: finalBin });
   return finalBin;

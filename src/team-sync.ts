@@ -100,17 +100,19 @@ function expMs(session: { exp: number }): number {
   return e > 0 && e < 1e12 ? e * 1000 : e;
 }
 
-let cachedState: { state: StoredState | null } | null = null;
+let cachedState: { filePath: string; state: StoredState | null } | null = null;
 
 function invalidateState(): void {
   cachedState = null;
 }
 
 async function loadStoredState(filePath: string): Promise<StoredState | null> {
-  if (cachedState) {
+  // Only honor the cache when it was populated from the SAME filePath --
+  // a process operating on two homes must not cross sessions.
+  if (cachedState && cachedState.filePath === filePath) {
     const s = cachedState.state;
     if (s && expMs(s.session) < Date.now()) {
-      cachedState = { state: null };
+      cachedState = { filePath, state: null };
       return null;
     }
     return s;
@@ -127,15 +129,15 @@ async function loadStoredState(filePath: string): Promise<StoredState | null> {
     parsed = null;
   }
   if (parsed && expMs(parsed.session) < Date.now()) {
-    cachedState = { state: null };
+    cachedState = { filePath, state: null };
     return null;
   }
-  cachedState = { state: parsed };
+  cachedState = { filePath, state: parsed };
   return parsed;
 }
 
 async function saveStoredState(filePath: string, state: StoredState): Promise<void> {
-  cachedState = { state };
+  cachedState = { filePath, state };
   try {
     await atomicWriteFile(filePath, JSON.stringify(state, null, 2));
     if (process.platform !== "win32") {

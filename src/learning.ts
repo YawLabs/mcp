@@ -42,6 +42,11 @@ export interface NamespaceUsage {
 }
 
 export class LearningStore {
+  // Growth bound: the map keys on namespace, and recordDispatch is only
+  // reached with validated/bounded namespaces from the dispatch path, so
+  // cardinality is capped by the number of distinct configured namespaces.
+  // No explicit cap is needed unless untrusted strings can reach
+  // recordDispatch (they cannot today).
   private usage = new Map<string, NamespaceUsage>();
 
   recordDispatch(namespace: string): void {
@@ -138,7 +143,14 @@ export class LearningStore {
   loadSnapshot(snapshot: Record<string, NamespaceUsage>): void {
     this.usage.clear();
     for (const [ns, usage] of Object.entries(snapshot)) {
-      this.usage.set(ns, { dispatched: usage.dispatched, succeeded: usage.succeeded, lastUsedAt: usage.lastUsedAt });
+      // Enforce the store's own invariants rather than trusting upstream
+      // sanitization: reject negatives/NaN (coerce to 0) and clamp
+      // succeeded <= dispatched so the rate computation stays in [0, 1].
+      const dispatched = Number.isFinite(usage.dispatched) ? Math.max(0, usage.dispatched) : 0;
+      const succeededRaw = Number.isFinite(usage.succeeded) ? Math.max(0, usage.succeeded) : 0;
+      const succeeded = Math.min(succeededRaw, dispatched);
+      const lastUsedAt = Number.isFinite(usage.lastUsedAt) ? usage.lastUsedAt : 0;
+      this.usage.set(ns, { dispatched, succeeded, lastUsedAt });
     }
   }
 }

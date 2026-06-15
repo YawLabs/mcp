@@ -47,6 +47,7 @@ export const SYNC_USAGE = `Usage: yaw-mcp sync <push|pull|status> [--json]
   Sign in first with \`yaw-mcp login --key <license-key>\`.`;
 
 export const BUNDLES_FILENAME = "bundles.json";
+export const SYNC_STATE_FILENAME = "sync-state.json";
 export const MCP_BUNDLES_RESOURCE = "mcp_bundles";
 
 export interface SyncCommandOptions {
@@ -87,8 +88,43 @@ interface LocalBundlesFile {
   servers: Partial<UpstreamServerConfig>[];
 }
 
+/** Sidecar tracking the remote resource version this machine last pulled.
+ *  Push submits THIS version (not a freshly-GET'd one) so optimistic
+ *  concurrency can actually fire when the remote moved ahead since the
+ *  last pull. */
+interface SyncState {
+  mcp_bundles?: { lastPulledVersion: number };
+}
+
 function bundlesPath(home: string): string {
   return join(home, CONFIG_DIRNAME, BUNDLES_FILENAME);
+}
+
+function syncStatePath(home: string): string {
+  return join(home, CONFIG_DIRNAME, SYNC_STATE_FILENAME);
+}
+
+/** Read the sync-state sidecar. Tolerates an absent or malformed file by
+ *  returning {} -- a missing last-pulled version simply means "never
+ *  pulled", which the push path handles by falling back to the GET'd
+ *  remote version (seeding). */
+async function readSyncState(home: string): Promise<SyncState> {
+  const path = syncStatePath(home);
+  if (!existsSync(path)) return {};
+  try {
+    const raw = await readFile(path, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed as SyncState;
+  } catch {
+    return {};
+  }
+}
+
+async function writeSyncState(home: string, state: SyncState): Promise<void> {
+  const path = syncStatePath(home);
+  await mkdir(dirname(path), { recursive: true });
+  await atomicWriteFile(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 async function readLocalBundles(home: string): Promise<LocalBundlesFile> {
@@ -151,6 +187,25 @@ function mergeLocalEnv(
   });
 }
 
+/** isActive is remote-authoritative: `set-active` is the sole intended
+ *  writer of each server's isActive on the remote. For each local server,
+ *  if a remote server with the SAME namespace exists AND carries an
+ *  isActive field, take the REMOTE value (overriding whatever stale local
+ *  value a push would otherwise clobber it with). Servers with no remote
+ *  match keep their local isActive -- those are genuinely new servers this
+ *  push is seeding onto the remote for the first time. */
+function mergeRemoteActive(
+  localStripped: Partial<UpstreamServerConfig>[],
+  remoteServers: Partial<UpstreamServerConfig>[],
+): Partial<UpstreamServerConfig>[] {
+  const remoteByNs = new Map(remoteServers.filter((s) => s.namespace).map((s) => [s.namespace as string, s]));
+  return localStripped.map((srv) => {
+    const matched = srv.namespace ? remoteByNs.get(srv.namespace) : undefined;
+    if (!matched || matched.isActive === undefined) return srv;
+    return { ...srv, isActive: matched.isActive };
+  });
+}
+
 export async function runSync(
   opts: SyncCommandOptions,
   io: { out: (s: string) => void; err: (s: string) => void } = {
@@ -193,7 +248,11 @@ async function syncStatus(
     home: opts.home,
     baseUrl: opts.baseUrl,
   });
-  const local = await readLocalBundles(home).catch(() => ({ servers: [] }) as LocalBundlesFile);
+  // Let a corrupt local bundles.json propagate (as syncPull/syncPush do)
+  // rather than silently reporting everything as remote-only.
+  const local = await readLocalBundles(home);
+  const syncState = await readSyncState(home);
+  const lastPulledVersion = syncState.mcp_bundles?.lastPulledVersion ?? null;
   const localNs = new Set(local.servers.map((s) => s.namespace).filter((n): n is string => typeof n === "string"));
   const remoteNs = new Set(
     (remote.data?.servers ?? []).map((s) => s.namespace).filter((n): n is string => typeof n === "string"),
@@ -209,6 +268,7 @@ async function syncStatus(
           signedInAs: session.email,
           role: session.role,
           remoteVersion: remote.version,
+          lastPulledVersion,
           localOnly,
           remoteOnly,
           updatedAt: remote.updated_at,
@@ -223,6 +283,7 @@ async function syncStatus(
     io.out(`Remote mcp_bundles: version ${remote.version}`);
     if (remote.updated_at) io.out(`, updated ${remote.updated_at} by ${remote.updated_by ?? "unknown"}`);
     io.out("\n");
+    io.out(lastPulledVersion === null ? "Last pulled: never pulled.\n" : `Last pulled: v${lastPulledVersion}.\n`);
     if (localOnly.length > 0) io.out(`Local-only servers: ${localOnly.join(", ")}\n`);
     if (remoteOnly.length > 0) io.out(`Remote-only servers: ${remoteOnly.join(", ")}\n`);
     if (localOnly.length === 0 && remoteOnly.length === 0) io.out("Server lists match (env values not compared).\n");
@@ -243,6 +304,9 @@ async function syncPull(
   const local = await readLocalBundles(home);
   const merged = mergeLocalEnv(remoteServers, local.servers);
   const written = await writeLocalBundles(home, { version: 1, servers: merged });
+  // Persist the version we just pulled so a later push submits IT (not a
+  // freshly-GET'd version) and optimistic concurrency can actually fire.
+  await writeSyncState(home, { mcp_bundles: { lastPulledVersion: remote.version } });
   if (opts.json) {
     io.out(
       `${JSON.stringify({ ok: true, written, serverCount: merged.length, remoteVersion: remote.version }, null, 2)}\n`,
@@ -260,19 +324,33 @@ async function syncPush(
   home: string,
 ): Promise<SyncCommandResult> {
   const local = await readLocalBundles(home);
-  // Learn current remote version so the optimistic-concurrency PUT
-  // accepts us. Costs one extra round-trip per push -- acceptable for
-  // a manual command.
+  // GET the remote so we can merge its authoritative isActive into our
+  // payload (FIX A). We do NOT push against this freshly-GET'd version --
+  // see below.
   const remote = await getResource<LocalBundlesFile>(MCP_BUNDLES_RESOURCE, {
     home: opts.home,
     baseUrl: opts.baseUrl,
   });
-  const stripped = local.servers.map(stripEnvValues);
+  const remoteServers = remote.data?.servers ?? [];
+  // isActive is remote-authoritative; set-active is the sole intended
+  // writer; push preserves remote toggles (only seeds isActive for servers
+  // not yet on the remote).
+  const stripped = mergeRemoteActive(local.servers.map(stripEnvValues), remoteServers);
   const payload: LocalBundlesFile = { version: 1, servers: stripped };
-  const res = await putResource<LocalBundlesFile>(MCP_BUNDLES_RESOURCE, remote.version, payload, {
+  // Push against the LAST-PULLED version, not the just-GET'd one: if the
+  // remote moved ahead since our last pull, the server 409s and the
+  // stale-version handler tells the user to pull + reconcile + push. If we
+  // never pulled (first push to seed), fall back to the GET'd version so
+  // seeding still works.
+  const syncState = await readSyncState(home);
+  const lastPulled = syncState.mcp_bundles?.lastPulledVersion;
+  const pushVersion = lastPulled ?? remote.version;
+  const res = await putResource<LocalBundlesFile>(MCP_BUNDLES_RESOURCE, pushVersion, payload, {
     home: opts.home,
     baseUrl: opts.baseUrl,
   });
+  // After a successful push, this machine is current at res.version.
+  await writeSyncState(home, { mcp_bundles: { lastPulledVersion: res.version } });
   if (opts.json) {
     io.out(`${JSON.stringify({ ok: true, serverCount: stripped.length, newVersion: res.version }, null, 2)}\n`);
   } else {

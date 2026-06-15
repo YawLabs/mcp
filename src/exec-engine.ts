@@ -226,6 +226,11 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
     return { ok: false, message: `too many steps (${steps.length}); max is ${MAX_EXEC_STEPS}` };
   }
   const seenIds = new Set<string>();
+  // Positional fallback slots ("0".."N-1") reserved by UNNAMED steps. An
+  // explicit id that is a pure-integer string colliding with one of these
+  // slots would silently overwrite the other step in the bindings map, so
+  // a later `$ref:"0.foo"` / `return:"0"` resolves to the wrong step.
+  const positionalSlots = new Set<string>();
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (step === null || typeof step !== "object" || Array.isArray(step)) {
@@ -243,9 +248,21 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
         return { ok: false, message: `step ${i}: duplicate id "${s.id}"` };
       }
       seenIds.add(s.id);
+    } else {
+      positionalSlots.add(String(i));
     }
     if (s.args !== undefined && (s.args === null || typeof s.args !== "object" || Array.isArray(s.args))) {
       return { ok: false, message: `step ${i}: \`args\` must be an object if provided` };
+    }
+  }
+  // Reject explicit ids that collide with another step's positional slot --
+  // both would bind under the same key and the second overwrites the first.
+  for (const id of seenIds) {
+    if (positionalSlots.has(id)) {
+      return {
+        ok: false,
+        message: `step id "${id}" collides with the positional binding key of an unnamed step; rename it`,
+      };
     }
   }
   if (ret !== undefined) {

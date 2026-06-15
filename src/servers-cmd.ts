@@ -164,7 +164,16 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   };
 
   if (opts.json) {
-    print(JSON.stringify(merged, null, 2));
+    // Echo the active filter (if any) and whether it matched, so a script
+    // consuming `servers --json` can distinguish "filter matched nothing"
+    // (filter set, filterMatched=false) from "account has no servers"
+    // (filter null) -- the table branch already explains this in prose.
+    const payload = {
+      ...merged,
+      filter: opts.filter ?? null,
+      filterMatched: opts.filter ? merged.servers.length > 0 : null,
+    };
+    print(JSON.stringify(payload, null, 2));
     return { exitCode: 0, lines };
   }
 

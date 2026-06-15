@@ -185,12 +185,16 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
     totalLen.toolName += fields.toolName.length;
     totalLen.toolDescription += fields.toolDescription.length;
   }
+  // Local divide-by-zero guard: rankServers early-returns on an empty
+  // corpus so N>0 here today, but clamp the divisor so this block is
+  // self-safe and won't emit NaN if the guard ever moves.
+  const denom = Math.max(N, 1);
   const avgFieldLen: Record<keyof DocFields, number> = {
-    namespace: totalLen.namespace / N,
-    name: totalLen.name / N,
-    description: totalLen.description / N,
-    toolName: totalLen.toolName / N,
-    toolDescription: totalLen.toolDescription / N,
+    namespace: totalLen.namespace / denom,
+    name: totalLen.name / denom,
+    description: totalLen.description / denom,
+    toolName: totalLen.toolName / denom,
+    toolDescription: totalLen.toolDescription / denom,
   };
 
   const results: RankedResult[] = [];

@@ -23,45 +23,65 @@ export function initRuntimeDetect(url: string, tok: string): void {
   token = tok;
 }
 
-interface Probe {
+interface ProbeCandidate {
   bin: string;
   args: string[];
+}
+
+interface Probe {
+  // One or more launch candidates tried in order; the first whose
+  // process exits 0 wins. Most runtimes have a single candidate; python
+  // has several because the binary name varies by platform/install
+  // (py launcher on Windows, python3 vs python on posix).
+  candidates: ProbeCandidate[];
   // Parser pulls the first version-shaped token out of the command
   // output. Returns true (binary present, no version captured) when the
   // probe succeeded but the output didn't include a parseable version.
   parse?: (output: string) => string | true;
 }
 
+// python is intentionally probed across a per-platform candidate list:
+// hard-coding `python` on win32 false-negatives when only the `py`
+// launcher or `python3` is installed; hard-coding `python3` on posix
+// misses installs that only expose `python`. First candidate that exits
+// 0 with a parseable version wins.
+const PYTHON_CANDIDATES: ProbeCandidate[] =
+  process.platform === "win32"
+    ? [
+        { bin: "py", args: ["-3", "--version"] },
+        { bin: "python", args: ["--version"] },
+        { bin: "python3", args: ["--version"] },
+      ]
+    : [
+        { bin: "python3", args: ["--version"] },
+        { bin: "python", args: ["--version"] },
+      ];
+
 const PROBES: Record<string, Probe> = {
   node: {
-    bin: "node",
-    args: ["--version"],
+    candidates: [{ bin: "node", args: ["--version"] }],
     parse: (out) => out.trim().replace(/^v/, "") || true,
   },
   npx: {
-    bin: "npx",
-    args: ["--version"],
+    candidates: [{ bin: "npx", args: ["--version"] }],
     parse: (out) => out.trim() || true,
   },
   python: {
-    bin: process.platform === "win32" ? "python" : "python3",
-    args: ["--version"],
+    candidates: PYTHON_CANDIDATES,
     parse: (out) => {
       const m = out.match(/Python\s+(\d+\.\d+\.\d+)/);
       return m ? m[1] : true;
     },
   },
   uvx: {
-    bin: "uvx",
-    args: ["--version"],
+    candidates: [{ bin: "uvx", args: ["--version"] }],
     parse: (out) => {
       const m = out.match(/(\d+\.\d+\.\d+)/);
       return m ? m[1] : true;
     },
   },
   docker: {
-    bin: "docker",
-    args: ["--version"],
+    candidates: [{ bin: "docker", args: ["--version"] }],
     parse: (out) => {
       const m = out.match(/Docker version (\d+\.\d+\.\d+)/);
       return m ? m[1] : true;
@@ -69,10 +89,10 @@ const PROBES: Record<string, Probe> = {
   },
 };
 
-// Run one probe with a hard timeout. Resolves to a version string,
+// Run one candidate with a hard timeout. Resolves to a version string,
 // `true` (present without parseable version), or `false` (absent /
 // errored / timed out). Never throws.
-async function probe(name: string, p: Probe): Promise<string | boolean> {
+async function probeCandidate(c: ProbeCandidate, parse: Probe["parse"]): Promise<string | boolean> {
   return new Promise((resolve) => {
     let settled = false;
     const settle = (v: string | boolean) => {
@@ -85,7 +105,7 @@ async function probe(name: string, p: Probe): Promise<string | boolean> {
     let stderr = "";
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(p.bin, p.args, {
+      child = spawn(c.bin, c.args, {
         stdio: ["ignore", "pipe", "pipe"],
         // Windows needs a shell for PATH lookup of .cmd/.bat shims —
         // node/npx/uvx arrive as `npx.cmd` in PATH, and native spawn
@@ -130,16 +150,25 @@ async function probe(name: string, p: Probe): Promise<string | boolean> {
       }
       // Some tools (older python) print to stderr instead of stdout.
       const text = stdout || stderr;
-      if (p.parse) {
-        const parsed = p.parse(text);
+      if (parse) {
+        const parsed = parse(text);
         settle(parsed);
       } else {
         settle(true);
       }
     });
-
-    void name; // reserved for future per-probe logging
   });
+}
+
+// Try each candidate in order; the first that reports present wins
+// (keeping its parsed version). Returns false only if every candidate
+// is absent / errors / times out. Never throws.
+async function probe(_name: string, p: Probe): Promise<string | boolean> {
+  for (const c of p.candidates) {
+    const result = await probeCandidate(c, p.parse);
+    if (result !== false) return result;
+  }
+  return false;
 }
 
 // Detect every known runtime in parallel, build a flat snapshot. Each

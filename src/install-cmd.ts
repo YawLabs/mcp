@@ -246,7 +246,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     if (opts.force) decision = "overwrite";
     else if (opts.skip) decision = "skip";
     else if (opts.promptAnswer) decision = opts.promptAnswer;
-    else if (opts.io?.isTTY ?? process.stdout.isTTY) {
+    else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {
       decision = await promptCollision(resolved.absolute, opts.io);
     } else {
       err(
@@ -584,6 +584,18 @@ async function composeYawMcpConfig(path: string, token: string): Promise<{ json:
         const parsed = parseJsonc(raw);
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
           existing = parsed as Record<string, unknown>;
+        } else {
+          // Valid JSON but not an object (array/string/number/boolean/null):
+          // we still discard it and write our object shape, so back up the
+          // original bytes first -- same recovery guarantee as the
+          // unparseable case below.
+          const candidate = `${path}.bak-${Date.now()}`;
+          try {
+            await atomicWriteFile(candidate, raw);
+            backupPath = candidate;
+          } catch {
+            // Couldn't write backup; not fatal. Proceed with overwrite.
+          }
         }
       } catch {
         // Malformed file: copy raw bytes aside before we overwrite, so

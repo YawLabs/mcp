@@ -182,17 +182,32 @@ describe("pruneContent", () => {
     expect(parsed[0].extras).toBeUndefined();
   });
 
-  it("replaces fully-pruned array elements with null, not removes them (fix 4)", () => {
-    // Array elements that are entirely null/empty objects should become null,
-    // not disappear, so indices are preserved.
+  it("preserves an OBJECT element that prunes to empty as {}, not null (fix 6)", () => {
+    // An object element whose every value prunes away keeps its object shape
+    // as `{}` (so a list of rows stays a list of objects), and stays in place.
     const raw = JSON.stringify([{ keep: "value" }, { drop: null }, { keep: "another" }]);
     const r = pruneContent([{ type: "text", text: raw }]);
     const parsed = JSON.parse(r.content[0].text);
     expect(parsed).toHaveLength(3);
     expect(parsed[0]).toEqual({ keep: "value" });
-    // Index 1 pruned to null (its only key was null-valued), NOT removed.
-    expect(parsed[1]).toBeNull();
+    // Index 1 was an object that pruned to empty -> {} (shape preserved), NOT null.
+    expect(parsed[1]).toEqual({});
     expect(parsed[2]).toEqual({ keep: "another" });
+  });
+
+  it("replaces fully-pruned NON-object array elements with null (fix 6)", () => {
+    // Non-object elements (null, empty array) that prune away still become
+    // null placeholders so indices stay stable. The first element carries
+    // droppable fields so the overall result still clears the min-savings
+    // gate (null is wider than [], so without real savings elsewhere the
+    // pruner would keep the original unchanged).
+    const raw = JSON.stringify([{ keep: "value", a: null, b: null, c: null }, null, []]);
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed).toHaveLength(3);
+    expect(parsed[0]).toEqual({ keep: "value" });
+    expect(parsed[1]).toBeNull();
+    expect(parsed[2]).toBeNull();
   });
 
   it("still returns undefined for a zero-length array (empty array = no info, fix 4)", () => {
