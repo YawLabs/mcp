@@ -25,6 +25,10 @@ interface DispatchRecord {
   // so similarity is a straight set operation with no re-tokenizing.
   tokens: Set<string>;
   time: number;
+  // True once ANY reply (clean or not) has been observed for this record.
+  // The SECOND observed reply flips furtherUse, so an error-then-success
+  // sequence still counts as "kept using" and can't be a loser.
+  replied: boolean;
   // First clean reply flips this true. It's the precondition for being a
   // miss candidate at all: a server that never replied cleanly wasn't
   // "tried and abandoned", it just failed.
@@ -70,10 +74,18 @@ export class RedispatchTracker {
 
   // Record a new dispatch decision. intentTokens = tokenize(intent).
   push(namespace: string, intentTokens: string[], now: number): void {
+    // A re-dispatch to a namespace means any earlier un-consumed record for
+    // that same namespace was NOT abandoned -- the model came back to it.
+    // Mark those furtherUse so a second clean dispatch to A can't leave the
+    // first record frozen as a false abandoned-clean loser candidate.
+    for (const rec of this.ring) {
+      if (rec.namespace === namespace && !rec.consumed) rec.furtherUse = true;
+    }
     this.ring.push({
       namespace,
       tokens: new Set(intentTokens),
       time: now,
+      replied: false,
       cleanReply: false,
       furtherUse: false,
       consumed: false,
@@ -96,13 +108,13 @@ export class RedispatchTracker {
       const rec = this.ring[i];
       if (rec.namespace !== namespace) continue;
 
-      if (!rec.cleanReply) {
-        // First reply we've seen for this record.
+      if (!rec.replied) {
+        // First reply we've seen for this record (clean or not).
+        rec.replied = true;
         if (clean) rec.cleanReply = true;
-        // A non-clean first reply leaves cleanReply false (still failed),
-        // and does NOT count as "further use".
       } else {
-        // Already had a clean reply, now it's being used again.
+        // A second (or later) reply of ANY kind -- clean OR error -- means
+        // the server kept getting used, so it was not abandoned.
         rec.furtherUse = true;
       }
       return;

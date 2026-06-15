@@ -121,6 +121,31 @@ describe("RedispatchTracker", () => {
     expect(miss).toEqual({ loser: "jira" });
   });
 
+  it("does not fire a stale same-namespace record after a second dispatch to it", () => {
+    const t = new RedispatchTracker();
+    t.push("github", tokenize(INTENT_A), 1000);
+    t.markReply("github", true); // R1 clean -> looks abandoned-clean
+    // A second, later dispatch to github (R2) means github was NOT abandoned;
+    // push must flag the earlier un-consumed github record as furtherUse.
+    t.push("github", tokenize("create github milestone board"), 1500);
+    t.markReply("github", true); // marks R2, not R1
+    // Without the push-time furtherUse marking, R1 would fire here as a false
+    // miss even though github was used cleanly twice.
+    const miss = t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude);
+    expect(miss).toBeNull();
+  });
+
+  it("treats an error-then-success sequence as kept-using, not abandoned-clean", () => {
+    const t = new RedispatchTracker();
+    t.push("github", tokenize(INTENT_A), 1000);
+    t.markReply("github", false); // first reply errored
+    t.markReply("github", true); // second reply clean -> furtherUse (used twice)
+    // Pre-fix this left {cleanReply:true, furtherUse:false} and fired a false
+    // miss; now the second reply flips furtherUse so it never qualifies.
+    const miss = t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude);
+    expect(miss).toBeNull();
+  });
+
   it("evicts the oldest record once the ring exceeds capacity", () => {
     const t = new RedispatchTracker();
     // Push the abandoned candidate first, then 8 more to evict it (cap 8).

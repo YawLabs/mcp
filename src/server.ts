@@ -71,7 +71,13 @@ import { type RankableServer, rankServers, scoreRelevance, tokenize } from "./re
 import { initRerank, rerank } from "./rerank.js";
 import { computeOutcomeReward } from "./reward.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
-import { bestOfNViaSampling, buildCandidates, parseRouteEffort, shouldSample } from "./sampling-rank.js";
+import {
+  bestOfNViaSampling,
+  buildCandidates,
+  parseRouteEffort,
+  sampleCountForEffort,
+  shouldSample,
+} from "./sampling-rank.js";
 import { type LoadedSlot, evaluateServerCap, resolveServerCap } from "./server-cap.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
@@ -2201,7 +2207,7 @@ export class ConnectServer {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
       const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, this.toolCache);
-      const samples = effort === "aggressive" ? 3 : 1;
+      const samples = sampleCountForEffort(effort);
       const picked = await bestOfNViaSampling(this.server, trimmed, candidates, samples);
       if (picked) {
         const winner = ranked.find((r) => r.namespace === picked);
@@ -3329,13 +3335,23 @@ export class ConnectServer {
 
       if (stepResult.isError) {
         const errText = stepResult.content?.[0]?.text ?? "unknown error";
-        if (stepNs) {
-          // -32602 = invalid params (proxy.ts tags the text "[code=-32602]").
-          // When the failing step consumed $ref data from earlier steps, the
-          // bad input likely came from a producer — split the blame (0.5
-          // each) instead of full-blaming this server. Transport / other
-          // errors are this server's own failure (0.0).
-          const inputShaped = errText.includes("[code=-32602]");
+        // Internal routing/cache faults (stale toolCache, dropped connection,
+        // failed auto-reconnect, unknown tool) are NOT the upstream's failure,
+        // so don't penalize the namespace's reliability for them.
+        const routingFault =
+          errText.includes("no longer available") ||
+          errText.includes("no longer connected") ||
+          errText.includes("auto-reconnect failed") ||
+          errText.includes("Unknown tool:");
+        if (stepNs && !routingFault) {
+          // Invalid-params is recognized either by the transport-level code
+          // tag ("[code=-32602]") OR by classifyError on a structured isError
+          // body (the common MCP self-validation pattern, which carries no
+          // code tag). When the failing step consumed $ref data from earlier
+          // steps, the bad input likely came from a producer — split the blame
+          // (0.5 each) instead of full-blaming this server. Other errors are
+          // this server's own failure (0.0).
+          const inputShaped = errText.includes("[code=-32602]") || classifyError(errText) === "validation_error";
           const deps = collectRefDeps(step.args);
           if (inputShaped && deps.length > 0) {
             this.learning.recordOutcome(stepNs, 0.5);
@@ -3369,7 +3385,10 @@ export class ConnectServer {
       }
 
       if (stepNs) {
-        this.learning.recordOutcome(stepNs, 1);
+        // Grade the success the same way the proxy path does -- an empty or
+        // error-shaped 200 must not bank full 1.0 credit just because it
+        // wasn't flagged isError.
+        this.learning.recordOutcome(stepNs, computeOutcomeReward(stepResult));
         this.scheduleStateSave();
       }
       bindings[key] = ConnectServer.parseStepPayload(stepResult);

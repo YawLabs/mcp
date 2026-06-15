@@ -39,13 +39,16 @@ const ERROR_SHAPED_CATEGORIES: ReadonlySet<ErrorCategory> = new Set<ErrorCategor
   "not_found",
 ]);
 
-// Returns the first text-block string, or undefined if there is no text
-// content at all (missing/empty content array, or no block carries text).
+// Returns the first NON-EMPTY text-block string, or undefined if no block
+// carries usable text. Skipping whitespace-only blocks aligns this scan with
+// isEmptyBody's all-block scan, so an error-shaped LATER block can't slip
+// between rule 2 (first-block error-shape) and rule 3 (empty body) -- e.g.
+// content [{text:""},{text:"not found"}] is graded 0.2, not 1.0.
 function firstTextBlock(result: ToolCallResultShape): string | undefined {
   const content = result.content;
   if (!content || content.length === 0) return undefined;
   for (const block of content) {
-    if (typeof block.text === "string") return block.text;
+    if (typeof block.text === "string" && block.text.trim().length > 0) return block.text;
   }
   return undefined;
 }
@@ -73,7 +76,9 @@ export function computeOutcomeReward(result: ToolCallResultShape): number {
   // classifying -- this keeps rule 3 (empty/whitespace) from ever being
   // shadowed by classifyError's "upstream_error" fallback on empty input.
   const text = firstTextBlock(result);
-  if (text !== undefined && text.trim().length > 0) {
+  if (text !== undefined) {
+    // firstTextBlock already skipped whitespace-only blocks, so `text` is
+    // guaranteed non-empty here.
     if (ERROR_SHAPED_CATEGORIES.has(classifyError(text))) {
       // Rule 2: a 200 reply whose first text block still reads like a
       // recognized error -- upstream returned a soft failure.

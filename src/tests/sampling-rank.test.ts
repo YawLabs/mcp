@@ -297,6 +297,28 @@ describe("shouldSample", () => {
     expect(shouldSample(clear, "auto")).toBe(false);
   });
 
+  it("auto preserves the 0.9 top-2 tiebreak exactly (no entropy-driven over-sampling)", () => {
+    // The entropy blend would push these into sampling; the auto path must
+    // NOT, since auto mirrors the historical second/top >= 0.9 gate.
+    for (const r of [0.5, 0.7, 0.88, 0.89]) {
+      const ranked = [
+        { namespace: "a", score: 1 },
+        { namespace: "b", score: r },
+      ];
+      expect(shouldSample(ranked, "auto"), `ratio ${r} should not sample under auto`).toBe(false);
+    }
+    // ...but a runner-up at >= 0.9 of the leader does sample.
+    expect(
+      shouldSample(
+        [
+          { namespace: "a", score: 1 },
+          { namespace: "b", score: 0.9 },
+        ],
+        "auto",
+      ),
+    ).toBe(true);
+  });
+
   it("aggressive samples on milder ambiguity than auto", () => {
     expect(shouldSample(tied, "aggressive")).toBe(true);
     expect(shouldSample(moderate, "aggressive")).toBe(true);

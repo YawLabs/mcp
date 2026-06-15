@@ -73,10 +73,28 @@ describe("redactIntent", () => {
     expect(r.redactedCount).toBe(1);
   });
 
-  it("keeps ordinary words and reports redactedCount 0", () => {
+  it("keeps ordinary words (sorted, order destroyed) and reports redactedCount 0", () => {
     const r = redactIntent("create a github pull request for the docs");
-    expect(r.tokens).toEqual(["create", "github", "pull", "request", "for", "the", "docs"]);
+    // Tokens are SORTED so word order can't reconstruct the sentence.
+    expect(r.tokens).toEqual(["create", "docs", "for", "github", "pull", "request", "the"]);
     expect(r.redactedCount).toBe(0);
+  });
+
+  it("drops a long pure-alpha passphrase-style secret", () => {
+    const r = redactIntent("login with correcthorsebatterystaple please");
+    expect(r.tokens).not.toContain("correcthorsebatterystaple");
+    expect(r.tokens).toContain("login");
+    expect(r.tokens).toContain("with");
+    expect(r.tokens).toContain("please");
+    expect(r.redactedCount).toBe(1);
+  });
+
+  it("drops a 12-19 char mixed letter+digit key (below the old 20 floor)", () => {
+    const r = redactIntent("key a1b2c3d4e5f6g7 here");
+    expect(r.tokens).not.toContain("a1b2c3d4e5f6g7");
+    expect(r.tokens).toContain("key");
+    expect(r.tokens).toContain("here");
+    expect(r.redactedCount).toBe(1);
   });
 
   it("counts every dropped token", () => {

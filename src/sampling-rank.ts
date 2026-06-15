@@ -20,12 +20,10 @@ export const MAX_SAMPLES = 5;
 // we fall back to the ranker's order.
 export const SAMPLING_TIMEOUT_MS = 2000;
 
-// Ambiguity thresholds for the effort-aware gate. "auto" mirrors today's
-// 0.9 tiebreak ratio generalized onto the [0,1] ambiguity scale; a top-2
-// ratio of 0.9 yields an inverse-margin of 0.1, but the entropy signal of
-// two near-tied scores pushes the combined ambiguity up near ~0.85+, so we
-// gate auto at 0.85. "aggressive" samples on milder ambiguity.
-export const AUTO_AMBIGUITY_THRESHOLD = 0.85;
+// Ambiguity threshold for the "aggressive" effort gate. "auto" does NOT use
+// this -- it delegates to shouldTiebreak (the exact pre-dial 0.9 top-2 ratio)
+// so the default path's sampling frequency is unchanged. Only "aggressive"
+// samples on the broader entropy-aware ambiguity signal, at a lower bar.
 export const AGGRESSIVE_AMBIGUITY_THRESHOLD = 0.6;
 
 export interface TiebreakCandidate {
@@ -255,13 +253,15 @@ export function computeAmbiguity(ranked: Array<{ namespace: string; score: numbe
 }
 
 // Effort-aware gate deciding whether to spend an LLM round-trip on this
-// ranking. Pure; no I/O. "off" never samples. "auto" and "aggressive" sample
-// when computed ambiguity crosses their respective thresholds.
+// ranking. Pure; no I/O. "off" never samples. "auto" preserves the historical
+// fixed-ratio tiebreak EXACTLY (delegates to shouldTiebreak: sample only when
+// the runner-up scored >= SAMPLING_TIEBREAK_RATIO of the leader), so the
+// DEFAULT path's sampling frequency is unchanged by the dial. Only
+// "aggressive" uses the broader entropy-aware ambiguity gate, at a lower bar.
 export function shouldSample(ranked: Array<{ namespace: string; score: number }>, effort: RouteEffort): boolean {
   if (effort === "off") return false;
-  const ambiguity = computeAmbiguity(ranked);
-  const threshold = effort === "aggressive" ? AGGRESSIVE_AMBIGUITY_THRESHOLD : AUTO_AMBIGUITY_THRESHOLD;
-  return ambiguity >= threshold;
+  if (effort === "auto") return shouldTiebreak(ranked);
+  return computeAmbiguity(ranked) >= AGGRESSIVE_AMBIGUITY_THRESHOLD;
 }
 
 // Map an effort level to the number of best-of-N samples. "auto" stays at a

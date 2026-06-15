@@ -72,6 +72,28 @@ describe("computeOutcomeReward", () => {
         }),
       ).toBe(0.2);
     });
+
+    it("classifies the first NON-EMPTY block when an empty block precedes the error", () => {
+      // Regression: an empty/whitespace first block must not let an
+      // error-shaped LATER block fall through to full credit (1.0). The
+      // first-non-empty scan aligns rule 2 with the empty-body scan.
+      expect(
+        computeOutcomeReward({
+          content: [
+            { type: "text", text: "" },
+            { type: "text", text: "not found" },
+          ],
+        }),
+      ).toBe(0.2);
+      expect(
+        computeOutcomeReward({
+          content: [
+            { type: "text", text: "   " },
+            { type: "text", text: "unauthorized" },
+          ],
+        }),
+      ).toBe(0.2);
+    });
   });
 
   describe("rule 3: empty / whitespace body -> 0.3", () => {

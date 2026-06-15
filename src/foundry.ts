@@ -15,14 +15,21 @@
 //
 //   2. `redactIntent` is the SECOND line of defense: it drops the tokens
 //      that survive splitting but still look sensitive -- long high-entropy
-//      blobs, known secret prefixes, hex digests, anything that slipped
-//      through as a single alphanumeric run (e.g. an API key with no
-//      punctuation inside it). What remains is an order-preserving bag of
-//      ordinary-looking words plus a count of how many tokens were dropped.
+//      blobs, known secret prefixes, hex digests, long pure-alpha runs, and
+//      mixed letter+digit runs (an API key with no punctuation inside it).
+//      The surviving tokens are then SORTED, so word order is destroyed and
+//      the original sentence cannot be reconstructed from the bag.
+//
+// Privacy scope (READ BEFORE ENABLING): this protects against persisting the
+// raw intent string, its delimiters/structure, secret-shaped tokens, and
+// word order. It does NOT strip ordinary words that happen to be sensitive --
+// personal names, company names, or ticket text are "ordinary words" to the
+// redactor and survive (un-ordered) in the bag. Do not enable YAW_MCP_FOUNDRY
+// on intents that routinely carry such PII.
 //
 // Default is privacy-safe: harvesting is DISABLED unless YAW_MCP_FOUNDRY is
-// explicitly "1" / "true". When enabled, only the redacted token bag, the
-// candidate namespaces + scores, and the chosen namespace are written --
+// explicitly "1" / "true". When enabled, only the redacted+sorted token bag,
+// the candidate namespaces + scores, and the chosen namespace are written --
 // never the raw intent string.
 
 import { appendFile, mkdir, stat } from "node:fs/promises";
@@ -36,10 +43,10 @@ export interface RedactedIntent {
   redactedCount: number;
 }
 
-// Known secret/token prefixes. A token is dropped outright if it starts
-// with any of these (case-insensitive for the alpha ones; AKIA stays
-// upper since it is the literal AWS access-key-id prefix, but tokenize has
-// already lowercased everything, so we match case-insensitively below).
+// Known secret/token prefixes. A token is dropped outright if it starts with
+// any of these. All prefixes are stored lowercase because tokenize has
+// already lowercased every token before it reaches us (so "akia" here matches
+// an "AKIA..." AWS access-key-id that arrived as "akia...").
 const SECRET_PREFIXES = ["sk_", "sk-", "tok_", "ghp_", "gho_", "xox", "pk_", "akia"];
 
 // A token "looks like a secret/PII" when any of these hold. tokenize has
@@ -55,10 +62,16 @@ function looksSensitive(token: string): boolean {
   // Pure-hex of length >= 16 (git SHAs, hashed ids, hex-encoded keys).
   if (token.length >= 16 && /^[0-9a-f]+$/.test(token)) return true;
 
-  // Long high-entropy-looking: length >= 20 AND mixes letters and digits.
-  // A 20+ char run that interleaves [a-z] and [0-9] is almost never an
-  // English word; it is overwhelmingly an id, token, or key fragment.
-  if (token.length >= 20 && /[a-z]/.test(token) && /[0-9]/.test(token)) return true;
+  // Mixed letters+digits, length >= 12. A 12+ char run that interleaves
+  // [a-z] and [0-9] is almost never an English word; it is overwhelmingly an
+  // id, token, or key fragment. (Lowered from 20 so 12-19 char keys don't
+  // slip through.)
+  if (token.length >= 12 && /[a-z]/.test(token) && /[0-9]/.test(token)) return true;
+
+  // Long pure-alpha run, length >= 16. A single [a-z] run this long is far
+  // more likely a passphrase / base32-style secret than an English word, so
+  // we over-redact here rather than risk persisting a cleartext secret.
+  if (token.length >= 16 && /^[a-z]+$/.test(token)) return true;
 
   return false;
 }
@@ -82,6 +95,10 @@ export function redactIntent(intent: string): RedactedIntent {
       tokens.push(token);
     }
   }
+  // Sort the surviving tokens so word ORDER is destroyed -- a bag of words
+  // can't reconstruct the original sentence. BM25-style eval is bag-of-words
+  // anyway, so ordering carries no signal we lose.
+  tokens.sort();
   return { tokens, redactedCount };
 }
 
