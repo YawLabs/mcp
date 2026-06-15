@@ -132,7 +132,17 @@ export async function runSetActive(
       }
       const nextServers = servers.map((s, i) => (i === idx ? { ...s, isActive: active } : s));
       try {
-        await deps.putResource<TeamBundles>(SET_ACTIVE_RESOURCE, res.version, { ...data, servers: nextServers }, base);
+        // Stamp the bundles-data schema version (1) so this writer agrees
+        // with syncPush, which also PUTs version:1. Note: set-active mutates
+        // the remote out-of-band; it does NOT update this machine's local
+        // sync-state, so a later `sync push` from here will 409 against the
+        // moved-ahead remote and correctly force a pull first.
+        await deps.putResource<TeamBundles>(
+          SET_ACTIVE_RESOURCE,
+          res.version,
+          { ...data, version: 1, servers: nextServers },
+          base,
+        );
         return done(io, opts.json, namespace, active, true);
       } catch (e) {
         if (e instanceof TeamSyncStaleVersionError && attempt < 1) continue;
