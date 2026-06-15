@@ -7,6 +7,32 @@ describe("LearningStore", () => {
     expect(store.boostFactor("never-seen")).toBe(1.0);
   });
 
+  describe("adjustSucceeded (reward-grader correction)", () => {
+    it("applies a delta to succeeded without changing dispatched", () => {
+      const store = new LearningStore();
+      store.recordOutcome("gh", 0.3); // dispatched 1, succeeded 0.3
+      store.adjustSucceeded("gh", 0.7); // revise heuristic 0.3 -> graded 1.0
+      const u = store.get("gh");
+      expect(u?.dispatched).toBe(1);
+      expect(u?.succeeded).toBeCloseTo(1.0);
+    });
+
+    it("clamps succeeded into [0, dispatched]", () => {
+      const store = new LearningStore();
+      store.recordOutcome("gh", 0.2);
+      store.adjustSucceeded("gh", 5); // would overshoot dispatched
+      expect(store.get("gh")?.succeeded).toBe(1); // dispatched is 1
+      store.adjustSucceeded("gh", -5); // would go negative
+      expect(store.get("gh")?.succeeded).toBe(0);
+    });
+
+    it("is a no-op for an unknown namespace", () => {
+      const store = new LearningStore();
+      store.adjustSucceeded("never-seen", 0.5);
+      expect(store.get("never-seen")).toBeUndefined();
+    });
+  });
+
   it("returns 1.0 boost below the observation floor", () => {
     const store = new LearningStore();
     for (let i = 0; i < LEARNING_MIN_OBSERVATIONS - 1; i++) {
