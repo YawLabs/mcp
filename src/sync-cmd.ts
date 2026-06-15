@@ -28,6 +28,7 @@ import {
   getSession,
   putResource,
 } from "./team-sync.js";
+import { readSyncState, writeSyncState } from "./sync-state.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export const SYNC_USAGE = `Usage: yaw-mcp sync <push|pull|status> [--json]
@@ -47,7 +48,6 @@ export const SYNC_USAGE = `Usage: yaw-mcp sync <push|pull|status> [--json]
   Sign in first with \`yaw-mcp login --key <license-key>\`.`;
 
 export const BUNDLES_FILENAME = "bundles.json";
-export const SYNC_STATE_FILENAME = "sync-state.json";
 export const MCP_BUNDLES_RESOURCE = "mcp_bundles";
 
 export interface SyncCommandOptions {
@@ -88,43 +88,8 @@ interface LocalBundlesFile {
   servers: Partial<UpstreamServerConfig>[];
 }
 
-/** Sidecar tracking the remote resource version this machine last pulled.
- *  Push submits THIS version (not a freshly-GET'd one) so optimistic
- *  concurrency can actually fire when the remote moved ahead since the
- *  last pull. */
-interface SyncState {
-  mcp_bundles?: { lastPulledVersion: number };
-}
-
 function bundlesPath(home: string): string {
   return join(home, CONFIG_DIRNAME, BUNDLES_FILENAME);
-}
-
-function syncStatePath(home: string): string {
-  return join(home, CONFIG_DIRNAME, SYNC_STATE_FILENAME);
-}
-
-/** Read the sync-state sidecar. Tolerates an absent or malformed file by
- *  returning {} -- a missing last-pulled version simply means "never
- *  pulled", which the push path handles by falling back to the GET'd
- *  remote version (seeding). */
-async function readSyncState(home: string): Promise<SyncState> {
-  const path = syncStatePath(home);
-  if (!existsSync(path)) return {};
-  try {
-    const raw = await readFile(path, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return {};
-    return parsed as SyncState;
-  } catch {
-    return {};
-  }
-}
-
-async function writeSyncState(home: string, state: SyncState): Promise<void> {
-  const path = syncStatePath(home);
-  await mkdir(dirname(path), { recursive: true });
-  await atomicWriteFile(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 async function readLocalBundles(home: string): Promise<LocalBundlesFile> {

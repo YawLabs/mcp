@@ -70,10 +70,12 @@ describe("runSetActive", () => {
         })),
     );
     const getResource = vi.fn(get);
+    const writeSyncState = vi.fn(async (_home: string, _state: unknown) => {});
     return {
-      deps: { getResource, putResource } as unknown as SetActiveDeps,
+      deps: { getResource, putResource, writeSyncState } as unknown as SetActiveDeps,
       getResource,
       putResource,
+      writeSyncState,
     };
   }
 
@@ -90,6 +92,26 @@ describe("runSetActive", () => {
     // syncPush agree (both PUT version:1).
     expect((data as Bundles).version).toBe(1);
     expect(out.join("")).toMatch(/now active/);
+  });
+
+  it("advances local sync-state to the new version after a successful toggle", async () => {
+    const { io } = makeIo();
+    const d = deps(async () => resource(5, [{ namespace: "github", isActive: false }]));
+    const r = await runSetActive({ namespace: "github", active: true }, io, d.deps);
+    expect(r.exitCode).toBe(0);
+    // Default mock PUT returns version+1 (5 -> 6); sync-state records 6 so an
+    // immediate `yaw-mcp sync push` from this machine isn't spuriously stale.
+    expect(d.writeSyncState).toHaveBeenCalledTimes(1);
+    expect(d.writeSyncState.mock.calls[0][1]).toEqual({ mcp_bundles: { lastPulledVersion: 6 } });
+  });
+
+  it("does not write sync-state on a no-op (no PUT, nothing changed)", async () => {
+    const { io } = makeIo();
+    const d = deps(async () => resource(1, [{ namespace: "github", isActive: true }]));
+    const r = await runSetActive({ namespace: "github", active: true }, io, d.deps);
+    expect(r.exitCode).toBe(0);
+    expect(d.putResource).not.toHaveBeenCalled();
+    expect(d.writeSyncState).not.toHaveBeenCalled();
   });
 
   it("disables a server that was on", async () => {
@@ -169,12 +191,16 @@ describe("runSetActive", () => {
       .fn()
       .mockResolvedValueOnce(resource(5, [{ namespace: "github", isActive: false }]))
       .mockResolvedValueOnce(resource(9, [{ namespace: "github", isActive: false }]));
-    const d = { getResource: get, putResource: put } as unknown as SetActiveDeps;
+    const writeSyncState = vi.fn(async (_home: string, _state: unknown) => {});
+    const d = { getResource: get, putResource: put, writeSyncState } as unknown as SetActiveDeps;
     const r = await runSetActive({ namespace: "github", active: true }, io, d);
     expect(r.exitCode).toBe(0);
     expect(get).toHaveBeenCalledTimes(2);
     expect(put).toHaveBeenCalledTimes(2);
     expect(put.mock.calls[1][1]).toBe(9); // retry uses the freshly-pulled version
+    // sync-state advances to the post-retry PUT's new version (9 -> 10).
+    expect(writeSyncState).toHaveBeenCalledTimes(1);
+    expect(writeSyncState.mock.calls[0][1]).toEqual({ mcp_bundles: { lastPulledVersion: 10 } });
   });
 
   it("emits machine-readable JSON with --json", async () => {

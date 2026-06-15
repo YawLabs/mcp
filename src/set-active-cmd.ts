@@ -8,7 +8,9 @@
 // ~/.yaw-mcp/config.json instead (config-loader isAllowed); that is what vew's
 // per-server checkbox does for non-team / local-only control.
 
+import { homedir } from "node:os";
 import { NAMESPACE_RE } from "./local-bundles.js";
+import { writeSyncState } from "./sync-state.js";
 import {
   type BaseOpts,
   TeamSyncAuthError,
@@ -94,12 +96,13 @@ type IO = { out: (s: string) => void; err: (s: string) => void };
 export interface SetActiveDeps {
   getResource: typeof defaultGetResource;
   putResource: typeof defaultPutResource;
+  writeSyncState: typeof writeSyncState;
 }
 
 export async function runSetActive(
   opts: SetActiveOptions,
   io: IO = { out: (s) => process.stdout.write(s), err: (s) => process.stderr.write(s) },
-  deps: SetActiveDeps = { getResource: defaultGetResource, putResource: defaultPutResource },
+  deps: SetActiveDeps = { getResource: defaultGetResource, putResource: defaultPutResource, writeSyncState },
 ): Promise<SetActiveResult> {
   const { namespace, active } = opts;
   if (!namespace || active === undefined) {
@@ -133,16 +136,26 @@ export async function runSetActive(
       const nextServers = servers.map((s, i) => (i === idx ? { ...s, isActive: active } : s));
       try {
         // Stamp the bundles-data schema version (1) so this writer agrees
-        // with syncPush, which also PUTs version:1. Note: set-active mutates
-        // the remote out-of-band; it does NOT update this machine's local
-        // sync-state, so a later `sync push` from here will 409 against the
-        // moved-ahead remote and correctly force a pull first.
-        await deps.putResource<TeamBundles>(
+        // with syncPush, which also PUTs version:1.
+        const putRes = await deps.putResource<TeamBundles>(
           SET_ACTIVE_RESOURCE,
           res.version,
           { ...data, version: 1, servers: nextServers },
           base,
         );
+        // We just advanced the remote, so this machine is now current at the
+        // new version. Record it in the local sync-state so an immediate
+        // `yaw-mcp sync push` from here doesn't spuriously 409 (and force a
+        // needless pull) against a remote we ourselves just moved. Best-effort:
+        // the authoritative toggle already succeeded server-side, so a local
+        // sync-state write failure must not fail the command.
+        if (typeof putRes.version === "number") {
+          await deps
+            .writeSyncState(opts.home ?? homedir(), {
+              mcp_bundles: { lastPulledVersion: putRes.version },
+            })
+            .catch(() => {});
+        }
         return done(io, opts.json, namespace, active, true);
       } catch (e) {
         if (e instanceof TeamSyncStaleVersionError && attempt < 1) continue;
