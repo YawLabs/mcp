@@ -123,7 +123,11 @@ export async function runSetActive(
           1,
         );
       }
-      if (servers[idx].isActive === active) {
+      // Normalize current state the way the aggregator does (local-bundles:
+      // absent isActive means active, only explicit false is inactive), so
+      // `set-active <ns> on` on a server with no isActive field is a true no-op
+      // rather than a redundant write.
+      if ((servers[idx].isActive !== false) === active) {
         return done(io, opts.json, namespace, active, false); // already in the desired state
       }
       const nextServers = servers.map((s, i) => (i === idx ? { ...s, isActive: active } : s));

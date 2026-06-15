@@ -106,6 +106,23 @@ describe("runSetActive", () => {
     expect(out.join("")).toMatch(/already active/);
   });
 
+  it("treats a server with absent isActive as active (on is a true no-op)", async () => {
+    const { out, io } = makeIo();
+    const d = deps(async () => resource(1, [{ namespace: "github" }])); // no isActive field
+    const r = await runSetActive({ namespace: "github", active: true }, io, d.deps);
+    expect(r.exitCode).toBe(0);
+    expect(d.putResource).not.toHaveBeenCalled();
+    expect(out.join("")).toMatch(/already active/);
+  });
+
+  it("disables a server whose isActive was absent (writes explicit false)", async () => {
+    const { io } = makeIo();
+    const d = deps(async () => resource(1, [{ namespace: "github" }]));
+    const r = await runSetActive({ namespace: "github", active: false }, io, d.deps);
+    expect(r.exitCode).toBe(0);
+    expect((d.putResource as ReturnType<typeof vi.fn>).mock.calls[0][2].servers[0].isActive).toBe(false);
+  });
+
   it("errors when the namespace is not in the team config", async () => {
     const { err, io } = makeIo();
     const d = deps(async () => resource(1, [{ namespace: "aws", isActive: true }]));
