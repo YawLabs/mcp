@@ -98,6 +98,15 @@ describe("parseSyncArgs", () => {
     }
   });
 
+  it("accepts --dry-run alongside pull", () => {
+    const r = parseSyncArgs(["pull", "--dry-run"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.action).toBe("pull");
+      expect(r.options.dryRun).toBe(true);
+    }
+  });
+
   it("rejects missing action", () => {
     const r = parseSyncArgs([]);
     expect(r.ok).toBe(false);
@@ -318,5 +327,59 @@ describe("sync optimistic concurrency (FIX C)", () => {
     const json = JSON.parse(io.out.mock.calls.map((c: string[]) => c[0]).join(""));
     expect(json.remoteVersion).toBe(9);
     expect(json.lastPulledVersion).toBe(7);
+  });
+});
+
+describe("sync pull --dry-run", () => {
+  let home: string;
+  const io = { out: vi.fn(), err: vi.fn() };
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-dryrun-"));
+    io.out.mockReset();
+    io.err.mockReset();
+    mockGetResource.mockReset();
+    mockPutResource.mockReset();
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("previews the merge without writing bundles.json or sync-state.json", async () => {
+    mockGetResource.mockResolvedValue({
+      data: { version: 1, servers: [{ namespace: "github", isActive: true }, { namespace: "linear" }] },
+      version: 5,
+      updated_at: null,
+      updated_by: null,
+    });
+
+    const res = await runSync({ action: "pull", dryRun: true, home }, io);
+
+    expect(res.exitCode).toBe(0);
+    // Nothing written: the overwrite is the destructive part we are gating.
+    expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
+    expect(existsSync(join(home, ".yaw-mcp", "sync-state.json"))).toBe(false);
+    // And the preview is reported.
+    const out = io.out.mock.calls.map((c: string[]) => c[0]).join("");
+    expect(out).toMatch(/dry-run/i);
+    expect(out).toContain("2 servers");
+  });
+
+  it("--json dry-run sets dryRun:true and writes nothing", async () => {
+    mockGetResource.mockResolvedValue({
+      data: { version: 1, servers: [{ namespace: "github", isActive: true }] },
+      version: 5,
+      updated_at: null,
+      updated_by: null,
+    });
+
+    const res = await runSync({ action: "pull", dryRun: true, json: true, home }, io);
+
+    expect(res.exitCode).toBe(0);
+    const json = JSON.parse(io.out.mock.calls.map((c: string[]) => c[0]).join(""));
+    expect(json.dryRun).toBe(true);
+    expect(json.serverCount).toBe(1);
+    expect(existsSync(join(home, ".yaw-mcp", "bundles.json"))).toBe(false);
   });
 });
