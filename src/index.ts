@@ -15,6 +15,7 @@ import { RESET_LEARNING_USAGE, parseResetLearningArgs, runResetLearning } from "
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
+import { parseSetActiveArgs, runSetActive } from "./set-active-cmd.js";
 import { parseStatsArgs, runStats } from "./stats-cmd.js";
 import { parseSyncArgs, runSync } from "./sync-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
@@ -44,6 +45,7 @@ const KNOWN_SUBCOMMANDS = [
   "sync",
   "stats",
   "secrets",
+  "set-active",
   "help",
   "--help",
   "-h",
@@ -265,6 +267,17 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   runSecrets(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "set-active") {
+  const parsed = parseSetActiveArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  runSetActive(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   yaw-mcp — one install, every MCP server, managed from the cloud.

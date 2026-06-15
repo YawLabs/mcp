@@ -32,6 +32,7 @@ const EXPECTED_SUBCOMMANDS = [
   "sync",
   "stats",
   "secrets",
+  "set-active",
   "audit",
   "compliance",
   "help",
