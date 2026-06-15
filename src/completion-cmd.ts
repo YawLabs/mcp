@@ -127,6 +127,12 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: ["set", "get", "list", "remove", "lock", "push", "pull"],
     flags: ["--key", "--value", "--stdin", "--json", "--help"],
   },
+  {
+    name: "set-active",
+    description: "Enable/disable a team server (authoritative)",
+    positional: ["<namespace>", "on", "off"],
+    flags: ["--json", "--help"],
+  },
   // Other.
   { name: "audit", description: "Run a full-pass audit of loaded servers", flags: ["--json", "--help"] },
   { name: "compliance", description: "Run the compliance suite against a server", flags: ["--publish", "--help"] },
