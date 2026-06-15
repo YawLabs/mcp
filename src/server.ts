@@ -69,6 +69,13 @@ import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName }
 import { RedispatchTracker } from "./redispatch.js";
 import { type RankableServer, rankServers, scoreRelevance, tokenize } from "./relevance.js";
 import { initRerank, rerank } from "./rerank.js";
+import {
+  type GraderContext,
+  firstResultText,
+  gradeOutcomeViaSampling,
+  isRewardGraderEnabled,
+  isUncertainReward,
+} from "./reward-grader.js";
 import { computeOutcomeReward } from "./reward.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
 import {
@@ -314,6 +321,10 @@ export class ConnectServer {
   // (LearningStore.recordMiss). Not persisted: a re-dispatch window that
   // spans a restart is meaningless. See redispatch.ts.
   private readonly redispatch = new RedispatchTracker();
+  // Last dispatch intent per namespace (session-scoped, not persisted). Lets
+  // the optional reward grader (reward-grader.ts) judge a tool call against the
+  // goal the server was routed for. Bounded by the number of namespaces.
+  private readonly lastIntentByNamespace = new Map<string, string>();
 
   // Short-TTL dedup cache for discover output. Agents often call
   // discover twice in quick succession (e.g. once to list, again after
@@ -1199,8 +1210,20 @@ export class ConnectServer {
       // success is deliberately NOT counted here (see handleDispatch). Exec
       // steps defer it (opts.deferLearning) for step-level attribution.
       if (!opts?.deferLearning) {
-        this.learning.recordOutcome(route.namespace, computeOutcomeReward(result));
+        const reward = computeOutcomeReward(result);
+        this.learning.recordOutcome(route.namespace, reward);
         this.scheduleStateSave();
+        // Optional LLM grader (opt-in, YAW_MCP_REWARD_GRADER): on the uncertain
+        // heuristic bands only, ask the client LLM whether the call actually
+        // accomplished the goal and revise the credit in the BACKGROUND. The
+        // tool result is not held up -- the correction lands when the grade does.
+        if (isRewardGraderEnabled() && isUncertainReward(reward)) {
+          void this.refineRewardInBackground(route.namespace, reward, {
+            intent: this.lastIntentByNamespace.get(route.namespace),
+            toolName: route.originalName,
+            resultText: firstResultText(result),
+          });
+        }
         // Re-dispatch routing-miss tracking: record whether the server the
         // model most recently dispatched to produced a clean reply. An
         // abandoned clean reply becomes a negative signal when a similar
@@ -2110,6 +2133,21 @@ export class ConnectServer {
   // when both namespaces co-occur in a curated bundle or a detected usage
   // pack — those A-then-B sequences are intentional, so re-dispatch from A
   // to B must NOT penalize A. Used as detectMiss's exclusion predicate.
+  // Background refinement of a just-recorded heuristic reward via the optional
+  // LLM grader. Fire-and-forget: the tool result has already returned. If the
+  // grader returns a verdict different from the heuristic, revise the credit by
+  // the delta (recordOutcome already counted the dispatch). Never throws.
+  private async refineRewardInBackground(namespace: string, heuristic: number, ctx: GraderContext): Promise<void> {
+    try {
+      const graded = await gradeOutcomeViaSampling(this.server, ctx);
+      if (graded === null || graded === heuristic) return;
+      this.learning.adjustSucceeded(namespace, graded - heuristic);
+      this.scheduleStateSave();
+    } catch {
+      // Refinement is best-effort; it must never surface to the caller.
+    }
+  }
+
   private isLegitChain(a: string, b: string): boolean {
     for (const bundle of CURATED_BUNDLES) {
       if (bundle.namespaces.includes(a) && bundle.namespaces.includes(b)) return true;
@@ -2232,6 +2270,9 @@ export class ConnectServer {
     // record this dispatch so a future re-route can be judged against it.
     const primary = winners[0]?.namespace;
     if (primary) {
+      // Remember the intent each activated server was routed for, so the
+      // optional LLM reward grader can judge later tool calls against the goal.
+      for (const w of winners) this.lastIntentByNamespace.set(w.namespace, trimmed);
       const intentTokens = tokenize(trimmed);
       const now = Date.now();
       const miss = this.redispatch.detectMiss(primary, intentTokens, now, (a, b) => this.isLegitChain(a, b));
