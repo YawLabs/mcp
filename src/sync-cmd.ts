@@ -20,6 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CONFIG_DIRNAME } from "./paths.js";
+import { readSyncState, writeSyncState } from "./sync-state.js";
 import {
   TeamSyncAuthError,
   TeamSyncForbiddenError,
@@ -28,7 +29,6 @@ import {
   getSession,
   putResource,
 } from "./team-sync.js";
-import { readSyncState, writeSyncState } from "./sync-state.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export const SYNC_USAGE = `Usage: yaw-mcp sync <push|pull|status> [--json]
@@ -43,7 +43,9 @@ export const SYNC_USAGE = `Usage: yaw-mcp sync <push|pull|status> [--json]
   status  Show sign-in state, last-pulled version, and a coarse
           local-vs-remote diff.
 
-  --json  Emit machine-readable JSON.
+  --json     Emit machine-readable JSON.
+  --dry-run  (pull only) Preview the merge without writing the local file
+             or advancing the sync version.
 
   Sign in first with \`yaw-mcp login --key <license-key>\`.`;
 
@@ -53,6 +55,9 @@ export const MCP_BUNDLES_RESOURCE = "mcp_bundles";
 export interface SyncCommandOptions {
   action?: "push" | "pull" | "status";
   json?: boolean;
+  /** (pull only) Compute and report the merge without writing bundles.json
+   *  or advancing the local sync-state version. */
+  dryRun?: boolean;
   /** Test hooks. */
   home?: string;
   baseUrl?: string;
@@ -69,6 +74,8 @@ export function parseSyncArgs(
       opts.action = a;
     } else if (a === "--json") {
       opts.json = true;
+    } else if (a === "--dry-run") {
+      opts.dryRun = true;
     } else if (a === "--help" || a === "-h") {
       return { ok: false, error: SYNC_USAGE, help: true };
     } else {
@@ -268,6 +275,25 @@ async function syncPull(
   const remoteServers = remote.data?.servers ?? [];
   const local = await readLocalBundles(home);
   const merged = mergeLocalEnv(remoteServers, local.servers);
+
+  if (opts.dryRun) {
+    // Preview only: report what pull WOULD write without overwriting
+    // bundles.json or advancing the sync-state version. Lets a user see the
+    // incoming server set before it clobbers local edits to the file.
+    const target = bundlesPath(home);
+    if (opts.json) {
+      io.out(
+        `${JSON.stringify({ ok: true, dryRun: true, wouldWrite: target, serverCount: merged.length, remoteVersion: remote.version }, null, 2)}\n`,
+      );
+    } else {
+      io.out(
+        `[dry-run] would pull ${merged.length} server${merged.length === 1 ? "" : "s"} -> ${target} (remote v${remote.version}); nothing written.\n`,
+      );
+      if (remote.version === 0) io.out("Remote mcp_bundles is empty (version 0). Push from this machine to seed it.\n");
+    }
+    return { exitCode: 0 };
+  }
+
   const written = await writeLocalBundles(home, { version: 1, servers: merged });
   // Persist the version we just pulled so a later push submits IT (not a
   // freshly-GET'd version) and optimistic concurrency can actually fire.
