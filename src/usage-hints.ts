@@ -69,7 +69,10 @@ export function formatUsageHint(usage: NamespaceUsage | undefined, coUsedWith: s
     // count is cumulative (restored from state.json on startup). Tacking
     // "this session" on overclaims freshness; dropping it is both
     // shorter and accurate in both persistence-on and opt-out states.
-    parts.push(`used ${usage.succeeded}x`);
+    // `succeeded` is a SUM of graded rewards in [0,1] (see learning.ts), not
+    // an integer count, so round before display -- otherwise IEEE-754
+    // accumulation prints "used 3.3000000000000003x" in discover() output.
+    parts.push(`used ${Math.round(usage.succeeded)}x`);
   }
   if (coUsedWith.length > 0) {
     const shown = coUsedWith.slice(0, MAX_PEERS);
