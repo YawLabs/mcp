@@ -5,6 +5,7 @@ import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
 import { ConfigError } from "./config.js";
 import { runDoctor } from "./doctor-cmd.js";
+import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { closestNames } from "./fuzzy.js";
 import { parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
@@ -28,6 +29,7 @@ import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 const KNOWN_SUBCOMMANDS = [
   "compliance",
   "audit",
+  "foundry",
   "install",
   "add",
   "remove",
@@ -70,6 +72,15 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   runAudit(parsed.options).then((r) => process.exit(r.exitCode));
+} else if (subcommand === "foundry") {
+  const parsed = parseFoundryArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    // --help prints the usage to stdout and exits 0; real errors go to stderr.
+    const isHelp = parsed.error === FOUNDRY_USAGE;
+    (isHelp ? process.stdout : process.stderr).write(`${parsed.error}\n`);
+    process.exit(isHelp ? 0 : 2);
+  }
+  runFoundryExport(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
   if (!parsed.ok) {
