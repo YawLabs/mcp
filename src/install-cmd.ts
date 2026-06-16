@@ -26,6 +26,7 @@ import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { Writable } from "node:stream";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CONFIG_FILENAME, CURRENT_SCHEMA_VERSION, loadYawMcpConfig } from "./config-loader.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
@@ -104,7 +105,12 @@ const USAGE =
   "                       [--token <mcp_pat_…>] [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                       [--force | --skip] [--dry-run] [--no-yaw-mcp-config]\n" +
   "       yaw-mcp install --list                       (detect clients; no writes)\n" +
-  "       yaw-mcp install --all  [--token <mcp_pat_…>] (install into every detected client)";
+  "       yaw-mcp install --all  [--token <mcp_pat_…>] (install into every detected client)\n" +
+  "\n" +
+  "  Note: --token puts the PAT on the command line, where it is visible in shell\n" +
+  "  history and the process table (ps/Task Manager) -- avoid it on shared machines.\n" +
+  "  Prefer seeding ~/.yaw-mcp/config.json once (install reads the token from there),\n" +
+  "  or set the token via your account before installing.";
 
 export async function runInstall(opts: InstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
@@ -302,7 +308,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   if (opts.dryRun) {
     log("\n--- dry run: would write the following ---");
-    if (writeYawMcpConfig) log(`# ${yawMcpConfigPath}\n${yawMcpConfigJson}`);
+    // Redact the token before printing the would-be config -- dry-run
+    // output routinely lands in terminal scrollback, screen-shares, and
+    // pasted bug reports, so the raw PAT must never appear there. The real
+    // (un-redacted) bytes are written only by the non-dry-run path below.
+    if (writeYawMcpConfig) log(`# ${yawMcpConfigPath}\n${redactConfigToken(yawMcpConfigJson)}`);
     log(`\n# ${resolved.absolute}\n${clientJson}`);
     if (settingsPatch?.changed) log(`# ${settingsPatch.path}\n${settingsPatch.nextJson}`);
     if (legacyEntry) {
@@ -325,7 +335,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // we never recorded, and would be re-prompted on every other client.
   if (writeYawMcpConfig) {
     try {
-      await atomicWriteFile(yawMcpConfigPath, yawMcpConfigJson);
+      // Create the tmp at 0o600 so the token file is never group/other-
+      // readable in the window between rename and the chmod below.
+      await atomicWriteFile(yawMcpConfigPath, yawMcpConfigJson, "utf8", 0o600);
       // Best-effort POSIX permissions tighten — ignored on Windows.
       if (process.platform !== "win32") {
         try {
@@ -568,6 +580,29 @@ export function removeFromClientConfig(
  *  so the user can recover their token by hand if anything else of value
  *  was in there. Backup is best-effort; if it fails, we proceed without
  *  it rather than blocking the install. */
+/** Back up the original (possibly token-bearing) config bytes to a
+ *  timestamped sibling before we overwrite. Created owner-only (0o600 tmp
+ *  + best-effort chmod) so the salvaged token never sits world-readable --
+ *  the backup carries the same secret the main file does. Best-effort:
+ *  returns undefined if the write fails so the install can still proceed. */
+async function writeBackup(path: string, raw: string): Promise<string | undefined> {
+  const candidate = `${path}.bak-${Date.now()}`;
+  try {
+    await atomicWriteFile(candidate, raw, "utf8", 0o600);
+    if (process.platform !== "win32") {
+      try {
+        await chmod(candidate, 0o600);
+      } catch {
+        // chmod not supported on this filesystem; not fatal.
+      }
+    }
+    return candidate;
+  } catch {
+    // Couldn't write backup; not fatal. Proceed with overwrite.
+    return undefined;
+  }
+}
+
 async function composeYawMcpConfig(path: string, token: string): Promise<{ json: string; backupPath?: string }> {
   let existing: Record<string, unknown> = {};
   let backupPath: string | undefined;
@@ -589,26 +624,14 @@ async function composeYawMcpConfig(path: string, token: string): Promise<{ json:
           // we still discard it and write our object shape, so back up the
           // original bytes first -- same recovery guarantee as the
           // unparseable case below.
-          const candidate = `${path}.bak-${Date.now()}`;
-          try {
-            await atomicWriteFile(candidate, raw);
-            backupPath = candidate;
-          } catch {
-            // Couldn't write backup; not fatal. Proceed with overwrite.
-          }
+          backupPath = await writeBackup(path, raw);
         }
       } catch {
         // Malformed file: copy raw bytes aside before we overwrite, so
         // a user who had a real token (or anything else) in there can
         // recover it. The new config still gets written -- the user
         // explicitly asked to install.
-        const candidate = `${path}.bak-${Date.now()}`;
-        try {
-          await atomicWriteFile(candidate, raw);
-          backupPath = candidate;
-        } catch {
-          // Couldn't write backup; not fatal. Proceed with overwrite.
-        }
+        backupPath = await writeBackup(path, raw);
       }
     }
   }
@@ -616,6 +639,14 @@ async function composeYawMcpConfig(path: string, token: string): Promise<{ json:
   next.token = token;
   if (typeof next.version !== "number") next.version = CURRENT_SCHEMA_VERSION;
   return { json: `${JSON.stringify(next, null, 2)}\n`, backupPath };
+}
+
+/** Redact the `token` field in a rendered ~/.yaw-mcp/config.json blob so
+ *  dry-run output never echoes the raw PAT. Replaces the value with
+ *  `mcp_pat_***` while preserving the rest of the JSON (path, version,
+ *  any other fields) and the original indentation. Exported for tests. */
+export function redactConfigToken(json: string): string {
+  return json.replace(/("token"\s*:\s*)"(?:[^"\\]|\\.)*"/g, '$1"mcp_pat_***"');
 }
 
 /** CLI argv parser used by index.ts dispatcher. Exported so tests can
@@ -756,7 +787,7 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
   }
   log("");
   log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
-  log("Install into every available user-scope client: `yaw-mcp install --all`");
+  log("Install into every available client (user scope where supported): `yaw-mcp install --all`");
   return { written: [], wouldWrite: [], messages: [], exitCode: 0 };
 }
 
@@ -777,11 +808,12 @@ function displayPath(abs: string, home: string): string {
   return abs;
 }
 
-/** `yaw-mcp install --all` — install into every client/scope combo that
- *  makes sense without ambiguity: user-scope for everyone that supports
- *  it, plus any project/workspace scope when --project-dir is passed.
- *  Aggregates results; exit code 0 only if every attempted install
- *  succeeded. Mirrors the per-client run behavior: prompts/--force/
+/** `yaw-mcp install --all` — install into every available client (user
+ *  scope where supported). For clients without a user scope, falls back to
+ *  the first non-project scope; clients that ONLY have project scopes
+ *  (vscode) are included just when --project-dir is passed, otherwise
+ *  skipped. Aggregates results; exit code 0 only if every attempted
+ *  install succeeded. Mirrors the per-client run behavior: prompts/--force/
  *  --skip flags propagate. */
 async function runInstallAll(
   opts: InstallCommandOptions,
@@ -833,21 +865,55 @@ async function runInstallAll(
   const aggregateMessages: string[] = [];
   let failed = 0;
   let succeeded = 0;
+  // Collision-without-flag refusals (non-TTY, no --force/--skip) all carry
+  // the same fix -- re-run --all with --force or --skip. Under --all they'd
+  // otherwise stack up as N identical per-client "already has entry and
+  // stdin is not a TTY" stderr lines. Capture each sub-install's stderr,
+  // suppress that specific refusal, and emit ONE consolidated hint below.
+  const collisionClients: string[] = [];
+  const realStderr = opts.io?.stderr ?? process.stderr;
+  const isCollisionRefusal = (s: string): boolean =>
+    s.includes(`already has a "${ENTRY_NAME}" entry and stdin is not a TTY`);
   for (const plan of plans) {
     log(`── ${plan.clientId} (${plan.scope}) ──`);
+    let sawCollision = false;
+    // Per-call stderr: replay every line to the real stderr EXCEPT the
+    // collision-without-flag refusal, which we consolidate.
+    const subStderr = new Writable({
+      write(chunk: Buffer | string, _enc, cb): void {
+        const text = chunk.toString();
+        if (isCollisionRefusal(text)) sawCollision = true;
+        else realStderr.write(text);
+        cb();
+      },
+    }) as unknown as NodeJS.WritableStream;
+    const baseIo = opts.io ?? {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      isTTY: Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY),
+    };
     const result = await runInstall({
       ...opts,
       listOnly: false,
       all: false,
       clientId: plan.clientId,
       scope: plan.scope,
+      io: { ...baseIo, stderr: subStderr },
     });
+    if (sawCollision) collisionClients.push(plan.clientId);
     aggregateWritten.push(...result.written);
     aggregateWouldWrite.push(...result.wouldWrite);
     aggregateMessages.push(...result.messages);
     if (result.exitCode === 0) succeeded += 1;
     else failed += 1;
     log("");
+  }
+
+  if (collisionClients.length > 0) {
+    err(
+      `yaw-mcp install --all: ${collisionClients.length} client${collisionClients.length === 1 ? "" : "s"} already have a "${ENTRY_NAME}" entry (${collisionClients.join(", ")}) and stdin is not a TTY.\n  Re-run \`yaw-mcp install --all --force\` to overwrite them, or \`--skip\` to leave them untouched.`,
+    );
   }
 
   const totalPlanned = plans.length;

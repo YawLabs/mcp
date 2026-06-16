@@ -5,12 +5,25 @@
 // clients have yaw-mcp wired up vs. don't / file permissions).
 //
 // The output is plain text so it survives Discord / Slack pasting.
-// Tokens are always fingerprinted (first-8…last-4) — never raw.
+// Tokens are always fingerprinted (never raw) — see tokenFingerprint in
+// config-loader.ts for the exact masking (the visible slice varies with
+// token length; short tokens reveal fewer characters).
+//
+// Side effects: doctor is NOT purely read-only. It runs the expired-trial
+// GC pass (gcExpiredTrials, both the text and --json paths), which is a
+// read-modify-write + unlink on client config files: it peels expired
+// `yaw-mcp-try-*` entries out of each client config, deletes the trial
+// marker, and fires a fire-and-forget expiry-gc telemetry event. There is
+// no lock around that write, so it carries the same TOCTOU class as any
+// other config mutation. The sweep is best-effort: any failure is swallowed
+// and never aborts the diagnostic.
 //
 // Exit codes:
-//   0  healthy (token present, no warnings)
-//   1  fatal   (no token resolvable — yaw-mcp won't start)
+//   0  healthy (token present, no warnings) OR local/Free mode (no token —
+//      yaw-mcp still starts and serves ~/.yaw-mcp/bundles.json)
 //   2  warnings (e.g., schema-version mismatch, loose file permissions)
+//   (1 = fatal is reserved and currently UNREACHABLE: a missing token is
+//   treated as healthy local/Free mode, not a fatal error, on both paths.)
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -77,8 +90,16 @@ export interface DoctorOptions {
 }
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
-// text sections 1:1 so support / dashboard consumers can pick fields
-// with jq. The raw token is NEVER included — only its fingerprint.
+// text sections so support / dashboard consumers can pick fields with jq.
+// The raw token is NEVER included — only its fingerprint.
+//
+// Sections deliberately NOT mirrored (text-only, by design):
+//   - SHADOWED CLI USAGE is carried as `shellShadows` (same data, renamed).
+//   - UPGRADE AVAILABLE's method-aware terminal hint is text-only; the JSON
+//     `upgrade` block carries the version facts but no install-method copy.
+// Everything else (CONFIG FILES, TOKEN, API BASE, ENVIRONMENT, STATE,
+// RELIABILITY, TRIALS, BACKGROUND POSTERS, INSTALLED CLIENTS, WARNINGS,
+// DIAGNOSIS) has a structured field below.
 export interface DoctorJsonSnapshot {
   timestamp: string;
   version: string;
@@ -104,6 +125,22 @@ export interface DoctorJsonSnapshot {
   }>;
   clients: ClientProbeResult[];
   shellShadows: ShadowHit[];
+  // Trial state. `cleared` is the count of expired trials swept this run
+  // (the GC write side effect — runs on the --json path too, matching the
+  // text path). `live` lists still-active trials with their TTL; `malformed`
+  // lists marker files that failed to parse.
+  trials: {
+    cleared: number;
+    live: Array<{ slug: string; clientName: string; clientPath: string; msUntilExpiry: number }>;
+    malformed: string[];
+  };
+  // Background HTTP poster failure latches (analytics, tool-report). A
+  // non-null entry is the 401/403 token-lost-write-scope signal; both null
+  // is the healthy case. Mirrors the text path's BACKGROUND POSTERS section.
+  backgroundPosters: {
+    analytics: { statusCode: number; url: string; at: string } | null;
+    toolReport: { statusCode: number; url: string; at: string } | null;
+  };
   upgrade: { current: string; latest: string | null; stale: boolean };
   diagnosis: { exitCode: number; summary: string };
 }
@@ -433,6 +470,46 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const shellShadows = scanShellHistoryForShadows({ home, env });
 
+  // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
+  // `doctor` and `doctor --json` have the SAME persistent side effects
+  // (peel expired entries out of client configs, delete markers, fire the
+  // expiry-gc telemetry). Previously the JSON path returned early and
+  // skipped GC entirely, leaving expired trials wired up. Best-effort:
+  // any sweep failure is swallowed, matching renderTrialsSection.
+  const trialGc = await gcExpiredTrials({ home, env, postEvent: opts.postTryEvent, now: opts.now }).catch(() => ({
+    cleared: 0,
+    failed: 0,
+  }));
+  const trialScan = await scanTrials({ home, now: opts.now });
+  const trials: DoctorJsonSnapshot["trials"] = {
+    cleared: trialGc.cleared,
+    live: trialScan.live.map(({ marker, msUntilExpiry }) => ({
+      slug: marker.slug,
+      clientName: marker.clientName,
+      clientPath: marker.clientPath,
+      msUntilExpiry,
+    })),
+    malformed: trialScan.malformed,
+  };
+
+  // Background HTTP poster failure latches — same getters the text path's
+  // renderBackgroundPostersSection reads. A non-null entry is the
+  // 401/403 token-lost-write-scope signal.
+  const analyticsFailure = getLastAnalyticsFailure();
+  const reportFailure = getLastReportFailure();
+  const backgroundPosters: DoctorJsonSnapshot["backgroundPosters"] = {
+    analytics: analyticsFailure
+      ? {
+          statusCode: analyticsFailure.statusCode,
+          url: analyticsFailure.url,
+          at: new Date(analyticsFailure.at).toISOString(),
+        }
+      : null,
+    toolReport: reportFailure
+      ? { statusCode: reportFailure.statusCode, url: reportFailure.url, at: new Date(reportFailure.at).toISOString() }
+      : null,
+  };
+
   // Mirrors the text path's hook handling (see runDoctor): an explicit
   // registryFetch bypasses the VITEST guard, and currentVersion overrides
   // the build-time VERSION. opts.argvPath is intentionally unused here --
@@ -475,6 +552,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     reliability,
     clients,
     shellShadows,
+    trials,
+    backgroundPosters,
     upgrade: { current: effectiveVersion, latest, stale },
     diagnosis: { exitCode, summary },
   };

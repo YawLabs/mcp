@@ -139,7 +139,9 @@ async function loadStoredState(filePath: string): Promise<StoredState | null> {
 async function saveStoredState(filePath: string, state: StoredState): Promise<void> {
   cachedState = { filePath, state };
   try {
-    await atomicWriteFile(filePath, JSON.stringify(state, null, 2));
+    // Born 0o600 so the session cookie is never group/other-readable in the
+    // window between rename and the chmod below.
+    await atomicWriteFile(filePath, JSON.stringify(state, null, 2), "utf8", 0o600);
     if (process.platform !== "win32") {
       try {
         await chmod(filePath, 0o600);

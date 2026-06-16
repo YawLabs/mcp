@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -127,9 +127,21 @@ describe("parseTryArgs", () => {
     }
   });
 
+  it("rejects --base followed by a flag instead of swallowing --dry-run as the URL", () => {
+    const r = parseTryArgs(["demo", "--base", "--dry-run"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--base requires a URL/);
+  });
+
   it("rejects unknown flags", () => {
     const r = parseTryArgs(["demo", "--bogus"]);
     expect(r.ok).toBe(false);
+  });
+
+  it("rejects a bare '-' positional with a clear arg-parse error", () => {
+    const r = parseTryArgs(["-"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Invalid argument "-"/);
   });
 });
 
@@ -141,6 +153,12 @@ describe("parseTryCleanupArgs", () => {
 
   it("rejects unknown flags", () => {
     expect(parseTryCleanupArgs(["demo", "--bogus"]).ok).toBe(false);
+  });
+
+  it("rejects a bare '-' positional with a clear arg-parse error", () => {
+    const r = parseTryCleanupArgs(["-"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Invalid argument "-"/);
   });
 });
 
@@ -330,6 +348,78 @@ describe("runTry — missing env vars", () => {
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
+    // Supplied via --env, NOT the ambient shell -- no ambient-source note.
+    expect(cap.errText()).not.toMatch(/read from your shell env/);
+  });
+
+  it("persists an ambient-shell value inline and warns it was sourced from the shell", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      // Value present in the ambient shell env, NOT via --env.
+      env: { FOO_TOKEN: "ambient-secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    // `try` (unlike `add`) copies the resolved value inline so the directly-
+    // launched trial entry can see it.
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "ambient-secret" });
+    // And warns on stderr that the value came from the shell.
+    expect(cap.errText()).toMatch(/FOO_TOKEN/);
+    expect(cap.errText()).toMatch(/read from your shell env/);
+  });
+});
+
+describe("runTry — client config perms (POSIX)", () => {
+  const posixOnly = process.platform === "win32" ? it.skip : it;
+
+  posixOnly("chmods a freshly-created secret-bearing client config to 0600", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    const clientPath = join(synthHome, ".claude.json");
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+  });
+
+  posixOnly("does NOT tighten perms on a pre-existing user-owned client file", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    // User's own file, group/other-readable.
+    writeFileSync(clientPath, JSON.stringify({ mcpServers: {} }), { mode: 0o644 });
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    // Pre-existing file: we must not silently re-perm the user's file to 0600.
+    expect(statSync(clientPath).mode & 0o777).not.toBe(0o600);
   });
 });
 

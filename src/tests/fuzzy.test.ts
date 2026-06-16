@@ -58,6 +58,20 @@ describe("closestNames", () => {
     expect(r).toContain("github");
   });
 
+  it("does not substring-match a short query against a long command (no misleading suggestions)", () => {
+    // A 2-char query like "ls" must NOT substring-match a 10-char command
+    // like "set-active" just because the chars happen to appear inside it.
+    // The substring tier is gated on q.length >= 3 plus a half-length rule.
+    const cmds = ["set-active", "secrets", "list-tools"] as const;
+    expect(closestNames("ls", cmds, 3)).toEqual([]);
+    // "ctiv" is a substring of "set-active" but not a prefix/suffix and not a
+    // near-typo; at 4 chars it is below half the length of "set-active" (10),
+    // so the half-length rule blocks the substring tier. (A genuine prefix
+    // like "set" still surfaces via the separate prefix tier -- that is
+    // intended and not what this gate suppresses.)
+    expect(closestNames("ctiv", cmds, 3)).not.toContain("set-active");
+  });
+
   it("surfaces a near-typo via edit distance (score 3–4)", () => {
     // "githu" → github is distance 1.
     const r = closestNames("githu", candidates, 3);

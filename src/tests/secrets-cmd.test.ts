@@ -97,6 +97,12 @@ describe("parseSecretsArgs", () => {
     expect(r.ok).toBe(false);
   });
 
+  it("rejects --value followed by a flag instead of storing it as the secret", () => {
+    const r = parseSecretsArgs(["set", "github", "--value", "--json"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--value requires a value/);
+  });
+
   it("rejects extra positional", () => {
     const r = parseSecretsArgs(["set", "github", "extra"]);
     expect(r.ok).toBe(false);
@@ -198,6 +204,21 @@ describe("runSecrets pull -- empty-remote guard", () => {
     });
     const result = await runSecrets({ action: "pull" }, io);
     expect(result.exitCode).toBe(0);
+  });
+
+  it("--json empty-remote output carries the same human hint under `message` (parity with prose)", async () => {
+    vi.mocked(getResource).mockResolvedValue({
+      version: 1,
+      data: { version: 1, salt: "", entries: {} },
+      updated_at: null,
+      updated_by: null,
+    });
+    const result = await runSecrets({ action: "pull", json: true }, io);
+    expect(result.exitCode).toBe(0);
+    const out = io.out.mock.calls.map((c) => c[0] as string).join("");
+    const parsed = JSON.parse(out);
+    expect(parsed).toMatchObject({ ok: true, empty: true });
+    expect(parsed.message).toMatch(/push from this machine to seed it/i);
   });
 });
 
@@ -432,5 +453,94 @@ describe("runSecrets set -- passphrase guards", () => {
     expect(r.exitCode).toBe(1);
     const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(errOutput.toLowerCase()).toMatch(/passphrase required/);
+  });
+});
+
+// -----------------------------------------------------------------------
+// readPassphraseFromTTY -- Ctrl-D (EOT) cancels instead of submitting a
+// partial passphrase. Driven through runSecrets via a fake TTY stdin.
+// -----------------------------------------------------------------------
+
+/** Minimal controllable fake of a TTY ReadStream for the passphrase reader.
+ *  Each `resume()` (one per prompt) flushes the next queued chunk to the
+ *  registered "data" listener on the next microtask. */
+class FakeTTYStdin {
+  isTTY = true;
+  isRaw = false;
+  private listener: ((chunk: string) => void) | null = null;
+  private queue: string[];
+  constructor(chunks: string[]) {
+    this.queue = [...chunks];
+  }
+  setRawMode(v: boolean): this {
+    this.isRaw = v;
+    return this;
+  }
+  setEncoding(): this {
+    return this;
+  }
+  on(event: string, cb: (chunk: string) => void): this {
+    if (event === "data") this.listener = cb;
+    return this;
+  }
+  removeListener(event: string, cb: (chunk: string) => void): this {
+    if (event === "data" && this.listener === cb) this.listener = null;
+    return this;
+  }
+  resume(): this {
+    // Deliver the next chunk after the current synchronous frame so the
+    // reader's "data" listener (attached AFTER resume() in the reader) is
+    // already registered. Read this.listener lazily inside the microtask.
+    const next = this.queue.shift();
+    if (next !== undefined) {
+      queueMicrotask(() => this.listener?.(next));
+    }
+    return this;
+  }
+  pause(): this {
+    return this;
+  }
+}
+
+describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
+  const home = nodePath.join(os.tmpdir(), `yaw-test-ctrld-${process.pid}`);
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const io = { out: vi.fn(), err: vi.fn() };
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+    try {
+      await unlink(vaultPath(home));
+    } catch {
+      /* ok */
+    }
+  });
+
+  it("treats typed chars followed by Ctrl-D (\\u0004) as cancel, NOT a partial submit", async () => {
+    const EOT = String.fromCharCode(4);
+    // Three prompts, each: type "abc" then Ctrl-D. If EOT were a line
+    // terminator (the old bug) the first prompt would submit "abc" and unlock;
+    // as a cancel it resolves "" each time, so resolvePassphrase exhausts its
+    // re-prompt budget and reports "passphrase required" (exit 1).
+    const stdin = new FakeTTYStdin([`abc${EOT}`, `abc${EOT}`, `abc${EOT}`]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput.toLowerCase()).toMatch(/passphrase required/);
+    // No vault should have been written under a "abc"-derived key.
   });
 });

@@ -79,10 +79,12 @@ describe("runResetLearning", () => {
     expect(io.err).toEqual([]);
   });
 
-  it("removes a malformed state file and reports 0 counts", async () => {
+  it("removes a malformed state file and reports it as unreadable (not 0 counts)", async () => {
     // loadState is tolerant and returns emptyState here; the unlink
     // still deletes the file, which is what we want — a corrupt state
     // file is exactly the kind of thing reset-learning should clear.
+    // But reporting "0 entries removed" would be misleading: we never
+    // got real counts, so we say the contents were unreadable instead.
     writeFileSync(stateFile, "{{not json", "utf8");
     const io = captureIO();
     const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
@@ -90,6 +92,49 @@ describe("runResetLearning", () => {
     expect(r.removed).toBe(true);
     expect(existsSync(stateFile)).toBe(false);
     const combined = io.out.join("");
+    expect(combined).toContain("cleared persisted state (contents unreadable)");
+    // Must NOT claim a concrete entry count it never read.
+    expect(combined).not.toContain("learning entries removed:");
+    expect(combined).not.toContain("pack history entries removed:");
+  });
+
+  it("removes a version-mismatched state file and reports it as unreadable", async () => {
+    // A version bump drops the old state (loadState returns emptyState),
+    // so the counts are 0/0 even though a non-trivial file existed.
+    // Report it as unreadable rather than "0 entries removed".
+    const payload = {
+      version: STATE_SCHEMA_VERSION + 1,
+      savedAt: Date.now(),
+      learning: { gh: { dispatched: 9, succeeded: 1, lastUsedAt: 1 } },
+      packHistory: [{ namespace: "gh", toolName: "listPrs", at: 2 }],
+    };
+    writeFileSync(stateFile, JSON.stringify(payload), "utf8");
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    expect(existsSync(stateFile)).toBe(false);
+    const combined = io.out.join("");
+    expect(combined).toContain("cleared persisted state (contents unreadable)");
+    expect(combined).not.toContain("learning entries removed:");
+  });
+
+  it("reports concrete 0/0 counts for a cleanly-parsed empty state file", async () => {
+    // A well-formed current-version file with no entries is NOT
+    // unreadable — it parsed fine, it just held nothing. The report
+    // should show the concrete 0/0 counts, not the unreadable message.
+    writeFileSync(
+      stateFile,
+      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning: {}, packHistory: [] }),
+      "utf8",
+    );
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    const combined = io.out.join("");
+    expect(combined).toContain("cleared persisted state.");
+    expect(combined).not.toContain("contents unreadable");
     expect(combined).toContain("learning entries removed:     0");
     expect(combined).toContain("pack history entries removed: 0");
   });
@@ -226,5 +271,17 @@ describe("parseResetLearningArgs", () => {
   it("returns error kind on stray positional too", () => {
     const r = parseResetLearningArgs(["something"]);
     expect(r.kind).toBe("error");
+  });
+
+  it("decides solely on the first arg (zero-arg-only contract; argv[1..] are not inspected)", () => {
+    // A help flag in position 0 wins regardless of trailing args.
+    expect(parseResetLearningArgs(["--help", "extra", "--bogus"]).kind).toBe("help");
+    // A non-help first arg errors on THAT arg; a later --help does not rescue it.
+    const r = parseResetLearningArgs(["--bogus", "--help"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") {
+      expect(r.error).toContain('"--bogus"');
+      expect(r.error).not.toContain('"--help"');
+    }
   });
 });

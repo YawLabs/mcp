@@ -22,8 +22,19 @@
 //      bundled-app)
 //   1  upgrade available but --run was not passed (human-interactive mode)
 //   2  usage error (unknown flag), OR --run on an install method that
-//      can't be auto-upgraded (dev-checkout / unknown)
+//      can't be auto-upgraded (binary / dev-checkout / unknown)
 //   3  --run attempted the upgrade and the child process failed
+//
+// SCRIPTING TRAP — the 1→2 transition for NON-RUNNABLE methods (binary,
+// dev-checkout, unknown): for these, plain `upgrade` on a stale install
+// returns 1 ("upgrade available, --run not passed"), but they can NEVER
+// be auto-run, so the advertised `--run` deterministically returns 2,
+// not 0. A script that treats 1 as "retry with --run" will always then
+// hit exit 2. This is intentional: these methods require a MANUAL
+// upgrade (download a build / `git pull` / inspect the tree), so the
+// human-facing message says "manual upgrade required" rather than
+// promising --run will fix it. Branch on the `method` field of the
+// --json snapshot (or on exit 2) instead of blindly chaining --run.
 //
 // `yaw-mcp doctor` shows the same staleness status — upgrade is purely
 // the "what do I type to fix it" surface. Kept separate so scripts
@@ -121,10 +132,15 @@ export function parseUpgradeArgs(
 export function detectInstallMethod(argvPath: string | undefined): InstallMethod {
   if (!argvPath) return "unknown";
   const normalized = argvPath.replace(/\\/g, "/");
-  // `npx -y @yawlabs/mcp` stages packages under ~/.npm/_npx/ (or
-  // platform equivalent with a hash dir). On Windows the cache is
-  // under npm-cache/_npx/... — same marker works.
-  if (/\/_npx\//.test(normalized)) return "npx";
+  // `npx -y @yawlabs/mcp` stages packages under ~/.npm/_npx/<hex>/
+  // node_modules/@yawlabs/mcp/ (or platform equivalent; on Windows the
+  // cache is under npm-cache/_npx/...). Require the full npm-cache
+  // context — `_npx/<hex>/node_modules/@yawlabs/mcp/` — rather than a
+  // bare `_npx` segment: a user project path that merely CONTAINS a
+  // `_npx` directory would otherwise be misclassified as an npx run.
+  // Consistent with the global markers below, which all anchor on the
+  // `@yawlabs/mcp` segment.
+  if (/\/_npx\/[0-9a-f]+\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "npx";
   // The copy Yaw Terminal ships inside its Electron resources
   // (resources/app.asar.unpacked/node_modules/@yawlabs/mcp). It LOOKS
   // like local-node-modules, but running `npm install` against the
@@ -436,10 +452,16 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
 
   if (method === "binary") {
-    print("yaw-mcp is running as a standalone binary — there's no package manager");
-    print("to upgrade it. Download the latest build and replace this executable:");
+    print("yaw-mcp is running as a standalone binary — manual upgrade required.");
+    print("There's no package manager to upgrade it, and `--run` can't automate");
+    print("this: download the latest build and replace this executable:");
     print("");
     print(`  ${BINARY_DOWNLOAD_URL}`);
+    // 1→2 scripting trap (see the "SCRIPTING TRAP" note in the file header):
+    // plain `upgrade` returns 1, but `--run` returns 2 because a binary can
+    // never be auto-run. The message above states "manual upgrade required"
+    // so scripts don't blindly retry with --run. The exit-code contract is
+    // intentionally unchanged.
     return { exitCode: opts.run ? 2 : 1, lines };
   }
 
@@ -469,7 +491,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     if (runSpec) {
       print("Run `yaw-mcp upgrade --run` to upgrade in place, or run it yourself:");
     } else {
-      print("Run it yourself (--run can't safely automate this install method):");
+      // Non-runnable method (dev-checkout / unknown): manual upgrade required.
+      // 1→2 scripting trap — see the file-header "SCRIPTING TRAP" note: this
+      // returns 1 here, but `--run` returns 2 below, never 0. Don't promise
+      // --run will fix it.
+      print("Manual upgrade required (--run can't safely automate this install method). Run it yourself:");
     }
     print("");
     if (installRoot) {
@@ -482,7 +508,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // --run: attempt the upgrade. Only whitelisted commands — never
   // pass arbitrary user input into a shell.
   if (!runSpec) {
-    printErr(`yaw-mcp upgrade --run: a "${method}" install can't be upgraded automatically. Run it yourself:`);
+    // Non-runnable method reached via --run: manual upgrade required. This is
+    // the exit-2 half of the documented 1→2 scripting trap (file-header note).
+    printErr(
+      `yaw-mcp upgrade --run: a "${method}" install can't be upgraded automatically (manual upgrade required). Run it yourself:`,
+    );
     printErr("");
     printErr(`  ${plan.command}`);
     return { exitCode: 2, lines };

@@ -95,7 +95,10 @@ export function parseAddArgs(
         break;
       case "--catalog": {
         const v = next();
-        if (!v) return { ok: false, error: "--catalog requires a URL" };
+        // Reject a following flag (e.g. `add slug --catalog --dry-run`, which
+        // would otherwise set catalogUrl="--dry-run" and drop the flag). A URL
+        // never starts with "--".
+        if (!v || v.startsWith("--")) return { ok: false, error: "--catalog requires a URL" };
         opts.catalogUrl = v;
         break;
       }
@@ -157,7 +160,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // value in --env or the shell. Same posture as `yaw-mcp try` so the two
   // commands behave alike. (The GUI provides the richer fill-in-the-blank UX.)
   const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
-  const missing = server.requiredEnvKeys.filter((k) => !supplied[k] || supplied[k] === "");
+  // Trim before the emptiness test so a whitespace-only value (FOO=" ") counts
+  // as missing instead of slipping through and persisting a blank-ish secret to
+  // bundles.json -- matching try-cmd.ts:465.
+  const missing = server.requiredEnvKeys.filter((k) => (supplied[k] ?? "").trim() === "");
   if (missing.length > 0) {
     printErr(`yaw-mcp add: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
@@ -176,7 +182,15 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // an ambient secret into bundles.json the user never asked to persist.
   const entryEnv: Record<string, string> = {};
   for (const k of server.requiredEnvKeys) entryEnv[k] = "";
-  for (const [k, v] of Object.entries(opts.envOverrides ?? {})) entryEnv[k] = v;
+  // Trim each --env value before persisting: a whitespace-only value is treated
+  // as missing (a required key stays seeded EMPTY; a non-required key is skipped
+  // entirely) so it never lands as a blank-ish secret in bundles.json --
+  // consistent with the trimmed required-env gate above.
+  for (const [k, v] of Object.entries(opts.envOverrides ?? {})) {
+    const trimmed = v.trim();
+    if (trimmed === "") continue;
+    entryEnv[k] = trimmed;
+  }
 
   // Required keys that passed the gate ONLY because the value was present in the
   // ambient shell env (not --env). The persisted entry seeds these EMPTY, so the

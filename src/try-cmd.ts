@@ -211,7 +211,10 @@ export function parseTryArgs(
         break;
       case "--base": {
         const v = next();
-        if (!v) return { ok: false, error: "--base requires a URL" };
+        // Reject a following flag (e.g. `try slug --base --dry-run`, which
+        // would otherwise set baseUrl="--dry-run" and silently drop the
+        // dry-run flag). A URL never starts with "--".
+        if (!v || v.startsWith("--")) return { ok: false, error: "--base requires a URL" };
         opts.baseUrl = v;
         break;
       }
@@ -220,6 +223,10 @@ export function parseTryArgs(
         return { ok: false, error: TRY_USAGE, help: true };
       default:
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_USAGE}` };
+        // A bare "-" is not a valid slug; reject it here with a clear
+        // arg-parse error rather than letting it slip to the slug regex,
+        // which would only reject it later with a generic "invalid slug".
+        if (a === "-") return { ok: false, error: `Invalid argument "-".\n${TRY_USAGE}` };
         positional.push(a);
     }
   }
@@ -247,6 +254,9 @@ export function parseTryCleanupArgs(
       continue;
     }
     if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_CLEANUP_USAGE}` };
+    // Reject a bare "-" with a clear arg-parse error rather than deferring
+    // to the slug regex's generic "invalid slug" message.
+    if (a === "-") return { ok: false, error: `Invalid argument "-".\n${TRY_CLEANUP_USAGE}` };
     positional.push(a);
   }
   if (positional.length !== 1) {
@@ -476,6 +486,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // place. Only carry the env vars the upstream actually wants (from
   // requiredEnvVars + any --env overrides the user supplied); we don't
   // want to leak every var in the user's shell into the entry.
+  //
+  // INTENTIONAL DIVERGENCE from `yaw-mcp add` (local-add-cmd.ts:174-190):
+  // `add` seeds required keys EMPTY and persists a value ONLY for explicit
+  // --env, deliberately NOT copying ambient-shell secrets to disk (yaw-mcp
+  // inherits the shell env at spawn time). `try` cannot do that -- the trial
+  // entry is upstream-shape and launched DIRECTLY by the client, not through
+  // yaw-mcp, so there is no env-inheriting launcher in the path; the resolved
+  // value (including an ambient-shell secret) MUST be written inline or the
+  // server has no way to see it. The ambientOnlyRequired note below warns the
+  // user when a value was sourced from the shell rather than --env.
   const trialEnv: Record<string, string> = {};
   for (const k of server.requiredEnvVars ?? []) {
     // Use the trimmed value so a padded entry doesn't carry surrounding
@@ -488,6 +508,14 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   for (const [k, v] of Object.entries(opts.envOverrides ?? {})) {
     if (!(k in trialEnv)) trialEnv[k] = v;
   }
+  // Required keys whose value came from the ambient shell, NOT --env. Unlike
+  // `add`, `try` DOES persist these inline (see divergence note above); the
+  // note at step 9 tells the user the secret was sourced from their shell so
+  // they're aware it now lives in the client config on disk.
+  const overrides = opts.envOverrides ?? {};
+  const ambientOnlyRequired = (server.requiredEnvVars ?? []).filter(
+    (k) => (!overrides[k] || overrides[k] === "") && (supplied[k] ?? "").trim() !== "",
+  );
   const entry = buildLaunchEntry({
     os,
     upstream: {
@@ -512,8 +540,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   };
 
   // Step 6: read existing client config (if any).
+  // Track whether the client file pre-existed: if it did, it is the user's
+  // own file and we must NOT tighten its perms (step 7's chmod is scoped to
+  // the freshly-created case). If it did not, `try` is creating it and a
+  // best-effort 0600 is appropriate when the entry carries secrets inline.
+  const clientPreExisted = existsSync(resolved.absolute);
   let existing: Record<string, unknown> = {};
-  if (existsSync(resolved.absolute)) {
+  if (clientPreExisted) {
     try {
       const raw = await readFile(resolved.absolute, "utf8");
       if (raw.trim().length > 0) {
@@ -549,9 +582,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 0, written: [], marker };
   }
 
-  // Step 7: write everything atomically. Order: marker first (so the
-  // GC pass can sweep even if the client write fails mid-way), then
-  // client config. Anon id seeded as a side-effect.
+  // Step 7: write everything atomically. Order: marker first, then client
+  // config. Rationale: if the process CRASHES between the two writes (where
+  // the catch-block rollback below cannot run), a sweepable marker is left
+  // behind so doctor's GC can reclaim it. On a CAUGHT client-write failure we
+  // do NOT rely on that -- the catch explicitly unlinks the marker (see
+  // below) so doctor never sees a trial whose launch entry was never written.
+  // Anon id seeded as a side-effect.
   const written: string[] = [];
   try {
     await mkdir(trialsDir(home), { recursive: true });
@@ -565,6 +602,19 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   try {
     await atomicWriteFile(resolved.absolute, clientJson);
     written.push(resolved.absolute);
+    // Best-effort 0600 ONLY when `try` freshly created the client file AND
+    // the entry carries inline env (secrets). We deliberately scope this to
+    // the freshly-created case: a pre-existing file is the user's own, and
+    // tightening its perms could surprise them (and atomicWriteFile's rename
+    // replaces the inode, so an unconditional chmod would silently re-perm
+    // their file on every trial). No-op on Windows (POSIX perms don't apply).
+    if (!clientPreExisted && entry.env && Object.keys(entry.env).length > 0 && process.platform !== "win32") {
+      try {
+        await chmod(resolved.absolute, 0o600);
+      } catch {
+        // chmod best-effort -- the trial still works at default perms.
+      }
+    }
   } catch (e) {
     printErr(`yaw-mcp try: failed to write ${resolved.absolute}: ${(e as Error).message}`);
     // Best-effort marker rollback so doctor doesn't think a trial is
@@ -583,6 +633,18 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   print(`Trial wired: ${server.name} via yaw-mcp-try-${slug} -> ${resolved.absolute}`);
   print(`Expires in ${ttlPretty}; remove sooner with: yaw-mcp try-cleanup ${slug}`);
   print(`Liking it? Sign up at ${baseUrl}/signup to keep ${server.name} on every machine.`);
+
+  // If a required key was satisfied by the ambient shell (not --env), its
+  // value was copied INTO the trial entry on disk (unlike `add`, which seeds
+  // it empty). Warn on stderr so the user knows a shell-resident secret was
+  // persisted to the client config.
+  if (ambientOnlyRequired.length > 0) {
+    printErr(
+      `Note: ${ambientOnlyRequired.join(", ")} ${
+        ambientOnlyRequired.length === 1 ? "was" : "were"
+      } read from your shell env and written into the trial entry at ${resolved.absolute}. Remove the trial with: yaw-mcp try-cleanup ${slug}`,
+    );
+  }
   return { exitCode: 0, written, marker };
 }
 

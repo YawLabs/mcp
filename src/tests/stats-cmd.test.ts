@@ -112,4 +112,32 @@ describe("formatPlain -- showing count respects --limit", () => {
     // 80 events, default limit 50 -> renderedCount = min(80, 50) = 50
     expect(out).toMatch(/^Showing 50 of 80 events/m);
   });
+
+  it("default window pluralizes 'days' correctly (days defaults to 7)", () => {
+    const events = Array.from({ length: 3 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, {}, "ord-123", 3);
+    expect(out).toMatch(/from the last 7 days\./m);
+  });
+
+  it("singular 'day' when --days 1", () => {
+    const events = Array.from({ length: 3 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, { days: 1 }, "ord-123", 3);
+    expect(out).toMatch(/from the last 1 day\./m);
+  });
+});
+
+describe("formatPlain -- aggregate-vs-recent caveat surfaces in plain output", () => {
+  it("notes that Recent is capped while By-server spans the full window when events > limit", () => {
+    const events = Array.from({ length: 100 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, { limit: 10 }, "ord-123", 100);
+    expect(out).toMatch(/Recent events \(newest first, capped at --limit; By-server/);
+    expect(out).toMatch(/span the full window/);
+  });
+
+  it("uses the plain Recent header (no caveat) when all events fit under the limit", () => {
+    const events = Array.from({ length: 5 }, (_, i) => makeEvent(1_000_000 + i));
+    const out = formatPlain(events, {}, "ord-123", 5);
+    expect(out).toMatch(/^Recent events \(newest first\):$/m);
+    expect(out).not.toMatch(/capped at --limit/);
+  });
 });

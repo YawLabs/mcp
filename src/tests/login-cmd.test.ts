@@ -29,6 +29,12 @@ describe("parseLoginArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/--key requires a value/);
   });
 
+  it("rejects --key followed by a flag instead of swallowing it as the key", () => {
+    const r = parseLoginArgs(["--key", "--json"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--key requires a value/);
+  });
+
   it("rejects unknown args", () => {
     const r = parseLoginArgs(["--key", "k", "--bogus"]);
     expect(r.ok).toBe(false);
