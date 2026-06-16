@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CONFIG_DIRNAME, GUIDE_FILENAME, cacheDir, findProjectConfigDir, guidePath, userConfigDir } from "../paths.js";
+import { CONFIG_DIRNAME, cacheDir, findProjectConfigDir, GUIDE_FILENAME, guidePath, userConfigDir } from "../paths.js";
 
 describe("cacheDir", () => {
   const ORIG_PLATFORM = process.platform;

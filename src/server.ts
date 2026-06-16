@@ -14,19 +14,19 @@ import {
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
-import { CURATED_BUNDLES, bundleActivateHint, matchBundles, topPartialBundles } from "./bundles.js";
+import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine } from "./cli-shadows.js";
 import { type ComplianceGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
-import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
+import { loadEffectiveProfile, type Profile, profileAllows } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
 import { formatRelativeAge } from "./doctor-cmd.js";
 import { classifyError } from "./error-category.js";
 import {
+  collectRefDeps,
   type ExecStepInput,
   RefError,
-  collectRefDeps,
   resolveArgs,
   stepBindingKey,
   validateExecRequest,
@@ -41,42 +41,42 @@ import {
   healthFactor,
 } from "./health-score.js";
 import { initHeartbeat, reportHeartbeat } from "./heartbeat.js";
-import { HISTORY_LIMIT, type ToolCallRecord, adaptiveThreshold, pushToolCall } from "./idle-ttl.js";
+import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
 import { LearningStore } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { META_TOOLS, META_TOOL_NAMES, buildInstallPayload } from "./meta-tools.js";
+import { buildInstallPayload, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { loadState, saveState } from "./persistence.js";
-import { type ProgressReporter, createProgressReporter } from "./progress.js";
+import { createProgressReporter, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
-  type PromptRoute,
-  type ResourceRoute,
-  type ToolRoute,
   buildPromptList,
   buildPromptRoutes,
   buildResourceList,
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  type PromptRoute,
+  type ResourceRoute,
   routePromptGet,
   routeResourceRead,
   routeToolCall,
+  type ToolRoute,
 } from "./proxy.js";
 import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
-import { type RankableServer, rankServers, scoreRelevance, tokenize } from "./relevance.js";
+import { type RankableServer, rankServers, tokenize } from "./relevance.js";
 import { initRerank, rerank } from "./rerank.js";
+import { computeOutcomeReward } from "./reward.js";
 import {
-  type GraderContext,
   firstResultText,
+  type GraderContext,
   gradeOutcomeViaSampling,
   isRewardGraderEnabled,
   isUncertainReward,
 } from "./reward-grader.js";
-import { computeOutcomeReward } from "./reward.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
 import {
   bestOfNViaSampling,
@@ -85,7 +85,7 @@ import {
   sampleCountForEffort,
   shouldSample,
 } from "./sampling-rank.js";
-import { type LoadedSlot, evaluateServerCap, resolveServerCap } from "./server-cap.js";
+import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
@@ -2508,7 +2508,7 @@ export class ConnectServer {
     for (const [namespace, connection] of this.connections) {
       const newServerConfig = newServersByNs.get(namespace);
 
-      if (!newServerConfig || !newServerConfig.isActive) {
+      if (!newServerConfig?.isActive) {
         log("info", "Server removed or disabled in config, deactivating", { namespace });
         await disconnectFromUpstream(connection);
         this.connections.delete(namespace);

@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  MAX_PROMPTS_PER_SERVER,
-  MAX_RESOURCES_PER_SERVER,
-  MAX_TOOLS_PER_SERVER,
   fetchPromptsFromUpstream,
   fetchResourcesFromUpstream,
   fetchToolsFromUpstream,
+  MAX_PROMPTS_PER_SERVER,
+  MAX_RESOURCES_PER_SERVER,
+  MAX_TOOLS_PER_SERVER,
 } from "../upstream.js";
 
 // Minimal stand-in for the MCP SDK Client — only the listTools/listResources/

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  bundleActivateHint,
   CURATED_BUNDLES,
   type CuratedBundle,
-  bundleActivateHint,
   matchBundles,
   topPartialBundles,
 } from "../bundles.js";

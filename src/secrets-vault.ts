@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
-import { type EncryptedEntry, decryptEntry, deriveKey, encryptEntry, generateSalt } from "./secrets-crypto.js";
+import { decryptEntry, deriveKey, type EncryptedEntry, encryptEntry, generateSalt } from "./secrets-crypto.js";
 
 export const SECRETS_FILENAME = "secrets.json";
 export const SECRETS_SCHEMA_VERSION = 1;

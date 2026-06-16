@@ -30,15 +30,15 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { CONFIG_FILENAME, CURRENT_SCHEMA_VERSION, loadYawMcpConfig } from "./config-loader.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
+  buildLaunchEntry,
   CLAUDE_CODE_ALLOW_PATTERN,
   CURRENT_OS,
   ENTRY_NAME,
+  findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
-  buildLaunchEntry,
-  findLegacyEntry,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "./install-targets.js";

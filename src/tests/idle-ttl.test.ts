@@ -4,10 +4,10 @@ import {
   ADAPTIVE_MAX,
   ADAPTIVE_MIN,
   ADAPTIVE_WINDOW_MS,
-  HISTORY_LIMIT,
-  type ToolCallRecord,
   adaptiveThreshold,
+  HISTORY_LIMIT,
   pushToolCall,
+  type ToolCallRecord,
 } from "../idle-ttl.js";
 
 // Fixed "now" used throughout tests so relative timestamps read easily.
@@ -136,13 +136,11 @@ describe("MCP_CONNECT_IDLE_THRESHOLD env var override", () => {
   const ORIGINAL_ENV = process.env.MCP_CONNECT_IDLE_THRESHOLD;
 
   beforeEach(() => {
-    // biome-ignore lint/performance/noDelete: env-var unset semantics require delete
     delete process.env.MCP_CONNECT_IDLE_THRESHOLD;
   });
 
   afterEach(() => {
     if (ORIGINAL_ENV === undefined) {
-      // biome-ignore lint/performance/noDelete: env-var unset semantics require delete
       delete process.env.MCP_CONNECT_IDLE_THRESHOLD;
     } else {
       process.env.MCP_CONNECT_IDLE_THRESHOLD = ORIGINAL_ENV;

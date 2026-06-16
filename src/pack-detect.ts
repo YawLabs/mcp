@@ -159,7 +159,7 @@ export class PackDetector {
   loadSnapshot(snapshot: ReadonlyArray<PackCall>): void {
     const clean: PackCall[] = [];
     for (const c of snapshot) {
-      if (!c || !c.namespace || !c.toolName) continue;
+      if (!c?.namespace || !c.toolName) continue;
       clean.push({ namespace: c.namespace, toolName: c.toolName, at: c.at });
     }
     if (clean.length > this.maxHistory) {

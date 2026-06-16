@@ -2,8 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseBundlesArgs, runBundlesCommand } from "../bundles-cmd.js";
 import { CURATED_BUNDLES } from "../bundles.js";
+import { parseBundlesArgs, runBundlesCommand } from "../bundles-cmd.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import type { ConnectConfig, UpstreamServerConfig } from "../types.js";
 

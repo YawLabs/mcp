@@ -6,7 +6,7 @@
 // Free users don't need to log in -- the bare `yaw-mcp` (local mode)
 // runs from ~/.yaw-mcp/bundles.json with no account.
 
-import { TeamSyncAuthError, signIn } from "./team-sync.js";
+import { signIn, TeamSyncAuthError } from "./team-sync.js";
 
 export const LOGIN_USAGE = `Usage: yaw-mcp login --key <license-key>
 

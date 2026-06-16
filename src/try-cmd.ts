@@ -30,7 +30,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, readdir, unlink } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir, hostname, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { request } from "undici";
@@ -39,11 +39,11 @@ import { resolveCatalogSlug } from "./catalog.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
 import { mergeClientConfig, readNested, removeFromClientConfig } from "./install-cmd.js";
 import {
+  buildLaunchEntry,
   CURRENT_OS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
-  buildLaunchEntry,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -66,8 +66,8 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
   --base <url>         Base URL for the signup/telemetry links (default:
-                       \$YAW_MCP_BASE_URL or https://yaw.sh/mcp). The catalog
-                       itself is set via \$YAW_MCP_CATALOG_URL.`;
+                       $YAW_MCP_BASE_URL or https://yaw.sh/mcp). The catalog
+                       itself is set via $YAW_MCP_CATALOG_URL.`;
 
 export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
@@ -196,7 +196,7 @@ export function parseTryArgs(
       }
       case "--env": {
         const v = next();
-        if (!v || !v.includes("=")) return { ok: false, error: "--env requires KEY=value" };
+        if (!v?.includes("=")) return { ok: false, error: "--env requires KEY=value" };
         const eq = v.indexOf("=");
         const key = v.slice(0, eq);
         const val = v.slice(eq + 1);

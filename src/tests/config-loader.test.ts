@@ -5,8 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CONFIG_FILENAME,
   CURRENT_SCHEMA_VERSION,
-  LOCAL_CONFIG_FILENAME,
   isAllowed,
+  LOCAL_CONFIG_FILENAME,
   loadEffectiveProfile,
   loadYawMcpConfig,
   profileAllows,

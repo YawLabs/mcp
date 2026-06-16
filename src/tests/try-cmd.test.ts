@@ -2,13 +2,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ENTRY_NAME, buildLaunchEntry } from "../install-targets.js";
+import { buildLaunchEntry, ENTRY_NAME } from "../install-targets.js";
 import {
-  type ExploreServerResponse,
-  type TrialMarker,
-  type TryEventBody,
   anonIdPath,
   computeAnonId,
+  type ExploreServerResponse,
   formatTtl,
   gcExpiredTrials,
   loadOrCreateAnonId,
@@ -18,6 +16,8 @@ import {
   runTry,
   runTryCleanup,
   scanTrials,
+  type TrialMarker,
+  type TryEventBody,
   trialMarkerPath,
   trialsDir,
 } from "../try-cmd.js";

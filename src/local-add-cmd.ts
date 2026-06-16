@@ -63,7 +63,7 @@ export interface AddCommandResult {
 }
 
 function parseEnvFlag(v: string | undefined, bag: Record<string, string>): string | null {
-  if (!v || !v.includes("=")) return "--env requires KEY=value";
+  if (!v?.includes("=")) return "--env requires KEY=value";
   const eq = v.indexOf("=");
   const key = v.slice(0, eq);
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return `--env: invalid KEY "${key}"`;
@@ -328,7 +328,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     return { exitCode: 1, written: [] };
   }
 
-  if (!res || !res.removed) {
+  if (!res?.removed) {
     // No-op exits 0 (like try-cleanup): "make it absent" succeeded.
     print(`yaw-mcp remove: no server matching "${opts.target}" in ${res?.path ?? "bundles.json"} (nothing to do).`);
     // `list` reads the project-local bundles.json when present (it overrides

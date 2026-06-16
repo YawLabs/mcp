@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type ToolCallResultShape, computeOutcomeReward } from "../reward.js";
+import { computeOutcomeReward, type ToolCallResultShape } from "../reward.js";
 
 describe("computeOutcomeReward", () => {
   describe("rule 1: hard failure (isError === true) -> 0.0", () => {

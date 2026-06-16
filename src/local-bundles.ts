@@ -200,12 +200,7 @@ export interface LoadLocalBundlesResult {
  *  (`<project>/.yaw-mcp/bundles.json`) wins over user-global
  *  (`~/.yaw-mcp/bundles.json`) -- no merge. Returns null config when
  *  neither file exists, so the caller can render the empty-state hint. */
-export async function loadLocalBundles(
-  opts: {
-    cwd?: string;
-    home?: string;
-  } = {},
-): Promise<LoadLocalBundlesResult> {
+export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {}): Promise<LoadLocalBundlesResult> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
   const warnings: string[] = [];

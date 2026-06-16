@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ERROR_CATEGORIES, classifyError } from "../error-category.js";
+import { classifyError, ERROR_CATEGORIES } from "../error-category.js";
 
 describe("classifyError", () => {
   // Test cases sourced from real failures observed in session

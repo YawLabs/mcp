@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  type InstallMethod,
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
+  type InstallMethod,
   localInstallRoot,
   parseUpgradeArgs,
   refineInstallMethod,
@@ -156,7 +156,6 @@ describe("detectSea", () => {
     try {
       expect(await detectSea()).toBe(false);
     } finally {
-      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
       if (prev === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
       else process.env.ELECTRON_RUN_AS_NODE = prev;
     }

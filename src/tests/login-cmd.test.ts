@@ -59,8 +59,7 @@ vi.mock("../team-sync.js", async (importOriginal) => {
   return { ...actual, signIn: vi.fn() };
 });
 
-import { TeamSyncAuthError } from "../team-sync.js";
-import { signIn } from "../team-sync.js";
+import { signIn, TeamSyncAuthError } from "../team-sync.js";
 
 describe("runLogin exit codes", () => {
   const io = { out: vi.fn(), err: vi.fn() };

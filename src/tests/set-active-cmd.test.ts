@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { type SetActiveDeps, parseSetActiveArgs, runSetActive } from "../set-active-cmd.js";
+import { parseSetActiveArgs, runSetActive, type SetActiveDeps } from "../set-active-cmd.js";
 import {
   type TeamResource,
   TeamSyncAuthError,

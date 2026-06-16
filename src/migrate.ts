@@ -22,7 +22,7 @@
 import { mkdir, rename, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { log } from "./logger.js";
-import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
+import { CONFIG_DIRNAME, userConfigDir } from "./paths.js";
 
 export const LEGACY_GLOBAL_FILENAME = ".yaw-mcp.json";
 export const LEGACY_PROJECT_FILENAME = ".yaw-mcp.json";
