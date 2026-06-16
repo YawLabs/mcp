@@ -38,7 +38,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
-    "@types/node": "^22.0.0",
+    "@types/node": "^25.9.3",
     "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.4.0",
