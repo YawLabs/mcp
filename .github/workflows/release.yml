@@ -80,3 +80,50 @@ jobs:
             dist-release/${{ steps.stage.outputs.asset }}
             dist-release/${{ steps.stage.outputs.asset }}.sha256
           fail_on_unmatched_files: true
+
+  # Publish server.json to the official MCP registry. Previously a manual
+  # `mcp-publisher publish` step, which meant the registry JWT silently expired
+  # between releases. Doing it here via GitHub OIDC is tokenless (the OIDC claim
+  # proves the run is in github.com/YawLabs, which owns the io.github.YawLabs/*
+  # namespace) so nothing expires and the registry is never out of sync.
+  publish-registry:
+    name: publish to MCP registry
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mint the OIDC token for `mcp-publisher login github-oidc`
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      # The registry verifies the referenced npm package exists AND that its
+      # package.json `mcpName` matches this server. release.sh publishes npm
+      # from the workstation just AFTER pushing the tag, so this job can race
+      # ahead of npm -- wait for the version to appear (server.json is the
+      # source of truth; release.sh keeps it in lockstep with package.json).
+      - name: Wait for the npm package to be live
+        shell: bash
+        run: |
+          ver=$(node -p "require('./server.json').version")
+          for i in $(seq 1 30); do
+            if [ "$(npm view "@yawlabs/mcp@${ver}" version 2>/dev/null)" = "$ver" ]; then
+              echo "npm has @yawlabs/mcp@${ver}"; exit 0
+            fi
+            echo "waiting for npm @yawlabs/mcp@${ver} (${i}/30)..."; sleep 10
+          done
+          echo "::error::npm did not show @yawlabs/mcp@${ver} within 5 minutes"; exit 1
+
+      # mcp-publisher is a Go binary distributed via the registry's releases.
+      - name: Install mcp-publisher
+        shell: bash
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar -xz mcp-publisher
+          ./mcp-publisher --help >/dev/null
+
+      - name: Publish server.json (GitHub OIDC)
+        shell: bash
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
