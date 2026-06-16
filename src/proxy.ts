@@ -269,7 +269,7 @@ export async function routeResourceRead(
   }
 
   const connection = activeConnections.get(route.namespace);
-  if (!connection || connection.status !== "connected") {
+  if (connection?.status !== "connected") {
     return { contents: [{ uri, text: `Server "${route.namespace}" is not connected.` }] };
   }
 
@@ -295,7 +295,7 @@ export async function routePromptGet(
   }
 
   const connection = activeConnections.get(route.namespace);
-  if (!connection || connection.status !== "connected") {
+  if (connection?.status !== "connected") {
     return {
       messages: [{ role: "user", content: { type: "text", text: `Server "${route.namespace}" is not connected.` } }],
     };
@@ -333,7 +333,7 @@ export async function routeToolCall(
 
   const connection = activeConnections.get(route.namespace);
 
-  if (!connection || connection.status !== "connected") {
+  if (connection?.status !== "connected") {
     return {
       content: [
         {

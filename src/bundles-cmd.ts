@@ -25,13 +25,13 @@
 
 import {
   type BundleMatchResult,
+  bundleActivateHint,
   CURATED_BUNDLES,
   type CuratedBundle,
-  bundleActivateHint,
   matchBundles,
 } from "./bundles.js";
-import { loadYawMcpConfig } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
+import { loadYawMcpConfig } from "./config-loader.js";
 import type { ConnectConfig } from "./types.js";
 
 export type BundlesAction = "list" | "match";

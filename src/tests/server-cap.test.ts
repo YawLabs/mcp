@@ -5,12 +5,10 @@ describe("resolveServerCap", () => {
   const originalEnv = process.env.YAW_MCP_SERVER_CAP;
 
   beforeEach(() => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
     delete process.env.YAW_MCP_SERVER_CAP;
   });
   afterEach(() => {
     if (originalEnv === undefined) {
-      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
       delete process.env.YAW_MCP_SERVER_CAP;
     } else {
       process.env.YAW_MCP_SERVER_CAP = originalEnv;

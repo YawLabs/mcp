@@ -32,7 +32,6 @@ describe("maybeAutoUpgrade", () => {
       expect(fetchLatestImpl).not.toHaveBeenCalled();
       expect(spawnImpl).not.toHaveBeenCalled();
     } finally {
-      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
       if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
       else process.env.YAW_MCP_AUTO_UPGRADE = prev;
     }
@@ -51,7 +50,6 @@ describe("maybeAutoUpgrade", () => {
       });
       expect(spawnImpl).not.toHaveBeenCalled();
     } finally {
-      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
       if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
       else process.env.YAW_MCP_AUTO_UPGRADE = prev;
     }
@@ -72,7 +70,6 @@ describe("maybeAutoUpgrade", () => {
       expect(fetchLatestImpl).not.toHaveBeenCalled();
       expect(spawnImpl).not.toHaveBeenCalled();
     } finally {
-      // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
       if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
       else process.env.YAW_MCP_AUTO_UPGRADE = prev;
     }
@@ -100,7 +97,6 @@ describe("maybeAutoUpgrade", () => {
           "@yawlabs/mcp@latest",
         ]);
       } finally {
-        // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
         if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
         else process.env.YAW_MCP_AUTO_UPGRADE = prev;
       }

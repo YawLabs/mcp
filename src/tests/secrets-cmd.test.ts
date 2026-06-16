@@ -2,7 +2,7 @@ import { mkdir, unlink } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SECRETS_USAGE, parseSecretsArgs, runSecrets } from "../secrets-cmd.js";
+import { parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 
 describe("parseSecretsArgs", () => {
   it("rejects missing action", () => {

@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  MAX_EXEC_STEPS,
-  RefError,
   collectRefDeps,
   isRefNode,
+  MAX_EXEC_STEPS,
   parseRefPath,
+  RefError,
   resolveArgs,
   resolveRef,
   stepBindingKey,

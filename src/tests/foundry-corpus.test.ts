@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  FOUNDRY_CORPUS_VERSION,
   buildCorpusFromTraces,
+  FOUNDRY_CORPUS_VERSION,
   loadFoundryCorpus,
   parseTraceLines,
   scoreCorpus,

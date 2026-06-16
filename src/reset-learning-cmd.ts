@@ -21,7 +21,7 @@ import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { userConfigDir } from "./paths.js";
-import { STATE_FILENAME, loadState } from "./persistence.js";
+import { loadState, STATE_FILENAME } from "./persistence.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 

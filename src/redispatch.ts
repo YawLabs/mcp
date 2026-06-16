@@ -12,8 +12,6 @@
 // That keeps it trivially testable and resume-safe (a snapshot/restore of
 // the session can replay timestamps without the clock drifting).
 
-import { tokenize } from "./relevance.js";
-
 export interface RedispatchMiss {
   loser: string;
 }

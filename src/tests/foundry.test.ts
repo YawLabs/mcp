@@ -8,13 +8,11 @@ describe("isFoundryEnabled", () => {
   const orig = process.env.YAW_MCP_FOUNDRY;
 
   afterEach(() => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
     if (orig === undefined) delete process.env.YAW_MCP_FOUNDRY;
     else process.env.YAW_MCP_FOUNDRY = orig;
   });
 
   it("is disabled by default (unset)", () => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
     delete process.env.YAW_MCP_FOUNDRY;
     expect(isFoundryEnabled()).toBe(false);
   });
@@ -128,13 +126,11 @@ describe("appendFoundryTrace", () => {
 
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
     if (orig === undefined) delete process.env.YAW_MCP_FOUNDRY;
     else process.env.YAW_MCP_FOUNDRY = orig;
   });
 
   it("is a no-op when disabled (no file written)", async () => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
     delete process.env.YAW_MCP_FOUNDRY;
     await expect(appendFoundryTrace(trace, home)).resolves.toBeUndefined();
     expect(() => readFileSync(join(home, ".yaw-mcp", "foundry.jsonl"), "utf8")).toThrow();

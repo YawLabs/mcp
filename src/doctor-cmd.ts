@@ -21,25 +21,25 @@ import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
-  type ResolvedConfig,
   loadYawMcpConfig,
+  type ResolvedConfig,
   tokenFingerprint,
 } from "./config-loader.js";
 import {
   CURRENT_OS,
   ENTRY_NAME,
+  findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
-  findLegacyEntry,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import { userConfigDir } from "./paths.js";
-import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
-import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
-import { type TryEventBody, formatTtl, gcExpiredTrials, scanTrials } from "./try-cmd.js";
+import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
+import { getLastReportFailure, type ReportFailure } from "./tool-report.js";
+import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
   BINARY_DOWNLOAD_URL,
   buildUpgradePlan,
@@ -496,10 +496,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 //
 // The "default when unset" hint next to each unset value is the most
 // useful bit — without it users don't know what the omission means.
-function renderEnvSection(opts: {
-  env: NodeJS.ProcessEnv;
-  print: (s?: string) => void;
-}): void {
+function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) => void }): void {
   const { env, print } = opts;
   const vars: Array<{ name: string; defaultHint: string }> = [
     { name: "YAW_MCP_POLL_INTERVAL", defaultHint: "default 60s" },
@@ -667,9 +664,7 @@ async function renderTrialsSection(opts: {
 // analytics/tool-report, never the reverse). The "no recent failure"
 // row appears only alongside a sibling that DID fail, so the user can
 // tell which poster is broken vs. which is fine.
-function renderBackgroundPostersSection(opts: {
-  print: (s?: string) => void;
-}): void {
+function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): void {
   const { print } = opts;
   const analyticsFailure = getLastAnalyticsFailure();
   const reportFailure = getLastReportFailure();
@@ -952,10 +947,7 @@ const SHELL_HISTORY_TAIL_LINES = 500;
  *  MCP server shadows. Returns a sorted (count desc) list of hits.
  *  Any I/O error on a history file is swallowed — this is purely
  *  diagnostic, never fatal. */
-export function scanShellHistoryForShadows(opts: {
-  home: string;
-  env: NodeJS.ProcessEnv;
-}): ShadowHit[] {
+export function scanShellHistoryForShadows(opts: { home: string; env: NodeJS.ProcessEnv }): ShadowHit[] {
   const shadowMap = cliToNamespaces();
   const counts = new Map<string, number>();
 
@@ -986,10 +978,7 @@ interface ShellHistorySource {
   extractCommand: (line: string) => string | null;
 }
 
-function shellHistorySources(opts: {
-  home: string;
-  env: NodeJS.ProcessEnv;
-}): ShellHistorySource[] {
+function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): ShellHistorySource[] {
   const sources: ShellHistorySource[] = [];
   sources.push({ path: join(opts.home, ".bash_history"), extractCommand: (l) => l.trim() || null });
   sources.push({

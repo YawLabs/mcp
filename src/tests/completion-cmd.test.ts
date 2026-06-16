@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   COMPLETION_USAGE,
-  SUBCOMMAND_SPEC,
   parseCompletionArgs,
   renderScript,
   runCompletion,
+  SUBCOMMAND_SPEC,
 } from "../completion-cmd.js";
 
 const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);

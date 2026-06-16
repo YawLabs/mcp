@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { META_TOOLS, META_TOOL_NAMES, buildInstallPayload } from "../meta-tools.js";
+import { buildInstallPayload, META_TOOL_NAMES, META_TOOLS } from "../meta-tools.js";
 
 describe("META_TOOLS.install — tool definition", () => {
   it("is registered under the mcp_connect_install name", () => {

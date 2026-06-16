@@ -2,10 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type EncryptedEntry, decryptEntry, deriveKey, encryptEntry, generateSalt } from "../secrets-crypto.js";
+import { decryptEntry, deriveKey, type EncryptedEntry, encryptEntry, generateSalt } from "../secrets-crypto.js";
 import {
-  VAULT_CHECK_PLAINTEXT,
-  type VaultFile,
   getSecret,
   hasSecretRefs,
   listKeys,
@@ -17,6 +15,8 @@ import {
   saveVault,
   setSecret,
   unlock,
+  VAULT_CHECK_PLAINTEXT,
+  type VaultFile,
   vaultPath,
 } from "../secrets-vault.js";
 

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LearningStore } from "../learning.js";
 import { PackDetector } from "../pack-detect.js";
-import { STATE_SCHEMA_VERSION, emptyState, loadState, saveState } from "../persistence.js";
+import { emptyState, loadState, STATE_SCHEMA_VERSION, saveState } from "../persistence.js";
 
 describe("persistence.loadState", () => {
   let dir: string;

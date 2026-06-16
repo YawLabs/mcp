@@ -13,13 +13,11 @@ import { isPruneEnabled, pruneContent } from "../prune.js";
 describe("isPruneEnabled", () => {
   const originalEnv = process.env.YAW_MCP_PRUNE_RESPONSES;
   afterEach(() => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" which would leave "undefined" as the string value
     if (originalEnv === undefined) delete process.env.YAW_MCP_PRUNE_RESPONSES;
     else process.env.YAW_MCP_PRUNE_RESPONSES = originalEnv;
   });
 
   it("defaults to enabled when env is unset", () => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
     delete process.env.YAW_MCP_PRUNE_RESPONSES;
     expect(isPruneEnabled()).toBe(true);
   });
@@ -43,11 +41,9 @@ describe("isPruneEnabled", () => {
 describe("pruneContent", () => {
   const originalEnv = process.env.YAW_MCP_PRUNE_RESPONSES;
   beforeEach(() => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
     delete process.env.YAW_MCP_PRUNE_RESPONSES;
   });
   afterEach(() => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete
     if (originalEnv === undefined) delete process.env.YAW_MCP_PRUNE_RESPONSES;
     else process.env.YAW_MCP_PRUNE_RESPONSES = originalEnv;
   });

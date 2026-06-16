@@ -22,13 +22,11 @@ function mockServer(
 describe("isRewardGraderEnabled", () => {
   const orig = process.env.YAW_MCP_REWARD_GRADER;
   afterEach(() => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
     if (orig === undefined) delete process.env.YAW_MCP_REWARD_GRADER;
     else process.env.YAW_MCP_REWARD_GRADER = orig;
   });
 
   it("is disabled by default (unset)", () => {
-    // biome-ignore lint/performance/noDelete: unsetting an env var needs delete, not "= undefined" (which would leave "undefined" as the string value)
     delete process.env.YAW_MCP_REWARD_GRADER;
     expect(isRewardGraderEnabled()).toBe(false);
   });

@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SYNC_USAGE, parseSyncArgs, runSync } from "../sync-cmd.js";
-import { TeamSyncStaleVersionError, getResource, putResource } from "../team-sync.js";
+import { parseSyncArgs, runSync, SYNC_USAGE } from "../sync-cmd.js";
+import { getResource, putResource, TeamSyncStaleVersionError } from "../team-sync.js";
 
 // Mock team-sync so runSync tests don't need real credentials or network.
 vi.mock("../team-sync.js", async (importOriginal) => {

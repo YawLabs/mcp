@@ -563,7 +563,6 @@ describe("ConnectServer", () => {
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toContain("Refused");
       } finally {
-        // biome-ignore lint/performance/noDelete: env-var unset semantics require delete
         delete process.env.YAW_MCP_MIN_COMPLIANCE;
       }
     });
@@ -2842,9 +2841,10 @@ describe("fetchToolsFromUpstream propagates protocol_error on listTools failure"
   it("throws ActivationError with category=protocol_error when listTools rejects", async () => {
     // Import directly from the module -- the vi.mock at the top of this file
     // replaces connectToUpstream/disconnectFromUpstream but leaves
-    // fetchToolsFromUpstream and ActivationError as real implementations
-    // because the mock uses importOriginal and spreads the actual module.
-    const { fetchToolsFromUpstream, ActivationError } = await import("../upstream.js");
+    // fetchToolsFromUpstream is the real implementation (the mock uses
+    // importOriginal and spreads the actual module). The thrown error is
+    // asserted by name/category below, so the class itself isn't bound here.
+    const { fetchToolsFromUpstream } = await import("../upstream.js");
     const client = { listTools: vi.fn().mockRejectedValue(new Error("JSON-RPC parse error")) } as any;
 
     await expect(fetchToolsFromUpstream(client, "testns")).rejects.toMatchObject({

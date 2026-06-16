@@ -13,11 +13,11 @@ import { NAMESPACE_RE } from "./local-bundles.js";
 import { writeSyncState } from "./sync-state.js";
 import {
   type BaseOpts,
+  getResource as defaultGetResource,
+  putResource as defaultPutResource,
   TeamSyncAuthError,
   TeamSyncForbiddenError,
   TeamSyncStaleVersionError,
-  getResource as defaultGetResource,
-  putResource as defaultPutResource,
 } from "./team-sync.js";
 import type { UpstreamServerConfig } from "./types.js";
 

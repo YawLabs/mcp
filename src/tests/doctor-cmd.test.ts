@@ -6,6 +6,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
   mkdirSync(join(root, ".yaw-mcp"), { recursive: true });
   writeFileSync(join(root, ".yaw-mcp", filename), JSON.stringify(obj));
 }
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";

@@ -13,11 +13,11 @@ import { log } from "../logger.js";
 
 describe("log() spread-order: envelope fields win over data keys", () => {
   let stderrWrites: string[] = [];
-  let originalWrite: typeof process.stderr.write;
+  let _originalWrite: typeof process.stderr.write;
 
   beforeEach(() => {
     stderrWrites = [];
-    originalWrite = process.stderr.write.bind(process.stderr);
+    _originalWrite = process.stderr.write.bind(process.stderr);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       else if (Buffer.isBuffer(chunk)) stderrWrites.push(chunk.toString("utf8"));

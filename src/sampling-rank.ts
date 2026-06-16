@@ -334,7 +334,9 @@ export async function bestOfNViaSampling(
 
     // Rank position for tie-breaking: earlier candidate wins.
     const order = new Map<string, number>();
-    candidates.forEach((c, i) => order.set(c.namespace, i));
+    candidates.forEach((c, i) => {
+      order.set(c.namespace, i);
+    });
 
     let winner: string | null = null;
     let bestVotes = -1;

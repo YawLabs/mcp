@@ -16,8 +16,8 @@
 //   1  no token resolved (same signal as `yaw-mcp` with no token)
 //   2  fetch failed (network, auth rejected, non-2xx response)
 
-import { loadYawMcpConfig } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
+import { loadYawMcpConfig } from "./config-loader.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import type { ConnectConfig } from "./types.js";
 

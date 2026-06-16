@@ -170,7 +170,7 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
   if (cache.length < 3) return [];
   const prefixes = new Set<string>();
   for (const t of cache) {
-    const first = t.name.split(/[_.\-]/)[0];
+    const first = t.name.split(/[_.-]/)[0];
     if (first) prefixes.add(first.toLowerCase());
   }
   if (prefixes.size !== 1) return [];

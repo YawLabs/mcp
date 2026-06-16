@@ -18,7 +18,7 @@ vi.stubGlobal("fetch", fetchMock);
 // -----------------------------------------------------------------------
 // A helper to build minimal fetch() responses.
 // -----------------------------------------------------------------------
-function makeFetchResponse(status: number, body: unknown = {}) {
+function _makeFetchResponse(status: number, body: unknown = {}) {
   return Promise.resolve({
     status,
     json: () => Promise.resolve(body),

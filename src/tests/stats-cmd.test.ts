@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { STATS_USAGE, formatPlain, parseStatsArgs } from "../stats-cmd.js";
+import { formatPlain, parseStatsArgs, STATS_USAGE } from "../stats-cmd.js";
 import type { AnalyticsEvent } from "../team-sync.js";
 
 describe("parseStatsArgs", () => {

@@ -17,8 +17,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { DEFAULT_CORPUS_CAP, buildCorpusFromTraces, parseTraceLines, scoreCorpus } from "./foundry-corpus.js";
 import { FOUNDRY_FILENAME } from "./foundry.js";
+import { buildCorpusFromTraces, DEFAULT_CORPUS_CAP, parseTraceLines, scoreCorpus } from "./foundry-corpus.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import type { RankableServer } from "./relevance.js";

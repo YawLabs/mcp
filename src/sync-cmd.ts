@@ -22,12 +22,12 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import { readSyncState, writeSyncState } from "./sync-state.js";
 import {
-  TeamSyncAuthError,
-  TeamSyncForbiddenError,
-  TeamSyncStaleVersionError,
   getResource,
   getSession,
   putResource,
+  TeamSyncAuthError,
+  TeamSyncForbiddenError,
+  TeamSyncStaleVersionError,
 } from "./team-sync.js";
 import type { UpstreamServerConfig } from "./types.js";
 

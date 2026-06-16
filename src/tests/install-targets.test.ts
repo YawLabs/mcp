@@ -1,9 +1,9 @@
 import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  buildLaunchEntry,
   ENTRY_NAME,
   INSTALL_TARGETS,
-  buildLaunchEntry,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "../install-targets.js";

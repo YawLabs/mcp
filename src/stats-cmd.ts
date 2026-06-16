@@ -8,7 +8,7 @@
 // "no events recorded yet".
 
 import { homedir } from "node:os";
-import { type AnalyticsEvent, TeamSyncAuthError, getSession, listAnalyticsEvents } from "./team-sync.js";
+import { type AnalyticsEvent, getSession, listAnalyticsEvents, TeamSyncAuthError } from "./team-sync.js";
 
 export const STATS_USAGE = `Usage: yaw-mcp stats [--json] [--limit N] [--days N]
 

@@ -15,7 +15,6 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { CONFIG_DIRNAME } from "./paths.js";
 import {
-  type VaultFile,
   getSecret,
   listKeys,
   loadVault,
@@ -25,9 +24,10 @@ import {
   saveVault,
   setSecret,
   unlock,
+  type VaultFile,
   vaultPath,
 } from "./secrets-vault.js";
-import { TeamSyncAuthError, TeamSyncStaleVersionError, getResource, getSession, putResource } from "./team-sync.js";
+import { getResource, getSession, putResource, TeamSyncAuthError, TeamSyncStaleVersionError } from "./team-sync.js";
 
 export const SECRETS_USAGE = `Usage: yaw-mcp secrets <action> [args]
 
@@ -458,7 +458,7 @@ async function runSecretsPull(
       remoteEntries !== null &&
       typeof remoteEntries === "object" &&
       Object.keys(remoteEntries).length > 0;
-    if (!remote.data || !remote.data.salt || !remoteHasEntries) {
+    if (!remote.data?.salt || !remoteHasEntries) {
       const msg = "Remote mcp_secrets is empty. Push from this machine to seed it.";
       if (opts.json) io.out(`${JSON.stringify({ ok: true, empty: true })}\n`);
       else io.out(`${msg}\n`);
