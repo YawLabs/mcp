@@ -2,6 +2,22 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
+## 0.63.0 -- CLI hardening: flag parsing, exit-code consistency, secret-file perms, dispatch error handling
+
+A full-pass sweep of the `yaw-mcp` subcommand surface. Every change is a fix, a hardening, or additive; there are no breaking changes to the MCP server or the public CLI contract.
+
+- **Value-taking flags no longer swallow a following flag.** `login --key`, `secrets set --value`, `try --base`, and `add --catalog` reject a dash-prefixed token instead of storing it as the value -- e.g. `login --key --json` no longer POSTs `"--json"` as the license key, and `try slug --base --dry-run` no longer silently drops `--dry-run` and wires the trial for real. (`--value` points at `--stdin` for a genuinely dash-leading secret.)
+- **`--help` / exit-code consistency.** `yaw-mcp audit --help` and `compliance --help` now print usage to stdout and exit 0 like every other subcommand (compliance previously forwarded `--help` into an `npx` download); `compliance` with no target exits 2 (arg error) instead of 1.
+- **Uncaught command rejections are handled.** Every subcommand funnels through a shared dispatcher `.catch` that prints `yaw-mcp <cmd>: <message>` and exits 1, instead of dumping a raw Node stack and bypassing the logger (reachable e.g. via `secrets` against a corrupt vault).
+- **Secret-bearing files are born 0600.** `atomicWriteFile` gained a creation-mode option; the token config, team session cookie, encrypted vault, and the install config backup are now written owner-only rather than sitting at the default umask in the window before the post-hoc chmod. `install --dry-run` redacts the token in the config dump, and `--token` carries a process-table exposure note.
+- **`doctor`:** `--json` now runs the same expired-trial GC as the text path, and the snapshot carries the `trials` + `backgroundPosters` sections (it was not the "1:1 mirror" its comment claimed). The header documents the config read-modify-write side effect and the now-unreachable exit code 1.
+- **Completion drift guard made real.** Shell completion now offers `foundry`, and the completion test asserts coverage against the real dispatch table (extracted to `src/subcommands.ts`) instead of a hand-maintained list that had silently diverged.
+- **`secrets`:** `get` documents that it prints cleartext (with an interactive-TTY stderr warning); Ctrl-D at the passphrase prompt cancels instead of submitting a partial passphrase; `pull` empty-remote `--json` carries the same hint as the prose path.
+- **`compliance --publish`** projects the report to an explicit allowlist before upload (no echoed env/argv/stack leaks), and the suite child's stdout is capped (16 MB) behind a wall-clock watchdog.
+- **`upgrade`:** the `_npx` marker now requires the full npm-cache hex context, so a user project path that merely contains a `_npx` segment is no longer misclassified as an npx run; the 1->2 exit sequence for non-runnable methods (binary/dev-checkout) is documented.
+- **`add`** trims whitespace-only `--env` values so a blank-ish required secret is never persisted to bundles.json. Did-you-mean now includes `help`, gates its substring tier for very short queries, and a leading-dash near-miss (`--versionn`) suggests the flag instead of silently booting the MCP server.
+- **deps:** `esbuild` override pinned to `^0.28.1`.
+
 ## 0.62.0 -- verifiable-signal routing: graded reward, miss tracking, and an eval foundry
 
 Lands #25, #26, and #27. The dispatch router's learning signal moves from a binary "any non-error reply counts as success" to a sound, quality-graded reward, plus the surrounding machinery to manufacture and verify that signal. All of the new behavior is additive and the new knobs are off by default, so existing setups are unchanged.
