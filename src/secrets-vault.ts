@@ -112,7 +112,10 @@ export async function saveVault(path: string, vault: VaultFile): Promise<void> {
   // atomicWriteFile mkdirs the target dir recursively (atomic-write.ts:19)
   // before writing the temp file, so the caller does NOT need to create
   // the directory first.
-  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`);
+  // Born 0o600 so the encrypted vault is never group/other-readable in the
+  // window between rename and the chmod below (ciphertext only, but consistent
+  // with the token/cookie files).
+  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8", 0o600);
   if (process.platform !== "win32") {
     try {
       await chmod(path, 0o600);

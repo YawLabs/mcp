@@ -35,7 +35,11 @@ export function parseLoginArgs(
     const a = argv[i];
     if (a === "--key") {
       const v = argv[++i];
-      if (!v) return { ok: false, error: `yaw-mcp login: --key requires a value\n\n${LOGIN_USAGE}` };
+      // Reject a following flag (e.g. `login --key --json`) instead of
+      // POSTing "--json" as the license key. Keys are never dash-prefixed.
+      if (!v || v.startsWith("-")) {
+        return { ok: false, error: `yaw-mcp login: --key requires a value\n\n${LOGIN_USAGE}` };
+      }
       opts.key = v;
     } else if (a === "--json") {
       opts.json = true;

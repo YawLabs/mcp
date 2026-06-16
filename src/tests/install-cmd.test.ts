@@ -1,9 +1,25 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mergeClientConfig, mergePermissionsAllow, parseInstallArgs, runInstall } from "../install-cmd.js";
+import {
+  INSTALL_USAGE,
+  mergeClientConfig,
+  mergePermissionsAllow,
+  parseInstallArgs,
+  redactConfigToken,
+  runInstall,
+} from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
 
 let synthHome: string;
@@ -726,8 +742,14 @@ describe("runInstall — token resolution", () => {
     const siblings = readdirSync(join(synthHome, ".yaw-mcp"));
     const backups = siblings.filter((f) => f.startsWith("config.json.bak-"));
     expect(backups).toHaveLength(1);
-    const backedUp = readFileSync(join(synthHome, ".yaw-mcp", backups[0]), "utf8");
+    const backupAbs = join(synthHome, ".yaw-mcp", backups[0]);
+    const backedUp = readFileSync(backupAbs, "utf8");
     expect(backedUp).toBe(malformedBytes);
+    // The backup carries the salvaged (token-bearing) bytes, so it must be
+    // owner-only -- never world-readable. POSIX-only assertion.
+    if (process.platform !== "win32") {
+      expect(statSync(backupAbs).mode & 0o777).toBe(0o600);
+    }
     // User-facing message names the backup path.
     expect(cap.stdout()).toMatch(/was malformed/);
     expect(cap.stdout()).toMatch(/backed up to/);
@@ -797,6 +819,43 @@ describe("runInstall — --dry-run", () => {
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
     expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
     expect(cap.stdout()).toMatch(/dry run/i);
+  });
+
+  it("redacts the token in the printed ~/.yaw-mcp/config.json dump", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_super_secret_value",
+      dryRun: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    // The raw PAT must never appear in dry-run output.
+    expect(out).not.toContain("mcp_pat_super_secret_value");
+    // The redaction marker stands in for it, and the path is still shown.
+    expect(out).toContain("mcp_pat_***");
+    expect(out).toContain(join(synthHome, ".yaw-mcp", "config.json"));
+  });
+});
+
+describe("redactConfigToken", () => {
+  it("replaces the token value, preserves other fields and indentation", () => {
+    const json = `${JSON.stringify({ version: 1, token: "mcp_pat_secret" }, null, 2)}\n`;
+    const out = redactConfigToken(json);
+    expect(out).not.toContain("mcp_pat_secret");
+    expect(out).toContain('"token": "mcp_pat_***"');
+    expect(out).toContain('"version": 1');
+    // Two-space indentation preserved (no reflow).
+    expect(out).toMatch(/^ {2}"token":/m);
+  });
+
+  it("is a no-op when there is no token field", () => {
+    const json = `${JSON.stringify({ version: 1 }, null, 2)}\n`;
+    expect(redactConfigToken(json)).toBe(json);
   });
 });
 
@@ -1041,5 +1100,63 @@ describe("runInstall --all", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/client install.*failed/);
+  });
+
+  it("consolidates collision-without-flag refusals into ONE hint", async () => {
+    // Seed BOTH user-scope clients (claude-code, cursor) with an existing
+    // yaw-mcp entry so each sub-install collides. Non-TTY + no --force/--skip
+    // => each would emit its own "already has entry and stdin is not a TTY"
+    // refusal. The consolidated path collapses them into one hint.
+    const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(join(synthHome, ".cursor", "mcp.json"), JSON.stringify(seeded), "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_collide",
+      all: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    const stderr = cap.stderr();
+    // Exactly ONE "not a TTY" line, naming both clients, with the re-run hint.
+    const ttyLines = stderr.split("\n").filter((l) => /stdin is not a TTY/.test(l));
+    expect(ttyLines).toHaveLength(1);
+    expect(stderr).toContain("claude-code");
+    expect(stderr).toContain("cursor");
+    expect(stderr).toMatch(/--all --force/);
+    expect(stderr).toMatch(/--skip/);
+  });
+
+  it("--all --force overwrites colliding clients without the consolidated hint", async () => {
+    const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(join(synthHome, ".cursor", "mcp.json"), JSON.stringify(seeded), "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_collide",
+      all: true,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stderr()).not.toMatch(/stdin is not a TTY/);
+  });
+});
+
+describe("install usage", () => {
+  it("warns that --token exposes the PAT to the process table on shared machines", () => {
+    expect(INSTALL_USAGE).toMatch(/process table/i);
+    expect(INSTALL_USAGE).toMatch(/shell\s+history/i);
+    expect(INSTALL_USAGE).toMatch(/~\/\.yaw-mcp\/config\.json/);
   });
 });

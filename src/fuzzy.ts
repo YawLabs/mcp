@@ -63,7 +63,17 @@ export function closestNames(query: string, candidates: readonly string[], limit
       score = 0;
     } else if (lc.startsWith(q) || q.startsWith(lc)) {
       score = 1;
-    } else if (lc.includes(q) || q.includes(lc)) {
+    } else if (
+      // Substring containment is only a credible "typo" signal when the
+      // query is long enough to be specific AND the shorter string covers
+      // at least half the longer one. Without these gates a 1-2 char query
+      // ("ls", "set") substring-matches long commands ("list", "set-active",
+      // "secrets") and surfaces misleading suggestions the header calls
+      // conservative. The Levenshtein tier still catches genuine short typos.
+      q.length >= 3 &&
+      (lc.includes(q) || q.includes(lc)) &&
+      Math.min(q.length, lc.length) * 2 >= Math.max(q.length, lc.length)
+    ) {
       score = 2;
     } else {
       const d = levenshtein(q, lc);

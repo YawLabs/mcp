@@ -72,6 +72,16 @@ describe("detectInstallMethod", () => {
     ).toBe("npx");
   });
 
+  it("does NOT classify a user project path that merely contains a `_npx` segment as npx", () => {
+    // A bare `_npx` directory anywhere in the path used to match. The npx
+    // marker now requires the npm-cache context (_npx/<hex>/node_modules/
+    // @yawlabs/mcp/), so a project dir named `_npx` falls through to the
+    // real install method (local-node-modules) instead of false-positiving.
+    expect(detectInstallMethod("/home/u/projects/_npx/app/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "local-node-modules",
+    );
+  });
+
   it("detects linux global install under /usr/lib/node_modules", () => {
     expect(detectInstallMethod("/usr/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe("global-npm");
   });

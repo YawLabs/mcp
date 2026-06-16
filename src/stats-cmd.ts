@@ -159,7 +159,11 @@ export function formatPlain(
   }
 
   lines.push("");
-  lines.push("Recent events (newest first):");
+  if (events.length > renderedCount) {
+    lines.push("Recent events (newest first, capped at --limit; By-server / By-AI-client above span the full window):");
+  } else {
+    lines.push("Recent events (newest first):");
+  }
   const recent = events.slice(-Math.min(events.length, opts.limit ?? 50)).reverse();
   for (const e of recent) {
     const when = new Date(e.ts).toISOString().replace("T", " ").slice(0, 19);

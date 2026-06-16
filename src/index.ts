@@ -6,7 +6,6 @@ import { ConfigError } from "./config.js";
 import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
-import { closestNames } from "./fuzzy.js";
 import { parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { log } from "./logger.js";
@@ -18,44 +17,32 @@ import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { parseSetActiveArgs, runSetActive } from "./set-active-cmd.js";
 import { parseStatsArgs, runStats } from "./stats-cmd.js";
+import { suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseSyncArgs, runSync } from "./sync-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
-// Known subcommands for fuzzy-match feedback on typos. Anything not in
-// this list and not a flag (leading `-`) falls through to "unknown
-// subcommand" before runServer, so `yaw-mcp instal` fails loud instead of
-// starting as an MCP server and opaquely erroring on the missing token.
-const KNOWN_SUBCOMMANDS = [
-  "compliance",
-  "audit",
-  "foundry",
-  "install",
-  "add",
-  "remove",
-  "list",
-  "doctor",
-  "reset-learning",
-  "servers",
-  "bundles",
-  "completion",
-  "upgrade",
-  "try",
-  "try-cleanup",
-  "login",
-  "logout",
-  "sync",
-  "stats",
-  "secrets",
-  "set-active",
-  "help",
-  "--help",
-  "-h",
-  "--version",
-  "-V",
-] as const;
+// The known-subcommand / flag-alias dispatch table and the did-you-mean
+// helpers (suggestSubcommand / suggestFlag) live in ./subcommands.js (a
+// side-effect-free module) so the completion test can import the
+// ground-truth dispatch table, and the suggestion logic can be unit
+// tested, without booting this dispatcher.
 
 declare const __VERSION__: string;
+
+// Shared dispatch tail for the subcommand runners. Every `runX(...)`
+// returns either a `{ exitCode }` result or a bare number; this funnels
+// the promise through a single `.catch()` so a rejection (e.g.
+// `runSecrets` on a corrupt vault) prints a clean
+// `yaw-mcp <cmd>: <message>` to stderr and exits 1, instead of dumping a
+// raw Node stack and bypassing the 2-for-usage / 1-for-error convention.
+function dispatch(cmd: string, p: Promise<{ exitCode: number } | number>): void {
+  p.then((r) => process.exit(typeof r === "number" ? r : r.exitCode)).catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`yaw-mcp ${cmd}: ${msg}\n`);
+    process.exit(1);
+  });
+}
 
 // Subcommand dispatcher. `yaw-mcp` with no args (or with flags only) runs as
 // the MCP server that talks to Yaw MCP. Known subcommands branch off
@@ -64,14 +51,18 @@ declare const __VERSION__: string;
 const subcommand = process.argv[2];
 
 if (subcommand === "compliance") {
-  runComplianceCommand(process.argv.slice(3)).then((code) => process.exit(code));
+  dispatch("compliance", runComplianceCommand(process.argv.slice(3)));
 } else if (subcommand === "audit") {
   const parsed = parseAuditArgs(process.argv.slice(3));
   if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runAudit(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("audit", runAudit(parsed.options));
 } else if (subcommand === "foundry") {
   const parsed = parseFoundryArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -80,7 +71,7 @@ if (subcommand === "compliance") {
     (isHelp ? process.stdout : process.stderr).write(`${parsed.error}\n`);
     process.exit(isHelp ? 0 : 2);
   }
-  runFoundryExport(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("foundry", runFoundryExport(parsed.options));
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -97,22 +88,31 @@ if (subcommand === "compliance") {
     process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
       ? process.env.CLAUDE_CONFIG_DIR
       : undefined;
-  runInstall({ ...parsed.options, claudeConfigDir }).then((r) => process.exit(r.exitCode));
+  dispatch("install", runInstall({ ...parsed.options, claudeConfigDir }));
 } else if (subcommand === "doctor") {
   const doctorArgs = process.argv.slice(3);
   const doctorJson = doctorArgs.includes("--json");
-  const doctorUnknown = doctorArgs.find((a) => a !== "--json" && a !== "--help" && a !== "-h");
-  if (doctorArgs.includes("--help") || doctorArgs.includes("-h")) {
+  const isHelpArg = (a: string): boolean => a === "--help" || a === "-h";
+  // Collect ALL stray args (not just the first) so `doctor --bad --worse`
+  // reports both. An explicit --help still wins, but only when no unknown
+  // PRECEDES it -- `doctor --bad --help` must report --bad, matching the
+  // parse-first siblings (which reject unknown flags before honoring help).
+  const doctorUnknowns = doctorArgs.filter((a) => a !== "--json" && !isHelpArg(a));
+  const firstHelpIdx = doctorArgs.findIndex(isHelpArg);
+  const firstUnknownIdx = doctorArgs.findIndex((a) => a !== "--json" && !isHelpArg(a));
+  const helpWins = firstHelpIdx !== -1 && (firstUnknownIdx === -1 || firstHelpIdx < firstUnknownIdx);
+  if (helpWins) {
     process.stdout.write(
       "Usage: yaw-mcp doctor [--json]\n\n  Print a diagnostic of your yaw-mcp setup.\n\n  --json  Emit machine-readable JSON instead of text.\n",
     );
     process.exit(0);
   }
-  if (doctorUnknown) {
-    process.stderr.write(`yaw-mcp doctor: unknown argument "${doctorUnknown}"\n`);
+  if (doctorUnknowns.length > 0) {
+    const quoted = doctorUnknowns.map((a) => `"${a}"`).join(", ");
+    process.stderr.write(`yaw-mcp doctor: unknown argument${doctorUnknowns.length > 1 ? "s" : ""} ${quoted}\n`);
     process.exit(2);
   }
-  runDoctor({ json: doctorJson }).then((r) => process.exit(r.exitCode));
+  dispatch("doctor", runDoctor({ json: doctorJson }));
 } else if (subcommand === "reset-learning") {
   const parsed = parseResetLearningArgs(process.argv.slice(3));
   if (parsed.kind === "help") {
@@ -123,7 +123,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runResetLearning().then((r) => process.exit(r.exitCode));
+  dispatch("reset-learning", runResetLearning());
 } else if (subcommand === "servers") {
   const parsed = parseServersArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -134,7 +134,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runServersCommand(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("servers", runServersCommand(parsed.options));
 } else if (subcommand === "bundles") {
   const parsed = parseBundlesArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -145,7 +145,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runBundlesCommand(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("bundles", runBundlesCommand(parsed.options));
 } else if (subcommand === "completion") {
   const parsed = parseCompletionArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -156,7 +156,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runCompletion(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("completion", runCompletion(parsed.options));
 } else if (subcommand === "upgrade") {
   const parsed = parseUpgradeArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -167,7 +167,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runUpgrade(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("upgrade", runUpgrade(parsed.options));
 } else if (subcommand === "try") {
   const parsed = parseTryArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -178,7 +178,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runTry(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("try", runTry(parsed.options));
 } else if (subcommand === "try-cleanup") {
   const parsed = parseTryCleanupArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -189,7 +189,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runTryCleanup(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("try-cleanup", runTryCleanup(parsed.options));
 } else if (subcommand === "add") {
   const parsed = parseAddArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -200,7 +200,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runAdd(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("add", runAdd(parsed.options));
 } else if (subcommand === "remove") {
   const parsed = parseRemoveArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -211,7 +211,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runRemove(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("remove", runRemove(parsed.options));
 } else if (subcommand === "list") {
   const parsed = parseListArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -222,7 +222,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runList(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("list", runList(parsed.options));
 } else if (subcommand === "login") {
   const parsed = parseLoginArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -233,7 +233,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runLogin(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("login", runLogin(parsed.options));
 } else if (subcommand === "logout") {
   const parsed = parseLogoutArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -244,7 +244,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runLogout(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("logout", runLogout(parsed.options));
 } else if (subcommand === "sync") {
   const parsed = parseSyncArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -255,7 +255,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runSync(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("sync", runSync(parsed.options));
 } else if (subcommand === "stats") {
   const parsed = parseStatsArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -266,7 +266,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runStats(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("stats", runStats(parsed.options));
 } else if (subcommand === "secrets") {
   const parsed = parseSecretsArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -277,7 +277,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runSecrets(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("secrets", runSecrets(parsed.options));
 } else if (subcommand === "set-active") {
   const parsed = parseSetActiveArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -288,7 +288,7 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runSetActive(parsed.options).then((r) => process.exit(r.exitCode));
+  dispatch("set-active", runSetActive(parsed.options));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   yaw-mcp — one install, every MCP server, managed from the cloud.
@@ -414,19 +414,22 @@ if (subcommand === "compliance") {
   // Bare positional first arg that isn't a known subcommand — almost
   // always a typo. Surface a "did you mean?" instead of falling through
   // to runServer, which would then fail opaquely on the missing token.
-  // Flags (anything with a leading `-`) still fall through so server
-  // startup can parse them (or ignore unknown ones) as it did before.
-  // INTENTIONAL: an unrecognized leading-dash arg (e.g. a typo'd
-  // `--versionn`) is NOT rejected here — it is silently passed through
-  // and boots MCP server mode. We do not "did you mean?" stray flags to
-  // avoid changing CLI behavior; only bare positional typos are caught.
-  const visible = KNOWN_SUBCOMMANDS.filter((s) => !s.startsWith("-") && s !== "help");
-  const suggestions = closestNames(subcommand, visible, 3);
+  const suggestions = suggestSubcommand(subcommand);
   const hint =
     suggestions.length > 0
       ? ` Did you mean: ${suggestions.join(", ")}?`
       : " Run `yaw-mcp --help` for the list of subcommands.";
   process.stderr.write(`yaw-mcp: unknown subcommand "${subcommand}".${hint}\n`);
+  process.exit(2);
+} else if (subcommand && suggestFlag(subcommand).length > 0) {
+  // Long-form leading-dash near-miss of a known flag alias (e.g.
+  // `--versionn`, `--hepl`). Without this it would fall through to
+  // runServer and hang as a stdio MCP server with no diagnostic.
+  // suggestFlag returns [] for short single-letter flags and for genuine
+  // long server flags with no close match, so those still pass through to
+  // runServer below — this only catches typos of the dispatcher's own flags.
+  const suggestions = suggestFlag(subcommand);
+  process.stderr.write(`yaw-mcp: unknown flag "${subcommand}". Did you mean: ${suggestions.join(", ")}?\n`);
   process.exit(2);
 } else {
   runServer();

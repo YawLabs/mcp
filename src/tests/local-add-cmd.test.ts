@@ -99,6 +99,11 @@ describe("parseAddArgs", () => {
     expect(parseAddArgs(["github", "--bogus"]).ok).toBe(false);
     expect(parseAddArgs(["a", "b"]).ok).toBe(false);
   });
+  it("rejects --catalog followed by a flag instead of swallowing --dry-run as the URL", () => {
+    const r = parseAddArgs(["github", "--catalog", "--dry-run"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--catalog requires a URL/);
+  });
   it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
     const r = parseAddArgs(["--help"]);
     expect(r.ok).toBe(false);
@@ -200,6 +205,26 @@ describe("runAdd", () => {
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     const entry = loaded.config?.servers.find((s) => s.namespace === "tailscale");
     expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-x");
+  });
+
+  it("treats a whitespace-only --env required value as missing (no blank-ish persist)", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { TAILSCALE_API_KEY: "   " },
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // The trimmed required-env gate rejects it the same as a missing value.
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toMatch(/TAILSCALE_API_KEY/);
+    // Nothing whitespace-only was persisted.
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config).toBeNull();
   });
 
   it("tokenizes a docker launch line into command + args", async () => {

@@ -38,6 +38,10 @@ Actions:
                           line, no echo). Override with --value <v> or
                           --stdin (raw, multi-line) for scripting.
   get <name>              Decrypt and print one secret value to stdout.
+                          NOTE: this prints the secret in CLEARTEXT (with
+                          or without --json). Redirect to a file or pipe
+                          to a consumer; avoid running it interactively so
+                          the value does not land in terminal scrollback.
   list                    Show vault entry names (values stay encrypted).
   remove <name>           Delete an entry.
   lock                    Clear the in-process passphrase cache.
@@ -104,7 +108,15 @@ export function parseSecretsArgs(
     }
     if (a === "--value") {
       const v = argv[++i];
-      if (v === undefined) return { ok: false, error: `yaw-mcp secrets: --value requires a value\n\n${SECRETS_USAGE}` };
+      // Reject a following flag (e.g. `secrets set NAME --value --json`)
+      // instead of storing "--json" as the secret. For a value that really
+      // begins with a dash, use `--stdin` (which reads the raw value).
+      if (v === undefined || v.startsWith("-")) {
+        return {
+          ok: false,
+          error: `yaw-mcp secrets: --value requires a value (for a dash-leading value use --stdin)\n\n${SECRETS_USAGE}`,
+        };
+      }
       opts.value = v;
       continue;
     }
@@ -201,7 +213,7 @@ function readPassphraseFromTTY(
     stdin.setEncoding("utf8");
     const onData = (chunk: string): void => {
       for (const ch of chunk) {
-        if (ch === "\n" || ch === "\r" || ch === "") {
+        if (ch === "\n" || ch === "\r") {
           stdout.write("\n");
           stdin.removeListener("data", onData);
           try {
@@ -211,6 +223,21 @@ function readPassphraseFromTTY(
           }
           stdin.pause();
           resolve(chunks.join(""));
+          return;
+        }
+        if (ch === "") {
+          // ^D (EOT): cancel this entry. Resolve to "" so resolvePassphrase
+          // treats it as an empty submission and re-prompts -- never a line
+          // terminator that would submit a partial passphrase.
+          stdout.write("\n");
+          stdin.removeListener("data", onData);
+          try {
+            stdin.setRawMode?.(wasRaw);
+          } catch {
+            // ignore
+          }
+          stdin.pause();
+          resolve("");
           return;
         }
         if (ch === "") {
@@ -341,6 +368,17 @@ export async function runSecrets(
         else io.err(`yaw-mcp secrets: ${msg}\n`);
         return { exitCode: 1 };
       }
+      // Warn (to stderr, never stdout -- keeps the value pipeable) when the
+      // caller is interactive: `get` prints cleartext, so an interactive run
+      // scrolls a secret into terminal scrollback. Skipped for piped/redirected
+      // stdout, which is the intended consumption path.
+      const outStream = opts.io?.stdout ?? process.stdout;
+      if ((outStream as { isTTY?: boolean }).isTTY === true) {
+        const stderr = opts.io?.stderr ?? process.stderr;
+        stderr.write(
+          `yaw-mcp secrets: warning -- printing "${name}" in cleartext to your terminal; it will remain in scrollback.\n`,
+        );
+      }
       if (opts.json) io.out(`${JSON.stringify({ ok: true, name, value })}\n`);
       else io.out(`${value}\n`);
       return { exitCode: 0 };
@@ -460,7 +498,7 @@ async function runSecretsPull(
       Object.keys(remoteEntries).length > 0;
     if (!remote.data?.salt || !remoteHasEntries) {
       const msg = "Remote mcp_secrets is empty. Push from this machine to seed it.";
-      if (opts.json) io.out(`${JSON.stringify({ ok: true, empty: true })}\n`);
+      if (opts.json) io.out(`${JSON.stringify({ ok: true, empty: true, message: msg })}\n`);
       else io.out(`${msg}\n`);
       return { exitCode: 0 };
     }

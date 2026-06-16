@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -32,6 +32,16 @@ describe("atomicWriteFile", () => {
     writeFileSync(file, '{"old":true}', "utf8");
     await atomicWriteFile(file, '{"new":true}');
     expect(readFileSync(file, "utf8")).toBe('{"new":true}');
+  });
+
+  // POSIX-only: Windows ignores the creation mode and reports 0o666.
+  it.skipIf(process.platform === "win32")("honors the mode option so the file is born owner-only (0600)", async () => {
+    const file = join(dir, "secret.json");
+    await atomicWriteFile(file, '{"token":"x"}', "utf8", 0o600);
+    expect(readFileSync(file, "utf8")).toBe('{"token":"x"}');
+    // Mask to the permission bits; umask may only clear bits, never add, so
+    // 0o600 stays 0o600 under any normal umask.
+    expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 
   it("leaves no orphan .tmp- siblings on success", async () => {

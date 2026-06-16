@@ -59,10 +59,13 @@ describe("parseAuditArgs", () => {
     if (!r.ok) expect(r.error).toContain("unexpected extra argument");
   });
 
-  it("--help returns usage", () => {
+  it("--help returns usage with help:true so the dispatcher routes to stdout+exit0", () => {
     const r = parseAuditArgs(["--help"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toBe(AUDIT_USAGE);
+    if (!r.ok) {
+      expect(r.error).toBe(AUDIT_USAGE);
+      expect((r as { help?: boolean }).help).toBe(true);
+    }
   });
 });
 
@@ -122,6 +125,16 @@ describe("runAudit", () => {
     // The whole stdout parses as JSON directly -- no leading lines to skip.
     const parsed = JSON.parse(stdout);
     expect(parsed).toMatchObject({ namespace: "ctxlint", grade: "B", score: 80 });
+  });
+
+  it("exit 2 (parse-layer convention) when called directly with no namespace", async () => {
+    // Unreachable via the CLI -- parseAuditArgs requires a namespace and
+    // index.ts exits 2 first. This pins the direct-caller guard at exit 2 so
+    // it matches the usage-error convention, not the exit-1 not-found case.
+    const io = captureIO();
+    const r = await runAudit({ out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(2);
+    expect(io.err.join("\n")).toContain("missing <namespace>");
   });
 
   it("exit 1 when the namespace is not in bundles.json", async () => {

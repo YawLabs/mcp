@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -845,5 +845,116 @@ describe("runDoctor — --json", () => {
     expect(Array.isArray(parsed.clients)).toBe(true);
     expect(parsed.clients.length).toBeGreaterThan(0);
     expect(parsed.clients[0]).toHaveProperty("clientId");
+  });
+
+  it("always emits trials and backgroundPosters fields (1:1-mirror claim)", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    // Healthy install: both present, trials empty, posters null.
+    expect(parsed.trials).toEqual({ cleared: 0, live: [], malformed: [] });
+    expect(parsed.backgroundPosters).toEqual({ analytics: null, toolReport: null });
+  });
+
+  it("runs the trial GC pass on the --json path (same side effect as text)", async () => {
+    // Write an EXPIRED trial marker pointing at a client config that has
+    // the trial entry wired up. The --json path must sweep it: delete the
+    // marker AND peel the entry out of the config -- proving doctor --json
+    // is not a read-only mirror but carries doctor's persistent side effect.
+    const clientConfigPath = join(synthHome, "client.json");
+    writeFileSync(
+      clientConfigPath,
+      JSON.stringify({ mcpServers: { "yaw-mcp-try-foo": { command: "x" }, keep: { command: "y" } } }),
+    );
+    const trialsRoot = join(synthHome, ".yaw-mcp", "trials");
+    mkdirSync(trialsRoot, { recursive: true });
+    const fixedNow = 1_000_000_000_000;
+    writeFileSync(
+      join(trialsRoot, "foo.json"),
+      JSON.stringify({
+        slug: "foo",
+        expiresAt: fixedNow - 60_000, // already expired
+        clientPath: clientConfigPath,
+        clientName: "claude-code",
+        containerPath: ["mcpServers"],
+        entryName: "yaw-mcp-try-foo",
+      }),
+    );
+
+    let postedEvents = 0;
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+      postTryEvent: async () => {
+        postedEvents += 1;
+      },
+    });
+
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.trials.cleared).toBe(1);
+    expect(parsed.trials.live).toEqual([]);
+    // Marker deleted.
+    expect(existsSync(join(trialsRoot, "foo.json"))).toBe(false);
+    // Trial entry peeled out of the client config; sibling entry preserved.
+    const after = JSON.parse(readFileSync(clientConfigPath, "utf8"));
+    expect(after.mcpServers["yaw-mcp-try-foo"]).toBeUndefined();
+    expect(after.mcpServers.keep).toBeDefined();
+    // Telemetry fired (fire-and-forget), confirming the full GC side effect.
+    expect(postedEvents).toBe(1);
+  });
+
+  it("reports a still-live trial in the trials.live array", async () => {
+    const clientConfigPath = join(synthHome, "client.json");
+    writeFileSync(clientConfigPath, JSON.stringify({ mcpServers: { "yaw-mcp-try-bar": { command: "x" } } }));
+    const trialsRoot = join(synthHome, ".yaw-mcp", "trials");
+    mkdirSync(trialsRoot, { recursive: true });
+    const fixedNow = 1_000_000_000_000;
+    writeFileSync(
+      join(trialsRoot, "bar.json"),
+      JSON.stringify({
+        slug: "bar",
+        expiresAt: fixedNow + 3_600_000, // 1h left
+        clientPath: clientConfigPath,
+        clientName: "claude-code",
+        containerPath: ["mcpServers"],
+        entryName: "yaw-mcp-try-bar",
+      }),
+    );
+
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+      postTryEvent: async () => undefined,
+    });
+
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.trials.cleared).toBe(0);
+    expect(parsed.trials.live).toHaveLength(1);
+    expect(parsed.trials.live[0]).toMatchObject({ slug: "bar", clientName: "claude-code" });
+    expect(parsed.trials.live[0].msUntilExpiry).toBe(3_600_000);
+    // Live trial NOT swept: marker still present, entry still wired.
+    expect(existsSync(join(trialsRoot, "bar.json"))).toBe(true);
   });
 });

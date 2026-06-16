@@ -56,8 +56,9 @@ interface SubcommandSpec {
 const INSTALL_CLIENTS = ["claude-code", "claude-desktop", "cursor", "vscode"] as const;
 
 // Single source of truth for shell completion across bash/zsh/fish/powershell.
-// MUST stay in sync with the dispatch in index.ts (KNOWN_SUBCOMMANDS) -- the
-// completion test asserts every dispatched subcommand appears here.
+// MUST cover every dispatched subcommand in KNOWN_SUBCOMMANDS (src/subcommands.ts)
+// -- the completion test imports that table directly and asserts every non-flag,
+// non-`help` dispatched subcommand appears here, so drift fails the build.
 export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   // Setup -- connect a client to yaw-mcp.
   {
@@ -136,6 +137,12 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   // Other.
   { name: "audit", description: "Run a full-pass audit of loaded servers", flags: ["--json", "--help"] },
   { name: "compliance", description: "Run the compliance suite against a server", flags: ["--publish", "--help"] },
+  {
+    name: "foundry",
+    description: "Export the opt-in dispatch-trace corpus",
+    positional: ["export"],
+    flags: ["--out", "--cap", "--json", "--help"],
+  },
   { name: "help", description: "Show usage", flags: [] },
 ];
 
@@ -212,7 +219,7 @@ ${posClause}
 # Install: save this to ~/.local/share/bash-completion/completions/yaw-mcp
 #          or source it from your .bashrc.
 _yaw-mcp() {
-  local cur prev words cword
+  local cur cword
   cur="\${COMP_WORDS[COMP_CWORD]}"
   cword=$COMP_CWORD
 

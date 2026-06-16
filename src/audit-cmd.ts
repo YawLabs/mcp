@@ -72,14 +72,18 @@ export const AUDIT_USAGE = `Usage: yaw-mcp audit <namespace> [--json]
 
 // Split out so index.ts can validate args early and surface a usage error
 // instead of falling through to runServer on a typo.
-export function parseAuditArgs(argv: string[]): { ok: true; options: ParsedAuditArgs } | { ok: false; error: string } {
+export function parseAuditArgs(
+  argv: string[],
+): { ok: true; options: ParsedAuditArgs } | { ok: false; error: string; help?: boolean } {
   let json = false;
   let namespace: string | undefined;
   for (const a of argv) {
     if (a === "--json") {
       json = true;
     } else if (a === "--help" || a === "-h") {
-      return { ok: false, error: AUDIT_USAGE };
+      // Flag --help so the dispatcher routes it to stdout + exit 0, matching
+      // every sibling subcommand instead of stderr + exit 2.
+      return { ok: false, error: AUDIT_USAGE, help: true };
     } else if (a.startsWith("-")) {
       return { ok: false, error: `yaw-mcp audit: unknown argument "${a}"\n\n${AUDIT_USAGE}` };
     } else if (namespace === undefined) {
@@ -132,8 +136,13 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
 
   const namespace = opts.namespace;
   if (!namespace) {
+    // Unreachable from the CLI: parseAuditArgs requires a <namespace> and
+    // index.ts exits 2 on a parse error before runAudit is ever called. Only
+    // a direct test/programmatic caller that omits `namespace` lands here.
+    // Exit 2 matches the parse-layer usage-error convention (index.ts), not
+    // the exit-1 "namespace not found" case below.
     printErr("yaw-mcp audit: missing <namespace>.");
-    return { exitCode: 1, lines };
+    return { exitCode: 2, lines };
   }
 
   const home = opts.home ?? homedir();

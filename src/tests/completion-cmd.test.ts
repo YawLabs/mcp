@@ -6,37 +6,20 @@ import {
   runCompletion,
   SUBCOMMAND_SPEC,
 } from "../completion-cmd.js";
+import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
 
 const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
 
-// Ground-truth dispatched subcommands from index.ts KNOWN_SUBCOMMANDS.
-// Keep this list in sync with KNOWN_SUBCOMMANDS in src/index.ts and
-// SUBCOMMAND_SPEC in src/completion-cmd.ts -- the test below catches
-// any three-way drift so none of the lists can diverge silently.
-// Entries here are the non-flag subcommand names only (strip --help/-h/--version/-V).
-const EXPECTED_SUBCOMMANDS = [
-  "install",
-  "add",
-  "remove",
-  "list",
-  "try",
-  "try-cleanup",
-  "doctor",
-  "servers",
-  "bundles",
-  "upgrade",
-  "reset-learning",
-  "completion",
-  "login",
-  "logout",
-  "sync",
-  "stats",
-  "secrets",
-  "set-active",
-  "audit",
-  "compliance",
-  "help",
-];
+// Ground truth comes straight from the real dispatch table
+// (src/subcommands.ts), which index.ts imports. Drop the leading-dash
+// flag aliases and `help` (which has no per-subcommand completion of its
+// own) to get the set the completion spec must cover. Importing the live
+// table -- not a hand-maintained mirror -- makes the drift guard REAL: a
+// new dispatched subcommand that forgets a SUBCOMMAND_SPEC entry fails
+// this test.
+const DISPATCHED_SUBCOMMANDS = KNOWN_SUBCOMMANDS.filter(
+  (s) => !(FLAG_ALIASES as readonly string[]).includes(s) && s !== "help",
+);
 
 function capture(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
   const out: string[] = [];
@@ -174,8 +157,25 @@ describe("renderScript — powershell", () => {
 });
 
 describe("SUBCOMMAND_SPEC coverage", () => {
-  it("matches the dispatched subcommand set exactly (no drift vs index.ts)", () => {
-    expect([...SUBCOMMAND_NAMES].sort()).toEqual([...EXPECTED_SUBCOMMANDS].sort());
+  it("covers every dispatched subcommand (no drift vs the real KNOWN_SUBCOMMANDS table)", () => {
+    // Every non-flag, non-`help` subcommand the dispatcher knows MUST have a
+    // SUBCOMMAND_SPEC entry, or the shell completions silently omit it. This
+    // compares against the live table imported from src/subcommands.ts, so a
+    // new dispatched subcommand without a spec entry fails here.
+    const missing = DISPATCHED_SUBCOMMANDS.filter((s) => !SUBCOMMAND_NAMES.includes(s));
+    expect(missing).toEqual([]);
+  });
+
+  it("does not spec any name that is not dispatched (no stale completion entries)", () => {
+    // The only legitimate spec entry without a bare KNOWN_SUBCOMMANDS slot is
+    // `help` (it has its own completion candidate but no per-subcommand args).
+    const known = new Set<string>(KNOWN_SUBCOMMANDS);
+    const stale = SUBCOMMAND_NAMES.filter((s) => s !== "help" && !known.has(s));
+    expect(stale).toEqual([]);
+  });
+
+  it("specs foundry (previously dispatched but absent from the completion spec)", () => {
+    expect(SUBCOMMAND_NAMES).toContain("foundry");
   });
 
   it("includes the local-server + account commands that were previously missing", () => {

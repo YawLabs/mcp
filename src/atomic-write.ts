@@ -13,6 +13,13 @@ export async function atomicWriteFile(
   filePath: string,
   contents: string,
   encoding: BufferEncoding = "utf8",
+  // Optional creation mode for the tmp file. Pass 0o600 for secret-bearing
+  // files (token config, session cookie, vault) so the file is born
+  // owner-only and never sits at the default-umask perms (often 0644) in the
+  // window between rename and a post-hoc chmod. The bits are masked by the
+  // process umask like any creat(2); callers that need an exact mode should
+  // still chmod afterward as belt-and-suspenders.
+  mode?: number,
 ): Promise<void> {
   const dir = path.dirname(filePath);
   // The tmp file is a SIBLING of the target (same directory => same
@@ -26,7 +33,7 @@ export async function atomicWriteFile(
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
   await mkdir(dir, { recursive: true });
   try {
-    await writeFile(tmp, contents, encoding);
+    await writeFile(tmp, contents, mode === undefined ? { encoding } : { encoding, mode });
     await rename(tmp, filePath);
   } catch (err) {
     // Best-effort cleanup so we don't leak orphan temp files when the
