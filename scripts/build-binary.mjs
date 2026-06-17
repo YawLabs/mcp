@@ -87,6 +87,12 @@ await esbuild.build({
   // on some CI runners but not others, so the .node may be absent locally and
   // present in CI -- externalizing covers both.)
   external: ['cpu-features', '*.node'],
+  // jsonc-parser's UMD build (its `main`) calls require('./impl/format') inside
+  // its UMD wrapper, which Node SEA's embedderRequire cannot resolve (it only
+  // handles named built-ins, not relative paths). Force esbuild to use the ESM
+  // build instead: static imports are resolved and inlined at bundle time, so no
+  // relative require reaches embedderRequire at runtime.
+  alias: { 'jsonc-parser': join(repoRoot, 'node_modules', 'jsonc-parser', 'lib', 'esm', 'main.js') },
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
