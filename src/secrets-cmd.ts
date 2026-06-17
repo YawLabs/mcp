@@ -315,6 +315,20 @@ export async function runSecrets(
     return { exitCode: 0 };
   }
 
+  // Short-circuit get/remove when the vault is missing or the entry
+  // doesn't exist -- avoids prompting for a passphrase and paying the
+  // scrypt derivation just to say "not found".
+  if (opts.action === "get" || opts.action === "remove") {
+    const existingVault = await loadVault(path);
+    if (!existingVault || !((opts.name as string) in existingVault.entries)) {
+      const name = opts.name as string;
+      const msg = `No secret named "${name}" in the vault.`;
+      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+      else io.err(`yaw-mcp secrets: ${msg}\n`);
+      return { exitCode: 1 };
+    }
+  }
+
   // Remaining actions all need the vault + passphrase.
   let vault = (await loadVault(path)) ?? newVault();
   const isFresh = !existsSync(path);

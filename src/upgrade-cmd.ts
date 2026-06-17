@@ -465,11 +465,6 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     return { exitCode: opts.run ? 2 : 1, lines };
   }
 
-  if (!plan.command) {
-    print("No upgrade command available for this install method.");
-    return { exitCode: 0, lines };
-  }
-
   // Auto-runnable methods spawn the OWNING tool with whitelisted args for
   // exactly our package: npm for global/local npm trees, pnpm/bun for
   // their global stores. dev-checkout stays manual — the user owns that

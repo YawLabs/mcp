@@ -626,7 +626,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // Step 8: seed anonId + fire the telemetry event.
   const anonId = await loadOrCreateAnonId(home);
   const postEvent = opts.postEvent ?? defaultPostEvent;
-  postEvent(baseUrl, { slug, action: "try", anonId }).catch(() => undefined);
+  await postEvent(baseUrl, { slug, action: "try", anonId }).catch(() => undefined);
 
   // Step 9: nudge.
   const ttlPretty = formatTtl(ttlMs);
@@ -726,7 +726,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   // Fire-and-forget telemetry.
   const anonId = await loadOrCreateAnonId(home);
   const postEvent = opts.postEvent ?? defaultPostEvent;
-  postEvent(baseUrl, { slug, action: "cleanup", anonId }).catch(() => undefined);
+  await postEvent(baseUrl, { slug, action: "cleanup", anonId }).catch(() => undefined);
 
   print(`Trial for "${slug}" cleaned up.`);
   return { exitCode: 0, written };
@@ -842,7 +842,7 @@ export async function gcExpiredTrials(opts: {
         }
       }
       await unlink(trialMarkerPath(marker.slug, home));
-      postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId }).catch(() => undefined);
+      await postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId }).catch(() => undefined);
       cleared++;
     } catch (e) {
       log("debug", "trial gc failed", { slug: marker.slug, error: (e as Error).message });

@@ -246,15 +246,17 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // entirely when persistence is disabled.
   const persistenceDisabled = isPersistenceDisabled(env);
   const stateFilePath = join(userConfigDir(home), STATE_FILENAME);
-  const persistedState = persistenceDisabled ? null : await loadState(stateFilePath);
+  const statePeek: StatePeek | null = persistenceDisabled ? null : await peekStateFile(stateFilePath);
+  const persistedState = statePeek?.kind === "ok" ? await loadState(stateFilePath) : null;
 
   // Persisted cross-session state — ~/.yaw-mcp/state.json. Shows whether
   // persistence is disabled by env, and otherwise reports the file path
   // + how fresh the snapshot is + how much signal it carries.
-  await renderStateSection({
+  renderStateSection({
     filePath: stateFilePath,
     disabled: persistenceDisabled,
     persisted: persistedState,
+    peek: statePeek,
     print,
   });
 
@@ -595,27 +597,23 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
   print("");
 }
 
-async function renderStateSection(opts: {
+function renderStateSection(opts: {
   filePath: string;
   disabled: boolean;
   /** State loaded once by the caller; null iff persistence is disabled. */
   persisted: Awaited<ReturnType<typeof loadState>> | null;
+  /** Peek result hoisted to the caller to avoid re-reading state.json. */
+  peek: StatePeek | null;
   print: (s?: string) => void;
-}): Promise<void> {
-  const { filePath, disabled, persisted, print } = opts;
+}): void {
+  const { filePath, disabled, persisted, peek, print } = opts;
   print("STATE");
-  if (disabled) {
-    print("  status: disabled via YAW_MCP_DISABLE_PERSISTENCE");
+  if (disabled || !peek) {
+    if (disabled) print("  status: disabled via YAW_MCP_DISABLE_PERSISTENCE");
     print("");
     return;
   }
   print(`  path:   ${filePath}`);
-  // Peek before delegating to loadState. loadState swallows malformed
-  // JSON and version mismatches silently (returns emptyState), which is
-  // correct for runtime but hides real diagnostic info from doctor. We
-  // re-read the bytes here so a user with a corrupted state file gets
-  // an actionable message instead of "(no persisted state yet)".
-  const peek = await peekStateFile(filePath);
   if (peek.kind === "malformed") {
     print("  status: corrupt -- file exists but JSON is unparseable");
     print(`  fix:    \`yaw-mcp reset-learning\` to clear, or open ${filePath} and fix by hand`);
@@ -846,32 +844,14 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         continue;
       }
       const exists = existsSync(resolved.absolute);
-      let hasMcpEntry = false;
-      let hasLegacyEntry = false;
-      let legacyEntryName: string | null = null;
-      let malformed = false;
+      let classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null as string | null, malformed: false };
       if (exists) {
         try {
-          // statSync to make sure it's a file (not a dir) before reading.
-          // Synchronous probe is fine here — these are tiny config files
-          // and doctor runs once interactively, not in a hot loop.
           statSync(resolved.absolute);
           const raw = readFileSync(resolved.absolute, "utf8");
-          if (raw.trim().length > 0) {
-            const parsed = parseJsonc(raw);
-            if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-              const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
-              if (container) {
-                hasMcpEntry = ENTRY_NAME in container;
-                legacyEntryName = findLegacyEntry(container);
-                hasLegacyEntry = legacyEntryName !== null;
-              }
-            } else {
-              malformed = true;
-            }
-          }
+          classified = classifyProbeContent(raw, resolved.containerPath);
         } catch {
-          malformed = true;
+          classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
         }
       }
       out.push({
@@ -879,10 +859,7 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         scope: scope.scope,
         path: resolved.absolute,
         exists,
-        hasMcpEntry,
-        hasLegacyEntry,
-        legacyEntryName,
-        malformed,
+        ...classified,
         unavailable: false,
       });
     }
@@ -900,6 +877,36 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
   }
   if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return null;
   return cur as Record<string, unknown>;
+}
+
+/** Classify raw config file content for a probe result. Shared by both
+ *  the sync and async probe variants so the parsing logic lives once. */
+function classifyProbeContent(
+  raw: string,
+  containerPath: string[],
+): { hasMcpEntry: boolean; hasLegacyEntry: boolean; legacyEntryName: string | null; malformed: boolean } {
+  if (raw.trim().length === 0) {
+    return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: false };
+  }
+  try {
+    const parsed = parseJsonc(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
+    }
+    const container = walkContainer(parsed as Record<string, unknown>, containerPath);
+    if (!container) {
+      return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: false };
+    }
+    const legacyEntryName = findLegacyEntry(container);
+    return {
+      hasMcpEntry: ENTRY_NAME in container,
+      hasLegacyEntry: legacyEntryName !== null,
+      legacyEntryName,
+      malformed: false,
+    };
+  } catch {
+    return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
+  }
 }
 
 // Async variant for code paths that prefer non-blocking I/O. Used by
@@ -926,42 +933,28 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
       continue;
     }
     for (const scope of target.scopes) {
-      const resolved = resolveInstallPath({
-        clientId: target.clientId,
-        scope: scope.scope,
-        os: opts.os,
-        home: opts.home,
-        projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
-        claudeConfigDir: opts.claudeConfigDir,
-      });
+      let resolved: ReturnType<typeof resolveInstallPath>;
+      try {
+        resolved = resolveInstallPath({
+          clientId: target.clientId,
+          scope: scope.scope,
+          os: opts.os,
+          home: opts.home,
+          projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
+          claudeConfigDir: opts.claudeConfigDir,
+        });
+      } catch {
+        continue;
+      }
       const exists = existsSync(resolved.absolute);
-      let hasMcpEntry = false;
-      let hasLegacyEntry = false;
-      let legacyEntryName: string | null = null;
-      let malformed = false;
+      let classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null as string | null, malformed: false };
       if (exists) {
         try {
-          // stat to confirm it's a file (not a dir) before reading, for
-          // parity with the sync probeClients guard. A directory at the
-          // config path would otherwise throw EISDIR on readFile and get
-          // mislabeled "malformed" instead of being skipped cleanly.
           await stat(resolved.absolute);
           const raw = await readFile(resolved.absolute, "utf8");
-          if (raw.trim().length > 0) {
-            const parsed = parseJsonc(raw);
-            if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-              const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
-              if (container) {
-                hasMcpEntry = ENTRY_NAME in container;
-                legacyEntryName = findLegacyEntry(container);
-                hasLegacyEntry = legacyEntryName !== null;
-              }
-            } else {
-              malformed = true;
-            }
-          }
+          classified = classifyProbeContent(raw, resolved.containerPath);
         } catch {
-          malformed = true;
+          classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
         }
       }
       result.push({
@@ -969,10 +962,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         scope: scope.scope,
         path: resolved.absolute,
         exists,
-        hasMcpEntry,
-        hasLegacyEntry,
-        legacyEntryName,
-        malformed,
+        ...classified,
         unavailable: false,
       });
     }

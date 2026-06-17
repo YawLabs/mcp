@@ -379,9 +379,9 @@ if (subcommand === "compliance") {
                                gate (default: a clearly-winning server is
                                activated in the same call).
     YAW_MCP_AUTO_UPGRADE          Set to \`0\` to disable the background
-                               self-upgrade check at \`yaw-mcp serve\` startup
-                               (default: stale global-npm installs are
-                               upgraded in the background).
+                               self-upgrade check at server startup (default:
+                               stale global-npm installs are upgraded in the
+                               background).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
