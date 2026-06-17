@@ -172,6 +172,12 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
+      # Pin the toolchain rather than leaning on the runner image's bundled
+      # Node for the `node -p` / `npm view` calls below.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
       # The registry verifies the referenced npm package exists AND that its
       # package.json `mcpName` matches this server. This job `needs: publish-npm`,
       # so npm is already published by the time it runs -- the wait loop below is
@@ -191,10 +197,25 @@ jobs:
           echo "::error::npm did not show @yawlabs/mcp@${ver} within 5 minutes"; exit 1
 
       # mcp-publisher is a Go binary distributed via the registry's releases.
+      # Pinned to a specific tag (not the mutable `latest`) and verified against
+      # the published sha256 BEFORE execution: this runner holds id-token: write
+      # for the io.github.YawLabs/* namespace, so a piped `curl | tar` of a
+      # compromised or mis-published upstream build would run with that scope.
+      # Bump MCP_PUBLISHER_VERSION + _SHA256 together, deliberately, like any
+      # other pinned dependency (sha256 is in registry_<ver>_checksums.txt on
+      # the release).
       - name: Install mcp-publisher
         shell: bash
+        env:
+          MCP_PUBLISHER_VERSION: v1.7.9
+          MCP_PUBLISHER_SHA256: ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac
         run: |
-          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar -xz mcp-publisher
+          tarball="mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${tarball}"
+          echo "${MCP_PUBLISHER_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" mcp-publisher
+          rm -f "$tarball"
           ./mcp-publisher --help >/dev/null
 
       - name: Publish server.json (GitHub OIDC)
