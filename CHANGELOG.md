@@ -2,6 +2,26 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
+## 0.63.2 -- release pipeline: publish npm from CI
+
+No changes to the package runtime or CLI -- this release exists to exercise the
+new CI-on-tag-push publish flow end to end. The published artifact is identical
+to 0.63.1 aside from the version bump.
+
+- **npm is now published from CI, not the workstation.** A new `publish-npm` job
+  in `release.yml` publishes `@yawlabs/mcp` on every `v*` tag using the org
+  `NPM_TOKEN` + `--provenance` (the repo and package are public), gated on the
+  binary build so npm and the GitHub Release stay in lockstep. It is idempotent:
+  a version already live is a clean skip, and an `EPUBLISHCONFLICT` from
+  registry read-replica lag is treated as success. `publish-registry` now
+  `needs: publish-npm`, so the MCP-registry verify can no longer race ahead of
+  the npm publish. `release.sh`'s hand-off detection was tightened to key on a
+  real `npm publish` / `NODE_AUTH_TOKEN` signal instead of the registry job's
+  `id-token: write` (the false positive that wedged the 0.63.0/0.63.1 runs).
+- **Registry job hardening.** `mcp-publisher` is pinned to a tagged release and
+  verified against its published sha256 before execution (was an unpinned
+  `curl .../latest | tar`), and the job pins its Node toolchain via `setup-node`.
+
 ## 0.63.1 -- CLI follow-ups: wire dead --dry-run/--stdin flags, fix completion drift, dedup probes
 
 Patch-level follow-ups on the 0.63.0 CLI hardening pass. All fixes; no behavior changes for callers who weren't already hitting the dead-flag bugs.
