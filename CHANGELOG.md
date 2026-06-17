@@ -2,6 +2,21 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
+## 0.63.1 -- CLI follow-ups: wire dead --dry-run/--stdin flags, fix completion drift, dedup probes
+
+Patch-level follow-ups on the 0.63.0 CLI hardening pass. All fixes; no behavior changes for callers who weren't already hitting the dead-flag bugs.
+
+- **`sync push --dry-run`** now short-circuits before any remote mutation. The flag was parsed but never checked by `syncPush`, so a "dry-run" PUT actually mutated `mcp_bundles`. Preview now prints server count and exits 0 without calling `putResource`.
+- **`secrets set --stdin`** now reads raw multi-line stdin even on a TTY. The flag was parsed but never consumed by `runSecrets`, so it silently fell through to the line-buffered echo-off prompt regardless. `--stdin` now forces the raw read path as documented.
+- **`install <client> --dry-run`** now bypasses the collision gate. With an existing yaw-mcp entry + non-TTY stdin, the gate refused before the dry-run preview block ever ran -- so the "...or --dry-run to preview" hint was unreachable. The decision chain now treats `dryRun` like `force` for the overwrite-vs-skip choice.
+- **Completion `SUBCOMMAND_SPEC` drift fixed.** `sync` no longer advertises a phantom `--key` (replaced with the real `--dry-run`); `secrets` no longer advertises a phantom `--key` (replaced with the real `--force`).
+- **`try-cmd` telemetry POSTs are now awaited.** Three fire-and-forget `postEvent(...).catch(() => undefined)` calls (try / cleanup / expiry-gc) could be killed by `process.exit` before the request landed. Now awaited so the analytics event reliably reaches the backend before exit.
+- **`doctor` `state.json` double-read eliminated.** `peekStateFile` hoisted to the caller and the result threaded into `renderStateSection`, removing the redundant disk read inside the section.
+- **`doctor` probe duplication removed.** Extracted `classifyProbeContent` shared by both sync and async client-config probes (~60 lines deduped). Also added the missing `try/catch` around `resolveInstallPath` in `probeClientsAsync` for parity with the sync variant.
+- **`secrets get` / `remove` against a missing vault or missing entry** now short-circuit before the passphrase prompt, avoiding the wasted scrypt key derivation just to say "not found".
+- **`upgrade-cmd`:** removed unreachable `if (!plan.command)` branch -- every install method whose plan reaches that point already returned earlier in the chain.
+- **`index.ts` help text:** corrected the `YAW_MCP_AUTO_UPGRADE` description ("yaw-mcp serve startup" was not a subcommand; now "server startup").
+
 ## 0.63.0 -- CLI hardening: flag parsing, exit-code consistency, secret-file perms, dispatch error handling
 
 A full-pass sweep of the `yaw-mcp` subcommand surface. Every change is a fix, a hardening, or additive; there are no breaking changes to the MCP server or the public CLI contract.
