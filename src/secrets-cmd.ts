@@ -256,11 +256,11 @@ function readPassphraseFromTTY(
   });
 }
 
-async function readStdinValue(io?: SecretsCommandOptions["io"]): Promise<string> {
+async function readStdinValue(io?: SecretsCommandOptions["io"], forceRaw?: boolean): Promise<string> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
   const isTTY = (stdin as { isTTY?: boolean }).isTTY === true;
-  if (isTTY) {
+  if (isTTY && !forceRaw) {
     stdout.write("Secret value: ");
     return readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout);
   }
@@ -342,7 +342,7 @@ export async function runSecrets(
     const name = opts.name as string;
     let value: string;
     if (opts.value !== undefined) value = opts.value;
-    else value = await readStdinValue(opts.io);
+    else value = await readStdinValue(opts.io, opts.fromStdin);
     if (!value) {
       const msg = "Secret value cannot be empty.";
       if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);

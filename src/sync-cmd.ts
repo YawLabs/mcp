@@ -315,6 +315,21 @@ async function syncPush(
   home: string,
 ): Promise<SyncCommandResult> {
   const local = await readLocalBundles(home);
+  const stripped = local.servers.map(stripEnvValues);
+
+  if (opts.dryRun) {
+    if (opts.json) {
+      io.out(
+        `${JSON.stringify({ ok: true, dryRun: true, serverCount: stripped.length }, null, 2)}\n`,
+      );
+    } else {
+      io.out(
+        `[dry-run] would push ${stripped.length} server${stripped.length === 1 ? "" : "s"} (env values stripped); nothing sent.\n`,
+      );
+    }
+    return { exitCode: 0 };
+  }
+
   // GET the remote so we can merge its authoritative isActive into our
   // payload (FIX A). We do NOT push against this freshly-GET'd version --
   // see below.
@@ -326,8 +341,8 @@ async function syncPush(
   // isActive is remote-authoritative; set-active is the sole intended
   // writer; push preserves remote toggles (only seeds isActive for servers
   // not yet on the remote).
-  const stripped = mergeRemoteActive(local.servers.map(stripEnvValues), remoteServers);
-  const payload: LocalBundlesFile = { version: 1, servers: stripped };
+  const merged = mergeRemoteActive(stripped, remoteServers);
+  const payload: LocalBundlesFile = { version: 1, servers: merged };
   // Push against the LAST-PULLED version, not the just-GET'd one: if the
   // remote moved ahead since our last pull, the server 409s and the
   // stale-version handler tells the user to pull + reconcile + push. If we
@@ -343,9 +358,9 @@ async function syncPush(
   // After a successful push, this machine is current at res.version.
   await writeSyncState(home, { mcp_bundles: { lastPulledVersion: res.version } });
   if (opts.json) {
-    io.out(`${JSON.stringify({ ok: true, serverCount: stripped.length, newVersion: res.version }, null, 2)}\n`);
+    io.out(`${JSON.stringify({ ok: true, serverCount: merged.length, newVersion: res.version }, null, 2)}\n`);
   } else {
-    io.out(`Pushed ${stripped.length} server${stripped.length === 1 ? "" : "s"} -> mcp_bundles v${res.version}.\n`);
+    io.out(`Pushed ${merged.length} server${merged.length === 1 ? "" : "s"} -> mcp_bundles v${res.version}.\n`);
     io.out("Env values stripped before upload; use `yaw-mcp secrets push` to sync secrets across machines.\n");
   }
   return { exitCode: 0 };

@@ -249,7 +249,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   if (existingHasEntry) {
     let decision: "overwrite" | "skip" | "abort";
-    if (opts.force) decision = "overwrite";
+    if (opts.force || opts.dryRun) decision = "overwrite";
     else if (opts.skip) decision = "skip";
     else if (opts.promptAnswer) decision = opts.promptAnswer;
     else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {

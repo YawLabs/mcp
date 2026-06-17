@@ -119,14 +119,14 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "sync",
     description: "Sync bundles across machines",
     positional: ["push", "pull", "status"],
-    flags: ["--key", "--json", "--help"],
+    flags: ["--dry-run", "--json", "--help"],
   },
   { name: "stats", description: "Show usage statistics", flags: ["--limit", "--days", "--json", "--help"] },
   {
     name: "secrets",
     description: "Manage stored secrets",
     positional: ["set", "get", "list", "remove", "lock", "push", "pull"],
-    flags: ["--key", "--value", "--stdin", "--json", "--help"],
+    flags: ["--force", "--value", "--stdin", "--json", "--help"],
   },
   {
     name: "set-active",
