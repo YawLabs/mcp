@@ -81,14 +81,88 @@ jobs:
             dist-release/${{ steps.stage.outputs.asset }}.sha256
           fail_on_unmatched_files: true
 
+  # Publish the npm package on every v* tag. This is the SINGLE source of
+  # truth for npm publication: a manual `git tag && git push --follow-tags`
+  # triggers it with no workstation step, and release.sh's "hand off to CI"
+  # path watches this run instead of publishing locally. Gated on `build` so a
+  # broken platform binary fails the whole release before npm gets the new
+  # version (npm + the GitHub Release stay in lockstep). Idempotent: a version
+  # already live (e.g. an interrupted local publish) is a clean skip, so a
+  # re-run never hard-fails on "cannot publish over existing version".
+  publish-npm:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance (sigstore) -- repo + package are public
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm ci
+
+      # Fail loudly if the tag and package.json disagree -- a tag pushed
+      # without the matching version bump would otherwise publish whatever
+      # package.json says under the tag's name.
+      - name: Verify tag matches package.json
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          want="${tag#v}"
+          have="$(node -p "require('./package.json').version")"
+          if [ "$want" != "$have" ]; then
+            echo "::error::tag ${tag} (=> ${want}) does not match package.json version ${have}"
+            exit 1
+          fi
+          echo "tag ${tag} matches package.json ${have}"
+
+      # prepublishOnly runs `npm run build`, so dist/ is rebuilt from the
+      # checked-out tag before packing. --access public + --provenance match
+      # the (public) package and emit a sigstore attestation from this run.
+      - name: Publish to npm (skip if the version is already live)
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          ver="$(node -p "require('./package.json').version")"
+          live="$(npm view "@yawlabs/mcp@${ver}" version 2>/dev/null || echo "")"
+          if [ "$live" = "$ver" ]; then
+            echo "@yawlabs/mcp@${ver} already on npm -- skipping publish"
+            exit 0
+          fi
+          # The npm view above reads a registry read-replica that can lag the
+          # write path: right after a near-simultaneous publish of the same
+          # version (interrupted local publish racing this run, or a dispatch
+          # racing a push-tag) the replica still shows it absent, so we fall
+          # through and npm publish 403s with "cannot publish over ...". Treat
+          # that specific conflict as success so the job is a clean no-op.
+          if ! out="$(npm publish --access public --provenance 2>&1)"; then
+            echo "$out"
+            if echo "$out" | grep -qiE 'cannot publish over|EPUBLISHCONFLICT|previously published'; then
+              echo "@yawlabs/mcp@${ver} already published (replica lag) -- treating as success"
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "$out"
+
   # Publish server.json to the official MCP registry. Previously a manual
   # `mcp-publisher publish` step, which meant the registry JWT silently expired
   # between releases. Doing it here via GitHub OIDC is tokenless (the OIDC claim
   # proves the run is in github.com/YawLabs, which owns the io.github.YawLabs/*
   # namespace) so nothing expires and the registry is never out of sync.
+  # Gated on publish-npm so the registry verify (which requires the npm package
+  # to be live) never races ahead of the npm publish.
   publish-registry:
     name: publish to MCP registry
-    needs: build
+    needs: publish-npm
     runs-on: ubuntu-latest
     permissions:
       id-token: write # mint the OIDC token for `mcp-publisher login github-oidc`
@@ -99,10 +173,11 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       # The registry verifies the referenced npm package exists AND that its
-      # package.json `mcpName` matches this server. release.sh publishes npm
-      # from the workstation just AFTER pushing the tag, so this job can race
-      # ahead of npm -- wait for the version to appear (server.json is the
-      # source of truth; release.sh keeps it in lockstep with package.json).
+      # package.json `mcpName` matches this server. This job `needs: publish-npm`,
+      # so npm is already published by the time it runs -- the wait loop below is
+      # cheap insurance against npm registry mirror/CDN propagation lag, not a
+      # workstation race (server.json is the source of truth; release.sh keeps it
+      # in lockstep with package.json).
       - name: Wait for the npm package to be live
         shell: bash
         run: |

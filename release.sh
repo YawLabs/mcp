@@ -253,7 +253,11 @@ if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
 elif [ "$IS_CI" = "true" ]; then
   npm publish --access public --provenance
   info "Published @yawlabs/mcp@${VERSION} to npm (with provenance)"
-elif [ -f ".github/workflows/release.yml" ] && grep -qE "npm publish|NODE_AUTH_TOKEN|id-token:[[:space:]]*write" .github/workflows/release.yml; then
+elif [ -f ".github/workflows/release.yml" ] && grep -qE "npm publish|NODE_AUTH_TOKEN" .github/workflows/release.yml; then
+  # Detect a REAL npm-publish job only. `id-token: write` is NOT a reliable
+  # signal -- the publish-registry job carries it for the MCP-registry OIDC
+  # login and does not touch npm, so matching it made the workstation hand off
+  # to a CI that never published npm (registry job then waited 5min + failed).
   info "CI release.yml fires on v* tag push -- workstation hands off to CI"
   # Verify the tag landed on origin BEFORE looking up the CI run. A local
   # push that succeeded but the remote rejected (protected-tag rule, network
