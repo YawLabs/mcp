@@ -21,10 +21,9 @@
 // Phase 6c via the mcp_secrets team-resource on yaw.sh (server gets
 // an opaque ciphertext blob; never sees plaintext).
 
-import { existsSync } from "node:fs";
-import { chmod, readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
@@ -63,24 +62,33 @@ function emptyVault(): VaultFile {
 }
 
 export async function loadVault(path: string): Promise<VaultFile | null> {
-  if (!existsSync(path)) return null;
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
   } catch (err) {
-    log("warn", "Failed to read vault", { path, error: err instanceof Error ? err.message : String(err) });
-    return null;
+    const code = (err as NodeJS.ErrnoException).code;
+    // ENOENT is the only "vault absent" signal; everything else (EACCES,
+    // EIO, EISDIR, EPERM, ...) means the file likely exists but we can't
+    // read it -- bubble that out so callers don't treat it as "no vault"
+    // and overwrite real data.
+    if (code === "ENOENT") return null;
+    log("warn", "Failed to read vault", { path, error: err instanceof Error ? err.message : String(err), code });
+    throw err;
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
     log("warn", "Vault file is not valid JSON", { path, error: err instanceof Error ? err.message : String(err) });
-    return null;
+    throw new Error(`vault at ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`vault at ${path} is corrupt: root must be a JSON object`);
+  }
   const obj = parsed as Record<string, unknown>;
-  if (typeof obj.salt !== "string" || !obj.entries || typeof obj.entries !== "object") return null;
+  if (typeof obj.salt !== "string" || !obj.entries || typeof obj.entries !== "object") {
+    throw new Error(`vault at ${path} is corrupt: missing or invalid salt/entries`);
+  }
   // Validate each entry's shape up front rather than deferring to decrypt
   // time -- a malformed entry (missing/non-string iv/ciphertext/authTag) is
   // a corrupt vault, and surfacing it here gives a clear, named error.
@@ -111,11 +119,26 @@ function isEncryptedEntry(v: unknown): v is EncryptedEntry {
 export async function saveVault(path: string, vault: VaultFile): Promise<void> {
   // atomicWriteFile mkdirs the target dir recursively (atomic-write.ts:19)
   // before writing the temp file, so the caller does NOT need to create
-  // the directory first.
+  // the directory first. We DO chmod the dir to 0o700 on POSIX so the
+  // vault directory itself isn't group/other-readable -- the file inside
+  // is born 0o600 below, but a world-readable parent dir lets others
+  // observe its existence and timestamps.
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  if (process.platform !== "win32") {
+    try {
+      await chmod(dir, 0o700);
+    } catch {
+      // not critical
+    }
+  }
   // Born 0o600 so the encrypted vault is never group/other-readable in the
   // window between rename and the chmod below (ciphertext only, but consistent
-  // with the token/cookie files).
-  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8", 0o600);
+  // with the token/cookie files). The dirMode: 0o700 closes the same gap
+  // for any parent directory atomicWriteFile creates -- belt-and-suspenders
+  // alongside the explicit chmod(dir, 0o700) above, which only handles the
+  // immediate parent (and only if it already existed).
+  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
     try {
       await chmod(path, 0o600);

@@ -66,6 +66,7 @@ function isEmptyBody(result: ToolCallResultShape): boolean {
   return true;
 }
 
+// HEURISTIC: known false-positive when result text contains the verb (e.g. "not found" matching a "find" verb). Re-evaluate with a proper success-signal schema.
 export function computeOutcomeReward(result: ToolCallResultShape): number {
   // Rule 1: explicit hard failure.
   if (result.isError === true) return 0.0;

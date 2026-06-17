@@ -1,5 +1,6 @@
 import { request } from "undici";
 import { log } from "./logger.js";
+import { isLoopbackHost } from "./url-safety.js";
 
 // POST /api/connect/heartbeat — fires when an MCP client (Claude Code,
 // Cursor, Claude Desktop, VS Code, ...) attaches to yaw-mcp via stdio and
@@ -35,12 +36,44 @@ let token = "";
 // and on success.
 let lastLoggedFailureStatus: number | null = null;
 let lastLoggedErrorMessage: string | null = null;
+// One-shot latch for the "skipped bearer over http://" warning so the
+// operator sees the misconfiguration once per process rather than every
+// 60s on each refresh. Reset by initHeartbeat() when the URL changes.
+let warnedInsecureBearerSkip = false;
 
 export function initHeartbeat(url: string, tok: string): void {
   apiUrl = url;
   token = tok;
   lastLoggedFailureStatus = null;
   lastLoggedErrorMessage = null;
+  warnedInsecureBearerSkip = false;
+}
+
+/**
+ * Decide whether it's safe to send `Authorization: Bearer ...` to the
+ * given URL. Bearers go over https://, OR over http:// only to loopback.
+ * Returns false (and emits a one-time warning) for any other scheme.
+ */
+function shouldSendBearer(targetUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    // Malformed URL — let the request fail at the transport layer with
+    // its usual error. Don't attach a bearer to garbage either way.
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return true;
+  if (!warnedInsecureBearerSkip) {
+    log(
+      "warn",
+      "Heartbeat URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+      { url: targetUrl },
+    );
+    warnedInsecureBearerSkip = true;
+  }
+  return false;
 }
 
 export async function reportHeartbeat(
@@ -52,12 +85,16 @@ export async function reportHeartbeat(
 ): Promise<void> {
   if (!apiUrl || !token) return;
   try {
-    const res = await request(`${apiUrl.replace(/\/$/, "")}${HEARTBEAT_PATH}`, {
+    const fullUrl = `${apiUrl.replace(/\/$/, "")}${HEARTBEAT_PATH}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (shouldSendBearer(fullUrl)) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    const res = await request(fullUrl, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({
         // Pass through whatever the AI client self-reported. Backend
         // normalizes (fallback to 'unknown', length caps) — keep this

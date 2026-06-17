@@ -87,6 +87,10 @@ export interface InstallCommandOptions {
   };
   /** Override for tests; replaces an interactive prompt with a fixed answer. */
   promptAnswer?: "overwrite" | "skip" | "abort";
+  /** Set by the parser when `--help` / `-h` was passed. Dispatcher prints
+   *  USAGE to stdout and exits 0 -- treated as a successful run, not an
+   *  argv error. Keeps `-h` distinguishable from unknown-flag rejections. */
+  helpRequested?: boolean;
 }
 
 export interface InstallResult {
@@ -284,9 +288,20 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     ? await composeYawMcpConfig(yawMcpConfigPath, token as string)
     : { json: "" };
   if ("backupPath" in yawMcpConfigComposed && yawMcpConfigComposed.backupPath) {
-    log(
-      `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; original bytes backed up to ${yawMcpConfigComposed.backupPath} before overwriting.`,
-    );
+    const reason = yawMcpConfigComposed.backupReason;
+    if (reason === "malformed") {
+      log(
+        `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; backed up to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
+      );
+    } else if (reason === "token-rotation") {
+      log(
+        `yaw-mcp install: existing ${yawMcpConfigPath} backed up before token rotation to ${yawMcpConfigComposed.backupPath} (previous token preserved for recovery).`,
+      );
+    } else {
+      log(
+        `yaw-mcp install: existing ${yawMcpConfigPath} was not a JSON object; backed up to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
+      );
+    }
   }
   const yawMcpConfigJson = yawMcpConfigComposed.json;
 
@@ -603,9 +618,15 @@ async function writeBackup(path: string, raw: string): Promise<string | undefine
   }
 }
 
-async function composeYawMcpConfig(path: string, token: string): Promise<{ json: string; backupPath?: string }> {
+type BackupReason = "malformed" | "token-rotation" | "non-object";
+
+async function composeYawMcpConfig(
+  path: string,
+  token: string,
+): Promise<{ json: string; backupPath?: string; backupReason?: BackupReason }> {
   let existing: Record<string, unknown> = {};
   let backupPath: string | undefined;
+  let backupReason: BackupReason | undefined;
   if (existsSync(path)) {
     let raw = "";
     try {
@@ -619,12 +640,24 @@ async function composeYawMcpConfig(path: string, token: string): Promise<{ json:
         const parsed = parseJsonc(raw);
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
           existing = parsed as Record<string, unknown>;
+          // Existing valid object config -- if it carries a token that
+          // differs from the one we're about to write, back up the
+          // original bytes first so the prior token can be recovered.
+          // Same timestamped-sibling pattern as the malformed-config
+          // backup branch below; an owner-only 0o600 copy lives next to
+          // the file as `<path>.bak-<ts>`.
+          const existingToken = (existing as { token?: unknown }).token;
+          if (typeof existingToken === "string" && existingToken.length > 0 && existingToken !== token) {
+            backupPath = await writeBackup(path, raw);
+            if (backupPath) backupReason = "token-rotation";
+          }
         } else {
           // Valid JSON but not an object (array/string/number/boolean/null):
           // we still discard it and write our object shape, so back up the
           // original bytes first -- same recovery guarantee as the
           // unparseable case below.
           backupPath = await writeBackup(path, raw);
+          if (backupPath) backupReason = "non-object";
         }
       } catch {
         // Malformed file: copy raw bytes aside before we overwrite, so
@@ -632,13 +665,14 @@ async function composeYawMcpConfig(path: string, token: string): Promise<{ json:
         // recover it. The new config still gets written -- the user
         // explicitly asked to install.
         backupPath = await writeBackup(path, raw);
+        if (backupPath) backupReason = "malformed";
       }
     }
   }
   const next: Record<string, unknown> = { version: CURRENT_SCHEMA_VERSION, ...existing };
   next.token = token;
   if (typeof next.version !== "number") next.version = CURRENT_SCHEMA_VERSION;
-  return { json: `${JSON.stringify(next, null, 2)}\n`, backupPath };
+  return { json: `${JSON.stringify(next, null, 2)}\n`, backupPath, backupReason };
 }
 
 /** Redact the `token` field in a rendered ~/.yaw-mcp/config.json blob so
@@ -710,7 +744,7 @@ export function parseInstallArgs(argv: string[]):
         break;
       case "-h":
       case "--help":
-        return { ok: false, error: USAGE, help: true };
+        return { ok: true, options: { helpRequested: true } as InstallCommandOptions };
       default:
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${USAGE}` };
         positional.push(a);
@@ -748,6 +782,15 @@ export function parseInstallArgs(argv: string[]):
  *  touches a file, never hits the network, works without a token. The
  *  exit code is always 0; this is diagnostic, not gating. */
 async function runInstallList(opts: InstallCommandOptions, log: (s: string) => void): Promise<InstallResult> {
+  // Capture every log() emission so the returned InstallResult carries
+  // the same diagnostic trail tests / programmatic callers see from the
+  // main install path. Without this, --list silently drops everything
+  // the caller may want to assert against.
+  const messages: string[] = [];
+  const capture = (s: string): void => {
+    messages.push(s);
+    log(s);
+  };
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
   const os = opts.os ?? CURRENT_OS;
@@ -762,8 +805,8 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
 
   const installed = probes.filter((p) => p.hasMcpEntry).length;
   const available = probes.filter((p) => !p.unavailable).length;
-  log(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
-  log("");
+  capture(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
+  capture("");
 
   const widths = {
     client: Math.max("CLIENT".length, ...rows.map((r) => r.client.length)),
@@ -776,19 +819,19 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
     `${"SCOPE".padEnd(widths.scope)}  ` +
     `${"PATH".padEnd(widths.path)}  ` +
     `${"STATUS".padEnd(widths.status)}`;
-  log(header);
+  capture(header);
   for (const r of rows) {
-    log(
+    capture(
       `  ${r.client.padEnd(widths.client)}  ` +
         `${r.scope.padEnd(widths.scope)}  ` +
         `${r.path.padEnd(widths.path)}  ` +
         `${r.status.padEnd(widths.status)}`,
     );
   }
-  log("");
-  log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
-  log("Install into every available client (user scope where supported): `yaw-mcp install --all`");
-  return { written: [], wouldWrite: [], messages: [], exitCode: 0 };
+  capture("");
+  capture("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
+  capture("Install into every available client (user scope where supported): `yaw-mcp install --all`");
+  return { written: [], wouldWrite: [], messages, exitCode: 0 };
 }
 
 function statusFor(p: ClientProbeResult): string {

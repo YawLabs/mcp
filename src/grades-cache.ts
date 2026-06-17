@@ -90,12 +90,44 @@ export async function readGradesCache(home: string = homedir()): Promise<GradesC
   return out;
 }
 
+// In-process serializer for writeGrade. Concurrent audits against different
+// namespaces share the same on-disk grades.json, so the read-modify-write
+// sequence below MUST run one-at-a-time per cache path -- otherwise two
+// writers race, each loads the pre-write snapshot, and whichever atomic
+// rename lands second silently drops the other's entry. We chain each call
+// onto the previous Promise (per cache path) so reads-then-writes serialize.
+// Errors are caught on the chained tail so one failed write does NOT poison
+// subsequent calls (the next caller still gets to run); the original caller
+// still sees its own error via the awaited `chained` below.
+const writeGradeChain = new Map<string, Promise<void>>();
+
 /** Write (insert or replace) a single namespace's grade into the cache,
- *  preserving every other entry. Atomic write. Returns the path written. */
+ *  preserving every other entry. Atomic write. Returns the path written.
+ *  Concurrent calls (same cache file) are serialized via writeGradeChain so
+ *  concurrent read-modify-write sequences cannot drop entries. */
 export async function writeGrade(namespace: string, grade: CachedGrade, home: string = homedir()): Promise<string> {
   const path = gradesCachePath(home);
-  const cache = await readGradesCache(home);
-  cache[namespace] = grade;
-  await atomicWriteFile(path, `${JSON.stringify(cache, null, 2)}\n`);
+  const prev = writeGradeChain.get(path) ?? Promise.resolve();
+  const run = async (): Promise<void> => {
+    const cache = await readGradesCache(home);
+    cache[namespace] = grade;
+    await atomicWriteFile(path, `${JSON.stringify(cache, null, 2)}\n`);
+  };
+  // .then(run, run) means: run AFTER the previous link settles, regardless of
+  // whether it resolved or rejected. The caller of THIS writeGrade still sees
+  // any error its own `run` throws via the awaited `chained` below.
+  const chained = prev.then(run, run);
+  // Stored variant swallows errors so the NEXT caller's await doesn't reject
+  // on a prior write's failure -- decouples chain liveness from per-call outcomes.
+  const tail = chained.catch(() => undefined);
+  writeGradeChain.set(path, tail);
+  try {
+    await chained;
+  } finally {
+    // Drop the map entry once OUR link is the latest -- prevents the map from
+    // growing forever in long-lived processes. If another writer queued after
+    // us, the map already holds their tail; leave it in place.
+    if (writeGradeChain.get(path) === tail) writeGradeChain.delete(path);
+  }
   return path;
 }

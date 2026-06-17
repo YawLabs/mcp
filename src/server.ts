@@ -1055,8 +1055,16 @@ export class ConnectServer {
             if (attempt > 0) await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
             try {
               await disconnectFromUpstream(conn);
+              // Re-inject any session-elicited credentials for this namespace
+              // before re-spawning — otherwise the reconnect uses the raw
+              // configured env and re-trips the same missing-credential error
+              // the user already supplied a value for this session.
+              const elicitedForReconnect = this.elicitedEnv.get(ns);
+              const reconnectConfig = elicitedForReconnect
+                ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForReconnect } }
+                : serverConfig;
               const newConn = await connectToUpstream(
-                serverConfig,
+                reconnectConfig,
                 this.onUpstreamDisconnect,
                 this.onUpstreamListChanged,
               );
@@ -2515,6 +2523,10 @@ export class ConnectServer {
         this.idleCallCounts.delete(namespace);
         this.adaptiveSkipLogged.delete(namespace);
         this.toolFilters.delete(namespace);
+        // Drop any session-elicited credentials for this namespace too —
+        // the server is gone (or disabled), so the cached values are stale
+        // and could leak into a future re-add of an unrelated config.
+        this.elicitedEnv.delete(namespace);
         changed = true;
         continue;
       }
@@ -2535,6 +2547,11 @@ export class ConnectServer {
         this.idleCallCounts.delete(namespace);
         this.adaptiveSkipLogged.delete(namespace);
         this.toolFilters.delete(namespace);
+        // Drop session-elicited credentials too — the connect spec changed,
+        // so creds the user provided for the OLD spec may not match the
+        // new one (different command/url/env wiring). Better to re-elicit
+        // than silently inject stale values that produce a confusing failure.
+        this.elicitedEnv.delete(namespace);
         changed = true;
       }
     }
@@ -2987,7 +3004,15 @@ export class ConnectServer {
     progress?.(`Inspecting "${serverArg}" (transient — not loading into session)…`);
     let transient: UpstreamConnection | undefined;
     try {
-      transient = await connectToUpstream(serverConfig);
+      // Include any session-elicited credentials for this namespace so the
+      // transient connect uses the same env as a persistent activation
+      // would — otherwise schema inspection re-trips the missing-credential
+      // error the user already supplied a value for this session.
+      const elicitedForTransient = this.elicitedEnv.get(serverArg);
+      const transientConfig = elicitedForTransient
+        ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForTransient } }
+        : serverConfig;
+      transient = await connectToUpstream(transientConfig);
     } catch (err) {
       const message = err instanceof ActivationError ? err.message : err instanceof Error ? err.message : String(err);
       return {

@@ -39,8 +39,13 @@ export async function readSyncState(home: string): Promise<SyncState> {
   }
 }
 
+// Merges the given keys into the existing sync-state file (read-modify-write),
+// rather than replacing the whole file. Callers can pass only the keys they
+// care about and trust unrelated keys to be preserved.
 export async function writeSyncState(home: string, state: SyncState): Promise<void> {
   const path = syncStatePath(home);
   await mkdir(dirname(path), { recursive: true });
-  await atomicWriteFile(path, `${JSON.stringify(state, null, 2)}\n`);
+  const existing = await readSyncState(home);
+  const merged = { ...existing, ...state };
+  await atomicWriteFile(path, `${JSON.stringify(merged, null, 2)}\n`);
 }

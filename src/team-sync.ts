@@ -96,8 +96,11 @@ function resolveBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
 function expMs(session: { exp: number }): number {
   // Tolerate seconds-shaped exp (anything below ~Sep 2001 in ms terms)
   // in case a future server bug or JWT-style payload sneaks in.
+  // Missing/non-numeric exp -> treat as already expired (return 0), so a
+  // corrupt write cannot bestow an eternal session.
   const e = session.exp;
-  return e > 0 && e < 1e12 ? e * 1000 : e;
+  if (typeof e !== "number" || !Number.isFinite(e) || e <= 0) return 0;
+  return e < 1e12 ? e * 1000 : e;
 }
 
 let cachedState: { filePath: string; state: StoredState | null } | null = null;
@@ -111,7 +114,7 @@ async function loadStoredState(filePath: string): Promise<StoredState | null> {
   // a process operating on two homes must not cross sessions.
   if (cachedState && cachedState.filePath === filePath) {
     const s = cachedState.state;
-    if (s && expMs(s.session) < Date.now()) {
+    if (s && expMs(s.session) <= Date.now()) {
       cachedState = { filePath, state: null };
       return null;
     }
@@ -124,11 +127,12 @@ async function loadStoredState(filePath: string): Promise<StoredState | null> {
     if (!obj || typeof obj !== "object") parsed = null;
     else if (typeof obj.cookie !== "string" || !obj.cookie) parsed = null;
     else if (!obj.session || typeof obj.session !== "object") parsed = null;
+    else if (typeof obj.session.exp !== "number" || !Number.isFinite(obj.session.exp)) parsed = null;
     else parsed = obj as StoredState;
   } catch {
     parsed = null;
   }
-  if (parsed && expMs(parsed.session) < Date.now()) {
+  if (parsed && expMs(parsed.session) <= Date.now()) {
     cachedState = { filePath, state: null };
     return null;
   }
@@ -140,8 +144,10 @@ async function saveStoredState(filePath: string, state: StoredState): Promise<vo
   cachedState = { filePath, state };
   try {
     // Born 0o600 so the session cookie is never group/other-readable in the
-    // window between rename and the chmod below.
-    await atomicWriteFile(filePath, JSON.stringify(state, null, 2), "utf8", 0o600);
+    // window between rename and the chmod below. dirMode: 0o700 ensures any
+    // freshly-created parent directory chain is also owner-only so the
+    // cookie file's existence/timestamps aren't observable by other users.
+    await atomicWriteFile(filePath, JSON.stringify(state, null, 2), "utf8", 0o600, 0o700);
     if (process.platform !== "win32") {
       try {
         await chmod(filePath, 0o600);
@@ -241,12 +247,22 @@ export async function signIn(key: string, opts: SignInOpts = {}): Promise<TeamSe
   const trimmed = key.trim();
   if (!trimmed) throw new Error("License key is required.");
   const baseUrl = opts.baseUrl;
-  const post = await httpJson<{ email?: string; role?: TeamRole; order_id?: string; error?: string }>({
-    method: "POST",
-    path: "/api/team/session",
-    body: { key: trimmed },
-    baseUrl,
-  });
+  let post: Awaited<
+    ReturnType<typeof httpJson<{ email?: string; role?: TeamRole; order_id?: string; error?: string }>>
+  >;
+  try {
+    post = await httpJson<{ email?: string; role?: TeamRole; order_id?: string; error?: string }>({
+      method: "POST",
+      path: "/api/team/session",
+      body: { key: trimmed },
+      baseUrl,
+    });
+  } catch (err) {
+    // Scrub the request body (license key) from any error surface: rebuild
+    // the Error with only the upstream cause class/message, never the body.
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new TeamSyncAuthError(`Sign in request failed: ${msg.replace(trimmed, "[redacted]")}`);
+  }
   if (post.status !== 200 || !post.cookie || !post.body.email || !post.body.role || !post.body.order_id) {
     if (post.body.error) log("warn", "team sign-in failed", { status: post.status, error: post.body.error });
     throw new TeamSyncAuthError("Sign in failed. Check your license key and try again.");

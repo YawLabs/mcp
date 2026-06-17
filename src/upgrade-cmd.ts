@@ -310,20 +310,62 @@ export function buildUpgradePlan(input: {
 }
 
 /** Copy of compareSemver kept local so upgrade-cmd doesn't drag
- *  doctor-cmd into its import graph (keeps the CLI startup fast). */
+ *  doctor-cmd into its import graph (keeps the CLI startup fast).
+ *
+ *  Implements semver.org precedence: split major.minor.patch-prerelease,
+ *  compare release fields numerically, then prerelease identifiers per
+ *  the spec:
+ *    - A version with a prerelease tag has LOWER precedence than the same
+ *      release without one (1.2.3-beta < 1.2.3).
+ *    - Prerelease identifiers are compared dot-by-dot: numeric identifiers
+ *      compare numerically, alphanumerics lexically, numeric < alphanumeric,
+ *      a shorter run of identifiers loses to a longer one when all earlier
+ *      ones are equal.
+ *  Build metadata (`+...`) is ignored per spec. */
 function compareSemverLocal(a: string, b: string): number {
-  const parse = (s: string): [number, number, number] | null => {
-    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(s);
+  const parse = (s: string): { release: [number, number, number]; prerelease: string[] } | null => {
+    // Strip any build-metadata suffix (semver.org §10) before splitting.
+    const cleaned = s.replace(/\+.*$/, "");
+    const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(cleaned);
     if (!m) return null;
-    return [Number(m[1]), Number(m[2]), Number(m[3])];
+    const release: [number, number, number] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    const prerelease = m[4] ? m[4].split(".") : [];
+    return { release, prerelease };
   };
   const pa = parse(a);
   const pb = parse(b);
   if (!pa || !pb) return 0;
   for (let i = 0; i < 3; i++) {
-    if (pa[i] < pb[i]) return -1;
-    if (pa[i] > pb[i]) return 1;
+    if (pa.release[i] < pb.release[i]) return -1;
+    if (pa.release[i] > pb.release[i]) return 1;
   }
+  // Release fields equal -- compare prerelease per semver.org §11.
+  // A version WITHOUT prerelease beats a version WITH one.
+  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0;
+  if (pa.prerelease.length === 0) return 1;
+  if (pb.prerelease.length === 0) return -1;
+  const len = Math.min(pa.prerelease.length, pb.prerelease.length);
+  for (let i = 0; i < len; i++) {
+    const ai = pa.prerelease[i];
+    const bi = pb.prerelease[i];
+    const aNum = /^\d+$/.test(ai);
+    const bNum = /^\d+$/.test(bi);
+    if (aNum && bNum) {
+      const na = Number(ai);
+      const nb = Number(bi);
+      if (na < nb) return -1;
+      if (na > nb) return 1;
+    } else if (aNum !== bNum) {
+      // Numeric identifiers always have lower precedence than alphanumerics.
+      return aNum ? -1 : 1;
+    } else {
+      if (ai < bi) return -1;
+      if (ai > bi) return 1;
+    }
+  }
+  // All compared identifiers equal -- longer prerelease wins (1.2.3-alpha.1 > 1.2.3-alpha).
+  if (pa.prerelease.length < pb.prerelease.length) return -1;
+  if (pa.prerelease.length > pb.prerelease.length) return 1;
   return 0;
 }
 

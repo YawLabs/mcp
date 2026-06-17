@@ -1,10 +1,14 @@
 // `yaw-mcp sync push|pull|status` -- replicate ~/.yaw-mcp/bundles.json
 // across machines via the mcp_bundles team-resource on yaw.sh.
 //
-// Push: strips env VALUES (preserves keys), PUTs to mcp_bundles. The
-// server only ever sees the schema of which env vars each server
-// expects, never the secret values themselves. Phase 6b will add an
-// encrypted mcp_secrets vault for syncing the values too.
+// Push: scrubs every channel a secret could leak through -- env VALUES
+// (preserves keys for schema), plus the `command`, `args`, and `url`
+// fields (which routinely embed tokens, license keys, or signed URLs
+// in real-world configs) -- then PUTs to mcp_bundles. The server only
+// ever sees the schema of which env vars each server expects, never
+// the secret values themselves, and never a secret smuggled in via
+// argv / connect URL. Phase 6b will add an encrypted mcp_secrets vault
+// for syncing the values too.
 //
 // Pull: GETs mcp_bundles, merges env values from the LOCAL bundles.json
 // where namespaces overlap (so a machine's local API keys aren't wiped
@@ -319,9 +323,7 @@ async function syncPush(
 
   if (opts.dryRun) {
     if (opts.json) {
-      io.out(
-        `${JSON.stringify({ ok: true, dryRun: true, serverCount: stripped.length }, null, 2)}\n`,
-      );
+      io.out(`${JSON.stringify({ ok: true, dryRun: true, serverCount: stripped.length }, null, 2)}\n`);
     } else {
       io.out(
         `[dry-run] would push ${stripped.length} server${stripped.length === 1 ? "" : "s"} (env values stripped); nothing sent.\n`,

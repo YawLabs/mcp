@@ -70,9 +70,14 @@ const CHILD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes wall-clock
 
 function runTest(args: string[]): Promise<ComplianceReport | null> {
   return new Promise((resolve) => {
-    const child = spawn("npx", ["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", ...args], {
+    // Structured command + args array; NO `shell: true`. On Windows, Node's
+    // CreateProcess does NOT honor PATHEXT for a plain "npx" name, so we
+    // resolve to "npx.cmd" explicitly there. Dropping `shell` removes the
+    // injection surface from any operator-supplied target string in `args`
+    // (a quote / `&&` / `;` in an arg can never reach a shell parser).
+    const npxBin = process.platform === "win32" ? "npx.cmd" : "npx";
+    const child = spawn(npxBin, ["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", ...args], {
       stdio: ["ignore", "pipe", "inherit"],
-      shell: process.platform === "win32",
     });
     let stdout = "";
     let stdoutBytes = 0;

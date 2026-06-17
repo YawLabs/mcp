@@ -18,7 +18,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
@@ -355,7 +355,14 @@ async function doUpsertUserBundle(
   // stamp CURRENT when the file had none (readRawUserBundles guarantees a
   // numeric version when the file existed, so this only fills the fresh case).
   file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`);
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600);
+  if (process.platform !== "win32") {
+    try {
+      await chmod(path, 0o600);
+    } catch {
+      // chmod not supported on this filesystem; not fatal.
+    }
+  }
   return { path, replaced };
 }
 
@@ -391,7 +398,14 @@ async function doRemoveUserBundle(
   if (file.servers.length === before) return { path, removed: false };
   // Preserve a newer on-disk schema version rather than downgrading it.
   file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`);
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600);
+  if (process.platform !== "win32") {
+    try {
+      await chmod(path, 0o600);
+    } catch {
+      // chmod not supported on this filesystem; not fatal.
+    }
+  }
   return { path, removed: true };
 }
 

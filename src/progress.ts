@@ -32,8 +32,17 @@ export function createProgressReporter(
   }
 
   let step = 0;
+  // MCP requires progress to be monotonically non-decreasing per token. Clamp
+  // each emission to max(lastEmitted, candidate) so a caller-supplied value
+  // that regresses (or a stale auto-increment after a higher explicit value)
+  // never goes backward on the wire. Keyed by progressToken in case a
+  // reporter ever gets reused across tokens.
+  const lastEmitted = new Map<string | number, number>();
   return (message, progress, total) => {
     step += 1;
+    const candidate = progress ?? step;
+    const prior = lastEmitted.get(token) ?? -Number.POSITIVE_INFINITY;
+    const emitted = candidate > prior ? candidate : prior;
     const params: {
       progressToken: string | number;
       progress: number;
@@ -41,10 +50,11 @@ export function createProgressReporter(
       message?: string;
     } = {
       progressToken: token,
-      progress: progress ?? step,
+      progress: emitted,
       message,
     };
     if (total !== undefined) params.total = total;
+    lastEmitted.set(token, emitted);
     send({ method: "notifications/progress", params }).catch((err) => {
       log("warn", "Progress notification send failed", {
         error: err instanceof Error ? err.message : String(err),

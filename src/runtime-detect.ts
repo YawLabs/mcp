@@ -15,10 +15,27 @@ import { log } from "./logger.js";
 const PROBE_TIMEOUT_MS = 3_000;
 const RUNTIME_REPORT_PATH = "/api/connect/runtimes";
 
+// URL-safe charset only — no whitespace, CR, or LF. A bearer with a CRLF
+// in it would let an attacker who controls the token value inject extra
+// HTTP headers into the request line ("Authorization: Bearer foo\r\nX-Evil:
+// bar"). undici sanitizes this in newer versions, but we validate at the
+// boundary so a malformed token is rejected with a clear error rather
+// than silently smuggling bytes into the header.
+const TOKEN_RE = /^[A-Za-z0-9._~+/=-]+$/;
+
 let apiUrl = "";
 let token = "";
 
 export function initRuntimeDetect(url: string, tok: string): void {
+  // Empty values reset module state (test teardown + uninitialized
+  // default). Only validate when a real token is being installed --
+  // reportRuntimes() already short-circuits when either is empty, so
+  // a blank token can never reach the Authorization header.
+  if (tok !== "" && !TOKEN_RE.test(tok)) {
+    throw new Error(
+      "Token contains invalid characters (must match /^[A-Za-z0-9._~+/=-]+$/ — no whitespace, CR, or LF)",
+    );
+  }
   apiUrl = url;
   token = tok;
 }

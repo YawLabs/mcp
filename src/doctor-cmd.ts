@@ -29,7 +29,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type AnalyticsFailure, getLastAnalyticsFailure } from "./analytics.js";
+import { type AnalyticsFailure, getDroppedEventsCount, getLastAnalyticsFailure } from "./analytics.js";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -69,6 +69,10 @@ export interface DoctorOptions {
   env?: NodeJS.ProcessEnv;
   /** Override for tests; defaults to process.stdout.write. */
   out?: (s: string) => void;
+  /** Override for tests; defaults to process.stderr.write. Used for the
+   *  always-on warning stream so pipelines that capture stdout still see
+   *  config warnings even when doctor exits 0 (e.g. local/Free mode). */
+  err?: (s: string) => void;
   /** Disable the npm registry freshness check (tests, offline use). */
   skipRegistryCheck?: boolean;
   /** Test hook: return the latest-version string for @yawlabs/mcp. */
@@ -376,6 +380,16 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   }
 
   let exitCode = 0;
+  // Warnings are emitted to stderr UNCONDITIONALLY (regardless of token
+  // state) so a pipeline that captures only stdout still sees them. The
+  // text WARNINGS section above is part of the human report (stdout); the
+  // stderr stream below is the always-on signal. Local/Free mode exits 0,
+  // but warning lines still print here so they don't get masked by the
+  // "fully functional" diagnosis below.
+  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  if (config.warnings.length > 0) {
+    for (const w of config.warnings) writeErr(`warning: ${w}\n`);
+  }
   if (config.token === null) {
     // No token is NOT an error: yaw-mcp runs in local/Free mode, serving
     // whatever is in ~/.yaw-mcp/bundles.json. runServer() (index.ts) treats
@@ -526,6 +540,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   let exitCode = 0;
   let summary: string;
+  // Always-on warning stream: mirrors the text path so JSON-mode pipelines
+  // that capture stdout (the JSON blob) still surface config warnings on
+  // stderr, even in local/Free mode where exit code is 0.
+  const writeErrJson = opts.err ?? ((s: string) => process.stderr.write(s));
+  if (config.warnings.length > 0) {
+    for (const w of config.warnings) writeErrJson(`warning: ${w}\n`);
+  }
   if (config.token === null) {
     // Local/Free mode -- not an error (see runDoctor's text branch).
     summary = "Local mode (Free) -- fully functional, no account needed.";
@@ -745,7 +766,8 @@ function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): 
   const { print } = opts;
   const analyticsFailure = getLastAnalyticsFailure();
   const reportFailure = getLastReportFailure();
-  if (!analyticsFailure && !reportFailure) return;
+  const dropped = getDroppedEventsCount();
+  if (!analyticsFailure && !reportFailure && dropped === 0) return;
 
   const now = Date.now();
   const fmt = (f: AnalyticsFailure | ReportFailure): string =>
@@ -754,6 +776,11 @@ function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): 
   print("BACKGROUND POSTERS (recent failures)");
   print(`  analytics:    ${analyticsFailure ? fmt(analyticsFailure) : "(no recent failure)"}`);
   print(`  tool-report:  ${reportFailure ? fmt(reportFailure) : "(no recent failure)"}`);
+  if (dropped > 0) {
+    print(
+      `  dropped:      ${dropped} analytics event${dropped === 1 ? "" : "s"} dropped (buffer full or non-retryable flush)`,
+    );
+  }
   print("");
 }
 
@@ -844,7 +871,12 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         continue;
       }
       const exists = existsSync(resolved.absolute);
-      let classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null as string | null, malformed: false };
+      let classified = {
+        hasMcpEntry: false,
+        hasLegacyEntry: false,
+        legacyEntryName: null as string | null,
+        malformed: false,
+      };
       if (exists) {
         try {
           statSync(resolved.absolute);
@@ -947,7 +979,12 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         continue;
       }
       const exists = existsSync(resolved.absolute);
-      let classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null as string | null, malformed: false };
+      let classified = {
+        hasMcpEntry: false,
+        hasLegacyEntry: false,
+        legacyEntryName: null as string | null,
+        malformed: false,
+      };
       if (exists) {
         try {
           await stat(resolved.absolute);

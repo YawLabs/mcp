@@ -6,7 +6,7 @@ import { ConfigError } from "./config.js";
 import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
-import { parseInstallArgs, runInstall } from "./install-cmd.js";
+import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { log } from "./logger.js";
 import { parseLoginArgs, runLogin } from "./login-cmd.js";
@@ -37,10 +37,22 @@ declare const __VERSION__: string;
 // `yaw-mcp <cmd>: <message>` to stderr and exits 1, instead of dumping a
 // raw Node stack and bypassing the 2-for-usage / 1-for-error convention.
 function dispatch(cmd: string, p: Promise<{ exitCode: number } | number>): void {
-  p.then((r) => process.exit(typeof r === "number" ? r : r.exitCode)).catch((err: unknown) => {
+  // IMPORTANT: do NOT call process.exit() synchronously here. A bare
+  // process.exit() force-flushes the event loop and can TRUNCATE buffered
+  // stdout when the consumer is a slow pipe (e.g. `yaw-mcp servers --json
+  // | jq ...` with a large bundle list, or `yaw-mcp audit --json | tee
+  // ...`). Setting process.exitCode and returning lets Node drain
+  // pending writes on its own; once the runner promise settles AND
+  // stdout/stderr finish flushing, the process exits naturally with the
+  // requested code. The runner has already awaited every print/write it
+  // owns by the time the promise resolves, so no further awaits are
+  // needed here.
+  p.then((r) => {
+    process.exitCode = typeof r === "number" ? r : r.exitCode;
+  }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`yaw-mcp ${cmd}: ${msg}\n`);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }
 
@@ -74,11 +86,14 @@ if (subcommand === "compliance") {
   dispatch("foundry", runFoundryExport(parsed.options));
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
+  // --help is now a successful parse with helpRequested=true (parser
+  // returns { ok: true, options: { helpRequested: true } }); print USAGE
+  // and exit 0. Real argv errors still come back as ok:false -> stderr + 2.
+  if (parsed.ok && parsed.options.helpRequested) {
+    process.stdout.write(`${INSTALL_USAGE}\n`);
+    process.exit(0);
+  }
   if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }

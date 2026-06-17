@@ -144,7 +144,11 @@ describe("appendFoundryTrace", () => {
     const lines = contents.trim().split("\n");
     expect(lines).toHaveLength(1);
     const parsed = JSON.parse(lines[0]);
-    expect(parsed).toEqual(trace);
+    // Scores are stripped on write to avoid stale-state replay bias on traces.
+    expect(parsed).toEqual({
+      ...trace,
+      candidates: trace.candidates.map((c) => ({ ns: c.ns })),
+    });
   });
 
   it("appends additional lines on repeat calls", async () => {

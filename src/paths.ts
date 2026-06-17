@@ -39,12 +39,30 @@ export function userConfigDir(home: string = homedir()): string {
 // Why exclusive of $HOME: a `.yaw-mcp/` sitting at $HOME is the
 // user-global scope (handled separately by userConfigDir). Returning
 // it here would double-load it as both project and user-global.
+function normalizeForCompare(p: string): string {
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
+
+function isUnderHome(dir: string, homeResolved: string): boolean {
+  const dirKey = normalizeForCompare(dir);
+  const homeKey = normalizeForCompare(homeResolved);
+  if (dirKey === homeKey) return false;
+  const rel = path.relative(homeResolved, dir);
+  const relNorm = normalizeForCompare(rel);
+  return relNorm !== "" && !relNorm.startsWith("..") && !path.isAbsolute(rel);
+}
+
 export async function findProjectConfigDir(start: string, home: string = homedir()): Promise<string | null> {
-  const homeResolved = path.resolve(home);
+  const homeFallback = home && home.length > 0 ? home : process.env.USERPROFILE || homedir();
+  const homeResolved = path.resolve(homeFallback);
   let dir = path.resolve(start);
   let prev = "";
   while (dir !== prev) {
-    if (dir === homeResolved) return null;
+    // Bound the walk at $HOME: only consider dirs strictly under $HOME.
+    // Prevents a hijacked `.yaw-mcp/` above the user's home from being
+    // picked up as a project config, and skips $HOME itself (handled
+    // separately by userConfigDir).
+    if (!isUnderHome(dir, homeResolved)) return null;
     const candidate = path.join(dir, CONFIG_DIRNAME);
     try {
       await access(candidate);

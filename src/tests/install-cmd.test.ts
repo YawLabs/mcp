@@ -65,19 +65,20 @@ describe("parseInstallArgs", () => {
     if (!r.ok) expect(r.error).toContain("Usage:");
   });
 
-  it("--help sets help:true so dispatcher routes to stdout+exit0", () => {
+  it("--help returns ok:true with helpRequested so dispatcher routes to stdout+exit0", () => {
+    // Parser shape changed: --help is now a SUCCESSFUL parse carrying
+    // helpRequested in options (was ok:false + help:true). The dispatcher
+    // in index.ts checks `parsed.ok && parsed.options.helpRequested` and
+    // prints USAGE to stdout + exit 0.
     const r = parseInstallArgs(["--help"]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.error).toContain("Usage:");
-      expect((r as { help?: boolean }).help).toBe(true);
-    }
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.helpRequested).toBe(true);
   });
 
-  it("-h sets help:true", () => {
+  it("-h returns ok:true with helpRequested", () => {
     const r = parseInstallArgs(["-h"]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.helpRequested).toBe(true);
   });
 
   it("parses positional client", () => {

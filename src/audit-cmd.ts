@@ -52,6 +52,51 @@ export interface AuditCommandResult {
   lines: string[];
 }
 
+// Flags whose VALUE (the very next arg) carries a credential / secret.
+// We only redact the value, never the flag name -- the operator still needs
+// to see WHICH flag was passed, just not what was passed to it. Matches the
+// `--flag value` shape; the `--flag=value` shape is handled separately below.
+const SECRET_FLAG_NAMES = new Set<string>([
+  "--api-key",
+  "--apikey",
+  "--token",
+  "--auth",
+  "--auth-token",
+  "--password",
+  "--secret",
+  "-p",
+]);
+
+/**
+ * Return a copy of `args` with the VALUE following any secret-bearing flag
+ * replaced by "<redacted>". Two shapes are handled:
+ *   ["--token", "abc"]    -> ["--token", "<redacted>"]
+ *   ["--token=abc"]       -> ["--token=<redacted>"]
+ * Bare flags with no following value are left alone (the redaction target
+ * is the value, not the presence of the flag).
+ */
+function redactSecretArgs(args: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? "";
+    if (SECRET_FLAG_NAMES.has(a)) {
+      out.push(a);
+      if (i + 1 < args.length) {
+        out.push("<redacted>");
+        i += 1;
+      }
+      continue;
+    }
+    const eq = a.indexOf("=");
+    if (eq > 0 && SECRET_FLAG_NAMES.has(a.slice(0, eq))) {
+      out.push(`${a.slice(0, eq)}=<redacted>`);
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
 export interface ParsedAuditArgs {
   namespace: string;
   json: boolean;
@@ -182,7 +227,8 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   // skip the human preamble; print it only for interactive use. (A server arg
   // containing a brace would otherwise corrupt brace-based JSON extraction.)
   if (!opts.json) {
-    print(`Auditing "${namespace}" (${target.command}${target.args.length ? ` ${target.args.join(" ")}` : ""})...`);
+    const printableArgs = redactSecretArgs(target.args);
+    print(`Auditing "${namespace}" (${target.command}${printableArgs.length ? ` ${printableArgs.join(" ")}` : ""})...`);
   }
 
   const runner = opts.runner ?? defaultRunner;

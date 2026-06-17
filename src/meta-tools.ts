@@ -374,6 +374,18 @@ export function buildInstallPayload(args: Record<string, unknown>): InstallPaylo
       }
       payload.args = args.args as string[];
     }
+
+    // Soft-warn (do NOT block) when the launcher command isn't one of
+    // the known MCP-server launchers. New launchers do appear, so this
+    // is advisory only -- the payload still goes through. The warning
+    // surfaces in the CLI's stderr so a misspelled `nxp` / `pyhton` is
+    // visible to the operator before they hit a server that won't start.
+    const KNOWN_LAUNCHERS = ["npx", "uvx", "node", "python", "python3", "docker", "bun", "deno"];
+    if (!KNOWN_LAUNCHERS.includes(command)) {
+      process.stderr.write(
+        `warning: install command \`${command}\` is not a known launcher; verify before activation\n`,
+      );
+    }
   }
 
   if (type === "remote") {

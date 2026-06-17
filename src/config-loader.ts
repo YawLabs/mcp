@@ -23,6 +23,7 @@ import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
 import { migrateLegacyConfigPaths } from "./migrate.js";
 import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
+import { validateApiBase } from "./url-safety.js";
 
 export const CONFIG_FILENAME = "config.json";
 export const LOCAL_CONFIG_FILENAME = "config.local.json";
@@ -105,6 +106,14 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
 
   const token = typeof obj.token === "string" && obj.token.length > 0 ? obj.token : undefined;
   const apiBase = typeof obj.apiBase === "string" && obj.apiBase.length > 0 ? obj.apiBase : undefined;
+  if (apiBase !== undefined) {
+    try {
+      validateApiBase(apiBase);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`${path}: ${msg}`);
+    }
+  }
   const servers = Array.isArray(obj.servers)
     ? obj.servers.filter((v): v is string => typeof v === "string")
     : undefined;
@@ -233,6 +242,16 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   } else if (global?.apiBase) {
     apiBase = global.apiBase;
     apiBaseSource = "global";
+  }
+
+  // Final guard — catches the env-override path (per-file validation
+  // covers local/project/global at read time) and any future source.
+  // The DEFAULT_API_BASE is https, so the default path never throws.
+  try {
+    validateApiBase(apiBase);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`apiBase (source: ${apiBaseSource}): ${msg}`);
   }
 
   return {

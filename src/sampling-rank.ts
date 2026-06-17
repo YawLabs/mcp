@@ -79,18 +79,25 @@ export function buildTiebreakPrompt(intent: string, candidates: TiebreakCandidat
 // candidate appears anywhere.
 export function parseTiebreakResponse(response: string, candidates: TiebreakCandidate[]): string | null {
   const namespaces = candidates.map((c) => c.namespace);
-  const namespaceSet = new Set(namespaces);
+  // Case-insensitive match: LLMs occasionally title-case or upper-case the
+  // namespace ("Github", "GITHUB"); the canonical form remains the lowercased
+  // namespace in the candidate list.
+  const namespaceSet = new Set(namespaces.map((n) => n.toLowerCase()));
   for (const rawLine of response.split(/\r?\n/)) {
     const line = rawLine.trim().replace(/^[`"'*>\-\s]+|[`"'*\s]+$/g, "");
     if (!line) continue;
-    if (namespaceSet.has(line)) return line;
+    if (namespaceSet.has(line.toLowerCase())) {
+      // Return the canonical-cased namespace from the candidate list.
+      const idx = namespaces.findIndex((n) => n.toLowerCase() === line.toLowerCase());
+      if (idx >= 0) return namespaces[idx]!;
+    }
     // Allow inline mentions like "I pick github because..." -- pick the
     // earliest-positioned candidate so the LLM's lexical choice wins
     // even when iteration order says otherwise.
     let bestNs: string | null = null;
     let bestPos = Number.POSITIVE_INFINITY;
     for (const ns of namespaces) {
-      const re = new RegExp(`\\b${escapeRegex(ns)}\\b`);
+      const re = new RegExp(`\\b${escapeRegex(ns)}\\b`, "i");
       const match = re.exec(line);
       if (match && match.index < bestPos) {
         bestPos = match.index;

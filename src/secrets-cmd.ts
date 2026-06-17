@@ -61,6 +61,9 @@ Flags:
   --stdin                 Read the secret from raw stdin (set only).
   --force                 (pull only) Overwrite even when the local vault
                           salt differs from the remote. Back up first.
+  --replace               (push only) Overwrite even when the remote vault
+                          salt differs from the local (different passphrase
+                          lineage). Coordinate with your team first.
 
 Passphrase:
   Set YAW_MCP_VAULT_PASSPHRASE in the env, or you will be prompted on
@@ -76,6 +79,9 @@ export interface SecretsCommandOptions {
   json?: boolean;
   /** For `pull`: overwrite even when the local vault salt differs from remote. */
   force?: boolean;
+  /** For `push`: overwrite even when the remote vault salt differs from local
+   *  (i.e. team is rotating the vault passphrase). */
+  replace?: boolean;
   /** Test hooks. */
   home?: string;
   passphrase?: string;
@@ -104,6 +110,10 @@ export function parseSecretsArgs(
     }
     if (a === "--force") {
       opts.force = true;
+      continue;
+    }
+    if (a === "--replace") {
+      opts.replace = true;
       continue;
     }
     if (a === "--value") {
@@ -153,6 +163,32 @@ export function parseSecretsArgs(
 
 export interface SecretsCommandResult {
   exitCode: number;
+}
+
+/** Wrap loadVault so a corrupt or unreadable on-disk vault surfaces a
+ *  named, actionable message to the user rather than crashing the
+ *  process. ENOENT still resolves to null (vault absent) -- only real
+ *  errors throw out of loadVault. We catch them here and translate to
+ *  a structured result the caller can return as exitCode:1. */
+async function safeLoadVault(
+  path: string,
+  io: { out: (s: string) => void; err: (s: string) => void },
+  json: boolean | undefined,
+  action: string,
+): Promise<{ ok: true; vault: VaultFile | null } | { ok: false; result: SecretsCommandResult }> {
+  try {
+    return { ok: true, vault: await loadVault(path) };
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : String(err);
+    // Detect the corrupt-entry case and emit the requested actionable hint.
+    const corruptMatch = /vault corrupt at entry (.+)$/.exec(raw);
+    const msg = corruptMatch
+      ? `secret entry ${corruptMatch[1]} is corrupt; remove it or run \`yaw-mcp secrets repair\``
+      : raw;
+    if (json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
+    return { ok: false, result: { exitCode: 1 } };
+  }
 }
 
 /** Read the passphrase. Env var wins; falls back to a stdin prompt
@@ -303,7 +339,9 @@ export async function runSecrets(
   }
 
   if (opts.action === "list") {
-    const vault = await loadVault(path);
+    const loaded = await safeLoadVault(path, io, opts.json, "list");
+    if (!loaded.ok) return loaded.result;
+    const vault = loaded.vault;
     const keys = vault ? listKeys(vault) : [];
     if (opts.json) io.out(`${JSON.stringify({ ok: true, vault: existsSync(path), keys }, null, 2)}\n`);
     else if (!vault) io.out(`No vault at ${path}. Run \`yaw-mcp secrets set <name>\` to create one.\n`);
@@ -319,7 +357,9 @@ export async function runSecrets(
   // doesn't exist -- avoids prompting for a passphrase and paying the
   // scrypt derivation just to say "not found".
   if (opts.action === "get" || opts.action === "remove") {
-    const existingVault = await loadVault(path);
+    const loaded = await safeLoadVault(path, io, opts.json, opts.action);
+    if (!loaded.ok) return loaded.result;
+    const existingVault = loaded.vault;
     if (!existingVault || !((opts.name as string) in existingVault.entries)) {
       const name = opts.name as string;
       const msg = `No secret named "${name}" in the vault.`;
@@ -330,7 +370,9 @@ export async function runSecrets(
   }
 
   // Remaining actions all need the vault + passphrase.
-  let vault = (await loadVault(path)) ?? newVault();
+  const loadedForMutate = await safeLoadVault(path, io, opts.json, opts.action ?? "");
+  if (!loadedForMutate.ok) return loadedForMutate.result;
+  let vault = loadedForMutate.vault ?? newVault();
   const isFresh = !existsSync(path);
 
   const passphrase = await resolvePassphrase(opts);
@@ -441,7 +483,9 @@ async function runSecretsPush(
     else io.err(`yaw-mcp secrets push: ${msg}\n`);
     return { exitCode: 1 };
   }
-  const vault = await loadVault(path);
+  const loadedPush = await safeLoadVault(path, io, opts.json, "push");
+  if (!loadedPush.ok) return loadedPush.result;
+  const vault = loadedPush.vault;
   if (!vault) {
     const msg = `No local vault at ${path} to push. Run \`yaw-mcp secrets set <name>\` first.`;
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
@@ -453,6 +497,19 @@ async function runSecretsPush(
     // is accepted. One extra round-trip per push -- acceptable for a
     // manual command.
     const remote = await getResource<VaultFile>(MCP_SECRETS_RESOURCE, { home, baseUrl: opts.baseUrl });
+    // Salt-conflict guard: if the remote already has a vault under a
+    // DIFFERENT salt (different passphrase lineage), refuse to push --
+    // pushing would replace the remote's entries with ones the rest of
+    // the team can't decrypt. The user must explicitly opt into the
+    // replacement with --replace (after they have synchronised the new
+    // passphrase out-of-band), or pull and reconcile.
+    const remoteSalt = remote.data?.salt;
+    if (typeof remoteSalt === "string" && remoteSalt.length > 0 && remoteSalt !== vault.salt && !opts.replace) {
+      const msg = "remote vault uses a different passphrase; use `pull` or `push --replace`";
+      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+      else io.err(`yaw-mcp secrets push: ${msg}\n`);
+      return { exitCode: 1 };
+    }
     const result = await putResource<VaultFile>(MCP_SECRETS_RESOURCE, remote.version, vault, {
       home,
       baseUrl: opts.baseUrl,
@@ -520,7 +577,9 @@ async function runSecretsPull(
     // differs from the remote's, refuse -- the two vaults were derived from
     // different passphrases and overwriting would make local secrets
     // irrecoverable.  The user must back up and pass --force to proceed.
-    const localVault = await loadVault(path);
+    const loadedPull = await safeLoadVault(path, io, opts.json, "pull");
+    if (!loadedPull.ok) return loadedPull.result;
+    const localVault = loadedPull.vault;
     const localHasEntries = localVault !== null && Object.keys(localVault.entries).length > 0;
     if (localHasEntries && localVault.salt !== remote.data.salt && !opts.force) {
       const msg =

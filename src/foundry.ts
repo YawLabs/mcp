@@ -84,10 +84,44 @@ function looksSensitive(token: string): boolean {
 // pass through as ordinary tokens, which is acceptable since the
 // identifying structure (the @ and dots) is already destroyed. We document
 // this rather than re-detect a structure tokenize has already removed.
+// Structured PII patterns we strip from the RAW intent BEFORE tokenize()
+// shreds it into bare alphanumeric runs. Tokenize splits on every
+// non-alphanumeric, which loses the structure that makes these
+// recognizable -- so we have to scrub here, not in the token loop.
+// Each pattern's matched substrings are replaced with " " (so a token
+// boundary is preserved) and counted toward redactedCount.
+//   - email: user@host.tld
+//   - phone-shape: 9+ digits with optional +/separators
+//   - GitHub-style refs: #1234
+//   - bracketed IDs: PROJ-1234, ABC-9 (Jira-style ticket refs)
+// Each pattern is wrapped with `(?<![A-Za-z0-9])...(?![A-Za-z0-9])` so it only
+// matches when bounded by non-alphanumerics (start/end of string, whitespace,
+// punctuation). Without these, the phone-shape pattern matches a digit run
+// INSIDE a longer alphanumeric token (e.g. the "0123456789" tail of
+// "xoxbabcdef0123456789"), double-counting against the prefix-token rule.
+const RAW_PII_PATTERNS: RegExp[] = [
+  /(?<![A-Za-z0-9])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])\+?[0-9][0-9\s().-]{8,}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])#\d+(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])[A-Z]+-\d+(?![A-Za-z0-9])/g,
+];
+
 export function redactIntent(intent: string): RedactedIntent {
-  const all = tokenize(intent);
-  const tokens: string[] = [];
   let redactedCount = 0;
+  // First pass: strip structured PII from the raw string. Replace each
+  // match with a single space to preserve token boundaries. APPEND to the
+  // existing token-level redaction below -- this layer catches patterns
+  // tokenize() would destroy before looksSensitive could see them.
+  let scrubbed = intent;
+  for (const re of RAW_PII_PATTERNS) {
+    scrubbed = scrubbed.replace(re, () => {
+      redactedCount++;
+      return " ";
+    });
+  }
+
+  const all = tokenize(scrubbed);
+  const tokens: string[] = [];
   for (const token of all) {
     if (looksSensitive(token)) {
       redactedCount++;
@@ -159,9 +193,13 @@ export async function appendFoundryTrace(trace: FoundryTrace, home: string = hom
     }
 
     // Persist ONLY the redacted bag + routing decision -- never raw intent.
+    // Strip per-candidate score fields before write: scores reflect the
+    // ranker's live health/learning state at decision time, which biases an
+    // eval replay against the SAME ranker state instead of measuring it.
+    const candidatesNoScores = trace.candidates.map((c) => ({ ns: c.ns }));
     const line = `${JSON.stringify({
       tokens: trace.tokens,
-      candidates: trace.candidates,
+      candidates: candidatesNoScores,
       chosen: trace.chosen,
       redactedCount: trace.redactedCount,
     })}\n`;

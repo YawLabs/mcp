@@ -20,11 +20,12 @@ import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 /**
  * Resolve `${secret:NAME}` references in an upstream server's env
- * against the local secret vault.  Best-effort:
+ * against the local secret vault. Fail-closed:
  *   - No refs in env: pass through unchanged (free path, no vault load).
- *   - Refs present but no vault file: log + pass literals through.
- *   - Refs present but no passphrase: log + pass literals through.
- *   - Refs present + vault unlocks: substitute resolved values.
+ *   - Refs present but no vault file / locked / unlock fails / missing
+ *     values: THROW. Passing literal `${secret:NAME}` to the child would
+ *     leak the placeholder into logs or be interpreted as a real token
+ *     by some servers, which is worse than refusing to spawn.
  *
  * Phase 6c ships passphrase-from-env only (YAW_MCP_VAULT_PASSPHRASE)
  * because the spawn happens in a non-interactive MCP-server context
@@ -35,38 +36,39 @@ import { resolveUvSpawn } from "./uv-bootstrap.js";
  */
 async function resolveServerEnv(env: Record<string, string>): Promise<Record<string, string>> {
   if (!hasSecretRefs(env)) return env;
+  const refKeys = Object.entries(env)
+    .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
+    .map(([k]) => k);
   const passphrase = process.env.YAW_MCP_VAULT_PASSPHRASE;
   if (typeof passphrase !== "string" || passphrase.length === 0) {
-    log("warn", "Server env carries ${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set", {
-      keys: Object.entries(env)
-        .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
-        .map(([k]) => k),
-    });
-    return env;
+    log("warn", "Server env carries ${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set", { keys: refKeys });
+    throw new Error("vault locked: server env references ${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set");
   }
-  const vault = await loadVault(vaultPath()).catch(() => null);
-  if (!vault) {
-    log("warn", "Server env carries ${secret:...} refs but no vault exists yet", {});
-    return env;
-  }
-  try {
-    const key = await unlock(vault, passphrase);
-    const { resolved, missing } = resolveSecretRefs(env, vault, key);
-    if (missing.length > 0) {
-      log("warn", "Some ${secret:...} refs could not be resolved", { missing });
-    }
-    return resolved;
-  } catch (err) {
-    log("warn", "Vault unlock failed; passing ${secret:...} refs through literally", {
+  const vault = await loadVault(vaultPath()).catch((err) => {
+    log("warn", "Failed to load vault for env resolution", {
       error: err instanceof Error ? err.message : String(err),
     });
-    return env;
+    return null;
+  });
+  if (!vault) {
+    throw new Error("vault locked: server env references ${secret:...} but no vault exists yet");
   }
+  const key = await unlock(vault, passphrase);
+  const { resolved, missing } = resolveSecretRefs(env, vault, key);
+  if (missing.length > 0) {
+    throw new Error(`vault: missing or undecryptable secret refs: ${missing.join(", ")}`);
+  }
+  return resolved;
 }
 
 declare const __VERSION__: string;
 
-const CONNECT_TIMEOUT = (() => {
+/** Default connect timeout. Per-server `config.connectTimeoutMs` wins
+ *  when present; this is the fallback used otherwise. Env override
+ *  (MCP_CONNECT_TIMEOUT) tunes the FALLBACK only -- per-server config
+ *  always takes precedence so a slow server can be tuned independently
+ *  of the global default. */
+const DEFAULT_CONNECT_TIMEOUT = (() => {
   const env = process.env.MCP_CONNECT_TIMEOUT;
   if (!env) return 15_000;
   const n = Number.parseInt(env, 10);
@@ -123,6 +125,40 @@ export class ActivationError extends Error {
   }
 }
 
+/**
+ * Redact secret values out of captured stderr before embedding it in error
+ * messages. A server that crashes during init often echoes the bad value
+ * back ("invalid token: ghp_abc123..."), and that string flows up into the
+ * ActivationError -- which is logged, surfaced to the LLM, and often
+ * pasted into bug reports. We never want the resolved cleartext to land
+ * there.
+ *
+ * Strategy: for each env value that came from a `${secret:NAME}` ref
+ * (i.e. anything that wasn't a literal at config time -- we approximate
+ * by redacting EVERY env value of meaningful length), replace exact
+ * occurrences with `${secret:NAME}` (when we know the name) or `***`.
+ * We also drop ${secret:NAME} literals themselves to `${secret:***}` in
+ * case any leaked unresolved.
+ *
+ * The redactor is conservative: short values (<8 chars) are skipped to
+ * avoid mangling unrelated substrings; the goal is to catch the high-
+ * entropy tokens that look like secrets, not redact the entire output.
+ */
+function redactSecretsInOutput(text: string, env: Record<string, string>): string {
+  let out = text;
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== "string" || v.length < 8) continue;
+    // Skip values that are themselves an unresolved ${secret:...} literal.
+    if (v.startsWith("${secret:") && v.endsWith("}")) continue;
+    // Escape regex metacharacters in the secret value.
+    const escaped = v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(escaped, "g"), `***${k}***`);
+  }
+  // Catch unresolved literals too (defense in depth).
+  out = out.replace(/\$\{secret:([a-zA-Z0-9_.-]+)\}/g, "${secret:***}");
+  return out;
+}
+
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
   const msg = err instanceof Error ? err.message : String(err);
   // Node's child_process surfaces ENOENT as the most common spawn failure —
@@ -149,6 +185,12 @@ export async function connectToUpstream(
   // required", "npm ERR! 404") instead of a generic "handshake timed
   // out". Only populated for local/stdio transports.
   let stderrRing = "";
+  // Resolved env (post-vault substitution) -- kept so the stderr-tail
+  // redactor can strip CLEARTEXT secret values out of error messages
+  // before they're embedded in ActivationError / logs. The original
+  // config.env still carries `${secret:NAME}` literals; the child sees
+  // the cleartext and may echo it on failure.
+  let resolvedServerEnv: Record<string, string> = {};
 
   if (config.type === "local") {
     if (!config.command) {
@@ -183,6 +225,7 @@ export async function connectToUpstream(
     // surfaces its own "missing env var" error, which is louder than
     // silently passing an empty string.
     const serverEnv = await resolveServerEnv(config.env ?? {});
+    resolvedServerEnv = serverEnv;
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
@@ -210,16 +253,22 @@ export async function connectToUpstream(
   }
 
   // Connect with timeout — clear timer on success, close client on timeout.
+  // Per-server config.connectTimeoutMs wins over the module default so a
+  // slow upstream can be tuned without globally raising the ceiling.
   // Errors are categorized (spawn/install/timeout/protocol) so the caller
   // can produce an actionable message for the LLM. stderr tail is included
   // when available — it's the part that usually explains the real failure.
+  const connectTimeoutMs =
+    typeof config.connectTimeoutMs === "number" && config.connectTimeoutMs > 0
+      ? config.connectTimeoutMs
+      : DEFAULT_CONNECT_TIMEOUT;
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
-      reject(new Error(`Connection timeout after ${CONNECT_TIMEOUT}ms`));
-    }, CONNECT_TIMEOUT);
+      reject(new Error(`Connection timeout after ${connectTimeoutMs}ms`));
+    }, connectTimeoutMs);
   });
   try {
     // Capture the connect promise so that, on timeout, the orphaned
@@ -246,18 +295,19 @@ export async function connectToUpstream(
     if (config.type !== "local") {
       category = timedOut ? "init_timeout" : "protocol_error";
       message = timedOut
-        ? `Remote server at ${config.url} did not respond within ${CONNECT_TIMEOUT / 1000}s. Verify the URL is reachable.`
+        ? `Remote server at ${config.url} did not respond within ${connectTimeoutMs / 1000}s. Verify the URL is reachable.`
         : `Remote server at ${config.url} refused the connection.`;
     } else if (timedOut) {
       category = "init_timeout";
-      message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${CONNECT_TIMEOUT / 1000}s.${
-        trimmedStderr ? ` stderr tail: ${trimmedStderr.slice(-500)}` : ""
+      message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${connectTimeoutMs / 1000}s.${
+        trimmedStderr ? ` stderr tail: ${redactSecretsInOutput(trimmedStderr, resolvedServerEnv).slice(-500)}` : ""
       }`;
     } else if (trimmedStderr.length > 0) {
       // Non-timeout error with stderr → the child likely exited before
       // the handshake (install failure, missing env var, bad args).
       category = "install_failure";
-      message = `Server "${config.namespace}" failed to start. stderr: ${trimmedStderr.slice(-500)}`;
+      const safe = redactSecretsInOutput(trimmedStderr, config.env ?? {});
+      message = `Server "${config.namespace}" failed to start. stderr: ${safe.slice(-500)}`;
     } else {
       category = categorizeSpawnError(err);
       if (category === "spawn_failure") {
@@ -275,7 +325,8 @@ export async function connectToUpstream(
       message = `${message} → Edit at https://yaw.sh/mcp/dashboard/connect#server-${config.id}`;
     }
 
-    throw new ActivationError(message, category, trimmedStderr || undefined, err);
+    const redactedTail = trimmedStderr ? redactSecretsInOutput(trimmedStderr, config.env ?? {}) : undefined;
+    throw new ActivationError(message, category, redactedTail, err);
   }
 
   log("info", "Connected to upstream", { name: config.name, namespace: config.namespace, type: config.type });

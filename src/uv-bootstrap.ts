@@ -290,7 +290,20 @@ async function resolveUv(): Promise<string> {
     throw new Error(`uv archive checksum mismatch (expected ${expected}, got ${actual})`);
   }
 
-  const archivePath = path.join(installDir, archiveName);
+  // Per-pid archive filename so two concurrent yaw-mcp processes racing the
+  // same uv version do not stomp each other's mid-flight download. If the
+  // shared path were used, the `finally` rm below would delete the OTHER
+  // process's archive while it is still mid-extract -- which then fails
+  // ENOENT on tar/Expand-Archive. Scoping the name to process.pid means
+  // each process writes, extracts from, and removes only ITS own archive.
+  // (The per-pid extractDir below already isolates the extraction tree;
+  // this completes the symmetry on the archive file too.)
+  const archiveBase = archiveName.endsWith(".tar.gz")
+    ? `${archiveName.slice(0, -".tar.gz".length)}.${process.pid}.tar.gz`
+    : archiveName.endsWith(".zip")
+      ? `${archiveName.slice(0, -".zip".length)}.${process.pid}.zip`
+      : `${archiveName}.${process.pid}`;
+  const archivePath = path.join(installDir, archiveBase);
   await pipeline(async function* () {
     yield archiveBuf;
   }, createWriteStream(archivePath));

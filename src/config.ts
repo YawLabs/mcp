@@ -4,6 +4,12 @@ import { NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
+// Hard cap on the config response body. The backend's real config
+// payload is a few KB; anything larger is either a misbehaving server
+// or a malicious / proxied response. Reject before parsing JSON so we
+// don't pay the parse cost on absurd inputs.
+const MAX_CONFIG_BODY_BYTES = 5 * 1024 * 1024; // 5 MB
+
 /**
  * Fetch the config from Yaw MCP.
  *
@@ -65,7 +71,40 @@ export async function fetchConfig(
     throw new ConfigError(`Config fetch failed (HTTP ${res.statusCode}): ${body}`, false);
   }
 
-  const data = (await res.body.json()) as ConnectConfig;
+  // Stream-read the body with a hard byte cap so a malicious / runaway
+  // server response can't OOM the process. undici's body is an async
+  // iterable of Buffer chunks; sum bytes as they arrive and bail the
+  // moment we cross the threshold.
+  const chunks: Buffer[] = [];
+  let received = 0;
+  try {
+    for await (const chunk of res.body) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      received += buf.length;
+      if (received > MAX_CONFIG_BODY_BYTES) {
+        // Make a best-effort attempt to abandon the rest of the body so
+        // the connection can be reused / closed cleanly.
+        try {
+          (res.body as { destroy?: (err?: Error) => void }).destroy?.();
+        } catch {}
+        throw new ConfigError(`Config response too large (>5 MB) from yaw-mcp backend`, false);
+      }
+      chunks.push(buf);
+    }
+  } catch (err) {
+    if (err instanceof ConfigError) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new ConfigError(`Config response read failed: ${msg}`, false);
+  }
+
+  const bodyText = Buffer.concat(chunks).toString("utf8");
+  let data: ConnectConfig;
+  try {
+    data = JSON.parse(bodyText) as ConnectConfig;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new ConfigError(`Config response was not valid JSON: ${msg}`, false);
+  }
 
   if (!data.servers || !Array.isArray(data.servers)) {
     throw new ConfigError("Invalid config response from server", false);

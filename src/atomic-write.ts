@@ -6,7 +6,7 @@
 // across concurrent processes; in-process serialization is the caller's
 // concern (see persistence.ts:saveState for an example).
 
-import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export async function atomicWriteFile(
@@ -20,6 +20,15 @@ export async function atomicWriteFile(
   // process umask like any creat(2); callers that need an exact mode should
   // still chmod afterward as belt-and-suspenders.
   mode?: number,
+  // Optional mode for the parent-directory chain. Pass 0o700 for secret-
+  // bearing paths (vault, team-session cookie) so newly-created parent
+  // directories aren't born group/other-readable -- mkdir(2)'s default of
+  // 0o777-&-umask typically lands at 0o755, which lets others list the
+  // directory and observe filenames/timestamps of secret files inside.
+  // No-op on Windows (POSIX-mode bits aren't meaningful there). Only
+  // applies to directories CREATED by this call -- pre-existing parents
+  // are left alone (we don't want to tighten the user's $HOME).
+  dirMode?: number,
 ): Promise<void> {
   const dir = path.dirname(filePath);
   // The tmp file is a SIBLING of the target (same directory => same
@@ -31,7 +40,7 @@ export async function atomicWriteFile(
   // as an EXDEV throw rather than an atomic swap. (If a real cross-device
   // need ever arises, fall back to writeFile-in-place, losing atomicity.)
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  await mkdir(dir, { recursive: true });
+  await mkdirpWithMode(dir, dirMode);
   try {
     await writeFile(tmp, contents, mode === undefined ? { encoding } : { encoding, mode });
     await rename(tmp, filePath);
@@ -41,5 +50,53 @@ export async function atomicWriteFile(
     // failure is what the caller cares about.
     await unlink(tmp).catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * mkdir -p with an optional POSIX mode applied to every directory we
+ * actually CREATE (pre-existing parents are not re-chmodded -- we don't
+ * want to tighten the user's $HOME just because we wrote a vault under it).
+ * Walks the path from root to leaf, stat-then-mkdir at each segment; on
+ * a successful mkdir, chmod to dirMode. On Windows or when dirMode is
+ * undefined this is just a recursive mkdir.
+ */
+async function mkdirpWithMode(dir: string, dirMode: number | undefined): Promise<void> {
+  if (dirMode === undefined || process.platform === "win32") {
+    await mkdir(dir, { recursive: true });
+    return;
+  }
+  // Walk leaf -> root collecting segments that don't exist yet, then create
+  // them root -> leaf, chmodding each one we created. We stat-walk UP rather
+  // than splitting and walking DOWN so we don't have to reason about the
+  // POSIX leading-slash / "" first-segment shape (path.dirname handles that
+  // correctly on every platform).
+  const resolved = path.resolve(dir);
+  const toCreate: string[] = [];
+  let cursor = resolved;
+  // Stop at the filesystem root (path.dirname("/" ) === "/").
+  while (true) {
+    let exists = true;
+    try {
+      await stat(cursor);
+    } catch {
+      exists = false;
+    }
+    if (exists) break;
+    toCreate.unshift(cursor);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break; // hit the root without finding an existing ancestor
+    cursor = parent;
+  }
+  if (toCreate.length === 0) return; // every parent already exists
+  // recursive:true tolerates a concurrent racer creating any of these dirs
+  // between our stat and our mkdir.
+  await mkdir(resolved, { recursive: true });
+  for (const created of toCreate) {
+    try {
+      await chmod(created, dirMode);
+    } catch {
+      // Best-effort -- some filesystems (FAT-shaped mounts) reject chmod.
+    }
   }
 }

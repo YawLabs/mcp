@@ -77,8 +77,39 @@ export function getLastAnalyticsFailure(): AnalyticsFailure | null {
   return lastFailure;
 }
 
+// Module-scope drop counter. Incremented whenever a buffer push is refused
+// because MAX_BUFFER is reached, or events fail to re-enqueue after a flush
+// error because the buffer is already full. Operators / `yaw-mcp doctor` can
+// read this via getDroppedEventsCount() to spot a backlog-shaped failure
+// (e.g. an offline run accumulating > MAX_BUFFER events, or a persistent
+// 5xx that retries until the buffer wedges).
+let droppedEvents = 0;
+
+export function getDroppedEventsCount(): number {
+  return droppedEvents;
+}
+
+export interface AnalyticsSnapshot {
+  bufferedConnect: number;
+  bufferedDispatch: number;
+  droppedEvents: number;
+  lastFailure: AnalyticsFailure | null;
+}
+
+export function getAnalyticsSnapshot(): AnalyticsSnapshot {
+  return {
+    bufferedConnect: buffer.length,
+    bufferedDispatch: dispatchBuffer.length,
+    droppedEvents,
+    lastFailure,
+  };
+}
+
 export function recordConnectEvent(event: Omit<ConnectAnalyticsEvent, "timestamp">): void {
-  if (buffer.length >= MAX_BUFFER) return;
+  if (buffer.length >= MAX_BUFFER) {
+    droppedEvents++;
+    return;
+  }
   buffer.push({ ...event, timestamp: new Date().toISOString() });
   if (buffer.length >= FLUSH_SIZE) {
     flush().catch(() => {});
@@ -134,7 +165,10 @@ export function _resetTeamAnalyticsForTests(): void {
 }
 
 export function recordDispatchEvent(event: DispatchAnalyticsEvent): void {
-  if (dispatchBuffer.length >= MAX_BUFFER) return;
+  if (dispatchBuffer.length >= MAX_BUFFER) {
+    droppedEvents++;
+    return;
+  }
   dispatchBuffer.push(event);
   if (dispatchBuffer.length >= FLUSH_SIZE) {
     flushDispatch().catch(() => {});
@@ -167,6 +201,9 @@ async function flush(): Promise<void> {
       if (retryable) {
         const room = MAX_BUFFER - buffer.length;
         if (room > 0) buffer.push(...events.slice(0, room));
+        if (events.length > Math.max(0, room)) droppedEvents += events.length - Math.max(0, room);
+      } else {
+        droppedEvents += events.length;
       }
       if (lastLoggedConnectStatus !== res.statusCode) {
         log("warn", "Analytics flush failed", { status: res.statusCode, retried: retryable });
@@ -183,6 +220,7 @@ async function flush(): Promise<void> {
     // Re-insert for retry
     const room = MAX_BUFFER - buffer.length;
     if (room > 0) buffer.push(...events.slice(0, room));
+    if (events.length > Math.max(0, room)) droppedEvents += events.length - Math.max(0, room);
     log("warn", "Analytics flush error", { error: err.message });
   }
 }
@@ -209,6 +247,9 @@ async function flushDispatch(): Promise<void> {
       if (retryable) {
         const room = MAX_BUFFER - dispatchBuffer.length;
         if (room > 0) dispatchBuffer.push(...events.slice(0, room));
+        if (events.length > Math.max(0, room)) droppedEvents += events.length - Math.max(0, room);
+      } else {
+        droppedEvents += events.length;
       }
       if (lastLoggedDispatchStatus !== res.statusCode) {
         log("warn", "Dispatch-events flush failed", { status: res.statusCode, retried: retryable });
@@ -223,6 +264,7 @@ async function flushDispatch(): Promise<void> {
   } catch (err: any) {
     const room = MAX_BUFFER - dispatchBuffer.length;
     if (room > 0) dispatchBuffer.push(...events.slice(0, room));
+    if (events.length > Math.max(0, room)) droppedEvents += events.length - Math.max(0, room);
     log("warn", "Dispatch-events flush error", { error: err.message });
   }
 }

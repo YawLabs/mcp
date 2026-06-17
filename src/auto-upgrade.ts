@@ -28,10 +28,88 @@
 // globals where `npm install -g` would always EACCES.
 
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { dirname, sep } from "node:path";
 import { log } from "./logger.js";
 import { buildUpgradePlan, detectInstallMethod, detectSea } from "./upgrade-cmd.js";
 
 declare const __VERSION__: string;
+
+/** Resolve the global install prefix of the CURRENTLY running yaw-mcp by
+ *  walking up from `process.argv[1]` (realpath-resolved so a symlinked
+ *  shim like `/usr/local/bin/yaw-mcp -> /opt/node/lib/node_modules/@yawlabs/mcp/...`
+ *  points at the real install root) until we find a `node_modules/.bin`
+ *  ancestor. The directory whose immediate child is `node_modules/.bin`
+ *  is the npm prefix that owns this install.
+ *
+ *  We need this because `npm prefix -g` reports the user's *configured*
+ *  global prefix -- which can differ from the prefix the running install
+ *  actually lives under (custom prefixes, multiple Node versions, nvm,
+ *  Yaw Terminal's bundled Node). Installing into the configured global
+ *  prefix while the running install is rooted elsewhere produces a
+ *  silent no-op upgrade: a second copy is updated but the spawned-from-
+ *  client one stays stale. */
+export function detectRunningInstallPrefix(argvPath: string | undefined): string | null {
+  if (!argvPath) return null;
+  let resolved: string;
+  try {
+    resolved = realpathSync(argvPath);
+  } catch {
+    return null;
+  }
+  let dir = dirname(resolved);
+  // Walk up until we find a `<prefix>/node_modules/.bin` shape OR we
+  // hit the filesystem root. Cap the climb at 24 segments to guard
+  // against pathological symlink loops.
+  let prev = "";
+  let safety = 24;
+  while (dir !== prev && safety-- > 0) {
+    // Two recognized shapes:
+    //   1. <prefix>/node_modules/<pkg>/...    -> prefix is the dir above node_modules
+    //   2. <prefix>/lib/node_modules/<pkg>/.. -> common on Linux global installs
+    const idx = dir.lastIndexOf(`${sep}node_modules${sep}`);
+    if (idx !== -1) {
+      const candidate = dir.slice(0, idx);
+      // Linux-style global: strip a trailing `/lib` if present so the
+      // prefix is the bin/lib parent (matches `npm prefix -g` output).
+      if (candidate.endsWith(`${sep}lib`)) return candidate.slice(0, -`${sep}lib`.length);
+      return candidate;
+    }
+    prev = dir;
+    dir = dirname(dir);
+  }
+  return null;
+}
+
+/** Run `npm prefix -g` and emit a stderr warning when the configured
+ *  global prefix differs from the detected running-install prefix.
+ *  Best-effort -- a spawn failure or non-zero exit just silently skips
+ *  the warning. Never blocks the caller; intentionally fire-and-forget. */
+async function compareWithNpmPrefix(detected: string): Promise<void> {
+  await new Promise<void>((res) => {
+    const child = spawn("npm", ["prefix", "-g"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      shell: process.platform === "win32",
+    });
+    let out = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    child.on("close", () => {
+      const npmPrefix = out.trim();
+      if (npmPrefix && npmPrefix !== detected) {
+        process.stderr.write(
+          `yaw-mcp self-upgrade: detected running prefix differs from \`npm prefix -g\`:\n` +
+            `  running:  ${detected}\n` +
+            `  npm -g:   ${npmPrefix}\n` +
+            `  Installing into the running prefix so the upgrade lands in the same tree the client spawned from.\n`,
+        );
+      }
+      res();
+    });
+    child.on("error", () => res());
+  });
+}
 
 // Kept local (a ~15-line fetch) rather than imported, matching the
 // existing pattern in upgrade-cmd.ts / doctor-cmd.ts -- each module
@@ -149,9 +227,23 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
 
   // Global installs self-upgrade with their OWNING tool -- same whitelist
   // as `upgrade --run` (exactly our package, fixed args).
+  //
+  // For npm specifically, we resolve the prefix from the RUNNING install
+  // (argv[1] -> walk up to node_modules parent) and pass it explicitly
+  // via `--prefix <dir>` so the upgrade lands in the same tree the
+  // client just spawned us from -- not whatever `npm prefix -g` reports.
+  // The two can drift (nvm, multiple Node versions, custom prefixes, the
+  // bundled-Node Yaw Terminal ships), in which case installing into
+  // npm's reported prefix is a no-op for the running copy.
+  const runningPrefix = method === "global-npm" ? detectRunningInstallPrefix(deps.argvPath ?? process.argv[1]) : null;
   const globalSpec =
     method === "global-npm"
-      ? { cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] }
+      ? {
+          cmd: "npm",
+          args: runningPrefix
+            ? ["install", "-g", "--prefix", runningPrefix, "@yawlabs/mcp@latest"]
+            : ["install", "-g", "@yawlabs/mcp@latest"],
+        }
       : method === "pnpm-global"
         ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
         : method === "bun-global"
@@ -162,7 +254,16 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
       current,
       latest,
       tool: globalSpec.cmd,
+      prefix: runningPrefix ?? undefined,
     });
+    // If we have a detected prefix AND can cheaply discover npm's
+    // configured global prefix, warn when they differ -- the user
+    // likely has a multi-prefix setup and may be confused why one
+    // copy updates while another stays stale. Best-effort, async,
+    // never blocks the upgrade itself.
+    if (method === "global-npm" && runningPrefix) {
+      void compareWithNpmPrefix(runningPrefix);
+    }
     (deps.spawnImpl ?? defaultSpawn)(globalSpec.cmd, globalSpec.args);
     return;
   }

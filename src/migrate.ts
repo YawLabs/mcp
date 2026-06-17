@@ -47,6 +47,41 @@ async function exists(path: string): Promise<boolean> {
 async function migrateFile(legacy: string, target: string, scope: string): Promise<void> {
   if (!(await exists(legacy))) return;
 
+  // POSIX-only owner check: confirm the legacy file is owned by the
+  // current effective uid before we rename it. A hostile or stale file
+  // dropped into the walker's range (a path we walked up into, a shared
+  // /tmp-style dir, a hand-off after `chown`) shouldn't get hoisted into
+  // ~/.yaw-mcp/ where it'd be trusted by the loader. process.geteuid is
+  // Posix-only -- on win32 it doesn't exist, and Windows uses a different
+  // ACL model, so we accept legacy files as-is there.
+  if (process.platform !== "win32") {
+    const geteuid = (process as { geteuid?: () => number }).geteuid;
+    if (typeof geteuid === "function") {
+      try {
+        const st = await stat(legacy);
+        const myUid = geteuid.call(process);
+        if (typeof st.uid === "number" && st.uid !== myUid) {
+          log("warn", "yaw-mcp config: legacy file not owned by current user -- skipping migration", {
+            scope,
+            legacy,
+            fileUid: st.uid,
+            processUid: myUid,
+          });
+          return;
+        }
+      } catch (err) {
+        // Couldn't stat the file we just verified exists -- treat as
+        // hostile / racy and skip rather than blindly trust it.
+        log("warn", "yaw-mcp config: could not stat legacy file -- skipping migration", {
+          scope,
+          legacy,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+    }
+  }
+
   if (await exists(target)) {
     // Target exists AND legacy exists — ambiguous. Prefer the new one,
     // but warn so the user knows the legacy is orphaned and can delete

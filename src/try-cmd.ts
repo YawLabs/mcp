@@ -37,7 +37,7 @@ import { request } from "undici";
 import { atomicWriteFile } from "./atomic-write.js";
 import { resolveCatalogSlug } from "./catalog.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
-import { mergeClientConfig, readNested, removeFromClientConfig } from "./install-cmd.js";
+import { mergeClientConfig, readNested } from "./install-cmd.js";
 import {
   buildLaunchEntry,
   CURRENT_OS,
@@ -46,7 +46,7 @@ import {
   type InstallScope,
   resolveInstallPath,
 } from "./install-targets.js";
-import { parseJsonc } from "./jsonc.js";
+import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 
@@ -544,15 +544,20 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // own file and we must NOT tighten its perms (step 7's chmod is scoped to
   // the freshly-created case). If it did not, `try` is creating it and a
   // best-effort 0600 is appropriate when the entry carries secrets inline.
+  // We also retain the RAW text so the write below can route through the
+  // comment-preserving `editJsoncEntry` -- a read-modify-write through
+  // JSON.parse + JSON.stringify drops every `//` and `/* */` the user has
+  // in their config (~/.claude.json on Claude Code carries user comments
+  // routinely; we must not silently strip them on every `try`).
   const clientPreExisted = existsSync(resolved.absolute);
-  let existing: Record<string, unknown> = {};
+  let rawClient: string | null = null;
   if (clientPreExisted) {
     try {
       const raw = await readFile(resolved.absolute, "utf8");
       if (raw.trim().length > 0) {
         const parsed = parseJsonc(raw);
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          existing = parsed as Record<string, unknown>;
+          rawClient = raw;
         } else {
           printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
           return { exitCode: 1, written: [] };
@@ -568,8 +573,31 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // user is re-running `try`, presumably with a different --ttl or env).
   // We never collide with the canonical "yaw-mcp" entry — trials
   // live under their own `yaw-mcp-try-<slug>` name.
-  const merged = mergeClientConfig(existing, resolved.containerPath, entry, entryName);
-  const clientJson = `${JSON.stringify(merged, null, 2)}\n`;
+  //
+  // Two write paths:
+  //   - File pre-exists with content -> route through `editJsoncEntry` to
+  //     diff against the original bytes; the user's comments survive.
+  //   - File missing / empty -> no comments to preserve, fall back to the
+  //     historical mergeClientConfig + JSON.stringify path (which also
+  //     handles the empty container-path materialization for us).
+  let clientJson: string;
+  if (rawClient !== null) {
+    try {
+      const next = editJsoncEntry(rawClient, resolved.containerPath, entryName, entry);
+      // Preserve the file's existing trailing-newline convention if present;
+      // editJsoncEntry returns the user's bytes verbatim outside the edit
+      // region, so a file that ended without a newline still won't.
+      clientJson = next.endsWith("\n") ? next : `${next}\n`;
+    } catch (e) {
+      printErr(
+        `yaw-mcp try: failed to splice entry into ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`,
+      );
+      return { exitCode: 1, written: [] };
+    }
+  } else {
+    const merged = mergeClientConfig({}, resolved.containerPath, entry, entryName);
+    clientJson = `${JSON.stringify(merged, null, 2)}\n`;
+  }
   const markerJson = `${JSON.stringify(marker, null, 2)}\n`;
 
   if (opts.dryRun) {
@@ -687,21 +715,22 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 1, written: [] };
   }
 
-  // Peel the entry out of the client config (no-op if already gone).
+  // Peel the entry out of the client config (no-op if already gone). Routed
+  // through `removeJsoncEntry` so user comments in the client config survive
+  // -- a JSON.parse + JSON.stringify pass would silently strip them.
   const written: string[] = [];
   if (existsSync(marker.clientPath)) {
     try {
       const raw = await readFile(marker.clientPath, "utf8");
       if (raw.trim().length > 0) {
+        // Sanity-parse first so we refuse to write garbage back if the file
+        // has drifted into an invalid shape since the marker was created.
         const parsed = parseJsonc(raw);
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          const stripped = removeFromClientConfig(
-            parsed as Record<string, unknown>,
-            marker.containerPath,
-            marker.entryName,
-          );
-          if (stripped !== parsed) {
-            await atomicWriteFile(marker.clientPath, `${JSON.stringify(stripped, null, 2)}\n`);
+          const next = removeJsoncEntry(raw, marker.containerPath, marker.entryName);
+          if (next !== raw) {
+            const out = next.endsWith("\n") ? next : `${next}\n`;
+            await atomicWriteFile(marker.clientPath, out);
             written.push(marker.clientPath);
             print(`Removed ${marker.entryName} from ${marker.clientPath}`);
           }
@@ -828,15 +857,19 @@ export async function gcExpiredTrials(opts: {
       if (existsSync(marker.clientPath)) {
         const raw = await readFile(marker.clientPath, "utf8");
         if (raw.trim().length > 0) {
+          // Sanity-parse to confirm the file is still a JSON object before
+          // we hand the raw text to removeJsoncEntry (it would also throw,
+          // but we want the same shape as runTryCleanup -- skip the GC
+          // write if the file has drifted out of valid shape).
           const parsed = parseJsonc(raw);
           if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-            const stripped = removeFromClientConfig(
-              parsed as Record<string, unknown>,
-              marker.containerPath,
-              marker.entryName,
-            );
-            if (stripped !== parsed) {
-              await atomicWriteFile(marker.clientPath, `${JSON.stringify(stripped, null, 2)}\n`);
+            // Route through removeJsoncEntry so user comments in the client
+            // config survive doctor's GC pass -- the previous JSON.parse +
+            // JSON.stringify shape silently stripped them.
+            const next = removeJsoncEntry(raw, marker.containerPath, marker.entryName);
+            if (next !== raw) {
+              const out = next.endsWith("\n") ? next : `${next}\n`;
+              await atomicWriteFile(marker.clientPath, out);
             }
           }
         }
