@@ -84,6 +84,9 @@ export function tokenizeCommand(cmd: string): string[] {
       has = true;
     }
   }
+  if (quote !== null) {
+    throw new Error(`Unbalanced quote in command: ${cmd}`);
+  }
   if (has) out.push(cur);
   return out;
 }

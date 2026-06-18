@@ -139,12 +139,13 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   // Filter applied AFTER the fetch so a filter that matches nothing
   // prints an explanatory "no matches" message instead of looking like
   // the account has no servers.
-  const filtered = opts.filter
-    ? {
-        ...backend,
-        servers: backend.servers.filter((s) => s.namespace.toLowerCase().includes(opts.filter!.toLowerCase())),
-      }
-    : backend;
+  const filtered =
+    opts.filter !== undefined
+      ? {
+          ...backend,
+          servers: backend.servers.filter((s) => s.namespace.toLowerCase().includes(opts.filter!.toLowerCase())),
+        }
+      : backend;
 
   // Overlay locally-cached compliance grades from `yaw-mcp audit` onto each
   // row. A freshly-audited grade in ~/.yaw-mcp/grades.json is more current
@@ -171,13 +172,13 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     const payload = {
       ...merged,
       filter: opts.filter ?? null,
-      filterMatched: opts.filter ? merged.servers.length > 0 : null,
+      filterMatched: opts.filter !== undefined ? merged.servers.length > 0 : null,
     };
     print(JSON.stringify(payload, null, 2));
     return { exitCode: 0, lines };
   }
 
-  if (opts.filter && filtered.servers.length === 0) {
+  if (opts.filter !== undefined && filtered.servers.length === 0) {
     print(`No servers match "${opts.filter}". Run \`yaw-mcp servers\` to see the full list.`);
     return { exitCode: 0, lines };
   }

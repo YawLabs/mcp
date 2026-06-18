@@ -2965,12 +2965,12 @@ export class ConnectServer {
       };
     }
 
-    const toolName = normalizeToolName(serverArg, toolArg);
-
     // Fast path: server already loaded. Schema is already in context,
-    // no network cost.
+    // no network cost. Normalize with the live tool list so exact-match
+    // takes priority over prefix-stripping.
     const existing = this.connections.get(serverArg);
     if (existing && existing.status === "connected") {
+      const toolName = normalizeToolName(serverArg, toolArg, existing.tools);
       const tool = findTool(existing.tools, toolName);
       if (!tool) {
         return {
@@ -3027,6 +3027,9 @@ export class ConnectServer {
     }
 
     try {
+      // Normalize with the transient tool list so exact-match takes
+      // priority over prefix-stripping.
+      const toolName = normalizeToolName(serverArg, toolArg, transient.tools);
       const tool = findTool(transient.tools, toolName);
       if (!tool) {
         return {

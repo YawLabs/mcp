@@ -37,23 +37,27 @@ const GUIDE_READ_TIMEOUT_MS = 1000;
 
 async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | null> {
   let raw: string;
+  // A stuck NFS mount or a large accidental binary at this path should
+  // never hang the yaw-mcp://guide resource — the client is usually the
+  // model, waiting on a prompt. Use AbortController so the readFile fd
+  // is not leaked when the timeout fires (unlike Promise.race which
+  // leaves the readFile promise — and its fd — alive in the background).
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error("guide read timeout")), GUIDE_READ_TIMEOUT_MS);
   try {
-    // A stuck NFS mount or a large accidental binary at this path should
-    // never hang the yaw-mcp://guide resource — the client is usually the
-    // model, waiting on a prompt. Race the read against a 1s timeout.
-    raw = await Promise.race([
-      readFile(path, "utf8"),
-      new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error("guide read timeout")), GUIDE_READ_TIMEOUT_MS),
-      ),
-    ]);
+    raw = await readFile(path, { encoding: "utf8", signal: ac.signal });
   } catch (err) {
     // Missing file is the common case and stays silent. Timeouts warn so
     // a genuinely hung disk isn't swallowed.
-    if (err instanceof Error && err.message === "guide read timeout") {
+    const isTimeout =
+      (err instanceof Error && err.message === "guide read timeout") ||
+      (err instanceof Error && (err as NodeJS.ErrnoException).code === "ABORT_ERR");
+    if (isTimeout) {
       log("warn", "Guide read timed out", { path });
     }
     return null;
+  } finally {
+    clearTimeout(timer);
   }
   const content = raw.trim();
   if (content.length === 0) {

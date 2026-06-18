@@ -7,7 +7,7 @@
 // SUBCOMMAND_SPEC covers every real subcommand (no hand-maintained
 // mirror to drift).
 
-import { closestNames } from "./fuzzy.js";
+import { closestNames, levenshtein } from "./fuzzy.js";
 
 // Leading-dash flag aliases handled by the dispatcher (help/version).
 // Kept separate from the subcommand names so consumers (did-you-mean,
@@ -57,13 +57,30 @@ export function suggestSubcommand(input: string, limit = 3): string[] {
 
 /**
  * Suggest the closest known flag alias for a long-form leading-dash typo
- * (e.g. `--versionn` -> `--version`). Restricted to inputs longer than a
- * single-letter flag (length > 2) so a genuine short flag like a server's
- * own lowercase `-v` is NOT hijacked by a case-only match against `-V`.
+ * (e.g. `--versionn` -> `--version`, `--hepl` -> `--help`). Restricted to
+ * inputs longer than a single-letter flag (length > 2) so a genuine short
+ * flag like a server's own lowercase `-v` is NOT hijacked by a case-only
+ * match against `-V`.
+ *
+ * Uses pure levenshtein distance <= 2 (without the prefix/substring tiers
+ * that closestNames adds). Prefix matching is unsafe here: `--vers` is a
+ * prefix of `--version` but could equally be the start of a genuine server
+ * flag; intercepting it as a "did you mean?" would swallow a valid flag
+ * before it reaches the server. Edit-distance only gives the same typo
+ * coverage without that false-positive surface.
+ *
  * Returns up to `limit` aliases, best first; [] when nothing is close (so
  * genuine long server flags fall through to the server untouched).
  */
 export function suggestFlag(input: string, limit = 2): string[] {
   if (input.length <= 2) return [];
-  return closestNames(input, FLAG_ALIASES, limit);
+  const q = input.toLowerCase();
+  const hits: Array<{ name: string; d: number }> = [];
+  for (const alias of FLAG_ALIASES) {
+    if (alias === input) continue; // exact match -- never "did you mean yourself"
+    const d = levenshtein(q, alias.toLowerCase());
+    if (d <= 2) hits.push({ name: alias, d });
+  }
+  hits.sort((a, b) => a.d - b.d || a.name.localeCompare(b.name));
+  return hits.slice(0, limit).map((h) => h.name);
 }

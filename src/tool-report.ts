@@ -13,21 +13,27 @@ import { log } from "./logger.js";
 let apiUrl = "";
 let token = "";
 
-// Single-slot latch capturing the most recent rejection from the
+// Per-server latch capturing the most recent rejection from the
 // dashboard so `yaw-mcp doctor` can surface lost-write-scope (e.g., a
 // rotated token) instead of letting the failure rot silently in the
-// logger. Cleared on the next successful (2xx) post -- a transient 4xx
-// must not pollute doctor output forever. Diagnostic-only: never POSTed
-// back to the dashboard.
+// logger. Cleared on the next successful (2xx) post for that server --
+// a transient 4xx must not pollute doctor output forever. Keyed by
+// serverId so concurrent activations for different servers don't race
+// on a shared single slot. Diagnostic-only: never POSTed back to the
+// dashboard.
 export interface ReportFailure {
   statusCode: number;
   url: string;
   at: number;
 }
-let lastFailure: ReportFailure | null = null;
+const lastFailureByServer = new Map<string, ReportFailure>();
 
-export function getLastReportFailure(): ReportFailure | null {
-  return lastFailure;
+export function getLastReportFailure(serverId?: string): ReportFailure | null {
+  if (serverId !== undefined) return lastFailureByServer.get(serverId) ?? null;
+  // Legacy: return any failure when no serverId specified (e.g. doctor).
+  const entries = [...lastFailureByServer.values()];
+  if (entries.length === 0) return null;
+  return entries.reduce((a, b) => (a.at >= b.at ? a : b));
 }
 
 export function initToolReport(url: string, tok: string): void {
@@ -40,7 +46,7 @@ export async function reportTools(
   tools: Array<{ name: string; description?: string }>,
 ): Promise<void> {
   if (!apiUrl || !token || !serverId) return;
-  const url = `${apiUrl.replace(/\/$/, "")}/api/connect/servers/${serverId}/tools`;
+  const url = `${apiUrl.replace(/\/$/, "")}/api/connect/servers/${encodeURIComponent(serverId)}/tools`;
   try {
     const res = await request(url, {
       method: "POST",
@@ -58,11 +64,11 @@ export async function reportTools(
     // skip the warn to keep logs clean. Any other non-2xx is genuine.
     if (res.statusCode >= 400 && res.statusCode !== 404) {
       log("warn", "Tool report failed", { serverId, status: res.statusCode });
-      lastFailure = { statusCode: res.statusCode, url, at: Date.now() };
+      lastFailureByServer.set(serverId, { statusCode: res.statusCode, url, at: Date.now() });
     } else if (res.statusCode < 400) {
       // Clear the latch on a real 2xx so an old failure doesn't linger
       // after the dashboard recovers (e.g., user re-issued the token).
-      lastFailure = null;
+      lastFailureByServer.delete(serverId);
     }
   } catch (err: any) {
     log("warn", "Tool report error", { serverId, error: err?.message });

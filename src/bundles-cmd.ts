@@ -126,9 +126,12 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   });
 
   if (!config.token) {
-    printErr(
-      "yaw-mcp bundles match: no token resolved. Run `yaw-mcp install <client> --token mcp_pat_…` or set YAW_MCP_TOKEN.",
-    );
+    const msg = "no token resolved. Run `yaw-mcp install <client> --token mcp_pat_…` or set YAW_MCP_TOKEN.";
+    if (opts.json) {
+      writeErr(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    } else {
+      printErr(`yaw-mcp bundles match: ${msg}`);
+    }
     return { exitCode: 1, lines };
   }
 
@@ -138,12 +141,21 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
     backend = await fetcher(config.apiBase, config.token);
   } catch (err) {
     const msg = err instanceof ConfigError || err instanceof Error ? err.message : String(err);
-    printErr(`yaw-mcp bundles match: ${msg}`);
+    if (opts.json) {
+      writeErr(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    } else {
+      printErr(`yaw-mcp bundles match: ${msg}`);
+    }
     return { exitCode: 2, lines };
   }
 
   if (!backend) {
-    printErr("yaw-mcp bundles match: backend returned 304 without a conditional request.");
+    const msg = "backend returned 304 without a conditional request.";
+    if (opts.json) {
+      writeErr(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    } else {
+      printErr(`yaw-mcp bundles match: ${msg}`);
+    }
     return { exitCode: 2, lines };
   }
 

@@ -381,9 +381,9 @@ function handleSyncError(
     return { exitCode: 1 };
   }
   if (err instanceof TeamSyncAuthError) {
-    if (opts.json)
-      io.err(`${JSON.stringify({ ok: false, error: "Session expired or revoked. Run `yaw-mcp login` again." })}\n`);
-    else io.err("yaw-mcp sync: session expired or revoked. Run `yaw-mcp login --key <license-key>` again.\n");
+    const authMsg = "Session expired or revoked. Run `yaw-mcp login --key <license-key>` again.";
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: authMsg })}\n`);
+    else io.err(`yaw-mcp sync: ${authMsg}\n`);
     return { exitCode: 1 };
   }
   if (err instanceof TeamSyncForbiddenError) {

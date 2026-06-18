@@ -19,7 +19,13 @@ export interface ReadToolResult {
 // matches so callers can paste whichever form they already have in
 // context. The namespace-aware check (rather than a blind split on
 // "_") keeps underscore-containing namespaces like "mcp_hosting" safe.
-export function normalizeToolName(namespace: string, raw: string): string {
+//
+// When `tools` is provided, try an exact-match against the list first.
+// Only strip the namespace prefix when no tool in the list has the
+// exact raw name — this prevents false-positive stripping for tools
+// whose bare name happens to start with the namespace prefix string.
+export function normalizeToolName(namespace: string, raw: string, tools?: Array<{ name: string }>): string {
+  if (tools && tools.some((t) => t.name === raw)) return raw;
   const prefix = `${namespace}_`;
   if (raw.startsWith(prefix) && raw.length > prefix.length) return raw.slice(prefix.length);
   return raw;

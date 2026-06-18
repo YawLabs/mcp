@@ -155,6 +155,13 @@ export async function runSetActive(
               mcp_bundles: { lastPulledVersion: putRes.version },
             })
             .catch(() => {});
+        } else {
+          // putRes.version is not a number -- the stale-version 409 guard in
+          // a future sync push will not have an accurate local version to
+          // submit, increasing the chance of a spurious conflict.
+          console.warn(
+            `yaw-mcp set-active: putRes.version was not a number (got ${JSON.stringify(putRes.version)}); local sync-state not updated`,
+          );
         }
         return done(io, opts.json, namespace, active, true);
       } catch (e) {

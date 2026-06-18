@@ -2,6 +2,7 @@ import { request } from "undici";
 import type { ErrorCategory } from "./error-category.js";
 import { log } from "./logger.js";
 import { postAnalyticsEvent } from "./team-sync.js";
+import { isLoopbackHost } from "./url-safety.js";
 
 export interface ConnectAnalyticsEvent {
   namespace: string | null;
@@ -72,6 +73,36 @@ let lastFailure: AnalyticsFailure | null = null;
 // diagnostic surfaced by `yaw-mcp doctor`.
 let lastLoggedConnectStatus: number | null = null;
 let lastLoggedDispatchStatus: number | null = null;
+// One-shot latch: warn once per process (reset by initAnalytics) when
+// the configured apiUrl is not https and not loopback, so the operator
+// sees the misconfiguration without a warn line every 30s.
+let warnedInsecureBearerSkip = false;
+
+/**
+ * Returns true when it is safe to send `Authorization: Bearer ...` to
+ * the given URL. Bearers are allowed over https://, or over http:// only
+ * to loopback (127.0.0.1, ::1, localhost). All other schemes/hosts get
+ * a one-time warning and no Authorization header.
+ */
+function shouldSendBearer(targetUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return true;
+  if (!warnedInsecureBearerSkip) {
+    log(
+      "warn",
+      "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+      { url: targetUrl },
+    );
+    warnedInsecureBearerSkip = true;
+  }
+  return false;
+}
 
 export function getLastAnalyticsFailure(): AnalyticsFailure | null {
   return lastFailure;
@@ -181,12 +212,11 @@ async function flush(): Promise<void> {
   const events = buffer.splice(0, FLUSH_SIZE);
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/analytics`;
   try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (shouldSendBearer(url)) headers.Authorization = `Bearer ${token}`;
     const res = await request(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({ events }),
       headersTimeout: 10_000,
       bodyTimeout: 10_000,
@@ -231,17 +261,16 @@ async function flushDispatch(): Promise<void> {
   const events = dispatchBuffer.splice(0, FLUSH_SIZE);
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/dispatch-events`;
   try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (shouldSendBearer(url)) headers.Authorization = `Bearer ${token}`;
     const res = await request(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({ events }),
       headersTimeout: 10_000,
       bodyTimeout: 10_000,
     });
-    if (res.statusCode >= 400 && res.statusCode !== 204) {
+    if (res.statusCode >= 400) {
       // See flush() above for the retry-class + log-latch rationale.
       const retryable = res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429;
       if (retryable) {
@@ -256,7 +285,7 @@ async function flushDispatch(): Promise<void> {
         lastLoggedDispatchStatus = res.statusCode;
       }
       lastFailure = { statusCode: res.statusCode, url, at: Date.now() };
-    } else if (res.statusCode < 400) {
+    } else {
       lastFailure = null;
       lastLoggedDispatchStatus = null;
     }
@@ -274,6 +303,7 @@ export function initAnalytics(url: string, tok: string): void {
   token = tok;
   lastLoggedConnectStatus = null;
   lastLoggedDispatchStatus = null;
+  warnedInsecureBearerSkip = false;
   // Also reset the team-analytics latch so a user who signs in mid-session
   // gets team analytics re-enabled (the latch fires on a failed/missing
   // session, but sign-in produces a fresh valid one).

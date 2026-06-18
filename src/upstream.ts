@@ -306,7 +306,7 @@ export async function connectToUpstream(
       // Non-timeout error with stderr → the child likely exited before
       // the handshake (install failure, missing env var, bad args).
       category = "install_failure";
-      const safe = redactSecretsInOutput(trimmedStderr, config.env ?? {});
+      const safe = redactSecretsInOutput(trimmedStderr, resolvedServerEnv);
       message = `Server "${config.namespace}" failed to start. stderr: ${safe.slice(-500)}`;
     } else {
       category = categorizeSpawnError(err);
@@ -325,7 +325,7 @@ export async function connectToUpstream(
       message = `${message} → Edit at https://yaw.sh/mcp/dashboard/connect#server-${config.id}`;
     }
 
-    const redactedTail = trimmedStderr ? redactSecretsInOutput(trimmedStderr, config.env ?? {}) : undefined;
+    const redactedTail = trimmedStderr ? redactSecretsInOutput(trimmedStderr, resolvedServerEnv) : undefined;
     throw new ActivationError(message, category, redactedTail, err);
   }
 
