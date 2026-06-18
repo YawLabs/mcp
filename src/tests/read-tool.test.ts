@@ -46,6 +46,18 @@ describe("normalizeToolName", () => {
     // the wrong thing downstream.
     expect(normalizeToolName("gh", "gh_")).toBe("gh_");
   });
+
+  it("returns raw name unchanged when it exactly matches a tool in the list", () => {
+    expect(normalizeToolName("gh", "gh_create_issue", [{ name: "gh_create_issue" }])).toBe("gh_create_issue");
+  });
+
+  it("strips prefix when raw name is not in the tools list", () => {
+    expect(normalizeToolName("gh", "gh_create_issue", [{ name: "create_issue" }])).toBe("create_issue");
+  });
+
+  it("strips prefix when tools list is empty", () => {
+    expect(normalizeToolName("gh", "gh_foo", [])).toBe("foo");
+  });
 });
 
 describe("findTool", () => {

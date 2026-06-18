@@ -208,16 +208,18 @@ function renderBash(): string {
   const subcommandList = SUBCOMMAND_SPEC.map((s) => s.name).join(" ");
   const topLevelFlags = "--help -h --version -V";
   const cases = SUBCOMMAND_SPEC.map((spec) => {
-    const realPositionals = (spec.positional ?? []).filter((p) => !isPlaceholder(p));
-    const posClause =
-      realPositionals.length > 0
-        ? `    if [[ $cword -eq 2 ]]; then
-      COMPREPLY=( $(compgen -W "${[...realPositionals, ...spec.flags].join(" ")}" -- "$cur") )
-      return 0
-    fi`
-        : "";
+    const indexedPositionals = (spec.positional ?? [])
+      .map((p, i) => ({ value: p, index: i }))
+      .filter(({ value }) => !isPlaceholder(value));
+    // Emit one if-block per real positional, using its original array index
+    // to compute the correct cword position (cword == originalIndex + 2 because
+    // COMP_WORDS[0] is "yaw-mcp", COMP_WORDS[1] is the subcommand).
+    const posClauses = indexedPositionals.map(
+      ({ value, index }) =>
+        `    if [[ $cword -eq $((${index} + 2)) ]]; then\n      COMPREPLY=( $(compgen -W "${value}" -- "$cur") )\n      return 0\n    fi`,
+    );
     const parts = [
-      posClause,
+      ...posClauses,
       `    COMPREPLY=( $(compgen -W "${spec.flags.join(" ")}" -- "$cur") )`,
       "    return 0",
     ].filter((p) => p !== "");
@@ -252,9 +254,16 @@ function renderZsh(): string {
 
   const argsCases = SUBCOMMAND_SPEC.map((spec) => {
     const lines = [`      ${spec.name})`];
-    const realPositionals = (spec.positional ?? []).filter((p) => !isPlaceholder(p));
-    if (realPositionals.length > 0) {
-      lines.push(`        _arguments '1: :(${realPositionals.join(" ")})' '*: :(${spec.flags.join(" ")})'`);
+    const indexedPositionals = (spec.positional ?? [])
+      .map((p, i) => ({ value: p, index: i }))
+      .filter(({ value }) => !isPlaceholder(value));
+    if (indexedPositionals.length > 0) {
+      // Emit one _arguments entry per real positional, using its original array
+      // index for the zsh slot number (slot == originalIndex + 1 because zsh
+      // _arguments slot numbering is 1-based and slot 1 is already claimed by
+      // the subcommand dispatch in the outer _arguments call).
+      const posArgs = indexedPositionals.map(({ value, index }) => `'${index + 1}: :(${value})'`).join(" ");
+      lines.push(`        _arguments ${posArgs} '*: :(${spec.flags.join(" ")})'`);
     } else {
       lines.push(`        _arguments '*: :(${spec.flags.join(" ")})'`);
     }
@@ -302,10 +311,17 @@ complete -c yaw-mcp -f`;
   const flagLines: string[] = [];
   for (const spec of SUBCOMMAND_SPEC) {
     if (spec.positional) {
-      for (const p of spec.positional) {
-        if (isPlaceholder(p)) continue;
-        positionalLines.push(`complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}" -a ${p}`);
-      }
+      // Preserve the original array index so the position guard uses the
+      // correct argument count. `count (commandline -opc)` in fish returns the
+      // number of tokens before the cursor (including "yaw-mcp" and the
+      // subcommand), so the expected count for originalIndex N is N + 2.
+      spec.positional.forEach((p, i) => {
+        if (isPlaceholder(p)) return;
+        const expectedCount = i + 2;
+        positionalLines.push(
+          `complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}; and test (count (commandline -opc)) -eq ${expectedCount}" -a ${p}`,
+        );
+      });
     }
     for (const f of spec.flags) {
       // `-l` takes a LONG option name (no dashes). Only emit for `--` flags;
@@ -322,12 +338,19 @@ complete -c yaw-mcp -f`;
 function renderPowershell(): string {
   const subcommandNames = SUBCOMMAND_SPEC.map((s) => `'${s.name}'`).join(", ");
   const caseBranches = SUBCOMMAND_SPEC.map((spec) => {
-    const realPositionals = (spec.positional ?? []).filter((p) => !isPlaceholder(p));
-    const positional = realPositionals.map((p) => `'${p}'`).join(", ");
+    const indexedPositionals = (spec.positional ?? [])
+      .map((p, i) => ({ value: p, index: i }))
+      .filter(({ value }) => !isPlaceholder(value));
     const flags = spec.flags.map((f) => `'${f}'`).join(", ");
-    const positionalLine = positional ? `      $completions += @(${positional})\n` : "";
+    // Emit one guarded block per real positional. $tokens[0] is "yaw-mcp",
+    // $tokens[1] is the subcommand, so the token count when completing
+    // originalIndex N is N + 2 (the cursor is on the next token to be typed).
+    const positionalLines = indexedPositionals
+      .map(({ value, index }) => `      if ($tokens.Count -eq ${index + 2}) { $completions += @('${value}') }`)
+      .join("\n");
+    const positionalBlock = positionalLines ? `${positionalLines}\n` : "";
     return `    '${spec.name}' {
-${positionalLine}      $completions += @(${flags})
+${positionalBlock}      $completions += @(${flags})
     }`;
   }).join("\n");
 

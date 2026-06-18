@@ -49,9 +49,7 @@ async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | n
   } catch (err) {
     // Missing file is the common case and stays silent. Timeouts warn so
     // a genuinely hung disk isn't swallowed.
-    const isTimeout =
-      (err instanceof Error && err.message === "guide read timeout") ||
-      (err instanceof Error && (err as NodeJS.ErrnoException).code === "ABORT_ERR");
+    const isTimeout = err instanceof Error && (err as NodeJS.ErrnoException).code === "ABORT_ERR";
     if (isTimeout) {
       log("warn", "Guide read timed out", { path });
     }

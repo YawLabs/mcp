@@ -139,11 +139,12 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   // Filter applied AFTER the fetch so a filter that matches nothing
   // prints an explanatory "no matches" message instead of looking like
   // the account has no servers.
+  const filterStr = opts.filter;
   const filtered =
-    opts.filter !== undefined
+    filterStr !== undefined
       ? {
           ...backend,
-          servers: backend.servers.filter((s) => s.namespace.toLowerCase().includes(opts.filter!.toLowerCase())),
+          servers: backend.servers.filter((s) => s.namespace.toLowerCase().includes(filterStr.toLowerCase())),
         }
       : backend;
 

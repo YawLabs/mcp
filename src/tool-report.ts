@@ -65,12 +65,17 @@ export async function reportTools(
     if (res.statusCode >= 400 && res.statusCode !== 404) {
       log("warn", "Tool report failed", { serverId, status: res.statusCode });
       lastFailureByServer.set(serverId, { statusCode: res.statusCode, url, at: Date.now() });
-    } else if (res.statusCode < 400) {
-      // Clear the latch on a real 2xx so an old failure doesn't linger
-      // after the dashboard recovers (e.g., user re-issued the token).
+    } else {
+      // Clear the latch on success or expected 404 so an old failure
+      // doesn't linger after the dashboard recovers (e.g., user
+      // re-issued the token). 404 = pre-endpoint deployment, not a
+      // real auth failure, so it must not keep doctor reporting broken.
       lastFailureByServer.delete(serverId);
     }
   } catch (err: any) {
     log("warn", "Tool report error", { serverId, error: err?.message });
+    // Network-level failures (ECONNREFUSED, timeout, DNS) never produce
+    // an HTTP status, so statusCode 0 signals a transport error to doctor.
+    lastFailureByServer.set(serverId, { statusCode: 0, url, at: Date.now() });
   }
 }

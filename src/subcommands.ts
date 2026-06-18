@@ -77,7 +77,7 @@ export function suggestFlag(input: string, limit = 2): string[] {
   const q = input.toLowerCase();
   const hits: Array<{ name: string; d: number }> = [];
   for (const alias of FLAG_ALIASES) {
-    if (alias === input) continue; // exact match -- never "did you mean yourself"
+    if (alias.toLowerCase() === q) continue; // exact match -- never "did you mean yourself"
     const d = levenshtein(q, alias.toLowerCase());
     if (d <= 2) hits.push({ name: alias, d });
   }

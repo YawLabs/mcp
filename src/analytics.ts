@@ -73,16 +73,20 @@ let lastFailure: AnalyticsFailure | null = null;
 // diagnostic surfaced by `yaw-mcp doctor`.
 let lastLoggedConnectStatus: number | null = null;
 let lastLoggedDispatchStatus: number | null = null;
-// One-shot latch: warn once per process (reset by initAnalytics) when
+// One-shot latches: warn once per process (reset by initAnalytics) when
 // the configured apiUrl is not https and not loopback, so the operator
 // sees the misconfiguration without a warn line every 30s.
-let warnedInsecureBearerSkip = false;
+// Separate latches for each flush path so the connect flush firing first
+// cannot suppress the dispatch-events warning.
+let warnedInsecureBearerSkipConnect = false;
+let warnedInsecureBearerSkipDispatch = false;
 
 /**
  * Returns true when it is safe to send `Authorization: Bearer ...` to
  * the given URL. Bearers are allowed over https://, or over http:// only
- * to loopback (127.0.0.1, ::1, localhost). All other schemes/hosts get
- * a one-time warning and no Authorization header.
+ * to loopback (127.0.0.1, ::1, localhost). Pure predicate -- no side
+ * effects. Callers are responsible for one-shot warn logging via their
+ * own per-path latch.
  */
 function shouldSendBearer(targetUrl: string): boolean {
   let parsed: URL;
@@ -93,14 +97,6 @@ function shouldSendBearer(targetUrl: string): boolean {
   }
   if (parsed.protocol === "https:") return true;
   if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return true;
-  if (!warnedInsecureBearerSkip) {
-    log(
-      "warn",
-      "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
-      { url: targetUrl },
-    );
-    warnedInsecureBearerSkip = true;
-  }
   return false;
 }
 
@@ -213,7 +209,16 @@ async function flush(): Promise<void> {
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/analytics`;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (shouldSendBearer(url)) headers.Authorization = `Bearer ${token}`;
+    if (shouldSendBearer(url)) {
+      headers.Authorization = `Bearer ${token}`;
+    } else if (!warnedInsecureBearerSkipConnect) {
+      log(
+        "warn",
+        "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+        { url },
+      );
+      warnedInsecureBearerSkipConnect = true;
+    }
     const res = await request(url, {
       method: "POST",
       headers,
@@ -262,7 +267,16 @@ async function flushDispatch(): Promise<void> {
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/dispatch-events`;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (shouldSendBearer(url)) headers.Authorization = `Bearer ${token}`;
+    if (shouldSendBearer(url)) {
+      headers.Authorization = `Bearer ${token}`;
+    } else if (!warnedInsecureBearerSkipDispatch) {
+      log(
+        "warn",
+        "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+        { url },
+      );
+      warnedInsecureBearerSkipDispatch = true;
+    }
     const res = await request(url, {
       method: "POST",
       headers,
@@ -303,7 +317,8 @@ export function initAnalytics(url: string, tok: string): void {
   token = tok;
   lastLoggedConnectStatus = null;
   lastLoggedDispatchStatus = null;
-  warnedInsecureBearerSkip = false;
+  warnedInsecureBearerSkipConnect = false;
+  warnedInsecureBearerSkipDispatch = false;
   // Also reset the team-analytics latch so a user who signs in mid-session
   // gets team analytics re-enabled (the latch fires on a failed/missing
   // session, but sign-in produces a fresh valid one).
