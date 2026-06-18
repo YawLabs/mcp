@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp",
-  "version": "0.64.1",
+  "version": "0.64.2",
   "mcpName": "io.github.YawLabs/mcp",
   "description": "Yaw MCP -- MCP servers, managed. Free to run locally; Yaw Team adds cross-machine sync.",
   "license": "UNLICENSED",
