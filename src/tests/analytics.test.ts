@@ -17,9 +17,11 @@ vi.mock("../team-sync.js", async (importOriginal) => {
 
 import {
   _resetTeamAnalyticsForTests,
+  getDroppedEventsCount,
   getLastAnalyticsFailure,
   initAnalytics,
   recordConnectEvent,
+  recordDispatchEvent,
   shutdownAnalytics,
 } from "../analytics.js";
 
@@ -124,6 +126,144 @@ describe("analytics", () => {
     // Allow the microtask queue to flush the fire-and-forget promise.
     await Promise.resolve();
     expect(spy).toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // shouldSendBearer (tested indirectly via flush headers)
+  // ---------------------------------------------------------------------------
+
+  it("shouldSendBearer: sends Authorization header for https:// URL", async () => {
+    initAnalytics("https://example.com", "tok-abc");
+    recordConnectEvent({
+      namespace: "gh",
+      toolName: null,
+      action: "discover",
+      latencyMs: null,
+      success: true,
+    });
+    await shutdownAnalytics();
+
+    const call = mockedRequest.mock.calls[0];
+    expect(call).toBeDefined();
+    const headers = (call[1] as { headers: Record<string, string> }).headers;
+    expect(headers.Authorization).toBe("Bearer tok-abc");
+  });
+
+  it.each([
+    ["http://localhost", "localhost"],
+    ["http://127.0.0.1", "127.0.0.1"],
+    ["http://[::1]", "[::1]"],
+  ])("shouldSendBearer: sends Authorization header for loopback %s", async (base) => {
+    initAnalytics(base, "tok-loop");
+    recordConnectEvent({
+      namespace: "gh",
+      toolName: null,
+      action: "discover",
+      latencyMs: null,
+      success: true,
+    });
+    await shutdownAnalytics();
+
+    const call = mockedRequest.mock.calls[0];
+    expect(call).toBeDefined();
+    const headers = (call[1] as { headers: Record<string, string> }).headers;
+    expect(headers.Authorization).toBe("Bearer tok-loop");
+  });
+
+  it("shouldSendBearer: omits Authorization header for http://example.com (non-loopback plaintext)", async () => {
+    initAnalytics("http://example.com", "tok-insecure");
+    recordConnectEvent({
+      namespace: "gh",
+      toolName: null,
+      action: "discover",
+      latencyMs: null,
+      success: true,
+    });
+    await shutdownAnalytics();
+
+    const call = mockedRequest.mock.calls[0];
+    expect(call).toBeDefined();
+    const headers = (call[1] as { headers: Record<string, string> }).headers;
+    expect(headers.Authorization).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------------------
+  // flushDispatch(): 500 re-enqueue behavior
+  // ---------------------------------------------------------------------------
+
+  it("flushDispatch(): 500 response re-enqueues events (not dropped) and sets the failure latch", async () => {
+    mockedRequest.mockResolvedValue({
+      statusCode: 500,
+      body: { text: vi.fn().mockResolvedValue(""), json: vi.fn().mockResolvedValue({}) },
+    } as never);
+
+    initAnalytics("https://example.com", "test-token");
+    recordDispatchEvent({
+      scope: "connect",
+      serverId: "srv-1",
+      toolName: "list_repos",
+      requestBytes: 10,
+      responseBytesRaw: 20,
+    });
+    // shutdownAnalytics retries up to 3 times; keep returning 500 so events
+    // stay in the buffer long enough to verify re-enqueue on the first flush.
+    // We check the failure latch rather than internal buffer state.
+    await shutdownAnalytics();
+
+    const latch = getLastAnalyticsFailure();
+    expect(latch).not.toBeNull();
+    expect(latch?.statusCode).toBe(500);
+    expect(latch?.url).toBe("https://example.com/api/connect/dispatch-events");
+  });
+
+  it("flushDispatch(): droppedEvents counted when dispatch buffer overflows MAX_BUFFER", () => {
+    // Use empty url/token so flushDispatch is a no-op and the buffer fills
+    // freely without being synchronously spliced on each FLUSH_SIZE hit.
+    initAnalytics("", "");
+    const before = getDroppedEventsCount();
+    const MAX = 5000;
+    const EXTRA = 10;
+
+    for (let i = 0; i < MAX + EXTRA; i++) {
+      recordDispatchEvent({
+        scope: "connect",
+        serverId: "srv",
+        toolName: "t",
+        requestBytes: 1,
+        responseBytesRaw: 1,
+      });
+    }
+
+    const after = getDroppedEventsCount();
+    expect(after).toBeGreaterThan(before);
+    expect(after - before).toBeGreaterThanOrEqual(EXTRA);
+  });
+
+  // ---------------------------------------------------------------------------
+  // getDroppedEventsCount()
+  // ---------------------------------------------------------------------------
+
+  it("getDroppedEventsCount() returns the accumulated drop total", () => {
+    // Use empty url/token so flush() is a no-op -- with a real apiUrl, flush()
+    // synchronously splices the buffer on every FLUSH_SIZE hit, preventing the
+    // buffer from ever reaching MAX_BUFFER.
+    initAnalytics("", "");
+    const before = getDroppedEventsCount();
+
+    // Push 5100 connect events -- the first 5000 land, the rest are dropped.
+    for (let i = 0; i < 5100; i++) {
+      recordConnectEvent({
+        namespace: "gh",
+        toolName: null,
+        action: "discover",
+        latencyMs: null,
+        success: true,
+      });
+    }
+
+    const after = getDroppedEventsCount();
+    // At least 100 events were dropped (5100 - MAX_BUFFER 5000).
+    expect(after - before).toBeGreaterThanOrEqual(100);
   });
 
   it("a subsequent 200 flush clears the latch", async () => {

@@ -16,6 +16,8 @@ vi.mock("undici", () => ({
   request: vi.fn(),
 }));
 
+vi.mock("../logger.js", () => ({ log: vi.fn() }));
+
 vi.mock("../upstream.js", async (importOriginal) => {
   const actual = (await importOriginal()) as any;
   return {
@@ -59,6 +61,7 @@ vi.mock("../team-sync.js", async (importOriginal) => {
 });
 
 import { request } from "undici";
+import { log } from "../logger.js";
 import { initRerank, rerank } from "../rerank.js";
 import { ConnectServer } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
@@ -217,6 +220,58 @@ describe("rerank client", () => {
     const call = vi.mocked(request).mock.calls[0];
     const body = JSON.parse((call[1] as any).body);
     expect(body).toEqual({ intent: "query" });
+  });
+
+  // Path-A / Path-B fallback-blocking contract:
+  // When a session exists but callTeamRerank returns null (Voyage
+  // unavailable or cookie missing), rerank() returns null immediately --
+  // it must NOT fall through to Path B (the legacy MCPH_TOKEN endpoint).
+  it("does not fall back to Path B when session exists but callTeamRerank returns null", async () => {
+    const teamSync = await import("../team-sync.js");
+    // Session is present -> Path A runs.
+    vi.mocked(teamSync.getSession).mockImplementationOnce(() =>
+      Promise.resolve({
+        email: "u@example.com",
+        role: "member" as const,
+        order_id: "ord",
+        exp: Date.now() + 86400_000,
+      }),
+    );
+    // No cookie -> callTeamRerank returns null without hitting the network.
+    vi.mocked(teamSync.getCachedCookie).mockReturnValueOnce(null);
+
+    // initRerank is called in beforeEach, so legacyApiUrl / legacyToken are set.
+    // If Path B ran, request() would be called for the legacy endpoint.
+    const result = await rerank("test intent", ["srv-id"]);
+
+    expect(result).toBeNull();
+    // request() must NOT have been called -- Path B was blocked.
+    expect(vi.mocked(request)).not.toHaveBeenCalled();
+  });
+
+  // 401 from callTeamRerank must log at "debug" level (not "warn"),
+  // because an expired session cookie is a normal operating condition,
+  // not a backend error worth alarming on.
+  it("callTeamRerank 401 logs at debug level and returns null", async () => {
+    const teamSync = await import("../team-sync.js");
+    vi.mocked(teamSync.getSession).mockImplementationOnce(() =>
+      Promise.resolve({
+        email: "u@example.com",
+        role: "member" as const,
+        order_id: "ord",
+        exp: Date.now() + 86400_000,
+      }),
+    );
+    vi.mocked(teamSync.getCachedCookie).mockReturnValueOnce("stale-cookie");
+
+    vi.mocked(request).mockResolvedValueOnce(mockStatusResponse(401) as any);
+
+    const result = await rerank("test intent", ["srv-id"]);
+
+    expect(result).toBeNull();
+    // Must have logged at "debug", not "warn".
+    expect(vi.mocked(log)).toHaveBeenCalledWith("debug", expect.stringContaining("401"), expect.anything());
+    expect(vi.mocked(log)).not.toHaveBeenCalledWith("warn", expect.stringContaining("401"), expect.anything());
   });
 });
 

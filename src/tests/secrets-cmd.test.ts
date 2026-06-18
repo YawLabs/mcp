@@ -409,6 +409,87 @@ describe("runSecrets push -- edge cases", () => {
 });
 
 // -----------------------------------------------------------------------
+// runSecrets push / pull -- no-session and auth-error paths
+// -----------------------------------------------------------------------
+
+describe("runSecrets push/pull -- no session + TeamSyncAuthError", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const home = nodePath.join(os.tmpdir(), `yaw-test-auth-${process.pid}`);
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  it("push with no session -> exitCode 1 + login message", async () => {
+    vi.mocked(getSession).mockResolvedValue(null);
+    const result = await runSecrets({ action: "push", home }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    expect(errOutput.toLowerCase()).toMatch(/not signed in|login/);
+  });
+
+  it("pull with no session -> exitCode 1 + login message", async () => {
+    vi.mocked(getSession).mockResolvedValue(null);
+    const result = await runSecrets({ action: "pull", home }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    expect(errOutput.toLowerCase()).toMatch(/not signed in|login/);
+  });
+
+  it("pull: getResource throws TeamSyncAuthError -> exitCode 1 + session-expired message", async () => {
+    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
+    const { TeamSyncAuthError } = await import("../team-sync.js");
+    vi.mocked(getResource).mockRejectedValue(new TeamSyncAuthError());
+    const result = await runSecrets({ action: "pull", home }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    expect(errOutput.toLowerCase()).toMatch(/session expired|login/);
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets push -- salt-conflict guard + --replace flag
+// -----------------------------------------------------------------------
+
+describe("runSecrets push -- salt-conflict guard", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const home = nodePath.join(os.tmpdir(), `yaw-test-push-salt-${process.pid}`);
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+    // Write a local vault with salt "aaa" for all tests in this block.
+    await saveVault(vaultPath(home), makeVault("YWFh", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any));
+    // Remote has a different salt "bbb" and an existing entry.
+    vi.mocked(getResource).mockResolvedValue({
+      version: 1,
+      data: makeVault("YmJi", { OTHER: { iv: "iv2", ciphertext: "ct2", authTag: "at2" } } as any),
+      updated_at: null,
+      updated_by: null,
+    });
+  });
+
+  it("without --replace returns exitCode 1 when remote salt differs", async () => {
+    const result = await runSecrets({ action: "push", home }, io);
+    expect(result.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls[0][0] as string;
+    expect(errOutput.toLowerCase()).toMatch(/different passphrase|different salt/);
+  });
+
+  it("with --replace proceeds past salt-conflict check", async () => {
+    vi.mocked(putResource).mockResolvedValue({ version: 2, data: null, updated_at: null, updated_by: null });
+    const result = await runSecrets({ action: "push", home, replace: true }, io);
+    expect(result.exitCode).toBe(0);
+    const outOutput = io.out.mock.calls.map((c) => c[0] as string).join("");
+    expect(outOutput).toMatch(/pushed|secret/i);
+  });
+});
+
+// -----------------------------------------------------------------------
 // runSecrets set -- wrong-passphrase and empty-passphrase rejection
 // -----------------------------------------------------------------------
 

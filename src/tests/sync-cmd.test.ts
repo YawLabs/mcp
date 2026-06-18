@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseSyncArgs, runSync, SYNC_USAGE } from "../sync-cmd.js";
-import { getResource, putResource, TeamSyncStaleVersionError } from "../team-sync.js";
+import { getResource, getSession, putResource, TeamSyncAuthError, TeamSyncStaleVersionError } from "../team-sync.js";
 
 // Mock team-sync so runSync tests don't need real credentials or network.
 vi.mock("../team-sync.js", async (importOriginal) => {
@@ -25,6 +25,7 @@ vi.mock("../team-sync.js", async (importOriginal) => {
   };
 });
 
+const mockGetSession = vi.mocked(getSession);
 const mockGetResource = vi.mocked(getResource);
 const mockPutResource = vi.mocked(putResource);
 
@@ -327,6 +328,173 @@ describe("sync optimistic concurrency (FIX C)", () => {
     const json = JSON.parse(io.out.mock.calls.map((c: string[]) => c[0]).join(""));
     expect(json.remoteVersion).toBe(9);
     expect(json.lastPulledVersion).toBe(7);
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSync with no session -> exitCode 1 + login message
+// -----------------------------------------------------------------------
+describe("runSync -- no session", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+
+  beforeEach(() => {
+    io.out.mockReset();
+    io.err.mockReset();
+    mockGetSession.mockReset();
+    mockGetSession.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    // Restore the default mock so other suites are not affected.
+    mockGetSession.mockResolvedValue({
+      email: "test@example.com",
+      role: "admin",
+      order_id: "order-1",
+      exp: Date.now() + 3_600_000,
+    });
+  });
+
+  it("returns exitCode 1 when getSession returns null", async () => {
+    const result = await runSync({ action: "pull" }, io);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("emits a login-hint message to stderr when not signed in", async () => {
+    await runSync({ action: "pull" }, io);
+    const errOutput = io.err.mock.calls.map((c: string[]) => c[0]).join("");
+    expect(errOutput).toMatch(/login/i);
+    expect(errOutput).toMatch(/license-key/i);
+  });
+
+  it("emits JSON error when --json is set and not signed in", async () => {
+    await runSync({ action: "pull", json: true }, io);
+    const errOutput = io.err.mock.calls.map((c: string[]) => c[0]).join("");
+    const parsed = JSON.parse(errOutput);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/license-key/i);
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSync with TeamSyncAuthError -> exitCode 1 + auth error message
+// -----------------------------------------------------------------------
+describe("runSync -- TeamSyncAuthError during action", () => {
+  let home: string;
+  const io = { out: vi.fn(), err: vi.fn() };
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-auth-"));
+    io.out.mockReset();
+    io.err.mockReset();
+    mockGetResource.mockReset();
+    mockPutResource.mockReset();
+    // Ensure session is present so we get past the login gate.
+    mockGetSession.mockResolvedValue({
+      email: "test@example.com",
+      role: "admin",
+      order_id: "order-1",
+      exp: Date.now() + 3_600_000,
+    });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("returns exitCode 1 when the action throws TeamSyncAuthError", async () => {
+    mockGetResource.mockRejectedValue(new TeamSyncAuthError("session expired"));
+    const result = await runSync({ action: "pull", home }, io);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("emits an auth-error message to stderr on TeamSyncAuthError", async () => {
+    mockGetResource.mockRejectedValue(new TeamSyncAuthError("session expired"));
+    await runSync({ action: "pull", home }, io);
+    const errOutput = io.err.mock.calls.map((c: string[]) => c[0]).join("");
+    expect(errOutput).toMatch(/session expired|revoked/i);
+    expect(errOutput).toMatch(/login/i);
+  });
+
+  it("emits JSON error when --json is set and action throws TeamSyncAuthError", async () => {
+    mockGetResource.mockRejectedValue(new TeamSyncAuthError("session expired"));
+    await runSync({ action: "pull", home, json: true }, io);
+    const errOutput = io.err.mock.calls.map((c: string[]) => c[0]).join("");
+    const parsed = JSON.parse(errOutput);
+    expect(parsed.ok).toBe(false);
+    expect(typeof parsed.error).toBe("string");
+  });
+});
+
+// -----------------------------------------------------------------------
+// mergeLocalEnv edge cases
+// -----------------------------------------------------------------------
+describe("mergeLocalEnv edge cases (via runSync pull)", () => {
+  let home: string;
+  const io = { out: vi.fn(), err: vi.fn() };
+
+  function writeBundles(servers: unknown[]): void {
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers }));
+  }
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-merge-"));
+    io.out.mockReset();
+    io.err.mockReset();
+    mockGetResource.mockReset();
+    mockPutResource.mockReset();
+    mockGetSession.mockResolvedValue({
+      email: "test@example.com",
+      role: "admin",
+      order_id: "order-1",
+      exp: Date.now() + 3_600_000,
+    });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("incoming key with empty value + local non-empty preserves local value", async () => {
+    // Local bundles.json has GITHUB_TOKEN set to a real value.
+    writeBundles([{ namespace: "github", env: { GITHUB_TOKEN: "local-secret" } }]);
+    // Remote incoming has the key stripped (empty) -- the push convention.
+    mockGetResource.mockResolvedValue({
+      data: { version: 1, servers: [{ namespace: "github", env: { GITHUB_TOKEN: "" } }] },
+      version: 2,
+      updated_at: null,
+      updated_by: null,
+    });
+
+    const result = await runSync({ action: "pull", home }, io);
+    expect(result.exitCode).toBe(0);
+
+    const written = JSON.parse(readFileSync(join(home, ".yaw-mcp", "bundles.json"), "utf8"));
+    const github = written.servers.find((s: { namespace?: string }) => s.namespace === "github");
+    // mergeLocalEnv must restore the local secret, not leave the empty incoming value.
+    expect(github?.env?.GITHUB_TOKEN).toBe("local-secret");
+  });
+
+  it("local key not in incoming is silently dropped (incoming schema wins)", async () => {
+    // Local has OLD_KEY that was removed from the remote schema.
+    writeBundles([{ namespace: "github", env: { GITHUB_TOKEN: "local-secret", OLD_KEY: "stale" } }]);
+    // Remote schema only exposes GITHUB_TOKEN.
+    mockGetResource.mockResolvedValue({
+      data: { version: 1, servers: [{ namespace: "github", env: { GITHUB_TOKEN: "" } }] },
+      version: 2,
+      updated_at: null,
+      updated_by: null,
+    });
+
+    const result = await runSync({ action: "pull", home }, io);
+    expect(result.exitCode).toBe(0);
+
+    const written = JSON.parse(readFileSync(join(home, ".yaw-mcp", "bundles.json"), "utf8"));
+    const github = written.servers.find((s: { namespace?: string }) => s.namespace === "github");
+    // OLD_KEY is no longer in the incoming schema -- it must not appear in the merged result.
+    expect("OLD_KEY" in (github?.env ?? {})).toBe(false);
+    // GITHUB_TOKEN must still be restored from the local value.
+    expect(github?.env?.GITHUB_TOKEN).toBe("local-secret");
   });
 });
 

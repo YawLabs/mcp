@@ -51,6 +51,19 @@ describe("atomicWriteFile", () => {
     expect(siblings).toEqual(["clean.json"]);
   });
 
+  // POSIX-only: Windows chmod is a no-op; the mode bits are not meaningful there.
+  it.skipIf(process.platform === "win32")(
+    "with dirMode creates parent directories with the specified mode on POSIX",
+    async () => {
+      const file = join(dir, "secret-dir", "deeper", "vault.json");
+      await atomicWriteFile(file, '{"s":1}', "utf8", undefined, 0o700);
+      expect(readFileSync(file, "utf8")).toBe('{"s":1}');
+      // Both newly-created parent directories should have mode 0o700.
+      expect(statSync(join(dir, "secret-dir")).mode & 0o777).toBe(0o700);
+      expect(statSync(join(dir, "secret-dir", "deeper")).mode & 0o777).toBe(0o700);
+    },
+  );
+
   it("leaves the original file untouched and rethrows when the rename target is unwritable", async () => {
     // Simulate failure by passing a path whose parent is a regular file --
     // mkdir returns ok (it sees the existing 'parent'), but writeFile/

@@ -35,6 +35,21 @@ describe("detectRuntimes", () => {
   });
 });
 
+describe("initRuntimeDetect token validation", () => {
+  afterEach(() => {
+    // Reset module-level state.
+    initRuntimeDetect("", "");
+  });
+
+  it("throws when token contains a newline character (CRLF injection guard)", () => {
+    expect(() => initRuntimeDetect("https://yaw.sh/mcp", "tok\nen")).toThrow(/invalid characters/);
+  });
+
+  it("throws when token contains a carriage return", () => {
+    expect(() => initRuntimeDetect("https://yaw.sh/mcp", "tok\ren")).toThrow(/invalid characters/);
+  });
+});
+
 describe("reportRuntimes", () => {
   beforeEach(() => {
     vi.clearAllMocks();

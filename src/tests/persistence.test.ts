@@ -188,6 +188,16 @@ describe("persistence.saveState", () => {
     expect(loaded.packHistory[1].namespace).toBe("linear");
   });
 
+  it("does NOT reject/throw when atomicWriteFile fails (best-effort swallow)", async () => {
+    // Point saveState at a path whose parent is a regular file so the
+    // underlying atomicWriteFile will throw ENOTDIR. saveState must swallow
+    // the error -- callers must never have an unhandled rejection from it.
+    const blockingParent = join(dir, "block.txt");
+    writeFileSync(blockingParent, "blocker", "utf8");
+    const badPath = join(blockingParent, "state.json");
+    await expect(saveState({ learning: {}, packHistory: [] }, badPath)).resolves.toBeUndefined();
+  });
+
   it("serializes concurrent saves so the later call's data wins on disk", async () => {
     const stateA = {
       learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } },

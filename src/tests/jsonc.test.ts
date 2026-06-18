@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseJsonc, stripJsoncComments, stripTrailingCommas } from "../jsonc.js";
+import { editJsoncEntry, parseJsonc, removeJsoncEntry, stripJsoncComments, stripTrailingCommas } from "../jsonc.js";
 
 describe("stripJsoncComments", () => {
   it("leaves plain JSON untouched", () => {
@@ -103,6 +103,41 @@ describe("stripTrailingCommas", () => {
   it("preserves string content unchanged", () => {
     const src = '{"url":"https://example.com/api,"}';
     expect(stripTrailingCommas(src)).toBe(src);
+  });
+});
+
+describe("editJsoncEntry", () => {
+  it("round-trips a JSONC file preserving comments", () => {
+    const src = '// top-level comment\n{\n  "a": 1, // inline\n  "b": 2\n}';
+    const result = editJsoncEntry(src, [], "b", 99);
+    // Comment must survive
+    expect(result).toContain("// top-level comment");
+    expect(result).toContain("// inline");
+    // Value must be updated
+    const parsed = parseJsonc(result);
+    expect((parsed as Record<string, unknown>).b).toBe(99);
+    expect((parsed as Record<string, unknown>).a).toBe(1);
+  });
+
+  it("handles BOM-prefixed input without throwing", () => {
+    // Notepad on Windows writes a UTF-8 BOM before the first char.
+    const bom = "﻿";
+    const src = `${bom}{"x": 1}`;
+    const result = editJsoncEntry(src, [], "x", 42);
+    const parsed = parseJsonc(result);
+    expect((parsed as Record<string, unknown>).x).toBe(42);
+  });
+});
+
+describe("removeJsoncEntry", () => {
+  it("removes the specified key while preserving other content", () => {
+    const src = '// header\n{\n  "keep": "yes",\n  "remove": "gone"\n}';
+    const result = removeJsoncEntry(src, [], "remove");
+    // The header comment and the kept key must survive
+    expect(result).toContain("// header");
+    const parsed = parseJsonc(result);
+    expect((parsed as Record<string, unknown>).keep).toBe("yes");
+    expect((parsed as Record<string, unknown>).remove).toBeUndefined();
   });
 });
 

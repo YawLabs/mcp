@@ -159,4 +159,59 @@ describe("LearningStore", () => {
       expect(store.boostFactor("mild")).toBeGreaterThan(store.boostFactor("severe"));
     });
   });
+
+  describe("exportSnapshot / loadSnapshot round-trip", () => {
+    it("export then load returns equivalent state", () => {
+      const store = new LearningStore();
+      store.loadSnapshot({
+        gh: { dispatched: 10, succeeded: 8, lastUsedAt: 1_000_000 },
+        slack: { dispatched: 5, succeeded: 5, lastUsedAt: 2_000_000 },
+      });
+
+      const snapshot = store.exportSnapshot();
+      const store2 = new LearningStore();
+      store2.loadSnapshot(snapshot);
+
+      expect(store2.get("gh")).toEqual({ dispatched: 10, succeeded: 8, lastUsedAt: 1_000_000 });
+      expect(store2.get("slack")).toEqual({ dispatched: 5, succeeded: 5, lastUsedAt: 2_000_000 });
+      // boost factors must be identical after round-trip
+      expect(store2.boostFactor("gh")).toBe(store.boostFactor("gh"));
+      expect(store2.boostFactor("slack")).toBe(store.boostFactor("slack"));
+    });
+
+    it("round-tripping an empty store produces an empty store", () => {
+      const store = new LearningStore();
+      const snapshot = store.exportSnapshot();
+      const store2 = new LearningStore();
+      store2.loadSnapshot(snapshot);
+      expect(store2.get("anything")).toBeUndefined();
+    });
+  });
+
+  describe("recordMiss", () => {
+    it("increments dispatched without incrementing succeeded", () => {
+      const store = new LearningStore();
+      store.recordMiss("gh");
+      const u = store.get("gh");
+      expect(u?.dispatched).toBe(1);
+      expect(u?.succeeded).toBe(0);
+    });
+
+    it("boostFactor reflects the lower success rate after misses", () => {
+      const store = new LearningStore();
+      // Seed 3 genuine successes to pass the observation floor.
+      store.loadSnapshot({ gh: { dispatched: 3, succeeded: 3, lastUsedAt: 1 } });
+      const boostBefore = store.boostFactor("gh");
+      expect(boostBefore).toBeGreaterThanOrEqual(1.0);
+
+      // Add 10 misses: dispatched=13, succeeded=3 -> rate ~23%, well below 80%.
+      for (let i = 0; i < 10; i++) {
+        store.recordMiss("gh");
+      }
+      const boostAfter = store.boostFactor("gh");
+      // Penalty branch should fire and bring the factor below 1.0.
+      expect(boostAfter).toBeLessThan(1.0);
+      expect(boostAfter).toBeGreaterThanOrEqual(LEARNING_MIN_BOOST);
+    });
+  });
 });

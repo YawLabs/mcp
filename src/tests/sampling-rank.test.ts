@@ -8,6 +8,7 @@ import {
   MAX_SAMPLES,
   parseRouteEffort,
   parseTiebreakResponse,
+  SAMPLING_TIMEOUT_MS,
   shouldSample,
   shouldTiebreak,
   tiebreakViaSampling,
@@ -93,6 +94,20 @@ describe("parseTiebreakResponse", () => {
     // we must not return github just because it iterates first.
     expect(parseTiebreakResponse("I prefer gitlab over github", candidates)).toBe("gitlab");
     expect(parseTiebreakResponse("github vs gitlab -- pick github", candidates)).toBe("github");
+  });
+
+  it("handles a namespace containing regex-special characters without throwing", () => {
+    // Namespaces like "aws+s3" contain '+', which is a regex quantifier.
+    // escapeRegex must neutralize it so the RegExp constructor doesn't throw
+    // and the match still works correctly.
+    const specialCandidates = [
+      { namespace: "aws+s3", score: 1.0, tools: [{ name: "list_buckets" }] },
+      { namespace: "github", score: 0.9, tools: [{ name: "create_issue" }] },
+    ];
+    expect(() => parseTiebreakResponse("I pick aws+s3 for this task.", specialCandidates)).not.toThrow();
+    expect(parseTiebreakResponse("I pick aws+s3 for this task.", specialCandidates)).toBe("aws+s3");
+    // Non-matching response should still return null cleanly.
+    expect(parseTiebreakResponse("neither", specialCandidates)).toBeNull();
   });
 });
 
@@ -417,5 +432,29 @@ describe("bestOfNViaSampling", () => {
     const server = mockServer({ sampling: {} }, createMessage);
     const out = await bestOfNViaSampling(server, "intent", candidates, 3);
     expect(out).toBe("github");
+  });
+
+  it("returns null when all samples resolve after SAMPLING_TIMEOUT_MS", async () => {
+    // All sample promises resolve after the timeout deadline. The race must
+    // resolve to null (falling back to the ranker's order) rather than
+    // hanging indefinitely or waiting for the slow samples to finish.
+    vi.useFakeTimers();
+    try {
+      const createMessage = vi.fn().mockImplementation(
+        () =>
+          new Promise<unknown>((resolve) => {
+            // Resolves well after the timeout window.
+            setTimeout(() => resolve({ content: { type: "text", text: "github" } }), SAMPLING_TIMEOUT_MS + 5_000);
+          }),
+      );
+      const server = mockServer({ sampling: {} }, createMessage);
+      const resultPromise = bestOfNViaSampling(server, "intent", candidates, 3);
+      // Advance past the timeout so the race resolves.
+      await vi.advanceTimersByTimeAsync(SAMPLING_TIMEOUT_MS + 100);
+      const out = await resultPromise;
+      expect(out).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -96,6 +96,20 @@ describe("buildGraderPrompt", () => {
     const p = buildGraderPrompt({ toolName: "list_prs", resultText: "[]" });
     expect(p).not.toContain("Goal:");
   });
+
+  it("truncates fenced content at 4000 chars and appends the truncation marker", () => {
+    // Build resultText that is longer than the 4000-char cap.
+    const longResult = "A".repeat(5000);
+    const p = buildGraderPrompt({ toolName: "t", resultText: longResult });
+    // The fenced region must not contain the full 5000 chars.
+    expect(p.length).toBeLessThan(5000 + 500); // rough upper bound for prompt overhead
+    // The truncation marker must appear inside the fenced block.
+    expect(p).toContain("...<truncated>");
+    // The first 4000 chars of resultText must be present.
+    expect(p).toContain("A".repeat(4000));
+    // Char 4001 onwards must NOT be present (they were cut off).
+    expect(p).not.toContain("A".repeat(4001));
+  });
 });
 
 describe("parseGrade", () => {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ADAPTIVE_BONUS_CAP,
+  ADAPTIVE_LOOKBACK,
   ADAPTIVE_MAX,
   ADAPTIVE_MIN,
   ADAPTIVE_WINDOW_MS,
@@ -98,6 +99,71 @@ describe("adaptiveThreshold", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("only considers the last ADAPTIVE_LOOKBACK same-namespace entries (cap)", () => {
+    // Build a history with ADAPTIVE_LOOKBACK + 5 recent gh entries. All are
+    // within the time window, but only ADAPTIVE_LOOKBACK of them should be
+    // examined. Each counts as +2 bonus; capping at ADAPTIVE_LOOKBACK entries
+    // means the bonus is min(ADAPTIVE_LOOKBACK * 2, ADAPTIVE_BONUS_CAP).
+    // ADAPTIVE_LOOKBACK=20, ADAPTIVE_BONUS_CAP=20 -> bonus=20 regardless of
+    // whether we examine 20 or 25 entries (both saturate the cap at 20).
+    // To make the cap *observable*, we need a history where beyond-cap entries
+    // would change the result if they were counted. We do that by mixing
+    // "far future" timestamps (would count as extra recent hits if examined)
+    // past the cap position, and OLD timestamps (outside the window) at the
+    // cap boundary.
+    //
+    // Strategy: place ADAPTIVE_LOOKBACK entries outside the window (old) and
+    // then 5 entries inside the window. The cap stops the walk at the 20th
+    // same-ns entry, which is one of the old ones. Only the 5 recent inner
+    // entries are within the window, contributing 5*2=10 bonus, not 20.
+    // If the cap were absent the walk would continue and find all old entries
+    // too (but they're outside the window so bonus stays 10 either way --
+    // we need a different arrangement).
+    //
+    // Actually simpler arrangement: 5 recent "inner" entries PLUS
+    // ADAPTIVE_LOOKBACK entries that are ALSO recent but interleaved with
+    // OTHER-namespace entries so they appear beyond the cap. After walking
+    // back ADAPTIVE_LOOKBACK same-ns hits (the 5 + 15 from the deep set),
+    // any remaining recent same-ns entries should be ignored.
+    //
+    // Clearest proof: build a history of exactly ADAPTIVE_LOOKBACK + 10
+    // recent same-ns entries (all within the window). Without the cap all
+    // 30 would be counted but the bonus is already capped at ADAPTIVE_BONUS_CAP
+    // so we can't distinguish 20 vs 30 that way. Instead use a low-enough
+    // count so that "first ADAPTIVE_LOOKBACK" vs "all entries" produces a
+    // different bonus when the cap fires.
+    //
+    // Use ADAPTIVE_LOOKBACK=20 entries: the first (newest) 5 are WITHIN the
+    // window, the next 15 are OUTSIDE the window. Then add 5 more entries
+    // that are within the window but should be skipped by the cap (they are
+    // beyond the 20th same-ns entry from the tail). The expected bonus
+    // is 5*2=10 (only the first 5 recent entries count before the cap halts
+    // the walk at the 20th same-ns entry which is outside the window).
+    const history: ToolCallRecord[] = [];
+    // 5 extra entries that are INSIDE the window but appear BEFORE the cap
+    // group in the array (so they are walked AFTER the cap group when
+    // iterating backwards -- i.e. they would be examined beyond position 20).
+    for (let i = 0; i < 5; i++) {
+      history.push({ namespace: "gh", at: NOW - (i + 1) * 1000 }); // recent, should be capped out
+    }
+    // ADAPTIVE_LOOKBACK entries: the first 5 are recent, the remaining 15
+    // are outside the window. These appear AFTER the extra 5 in the array
+    // so they are seen first when walking backwards.
+    for (let i = 0; i < ADAPTIVE_LOOKBACK; i++) {
+      const offsetMs =
+        i < 5
+          ? (i + 6) * 1000 // recent (inside window)
+          : ADAPTIVE_WINDOW_MS + (i + 1) * 1000; // old (outside window)
+      history.push({ namespace: "gh", at: NOW - offsetMs });
+    }
+    // Walking backwards: the last ADAPTIVE_LOOKBACK entries (oldest 20 in the
+    // push order) are encountered first. Those 20 constitute the cap group:
+    // 5 recent + 15 old -> sameNsSeen reaches ADAPTIVE_LOOKBACK, loop stops.
+    // The 5 extra entries prepended earlier are never examined.
+    // Bonus = 5 * 2 = 10 -> threshold = 10 + 10 = 20.
+    expect(adaptiveThreshold("gh", history, 10, NOW)).toBe(20);
   });
 });
 

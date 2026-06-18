@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -104,6 +104,20 @@ describe("redactIntent", () => {
     expect(r.tokens).toContain("plus");
     expect(r.tokens).toContain("normalword");
   });
+
+  it("strips an email address before tokenize and increments redactedCount", () => {
+    // The RAW_PII_PATTERNS email regex fires on the raw string before tokenize()
+    // shreds it. The whole address is replaced with a space, so "user",
+    // "example", and "com" never reach the token bag.
+    const r = redactIntent("send email to user@example.com");
+    expect(r.redactedCount).toBe(1);
+    expect(r.tokens).not.toContain("user");
+    expect(r.tokens).not.toContain("example");
+    expect(r.tokens).not.toContain("com");
+    // Ordinary words from the rest of the intent survive.
+    expect(r.tokens).toContain("send");
+    expect(r.tokens).toContain("email");
+  });
 });
 
 describe("appendFoundryTrace", () => {
@@ -164,5 +178,19 @@ describe("appendFoundryTrace", () => {
     process.env.YAW_MCP_FOUNDRY = "1";
     // A path with a NUL byte cannot be created; the helper must swallow it.
     await expect(appendFoundryTrace(trace, "\0bad")).resolves.toBeUndefined();
+  });
+
+  it("does not append when foundry.jsonl is already at the 5 MiB cap", async () => {
+    process.env.YAW_MCP_FOUNDRY = "1";
+    const dir = join(home, ".yaw-mcp");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "foundry.jsonl");
+    // Write exactly MAX_FOUNDRY_BYTES (5 MiB) of content so stat().size >= cap.
+    const MAX_FOUNDRY_BYTES = 5 * 1024 * 1024;
+    writeFileSync(file, Buffer.alloc(MAX_FOUNDRY_BYTES, "x"));
+    const sizeBefore = MAX_FOUNDRY_BYTES;
+    await appendFoundryTrace(trace, home);
+    const sizeAfter = readFileSync(file).length;
+    expect(sizeAfter).toBe(sizeBefore);
   });
 });

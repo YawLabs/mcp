@@ -25,7 +25,7 @@ export interface ReadToolResult {
 // exact raw name — this prevents false-positive stripping for tools
 // whose bare name happens to start with the namespace prefix string.
 export function normalizeToolName(namespace: string, raw: string, tools?: Array<{ name: string }>): string {
-  if (tools && tools.some((t) => t.name === raw)) return raw;
+  if (tools?.some((t) => t.name === raw)) return raw;
   const prefix = `${namespace}_`;
   if (raw.startsWith(prefix) && raw.length > prefix.length) return raw.slice(prefix.length);
   return raw;
