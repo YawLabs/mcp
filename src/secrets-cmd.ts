@@ -165,13 +165,15 @@ export function parseSecretsArgs(
     }
     if (a === "--secret") {
       const v = argv[++i];
-      if (v === undefined) return { ok: false, error: `yaw-mcp secrets: --secret requires a value\n\n${SECRETS_USAGE}` };
+      if (v === undefined)
+        return { ok: false, error: `yaw-mcp secrets: --secret requires a value\n\n${SECRETS_USAGE}` };
       opts.secretFilter = v;
       continue;
     }
     if (a === "--server") {
       const v = argv[++i];
-      if (v === undefined) return { ok: false, error: `yaw-mcp secrets: --server requires a value\n\n${SECRETS_USAGE}` };
+      if (v === undefined)
+        return { ok: false, error: `yaw-mcp secrets: --server requires a value\n\n${SECRETS_USAGE}` };
       opts.serverFilter = v;
       continue;
     }

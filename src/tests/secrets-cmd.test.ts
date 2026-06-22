@@ -720,7 +720,8 @@ describe("runSecrets rotate", () => {
     lock();
 
     const r = await runSecrets(
-      { action: "rotate", passphrase: "wrong-current", newPassphrase: "whatever-new", home }, io,
+      { action: "rotate", passphrase: "wrong-current", newPassphrase: "whatever-new", home },
+      io,
     );
     expect(r.exitCode).toBe(1);
     // On-disk vault untouched by the aborted rotate.
@@ -728,9 +729,7 @@ describe("runSecrets rotate", () => {
   });
 
   it("errors when there is no vault to rotate", async () => {
-    const r = await runSecrets(
-      { action: "rotate", passphrase: "x", newPassphrase: "y", home }, io,
-    );
+    const r = await runSecrets({ action: "rotate", passphrase: "x", newPassphrase: "y", home }, io);
     expect(r.exitCode).toBe(1);
     const err = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(err.toLowerCase()).toContain("no vault");

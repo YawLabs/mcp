@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { META_TOOLS, META_TOOL_NAMES, computeSecretsReport } from "../meta-tools.js";
+import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "../meta-tools.js";
 
 describe("mcp_connect_secrets meta-tool definition", () => {
   it("is registered with values-free annotations", () => {

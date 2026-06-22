@@ -2,13 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  AUDIT_TAIL_CAP,
-  type AuditEvent,
-  appendAuditEvent,
-  auditLogPath,
-  readAuditLog,
-} from "../secrets-audit.js";
+import { AUDIT_TAIL_CAP, type AuditEvent, appendAuditEvent, auditLogPath, readAuditLog } from "../secrets-audit.js";
 
 let home: string;
 

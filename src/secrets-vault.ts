@@ -240,11 +240,7 @@ export function isUnlocked(): boolean {
  * see (the returned vault holds only ciphertext); the local `plaintext`
  * map here is best-effort cleared before return.
  */
-export async function rotateVault(
-  vault: VaultFile,
-  oldKey: Buffer,
-  newPassphrase: string,
-): Promise<VaultFile> {
+export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphrase: string): Promise<VaultFile> {
   // Step 1: verify the old key against the check marker first, so a wrong
   // old passphrase aborts loudly before we attempt any entry decrypt.
   if (vault.check) {
