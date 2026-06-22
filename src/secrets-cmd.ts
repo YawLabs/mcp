@@ -14,6 +14,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { CONFIG_DIRNAME } from "./paths.js";
+import { type AuditEvent, readAuditLog } from "./secrets-audit.js";
 import {
   getSecret,
   listKeys,
@@ -21,6 +22,7 @@ import {
   lock,
   newVault,
   removeSecret,
+  rotateVault,
   saveVault,
   setSecret,
   unlock,
@@ -53,6 +55,19 @@ Actions:
                           \`yaw-mcp login\` first. Refuses when the local
                           vault has a different salt (different passphrase
                           lineage) unless --force is passed.
+  rotate                  Re-encrypt every entry under a NEW passphrase
+                          (fresh salt + derived key). Re-wraps the
+                          ENCRYPTION, NOT the underlying token values -- a
+                          leaked token is still leaked; rotate it at its
+                          source. Reads the current passphrase, then the
+                          new one (env YAW_MCP_VAULT_PASSPHRASE_NEW or a
+                          confirm-twice TTY prompt). Pass --push to also
+                          upload the re-encrypted blob to mcp_secrets.
+  audit [--secret NAME] [--server NS]
+                          Show the local secret-resolution audit trail
+                          (~/.yaw-mcp/secrets-audit.log): which secret
+                          NAMES were injected into (or missing for) which
+                          server, and when. Never shows a value.
 
 Flags:
   --json                  Machine-readable output (where applicable).
@@ -64,15 +79,21 @@ Flags:
   --replace               (push only) Overwrite even when the remote vault
                           salt differs from the local (different passphrase
                           lineage). Coordinate with your team first.
+  --push                  (rotate only) After re-encrypting, push the new
+                          blob to mcp_secrets (requires a login session).
+  --secret <name>         (audit only) Filter to one secret name.
+  --server <ns>           (audit only) Filter to one server namespace.
 
 Passphrase:
   Set YAW_MCP_VAULT_PASSPHRASE in the env, or you will be prompted on
   the controlling TTY. The passphrase derives the encryption key via
   scrypt and is cached in memory for the lifetime of this yaw-mcp
-  process; the on-disk vault only ever holds ciphertext.`;
+  process; the on-disk vault only ever holds ciphertext. For rotate, the
+  NEW passphrase comes from YAW_MCP_VAULT_PASSPHRASE_NEW (or a TTY
+  confirm-twice prompt).`;
 
 export interface SecretsCommandOptions {
-  action?: "set" | "get" | "list" | "remove" | "lock" | "push" | "pull";
+  action?: "set" | "get" | "list" | "remove" | "lock" | "push" | "pull" | "rotate" | "audit";
   name?: string;
   value?: string;
   fromStdin?: boolean;
@@ -82,9 +103,17 @@ export interface SecretsCommandOptions {
   /** For `push`: overwrite even when the remote vault salt differs from local
    *  (i.e. team is rotating the vault passphrase). */
   replace?: boolean;
+  /** For `rotate`: after re-encrypting, push the new blob to mcp_secrets. */
+  push?: boolean;
+  /** For `audit`: filter to one secret name. */
+  secretFilter?: string;
+  /** For `audit`: filter to one server namespace. */
+  serverFilter?: string;
   /** Test hooks. */
   home?: string;
   passphrase?: string;
+  /** For `rotate`: the NEW passphrase (overrides env + TTY prompt in tests). */
+  newPassphrase?: string;
   baseUrl?: string;
   io?: {
     stdin: NodeJS.ReadableStream;
@@ -116,6 +145,10 @@ export function parseSecretsArgs(
       opts.replace = true;
       continue;
     }
+    if (a === "--push") {
+      opts.push = true;
+      continue;
+    }
     if (a === "--value") {
       const v = argv[++i];
       // Reject a following flag (e.g. `secrets set NAME --value --json`)
@@ -130,6 +163,18 @@ export function parseSecretsArgs(
       opts.value = v;
       continue;
     }
+    if (a === "--secret") {
+      const v = argv[++i];
+      if (v === undefined) return { ok: false, error: `yaw-mcp secrets: --secret requires a value\n\n${SECRETS_USAGE}` };
+      opts.secretFilter = v;
+      continue;
+    }
+    if (a === "--server") {
+      const v = argv[++i];
+      if (v === undefined) return { ok: false, error: `yaw-mcp secrets: --server requires a value\n\n${SECRETS_USAGE}` };
+      opts.serverFilter = v;
+      continue;
+    }
     if (a.startsWith("-")) {
       return { ok: false, error: `yaw-mcp secrets: unknown flag "${a}"\n\n${SECRETS_USAGE}` };
     }
@@ -141,7 +186,9 @@ export function parseSecretsArgs(
         a !== "remove" &&
         a !== "lock" &&
         a !== "push" &&
-        a !== "pull"
+        a !== "pull" &&
+        a !== "rotate" &&
+        a !== "audit"
       ) {
         return { ok: false, error: `yaw-mcp secrets: unknown action "${a}"\n\n${SECRETS_USAGE}` };
       }
@@ -219,6 +266,41 @@ async function resolvePassphrase(opts: SecretsCommandOptions): Promise<string | 
     const entered = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout);
     if (entered.length > 0) return entered;
     stdout.write("Passphrase cannot be empty.\n");
+  }
+  return null;
+}
+
+/** Resolve the NEW passphrase for `rotate`. Precedence:
+ *    1. opts.newPassphrase (test hook)
+ *    2. YAW_MCP_VAULT_PASSPHRASE_NEW env var
+ *    3. TTY confirm-twice prompt (must match; non-empty)
+ *  Returns null when none can be obtained (non-TTY + no env) or the two
+ *  TTY entries disagree after the allowed prompts. */
+async function resolveNewPassphrase(opts: SecretsCommandOptions): Promise<string | null> {
+  if (opts.newPassphrase !== undefined) return opts.newPassphrase.length > 0 ? opts.newPassphrase : null;
+  const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    if (fromEnv.length < MIN_PASSPHRASE_WARN_LEN) {
+      const stderr = opts.io?.stderr ?? process.stderr;
+      stderr.write(
+        `yaw-mcp secrets: warning -- the new passphrase is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.\n`,
+      );
+    }
+    return fromEnv;
+  }
+  const stdin = opts.io?.stdin ?? process.stdin;
+  const stdout = opts.io?.stdout ?? process.stdout;
+  const isTTY = (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
+  if (!isTTY) return null;
+  for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
+    const first = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout, "New vault passphrase: ");
+    if (first.length === 0) {
+      stdout.write("Passphrase cannot be empty.\n");
+      continue;
+    }
+    const second = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm new passphrase: ");
+    if (first === second) return first;
+    stdout.write("Passphrases did not match. Try again.\n");
   }
   return null;
 }
@@ -336,6 +418,15 @@ export async function runSecrets(
   }
   if (opts.action === "pull") {
     return await runSecretsPull(opts, io);
+  }
+  if (opts.action === "rotate") {
+    return await runSecretsRotate(opts, io);
+  }
+
+  // audit is a read-only command -- no passphrase needed (it never
+  // touches ciphertext, only the names/timestamps in the audit log).
+  if (opts.action === "audit") {
+    return await runSecretsAudit(opts, io);
   }
 
   if (opts.action === "list") {
@@ -619,6 +710,176 @@ async function runSecretsPull(
     else io.err(`yaw-mcp secrets pull: ${message}\n`);
     return { exitCode: 1 };
   }
+}
+
+/**
+ * Re-encrypt the whole vault under a new passphrase.
+ *
+ * Flow:
+ *   1. Load the local vault; error if none.
+ *   2. Resolve + verify the CURRENT passphrase (unlock validates the key
+ *      against vault.check, so a wrong current passphrase is rejected
+ *      before any rotation).
+ *   3. Resolve the NEW passphrase (env / TTY confirm-twice).
+ *   4. rotateVault decrypts every entry under the old key FIRST (aborting
+ *      on any failure with the on-disk vault untouched), then re-encrypts
+ *      under a fresh salt + the new key.
+ *   5. Save atomically, lock() to drop the stale in-memory key.
+ *   6. If --push and a session exists, push the re-encrypted blob.
+ */
+async function runSecretsRotate(
+  opts: SecretsCommandOptions,
+  io: { out: (s: string) => void; err: (s: string) => void },
+): Promise<SecretsCommandResult> {
+  const home = opts.home ?? homedir();
+  const path = vaultPath(home);
+
+  const vault = await loadVault(path);
+  if (!vault) {
+    const msg = `No vault at ${path} to rotate. Run \`yaw-mcp secrets set <name>\` first.`;
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    return { exitCode: 1 };
+  }
+
+  const currentPassphrase = await resolvePassphrase(opts);
+  if (currentPassphrase === null) {
+    const msg = "Current passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.";
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    return { exitCode: 1 };
+  }
+
+  let oldKey: Buffer;
+  try {
+    oldKey = await unlock(vault, currentPassphrase);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    return { exitCode: 1 };
+  }
+
+  const newPassphrase = await resolveNewPassphrase(opts);
+  if (newPassphrase === null) {
+    const msg =
+      "New passphrase required (and must be confirmed). Set YAW_MCP_VAULT_PASSPHRASE_NEW or run from a TTY so we can prompt.";
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    return { exitCode: 1 };
+  }
+
+  let rotated: VaultFile;
+  try {
+    // rotateVault decrypts EVERY entry first; if any fails it throws
+    // before re-encrypting, so the on-disk vault stays untouched.
+    rotated = await rotateVault(vault, oldKey, newPassphrase);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+    // On-disk vault is untouched by definition (we never reached save).
+    lock();
+    return { exitCode: 1 };
+  }
+
+  await saveVault(path, rotated);
+  // Drop the stale key derived from the OLD passphrase. The salt changed,
+  // so the next secrets command must re-derive against the new passphrase.
+  lock();
+
+  const count = Object.keys(rotated.entries).length;
+
+  // Optional push of the re-encrypted blob -- only when --push AND a
+  // session exists. No auto-push by design.
+  let pushedVersion: number | null = null;
+  if (opts.push) {
+    const session = await getSession({ home, baseUrl: opts.baseUrl });
+    if (!session) {
+      const msg = "Rotated locally, but --push needs a session. Run `yaw-mcp login --key <license-key>` then push.";
+      if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, note: msg })}\n`);
+      else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
+      // Local rotation succeeded; surface the push gap but don't fail the
+      // whole command -- the rotation is the primary effect.
+      return { exitCode: 0 };
+    }
+    try {
+      const remote = await getResource<VaultFile>(MCP_SECRETS_RESOURCE, { home, baseUrl: opts.baseUrl });
+      const result = await putResource<VaultFile>(MCP_SECRETS_RESOURCE, remote.version, rotated, {
+        home,
+        baseUrl: opts.baseUrl,
+      });
+      pushedVersion = result.version;
+    } catch (err) {
+      if (err instanceof TeamSyncStaleVersionError) {
+        const hint = `Rotated locally. Push skipped -- remote is at v${err.currentVersion}; pull and reconcile, then push.`;
+        if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, note: hint })}\n`);
+        else io.err(`yaw-mcp secrets rotate: ${hint}\n`);
+        return { exitCode: 0 };
+      }
+      if (err instanceof TeamSyncAuthError) {
+        const hint = "Rotated locally. Push skipped -- session expired. Run `yaw-mcp login` again, then push.";
+        if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, note: hint })}\n`);
+        else io.err(`yaw-mcp secrets rotate: ${hint}\n`);
+        return { exitCode: 0 };
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, error: message })}\n`);
+      else io.err(`yaw-mcp secrets rotate: rotated locally but push failed: ${message}\n`);
+      return { exitCode: 0 };
+    }
+  }
+
+  if (opts.json) {
+    io.out(
+      `${JSON.stringify({ ok: true, rotated: true, secret_count: count, pushed: pushedVersion !== null, ...(pushedVersion !== null ? { new_version: pushedVersion } : {}) })}\n`,
+    );
+  } else {
+    io.out(
+      `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase (encryption re-wrapped, token values unchanged).\n`,
+    );
+    if (pushedVersion !== null) io.out(`Pushed the re-encrypted vault -> mcp_secrets v${pushedVersion}.\n`);
+    io.out("Vault locked -- the next secrets command will prompt for the new passphrase.\n");
+  }
+  return { exitCode: 0 };
+}
+
+/** Render + filter the local secret-resolution audit log. Read-only; never
+ *  decrypts anything (the log holds only names/timestamps). */
+async function runSecretsAudit(
+  opts: SecretsCommandOptions,
+  io: { out: (s: string) => void; err: (s: string) => void },
+): Promise<SecretsCommandResult> {
+  const home = opts.home ?? homedir();
+  let events: AuditEvent[];
+  try {
+    events = await readAuditLog(
+      {
+        ...(opts.secretFilter !== undefined ? { secret: opts.secretFilter } : {}),
+        ...(opts.serverFilter !== undefined ? { server: opts.serverFilter } : {}),
+      },
+      home,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets audit: ${msg}\n`);
+    return { exitCode: 1 };
+  }
+
+  if (opts.json) {
+    io.out(`${JSON.stringify({ ok: true, count: events.length, events }, null, 2)}\n`);
+    return { exitCode: 0 };
+  }
+
+  if (events.length === 0) {
+    io.out("No secret-resolution audit events recorded yet.\n");
+    return { exitCode: 0 };
+  }
+  for (const e of events) {
+    io.out(`${e.ts}  ${e.event === "injected" ? "injected" : "missing "}  ${e.server}  ${e.secret}\n`);
+  }
+  return { exitCode: 0 };
 }
 
 // Expose for vault file path tests

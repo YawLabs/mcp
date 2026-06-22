@@ -214,6 +214,86 @@ export function isUnlocked(): boolean {
   return cachedKey !== null;
 }
 
+/**
+ * Re-encrypt every entry (and the verification check) under a NEW
+ * passphrase. Returns a fresh VaultFile the caller saves atomically; it
+ * does NOT touch disk or the module key cache.
+ *
+ * Crypto discipline -- decrypt-all-BEFORE-write:
+ *   1. Decrypt the `check` marker (if present) with `oldKey`. A failure
+ *      means the supplied old passphrase is wrong -- throw before any
+ *      re-encryption so the caller never overwrites a good vault with a
+ *      mis-keyed one.
+ *   2. Decrypt EVERY entry into memory. If ANY entry fails to decrypt
+ *      (corruption, key mismatch), throw immediately -- nothing is
+ *      re-encrypted, so the on-disk vault the caller still holds is
+ *      untouched and recoverable.
+ *   3. Only after all plaintext is in hand: generate a fresh salt,
+ *      derive `newKey`, and re-encrypt every entry + a fresh check
+ *      marker under it.
+ *
+ * Rotate re-wraps the ENCRYPTION (salt + derived key), not the underlying
+ * token VALUES -- a leaked token is still leaked; rotate the token at its
+ * source for that.
+ *
+ * The caller is responsible for zeroizing the decrypted plaintext it can
+ * see (the returned vault holds only ciphertext); the local `plaintext`
+ * map here is best-effort cleared before return.
+ */
+export async function rotateVault(
+  vault: VaultFile,
+  oldKey: Buffer,
+  newPassphrase: string,
+): Promise<VaultFile> {
+  // Step 1: verify the old key against the check marker first, so a wrong
+  // old passphrase aborts loudly before we attempt any entry decrypt.
+  if (vault.check) {
+    try {
+      const probe = decryptEntry(vault.check, oldKey);
+      if (probe !== VAULT_CHECK_PLAINTEXT) {
+        throw new Error("vault check marker did not match expected plaintext");
+      }
+    } catch {
+      throw new Error("rotate aborted: current passphrase is wrong (vault check failed to decrypt)");
+    }
+  }
+
+  // Step 2: decrypt every entry into memory. Any failure aborts the whole
+  // rotation -- the on-disk vault stays untouched.
+  const plaintext = new Map<string, string>();
+  for (const [name, entry] of Object.entries(vault.entries)) {
+    try {
+      plaintext.set(name, decryptEntry(entry, oldKey));
+    } catch {
+      // Best-effort scrub of whatever we already decrypted before bailing.
+      plaintext.clear();
+      throw new Error(`rotate aborted: entry "${name}" failed to decrypt under the current passphrase`);
+    }
+  }
+
+  // Step 3: all plaintext in hand -- derive a fresh key under a new salt
+  // and re-encrypt everything (entries + a fresh check marker).
+  const newSalt = generateSalt();
+  const newKey = await deriveKey(newPassphrase, newSalt);
+  try {
+    const entries: Record<string, EncryptedEntry> = {};
+    for (const [name, value] of plaintext) {
+      entries[name] = encryptEntry(value, newKey);
+    }
+    return {
+      version: SECRETS_SCHEMA_VERSION,
+      salt: newSalt.toString("base64"),
+      entries,
+      check: encryptEntry(VAULT_CHECK_PLAINTEXT, newKey),
+    };
+  } finally {
+    // Best-effort: drop references to plaintext. Strings can't be wiped in
+    // V8, but clearing the map removes our held references promptly.
+    plaintext.clear();
+    newKey.fill(0);
+  }
+}
+
 // ---------------------------------------------------------------------
 // Public ops -- pure functions over VaultFile + cached key. Callers
 // orchestrate load -> unlock -> mutate -> save.
@@ -269,7 +349,13 @@ export function newVault(): VaultFile {
  *     with the secret. Inline composition (e.g. `Bearer ${secret:GH}`)
  *     also works -- the regex replaces just the reference span.
  */
-const SECRET_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
+/** Matches a `${secret:NAME}` reference. Exported so callers that only
+ *  need the NAMES referenced in an env map (e.g. the values-free
+ *  mcp_connect_secrets meta-tool) can scan without decrypting anything.
+ *  Global flag => callers using `.exec`/`.matchAll` must mind lastIndex
+ *  (reset by creating a fresh RegExp or using String.matchAll, which
+ *  clones internally). */
+export const SECRET_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
 export function resolveSecretRefs(
   env: Record<string, string>,
   vault: VaultFile,

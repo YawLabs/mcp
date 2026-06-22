@@ -8,6 +8,7 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./logger.js";
+import { appendAuditEvent } from "./secrets-audit.js";
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, vaultPath } from "./secrets-vault.js";
 import type {
   UpstreamConnection,
@@ -34,7 +35,7 @@ import { resolveUvSpawn } from "./uv-bootstrap.js";
  * step that pre-seeds the derived key into a session file -- that
  * is deferred to a follow-up.
  */
-async function resolveServerEnv(env: Record<string, string>): Promise<Record<string, string>> {
+async function resolveServerEnv(env: Record<string, string>, namespace: string): Promise<Record<string, string>> {
   if (!hasSecretRefs(env)) return env;
   const refKeys = Object.entries(env)
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
@@ -58,7 +59,50 @@ async function resolveServerEnv(env: Record<string, string>): Promise<Record<str
   if (missing.length > 0) {
     throw new Error(`vault: missing or undecryptable secret refs: ${missing.join(", ")}`);
   }
+  // Audit which secrets were consumed for this spawn -- NAME + namespace
+  // only, never a value. Wrapped in try/catch (and each append is itself
+  // fail-open) so a broken audit log can never block the spawn. Runs only
+  // after a fully successful resolve (no missing refs reach this point --
+  // we throw above), so every recorded event is an "injected".
+  try {
+    await recordResolveAudit(namespace, env, missing);
+  } catch (auditErr) {
+    log("warn", "Failed to record secret-resolve audit (non-fatal)", {
+      namespace,
+      error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+    });
+  }
   return resolved;
+}
+
+/**
+ * Append one audit event per secret reference this spawn touched:
+ *   - "injected" for each distinct secret NAME that was successfully
+ *     resolved (referenced in env AND not in the `missing` set),
+ *   - "missing" for each name the vault lacked.
+ * Names only -- the value is never read here, let alone written.
+ */
+async function recordResolveAudit(namespace: string, env: Record<string, string>, missing: string[]): Promise<void> {
+  const missingSet = new Set(missing);
+  const referenced = collectSecretNames(env);
+  for (const name of referenced) {
+    if (missingSet.has(name)) continue;
+    await appendAuditEvent({ server: namespace, secret: name, event: "injected" });
+  }
+  for (const name of missingSet) {
+    await appendAuditEvent({ server: namespace, secret: name, event: "missing" });
+  }
+}
+
+/** Distinct `${secret:NAME}` names referenced across an env map. */
+function collectSecretNames(env: Record<string, string>): string[] {
+  const names = new Set<string>();
+  const re = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
+  for (const v of Object.values(env)) {
+    if (typeof v !== "string") continue;
+    for (const m of v.matchAll(re)) names.add(m[1]);
+  }
+  return [...names];
 }
 
 declare const __VERSION__: string;
@@ -224,7 +268,7 @@ export async function connectToUpstream(
     // literal `${secret:NAME}` is passed through and the child process
     // surfaces its own "missing env var" error, which is louder than
     // silently passing an empty string.
-    const serverEnv = await resolveServerEnv(config.env ?? {});
+    const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace);
     resolvedServerEnv = serverEnv;
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
