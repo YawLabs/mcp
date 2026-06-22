@@ -15,13 +15,13 @@ import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
-import { formatShadowLine } from "./cli-shadows.js";
+import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { type ComplianceGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
 import { ConfigError, fetchConfig } from "./config.js";
-import { loadEffectiveProfile, type Profile, profileAllows } from "./config-loader.js";
+import { loadYawMcpConfig, type Profile, profileAllows, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
-import { formatRelativeAge } from "./doctor-cmd.js";
+import { formatRelativeAge, scanShellHistoryForShadows } from "./doctor-cmd.js";
 import { classifyError } from "./error-category.js";
 import {
   collectRefDeps,
@@ -42,6 +42,7 @@ import {
 } from "./health-score.js";
 import { initHeartbeat, reportHeartbeat } from "./heartbeat.js";
 import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
+import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
 import { LearningStore } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
@@ -263,6 +264,19 @@ export class ConnectServer {
   // same namespace, on deactivate, and on config reconcile.
   private toolFilters = new Map<string, Set<string>>();
   private profile: Profile | null = null;
+  // Shadow-driven install-nudge gate. Resolved once at start() from the
+  // env override (YAW_MCP_INSTALL_NUDGE=1) OR config (installNudge: true);
+  // off by default. When false, discover NEVER runs the shell-history scan
+  // and its output is byte-identical to today (the load-bearing privacy
+  // property). See install-nudge.ts. Stays false in unit tests that skip
+  // start(), so the nudge block is opt-in there too.
+  private installNudge = false;
+  // home / env used by the install-nudge shell-history scan. Default to the
+  // real process values; overridable so tests can point the scan at a
+  // synthetic home + stubbed env without touching the developer's real
+  // shell history or ~/.yaw-mcp/ state file.
+  private nudgeHome: string = homedir();
+  private nudgeEnv: NodeJS.ProcessEnv = process.env;
   // Loaded YAW-MCP.md guides (user-global + project-local). Null until
   // start() has run the loader; fail-open if either file is missing,
   // unreadable, or empty.
@@ -557,12 +571,16 @@ export class ConnectServer {
       this.persistenceReady = true;
     }
 
-    // Load the effective profile (allow/deny lists from .yaw-mcp/config.*
-    // files). Walks up from cwd for a project-local .yaw-mcp/ dir and also
-    // consults ~/.yaw-mcp/config.json (user-global). Local beats project
-    // beats global for the allow-list; denies union. Failure is silent
-    // — fail-open so a bad config doesn't brick the session.
-    this.profile = await loadEffectiveProfile(process.cwd()).catch(() => null);
+    // Load the effective config (allow/deny lists + the install-nudge flag)
+    // from .yaw-mcp/config.* files. Walks up from cwd for a project-local
+    // .yaw-mcp/ dir and also consults ~/.yaw-mcp/config.json (user-global).
+    // Local beats project beats global for the allow-list; denies union.
+    // Failure is silent — fail-open so a bad config doesn't brick the
+    // session. One read here derives BOTH the profile and the nudge gate
+    // (previously loadEffectiveProfile re-read the config just for the
+    // profile slice).
+    const resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch(() => null);
+    this.profile = resolvedConfig ? toProfile(resolvedConfig) : null;
     if (this.profile) {
       log("info", "Loaded profile", {
         path: this.profile.path,
@@ -570,6 +588,15 @@ export class ConnectServer {
         allow: this.profile.servers,
         block: this.profile.blocked,
       });
+    }
+    // Resolve the shadow-driven install-nudge gate once, from the env
+    // override OR the resolved config flag (either enables it; off by
+    // default). Gating here means a fresh load per session picks up a
+    // config change on restart. When this stays false, buildDiscoverOutput
+    // never runs the shell-history scan.
+    this.installNudge = installNudgeEnabled(process.env, resolvedConfig);
+    if (this.installNudge) {
+      log("info", "Shadow-driven install nudge enabled");
     }
 
     // Load YAW-MCP.md guides (user-global + project-local). Fail-open:
@@ -1707,6 +1734,13 @@ export class ConnectServer {
       }
     }
 
+    // Shadow-driven install candidates — its OWN section, gated OFF by
+    // default. Only runs the offline shell-history scan when the gate is
+    // on (env or config); otherwise this is a no-op and the output above
+    // is byte-identical to a build without the feature. See
+    // buildInstallCandidatesLines + install-nudge.ts.
+    lines.push(...this.buildInstallCandidatesLines(activeServers));
+
     const activeCount = this.connections.size;
     // Count EXPOSED tools (post-filter) so the summary matches what
     // tools/list actually hands the client — hidden tools don't spend
@@ -1736,6 +1770,68 @@ export class ConnectServer {
     }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // Build the opt-in "Install candidates" block from the offline shell-
+  // history shadow scan. Returns [] (no lines, byte-identical output) when
+  // the gate is off — the load-bearing privacy property: with the gate
+  // unset the scan never runs and nothing about shell history is read.
+  //
+  // When ON, for each heavily-used CLI the scan found:
+  //   - skip unless count >= INSTALL_NUDGE_MIN_COUNT (noise floor),
+  //   - skip unless a FIRST-PARTY install target exists (installTargetForCli;
+  //     a CLI like kubectl/npm/ssh with no target produces no nudge),
+  //   - skip if ANY namespace the CLI maps to is already installed (the user
+  //     already has a server that covers it — intersect the hit's namespaces
+  //     with the installed set),
+  //   - skip if the per-CLI cooldown hasn't elapsed (shouldNudge).
+  // Surviving CLIs are recorded (recordNudge) so they stay suppressed for
+  // the cooldown, and rendered as one line + an mcp_connect_install sketch.
+  //
+  // Privacy: the only data emitted is the aggregate integer count + the
+  // first-party package / namespace / name. No raw history line, command
+  // text, or argument ever reaches this output, and nothing here is sent to
+  // analytics — scanShellHistoryForShadows is local-only and returns just
+  // { cli, count, namespaces }.
+  private buildInstallCandidatesLines(activeServers: UpstreamServerConfig[]): string[] {
+    if (!this.installNudge) return [];
+
+    // Namespaces the user already has installed (active, profile-narrowed).
+    // A CLI whose shadow maps onto any of these is already covered — no nudge.
+    const installedNamespaces = new Set(activeServers.map((s) => s.namespace));
+
+    const hits = scanShellHistoryForShadows({ home: this.nudgeHome, env: this.nudgeEnv });
+
+    const candidates: Array<{
+      cli: string;
+      count: number;
+      target: { package: string; namespace: string; name: string };
+    }> = [];
+    for (const hit of hits) {
+      if (hit.count < INSTALL_NUDGE_MIN_COUNT) continue;
+      // Already covered by an installed server for any namespace this CLI
+      // shadows — they have it; don't nudge.
+      if (hit.namespaces.some((ns) => installedNamespaces.has(ns))) continue;
+      const target = installTargetForCli(hit.cli);
+      if (!target) continue;
+      // Defense in depth: never nudge toward a target whose own namespace is
+      // already installed, even if the shadow registry didn't list it.
+      if (installedNamespaces.has(target.namespace)) continue;
+      if (!shouldNudge(hit.cli, this.nudgeHome)) continue;
+      candidates.push({ cli: hit.cli, count: hit.count, target });
+    }
+
+    if (candidates.length === 0) return [];
+
+    const lines: string[] = ["\nInstall candidates (from your recent shell usage; history stays local):"];
+    for (const { cli, count, target } of candidates) {
+      lines.push(`  ${cli.padEnd(10)} (ran ${count}x recently) -> install ${target.package}`);
+      const sketch = `mcp_connect_install({ name: ${JSON.stringify(target.name)}, namespace: ${JSON.stringify(target.namespace)}, type: "local", command: "npx", args: ["-y", ${JSON.stringify(target.package)}] })`;
+      lines.push(`     ${sketch}`);
+      // Suppress this CLI for the cooldown now that we've surfaced it.
+      recordNudge(cli, this.nudgeHome);
+    }
+    return lines;
   }
 
   // Activate a single server by namespace. Shared by handleActivate,

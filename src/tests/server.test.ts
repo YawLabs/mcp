@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock external dependencies before importing the module under test
@@ -677,6 +680,157 @@ describe("ConnectServer", () => {
       // Ungraded stays clean — don't invent a placeholder that would
       // read as a grade to the model.
       expect(text).not.toMatch(/raw — Ungraded.*\[[A-F]\]/);
+    });
+  });
+
+  describe("shadow-driven install nudge", () => {
+    let nudgeHome: string;
+
+    // Point the scan at a synthetic home with a controlled .bash_history,
+    // and an env with no APPDATA so only the bash source is read. The state
+    // file (suppression) also lands under this synthetic home, so tests
+    // never touch the developer's real ~/.yaw-mcp/ or shell history.
+    function primeHistory(server: ConnectServer, lines: string[], extra: Record<string, string> = {}): void {
+      writeFileSync(join(nudgeHome, ".bash_history"), `${lines.join("\n")}\n`, "utf8");
+      const priv = getPrivate(server);
+      priv.nudgeHome = nudgeHome;
+      priv.nudgeEnv = { ...extra }; // no APPDATA -> PowerShell source skipped
+      // The discover dedup cache is keyed on config/context/active-set, not
+      // on nudge state — clear it so repeated handleDiscover() calls in one
+      // test re-render instead of returning a stale cached block.
+      priv.discoverCache = null;
+    }
+
+    // Repeat `tailscale` N times so its ShadowHit.count >= threshold (5).
+    const HEAVY = (cli: string, n = 14): string[] => Array.from({ length: n }, () => `${cli} status`);
+
+    beforeEach(() => {
+      nudgeHome = mkdtempSync(join(tmpdir(), "yaw-mcp-srv-nudge-"));
+    });
+
+    afterEach(() => {
+      rmSync(nudgeHome, { recursive: true, force: true });
+    });
+
+    it("OFF by default: scan never runs and output is byte-identical to a build without the feature", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      // Even with a heavy tailscale history present, the gate is off so
+      // nothing is surfaced.
+      primeHistory(server, HEAVY("tailscale"));
+      priv.installNudge = false;
+
+      const withFeatureOff = priv.handleDiscover().content[0].text;
+      expect(withFeatureOff).not.toContain("Install candidates");
+      expect(withFeatureOff).not.toContain("tailscale");
+
+      // Byte-identical to a server whose nudgeHome points nowhere (scan
+      // would find nothing) — proves the off path doesn't read history.
+      priv.discoverCache = null;
+      priv.nudgeHome = mkdtempSync(join(tmpdir(), "yaw-mcp-empty-"));
+      const baseline = priv.handleDiscover().content[0].text;
+      expect(withFeatureOff).toBe(baseline);
+      rmSync(priv.nudgeHome, { recursive: true, force: true });
+    });
+
+    it("ON: surfaces a heavily-used first-party CLI as an install candidate", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.installNudge = true;
+      primeHistory(server, HEAVY("tailscale"));
+
+      const text = priv.handleDiscover().content[0].text;
+      expect(text).toContain("Install candidates (from your recent shell usage; history stays local):");
+      expect(text).toContain("tailscale");
+      expect(text).toContain("ran 14x recently");
+      expect(text).toContain("install @yawlabs/tailscale-mcp");
+      // The mcp_connect_install sketch is present with the right namespace.
+      expect(text).toContain('namespace: "tailscale"');
+      expect(text).toContain('args: ["-y", "@yawlabs/tailscale-mcp"]');
+    });
+
+    it("never leaks a raw history line / argument into the nudge output", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.installNudge = true;
+      // Put a secret-looking argument in the history lines.
+      const SECRET = "SUPERSECRETAUTHKEY-9f3a";
+      primeHistory(
+        server,
+        Array.from({ length: 14 }, () => `tailscale up --authkey=${SECRET}`),
+      );
+
+      const text = priv.handleDiscover().content[0].text;
+      // The CLI is surfaced …
+      expect(text).toContain("tailscale");
+      // … but the argument / raw command text NEVER appears.
+      expect(text).not.toContain(SECRET);
+      expect(text).not.toContain("--authkey");
+      expect(text).not.toContain("tailscale up");
+    });
+
+    it("does NOT nudge a heavily-used CLI with no first-party target (kubectl/npm/ssh)", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.installNudge = true;
+      primeHistory(server, [...HEAVY("kubectl"), ...HEAVY("npm"), ...HEAVY("ssh")]);
+
+      const text = priv.handleDiscover().content[0].text;
+      expect(text).not.toContain("Install candidates");
+      expect(text).not.toContain("kubectl");
+    });
+
+    it("does NOT nudge below the count threshold", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.installNudge = true;
+      // 4 runs < threshold of 5.
+      primeHistory(server, HEAVY("tailscale", 4));
+
+      const text = priv.handleDiscover().content[0].text;
+      expect(text).not.toContain("Install candidates");
+    });
+
+    it("skips a CLI whose namespace is already installed (they already have it)", () => {
+      const priv = getPrivate(server);
+      // tailscale server IS installed/active — no nudge even with heavy usage.
+      priv.config = makeConfig([makeServerConfig({ namespace: "tailscale", name: "Tailscale" })]);
+      priv.installNudge = true;
+      primeHistory(server, HEAVY("tailscale"));
+
+      const text = priv.handleDiscover().content[0].text;
+      expect(text).not.toContain("Install candidates");
+    });
+
+    it("per-CLI suppression: a second discover within the cooldown does not re-nudge", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.installNudge = true;
+      primeHistory(server, HEAVY("tailscale"));
+
+      // First call surfaces it (and records the nudge to the state file).
+      const first = priv.buildInstallCandidatesLines(priv.getProfiledActiveServers()).join("\n");
+      expect(first).toContain("tailscale");
+
+      // Second call within the cooldown is suppressed.
+      const second = priv.buildInstallCandidatesLines(priv.getProfiledActiveServers()).join("\n");
+      expect(second).toBe("");
+    });
+
+    it("nudge output is NOT sent to analytics (local-only by construction)", async () => {
+      const { recordConnectEvent } = await import("../analytics.js");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.installNudge = true;
+      primeHistory(server, HEAVY("tailscale"));
+
+      priv.handleDiscover();
+      // discover is read-only telemetry-wise; the nudge path adds no
+      // analytics event carrying history data.
+      const calls = vi.mocked(recordConnectEvent).mock.calls;
+      for (const [arg] of calls) {
+        expect(JSON.stringify(arg)).not.toContain("tailscale");
+      }
     });
   });
 

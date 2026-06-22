@@ -204,6 +204,37 @@ export function cliToNamespaces(): Map<string, string[]> {
   return map;
 }
 
+/** First-party install targets keyed by CLI binary name. Used by the
+ *  opt-in shadow-driven install nudge (install-nudge.ts + discover): when
+ *  a user runs `<cli>` heavily but has no matching MCP server installed,
+ *  discover surfaces "install <package>".
+ *
+ *  Deliberately HARDCODED and first-party only. This is NOT the inverse of
+ *  NAMESPACE_REGISTRY — that registry maps many CLIs (npm, ssh, gh, kubectl,
+ *  docker, ...) to servers, but only the entries below correspond to a
+ *  Yaw Labs npm package we are willing to recommend installing unprompted.
+ *  A heavily-used CLI with no entry here (kubectl, npm, ssh, docker, gh)
+ *  produces NO nudge — we never push a third-party server, and we never
+ *  push a CLI whose package isn't confirmed live on npm. Adding an entry is
+ *  an explicit decision; do not derive this table from NAMESPACE_REGISTRY. */
+export const SHADOW_INSTALL_TARGETS: Record<string, { package: string; namespace: string; name: string }> = {
+  aws: { package: "@yawlabs/aws-mcp", namespace: "aws", name: "AWS" },
+  caddy: { package: "@yawlabs/caddy-mcp", namespace: "caddy", name: "Caddy" },
+  curl: { package: "@yawlabs/fetch-mcp", namespace: "fetch", name: "Fetch" },
+  wget: { package: "@yawlabs/fetch-mcp", namespace: "fetch", name: "Fetch" },
+  psql: { package: "@yawlabs/postgres-mcp", namespace: "postgres", name: "Postgres" },
+  pg_dump: { package: "@yawlabs/postgres-mcp", namespace: "postgres", name: "Postgres" },
+  tailscale: { package: "@yawlabs/tailscale-mcp", namespace: "tailscale", name: "Tailscale" },
+};
+
+/** Look up the first-party install target for a CLI binary name, or
+ *  undefined if no first-party server covers it. Pure lookup over
+ *  SHADOW_INSTALL_TARGETS; the CLI name is matched exactly (the caller
+ *  already strips path/sudo prefixes via extractLeadingBinary). */
+export function installTargetForCli(cli: string): { package: string; namespace: string; name: string } | undefined {
+  return SHADOW_INSTALL_TARGETS[cli];
+}
+
 /** Format a single server's shadow info as one human line. Used by
  *  discover + the guide auto-section. Returns null when the server
  *  shadows nothing — callers skip the line entirely. */
