@@ -390,3 +390,42 @@ describe("loadEffectiveProfile", () => {
     expect(p?.servers).toEqual(["github"]);
   });
 });
+
+describe("loadYawMcpConfig — installNudge flag", () => {
+  it("is undefined when no scope sets it (off by default)", async () => {
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.installNudge).toBeUndefined();
+  });
+
+  it("reads installNudge:true from the global file", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { installNudge: true });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.installNudge).toBe(true);
+  });
+
+  it("reads installNudge:false explicitly", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { installNudge: false });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.installNudge).toBe(false);
+  });
+
+  it("most-specific scope wins (local:false overrides global:true)", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { installNudge: true });
+    writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { installNudge: false });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.installNudge).toBe(false);
+  });
+
+  it("project scope wins over global when local is absent", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { installNudge: false });
+    writeConfig(synthCwd, CONFIG_FILENAME, { installNudge: true });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.installNudge).toBe(true);
+  });
+
+  it("ignores a non-boolean installNudge (no coercion of a typo)", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ installNudge: "true" }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.installNudge).toBeUndefined();
+  });
+});

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { cliToNamespaces, formatShadowLine, resolveShadowedClis, shadowedCliNames } from "../cli-shadows.js";
+import {
+  cliToNamespaces,
+  formatShadowLine,
+  installTargetForCli,
+  resolveShadowedClis,
+  SHADOW_INSTALL_TARGETS,
+  shadowedCliNames,
+} from "../cli-shadows.js";
 
 describe("resolveShadowedClis", () => {
   it("returns the registered shadow for a catalog slug", () => {
@@ -90,6 +97,54 @@ describe("formatShadowLine", () => {
   it("returns null for servers that shadow nothing", () => {
     expect(formatShadowLine({ namespace: "linear" })).toBeNull();
     expect(formatShadowLine({ namespace: "unknown-xyz" })).toBeNull();
+  });
+});
+
+describe("SHADOW_INSTALL_TARGETS / installTargetForCli", () => {
+  it("resolves each of the seven first-party CLI targets", () => {
+    expect(installTargetForCli("aws")).toEqual({ package: "@yawlabs/aws-mcp", namespace: "aws", name: "AWS" });
+    expect(installTargetForCli("caddy")).toEqual({ package: "@yawlabs/caddy-mcp", namespace: "caddy", name: "Caddy" });
+    expect(installTargetForCli("curl")).toEqual({ package: "@yawlabs/fetch-mcp", namespace: "fetch", name: "Fetch" });
+    expect(installTargetForCli("wget")).toEqual({ package: "@yawlabs/fetch-mcp", namespace: "fetch", name: "Fetch" });
+    expect(installTargetForCli("psql")).toEqual({
+      package: "@yawlabs/postgres-mcp",
+      namespace: "postgres",
+      name: "Postgres",
+    });
+    expect(installTargetForCli("pg_dump")).toEqual({
+      package: "@yawlabs/postgres-mcp",
+      namespace: "postgres",
+      name: "Postgres",
+    });
+    expect(installTargetForCli("tailscale")).toEqual({
+      package: "@yawlabs/tailscale-mcp",
+      namespace: "tailscale",
+      name: "Tailscale",
+    });
+  });
+
+  it("returns undefined for CLIs with no first-party target", () => {
+    // These are in NAMESPACE_REGISTRY (so they shadow installed servers)
+    // but are deliberately NOT install-nudge targets — we never push
+    // npm/ssh/gh/kubectl/docker unprompted.
+    for (const cli of ["npm", "ssh", "gh", "kubectl", "docker", "scp", "wrangler", "stripe"]) {
+      expect(installTargetForCli(cli)).toBeUndefined();
+    }
+  });
+
+  it("is the exact seven-entry first-party allowlist (no accidental additions)", () => {
+    expect(Object.keys(SHADOW_INSTALL_TARGETS).sort()).toEqual(
+      ["aws", "caddy", "curl", "pg_dump", "psql", "tailscale", "wget"].sort(),
+    );
+    // Every target package is under the @yawlabs scope.
+    for (const target of Object.values(SHADOW_INSTALL_TARGETS)) {
+      expect(target.package.startsWith("@yawlabs/")).toBe(true);
+    }
+  });
+
+  it("matches the CLI name exactly (no path/case fuzzing here)", () => {
+    expect(installTargetForCli("AWS")).toBeUndefined();
+    expect(installTargetForCli("/usr/bin/aws")).toBeUndefined();
   });
 });
 

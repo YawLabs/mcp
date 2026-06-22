@@ -42,6 +42,9 @@ export interface LoadedConfigFile {
   apiBase?: string;
   servers?: string[];
   blocked?: string[];
+  /** Opt-in flag for the shadow-driven install nudge. Off (undefined)
+   *  by default; only `true` enables it. See install-nudge.ts. */
+  installNudge?: boolean;
 }
 
 export type TokenSource = "env" | "local" | "global" | "missing";
@@ -56,6 +59,11 @@ export interface ResolvedConfig {
   servers?: string[];
   /** Deny-list (union across all scopes that set it). */
   blocked?: string[];
+  /** Opt-in: enable the shadow-driven install nudge in discover. Resolved
+   *  most-specific-scope-wins (local > project > global). Undefined when no
+   *  scope sets it (treated as off). The env var YAW_MCP_INSTALL_NUDGE=1
+   *  also enables it independently — see install-nudge.ts installNudgeEnabled. */
+  installNudge?: boolean;
   /** Absolute path to the discovered project `.yaw-mcp/` dir, or null if none. */
   projectConfigDir: string | null;
   /** Files actually read + parsed (in load order). */
@@ -120,6 +128,10 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   const blocked = Array.isArray(obj.blocked)
     ? obj.blocked.filter((v): v is string => typeof v === "string")
     : undefined;
+  // Only a literal boolean is honored — a non-boolean (string "true",
+  // number 1) is ignored rather than coerced, so a typo can't silently
+  // flip on a privacy-sensitive nudge.
+  const installNudge = typeof obj.installNudge === "boolean" ? obj.installNudge : undefined;
 
   if (token) {
     if (scope === "project") {
@@ -130,7 +142,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     await checkPermissions(path, warnings);
   }
 
-  return { path, scope, version, token, apiBase, servers, blocked };
+  return { path, scope, version, token, apiBase, servers, blocked, installNudge };
 }
 
 async function checkPermissions(path: string, warnings: string[]): Promise<void> {
@@ -155,6 +167,17 @@ function pickServers(files: LoadedConfigFile[]): string[] | undefined {
   const project = files.find((f) => f.scope === "project")?.servers;
   if (project !== undefined) return project;
   return files.find((f) => f.scope === "global")?.servers;
+}
+
+/** Resolve installNudge: most specific scope that sets it wins (local >
+ *  project > global), mirroring pickServers. Undefined when no scope sets
+ *  it — the gate treats that as off. */
+function pickInstallNudge(files: LoadedConfigFile[]): boolean | undefined {
+  const local = files.find((f) => f.scope === "local")?.installNudge;
+  if (local !== undefined) return local;
+  const project = files.find((f) => f.scope === "project")?.installNudge;
+  if (project !== undefined) return project;
+  return files.find((f) => f.scope === "global")?.installNudge;
 }
 
 /** Merge blocked (deny-list): union across all scopes that declare it. */
@@ -261,6 +284,7 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
     apiBaseSource,
     servers: pickServers(loadedFiles),
     blocked: unionBlocked(loadedFiles),
+    installNudge: pickInstallNudge(loadedFiles),
     projectConfigDir,
     loadedFiles,
     warnings,
