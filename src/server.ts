@@ -45,7 +45,7 @@ import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } f
 import { LearningStore } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { buildInstallPayload, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
+import { buildInstallPayload, computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { loadState, saveState } from "./persistence.js";
 import { createProgressReporter, type ProgressReporter } from "./progress.js";
@@ -85,6 +85,7 @@ import {
   sampleCountForEffort,
   shouldSample,
 } from "./sampling-rank.js";
+import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
@@ -978,6 +979,17 @@ export class ConnectServer {
       const action = args.action === "match" ? "match" : "list";
       recordConnectEvent({ namespace: null, toolName: null, action: "bundles", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleBundles(action));
+    }
+    if (name === META_TOOLS.secrets.name) {
+      const serverArg = typeof args.server === "string" ? args.server : undefined;
+      recordConnectEvent({
+        namespace: serverArg ?? null,
+        toolName: null,
+        action: "secrets",
+        latencyMs: null,
+        success: true,
+      });
+      return this.attachGuideNudge(await this.handleSecretsReport(serverArg));
     }
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during
@@ -3057,6 +3069,55 @@ export class ConnectServer {
         }),
       );
     }
+  }
+
+  // Values-free preview of which local-vault secrets each installed
+  // server's `${secret:NAME}` env refs resolve to. NAMES ONLY -- this
+  // reads the vault's KEY LIST (listKeys, no unlock, no passphrase) and
+  // the servers' env-reference names, and NEVER calls getSecret /
+  // decryptEntry. Servers with no refs are omitted.
+  private async handleSecretsReport(
+    serverArg?: string,
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    // Vault key list only -- no unlock, no decryption. A missing/unreadable
+    // vault yields an empty key set, so every referenced name reports as
+    // missing rather than erroring.
+    const vault = await loadVault(vaultPath()).catch(() => null);
+    const vaultKeys = new Set(vault ? listKeys(vault) : []);
+
+    let servers = this.getProfiledActiveServers().map((s) => ({ namespace: s.namespace, env: s.env }));
+    if (serverArg) servers = servers.filter((s) => s.namespace === serverArg);
+
+    const rows = computeSecretsReport(servers, vaultKeys);
+
+    if (serverArg && servers.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No installed server with namespace "${serverArg}". Call mcp_connect_discover to list installed servers.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (rows.length === 0) {
+      const scope = serverArg ? `Server "${serverArg}"` : "No installed server";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${scope} references any \${secret:NAME} vault values. Add a reference in a server's env (e.g. GITHUB_TOKEN=\${secret:gh}) and store the value with \`yaw-mcp secrets set <name>\`.`,
+          },
+        ],
+      };
+    }
+
+    // Names only -- no value ever appears in this payload.
+    return {
+      content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
+    };
   }
 
   private handleHealth(): { content: Array<{ type: string; text: string }> } {

@@ -270,6 +270,28 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  secrets: {
+    name: "mcp_connect_secrets",
+    description:
+      "List, per installed server, which local-vault secrets its `${secret:NAME}` env references resolve to -- by NAME only, never a value. Use this to confirm a server will get the credentials it needs before activating it, or to spot a typo'd / un-set secret reference. `injectedSecrets` are the names the local vault HAS and the server references; `missing` are names the server references but the vault LACKS (set them via `yaw-mcp secrets set <name>`). This is a values-free preview: it reads the vault's KEY LIST and the server's env-reference NAMES, and never decrypts or returns any secret value. Servers with no `${secret:...}` references are omitted. Requires no passphrase (no decryption happens).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        server: {
+          type: "string",
+          description:
+            'Optional: restrict the report to a single server namespace (e.g. "gh"). Omit to report every installed server that references a vault secret.',
+        },
+      },
+    },
+    annotations: {
+      title: "Inspect Vault Secret Resolution",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
   exec: {
     name: "mcp_connect_exec",
     description:
@@ -436,6 +458,56 @@ export function buildInstallPayload(args: Record<string, unknown>): InstallPaylo
   return { ok: true, payload };
 }
 
+// `${secret:NAME}` reference matcher -- local copy so the pure report
+// helper below has no I/O dependency on secrets-vault. Kept byte-identical
+// to secrets-vault's SECRET_REF_RE.
+const SECRETS_REPORT_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
+
+export interface SecretsReportRow {
+  server: string;
+  /** Names the vault HAS and this server references (sorted). */
+  injectedSecrets: string[];
+  /** Names this server references but the vault LACKS (sorted). */
+  missing: string[];
+}
+
+/**
+ * Pure, values-free computation backing the `mcp_connect_secrets`
+ * meta-tool. Given each server's namespace + env map and the SET of secret
+ * names the vault holds, returns one row per server that references at
+ * least one `${secret:...}`:
+ *   - injectedSecrets = referenced names ∩ vaultKeys
+ *   - missing         = referenced names \ vaultKeys
+ * Never decrypts; takes only NAMES in and emits only NAMES out. Servers
+ * with no references are omitted.
+ */
+export function computeSecretsReport(
+  servers: Array<{ namespace: string; env?: Record<string, string> }>,
+  vaultKeys: Set<string>,
+): SecretsReportRow[] {
+  const rows: SecretsReportRow[] = [];
+  for (const server of servers) {
+    const referenced = new Set<string>();
+    for (const v of Object.values(server.env ?? {})) {
+      if (typeof v !== "string") continue;
+      for (const m of v.matchAll(SECRETS_REPORT_REF_RE)) referenced.add(m[1]);
+    }
+    if (referenced.size === 0) continue;
+    const injectedSecrets: string[] = [];
+    const missing: string[] = [];
+    for (const name of referenced) {
+      if (vaultKeys.has(name)) injectedSecrets.push(name);
+      else missing.push(name);
+    }
+    rows.push({
+      server: server.namespace,
+      injectedSecrets: injectedSecrets.sort(),
+      missing: missing.sort(),
+    });
+  }
+  return rows;
+}
+
 export const META_TOOL_NAMES = new Set([
   META_TOOLS.discover.name,
   META_TOOLS.activate.name,
@@ -448,4 +520,5 @@ export const META_TOOL_NAMES = new Set([
   META_TOOLS.suggest.name,
   META_TOOLS.exec.name,
   META_TOOLS.bundles.name,
+  META_TOOLS.secrets.name,
 ]);

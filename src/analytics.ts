@@ -18,7 +18,8 @@ export interface ConnectAnalyticsEvent {
     | "suggest"
     | "read_tool"
     | "exec"
-    | "bundles";
+    | "bundles"
+    | "secrets";
   latencyMs: number | null;
   // Failure rate is inferred from `success`. Never add a string field
   // sourced from upstream content here -- third-party MCP servers routinely

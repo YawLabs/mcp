@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
@@ -131,6 +132,37 @@ describe("parseSecretsArgs", () => {
     const r = parseSecretsArgs(["pull", "--force"]);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.options.force).toBe(true);
+  });
+
+  it("rotate action parses without a name", () => {
+    const r = parseSecretsArgs(["rotate"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.action).toBe("rotate");
+  });
+
+  it("rotate --push parses", () => {
+    const r = parseSecretsArgs(["rotate", "--push"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.action).toBe("rotate");
+      expect(r.options.push).toBe(true);
+    }
+  });
+
+  it("audit action parses with filters", () => {
+    const r = parseSecretsArgs(["audit", "--secret", "gh", "--server", "github", "--json"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.action).toBe("audit");
+      expect(r.options.secretFilter).toBe("gh");
+      expect(r.options.serverFilter).toBe("github");
+      expect(r.options.json).toBe(true);
+    }
+  });
+
+  it("rejects --secret without arg", () => {
+    const r = parseSecretsArgs(["audit", "--secret"]);
+    expect(r.ok).toBe(false);
   });
 });
 
@@ -623,5 +655,121 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
     const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(errOutput.toLowerCase()).toMatch(/passphrase required/);
     // No vault should have been written under a "abc"-derived key.
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets rotate -- local re-encryption (no --push)
+// -----------------------------------------------------------------------
+
+describe("runSecrets rotate", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const home = nodePath.join(os.tmpdir(), `yaw-test-rotate-${process.pid}`);
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+    try {
+      await unlink(vaultPath(home));
+    } catch {
+      /* ok */
+    }
+  });
+
+  it("re-encrypts the vault: new passphrase reads, old one no longer does", async () => {
+    // Seed a vault under the old passphrase.
+    const r1 = await runSecrets(
+      { action: "set", name: "github", value: "ghp_abc", passphrase: "old-passphrase-xyz", home },
+      io,
+    );
+    expect(r1.exitCode).toBe(0);
+    lock();
+
+    // Rotate to a new passphrase (test hooks bypass env/TTY).
+    const r2 = await runSecrets(
+      { action: "rotate", passphrase: "old-passphrase-xyz", newPassphrase: "new-passphrase-xyz", home },
+      io,
+    );
+    expect(r2.exitCode).toBe(0);
+    lock();
+
+    // get under the NEW passphrase succeeds.
+    io.out.mockReset();
+    const r3 = await runSecrets(
+      { action: "get", name: "github", passphrase: "new-passphrase-xyz", home, json: true },
+      io,
+    );
+    expect(r3.exitCode).toBe(0);
+    const okLine = io.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    expect(okLine && JSON.parse(okLine).value).toBe("ghp_abc");
+    lock();
+
+    // get under the OLD passphrase is now rejected (wrong passphrase).
+    io.err.mockReset();
+    const r4 = await runSecrets({ action: "get", name: "github", passphrase: "old-passphrase-xyz", home }, io);
+    expect(r4.exitCode).toBe(1);
+    const err = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(err.toLowerCase()).toMatch(/wrong passphrase|decryption failed/);
+  });
+
+  it("aborts on a wrong current passphrase; vault is unchanged", async () => {
+    await runSecrets({ action: "set", name: "k", value: "v", passphrase: "correct-current", home }, io);
+    const before = readFileSync(vaultPath(home), "utf8");
+    lock();
+
+    const r = await runSecrets(
+      { action: "rotate", passphrase: "wrong-current", newPassphrase: "whatever-new", home }, io,
+    );
+    expect(r.exitCode).toBe(1);
+    // On-disk vault untouched by the aborted rotate.
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("errors when there is no vault to rotate", async () => {
+    const r = await runSecrets(
+      { action: "rotate", passphrase: "x", newPassphrase: "y", home }, io,
+    );
+    expect(r.exitCode).toBe(1);
+    const err = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(err.toLowerCase()).toContain("no vault");
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets audit -- read the local audit log
+// -----------------------------------------------------------------------
+
+describe("runSecrets audit", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const home = nodePath.join(os.tmpdir(), `yaw-test-secaudit-${process.pid}`);
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  it("reports an empty trail when nothing has been recorded", async () => {
+    const r = await runSecrets({ action: "audit", home }, io);
+    expect(r.exitCode).toBe(0);
+    const out = io.out.mock.calls.map((c) => c[0] as string).join("");
+    expect(out.toLowerCase()).toContain("no secret-resolution audit");
+  });
+
+  it("renders recorded events and filters by server", async () => {
+    const { appendAuditEvent } = await import("../secrets-audit.js");
+    await appendAuditEvent({ server: "gh", secret: "token", event: "injected" }, home);
+    await appendAuditEvent({ server: "aws", secret: "key", event: "missing" }, home);
+
+    const r = await runSecrets({ action: "audit", serverFilter: "gh", home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    const out = io.out.mock.calls.map((c) => c[0] as string).join("");
+    const parsed = JSON.parse(out);
+    expect(parsed.count).toBe(1);
+    expect(parsed.events[0].server).toBe("gh");
+    // No value field in any emitted event.
+    expect(Object.keys(parsed.events[0]).sort()).toEqual(["event", "secret", "server", "ts"]);
   });
 });

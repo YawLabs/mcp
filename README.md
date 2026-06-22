@@ -373,6 +373,8 @@ Rotate a credential in one place (the dashboard), every machine picks up the new
 | `YAW_MCP_DISABLE_PERSISTENCE` | No | Set to `1` or `true` to keep learning + pack-history scoped to the current process -- nothing loaded at start, nothing written on shutdown. Intended for ephemeral / shared environments (CI, containers). Default: cross-session persistence enabled at `~/.yaw-mcp/state.json`. |
 | `YAW_MCP_AUTO_LOAD` | No | Set to `1` or `true` to pre-activate the top recurring pack (from persisted pack-history) on startup -- no LLM round-trip required. Skips silently when history is empty or no pack's namespaces are all installed. Default: off. Requires persistence to be enabled. |
 | `YAW_MCP_MIN_COMPLIANCE` | No | Minimum compliance grade (`A`, `B`, `C`, `D`, or `F`, case-insensitive) an installed server must report before `mcp_connect_activate` will load it. Ungraded servers always pass (don't punish unknown). `discover()` annotates below-grade servers in place and shows a "Compliance filter active" header when set. Invalid values log a warning and disable the filter. Default: unset (no filter). |
+| `YAW_MCP_VAULT_PASSPHRASE` | No | Passphrase for the local secret vault (`~/.yaw-mcp/secrets.json`). Required for spawn-time `${secret:NAME}` substitution and to avoid the interactive prompt on `yaw-mcp secrets`. Stripped from every spawned upstream server's env. |
+| `YAW_MCP_VAULT_PASSPHRASE_NEW` | No | The NEW passphrase for `yaw-mcp secrets rotate`. When unset, rotate prompts (confirm-twice) on a TTY instead. |
 | `MCP_CONNECT_TIMEOUT` | No | Connection timeout in ms for upstream servers (default: `15000`) |
 | `MCP_CONNECT_IDLE_THRESHOLD` | No | Baseline for idle auto-unload (default: `10`). The per-namespace adaptive cap is `[5, 50]` -- bursty namespaces extend past the baseline, long-idle ones unload at it. |
 
@@ -387,6 +389,104 @@ The detection is best-effort: each probe has a 3-second timeout and missing runt
 The popular Python-based MCP servers (`sqlite`, `time`, `sentry`, and other uvx-launched entries) all launch via Astral's `uv`/`uvx`. yaw-mcp ships its own bootstrap for these: on first encounter with a `uv`/`uvx` command, if the binary isn't on your PATH, yaw-mcp lazily downloads Astral's standalone `uv` release, verifies the sha256, and caches it under the platform-appropriate cache dir. Subsequent loads reuse the cached binary. If you already have `uv` installed, yaw-mcp uses your version and never downloads.
 
 `uvx ARGS` is always rewritten to `uv tool run ARGS` at spawn time -- so only `uv` needs to be reachable, not `uvx` separately. Fixes Windows setups where one was on PATH and the other wasn't.
+
+## Local secret vault (no account required)
+
+There are two ways a secret reaches a server yaw-mcp spawns, and they have
+different threat models:
+
+1. **Backend-credential path (account required).** Paste a token into a
+   server's `env` block in the yaw.sh/mcp dashboard. The value is encrypted
+   at rest on the backend and injected at spawn time. It syncs across every
+   machine signed in to the same account, and revoking the account token cuts
+   off access everywhere on the next poll. This is the path the
+   "Cross-machine config sync" and "Trust & security" sections describe.
+
+2. **Local secret vault (no account required).** Keep the value in an
+   encrypted file on your own machine at `~/.yaw-mcp/secrets.json` and
+   reference it from any server's `env` with a `${secret:NAME}` placeholder.
+   yaw-mcp substitutes the decrypted value into the child env at spawn time.
+   The value never leaves your machine, never goes to the backend, and works
+   with no login. This is the right path when you want a credential that is
+   strictly local to one machine, or you don't have an account at all.
+
+### How `${secret:NAME}` references work
+
+Put a placeholder in a server's `env` value -- it can stand alone or be
+composed inline:
+
+```jsonc
+{
+  "namespace": "gh",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-github"],
+  "env": {
+    "GITHUB_PERSONAL_ACCESS_TOKEN": "${secret:gh}",
+    "AUTH_HEADER": "Bearer ${secret:gh}"
+  }
+}
+```
+
+At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own
+environment, yaw-mcp loads the vault, decrypts the referenced names, and
+substitutes the values into the child's env. If the passphrase is absent, the
+vault is missing, or a referenced name isn't stored, the literal
+`${secret:NAME}` is passed through unchanged -- the child then surfaces its
+own "missing/invalid credential" error, which is louder than silently passing
+an empty string.
+
+### Managing the vault -- `yaw-mcp secrets`
+
+```bash
+yaw-mcp secrets set <name>      # store a value (stdin prompt, no echo; or --value/--stdin)
+yaw-mcp secrets get <name>      # decrypt and print one value
+yaw-mcp secrets list            # show entry NAMES (values stay encrypted)
+yaw-mcp secrets remove <name>   # delete an entry
+yaw-mcp secrets lock            # clear the in-process passphrase cache
+yaw-mcp secrets rotate [--push] # re-encrypt the whole vault under a NEW passphrase
+yaw-mcp secrets audit [--secret NAME] [--server NS] [--json]   # who consumed which secret, when
+yaw-mcp secrets push            # upload the encrypted blob to your account (login required)
+yaw-mcp secrets pull            # download it back (login required)
+```
+
+The passphrase derives the encryption key via scrypt and is cached in memory
+for the lifetime of one yaw-mcp process; the on-disk file only ever holds
+ciphertext (AES-256-GCM, per-entry IV + auth tag, one vault-level salt). Set
+`YAW_MCP_VAULT_PASSPHRASE` in the env to avoid the prompt -- this is required
+for spawn-time substitution, since a spawned MCP server runs non-interactively
+and can't prompt on a TTY.
+
+`rotate` re-encrypts every entry under a fresh salt + key derived from a NEW
+passphrase (read from `YAW_MCP_VAULT_PASSPHRASE_NEW` or a confirm-twice
+prompt). It decrypts every entry under the current passphrase FIRST and aborts
+the whole operation -- leaving the on-disk vault untouched -- if any entry
+fails to decrypt. **Rotate re-wraps the ENCRYPTION, not the underlying token
+values:** a token that has leaked is still leaked after a rotate; rotate it at
+its source. Rotate does NOT push to your account unless you pass `--push`.
+
+`audit` reads an append-only NDJSON log at `~/.yaw-mcp/secrets-audit.log`
+(mode `0600`, tail-capped) recording that a secret NAME was `injected` into
+(or was `missing` for) a given server namespace, with a timestamp. **The log
+never records a value** -- only names, namespaces, and times. Writes to it are
+fail-open: a broken or unwritable log never blocks a server spawn.
+
+The `mcp_connect_secrets` meta-tool gives the same picture to the model
+without any decryption: per server it lists `injectedSecrets` (names the vault
+has and the server references) and `missing` (referenced names the vault
+lacks). It reads only the vault's key list and the servers' reference names --
+it never decrypts or returns a value, and needs no passphrase.
+
+### Offline threat model
+
+The vault protects the on-disk file against **offline brute-force after
+exfiltration** -- a stolen laptop, a leaked backup, a synced dotfile repo. The
+file is useless without the passphrase: scrypt key derivation makes guessing
+expensive, and AES-256-GCM means a tampered ciphertext fails to decrypt rather
+than yielding garbage plaintext. What the vault does **not** defend against: a
+process running as you while the passphrase is cached in memory (it can ask
+yaw-mcp to decrypt), a keylogger capturing the passphrase, or a value already
+leaked at its source. For those, rotate the underlying token, not the vault
+encryption.
 
 ## Trust & security
 

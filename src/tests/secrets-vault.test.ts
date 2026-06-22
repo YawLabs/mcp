@@ -12,7 +12,9 @@ import {
   newVault,
   removeSecret,
   resolveSecretRefs,
+  rotateVault,
   saveVault,
+  SECRET_REF_RE,
   setSecret,
   unlock,
   VAULT_CHECK_PLAINTEXT,
@@ -217,6 +219,81 @@ describe("secrets-vault: set/get/list/remove", () => {
 
   it("vaultPath places secrets.json under ~/.yaw-mcp/", () => {
     expect(vaultPath("/home/jeff")).toMatch(/[/\\]\.yaw-mcp[/\\]secrets\.json$/);
+  });
+});
+
+describe("SECRET_REF_RE is exported and matches ${secret:NAME}", () => {
+  it("captures the name", () => {
+    // Fresh regex use to avoid lastIndex carryover from the global flag.
+    const m = [...`x ${"${secret:gh}"} y`.matchAll(SECRET_REF_RE)];
+    expect(m[0][1]).toBe("gh");
+  });
+});
+
+describe("rotateVault", () => {
+  it("re-encrypts every entry: old passphrase fails post-rotate, new one decrypts", async () => {
+    let vault = newVault();
+    const oldKey = await unlock(vault, "old-passphrase");
+    vault = setSecret(vault, oldKey, "github", "ghp_abc");
+    vault = setSecret(vault, oldKey, "aws", "aws_xyz");
+    const oldSalt = vault.salt;
+
+    // Sanity: old key decrypts pre-rotate.
+    expect(getSecret(vault, oldKey, "github")).toBe("ghp_abc");
+
+    const rotated = await rotateVault(vault, oldKey, "new-passphrase");
+
+    // Salt changed -> fresh derivation lineage.
+    expect(rotated.salt).not.toBe(oldSalt);
+    expect(listKeys(rotated)).toEqual(["aws", "github"]);
+    expect(rotated.check).toBeDefined();
+
+    // The OLD key must NOT decrypt the rotated entries.
+    expect(() => getSecret(rotated, oldKey, "github")).toThrow();
+
+    // The NEW passphrase decrypts post-rotate, values intact.
+    lock();
+    const newKey = await unlock(rotated, "new-passphrase");
+    expect(getSecret(rotated, newKey, "github")).toBe("ghp_abc");
+    expect(getSecret(rotated, newKey, "aws")).toBe("aws_xyz");
+
+    // The new check marker verifies under the new key, and a wrong
+    // passphrase is rejected at unlock.
+    expect(decryptEntry(rotated.check as EncryptedEntry, newKey)).toBe(VAULT_CHECK_PLAINTEXT);
+    lock();
+    await expect(unlock(rotated, "old-passphrase")).rejects.toThrow(/wrong passphrase/i);
+  });
+
+  it("aborts when an entry fails to decrypt, leaving the input vault untouched", async () => {
+    let vault = newVault();
+    const oldKey = await unlock(vault, "old-passphrase");
+    vault = setSecret(vault, oldKey, "github", "ghp_abc");
+
+    // Corrupt one entry's ciphertext so decrypt-all fails.
+    const corrupted: VaultFile = {
+      ...vault,
+      entries: {
+        ...vault.entries,
+        github: { ...vault.entries.github, ciphertext: Buffer.from("tampered").toString("base64") },
+      },
+    };
+    const snapshot = JSON.stringify(corrupted);
+
+    await expect(rotateVault(corrupted, oldKey, "new-passphrase")).rejects.toThrow(/failed to decrypt/i);
+    // The input vault object is not mutated by the abort.
+    expect(JSON.stringify(corrupted)).toBe(snapshot);
+  });
+
+  it("aborts when the current key is wrong (check marker fails), nothing re-encrypted", async () => {
+    let vault = newVault();
+    const oldKey = await unlock(vault, "old-passphrase");
+    vault = setSecret(vault, oldKey, "github", "ghp_abc");
+    const snapshot = JSON.stringify(vault);
+
+    // Derive a DIFFERENT key (wrong passphrase) against the same salt.
+    const wrongKey = await deriveKey("not-the-passphrase", Buffer.from(vault.salt, "base64"));
+    await expect(rotateVault(vault, wrongKey, "new-passphrase")).rejects.toThrow(/current passphrase is wrong/i);
+    expect(JSON.stringify(vault)).toBe(snapshot);
   });
 });
 
