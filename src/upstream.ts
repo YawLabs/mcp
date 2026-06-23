@@ -17,6 +17,7 @@ import type {
   UpstreamServerConfig,
   UpstreamToolDef,
 } from "./types.js";
+import { resolveOamSpawn } from "./oam-spawn.js";
 import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 /**
@@ -260,7 +261,14 @@ export async function connectToUpstream(
     // out and is caught by the ActivationError handler below — the
     // stderr tail will be empty, so we fall through to the
     // categorizeSpawnError path with the actual error message.
-    const resolved = await resolveUvSpawn(config.command, config.args ?? []);
+    let resolved = await resolveUvSpawn(config.command, config.args ?? []);
+    // Host on the oam runtime when this server opted in (config.runtime ===
+    // "oam"). Applied AFTER resolveUvSpawn so uv/uvx stay on their managed
+    // binary; resolveOamSpawn only rewrites node/npx and otherwise (incl. when
+    // oam is absent) returns the command unchanged -- a pure optimization.
+    if (config.runtime === "oam") {
+      resolved = resolveOamSpawn(resolved.command, resolved.args);
+    }
 
     // Resolve ${secret:NAME} references in the server's env against
     // the local secret vault.  Requires YAW_MCP_VAULT_PASSPHRASE in

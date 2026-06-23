@@ -35,6 +35,14 @@ export interface UpstreamServerConfig {
    * default (we don't punish unknown).
    */
   complianceGrade?: "A" | "B" | "C" | "D" | "F";
+  /**
+   * Opt this server into being hosted on the oam runtime (`oam run <entry>`)
+   * instead of node/npx. "oam" = prefer oam when it's installed, falling back
+   * to node/npx if oam is absent or the package can't be resolved on disk.
+   * Absent (or "node") = node, the default. Per-server opt-in -- set in
+   * bundles.json or the dashboard. See oam-spawn.ts.
+   */
+  runtime?: "oam" | "node";
 }
 
 export interface ConnectConfig {
