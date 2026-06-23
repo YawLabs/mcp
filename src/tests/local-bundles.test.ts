@@ -64,6 +64,26 @@ describe("loadLocalBundles", () => {
     });
   });
 
+  it("propagates a per-server runtime override from bundles.json", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "fetch", name: "Fetch", command: "node", args: ["/srv/fetch/dist/index.js"], runtime: "oam" },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].runtime).toBe("oam");
+  });
+
+  it("drops an invalid runtime value (only oam/node are accepted)", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "node", args: ["/x"], runtime: "wasm" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].runtime).toBeUndefined();
+  });
+
   it("loads from project-local <cwd>/.yaw-mcp/bundles.json", async () => {
     writeBundles(synthCwd, {
       version: 1,

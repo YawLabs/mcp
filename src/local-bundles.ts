@@ -91,6 +91,12 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
       : undefined;
   const url = typeof e.url === "string" ? e.url : undefined;
   const description = typeof e.description === "string" ? e.description : undefined;
+  // Per-server runtime override. "oam" hosts the server on the oam runtime
+  // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`);
+  // "node" or absent = node, the default. Without propagating this here, a
+  // bundles.json `"runtime": "oam"` is silently dropped and never reaches the
+  // resolver.
+  const runtime = e.runtime === "oam" || e.runtime === "node" ? e.runtime : undefined;
 
   // Default isActive=true in local mode -- if the user wrote a server
   // into bundles.json they presumably want it loadable. Toggle off with
@@ -114,6 +120,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     url,
     isActive,
     description,
+    runtime,
   };
 }
 
