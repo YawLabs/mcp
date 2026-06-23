@@ -123,6 +123,24 @@ jobs:
           fi
           echo "tag ${tag} matches package.json ${have}"
 
+      # Fail loudly if server.json (the MCP-registry manifest) drifts from
+      # package.json. release.sh bumps both in lockstep; a manual bump that
+      # touches only package.json would otherwise publish npm + the GitHub
+      # Release at the new version while the MCP-registry step tries the stale
+      # server.json version and 400s on "cannot publish duplicate version"
+      # (exactly what happened on v0.66.0). Stop the run here instead.
+      - name: Verify server.json matches package.json
+        shell: bash
+        run: |
+          have="$(node -p "require('./package.json').version")"
+          sjv="$(node -p "require('./server.json').version")"
+          sjp="$(node -p "require('./server.json').packages[0].version")"
+          if [ "$sjv" != "$have" ] || [ "$sjp" != "$have" ]; then
+            echo "::error::server.json drift -- package.json=${have}, server.json.version=${sjv}, packages[0].version=${sjp}. Bump both with ./release.sh."
+            exit 1
+          fi
+          echo "server.json (${sjv} / pkg ${sjp}) matches package.json ${have}"
+
       # prepublishOnly runs `npm run build`, so dist/ is rebuilt from the
       # checked-out tag before packing. --access public + --provenance match
       # the (public) package and emit a sigstore attestation from this run.
