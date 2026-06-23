@@ -36,7 +36,7 @@ export interface TeamSession {
   /** Session expiration as ms since epoch. */
   exp: number;
   /** Per-resource write permission map. Includes Yaw Terminal
-   *  resources (commands/connections/runbooks) and Yaw MCP resources
+   *  resources (commands/connections) and Yaw MCP resources
    *  (mcp_bundles/mcp_secrets/mcp_audit_log). Admins get all true;
    *  members get true only for resources whose allowlist contains
    *  their email. */
