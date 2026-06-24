@@ -1,5 +1,9 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { packageName, rewriteForOam, winNormalize } from "./oam-spawn.js";
+import { npxCacheNodeModules, packageName, rewriteForOam, winNormalize } from "./oam-spawn.js";
 
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
@@ -82,5 +86,32 @@ describe("rewriteForOam", () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/not-installed"], { oamBin: "oam", resolveEntry: () => null })).toEqual(
       { command: "npx", args: ["-y", "@yawlabs/not-installed"] },
     );
+  });
+});
+
+describe("npxCacheNodeModules", () => {
+  it("derives sibling npx-cache node_modules from a path under _npx", () => {
+    const root = mkdtempSync(join(tmpdir(), "npxcache-"));
+    const npx = join(root, "_npx");
+    // The broker itself is fetched into cache "aaa"; "bbb" is a sibling
+    // cache where some other `npx -y <pkg>` server was installed.
+    mkdirSync(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist"), { recursive: true });
+    mkdirSync(join(npx, "bbb", "node_modules"), { recursive: true });
+    const selfUrl = pathToFileURL(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
+    try {
+      expect(npxCacheNodeModules(selfUrl).sort()).toEqual(
+        [join(npx, "aaa", "node_modules"), join(npx, "bbb", "node_modules")].sort(),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns [] for a path not under an npx cache", () => {
+    expect(npxCacheNodeModules(pathToFileURL(join(tmpdir(), "plain", "index.js")).href)).toEqual([]);
+  });
+
+  it("returns [] for a non-file URL", () => {
+    expect(npxCacheNodeModules("not-a-url")).toEqual([]);
   });
 });
