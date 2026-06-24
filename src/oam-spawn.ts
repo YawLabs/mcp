@@ -18,12 +18,9 @@
 // only opt in servers verified to run on oam.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync } from "node:fs";
-import { createRequire } from "node:module";
-import { join, sep } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-
-const requireFrom = createRequire(import.meta.url);
 
 /**
  * Strip an npm version/tag suffix from a package spec:
@@ -149,26 +146,73 @@ export function npxCacheNodeModules(fromUrl: string = import.meta.url): string[]
 }
 
 /**
- * Resolve a package name to an on-disk entry, or `null` if unresolvable. Tries
- * the broker's OWN module graph first (its dependencies), then each npx cache:
- * an `npx -y <pkg>` server lives in a sibling `_npx/<hash>/node_modules` that
- * the broker's own resolver can't see, so without this an opted-in npx server
- * silently falls back to Node. `null` keeps the npx/node command (Node).
+ * The `node_modules` that contains the broker itself, derived from the LAST
+ * `node_modules` segment of a module path. Lets the broker's own dependencies
+ * be searched even when it is launched as a global / `node <abs>` install (not
+ * via npx). Returns `[]` when the path has no `node_modules` segment.
+ *
+ * `fromUrl` is injectable for testing; it defaults to this module's own URL.
+ */
+export function ownNodeModules(fromUrl: string = import.meta.url): string[] {
+  let here: string;
+  try {
+    here = fileURLToPath(fromUrl);
+  } catch {
+    return [];
+  }
+  const seg = `${sep}node_modules${sep}`;
+  const idx = here.lastIndexOf(seg);
+  if (idx === -1) return [];
+  return [here.slice(0, idx + seg.length - sep.length)];
+}
+
+/**
+ * Read a package's RUNNABLE entry from its package.json: the `bin` (the CLI
+ * `npx` would execute), falling back to `main`. Deliberately NOT
+ * `require.resolve`, which returns the `exports["."]` LIBRARY entry -- often a
+ * different file than the bin (e.g. fetch-mcp: bin=dist/index.js vs
+ * exports.=dist/server.js) AND throws ERR_PACKAGE_PATH_NOT_EXPORTED on an
+ * ESM-only `exports` with no `require`/`default` condition. Reading
+ * package.json directly sidesteps the package's own `exports` gating entirely.
+ */
+function packageEntry(pkgDir: string, pkg: string): string | null {
+  const pjPath = join(pkgDir, "package.json");
+  if (!existsSync(pjPath)) return null;
+  let j: { bin?: string | Record<string, string>; main?: string; name?: string };
+  try {
+    j = JSON.parse(readFileSync(pjPath, "utf8"));
+  } catch {
+    return null;
+  }
+  let rel: string | undefined;
+  if (typeof j.bin === "string") {
+    rel = j.bin;
+  } else if (j.bin && typeof j.bin === "object") {
+    // Prefer the bin keyed by the unscoped name, then the full name, then the
+    // first declared bin (servers often name the bin differently from the pkg).
+    const unscoped = pkg.slice(pkg.lastIndexOf("/") + 1);
+    rel = j.bin[unscoped] ?? (j.name ? j.bin[j.name] : undefined) ?? Object.values(j.bin)[0];
+  }
+  if (!rel && typeof j.main === "string") rel = j.main;
+  if (!rel) return null;
+  return isAbsolute(rel) ? rel : join(pkgDir, rel);
+}
+
+/**
+ * Resolve a package name to an on-disk RUNNABLE entry, or `null`. Searches the
+ * broker's own node_modules then every npx cache: an `npx -y <pkg>` server
+ * lives in a sibling `_npx/<hash>/node_modules` that the broker's own resolver
+ * can't see, so without this an opted-in npx server silently falls back to
+ * Node. Resolves the package's BIN (read straight from package.json) rather
+ * than require.resolve's library "." export. `null` keeps the npx/node command.
  *
  * `fromUrl` is injectable for testing; it defaults to this module's own URL.
  */
 export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
-  try {
-    return requireFrom.resolve(pkg);
-  } catch {
-    // not a broker dependency -- fall through to the npx caches
-  }
-  for (const nodeModules of npxCacheNodeModules(fromUrl)) {
-    try {
-      return requireFrom.resolve(pkg, { paths: [nodeModules] });
-    } catch {
-      // not in this cache -- try the next
-    }
+  const parts = pkg.split("/"); // "@scope/name" -> ["@scope", "name"]
+  for (const nodeModules of [...ownNodeModules(fromUrl), ...npxCacheNodeModules(fromUrl)]) {
+    const entry = packageEntry(join(nodeModules, ...parts), pkg);
+    if (entry) return entry;
   }
   return null;
 }

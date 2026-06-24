@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { npxCacheNodeModules, packageName, rewriteForOam, winNormalize } from "./oam-spawn.js";
+import { npxCacheNodeModules, packageName, resolveNpmEntry, rewriteForOam, winNormalize } from "./oam-spawn.js";
 
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
@@ -113,5 +113,74 @@ describe("npxCacheNodeModules", () => {
 
   it("returns [] for a non-file URL", () => {
     expect(npxCacheNodeModules("not-a-url")).toEqual([]);
+  });
+});
+
+describe("resolveNpmEntry", () => {
+  // Build a temp npx cache: the broker in cache "aaa", a sidecar in sibling
+  // "bbb". `brokerUrl` is a module path under "aaa" so the resolver derives the
+  // sibling caches from it.
+  function fixture(): { npx: string; brokerUrl: string; cleanup: () => void } {
+    const root = mkdtempSync(join(tmpdir(), "resolve-"));
+    const npx = join(root, "_npx");
+    mkdirSync(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist"), { recursive: true });
+    const brokerUrl = pathToFileURL(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
+    return { npx, brokerUrl, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+  function writePkg(npx: string, pkg: string, json: Record<string, unknown>): string {
+    const dir = join(npx, "bbb", "node_modules", ...pkg.split("/"));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify(json));
+    return dir;
+  }
+
+  it("resolves a sidecar's BIN, not its ESM-only exports library entry", () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    // Real-world shape: bin is the CLI (dist/index.js); exports is ESM-only
+    // (import/types, no require/default) so require.resolve throws -- the bug.
+    const dir = writePkg(npx, "@yawlabs/fetch-mcp", {
+      name: "@yawlabs/fetch-mcp",
+      type: "module",
+      main: "./dist/server.js",
+      bin: { "fetch-mcp": "./dist/index.js" },
+      exports: { ".": { import: "./dist/server.js", types: "./dist/server.d.ts" } },
+    });
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("falls back to the first bin when none is keyed by the unscoped name", () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = writePkg(npx, "@modelcontextprotocol/server-memory", {
+      name: "@modelcontextprotocol/server-memory",
+      bin: { "mcp-server-memory": "dist/index.js" }, // bin key != unscoped name
+    });
+    try {
+      expect(resolveNpmEntry("@modelcontextprotocol/server-memory", brokerUrl)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("falls back to main when there is no bin", () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = writePkg(npx, "libonly", { name: "libonly", main: "lib/main.js" });
+    try {
+      expect(resolveNpmEntry("libonly", brokerUrl)).toBe(join(dir, "lib", "main.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns null when the package is in no cache", () => {
+    const { brokerUrl, cleanup } = fixture();
+    try {
+      expect(resolveNpmEntry("@yawlabs/nonexistent-mcp", brokerUrl)).toBeNull();
+    } finally {
+      cleanup();
+    }
   });
 });
