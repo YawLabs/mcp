@@ -8,6 +8,7 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./logger.js";
+import { resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, vaultPath } from "./secrets-vault.js";
 import type {
@@ -17,7 +18,6 @@ import type {
   UpstreamServerConfig,
   UpstreamToolDef,
 } from "./types.js";
-import { resolveOamSpawn } from "./oam-spawn.js";
 import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 /**
