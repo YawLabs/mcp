@@ -18,7 +18,10 @@
 // only opt in servers verified to run on oam.
 
 import { execFileSync } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { createRequire } from "node:module";
+import { join, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const requireFrom = createRequire(import.meta.url);
 
@@ -116,6 +119,61 @@ export function rewriteForOam(
 }
 
 /**
+ * The `node_modules` directories of every npx install cache, derived from a
+ * module path that lives under `_npx/<hash>/...`. When the broker is itself
+ * launched via `npx -y @yawlabs/mcp`, its own location is inside one such
+ * cache, so the SIBLING caches -- where other `npx -y <pkg>` servers were
+ * fetched -- are reachable from here. Returns `[]` when the path is not under
+ * an npx cache (e.g. a global or `node <abs>` launch).
+ *
+ * `fromUrl` is injectable for testing; it defaults to this module's own URL.
+ */
+export function npxCacheNodeModules(fromUrl: string = import.meta.url): string[] {
+  let here: string;
+  try {
+    here = fileURLToPath(fromUrl);
+  } catch {
+    return [];
+  }
+  const marker = `${sep}_npx${sep}`;
+  const idx = here.indexOf(marker);
+  if (idx === -1) return [];
+  const npxRoot = here.slice(0, idx + marker.length - sep.length); // ".../_npx"
+  try {
+    return readdirSync(npxRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => join(npxRoot, e.name, "node_modules"));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolve a package name to an on-disk entry, or `null` if unresolvable. Tries
+ * the broker's OWN module graph first (its dependencies), then each npx cache:
+ * an `npx -y <pkg>` server lives in a sibling `_npx/<hash>/node_modules` that
+ * the broker's own resolver can't see, so without this an opted-in npx server
+ * silently falls back to Node. `null` keeps the npx/node command (Node).
+ *
+ * `fromUrl` is injectable for testing; it defaults to this module's own URL.
+ */
+export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
+  try {
+    return requireFrom.resolve(pkg);
+  } catch {
+    // not a broker dependency -- fall through to the npx caches
+  }
+  for (const nodeModules of npxCacheNodeModules(fromUrl)) {
+    try {
+      return requireFrom.resolve(pkg, { paths: [nodeModules] });
+    } catch {
+      // not in this cache -- try the next
+    }
+  }
+  return null;
+}
+
+/**
  * Resolve a server's launch to run on oam when it has opted in
  * (`config.runtime === "oam"`). A no-op for non-Node commands and a safe Node
  * fallback when oam isn't installed or the package can't be resolved on disk.
@@ -123,12 +181,6 @@ export function rewriteForOam(
 export function resolveOamSpawn(command: string, args: string[]): { command: string; args: string[] } {
   return rewriteForOam(command, args, {
     oamBin: oamBin(),
-    resolveEntry: (pkg) => {
-      try {
-        return requireFrom.resolve(pkg);
-      } catch {
-        return null;
-      }
-    },
+    resolveEntry: (pkg) => resolveNpmEntry(pkg),
   });
 }
