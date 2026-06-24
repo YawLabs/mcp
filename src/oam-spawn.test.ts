@@ -1,5 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { packageName, rewriteForOam } from "./oam-spawn.js";
+import { packageName, rewriteForOam, winNormalize } from "./oam-spawn.js";
+
+describe("winNormalize", () => {
+  it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
+    expect(winNormalize("C:/Users/jeff/oam/target/release/oam.exe", "win32")).toBe(
+      "C:\\Users\\jeff\\oam\\target\\release\\oam.exe",
+    );
+  });
+  it("leaves an already-backslash path untouched on Windows", () => {
+    expect(winNormalize("C:\\Users\\jeff\\oam.exe", "win32")).toBe("C:\\Users\\jeff\\oam.exe");
+  });
+  it("leaves a bare binary name untouched", () => {
+    expect(winNormalize("oam.exe", "win32")).toBe("oam.exe");
+  });
+  it("is a no-op off Windows", () => {
+    expect(winNormalize("/usr/local/bin/oam", "linux")).toBe("/usr/local/bin/oam");
+  });
+});
 
 describe("packageName", () => {
   it("strips @latest from a scoped package", () => {

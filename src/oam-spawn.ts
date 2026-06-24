@@ -39,12 +39,24 @@ export function packageName(spec: string): string {
 let oamBinCache: string | null | undefined;
 
 /**
+ * Convert forward slashes to backslashes on Windows. The MCP SDK spawns stdio
+ * servers with `shell: true` (-> cmd.exe), which mis-parses a forward-slash
+ * command path ("C:/Users/.../oam.exe" makes cmd read "/Users" as a switch).
+ * A backslash path (or a bare "oam.exe" on PATH) spawns correctly. No-op off
+ * Windows. `platform` is injectable so the behaviour is testable cross-OS.
+ */
+export function winNormalize(p: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? p.replace(/\//g, "\\") : p;
+}
+
+/**
  * The oam binary to spawn, or `null` if oam isn't available. Probed once with
- * `oam --version` and cached. OAM_BIN overrides the binary path.
+ * `oam --version` and cached. OAM_BIN overrides the binary path; it's
+ * normalized to a cmd-safe path so a forward-slash OAM_BIN still spawns.
  */
 export function oamBin(): string | null {
   if (oamBinCache !== undefined) return oamBinCache;
-  const bin = process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam");
+  const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
   try {
     execFileSync(bin, ["--version"], { stdio: "ignore" });
     oamBinCache = bin;
