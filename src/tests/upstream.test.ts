@@ -53,6 +53,9 @@ const _sdkBehavior = {
   clientConnect: (): Promise<void> => Promise.reject(new Error("connect not configured")),
   clientClose: (): Promise<void> => Promise.resolve(),
   stderrEmitter: null as EventEmitter | null,
+  // The {command,args,env} the stdio transport was last constructed with --
+  // lets a test assert what actually gets spawned (e.g. the oam-rewritten cmd).
+  lastStdioArgs: null as { command: string; args: string[]; env?: Record<string, string> } | null,
 };
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
@@ -70,13 +73,21 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
 });
 
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => {
-  function MockStdioClientTransport() {
+  function MockStdioClientTransport(opts: { command: string; args: string[]; env?: Record<string, string> }) {
+    _sdkBehavior.lastStdioArgs = opts;
     const emitter = new EventEmitter();
     _sdkBehavior.stderrEmitter = emitter;
     return { stderr: emitter };
   }
   return { StdioClientTransport: MockStdioClientTransport };
 });
+
+// resolveOamSpawn is the spawn-rewrite chokepoint (upstream.ts gates it on
+// config.runtime === "oam"). Mock it so the WIRING -- "does runtime:oam actually
+// reach + apply the rewrite?" -- is tested independently of an installed oam.
+vi.mock("../oam-spawn.js", () => ({
+  resolveOamSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
+}));
 
 // Remote transports -- not needed for env/redact tests but must not throw.
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
@@ -90,6 +101,8 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
   },
 }));
 
+// Import the mocked resolveOamSpawn so the wiring test can configure/assert it.
+import { resolveOamSpawn } from "../oam-spawn.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock } from "../secrets-vault.js";
 
@@ -424,5 +437,74 @@ describe("resolveServerEnv", () => {
     const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
 
     await expect(connectToUpstream(config)).rejects.toThrow(/vault locked.*YAW_MCP_VAULT_PASSPHRASE/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// oam runtime wiring -- connectToUpstream must apply resolveOamSpawn to the
+// launch command iff config.runtime === "oam". This is the integration link
+// between local-bundles (which propagates `runtime`) and oam-spawn (which does
+// the rewrite); a regression here (e.g. the 0.66.2 bug where `runtime` was
+// dropped before reaching this gate) would silently host opted-in servers on
+// node instead of oam.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream oam runtime wiring", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    // The transport is constructed before the client connects; reject connect so
+    // the call returns fast -- lastStdioArgs is already captured by then.
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("stop after spawn"));
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.lastStdioArgs = null;
+    vi.mocked(resolveOamSpawn).mockReset();
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("applies resolveOamSpawn to the spawn command when runtime is 'oam'", async () => {
+    vi.mocked(resolveOamSpawn).mockReturnValue({
+      command: "/usr/bin/oam",
+      args: ["run", "/cache/fetch/dist/index.js"],
+    });
+    const config = makeLocalConfig({
+      runtime: "oam",
+      command: "npx",
+      args: ["-y", "@yawlabs/fetch-mcp@latest"],
+    });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      // connect rejects in the mock; we only assert the spawn was rewritten.
+    }
+    // The gate fired with the (uv-resolved) command/args ...
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+    // ... and the REWRITTEN command/args are what actually get spawned.
+    expect(_sdkBehavior.lastStdioArgs?.command).toBe("/usr/bin/oam");
+    expect(_sdkBehavior.lastStdioArgs?.args).toEqual(["run", "/cache/fetch/dist/index.js"]);
+  });
+
+  it("does NOT touch the spawn command when runtime is unset", async () => {
+    const config = makeLocalConfig({ command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* connect rejects; assert the original command was spawned */
+    }
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.lastStdioArgs?.command).toBe("npx");
+    expect(_sdkBehavior.lastStdioArgs?.args).toEqual(["-y", "@yawlabs/fetch-mcp@latest"]);
+  });
+
+  it("does NOT touch the spawn command when runtime is 'node'", async () => {
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* same */
+    }
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.lastStdioArgs?.command).toBe("npx");
   });
 });
