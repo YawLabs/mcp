@@ -122,6 +122,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--dry-run", "--json", "--help"],
   },
   { name: "stats", description: "Show usage statistics", flags: ["--limit", "--days", "--json", "--help"] },
+  { name: "token", description: "Print the account session token for a trusted local app", flags: ["--json", "--help"] },
   {
     name: "secrets",
     description: "Manage stored secrets",

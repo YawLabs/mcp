@@ -38,6 +38,7 @@ export const KNOWN_SUBCOMMANDS = [
   "logout",
   "sync",
   "stats",
+  "token",
   "secrets",
   "set-active",
   "help",
