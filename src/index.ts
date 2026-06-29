@@ -19,6 +19,7 @@ import { parseSetActiveArgs, runSetActive } from "./set-active-cmd.js";
 import { parseStatsArgs, runStats } from "./stats-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseSyncArgs, runSync } from "./sync-cmd.js";
+import { parseTokenArgs, runTokenCmd } from "./token-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
@@ -260,6 +261,17 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   dispatch("logout", runLogout(parsed.options));
+} else if (subcommand === "token") {
+  const parsed = parseTokenArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  dispatch("token", runTokenCmd(parsed.options));
 } else if (subcommand === "sync") {
   const parsed = parseSyncArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -364,6 +376,8 @@ if (subcommand === "compliance") {
                              remove, lock, push, pull.
     stats                    Show your account usage statistics
                              (--limit, --days, --json).
+    token                    Print this machine's session token for a trusted
+                             local app (e.g. Vew Meetings). --json for fields.
 
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP

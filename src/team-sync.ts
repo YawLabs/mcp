@@ -494,6 +494,19 @@ export function getCachedCookie(home: string = homedir()): string | null {
   return s ? s.cookie : null;
 }
 
+/** Returns the stored yaw_team cookie + session for the current session, or
+ *  null when not signed in / expired. Reads (and exp-validates) the persisted
+ *  state via loadStoredState; makes NO network call. Used by `yaw-mcp token`
+ *  so a trusted local app (e.g. Vew) can present the session to a Yaw endpoint
+ *  that verifies the same HMAC cookie. */
+export async function getSessionWithCookie(
+  opts: BaseOpts = {},
+): Promise<{ cookie: string; session: TeamSession } | null> {
+  const filePath = opts.filePath ?? sessionStatePath(opts.home);
+  const state = await loadStoredState(filePath);
+  return state ? { cookie: state.cookie, session: state.session } : null;
+}
+
 /** Test-only: reset module-scoped state caches. */
 export function _resetForTests(): void {
   invalidateState();
