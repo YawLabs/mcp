@@ -84,6 +84,52 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].runtime).toBeUndefined();
   });
 
+  it("surfaces a top-level defaultRuntime", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      defaultRuntime: "oam",
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"] }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.defaultRuntime).toBe("oam");
+    // The knob is config-level, not per-server: the entry itself stays unset.
+    expect(r.config?.servers[0].runtime).toBeUndefined();
+  });
+
+  it("warns on and drops an invalid top-level defaultRuntime", async () => {
+    writeBundles(synthHome, { version: 1, defaultRuntime: "wasm", servers: [] });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.defaultRuntime).toBeUndefined();
+    expect(r.warnings.some((w) => w.includes("defaultRuntime"))).toBe(true);
+  });
+
+  it("leaves defaultRuntime undefined when the file doesn't set it", async () => {
+    writeBundles(synthHome, { version: 1, servers: [] });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.defaultRuntime).toBeUndefined();
+  });
+
+  it("falls back to user-global defaultRuntime when the winning project file doesn't set it", async () => {
+    writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
+    writeBundles(synthCwd, { version: 1, servers: [] });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    // Servers follow winner-takes-all (project), but defaultRuntime is a
+    // MACHINE-level knob: a committed team bundles.json that doesn't mention
+    // it must not silently turn it off. See LoadLocalBundlesResult.
+    expect(r.defaultRuntime).toBe("oam");
+    expect(r.defaultRuntimePath).toBe(localBundlesPath(join(synthHome, CONFIG_DIRNAME)));
+    // The server list itself still comes from the project file.
+    expect(r.path).toBe(localBundlesPath(join(synthCwd, CONFIG_DIRNAME)));
+  });
+
+  it("project defaultRuntime wins over user-global when both are set", async () => {
+    writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
+    writeBundles(synthCwd, { version: 1, defaultRuntime: "node", servers: [] });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.defaultRuntime).toBe("node");
+    expect(r.defaultRuntimePath).toBe(localBundlesPath(join(synthCwd, CONFIG_DIRNAME)));
+  });
+
   it("loads from project-local <cwd>/.yaw-mcp/bundles.json", async () => {
     writeBundles(synthCwd, {
       version: 1,
@@ -316,6 +362,34 @@ describe("readRawUserBundles error message branching (fix 9)", () => {
       }
     },
   );
+});
+
+// The write path (add/remove) must round-trip the top-level defaultRuntime --
+// dropping it on an unrelated `yaw-mcp add` would silently flip every
+// defaulted server back to node.
+describe("defaultRuntime round-trip through the write path", () => {
+  it("upsertUserBundle preserves an existing top-level defaultRuntime", async () => {
+    writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
+    await upsertUserBundle(
+      { namespace: "fetch", name: "Fetch", command: "npx", args: [], isActive: true },
+      { home: synthHome },
+    );
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.defaultRuntime).toBe("oam");
+    expect(r.config?.servers.map((s) => s.namespace)).toEqual(["fetch"]);
+  });
+
+  it("removeUserBundle preserves an existing top-level defaultRuntime", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      defaultRuntime: "oam",
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx" }],
+    });
+    await removeUserBundle("fetch", { home: synthHome });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.defaultRuntime).toBe("oam");
+    expect(r.config?.servers).toEqual([]);
+  });
 });
 
 // Fix 2: bundleWriteChain serializer -- concurrent calls must not lose writes

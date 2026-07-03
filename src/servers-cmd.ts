@@ -18,8 +18,10 @@
 
 import { ConfigError, fetchConfig } from "./config.js";
 import { loadYawMcpConfig } from "./config-loader.js";
+import { describeDefaultRuntime, describeServerRuntime, type ServerRuntimeInfo } from "./default-runtime.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
-import type { ConnectConfig } from "./types.js";
+import { type OamProbe, probeOam } from "./oam-spawn.js";
+import type { ConnectConfig, UpstreamServerConfig } from "./types.js";
 
 export interface ServersCommandOptions {
   home?: string;
@@ -41,6 +43,9 @@ export interface ServersCommandOptions {
   fetcher?: (apiBase: string, token: string) => Promise<ConnectConfig | null>;
   /** Test hook: supply a grade cache instead of reading ~/.yaw-mcp/grades.json. */
   gradesReader?: (home?: string) => Promise<GradesCache>;
+  /** Test hook: replace the real `oam --version` probe (keeps the RUNTIME
+   *  column deterministic regardless of what's installed on the host). */
+  oamProbe?: () => OamProbe;
 }
 
 export interface ServersCommandResult {
@@ -165,13 +170,31 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     }),
   };
 
+  // Effective-runtime verdict per server: what would this server ACTUALLY
+  // spawn on (oam vs node) and why (per-server opt-in/out, config default,
+  // oam missing/below-min, non-node command). Backend defs never carry
+  // `runtime`, so without this the oam->node fallback is invisible. Same
+  // helper doctor uses, so both surfaces agree.
+  const probe = (opts.oamProbe ?? probeOam)();
+  const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
+  const runtimes = new Map<UpstreamServerConfig, ServerRuntimeInfo>(
+    merged.servers.map((s) => [s, describeServerRuntime(s, dflt.runtime, probe)]),
+  );
+
   if (opts.json) {
     // Echo the active filter (if any) and whether it matched, so a script
     // consuming `servers --json` can distinguish "filter matched nothing"
     // (filter set, filterMatched=false) from "account has no servers"
     // (filter null) -- the table branch already explains this in prose.
+    // `effectiveRuntime`/`effectiveRuntimeReason` are the computed verdicts;
+    // the configured per-server `runtime` field (when present) is preserved
+    // as-is on each server object.
     const payload = {
       ...merged,
+      servers: merged.servers.map((s) => {
+        const v = runtimes.get(s);
+        return { ...s, effectiveRuntime: v?.runtime ?? null, effectiveRuntimeReason: v?.reason ?? "" };
+      }),
       filter: opts.filter ?? null,
       filterMatched: opts.filter !== undefined ? merged.servers.length > 0 : null,
     };
@@ -184,11 +207,32 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     return { exitCode: 0, lines };
   }
 
-  renderTable(merged, print);
+  renderTable(merged, runtimes, print);
   return { exitCode: 0, lines };
 }
 
-function renderTable(cfg: ConnectConfig, print: (s?: string) => void): void {
+/** Compact RUNTIME cell. Plain "oam"/"node" for the expected cases; the
+ *  oam->node fallback cases carry a short parenthetical so the silent
+ *  downgrade is visible at a glance (full reason in `servers --json`). */
+function runtimeCell(v: ServerRuntimeInfo | undefined): string {
+  if (!v || v.runtime === null) return "-";
+  switch (v.code) {
+    case "oam-not-installed":
+      return "node (no oam)";
+    case "oam-below-min":
+      return "node (oam too old)";
+    case "not-node-command":
+      return "node (not node-based)";
+    default:
+      return v.runtime;
+  }
+}
+
+function renderTable(
+  cfg: ConnectConfig,
+  runtimes: Map<UpstreamServerConfig, ServerRuntimeInfo>,
+  print: (s?: string) => void,
+): void {
   const servers = cfg.servers;
   if (servers.length === 0) {
     print("No servers configured yet. Visit https://yaw.sh/mcp to add one.");
@@ -213,6 +257,7 @@ function renderTable(cfg: ConnectConfig, print: (s?: string) => void): void {
     name: s.name,
     type: s.type,
     status: s.isActive ? "enabled" : "disabled",
+    runtime: runtimeCell(runtimes.get(s)),
     grade: s.complianceGrade ?? "-",
     tools: s.toolCache ? String(s.toolCache.length) : "?",
   }));
@@ -222,6 +267,7 @@ function renderTable(cfg: ConnectConfig, print: (s?: string) => void): void {
     name: Math.max("NAME".length, ...rows.map((r) => r.name.length)),
     type: Math.max("TYPE".length, ...rows.map((r) => r.type.length)),
     status: Math.max("STATUS".length, ...rows.map((r) => r.status.length)),
+    runtime: Math.max("RUNTIME".length, ...rows.map((r) => r.runtime.length)),
     grade: Math.max("GRADE".length, ...rows.map((r) => r.grade.length)),
     tools: Math.max("TOOLS".length, ...rows.map((r) => r.tools.length)),
   };
@@ -231,6 +277,7 @@ function renderTable(cfg: ConnectConfig, print: (s?: string) => void): void {
     `${"NAME".padEnd(widths.name)}  ` +
     `${"TYPE".padEnd(widths.type)}  ` +
     `${"STATUS".padEnd(widths.status)}  ` +
+    `${"RUNTIME".padEnd(widths.runtime)}  ` +
     `${"GRADE".padEnd(widths.grade)}  ` +
     `${"TOOLS".padStart(widths.tools)}`;
   print(header);
@@ -244,6 +291,7 @@ function renderTable(cfg: ConnectConfig, print: (s?: string) => void): void {
       `${r.name.padEnd(widths.name)}  ` +
       `${r.type.padEnd(widths.type)}  ` +
       `${r.status.padEnd(widths.status)}  ` +
+      `${r.runtime.padEnd(widths.runtime)}  ` +
       `${r.grade.padEnd(widths.grade)}  ` +
       `${r.tools.padStart(widths.tools)}`;
     print(line);

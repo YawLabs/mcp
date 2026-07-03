@@ -38,9 +38,12 @@ export interface UpstreamServerConfig {
   /**
    * Opt this server into being hosted on the oam runtime (`oam run <entry>`)
    * instead of node/npx. "oam" = prefer oam when it's installed, falling back
-   * to node/npx if oam is absent or the package can't be resolved on disk.
-   * Absent (or "node") = node, the default. Per-server opt-in -- set in
-   * bundles.json or the dashboard. See oam-spawn.ts.
+   * to node/npx if oam is absent, below the minimum supported version, or the
+   * package can't be resolved on disk. "node" = always node -- the escape
+   * hatch when a config-level default of "oam" is set (bundles.json
+   * `defaultRuntime` / YAW_MCP_DEFAULT_RUNTIME; see default-runtime.ts).
+   * Absent = the config-level default, or node when none is set. Per-server
+   * -- set in bundles.json or the dashboard. See oam-spawn.ts.
    */
   runtime?: "oam" | "node";
 }

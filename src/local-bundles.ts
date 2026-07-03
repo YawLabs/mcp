@@ -9,12 +9,20 @@
 // your repo, the team gets exactly that set, no surprises from a
 // teammate's user-global file leaking in.
 //
-// When yaw-mcp starts WITH a token, this file is ignored -- the cloud
-// account is the source of truth, and bundles.json sits unused on disk.
-// When yaw-mcp starts WITHOUT a token, bundles.json IS the source. If
-// neither file exists, yaw-mcp starts with an empty server list and
-// surfaces the "no servers configured" hint pointing at
-// `yaw-mcp add <slug>` (NOT `install`, which connects a CLIENT to yaw-mcp).
+// When yaw-mcp starts WITH a token, the server DEFINITIONS in this file
+// are ignored -- the cloud account is the source of truth, and the
+// `servers` array sits unused on disk. When yaw-mcp starts WITHOUT a
+// token, bundles.json IS the source. If neither file exists, yaw-mcp
+// starts with an empty server list and surfaces the "no servers
+// configured" hint pointing at `yaw-mcp add <slug>` (NOT `install`,
+// which connects a CLIENT to yaw-mcp).
+//
+// Exception: the top-level `defaultRuntime` knob ("oam" | "node") is a
+// MACHINE-level preference, not a server definition, so it applies in
+// BOTH modes -- backend server defs don't carry `runtime`, and the
+// account dashboard has no per-machine concept of "oam is installed
+// here". See default-runtime.ts for the resolution order
+// (YAW_MCP_DEFAULT_RUNTIME env > this file's defaultRuntime > unset).
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -40,6 +48,11 @@ export const CURRENT_BUNDLES_SCHEMA_VERSION = 1;
 export interface LocalBundlesFile {
   version?: number;
   servers: Array<Partial<UpstreamServerConfig>>;
+  /** Config-level default runtime for servers that don't set a per-server
+   *  `runtime`. Per-server `"node"` stays an escape hatch under a default of
+   *  `"oam"`. Applied in connectToUpstream (via default-runtime.ts) so it
+   *  covers backend-sourced defs in account mode too. */
+  defaultRuntime?: "oam" | "node";
 }
 
 /** Build the absolute path to bundles.json inside a given config dir. */
@@ -181,9 +194,21 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
     warnings.push(`${path}: 'servers' must be an array -- file ignored`);
     return { exists: true, file: null };
   }
+  // Top-level default runtime. Only "oam"/"node" are meaningful; anything
+  // else is dropped with a warning (matching the per-server `runtime`
+  // validation in validateEntry, which drops silently -- top-level gets a
+  // warning because a typo here changes EVERY server's runtime).
+  let defaultRuntime: "oam" | "node" | undefined;
+  if (obj.defaultRuntime === "oam" || obj.defaultRuntime === "node") {
+    defaultRuntime = obj.defaultRuntime;
+  } else if (obj.defaultRuntime !== undefined) {
+    warnings.push(
+      `${path}: ignoring invalid 'defaultRuntime' ${JSON.stringify(obj.defaultRuntime)} (expected "oam" or "node")`,
+    );
+  }
   return {
     exists: true,
-    file: { version, servers: rawServers as Array<Partial<UpstreamServerConfig>> },
+    file: { version, servers: rawServers as Array<Partial<UpstreamServerConfig>>, defaultRuntime },
   };
 }
 
@@ -201,12 +226,24 @@ export interface LoadLocalBundlesResult {
   config: ConnectConfig | null;
   path: string | null;
   warnings: string[];
+  /** Top-level `defaultRuntime`. A project file that SETS it wins; a project
+   *  file that doesn't falls back to the user-global file's value -- the
+   *  knob is a MACHINE-level preference, so a committed team bundles.json
+   *  (which will never carry a machine fact) must not silently turn it off.
+   *  This is the one deliberate departure from the winner-takes-all
+   *  server-list precedence. Undefined when nothing sets it. */
+  defaultRuntime?: "oam" | "node";
+  /** Absolute path of the bundles.json the defaultRuntime came from (may be
+   *  the user-global file even when servers came from a project file -- see
+   *  above). Undefined when defaultRuntime is undefined. */
+  defaultRuntimePath?: string;
 }
 
 /** Load bundles.json from the canonical locations. Project-local
  *  (`<project>/.yaw-mcp/bundles.json`) wins over user-global
- *  (`~/.yaw-mcp/bundles.json`) -- no merge. Returns null config when
- *  neither file exists, so the caller can render the empty-state hint. */
+ *  (`~/.yaw-mcp/bundles.json`) -- no merge (defaultRuntime excepted; see
+ *  LoadLocalBundlesResult). Returns null config when neither file exists,
+ *  so the caller can render the empty-state hint. */
 export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {}): Promise<LoadLocalBundlesResult> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
@@ -245,6 +282,22 @@ export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {
     if (validated) servers.push(validated);
   }
 
+  // defaultRuntime is machine-level: when a VALID project file won but
+  // doesn't set it, fall back to the user-global file's value. The scratch
+  // warnings array keeps the global file's diagnostics out of the result --
+  // its servers are deliberately shadowed, so "file ignored"-class warnings
+  // about it would only confuse.
+  let defaultRuntime = file.defaultRuntime;
+  let defaultRuntimePath = defaultRuntime !== undefined ? (sourcePath ?? undefined) : undefined;
+  if (defaultRuntime === undefined && sourcePath === projectPath && projectPath !== null) {
+    const scratch: string[] = [];
+    const globalResult = await readBundlesAt(globalPath, scratch);
+    if (globalResult.file?.defaultRuntime !== undefined) {
+      defaultRuntime = globalResult.file.defaultRuntime;
+      defaultRuntimePath = globalPath;
+    }
+  }
+
   return {
     config: {
       servers,
@@ -252,6 +305,8 @@ export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {
     },
     path: sourcePath,
     warnings,
+    defaultRuntime,
+    defaultRuntimePath,
   };
 }
 
@@ -320,7 +375,21 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
     const detail = warnings.length > 0 ? ` (${warningText})` : "";
     throw new Error(`${path} could not be parsed -- fix the JSON${detail} before adding servers.`);
   }
-  return { version: r.file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION, servers: r.file.servers };
+  // Surface non-fatal read warnings on the write path too: an invalid
+  // `defaultRuntime` value (a typo like "omm") is dropped by readBundlesAt,
+  // and the rewrite below would silently delete the key from the file --
+  // the user should see WHY before it vanishes.
+  for (const w of warnings) {
+    log("warn", "bundles.json warning (write path)", { warning: w });
+  }
+  // Round-trip defaultRuntime so an add/remove never drops the user's
+  // config-level runtime knob (validateEntry-style coercion already ran in
+  // readBundlesAt; an invalid value was warned about and dropped there).
+  return {
+    version: r.file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION,
+    servers: r.file.servers,
+    ...(r.file.defaultRuntime !== undefined ? { defaultRuntime: r.file.defaultRuntime } : {}),
+  };
 }
 
 /**
