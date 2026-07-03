@@ -9,6 +9,7 @@ import {
   MAX_PROMPTS_PER_SERVER,
   MAX_RESOURCES_PER_SERVER,
   MAX_TOOLS_PER_SERVER,
+  resetOamDowngrades,
 } from "../upstream.js";
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,9 @@ const _sdkBehavior = {
   // The {command,args,env} the stdio transport was last constructed with --
   // lets a test assert what actually gets spawned (e.g. the oam-rewritten cmd).
   lastStdioArgs: null as { command: string; args: string[]; env?: Record<string, string> } | null,
+  // EVERY stdio construction, in order -- the boot-probe fallback respawns,
+  // so a single "last" slot can't show the oam -> node downgrade sequence.
+  stdioConstructions: [] as Array<{ command: string; args: string[]; env?: Record<string, string> }>,
 };
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
@@ -63,6 +67,10 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
     return {
       connect: () => _sdkBehavior.clientConnect(),
       close: () => _sdkBehavior.clientClose(),
+      // listTools succeeds with an empty set so tests can drive the connect
+      // flow to a SUCCESSFUL completion (the boot-probe fallback tests need
+      // the second attempt to come up healthy).
+      listTools: () => Promise.resolve({ tools: [] }),
       listResources: () => Promise.resolve({ resources: [] }),
       listPrompts: () => Promise.resolve({ prompts: [] }),
       onclose: undefined as (() => void) | undefined,
@@ -75,6 +83,7 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => {
   function MockStdioClientTransport(opts: { command: string; args: string[]; env?: Record<string, string> }) {
     _sdkBehavior.lastStdioArgs = opts;
+    _sdkBehavior.stdioConstructions.push(opts);
     const emitter = new EventEmitter();
     _sdkBehavior.stderrEmitter = emitter;
     return { stderr: emitter };
@@ -83,10 +92,20 @@ vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => {
 });
 
 // resolveOamSpawn is the spawn-rewrite chokepoint (upstream.ts gates it on
-// config.runtime === "oam"). Mock it so the WIRING -- "does runtime:oam actually
-// reach + apply the rewrite?" -- is tested independently of an installed oam.
+// the effective runtime being "oam"). Mock it so the WIRING -- "does the
+// runtime gate actually reach + apply the rewrite?" -- is tested
+// independently of an installed oam. probeOam feeds the oamVersion field of
+// the connect/downgrade log lines; a fixed probe keeps that deterministic.
 vi.mock("../oam-spawn.js", () => ({
   resolveOamSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
+  probeOam: vi.fn(() => ({ bin: "/usr/bin/oam", version: "0.6.0", belowMin: false })),
+}));
+
+// Config-level default runtime (feature knob) -- mocked so connectToUpstream
+// never reads the developer machine's real ~/.yaw-mcp/bundles.json, and so
+// tests can flip the default per-case.
+vi.mock("../default-runtime.js", () => ({
+  defaultRuntime: vi.fn().mockResolvedValue(null),
 }));
 
 // Remote transports -- not needed for env/redact tests but must not throw.
@@ -101,7 +120,8 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
   },
 }));
 
-// Import the mocked resolveOamSpawn so the wiring test can configure/assert it.
+// Import the mocked modules so the wiring tests can configure/assert them.
+import { defaultRuntime } from "../default-runtime.js";
 import { resolveOamSpawn } from "../oam-spawn.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock } from "../secrets-vault.js";
@@ -457,7 +477,10 @@ describe("connectToUpstream oam runtime wiring", () => {
     _sdkBehavior.clientConnect = () => Promise.reject(new Error("stop after spawn"));
     _sdkBehavior.clientClose = () => Promise.resolve();
     _sdkBehavior.lastStdioArgs = null;
+    _sdkBehavior.stdioConstructions = [];
     vi.mocked(resolveOamSpawn).mockReset();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
   });
   afterEach(() => {
     vi.clearAllMocks();
@@ -478,11 +501,13 @@ describe("connectToUpstream oam runtime wiring", () => {
     } catch {
       // connect rejects in the mock; we only assert the spawn was rewritten.
     }
-    // The gate fired with the (uv-resolved) command/args ...
+    // The gate fired with the (uv-resolved) command/args, exactly once -- the
+    // boot-probe downgrade retry deliberately skips the rewrite ...
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledOnce();
     expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
-    // ... and the REWRITTEN command/args are what actually get spawned.
-    expect(_sdkBehavior.lastStdioArgs?.command).toBe("/usr/bin/oam");
-    expect(_sdkBehavior.lastStdioArgs?.args).toEqual(["run", "/cache/fetch/dist/index.js"]);
+    // ... and the REWRITTEN command/args are what actually get spawned first.
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/usr/bin/oam");
+    expect(_sdkBehavior.stdioConstructions[0]?.args).toEqual(["run", "/cache/fetch/dist/index.js"]);
   });
 
   it("does NOT touch the spawn command when runtime is unset", async () => {
@@ -506,5 +531,170 @@ describe("connectToUpstream oam runtime wiring", () => {
     }
     expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
     expect(_sdkBehavior.lastStdioArgs?.command).toBe("npx");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Config-level default runtime -- connectToUpstream must apply the oam rewrite
+// when defaultRuntime() says "oam" and the server carries no per-server
+// runtime; per-server "node" stays an escape hatch. Backend server defs never
+// carry `runtime`, so this gate is what makes the knob work in account mode.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream config-level default runtime", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("stop after spawn"));
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.lastStdioArgs = null;
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveOamSpawn).mockReset();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("applies the oam rewrite when the default is 'oam' and runtime is unset", async () => {
+    vi.mocked(defaultRuntime).mockResolvedValue("oam");
+    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    const config = makeLocalConfig({ command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* connect rejects; assertions below */
+    }
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/usr/bin/oam");
+  });
+
+  it("per-server runtime:'node' opts out of a default of 'oam'", async () => {
+    vi.mocked(defaultRuntime).mockResolvedValue("oam");
+    const config = makeLocalConfig({ runtime: "node", command: "npx", args: ["-y", "x"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* same */
+    }
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+  });
+
+  it("stays on node when the default is 'node'", async () => {
+    vi.mocked(defaultRuntime).mockResolvedValue("node");
+    const config = makeLocalConfig({ command: "npx", args: ["-y", "x"] });
+    try {
+      await connectToUpstream(config);
+    } catch {
+      /* same */
+    }
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+    expect(_sdkBehavior.lastStdioArgs?.command).toBe("npx");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot-probe fallback -- when the spawn was ACTUALLY oam-rewritten and the
+// boot fails (handshake failure / early child exit, both surfacing as an
+// ActivationError), connectToUpstream respawns ONCE with the original
+// pre-rewrite command. No retry ladder beyond that single downgrade, and
+// non-oam spawns keep the existing single-attempt behavior.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream oam boot-probe fallback", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("boot failed"));
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.lastStdioArgs = null;
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveOamSpawn).mockReset();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("respawns once on the ORIGINAL command and succeeds when node boots", async () => {
+    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
+
+    const connection = await connectToUpstream(config);
+
+    expect(connection.status).toBe("connected");
+    // First spawn = oam-rewritten, second = the original pre-rewrite command.
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+    expect(_sdkBehavior.stdioConstructions[1]?.args).toEqual(["-y", "@yawlabs/fetch-mcp@latest"]);
+    // The downgrade attempt skips the rewrite entirely.
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledOnce();
+  });
+
+  it("downgrades exactly once: a second failure propagates (no retry ladder)", async () => {
+    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+  });
+
+  it("does NOT respawn when the spawn was never oam-rewritten", async () => {
+    const config = makeLocalConfig({ command: "npx", args: ["-y", "x"] });
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions).toHaveLength(1);
+  });
+
+  it("does NOT respawn when resolveOamSpawn already fell back internally (command unchanged)", async () => {
+    // oam absent / package unresolvable: resolveOamSpawn returns the command
+    // untouched, so a boot failure is a NODE failure -- no downgrade retry.
+    vi.mocked(resolveOamSpawn).mockImplementation((command: string, args: string[]) => ({ command, args }));
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions).toHaveLength(1);
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("npx");
+  });
+
+  it("does NOT downgrade on non-activation failures (vault refusals rethrow untouched)", async () => {
+    // Secret refs present but no passphrase -> resolveServerEnv throws a
+    // plain Error AFTER the rewrite gate. Downgrading would just fail
+    // identically on node, so the wrapper must rethrow without a respawn.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    const config = makeLocalConfig({
+      runtime: "oam",
+      command: "npx",
+      args: ["-y", "x"],
+      env: { TOKEN: "${secret:MY_TOKEN}" },
+    });
+    await expect(connectToUpstream(config)).rejects.toThrow(/vault locked/);
+    // The env is resolved before the transport is built -> no spawn at all.
+    expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
+  });
+
+  it("the downgrade STICKS for the session: later connects skip the oam rewrite", async () => {
+    // Callers (activation retry, auto-reconnect) call connectToUpstream
+    // repeatedly; without the namespace memo they'd re-pay the oam boot
+    // failure on every outer attempt.
+    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+
+    // First call: oam attempt fails, downgrade attempt fails too.
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    // Second call for the same namespace: straight to node, single spawn,
+    // rewrite never consulted again.
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveOamSpawn).mockClear();
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
   });
 });

@@ -2,8 +2,18 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
-import { npxCacheNodeModules, packageName, resolveNpmEntry, rewriteForOam, winNormalize } from "./oam-spawn.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  MIN_OAM_VERSION,
+  npxCacheNodeModules,
+  packageName,
+  parseOamVersion,
+  probeOam,
+  resetOamBinCache,
+  resolveNpmEntry,
+  rewriteForOam,
+  winNormalize,
+} from "./oam-spawn.js";
 
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
@@ -34,6 +44,62 @@ describe("packageName", () => {
   });
   it("leaves a bare unscoped name untouched", () => {
     expect(packageName("cowsay")).toBe("cowsay");
+  });
+});
+
+describe("parseOamVersion", () => {
+  it("extracts x.y.z from the canonical `oam X.Y.Z` output", () => {
+    expect(parseOamVersion("oam 0.6.0\n")).toBe("0.6.0");
+  });
+  it("extracts a bare x.y.z", () => {
+    expect(parseOamVersion("1.2.3")).toBe("1.2.3");
+  });
+  it("returns null when no version is present", () => {
+    expect(parseOamVersion("oam dev build")).toBeNull();
+  });
+});
+
+describe("probeOam min-version gate", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  it("reports a usable bin + version when at/above MIN_OAM_VERSION", () => {
+    const probe = probeOam(() => `oam ${MIN_OAM_VERSION}\n`);
+    expect(probe.bin).not.toBeNull();
+    expect(probe.version).toBe(MIN_OAM_VERSION);
+    expect(probe.belowMin).toBe(false);
+  });
+
+  it("treats a below-min install as oam-absent (bin null, belowMin set)", () => {
+    const probe = probeOam(() => "oam 0.5.9\n");
+    expect(probe.bin).toBeNull();
+    expect(probe.version).toBe("0.5.9");
+    expect(probe.belowMin).toBe(true);
+  });
+
+  it("treats a failed probe as not installed", () => {
+    const probe = probeOam(() => {
+      throw new Error("ENOENT");
+    });
+    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+  });
+
+  it("treats an unparseable version as usable (a working --version proves oam exists)", () => {
+    const probe = probeOam(() => "oam dev build\n");
+    expect(probe.bin).not.toBeNull();
+    expect(probe.version).toBeNull();
+    expect(probe.belowMin).toBe(false);
+  });
+
+  it("caches the probe result (the runner is only consulted once)", () => {
+    let calls = 0;
+    const run = () => {
+      calls++;
+      return "oam 9.9.9";
+    };
+    probeOam(run);
+    probeOam(run);
+    expect(calls).toBe(1);
   });
 });
 

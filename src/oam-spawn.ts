@@ -14,13 +14,17 @@
 // Compat note: opt in the pure-JS/SDK tier (npmjs/fetch/lemonsqueezy) and the
 // pure-JS DB drivers (postgres via `pg`, redis via `ioredis`) first. Servers
 // with native addons (ssh2) or bundled browsers (playwright) are not oam-
-// hostable yet. There is no auto-fallback once oam has launched the child, so
-// only opt in servers verified to run on oam.
+// hostable yet. Boot failures ARE recovered: connectToUpstream respawns once
+// on the original node/npx command when an oam-hosted child fails the connect
+// handshake or dies during the initial capability fetch (see upstream.ts).
+// There is still no auto-fallback after a healthy boot, so only opt in
+// servers verified to run on oam.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { log } from "./logger.js";
 
 /**
  * Strip an npm version/tag suffix from a package spec:
@@ -36,7 +40,50 @@ export function packageName(spec: string): string {
   return at === -1 ? spec : spec.slice(0, at);
 }
 
-let oamBinCache: string | null | undefined;
+/**
+ * Minimum oam version yaw-mcp will host sidecars on. Older builds predate the
+ * extra-fd stdio + npx-bin-resolution fixes MCP sidecars rely on; hosting on
+ * them produces hangs that LOOK like server bugs. Below-min is treated the
+ * same as oam-absent: the spawn falls back to node/npx (one warn log).
+ */
+export const MIN_OAM_VERSION = "0.6.0";
+
+/** Result of probing the oam binary (`oam --version`). */
+export interface OamProbe {
+  /** The spawnable oam binary -- null when oam is not installed OR its
+   *  version is below MIN_OAM_VERSION (both mean "fall back to node"). */
+  bin: string | null;
+  /** Version reported by `oam --version` (e.g. "0.6.0"), or null when oam
+   *  is not installed or the output was unparseable. */
+  version: string | null;
+  /** True when oam IS installed but below MIN_OAM_VERSION (bin is null). */
+  belowMin: boolean;
+}
+
+let oamProbeCache: OamProbe | undefined;
+
+/** Extract the first x.y.z version from `oam --version` output ("oam 0.6.0"). */
+export function parseOamVersion(out: string): string | null {
+  const m = /(\d+\.\d+\.\d+)/.exec(out);
+  return m ? m[1] : null;
+}
+
+/** Dotted-numeric x.y.z compare: negative when a < b, 0 when equal/unparseable.
+ *  Local copy (doctor-cmd.ts has compareSemver, but importing it here would
+ *  create an upstream -> oam-spawn -> doctor-cmd dependency chain). */
+function compareVersions(a: string, b: string): number {
+  const parse = (s: string): [number, number, number] | null => {
+    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(s);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
+}
 
 /**
  * Convert forward slashes to backslashes on Windows. The MCP SDK spawns stdio
@@ -50,25 +97,52 @@ export function winNormalize(p: string, platform: NodeJS.Platform = process.plat
 }
 
 /**
- * The oam binary to spawn, or `null` if oam isn't available. Probed once with
- * `oam --version` and cached. OAM_BIN overrides the binary path; it's
- * normalized to a cmd-safe path so a forward-slash OAM_BIN still spawns.
+ * Probe the oam binary once (`oam --version`) and cache the result. OAM_BIN
+ * overrides the binary path; it's normalized to a cmd-safe path so a
+ * forward-slash OAM_BIN still spawns. The version output is parsed and gated
+ * against MIN_OAM_VERSION: a below-min install is reported with bin=null
+ * (same fallback as oam-absent) plus ONE warn log naming both versions. An
+ * unparseable version is treated as usable -- a working `--version` proves
+ * oam exists, and refusing on a future format change would silently disable
+ * every opted-in server.
+ *
+ * `run` is injectable so the parse + gate logic is testable without a real
+ * binary on PATH.
  */
-export function oamBin(): string | null {
-  if (oamBinCache !== undefined) return oamBinCache;
+export function probeOam(
+  run: (bin: string) => string = (bin) =>
+    execFileSync(bin, ["--version"], { stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" }),
+): OamProbe {
+  if (oamProbeCache !== undefined) return oamProbeCache;
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
   try {
-    execFileSync(bin, ["--version"], { stdio: "ignore" });
-    oamBinCache = bin;
+    const version = parseOamVersion(run(bin));
+    if (version !== null && compareVersions(version, MIN_OAM_VERSION) < 0) {
+      log("warn", "oam is installed but below the minimum supported version; falling back to node", {
+        oamVersion: version,
+        minVersion: MIN_OAM_VERSION,
+      });
+      oamProbeCache = { bin: null, version, belowMin: true };
+    } else {
+      oamProbeCache = { bin, version, belowMin: false };
+    }
   } catch {
-    oamBinCache = null;
+    oamProbeCache = { bin: null, version: null, belowMin: false };
   }
-  return oamBinCache;
+  return oamProbeCache;
+}
+
+/**
+ * The oam binary to spawn, or `null` if oam isn't available (not installed,
+ * or installed below MIN_OAM_VERSION -- see probeOam).
+ */
+export function oamBin(): string | null {
+  return probeOam().bin;
 }
 
 /** Reset the cached oam-binary probe (test hook). */
 export function resetOamBinCache(): void {
-  oamBinCache = undefined;
+  oamProbeCache = undefined;
 }
 
 export interface OamRewriteDeps {

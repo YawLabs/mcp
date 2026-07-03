@@ -7,8 +7,9 @@ import {
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { defaultRuntime } from "./default-runtime.js";
 import { log } from "./logger.js";
-import { resolveOamSpawn } from "./oam-spawn.js";
+import { probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, vaultPath } from "./secrets-vault.js";
 import type {
@@ -214,10 +215,74 @@ function categorizeSpawnError(err: unknown): ActivationFailureCategory {
   return "unknown";
 }
 
+/** Per-attempt spawn facts, threaded out of connectToUpstreamOnce so the
+ *  wrapper can decide whether a failure qualifies for the oam->node
+ *  downgrade (and log the oam version it downgraded from). */
+interface SpawnAttempt {
+  /** True when resolveOamSpawn actually CHANGED the launch (oam installed,
+   *  command was node/npx, package resolved). False for plain node spawns
+   *  and for oam opt-ins that already fell back inside resolveOamSpawn. */
+  oamRewritten: boolean;
+  oamVersion: string | null;
+}
+
+/** Namespaces whose oam-hosted boot already failed once this session. The
+ *  rewrite gate skips these so the downgrade STICKS: without the memo,
+ *  callers with their own retry loops (runActivateOne's two attempts, the
+ *  auto-reconnect path) would re-pay the oam boot failure on every outer
+ *  attempt and on every later reconnect. Cleared only by process restart --
+ *  matching the "for this session" wording of the downgrade log. */
+const oamDowngradedNamespaces = new Set<string>();
+
+/** Reset the session-scoped oam downgrade memo (test hook). */
+export function resetOamDowngrades(): void {
+  oamDowngradedNamespaces.clear();
+}
+
 export async function connectToUpstream(
   config: UpstreamServerConfig,
   onDisconnect?: (namespace: string) => void,
   onListChanged?: (namespace: string) => void,
+): Promise<UpstreamConnection> {
+  const attempt: SpawnAttempt = { oamRewritten: false, oamVersion: null };
+  try {
+    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, false);
+  } catch (err) {
+    // Boot-probe fallback: when the spawn was oam-rewritten and the boot
+    // failed (spawn error, connect/initialize handshake failure, or the
+    // child dying during the initial capability fetch -- all surfaced as
+    // ActivationError), respawn ONCE with the original pre-rewrite command.
+    // Exactly one downgrade per call, no retry ladder: a second failure
+    // propagates; the namespace memo above makes the downgrade stick for
+    // the rest of the session. Non-oam spawns and non-activation errors
+    // (e.g. vault refusals, which would fail identically on node) rethrow
+    // untouched. A child that dies AFTER a healthy boot still gets no
+    // auto-fallback (see oam-spawn.ts).
+    //
+    // Accepted tradeoff: ANY ActivationError qualifies, including a
+    // protocol_error from the initial tools/list. That's deliberate -- a
+    // child that dies right after the handshake surfaces there too, and
+    // cheaply distinguishing "dead child" from "healthy server returning a
+    // JSON-RPC error" isn't possible at this layer. Worst case is one extra
+    // node boot before the same error propagates (bounded by the memo).
+    if (!attempt.oamRewritten || !(err instanceof ActivationError)) throw err;
+    oamDowngradedNamespaces.add(config.namespace);
+    log("warn", "oam-hosted server failed to boot; downgrading to node for this session", {
+      namespace: config.namespace,
+      oamVersion: attempt.oamVersion,
+      category: err.category,
+      error: err.message,
+    });
+    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, true);
+  }
+}
+
+async function connectToUpstreamOnce(
+  config: UpstreamServerConfig,
+  onDisconnect: ((namespace: string) => void) | undefined,
+  onListChanged: ((namespace: string) => void) | undefined,
+  attempt: SpawnAttempt,
+  disableOamRewrite: boolean,
 ): Promise<UpstreamConnection> {
   const client = new Client(
     { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
@@ -263,11 +328,22 @@ export async function connectToUpstream(
     // categorizeSpawnError path with the actual error message.
     let resolved = await resolveUvSpawn(config.command, config.args ?? []);
     // Host on the oam runtime when this server opted in (config.runtime ===
-    // "oam"). Applied AFTER resolveUvSpawn so uv/uvx stay on their managed
+    // "oam") or the config-level default says so (YAW_MCP_DEFAULT_RUNTIME /
+    // bundles.json `defaultRuntime`) -- per-server "node" stays an escape
+    // hatch. Applied AFTER resolveUvSpawn so uv/uvx stay on their managed
     // binary; resolveOamSpawn only rewrites node/npx and otherwise (incl. when
-    // oam is absent) returns the command unchanged -- a pure optimization.
-    if (config.runtime === "oam") {
-      resolved = resolveOamSpawn(resolved.command, resolved.args);
+    // oam is absent or below min version) returns the command unchanged -- a
+    // pure optimization. disableOamRewrite is the boot-probe downgrade path:
+    // the wrapper re-runs this function once with the rewrite suppressed so
+    // the ORIGINAL node/npx command spawns.
+    const effectiveRuntime = config.runtime ?? (await defaultRuntime());
+    if (effectiveRuntime === "oam" && !disableOamRewrite && !oamDowngradedNamespaces.has(config.namespace)) {
+      const rewritten = resolveOamSpawn(resolved.command, resolved.args);
+      if (rewritten.command !== resolved.command) {
+        attempt.oamRewritten = true;
+        attempt.oamVersion = probeOam().version;
+        resolved = rewritten;
+      }
     }
 
     // Resolve ${secret:NAME} references in the server's env against
@@ -381,7 +457,20 @@ export async function connectToUpstream(
     throw new ActivationError(message, category, redactedTail, err);
   }
 
-  log("info", "Connected to upstream", { name: config.name, namespace: config.namespace, type: config.type });
+  // Name the runtime that actually won: "oam" (with the probed oam version)
+  // when the rewrite applied, an explicit downgrade marker when the boot-probe
+  // fallback respawned on node, and nothing extra for plain node spawns.
+  const runtimeFields = attempt.oamRewritten
+    ? disableOamRewrite
+      ? { runtime: "node", downgradedFromOam: true }
+      : { runtime: "oam", oamVersion: attempt.oamVersion }
+    : {};
+  log("info", "Connected to upstream", {
+    name: config.name,
+    namespace: config.namespace,
+    type: config.type,
+    ...runtimeFields,
+  });
 
   // Fetch tools, resources, prompts — clean up client on failure
   try {

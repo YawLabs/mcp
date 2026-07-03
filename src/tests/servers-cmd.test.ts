@@ -274,6 +274,105 @@ describe("runServersCommand", () => {
     expect(io.out.join("\n")).toMatch(/-\s+\?$/m);
   });
 
+  it("shows the effective runtime per server (RUNTIME column) with why on fallback", async () => {
+    const io = captureIO();
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [
+        // Backend defs never carry `runtime` -- the per-server field here
+        // mimics a dashboard-set override; the rest exercise the default.
+        makeServer({ namespace: "fetch", name: "Fetch", type: "local", command: "npx", runtime: "oam" }),
+        makeServer({ namespace: "plain", name: "Plain", type: "local", command: "npx" }),
+        makeServer({ namespace: "dockerized", name: "Docker", type: "local", command: "docker", runtime: "oam" }),
+        makeServer({ namespace: "linear", name: "Linear", type: "remote" }),
+      ],
+    };
+    await runServersCommand({
+      home,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => cfg,
+      oamProbe: () => ({ bin: "/usr/local/bin/oam", version: "0.6.0", belowMin: false }),
+    });
+    const combined = io.out.join("\n");
+    expect(combined).toContain("RUNTIME");
+    expect(combined).toMatch(/fetch\s+Fetch\s+local\s+enabled\s+oam\b/);
+    expect(combined).toMatch(/plain\s+Plain\s+local\s+enabled\s+node\b/);
+    expect(combined).toMatch(/dockerized\s+Docker\s+local\s+enabled\s+node \(not node-based\)/);
+    expect(combined).toMatch(/linear\s+Linear\s+remote\s+enabled\s+-\s/);
+  });
+
+  it("marks the oam->node fallback in the table when oam is missing or too old", async () => {
+    const io = captureIO();
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [makeServer({ namespace: "fetch", name: "Fetch", type: "local", command: "npx", runtime: "oam" })],
+    };
+    const run = (probe: { bin: string | null; version: string | null; belowMin: boolean }) =>
+      runServersCommand({
+        home,
+        env: {},
+        out: io.push,
+        err: io.pushErr,
+        fetcher: async () => cfg,
+        oamProbe: () => probe,
+      });
+    await run({ bin: null, version: null, belowMin: false });
+    expect(io.out.join("\n")).toContain("node (no oam)");
+    io.out.length = 0;
+    await run({ bin: null, version: "0.5.0", belowMin: true });
+    expect(io.out.join("\n")).toContain("node (oam too old)");
+  });
+
+  it("emits effectiveRuntime + effectiveRuntimeReason in --json", async () => {
+    const io = captureIO();
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [
+        makeServer({ namespace: "fetch", name: "Fetch", type: "local", command: "npx", runtime: "oam" }),
+        makeServer({ namespace: "linear", name: "Linear", type: "remote" }),
+      ],
+    };
+    await runServersCommand({
+      home,
+      env: {},
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => cfg,
+      oamProbe: () => ({ bin: null, version: "0.5.0", belowMin: true }),
+    });
+    const parsed = JSON.parse(io.out.join("\n"));
+    const fetchRow = parsed.servers.find((s: { namespace: string }) => s.namespace === "fetch");
+    expect(fetchRow.effectiveRuntime).toBe("node");
+    expect(fetchRow.effectiveRuntimeReason).toContain("below min");
+    // The configured per-server field is preserved alongside the verdict.
+    expect(fetchRow.runtime).toBe("oam");
+    const remoteRow = parsed.servers.find((s: { namespace: string }) => s.namespace === "linear");
+    expect(remoteRow.effectiveRuntime).toBeNull();
+  });
+
+  it("honors YAW_MCP_DEFAULT_RUNTIME for servers without a per-server runtime", async () => {
+    const io = captureIO();
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [makeServer({ namespace: "plain", name: "Plain", type: "local", command: "npx" })],
+    };
+    await runServersCommand({
+      home,
+      env: { YAW_MCP_DEFAULT_RUNTIME: "oam" },
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => cfg,
+      oamProbe: () => ({ bin: "/usr/local/bin/oam", version: "0.6.0", belowMin: false }),
+    });
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.servers[0].effectiveRuntime).toBe("oam");
+    expect(parsed.servers[0].effectiveRuntimeReason).toContain("default");
+  });
+
   it("filters by substring on namespace (case-insensitive)", async () => {
     const cfg: ConnectConfig = {
       configVersion: "v1",

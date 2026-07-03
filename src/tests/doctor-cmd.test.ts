@@ -958,3 +958,116 @@ describe("runDoctor — --json", () => {
     expect(existsSync(join(trialsRoot, "bar.json"))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// OAM RUNTIME section -- doctor must surface which runtime each server would
+// ACTUALLY get (oam vs node) and why, so the oam->node silent fallback
+// (binary missing / below min version / per-server node / plain default) is
+// visible. The probe is injected via opts.oamProbe so assertions don't depend
+// on what's installed on the host running the tests.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — OAM RUNTIME section", () => {
+  const oamOk = () => ({ bin: "/usr/local/bin/oam", version: "0.6.0", belowMin: false });
+  const oamMissing = () => ({ bin: null, version: null, belowMin: false });
+  const oamOld = () => ({ bin: null, version: "0.5.0", belowMin: true });
+
+  function writeLocalBundles(obj: unknown): void {
+    writeYawMcpConfig(synthHome, "bundles.json", obj);
+  }
+
+  it("reports the binary path + version when oam is usable", async () => {
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+    expect(txt).toContain("OAM RUNTIME");
+    expect(txt).toContain("/usr/local/bin/oam");
+    expect(txt).toContain("v0.6.0");
+  });
+
+  it("reports not-installed when the probe finds no binary", async () => {
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamMissing });
+    expect(cap.text()).toMatch(/binary: {2}not installed/);
+  });
+
+  it("names both versions when oam is below the minimum", async () => {
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOld });
+    const txt = cap.text();
+    expect(txt).toContain("v0.5.0");
+    expect(txt).toContain("below min 0.6.0");
+    expect(txt).toContain("servers run on node");
+  });
+
+  it("shows the default runtime and its source (env)", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_DEFAULT_RUNTIME: "oam" },
+      os: "linux",
+      out: cap.out,
+      oamProbe: oamOk,
+    });
+    expect(cap.text()).toContain("default runtime: oam (env YAW_MCP_DEFAULT_RUNTIME)");
+  });
+
+  it("shows the default runtime, its source, and the source file path (bundles.json)", async () => {
+    writeLocalBundles({ version: 1, defaultRuntime: "oam", servers: [] });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    // The exact file is named because the broker resolves the default from
+    // ITS cwd, not the shell's -- the path is what makes a mismatch visible.
+    expect(cap.text()).toContain("default runtime: oam (bundles.json defaultRuntime @ ");
+    expect(cap.text()).toContain(join(synthHome, ".yaw-mcp", "bundles.json"));
+  });
+
+  it("lists a per-server verdict + reason for local bundles.json servers", async () => {
+    writeLocalBundles({
+      version: 1,
+      servers: [
+        { namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"], runtime: "oam" },
+        { namespace: "dockerized", name: "Docker", command: "docker", args: ["run", "img"], runtime: "oam" },
+        { namespace: "plain", name: "Plain", command: "npx", args: ["-y", "x"] },
+      ],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+    expect(txt).toContain("servers (local bundles.json):");
+    expect(txt).toMatch(/fetch\s+oam\s+per-server runtime:"oam"/);
+    expect(txt).toMatch(/dockerized\s+node\s+.*not node\/npx/);
+    expect(txt).toMatch(/plain\s+node\s+default \(no oam opt-in\)/);
+  });
+
+  it("emits the oamRuntime block on the --json path (mirror of the text section)", async () => {
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "x"], runtime: "oam" }],
+    });
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamOld,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime).toMatchObject({
+      binary: null,
+      version: "0.5.0",
+      belowMin: true,
+      minVersion: "0.6.0",
+      defaultRuntime: null,
+      defaultRuntimeSource: null,
+    });
+    expect(parsed.oamRuntime.servers).toHaveLength(1);
+    expect(parsed.oamRuntime.servers[0]).toMatchObject({ namespace: "fetch", runtime: "node" });
+    expect(parsed.oamRuntime.servers[0].reason).toContain("below min");
+  });
+});

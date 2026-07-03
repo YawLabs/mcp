@@ -39,6 +39,12 @@ import {
   tokenFingerprint,
 } from "./config-loader.js";
 import {
+  type DefaultRuntimeInfo,
+  describeDefaultRuntime,
+  describeServerRuntime,
+  type ServerRuntimeInfo,
+} from "./default-runtime.js";
+import {
   CURRENT_OS,
   ENTRY_NAME,
   findLegacyEntry,
@@ -49,6 +55,8 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
+import { loadLocalBundles } from "./local-bundles.js";
+import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
 import { getLastReportFailure, type ReportFailure } from "./tool-report.js";
@@ -91,6 +99,9 @@ export interface DoctorOptions {
   /** Test hook: override process.argv[1] used for install-method detection in
    *  the UPGRADE AVAILABLE hint. Defaults to process.argv[1]. */
   argvPath?: string;
+  /** Test hook: replace the real `oam --version` probe so the OAM RUNTIME
+   *  section is deterministic regardless of what's installed on the host. */
+  oamProbe?: () => OamProbe;
 }
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
@@ -144,6 +155,21 @@ export interface DoctorJsonSnapshot {
   backgroundPosters: {
     analytics: { statusCode: number; url: string; at: string } | null;
     toolReport: { statusCode: number; url: string; at: string } | null;
+  };
+  // oam runtime visibility: whether the oam binary is usable (installed AND
+  // >= minVersion), the config-level default, and the per-server effective
+  // runtime for locally-defined servers (bundles.json). Mirrors the text
+  // path's OAM RUNTIME section so the oam->node silent fallback is
+  // machine-readable too.
+  oamRuntime: {
+    binary: string | null;
+    version: string | null;
+    belowMin: boolean;
+    minVersion: string;
+    defaultRuntime: "oam" | "node" | null;
+    defaultRuntimeSource: "env" | "bundles" | null;
+    defaultRuntimePath: string | null;
+    servers: Array<{ namespace: string; runtime: "oam" | "node" | null; reason: string }>;
   };
   upgrade: { current: string; latest: string | null; stale: boolean };
   diagnosis: { exitCode: number; summary: string };
@@ -242,6 +268,13 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // says AUTO_LOAD is not set). TOKEN / URL / DISABLE_PERSISTENCE have
   // their own dedicated sections and are intentionally omitted.
   renderEnvSection({ env, print });
+
+  // oam runtime visibility — which runtime each server would ACTUALLY get
+  // (oam vs node) and why. The oam spawn-rewrite falls back to node
+  // silently by design (oam absent / below min / non-node command), so
+  // this section is where that fallback becomes visible.
+  const oamStatus = await collectOamRuntimeStatus({ env, cwd, home, probeFn: opts.oamProbe ?? probeOam });
+  renderOamRuntimeSection({ status: oamStatus, print });
 
   // Load state.json ONCE for both the STATE and RELIABILITY sections.
   // Previously each section re-read the file (peek + loadState in STATE,
@@ -438,6 +471,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     "YAW_MCP_AUTO_LOAD",
     "YAW_MCP_AUTO_ACTIVATE",
     "YAW_MCP_PRUNE_RESPONSES",
+    "YAW_MCP_DEFAULT_RUNTIME",
   ] as const;
   const envOverrides: Record<string, string | null> = {};
   for (const name of envVarNames) {
@@ -506,6 +540,24 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       msUntilExpiry,
     })),
     malformed: trialScan.malformed,
+  };
+
+  // oam runtime block — same collector as the text path's OAM RUNTIME
+  // section, so the two surfaces can't drift.
+  const oamStatus = await collectOamRuntimeStatus({ env, cwd, home, probeFn: opts.oamProbe ?? probeOam });
+  const oamRuntime: DoctorJsonSnapshot["oamRuntime"] = {
+    binary: oamStatus.probe.bin,
+    version: oamStatus.probe.version,
+    belowMin: oamStatus.probe.belowMin,
+    minVersion: MIN_OAM_VERSION,
+    defaultRuntime: oamStatus.dflt.runtime,
+    defaultRuntimeSource: oamStatus.dflt.source,
+    defaultRuntimePath: oamStatus.dflt.path,
+    servers: oamStatus.servers.map((s) => ({
+      namespace: s.namespace,
+      runtime: s.info.runtime,
+      reason: s.info.reason,
+    })),
   };
 
   // Background HTTP poster failure latches — same getters the text path's
@@ -577,6 +629,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     shellShadows,
     trials,
     backgroundPosters,
+    oamRuntime,
     upgrade: { current: effectiveVersion, latest, stale },
     diagnosis: { exitCode, summary },
   };
@@ -607,6 +660,7 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
     { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
     { name: "YAW_MCP_AUTO_ACTIVATE", defaultHint: "default on" },
     { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
+    { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "per-server opt-in only" },
   ];
   const widest = vars.reduce((m, v) => Math.max(m, v.name.length), 0);
   print("ENVIRONMENT (behavior overrides)");
@@ -614,6 +668,63 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
     const raw = env[v.name];
     const value = raw === undefined || raw === "" ? `(not set — ${v.defaultHint})` : raw;
     print(`  ${v.name.padEnd(widest)}  ${value}`);
+  }
+  print("");
+}
+
+// Everything the OAM RUNTIME section (text) / oamRuntime block (json) needs,
+// collected once so the two paths can't drift: the binary probe, the
+// config-level default (+ provenance), and a per-server verdict for every
+// locally-defined server. Account-mode server defs live on the backend, so
+// the per-server list here covers bundles.json only — `yaw-mcp servers`
+// carries the same verdict for account servers.
+interface OamRuntimeStatus {
+  probe: OamProbe;
+  dflt: DefaultRuntimeInfo;
+  servers: Array<{ namespace: string; info: ServerRuntimeInfo }>;
+}
+
+async function collectOamRuntimeStatus(opts: {
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+  home: string;
+  probeFn: () => OamProbe;
+}): Promise<OamRuntimeStatus> {
+  const probe = opts.probeFn();
+  const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
+  const bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home }).catch(() => null);
+  const servers = (bundles?.config?.servers ?? []).map((s) => ({
+    namespace: s.namespace,
+    info: describeServerRuntime(s, dflt.runtime, probe),
+  }));
+  return { probe, dflt, servers };
+}
+
+function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: string) => void }): void {
+  const { status, print } = opts;
+  const { probe, dflt, servers } = status;
+  print("OAM RUNTIME");
+  if (probe.belowMin) {
+    print(`  binary:  installed (v${probe.version}) — below min ${MIN_OAM_VERSION}; IGNORED, servers run on node`);
+  } else if (probe.bin === null) {
+    print("  binary:  not installed — node/npx spawns are used directly");
+  } else {
+    print(`  binary:  ${probe.bin} (v${probe.version ?? "unknown"}, min ${MIN_OAM_VERSION})`);
+  }
+  // Name the exact source: the connect path resolves project-local bundles
+  // from the BROKER's cwd, doctor from the shell's cwd — printing the file
+  // path makes a divergence between the two spottable.
+  const dfltLabel =
+    dflt.runtime !== null
+      ? `${dflt.runtime} (${dflt.source === "env" ? "env YAW_MCP_DEFAULT_RUNTIME" : `bundles.json defaultRuntime @ ${dflt.path}`})`
+      : '(not set — per-server runtime:"oam" opt-in only)';
+  print(`  default runtime: ${dfltLabel}`);
+  if (servers.length > 0) {
+    print("  servers (local bundles.json):");
+    const widest = servers.reduce((m, s) => Math.max(m, s.namespace.length), 0);
+    for (const s of servers) {
+      print(`    ${s.namespace.padEnd(widest)}  ${(s.info.runtime ?? "-").padEnd(4)}  ${s.info.reason}`);
+    }
   }
   print("");
 }

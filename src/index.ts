@@ -412,6 +412,12 @@ if (subcommand === "compliance") {
                                stale global-npm installs are upgraded in the
                                background).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
+    YAW_MCP_DEFAULT_RUNTIME       Default runtime for local node/npx servers
+                               (\`oam\` or \`node\`). Servers without a per-
+                               server \`runtime\` use this; per-server
+                               \`"runtime": "node"\` opts out. Same knob as
+                               bundles.json top-level \`defaultRuntime\`
+                               (env wins). Unset = node (today's default).
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
