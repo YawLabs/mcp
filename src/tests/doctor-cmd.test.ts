@@ -37,11 +37,11 @@ function captureOut() {
 }
 
 describe("runDoctor — exit codes", () => {
-  it("exits 0 in local (Free) mode when no token is anywhere", async () => {
+  it("exits 0 in local mode when no token is anywhere", async () => {
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(r.exitCode).toBe(0);
-    expect(cap.text()).toMatch(/Local mode \(Free\)/);
+    expect(cap.text()).toMatch(/Local mode/);
   });
 
   it("exits 0 when a token is in env and there are no warnings", async () => {
