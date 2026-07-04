@@ -19,11 +19,11 @@
 // and never aborts the diagnostic.
 //
 // Exit codes:
-//   0  healthy (token present, no warnings) OR local/Free mode (no token —
+//   0  healthy (token present, no warnings) OR local mode (no token —
 //      yaw-mcp still starts and serves ~/.yaw-mcp/bundles.json)
 //   2  warnings (e.g., schema-version mismatch, loose file permissions)
 //   (1 = fatal is reserved and currently UNREACHABLE: a missing token is
-//   treated as healthy local/Free mode, not a fatal error, on both paths.)
+//   treated as healthy local mode, not a fatal error, on both paths.)
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -79,7 +79,7 @@ export interface DoctorOptions {
   out?: (s: string) => void;
   /** Override for tests; defaults to process.stderr.write. Used for the
    *  always-on warning stream so pipelines that capture stdout still see
-   *  config warnings even when doctor exits 0 (e.g. local/Free mode). */
+   *  config warnings even when doctor exits 0 (e.g. local mode). */
   err?: (s: string) => void;
   /** Disable the npm registry freshness check (tests, offline use). */
   skipRegistryCheck?: boolean;
@@ -416,7 +416,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // Warnings are emitted to stderr UNCONDITIONALLY (regardless of token
   // state) so a pipeline that captures only stdout still sees them. The
   // text WARNINGS section above is part of the human report (stdout); the
-  // stderr stream below is the always-on signal. Local/Free mode exits 0,
+  // stderr stream below is the always-on signal. Local mode exits 0,
   // but warning lines still print here so they don't get masked by the
   // "fully functional" diagnosis below.
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
@@ -424,13 +424,13 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     for (const w of config.warnings) writeErr(`warning: ${w}\n`);
   }
   if (config.token === null) {
-    // No token is NOT an error: yaw-mcp runs in local/Free mode, serving
+    // No token is NOT an error: yaw-mcp runs in local mode, serving
     // whatever is in ~/.yaw-mcp/bundles.json. runServer() (index.ts) treats
     // a missing token as non-fatal, so doctor must agree -- reporting
     // "cannot start" here was a false alarm that the Yaw MCP panel surfaced
     // as a blocking ATTENTION banner.
     print("DIAGNOSIS");
-    print("  Local mode (Free) -- fully functional, no account needed. yaw-mcp serves");
+    print("  Local mode -- fully functional, no account needed. yaw-mcp serves");
     print("  whatever servers are configured locally in ~/.yaw-mcp/bundles.json.");
   } else if (config.warnings.length > 0) {
     exitCode = 2;
@@ -510,7 +510,10 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
         reliability.push({
           namespace,
           dispatched: usage.dispatched,
-          succeeded: usage.succeeded,
+          // `succeeded` is a graded-reward SUM (learning.ts), so adding [0,1]
+          // rewards can leave IEEE-754 noise (e.g. 48.00000000000001). Round for
+          // a clean diagnostic; successRate stays computed from the raw value.
+          succeeded: Math.round(usage.succeeded * 1000) / 1000,
           successRate: usage.succeeded / usage.dispatched,
           lastUsedAt: new Date(usage.lastUsedAt).toISOString(),
         });
@@ -594,14 +597,14 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   let summary: string;
   // Always-on warning stream: mirrors the text path so JSON-mode pipelines
   // that capture stdout (the JSON blob) still surface config warnings on
-  // stderr, even in local/Free mode where exit code is 0.
+  // stderr, even in local mode where exit code is 0.
   const writeErrJson = opts.err ?? ((s: string) => process.stderr.write(s));
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErrJson(`warning: ${w}\n`);
   }
   if (config.token === null) {
-    // Local/Free mode -- not an error (see runDoctor's text branch).
-    summary = "Local mode (Free) -- fully functional, no account needed.";
+    // Local mode -- not an error (see runDoctor's text branch).
+    summary = "Local mode -- fully functional, no account needed.";
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     summary = "Token present, but warnings need attention.";
