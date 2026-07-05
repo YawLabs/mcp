@@ -207,7 +207,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
   if (!token) {
     log(
-      "yaw-mcp install: no token resolved -- configuring for local mode (Free).\n" +
+      "yaw-mcp install: no token resolved -- configuring for local mode.\n" +
         "  Add servers by editing ~/.yaw-mcp/bundles.json, or re-run with --token mcp_pat_... to use a Yaw MCP account.",
     );
   }
