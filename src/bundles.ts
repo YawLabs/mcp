@@ -46,8 +46,8 @@ export const CURATED_BUNDLES: readonly CuratedBundle[] = [
   {
     id: "data-ops",
     name: "Data Ops",
-    description: "Postgres + S3 + Snowflake for pipeline debugging",
-    namespaces: ["postgres", "s3", "snowflake"],
+    description: "Postgres + AWS + Snowflake for pipeline debugging",
+    namespaces: ["postgres", "aws", "snowflake"],
     category: "data",
   },
   {
