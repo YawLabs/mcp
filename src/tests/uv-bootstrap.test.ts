@@ -64,8 +64,7 @@ describe("resolveUvSpawn with uv present", () => {
   // correct in both cases -- what's load-bearing is "the command points
   // at a uv binary and the args are rewritten to `uv tool run ...`."
   // isUvSpawnTarget accepts either form.
-  const isUvSpawnTarget = (cmd: string): boolean =>
-    cmd === "uv" || /uv(\.exe)?$/.test(cmd);
+  const isUvSpawnTarget = (cmd: string): boolean => cmd === "uv" || /uv(\.exe)?$/.test(cmd);
 
   it("returns a uv spawn target (bare or bootstrapped path) when uv is reachable", async () => {
     const { spawnSync } = await import("node:child_process");
