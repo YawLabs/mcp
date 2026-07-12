@@ -54,23 +54,29 @@ describe("resolveUvSpawn with uv present", () => {
     __resetUvBootstrap();
   });
 
-  it("returns bare uv when uv is on PATH", async () => {
-    // Probe uv once via the same mechanism the bootstrap uses. If
-    // present, the bootstrap should return the bare command string
-    // so the OS keeps resolving it (respecting the user's install).
+  // resolveUvSpawn (uv-bootstrap.ts:349) returns uvBin from ensureUv(),
+  // which is either the literal "uv" (PATH) or the absolute path to the
+  // managed cache copy. The previous shape asserted `command: "uv"`
+  // exactly, which failed after a prior run bootstrapped a managed copy
+  // (now the resolve target is `C:\...\Cache\uv\<ver>\uv.exe` even on a
+  // box that also has `uv` on PATH, because ensureUv() memoizes the
+  // first resolution for the process lifetime). The spawn target is
+  // correct in both cases -- what's load-bearing is "the command points
+  // at a uv binary and the args are rewritten to `uv tool run ...`."
+  // isUvSpawnTarget accepts either form.
+  const isUvSpawnTarget = (cmd: string): boolean =>
+    cmd === "uv" || /uv(\.exe)?$/.test(cmd);
+
+  it("returns a uv spawn target (bare or bootstrapped path) when uv is reachable", async () => {
     const { spawnSync } = await import("node:child_process");
     const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
-    if (probe.status !== 0) {
-      // uv not installed on this machine — skip, the other describe
-      // covers the "not on PATH + fails to download" pathway via its
-      // own fakes.
-      return;
-    }
+    if (probe.status !== 0) return;
     const result = await resolveUvSpawn("uv", ["--version"]);
-    expect(result).toEqual({ command: "uv", args: ["--version"] });
+    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.args).toEqual(["--version"]);
   });
 
-  it("rewrites uvx to `uv tool run` when uv is on PATH", async () => {
+  it("rewrites uvx to `uv tool run` when uv is reachable", async () => {
     const { spawnSync } = await import("node:child_process");
     const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
     if (probe.status !== 0) return;
@@ -80,7 +86,8 @@ describe("resolveUvSpawn with uv present", () => {
     // partial installs). Always-rewriting means the spawn target is
     // always uv, which we've already confirmed is reachable.
     const result = await resolveUvSpawn("uvx", ["mcp-server-fetch"]);
-    expect(result).toEqual({ command: "uv", args: ["tool", "run", "mcp-server-fetch"] });
+    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.args).toEqual(["tool", "run", "mcp-server-fetch"]);
   });
 
   it("preserves additional args when rewriting uvx", async () => {
@@ -88,10 +95,8 @@ describe("resolveUvSpawn with uv present", () => {
     const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
     if (probe.status !== 0) return;
     const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
-    expect(result).toEqual({
-      command: "uv",
-      args: ["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"],
-    });
+    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.args).toEqual(["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"]);
   });
 
   it("rewrites uvx with empty args", async () => {
@@ -99,6 +104,7 @@ describe("resolveUvSpawn with uv present", () => {
     const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
     if (probe.status !== 0) return;
     const result = await resolveUvSpawn("uvx", []);
-    expect(result).toEqual({ command: "uv", args: ["tool", "run"] });
+    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.args).toEqual(["tool", "run"]);
   });
 });
