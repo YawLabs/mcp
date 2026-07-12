@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Orchestrator: build + stage + attach binaries for ALL 5 SEA platforms to a
-# single release. Mirrors the parallel-remote-leg pattern from
+# Orchestrator: build + stage + verify binaries for ALL 5 SEA platforms
+# in a single release. Mirrors the parallel-remote-leg pattern from
 # `yaw/release.sh` step 6 + `scripts/build-platforms-{tailnet,gcp-iap}.sh`.
 #
 # The hard physical constraint for @yawlabs/mcp is that Node SEA cannot
@@ -10,9 +10,17 @@
 # darwin-x64, darwin-arm64, win32-x64 (win32-arm64 is the orchestrator's
 # own host by default). This script runs the per-host leg
 # (scripts/build-platform-remote.sh) on each, in parallel, pulls the
-# staged artifacts back to a single LOCAL_CI_ARTIFACTS_DIR, verifies
-# them, and attaches each to the existing GitHub release via
-# ./release.sh --upload-asset.
+# staged artifacts back to a single LOCAL_CI_ARTIFACTS_DIR, and verifies
+# each (binary present, non-zero, .sha256 sidecar matches).
+#
+# Asset attachment is NOT this script's job. The operator (or a separate
+# release driver) runs ./release.sh --upload-asset for each staged asset
+# after the orchestrator prints the handoff. This split is intentional:
+# the orchestrator depends only on git + ssh + scp (no `gh` CLI), so it
+# can run on any host that has build access to the per-platform build
+# machines, even hosts without a GitHub login. It also keeps the build
+# step pure -- a broken build cannot corrupt the GitHub release, and a
+# broken release cannot retroactively un-stage a built artifact.
 #
 # Usage:
 #   scripts/build-platforms-all.sh <version> [--config PATH] [--only PLATFORM]...
@@ -34,9 +42,27 @@
 # Yaw Terminal's contract.
 #
 # Resume: re-running with --only <platform> re-runs just that leg. A leg
-# whose artifact is already attached to the release (or already in
-# LOCAL_CI_ARTIFACTS_DIR) is skipped. The release's asset list is the
-# source of truth for "what's already shipped."
+# whose artifact is already in LOCAL_CI_ARTIFACTS_DIR is skipped; a leg
+# with an empty host in the config is skipped (build manually and drop
+# the artifact into $LOCAL_CI_ARTIFACTS_DIR/<platform>/ when ready).
+#
+# Tag validation: `git ls-remote --tags origin` confirms v<version>
+# exists on origin BEFORE dispatching. This is the only remote lookup
+# the orchestrator does -- no GitHub API, no `gh` CLI, no auth token.
+# That's the point of removing `gh` from this script: tag existence is
+# a git concern, asset upload is a release concern, and conflating them
+# forced the orchestrator onto a host that has GitHub auth.
+#
+# Queue: --status prints the per-platform build queue (host + transport)
+# and exits 0 WITHOUT building. Mirrors how Yaw Terminal's release.sh
+# Step 6 reports the parallel-leg dispatch plan before any leg fires --
+# the operator (and the chat transcript) see "linux-x64 -> gcp-iap:
+# yaw-linux-builder" / "win32-x64 -> gcp-iap: yaw-linux-builder" /
+# "win32-arm64 -> local (orchestrator)" before ssh/scp starts, so a
+# misconfigured host is visible in chat and not buried in a 10-minute
+# leg log. The same queue is also printed at the top of every normal
+# run (right after the platform list is resolved) so the transcript
+# records what was about to dispatch.
 #
 # Output: per-leg logs to stderr; final "all assets attached" line to
 # stdout. Suitable for piping to CI dashboards.
@@ -47,19 +73,25 @@ set -euo pipefail
 VERSION=""
 CONFIG_PATH=""
 ONLY_PLATFORMS=()
+STATUS_ONLY=0
 
 usage() {
   cat <<'EOF'
 Usage: scripts/build-platforms-all.sh <version> [--config PATH] [--only PLATFORM]...
 
 Builds the @yawlabs/mcp SEA binary on every configured host in parallel,
-rsync-pulls the artifacts back to a single staging dir, verifies each,
-and attaches every asset (binary + sha256 sidecar) to the v<version>
-GitHub release.
+rsync-pulls the artifacts back to a single staging dir, and verifies
+each (binary present, .sha256 sidecar matches). Does NOT attach to the
+GitHub release -- run ./release.sh --upload-asset <asset> <version>
+per staged artifact after the orchestrator prints the handoff.
 
 Options:
   --config PATH       Path to platforms.json (default: bin/platforms.json)
   --only PLATFORM     Limit to one or more platforms (e.g. linux-x64)
+  --status            Print the build queue (platform -> host + transport)
+                      and exit 0. No version required; no build, no ssh,
+                      no remote lookup. Useful for verifying a config
+                      change before kicking off a real run.
   -h, --help          This help
 
 Environment:
@@ -87,6 +119,10 @@ while [ $# -gt 0 ]; do
         shift
       done
       ;;
+    --status)
+      STATUS_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -107,11 +143,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$VERSION" ]; then
+if [ -z "$VERSION" ] && [ "$STATUS_ONLY" -ne 1 ]; then
   usage >&2
   exit 64
 fi
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "Invalid version: $VERSION (expected X.Y.Z)" >&2
   exit 64
 fi
@@ -141,24 +177,32 @@ if [ ! -f "$CONFIG_PATH" ]; then
   exit 1
 fi
 
-# Validate the release + tag exist on origin BEFORE we burn 5+ minutes
+# ---- Validate the tag exists on origin BEFORE we burn 5+ minutes
 # building (a typo in the version would otherwise produce 5 orphans in
-# LOCAL_CI_ARTIFACTS_DIR).
-if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -qE 'refs/tags/v[0-9]'; then
-  echo "Tag v${VERSION} not found on origin -- run the main release path (./release.sh $VERSION) on the release-driver machine first." >&2
-  exit 1
-fi
-if ! gh release view "v${VERSION}" >/dev/null 2>&1; then
-  echo "GitHub release v${VERSION} does not exist -- run the main release path first." >&2
-  exit 1
+# LOCAL_CI_ARTIFACTS_DIR). Pure git -- no `gh`, no GitHub API, no auth
+# token. The release *asset* existence is the upload step's
+# responsibility (./release.sh --upload-asset), not the orchestrator's.
+# Skipped under --status: a status read should work with no version
+# and no remote lookup, so the operator can verify a config change
+# before the real run.
+if [ "$STATUS_ONLY" -ne 1 ]; then
+  if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -qE 'refs/tags/v[0-9]'; then
+    echo "Tag v${VERSION} not found on origin -- push the tag first (git push origin v${VERSION})." >&2
+    exit 1
+  fi
 fi
 
-# ---- Pre-flight: every needed tool exists ----
-command -v gh    >/dev/null || { echo "gh not installed" >&2; exit 1; }
-command -v rsync >/dev/null || echo "rsync not installed (will fall back to scp)" >&2
-command -v ssh   >/dev/null || { echo "ssh not installed" >&2; exit 1; }
-command -v scp   >/dev/null || { echo "scp not installed" >&2; exit 1; }
-command -v node  >/dev/null || { echo "node not installed" >&2; exit 1; }
+# ---- Pre-flight: every needed tool exists (skipped under --status,
+# which never invokes ssh/scp, so a missing tool is irrelevant to
+# the queue print). Note: no `gh` here -- asset attach is a separate
+# release.sh step that the operator runs after the orchestrator
+# finishes.
+if [ "$STATUS_ONLY" -ne 1 ]; then
+  command -v rsync >/dev/null || echo "rsync not installed (will fall back to scp)" >&2
+  command -v ssh   >/dev/null || { echo "ssh not installed" >&2; exit 1; }
+  command -v scp   >/dev/null || { echo "scp not installed" >&2; exit 1; }
+  command -v node  >/dev/null || { echo "node not installed" >&2; exit 1; }
+fi
 
 # ---- Load + filter the platform list ----
 # Read platforms.json via node (already a hard dep) instead of jq (may not
@@ -192,6 +236,98 @@ if [ ${#ONLY_PLATFORMS[@]} -gt 0 ]; then
     echo "No matching platforms in $CONFIG_PATH for: ${ONLY_PLATFORMS[*]}" >&2
     exit 1
   fi
+fi
+
+# ---- Classify a host into a transport label ----
+# Mirrors Yaw Terminal's release.sh Step 6 vocabulary so the queue is
+# readable in chat by anyone who knows the Yaw Terminal build flow:
+#   (local)        orchestrator's own host -- no SSH, runs the leg itself
+#   (gcp-iap)      GCP Linux VM reached over Identity-Aware Proxy
+#   (tailnet)      Mac reached over Tailscale
+#   (remote)       generic SSH (tailnet, public IP, DNS -- not specifically
+#                  tagged in this script; the operator knows the network)
+#   (unconfigured) empty host in platforms.json -- leg will be SKIPPED,
+#                  which is what bin/platforms.json does for win32-x64
+#                  when the operator builds it manually
+# The classification is heuristic (host string match), not a hard
+# contract -- it's there to make the queue readable, not to gate runs.
+classify_host() {
+  local plat="$1"
+  local host="$2"
+  if [ -z "$host" ]; then
+    echo "unconfigured"
+    return
+  fi
+  if [ "$plat" = "$THIS_PLATFORM" ]; then
+    echo "local"
+    return
+  fi
+  # GCP IAP builder -- the canonical host string from yaw-linux-builder
+  # and its aliases. Keep these strings in sync with
+  # scripts/build-platforms-gcp-iap.sh and release.sh.
+  case "$host" in
+    *yaw-linux-builder*|*linux-builder*) echo "gcp-iap"; return ;;
+  esac
+  # Tailscale hostname convention. The MCP currently uses real DNS names
+  # (e.g. yaw-mac-air.tailnet.example) for the Mac, so anything with
+  # .tailnet. is also tailnet.
+  case "$host" in
+    *.tailnet*|*macbook-air*|*mac-air*) echo "tailnet"; return ;;
+  esac
+  echo "remote"
+}
+
+# ---- Print the build queue (platform -> host + transport) ----
+# Goes to stdout -- chat transcripts capture it, and the operator
+# sees the dispatch plan before any leg fires. The same lines are
+# logged on stderr too so they land in the per-run log file even
+# when the operator redirects stdout.
+print_queue() {
+  # Header line
+  if [ "$STATUS_ONLY" -eq 1 ]; then
+    printf 'build queue (--status, no build):\n'
+  else
+    printf 'build queue:\n'
+  fi
+  # Body -- one line per platform in config order. We use a pipe
+  # delimiter between fields because the default IFS (space+tab+newline)
+  # collapses empty fields -- `read` with default IFS on
+  # "||" (empty host, empty user) puts the next non-empty field (port)
+  # into the wrong variable. The '|' character cannot appear in any
+  # of the four fields (hostname, user, key path, port) so it's safe.
+  for plat in $ALL_PLATFORMS; do
+    IFS='|' read -r host ssh_user ssh_key ssh_port < <(node -e '
+      const fs = require("fs");
+      const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
+      const p = cfg[process.argv[2]] || {};
+      process.stdout.write(
+        (p.host || "") + "|" +
+        (p.ssh_user || "") + "|" +
+        (p.ssh_key || "") + "|" +
+        String(p.ssh_port || 22) + "\n"
+      );
+    ' "$CONFIG_PATH" "$plat")
+    # Restore default IFS for the rest of the loop body
+    unset IFS
+    local transport
+    transport=$(classify_host "$plat" "$host")
+    local where
+    if [ "$transport" = "local" ]; then
+      where="local (orchestrator: $THIS_PLATFORM)"
+    elif [ "$transport" = "unconfigured" ]; then
+      where="unconfigured -- leg will be skipped (build manually or set host in $CONFIG_PATH)"
+    else
+      where="$transport: $ssh_user@$host:$ssh_port"
+    fi
+    printf '  %-12s -> %s\n' "$plat" "$where"
+  done
+}
+
+# Always print the queue so the transcript records what was about to
+# dispatch. --status exits here without building anything.
+print_queue
+if [ "$STATUS_ONLY" -eq 1 ]; then
+  exit 0
 fi
 
 # ---- Local artifact staging dir ----
@@ -251,16 +387,76 @@ run_leg() {
   else
     echo "[$plat] remote leg -> $ssh_user@$host:$ssh_port" >&2
     if [ -n "${DRY_RUN:-}" ]; then
-      echo "[$plat] DRY: $SSH_CMD -i $ssh_key -p $ssh_port $ssh_user@$host 'cd $REPO_ROOT && bash scripts/build-platform-remote.sh $VERSION'" >&2
+      local dry_remote_repo_dir="/tmp/yaw-mcp-build-${VERSION}"
+      echo "[$plat] DRY: tar+scp the local repo to $ssh_user@$host:$dry_remote_repo_dir" >&2
+      echo "[$plat] DRY: $SSH_CMD -i $ssh_key -p $ssh_port $ssh_user@$host 'REPO_DIR=$dry_remote_repo_dir bash $dry_remote_repo_dir/scripts/build-platform-remote.sh $VERSION'" >&2
       echo "$plat_dir/yaw-mcp-$plat"  # placeholder
       return 0
     fi
+
+    # ---- Push the repo to the remote host ----
+    # The per-platform hosts may not have the mcp repo checked out (the
+    # yaw-mcp release flow is workstation-driven; the per-host machines
+    # are configured for the Yaw Terminal release flow, not for mcp). So
+    # we tar+scp a snapshot of the orchestrator's local working tree
+    # (excluding node_modules, build artifacts, .git) and extract on
+    # the remote. Mirrors yaw/build-platforms-gcp-iap.sh:130, which
+    # gcp_scp_to a tarball and untar's it on the GCP VM before each
+    # build. The remote leg runs from REMOTE_REPO_DIR (passed via
+    # REPO_DIR env var) instead of the script's own location.
+    #
+    # We use /tmp/ not ~/ because tilde does NOT expand inside the
+    # single-quoted strings in the SSH command below (bash tilde
+    # expansion is positional + unquoted only). Using a /tmp absolute
+    # path is also more discoverable for debugging and avoids per-user
+    # home-dir drift between the orchestrator and the remote host.
+    local remote_repo_dir="/tmp/yaw-mcp-build-${VERSION}"
+    local tarball="/tmp/yaw-mcp-build-${VERSION}.tar.gz"
+    echo "[$plat] pushing repo snapshot to $ssh_user@$host:$remote_repo_dir" >&2
+    # Build the tarball from the orchestrator's local working tree.
+    # Exclude everything that gets regenerated on first build (node_modules,
+    # bin, build-tmp, dist, dist-release) and the .git dir (we don't
+    # need the remote to have the full git history -- the orchestrator's
+    # `git rev-parse HEAD` is the source of truth for "what was built").
+    (cd "$REPO_ROOT" && tar --exclude='./node_modules' --exclude='./bin' \
+        --exclude='./build-tmp' --exclude='./dist' --exclude='./dist-release' \
+        --exclude='./.git' --exclude='./package-lock.json' \
+        -czf "$tarball" .) || {
+      echo "[$plat] failed to build tarball at $tarball" >&2
+      return 1
+    }
+    # scp the tarball. -P for port on POSIX scp; MSYS-Windows scp on
+    # this box uses -P the same way. Use -o for the ssh options.
+    scp -i "$ssh_key" -P "$ssh_port" -o IdentitiesOnly=yes \
+      "$tarball" "$ssh_user@$host:/tmp/" || {
+      echo "[$plat] scp of repo tarball failed" >&2
+      rm -f "$tarball"
+      return 1
+    }
+    # Remote side: extract into a clean dir, then rm the tarball.
+    # Idempotent: re-running overwrites the previous checkout, so the
+    # remote leg always runs against the orchestrator's current HEAD.
+    # We unconditionally rm -rf first (the tarball ships without a
+    # top-level dir entry, so re-extracting into a non-empty dir would
+    # leave stale files).
+    $SSH_CMD -i "$ssh_key" -p "$ssh_port" "$ssh_user@$host" \
+      "rm -rf '$remote_repo_dir' && mkdir -p '$remote_repo_dir' && \
+       tar -xzf '/tmp/yaw-mcp-build-${VERSION}.tar.gz' -C '$remote_repo_dir' && \
+       rm -f '/tmp/yaw-mcp-build-${VERSION}.tar.gz'" \
+      || {
+      echo "[$plat] remote untar failed" >&2
+      rm -f "$tarball"
+      return 1
+    }
+    rm -f "$tarball"
+
+    # ---- Run the per-host leg on the remote ----
     # Capture the asset path on the LAST stdout line. Everything else
     # goes to stderr. Mirrors the Yaw Terminal contract.
     local asset
     asset=$(
       $SSH_CMD -i "$ssh_key" -p "$ssh_port" "$ssh_user@$host" \
-        "cd '$REPO_ROOT' && bash scripts/build-platform-remote.sh '$VERSION'" \
+        "REPO_DIR='$remote_repo_dir' bash '$remote_repo_dir/scripts/build-platform-remote.sh' '$VERSION'" \
         2>>"$plat_dir/leg.log"
     )
     # `tail -n1` of the captured stdout is the asset path; defensive
@@ -296,14 +492,24 @@ echo "[orchestrator] starting parallel legs" >&2
 STARTED_AT=$(date +%s)
 FAIL=0
 for plat in $ALL_PLATFORMS; do
-  # Read per-platform config via node
-  read -r host ssh_user ssh_key ssh_port < <(node -e '
+  # Read per-platform config via node. Pipe-delimited to preserve empty
+  # fields (default IFS on `read` collapses "||" into a single
+  # separator, putting the next non-empty field into the wrong var --
+  # this is the same bug print_queue() was fixed for; if a future refactor
+  # moves the two readers, keep them in sync).
+  IFS='|' read -r host ssh_user ssh_key ssh_port < <(node -e '
     const fs = require("fs");
     const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
     const p = cfg[process.argv[2]];
     if (!p) { process.stderr.write("no config for platform: " + process.argv[2] + "\n"); process.exit(1); }
-    process.stdout.write((p.host || "") + " " + (p.ssh_user || "") + " " + (p.ssh_key || "") + " " + (p.ssh_port || 22) + "\n");
+    process.stdout.write(
+      (p.host || "") + "|" +
+      (p.ssh_user || "") + "|" +
+      (p.ssh_key || "") + "|" +
+      String(p.ssh_port || 22) + "\n"
+    );
   ' "$CONFIG_PATH" "$plat")
+  unset IFS
 
   if [ -z "$host" ]; then
     echo "[$plat] no host in config -- skipping" >&2
@@ -363,15 +569,17 @@ for plat in $ALL_PLATFORMS; do
   echo "[$plat] verified: $(basename "$asset") ($actual)" >&2
 done
 if [ "$FAIL" -ne 0 ]; then
-  echo "[orchestrator] verification failed -- refusing to attach" >&2
+  echo "[orchestrator] verification failed -- refusing to hand off" >&2
   exit 1
 fi
 
-# ---- Attach each asset to the existing release ----
-# Delegate to ./release.sh --upload-asset, which is the canonical attach
-# path. Idempotent: re-running on an already-attached asset is a no-op.
-ATTACHED=0
-SKIPPED=0
+# ---- Handoff summary ----
+# Asset upload is NOT this script's job (the orchestrator depends only
+# on git + ssh + scp -- no `gh` CLI, no GitHub auth). Print the per-
+# platform handoff so the operator (or a downstream release driver) can
+# run ./release.sh --upload-asset for each artifact.
+STAGED=0
+echo "[orchestrator] verified artifacts (NOT attached -- run ./release.sh --upload-asset per artifact):"
 for plat in $ALL_PLATFORMS; do
   plat_dir="$LOCAL_CI_ARTIFACTS_DIR/$plat"
   asset=$(ls "$plat_dir"/yaw-mcp-* 2>/dev/null | grep -v '\.sha256$' | head -1 || true)
@@ -379,34 +587,11 @@ for plat in $ALL_PLATFORMS; do
     continue
   fi
   bn=$(basename "$asset")
-  # Skip if the release already has this asset (resume / re-run).
-  if gh release view "v${VERSION}" --json assets --jq ".assets[].name" 2>/dev/null | grep -qxF "$bn"; then
-    echo "[$plat] already attached: $bn" >&2
-    SKIPPED=$((SKIPPED + 1))
-    continue
-  fi
-  echo "[$plat] attaching $bn" >&2
-  if [ -n "${DRY_RUN:-}" ]; then
-    # DRY_RUN short-circuits the upload too -- not just the legs. A test
-    # pre-staged with fake assets would otherwise pollute the real
-    # release (we hit this once during development: DRY_RUN=1 still
-    # attached the pre-staged binaries to v0.70.1 because the upload
-    # delegates to a child script that does not see DRY_RUN).
-    echo "[$plat] DRY: would attach $bn to v${VERSION}" >&2
-    ATTACHED=$((ATTACHED + 1))
-    continue
-  fi
-  (cd "$REPO_ROOT" && ./release.sh --upload-asset "$asset" "$VERSION") || {
-    echo "[$plat] upload failed" >&2
-    FAIL=1
-  }
-  ATTACHED=$((ATTACHED + 1))
+  echo "  $plat -> $asset"
+  echo "    attach: ./release.sh --upload-asset '$asset' $VERSION"
+  STAGED=$((STAGED + 1))
 done
 
-if [ "$FAIL" -ne 0 ]; then
-  echo "[orchestrator] one or more uploads failed" >&2
-  exit 1
-fi
-echo "[orchestrator] done -- attached: $ATTACHED, skipped (already present): $SKIPPED"
+echo "[orchestrator] done -- staged: $STAGED"
 echo "Staging dir: $LOCAL_CI_ARTIFACTS_DIR"
 echo "Run scripts/update-manifests.mjs --version $VERSION --push to refresh Scoop + Homebrew"
