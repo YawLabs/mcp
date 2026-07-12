@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Example config for scripts/build-platforms-all.sh. Copy to",
+    "bin/platforms.json and fill in your per-platform hosts.",
+    "",
+    "Each platform's entry tells the orchestrator:",
+    "  - host:      SSH hostname or IP (tailnet IP, public IP, or DNS).",
+    "  - ssh_user:  Login user on the remote host (must be able to read",
+    "               the repo checkout, run node + npm + postject, and ssh",
+    "               without a password prompt).",
+    "  - ssh_key:   Path to a private key. Default ~/.ssh/gh_woods works",
+    "               (Yaw Terminal uses this for the same purpose).",
+    "  - ssh_port:  SSH port. 22 unless you've moved sshd.",
+    "",
+    "The orchestrator's own host (whatever it is) is auto-detected and its",
+    "config entry is overridden to run the leg locally (no SSH). All OTHER",
+    "entries trigger a remote leg. The local-platform entry's host/ssh_*",
+    "fields are therefore unused when this host matches the platform, but",
+    "should still be present for completeness so the file is the same on",
+    "every host (e.g. a Linux box running the orchestrator for a 0.70.2",
+    "release will skip the local linux leg if its config lists it).",
+    "",
+    "The platform keys MUST match the names release.sh uses:",
+    "  linux-x64, linux-arm64, darwin-x64, darwin-arm64,",
+    "  win32-x64, win32-arm64.",
+    "",
+    "bin/ is gitignored, so the live config is local-only. The example",
+    "lives here in scripts/ so it's tracked alongside the orchestrator",
+    "that reads it."
+  ],
+  "linux-x64": {
+    "host": "linux-builder.example.internal",
+    "ssh_user": "builder",
+    "ssh_key": "~/.ssh/gh_woods",
+    "ssh_port": 22
+  },
+  "linux-arm64": {
+    "host": "linux-arm-builder.example.internal",
+    "ssh_user": "builder",
+    "ssh_key": "~/.ssh/gh_woods",
+    "ssh_port": 22
+  },
+  "darwin-x64": {
+    "host": "macintel.tailnet.example",
+    "ssh_user": "jeff",
+    "ssh_key": "~/.ssh/gh_woods",
+    "ssh_port": 22
+  },
+  "darwin-arm64": {
+    "host": "macbook-air.tailnet.example",
+    "ssh_user": "jeff",
+    "ssh_key": "~/.ssh/gh_woods",
+    "ssh_port": 22
+  },
+  "win32-x64": {
+    "host": "win10-builder.tailnet.example",
+    "ssh_user": "builder",
+    "ssh_key": "~/.ssh/gh_woods",
+    "ssh_port": 22
+  },
+  "win32-arm64": {
+    "host": "surface.tailnet.example",
+    "ssh_user": "jeff",
+    "ssh_key": "~/.ssh/gh_woods",
+    "ssh_port": 22
+  }
+}

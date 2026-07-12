@@ -200,20 +200,93 @@ compiles to other platforms via `--target`. Untested here (bun not installed).
 
 `scripts/build-binary.mjs` targets the **host** platform/arch (Node SEA cannot
 cross-compile -- the carrier is the host `node` binary). The `release.sh` flow
-handles this by:
-1. **Release driver** (any platform): runs the full release (`release.sh <v>`).
-   It builds the host's platform binary, attaches it to the GitHub Release,
-   and publishes npm + the MCP registry.
-2. **Per-platform machines** (Linux x64, macOS arm64/x64, Windows x64/arm64):
-   `release.sh --build-only <v>` to build the host's binary into
-   `dist-release/`, then `release.sh --upload-asset dist-release/<asset> <v>`
-   to attach it to the same GitHub Release. Idempotent: re-running the upload
-   on an already-attached asset is a no-op.
+handles this two ways, low-level and orchestrated:
 
-If you need to ship all 5 platforms in one shot, this is the path. The
-trade-off vs. the old 5-platform CI matrix: builds are now manual/serial
-instead of parallel, but you avoid CI runner minutes and the brittle tag-push
-hand-off that broke v0.70.0.
+### Per-platform-machine (manual)
+
+The per-host recipe. Run on each per-platform machine after the release-driver
+machine has published the GitHub Release + npm + registry:
+
+```
+# On a Linux x64 box:
+./release.sh --build-only 0.70.1
+./release.sh --upload-asset dist-release/yaw-mcp-linux-x64 0.70.1
+```
+
+Repeat on macOS arm64, Windows x64, etc. Idempotent: re-running the upload on
+an already-attached asset is a no-op. This is the path for ad-hoc / one-off
+shipments (e.g. you only need a single missing platform filled in).
+
+### All-platforms orchestrator (Yaw Terminal pattern)
+
+The release driver can also fan out the per-host legs in parallel, mirror
+Yaw Terminal's `release.sh` step 6 + `scripts/build-platforms-{tailnet,gcp-iap}.sh`
+split. The orchestrator is `scripts/build-platforms-all.sh`:
+
+```
+# One-time setup: copy the example config and fill in the per-platform hosts.
+cp scripts/platforms.json.example bin/platforms.json
+# edit bin/platforms.json with each host's tailnet/IAP hostname + ssh_user
+
+# Run the orchestrator (release v0.70.1 must already exist on origin).
+scripts/build-platforms-all.sh 0.70.1
+```
+
+What it does, in order:
+
+1. Auto-detects the orchestrator's own host (e.g. win32-arm64 on this box);
+   the matching config entry is overridden to run the leg locally.
+2. Validates that the tag and GitHub release for v<version> exist on origin
+   (a typo would otherwise produce 5 orphans in `LOCAL_CI_ARTIFACTS_DIR`).
+3. For every other platform, SSHes to the configured host, runs
+   `scripts/build-platform-remote.sh <version>`, and rsync-pulls the staged
+   binary + sha256 back to `LOCAL_CI_ARTIFACTS_DIR/<platform>/`. All legs
+   run in parallel; the orchestrator `wait`s on every PID and fails closed
+   if any leg exits non-zero.
+4. Verifies each staged asset (binary present, sha256 sidecar matches the
+   binary's actual hash).
+5. Attaches each verified asset to the existing GitHub release via the
+   canonical `./release.sh --upload-asset`. Idempotent: re-running with
+   `--only <platform>` re-runs just that leg; an asset already on the
+   release is skipped.
+
+The per-host leg (`scripts/build-platform-remote.sh`) is a thin wrapper that
+re-runs `release.sh --build-only <version>` + `scripts/stage-release-asset.mjs`
+and prints the staged asset path on its last stdout line. The orchestrator
+parses only that last line. This is the same contract Yaw Terminal's
+`scripts/build-platforms-{tailnet,gcp-iap}.sh` follow: "the LAST stdout line
+is the staging dir."
+
+Why this isn't exactly the same as Yaw Terminal: electron-forge can
+cross-compile between host platforms (one Linux VM builds linux-x64 + win-x64;
+one Mac builds mac-arm64 + mac-x64), so Yaw Terminal needs two remote hosts.
+Node SEA **can't** cross-compile -- the carrier is the host `node` binary --
+so `@yawlabs/mcp` needs one host per target. The orchestrator's parallel-leg
++ rsync-merge structure is otherwise identical, so the orchestration patterns
+stay in sync.
+
+### Pre-staging (manual artifact inputs)
+
+If you've already built some assets on your per-platform machines (e.g. you
+ran the manual recipe above for win32-x64 and want the orchestrator to do
+the rest), point `LOCAL_CI_ARTIFACTS_DIR` at a directory with the platform
+subdirs already populated:
+
+```
+LOCAL_CI_ARTIFACTS_DIR=/path/to/pre-staged \
+  scripts/build-platforms-all.sh 0.70.1 --only linux-x64 linux-arm64 darwin-arm64
+```
+
+Legs whose `<platform>/` subdir already has a binary + sha256 sidecar are
+skipped. Same contract as Yaw Terminal's pre-staging.
+
+### Trade-off vs. the old 5-platform CI matrix
+
+Builds are now manual (or scripted-but-driven-by-you) instead of parallel on
+GitHub-hosted runners. The win is no CI minutes, no tag-push hand-off (which
+broke v0.70.0), and a single workstation you can fully audit. The loss is
+slower: 5 hosts have to be available before a release can be complete. In
+practice this is fine for the @yawlabs/mcp release cadence (a few per month).
 
 ## Files in the pipeline
 
@@ -225,6 +298,18 @@ hand-off that broke v0.70.0.
   API) -> macOS ad-hoc codesign. Builds the host platform only.
 - `scripts/stage-release-asset.mjs` -- rename to `yaw-mcp-<platform>-<arch>`
   + sha256 sidecar.
+- `scripts/build-platform-remote.sh` -- per-host leg for the all-platforms
+  orchestrator. Wraps `release.sh --build-only` + `stage-release-asset.mjs`,
+  emits the staged asset path on its last stdout line. Idempotent: reuses
+  an already-staged asset if its sha256 sidecar is present.
+- `scripts/build-platforms-all.sh` -- the all-platforms orchestrator. SSHes
+  to each configured host in parallel, runs the per-host leg, rsync-pulls
+  the artifacts back to a single `LOCAL_CI_ARTIFACTS_DIR`, verifies them,
+  and attaches every asset to the existing GitHub release. Mirrors
+  Yaw Terminal's `release.sh` step 6 + per-leg split.
+- `scripts/platforms.json.example` -- example config for the orchestrator.
+  Copy to `bin/platforms.json` (gitignored) and fill in your per-platform
+  hosts.
 - `scripts/update-manifests.mjs` -- regenerate the Scoop + Homebrew manifests
   from a release's hashes.
 - `sea-config.json` -- Node SEA config.
