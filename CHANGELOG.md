@@ -2,6 +2,14 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
+## 0.70.0 -- `yaw-mcp token` subcommand for trusted local apps
+
+Adds a `token` subcommand that prints this machine's Yaw Team session token (the raw `yaw_team` cookie) on stdout, for a TRUSTED LOCAL app to present to a Yaw endpoint that verifies the same HMAC session -- e.g. Vew Meetings' `POST /api/meeting`. Makes NO network call: reads the session persisted by `login` and emits it only when still valid (exp-checked via `team-sync`'s `loadStoredState`), else exits 1 with nothing on stdout.
+
+- **`team-sync`:** new `getSessionWithCookie()` reads + exp-validates the stored `{ cookie, session }` and returns it (or `null`); no network call.
+- **Registered everywhere a subcommand must be:** `index.ts` dispatch + help, `KNOWN_SUBCOMMANDS`, and `SUBCOMMAND_SPEC` (the completion-coverage test enforces no drift). `--json` emits `{ ok, token, email, exp }`; plain prints the raw token (treat stdout as sensitive -- it's a bearer credential).
+- **Completion spec dedup.** `SUBCOMMAND_SPEC` had a stale duplicate `token` entry from a prior WIP; removed so the spec stays one-entry-per-subcommand. Caught by `biome check` formatting the now-double entry, not by the coverage test -- the spec coverage test should arguably also assert uniqueness, file a follow-up.
+
 ## 0.63.2 -- release pipeline: publish npm from CI
 
 No changes to the package runtime or CLI -- this release exists to exercise the
