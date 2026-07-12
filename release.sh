@@ -185,11 +185,14 @@ cd "$SCRIPT_DIR"
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm  >/dev/null || fail "npm not installed"
-# `gh` is intentionally NOT required on any path. The per-host legs
-# run --build-only (which doesn't publish), the main release path
-# commits+tags+pushes (regular git) and publishes to npm + the MCP
-# registry, and the operator's workstation runs --upload-asset (curl
-# + $GITHUB_TOKEN, no `gh`). No path needs the GitHub CLI.
+# `gh` is NOT required on the per-host --build-only legs or on the
+# --upload-asset subcommand. The main release path commits+tags+pushes
+# (regular git) and publishes to npm + the MCP registry. Step 7 (MCP
+# registry) refreshes the mcp-publisher token from $GITHUB_TOKEN if set,
+# otherwise from \`gh auth token\` (the established fallback for the
+# parallel ssh-mcp / npmjs-mcp release scripts per their project memory)
+# if \`gh\` is installed and authenticated. No path HARD-requires the
+# GitHub CLI -- it is a convenience for the workstation.
 
 # Re-read state from disk at every step boundary (per project rule: release
 # scripts must not cache at script-start). Functions call these helpers to
@@ -574,16 +577,32 @@ node -e '
 TOKEN_STATE=$(cat "$TOKEN_STATUS")
 rm -f "$TOKEN_STATUS"
 if [ "$TOKEN_STATE" != "valid" ]; then
-  # Refresh via $GITHUB_TOKEN (regular env var, not `gh auth token`) so
-  # the per-host build machines that don't have the gh CLI installed
-  # can still publish the MCP-registry side. The operator exports
-  # GITHUB_TOKEN once on the workstation; per-host machines that need
-  # to publish server.json get it via the release orchestrator's env.
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    fail "mcp-publisher token ${TOKEN_STATE} and GITHUB_TOKEN is not set. Export GITHUB_TOKEN (a GitHub PAT with publish rights to the io.github.YawLabs/* MCP namespace) and re-run, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+  # Token refresh needs a GitHub token with publish rights on
+  # `io.github.YawLabs/*` (per the prior release memory for the parallel
+  # ssh-mcp repo, the MCP Registry `mcp-publisher` auth needs `read:org`).
+  # Resolution order:
+  #   1. $GITHUB_TOKEN (explicit env, takes priority -- the operator's
+  #      workstation with a fine-grained PAT)
+  #   2. $MCP_REGISTRY_TOKEN (an explicit override name some setups use)
+  #   3. `gh auth token` (works on any host that has the `gh` CLI
+  #      authenticated -- the established fallback for the parallel
+  #      ssh-mcp / npmjs-mcp release scripts per their memory)
+  # The mcp-publisher binary only needs a GitHub token at login time; it
+  # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
+  # GitHub token does NOT need to be in env for subsequent releases.
+  REGISTRY_GH_TOKEN="${GITHUB_TOKEN:-${MCP_REGISTRY_TOKEN:-}}"
+  if [ -z "$REGISTRY_GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
+    if REGISTRY_GH_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$REGISTRY_GH_TOKEN" ]; then
+      info "MCP-registry auth: using \`gh auth token\` (fallback)"
+    else
+      REGISTRY_GH_TOKEN=""
+    fi
   fi
-  info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\` (non-interactive: GITHUB_TOKEN is set)"
-  MCP_GITHUB_TOKEN="$GITHUB_TOKEN" "${WORKDIR}/${BIN_NAME}" login github
+  if [ -z "$REGISTRY_GH_TOKEN" ]; then
+    fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+  fi
+  info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\`"
+  MCP_GITHUB_TOKEN="$REGISTRY_GH_TOKEN" "${WORKDIR}/${BIN_NAME}" login github
   TOKEN_REFRESHED=true
 else
   info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
