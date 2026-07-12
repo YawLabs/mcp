@@ -1,50 +1,38 @@
 #!/bin/bash
 # =============================================================================
-# Release Script -- Bump, tag, publish to npm + MCP registry. Per-host
-# build orchestration matches Yaw Terminal's `release.sh` shape: each
-# host runs this script locally, the script builds that host's SEA
-# binary, commits + tags + pushes, and publishes the two registry
-# channels. NO GitHub release creation, NO `gh` calls in the main path.
+# Release Script -- Bump, tag, publish to npm + MCP registry.
+#
+# Single-machine flow: lint + typecheck + tests, bump package.json +
+# server.json in lockstep, commit + tag + push, publish to npm via
+# ~/.npmrc, publish server.json to the MCP registry via mcp-publisher.
+# No GitHub release creation, no per-platform build orchestration, no
+# SEA binaries. Install story is `npm install -g @yawlabs/mcp` (or
+# `npx -y @yawlabs/mcp`) -- see docs/v0.70.3-binary-track-decision.md
+# for the rationale on dropping the SEA binary track.
 # =============================================================================
-# Replaces the previous .github/workflows/release.yml-driven flow. The
-# .github/workflows/ directory is intentionally EMPTY (see the
-# `gh` strip-out 2026-...) -- CI was already ripped out of the parent
-# Yaw Terminal project; the MCP repo follows the same shape. The script
-# is the single source of truth: it runs the pre-flight gates (lint,
+# Replaces the earlier .github/workflows/release.yml-driven flow + the
+# per-platform SEA build orchestration that briefly lived in
+# scripts/build-platforms-all.sh (removed in v0.70.3). The script is
+# the single source of truth: it runs the pre-flight gates (lint,
 # typecheck, tests, build), bumps package.json + server.json in
 # lockstep, commits and tags, publishes to npm via the ~/.npmrc
 # automation token, publishes server.json to the MCP registry via
-# mcp-publisher, and prints the next-step handoff (asset attach to the
-# GitHub release is a SEPARATE `./release.sh --upload-asset` step that
-# the operator runs on a machine with $GITHUB_TOKEN, NOT on the
-# per-host build machine).
+# mcp-publisher, and exits.
 #
 # Usage:
-#   ./release.sh <version>                  -- full release from the workstation
-#   ./release.sh --build-only <version>     -- build this platform's SEA binary
-#                                              to dist-release/; do not tag/push.
-#                                              Run the upload step afterwards.
-#   ./release.sh --upload-asset <path> <version>
-#                                            -- attach <path> (and <path>.sha256
-#                                              if present) to the GitHub Release
-#                                              of <version>. Idempotent. Uses
-#                                              curl + $GITHUB_TOKEN (NOT `gh`)
-#                                              so it can run on any host with
-#                                              the token in env, no `gh` install.
+#   ./release.sh <version>           -- full release (the only mode)
+#   ./release.sh -y <version>        -- skip the y/N confirm prompt
 #
 # Environment:
-#   SKIP_CONFIRM=1                 skip the y/N confirm prompt
-#   NO_COLOR=1                     disable ANSI colors
-#   GITHUB_TOKEN                   required by --upload-asset (a fine-grained
-#                                  PAT with `contents: write` on YawLabs/mcp).
-#                                  Not required by the main release path or
-#                                  --build-only.
+#   SKIP_CONFIRM=1                   skip the y/N confirm prompt
+#   NO_COLOR=1                       disable ANSI colors
 #
-# Required tools on PATH: node, npm, curl, tar, sha256sum, openssl.
-# The first run also needs `mcp-publisher` (downloaded to a temp dir on demand,
-# sha256-verified against MCP_PUBLISHER_SHA256 below) and a one-time
-# `mcp-publisher login github` (interactive device flow) which persists a JWT
-# at ~/.config/mcp-publisher/token.json for subsequent runs.
+# Required tools on PATH: node, npm, curl, tar, sha256sum, openssl, git.
+# The first run also needs `mcp-publisher` (downloaded to a temp dir on
+# demand, sha256-verified against the registry's per-release
+# `registry_<ver>_checksums.txt`) and a one-time `mcp-publisher login
+# github` (interactive device flow) which persists a JWT at
+# ~/.config/mcp-publisher/token.json for subsequent runs.
 #
 # If interrupted, re-run with the same version -- each step is idempotent.
 # =============================================================================
@@ -71,7 +59,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 if [ "${NO_COLOR:-0}" = "1" ] || [ ! -t 1 ]; then
-  RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
+  RED=''; GREEN=''; YELLOW=''; NC=''
 fi
 
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
@@ -129,33 +117,18 @@ run_npm_check() {
   fail "$label failed (exit $rc)"
 }
 
-# Arg parsing -- manual loop so we can handle `--upload-asset PATH` (the next
-# argv is the asset path, not the version). Flags: -y/--yes, --build-only,
-# --upload-asset PATH. Version is positional and required.
+# Arg parsing -- manual loop. Flags: -y/--yes. Version is positional and
+# required. (The --build-only + --upload-asset subcommands were removed in
+# v0.70.3 when the SEA binary track was dropped -- npm install is the install
+# story now; see docs/v0.70.3-binary-track-decision.md.)
 SKIP_CONFIRM=false
-SUBCOMMAND="release"
-UPLOAD_ASSET=""
 REMAINING=()
 i=0
 while [ $i -lt $# ]; do
   arg="${@:$((i+1)):1}"
   case "$arg" in
     -y|--yes) SKIP_CONFIRM=true ;;
-    --build-only) SUBCOMMAND="build-only" ;;
-    --upload-asset)
-      SUBCOMMAND="upload-asset"
-      next_idx=$((i+1))
-      if [ "$next_idx" -ge "$#" ]; then
-        fail "--upload-asset requires a PATH argument"
-      fi
-      UPLOAD_ASSET="${@:$((next_idx+1)):1}"
-      i=$next_idx
-      ;;
-    --upload-asset=*)
-      SUBCOMMAND="upload-asset"
-      UPLOAD_ASSET="${arg#--upload-asset=}"
-      ;;
-    --*) fail "Unrecognized flag: '$arg'" ;;
+    --*) fail "Unrecognized flag: '$arg' (--build-only and --upload-asset were removed in v0.70.3; npm install is the install story now)" ;;
     *) REMAINING+=("$arg") ;;
   esac
   i=$((i+1))
@@ -174,7 +147,7 @@ if [ "${#REMAINING[@]}" -gt 0 ]; then
   done
 fi
 
-[ -n "$VERSION" ] || fail "Usage: ./release.sh [-y] [--build-only | --upload-asset PATH] <version>"
+[ -n "$VERSION" ] || fail "Usage: ./release.sh [-y] <version>"
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   fail "Invalid version format: $VERSION (expected X.Y.Z)"
@@ -185,14 +158,7 @@ cd "$SCRIPT_DIR"
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm  >/dev/null || fail "npm not installed"
-# `gh` is NOT required on the per-host --build-only legs or on the
-# --upload-asset subcommand. The main release path commits+tags+pushes
-# (regular git) and publishes to npm + the MCP registry. Step 7 (MCP
-# registry) refreshes the mcp-publisher token from $GITHUB_TOKEN if set,
-# otherwise from \`gh auth token\` (the established fallback for the
-# parallel ssh-mcp / npmjs-mcp release scripts per their project memory)
-# if \`gh\` is installed and authenticated. No path HARD-requires the
-# GitHub CLI -- it is a convenience for the workstation.
+command -v git  >/dev/null || fail "git not installed"
 
 # Re-read state from disk at every step boundary (per project rule: release
 # scripts must not cache at script-start). Functions call these helpers to
@@ -200,187 +166,14 @@ command -v npm  >/dev/null || fail "npm not installed"
 current_pkg_version() { node -p "require('./package.json').version"; }
 current_server_version() { node -p "require('./server.json').version"; }
 current_head_sha() { git rev-parse HEAD; }
-# The second-most-recent tag -- i.e. the tag immediately preceding the one
-# we're creating. Used for the changelog range.
-previous_local_tag() { git tag --sort=-v:refname | grep -v "^v${VERSION}$" | head -1; }
-
-# ---------- Subcommand: --upload-asset ----------------------------------------
-# Attach a binary (and its .sha256 sidecar, if present) to an existing
-# GitHub release. The per-host build machines do NOT run this -- they
-# only run --build-only and produce dist-release/<asset>. The OPERATOR
-# runs --upload-asset on the WORKSTATION (which has $GITHUB_TOKEN) after
-# each per-host artifact arrives. Idempotent: the GitHub API returns a
-# 422 "already_exists" for a re-upload, which we treat as success.
-#
-# Uses curl + $GITHUB_TOKEN against the GitHub REST API. NO `gh` CLI --
-# the per-host machines don't have it installed, and a fine-grained PAT
-# in env is enough on the workstation.
-if [ "$SUBCOMMAND" = "upload-asset" ]; then
-  # GitHub-token resolution mirrors step 7's registry-auth fallback: explicit
-  # $GITHUB_TOKEN first, else `gh auth token` on a host with an authed gh CLI.
-  # Preserves the per-host no-gh design (falls through to the hard error below
-  # when neither is available) while making the workstation path seamless.
-  if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
-    if GH_FALLBACK_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$GH_FALLBACK_TOKEN" ]; then
-      GITHUB_TOKEN="$GH_FALLBACK_TOKEN"
-      info "--upload-asset auth: using \`gh auth token\` (fallback)"
-    fi
-  fi
-  : "${GITHUB_TOKEN:?GITHUB_TOKEN env var required for --upload-asset (fine-grained PAT with contents: write on YawLabs/mcp). On a host with an authed \`gh\` it is auto-derived; otherwise export it or run \`gh auth login\`.}"
-  command -v curl >/dev/null || fail "curl not installed (required for --upload-asset)"
-
-  GH_REPO="YawLabs/mcp"
-  GH_API="https://api.github.com"
-  GH_AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
-
-  TOTAL_STEPS=3
-  step 1 "Validate"
-  [ -f "$UPLOAD_ASSET" ] || fail "--upload-asset path does not exist: $UPLOAD_ASSET"
-  # Tag existence via plain git (no `gh`).
-  if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -qE 'refs/tags/v[0-9]'; then
-    fail "Tag v${VERSION} not found on origin -- run the main release path on the release-driver machine first."
-  fi
-  # Capture release id AND upload_url. The asset upload endpoint lives on
-  # the `uploads.github.com` host (NOT api.github.com -- a POST to the
-  # api host returns 404). The release JSON's `upload_url` field gives us
-  # the correct host with a `{?name,label}` query template; we strip the
-  # template and pass `?name=...` ourselves. This is the only way to
-  # upload from a host that doesn't have the `gh` CLI -- `gh release
-  # upload` abstracts over this, but we removed `gh` from the script by
-  # design. A 404 means the release does not exist yet -- the FIRST
-  # --upload-asset for a version creates it (empty, minimal notes); later
-  # calls attach to it. This is the "creates the empty release as a side
-  # effect of --upload-asset init" behavior that was previously
-  # documented but never implemented -- without it there was a
-  # chicken-and-egg (the main path never creates the release, and this
-  # step required it to pre-exist). We capture the HTTP status explicitly
-  # (rather than curl -f) so a 401/403 stays a clear auth failure
-  # instead of being mistaken for "absent -> create".
-  extract_rel() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(String(j.id||"")+"|"+(j.upload_url||""))}catch{process.stdout.write("|")}})'; }
-  REL_RESP=$(curl -sS -w '\n%{http_code}' "${GH_AUTH[@]}" "${GH_API}/repos/${GH_REPO}/releases/tags/v${VERSION}")
-  REL_CODE=$(printf '%s\n' "$REL_RESP" | tail -n1)
-  REL_JSON=$(printf '%s\n' "$REL_RESP" | sed '$d')
-  case "$REL_CODE" in
-    200)
-      REL_PAIR=$(printf '%s' "$REL_JSON" | extract_rel)
-      REL_ID="${REL_PAIR%%|*}"
-      REL_UPLOAD_URL="${REL_PAIR#*|}"
-      # Strip the {?name,label} template from upload_url; we pass ?name=
-      # ourselves in upload_asset().
-      REL_UPLOAD_URL="${REL_UPLOAD_URL%\{*\}}"
-      [ -n "$REL_ID" ] || fail "release v${VERSION} returned 200 but its id could not be parsed: $REL_JSON"
-      [ -n "$REL_UPLOAD_URL" ] || fail "release v${VERSION} returned 200 but its upload_url could not be parsed: $REL_JSON"
-      info "Tag v${VERSION} and release id ${REL_ID} present on origin"
-      ;;
-    404)
-      warn "No GitHub release for v${VERSION} yet -- creating it (empty, minimal notes)"
-      CREATE_BODY=$(node -e 'const v=process.argv[1];process.stdout.write(JSON.stringify({tag_name:"v"+v,name:"v"+v,body:"Release v"+v+". Per-platform binaries are attached as each host build completes."}))' "$VERSION")
-      CREATE_JSON=$(curl -sS --fail-with-body -X POST "${GH_AUTH[@]}" -H "Content-Type: application/json" -d "$CREATE_BODY" "${GH_API}/repos/${GH_REPO}/releases" 2>&1) || fail "could not create GitHub release v${VERSION} -- check GITHUB_TOKEN has contents: write (HTTP error above)"
-      REL_PAIR=$(printf '%s' "$CREATE_JSON" | extract_rel)
-      REL_ID="${REL_PAIR%%|*}"
-      REL_UPLOAD_URL="${REL_PAIR#*|}"
-      REL_UPLOAD_URL="${REL_UPLOAD_URL%\{*\}}"
-      [ -n "$REL_ID" ] || fail "created release v${VERSION} but its id could not be parsed: $CREATE_JSON"
-      [ -n "$REL_UPLOAD_URL" ] || fail "created release v${VERSION} but its upload_url could not be parsed: $CREATE_JSON"
-      info "Created GitHub release v${VERSION} (id ${REL_ID})"
-      ;;
-    *)
-      fail "unexpected HTTP ${REL_CODE} reading release v${VERSION} (check GITHUB_TOKEN / repo): ${REL_JSON}"
-      ;;
-  esac
-
-  step 2 "Upload asset"
-  # Upload via the assets endpoint. -L follows the 422 redirect to a
-  # useful error body; --fail-with-body surfaces 4xx/5xx in $? for the
-  # "already exists" check below. -H "Content-Length: 0" is the
-  # recommended probe pattern for the existence-only path.
-  upload_asset() {
-    local file="$1"
-    local name
-    name=$(basename "$file")
-    local mime
-    case "$name" in
-      *.sha256) mime="text/plain" ;;
-      *.exe)    mime="application/vnd.microsoft.portable-executable" ;;
-      *)        mime="application/octet-stream" ;;
-    esac
-    info "Attaching $name to v${VERSION}"
-    local resp
-    resp=$(curl -sS -w "\n%{http_code}" -X POST \
-      "${GH_AUTH[@]}" \
-      -H "Content-Type: ${mime}" \
-      --data-binary "@${file}" \
-      "${REL_UPLOAD_URL}?name=${name}")
-    local code
-    code=$(echo "$resp" | tail -n1)
-    local body
-    body=$(echo "$resp" | sed '$d')
-    case "$code" in
-      201) return 0 ;;
-      422)
-        # 422 = validation failed; "already_exists" is one of the
-        # well-known causes for asset upload. Treat as idempotent success.
-        if echo "$body" | grep -qi 'already_exists'; then
-          warn "$name already attached (treating as success)"
-          return 0
-        fi
-        warn "$name upload returned 422: $body"
-        return 1
-        ;;
-      *)
-        warn "$name upload failed (HTTP $code): $body"
-        return 1
-        ;;
-    esac
-  }
-  upload_asset "$UPLOAD_ASSET" || fail "asset upload failed -- see warnings above"
-  if [ -f "${UPLOAD_ASSET}.sha256" ]; then
-    upload_asset "${UPLOAD_ASSET}.sha256" || warn "sha256 sidecar upload failed (non-fatal)"
-  fi
-
-  step 3 "Verify"
-  # -f surfaces HTTP errors in curl's exit code (the previous shape -- a
-  # bare `curl -sS` -- would 200 an HTML error body on a 401/403/404 and
-  # the empty-REL_ASSETS path would just say "asset not visible" with
-  # no hint about the actual cause).
-  REL_ASSETS=$(curl -sS -f --fail-with-body "${GH_AUTH[@]}" "${GH_API}/repos/${GH_REPO}/releases/${REL_ID}" 2>&1) || fail "could not read release v${VERSION} assets from GitHub (HTTP error above)"
-  REL_ASSETS=$(echo "$REL_ASSETS" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write((JSON.parse(d).assets||[]).map(a=>a.name).join("\n"))}catch{process.stdout.write("")}})')
-  if echo "$REL_ASSETS" | grep -qxF "$(basename "$UPLOAD_ASSET")"; then
-    info "v${VERSION} assets now include $(basename "$UPLOAD_ASSET")"
-  else
-    fail "Asset $(basename "$UPLOAD_ASSET") not visible on v${VERSION} after upload"
-  fi
-  echo ""
-  echo -e "${GREEN}  Asset attached to v${VERSION}.${NC}"
-  exit 0
-fi
-
-# ---------- Subcommand: --build-only -----------------------------------------
-# Build the platform's SEA binary to dist-release/ and exit. No tag, no push.
-if [ "$SUBCOMMAND" = "build-only" ]; then
-  TOTAL_STEPS=3
-  step 1 "Build SEA binary"
-  node scripts/build-binary.mjs
-  step 2 "Stage release asset"
-  node scripts/stage-release-asset.mjs
-  step 3 "Smoke test"
-  ASSET=$(ls dist-release/ 2>/dev/null | grep -v '\.sha256$' | head -1)
-  [ -n "$ASSET" ] || fail "No asset in dist-release/ after build+stage"
-  "./dist-release/$ASSET" --version
-  info "Build complete: dist-release/$ASSET (run ./release.sh --upload-asset dist-release/$ASSET $VERSION on the same machine to attach)"
-  exit 0
-fi
 
 # ---------- Main path: full release -------------------------------------------
-TOTAL_STEPS=8
-
-# `gh` is NOT required on the main release path -- the main path
-# creates a git tag and pushes it (regular git commands), publishes to
-# npm (npm CLI), and publishes server.json to the MCP registry
-# (mcp-publisher). The GitHub *release* (with attached assets) is a
-# SEPARATE step the operator runs via --upload-asset on a host that has
-# $GITHUB_TOKEN; the per-host build machines never need to know about
-# the release. (node/npm pre-flighted at 186-187; no need to re-check here.)
+# 5 steps. The build is just `npm run build` (tsup -> dist/index.js); npm
+# publish ships the tarball directly. Install method is
+# `npm install -g @yawlabs/mcp` or `npx -y @yawlabs/mcp`. See
+# docs/v0.70.3-binary-track-decision.md for the rationale and the
+# install-store union follow-up.
+TOTAL_STEPS=5
 
 echo -e "${CYAN}Pre-flight checks...${NC}"
 CURRENT_VERSION=$(current_pkg_version)
@@ -411,7 +204,7 @@ fi
 
 # --- Guard: refuse a backward or duplicate version, BEFORE the expensive
 # lint/test/build. npm only rejects a below-latest version at publish time
-# (step 6), with a cryptic "Cannot implicitly apply the latest tag" error, after
+# (step 4), with a cryptic "Cannot implicitly apply the latest tag" error, after
 # a full build + tag + push has already happened. Catch it here with a clear
 # message. A version that is ALREADY published is a legitimate resume (later
 # steps skip it), so only a not-yet-published version at or below the current
@@ -428,9 +221,9 @@ fi
 
 # --- Guard: on a FRESH bump, a tag v${VERSION} that already exists is a
 # collision (e.g. a fat-finger reusing an old release number, as 0.8.0 did with
-# the 2026-04 tag). Step 5's "tag already exists" branch would silently keep the
-# OLD tag and ship the wrong commit. On a resume the tag legitimately already
-# points at the bump commit, so this only fires on a fresh bump.
+# the 2026-04 tag). Step 3's "tag already exists" branch would silently keep
+# the OLD tag and ship the wrong commit. On a resume the tag legitimately
+# already points at the bump commit, so this only fires on a fresh bump.
 if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
   EXISTING_TAG_COMMIT=$(git rev-list -n1 "v${VERSION}")
   fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
@@ -439,18 +232,13 @@ fi
 if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
-  echo "  1. Run lint + typecheck"
-  echo "  2. Run tests"
-  echo "  3. Build the SEA binary for this platform"
-  echo "  4. Bump version in package.json + server.json"
-  echo "  5. Commit, tag, and push"
-  echo "  6. Publish to npm (using ~/.npmrc automation token)"
-  echo "  7. Publish server.json to the MCP registry (mcp-publisher)"
-  echo "  8. Hand off this platform's binary for GitHub release attach (operator runs ./release.sh --upload-asset on the workstation)"
+  echo "  1. Run lint + typecheck + tests"
+  echo "  2. Build the bundled CLI (npm run build)"
+  echo "  3. Bump version in package.json + server.json, commit, tag, push"
+  echo "  4. Publish to npm (using ~/.npmrc automation token)"
+  echo "  5. Publish server.json to the MCP registry (mcp-publisher)"
   echo ""
-  echo -e "  Other platforms: build on a ${CYAN}<platform>${NC} machine, then run"
-  echo -e "    ${CYAN}./release.sh --upload-asset dist-release/<asset> ${VERSION}${NC}"
-  echo -e "  on each, to attach their binary to the same release."
+  echo -e "  Install method is ${CYAN}npm install -g @yawlabs/mcp${NC} (or ${CYAN}npx -y @yawlabs/mcp${NC})."
   echo ""
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -460,24 +248,17 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   fi
 fi
 
-step 1 "Lint + typecheck"
+step 1 "Lint + typecheck + tests"
 run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
-info "Lint + typecheck passed"
-
-step 2 "Tests"
 npm test || fail "Tests failed"
-info "All tests passed"
+info "Lint + typecheck + tests passed"
 
-step 3 "Build SEA binary for this platform"
-node scripts/build-binary.mjs
-node scripts/stage-release-asset.mjs
-ASSET=$(ls dist-release/ 2>/dev/null | grep -v '\.sha256$' | head -1)
-[ -n "$ASSET" ] || fail "No asset in dist-release/ after build+stage"
-"./dist-release/$ASSET" --version
-info "Built and smoke-tested $ASSET"
+step 2 "Build"
+npm run build || fail "Build failed"
+info "Build complete"
 
-step 4 "Bump version to $VERSION"
+step 3 "Bump version to $VERSION, commit, tag, and push"
 # Re-read current version (the resume path can skip a bump that's already done).
 CURRENT_VERSION=$(current_pkg_version)
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
@@ -485,14 +266,14 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
 else
   npm version "$VERSION" --no-git-tag-version
   info "package.json bumped"
-  # Keep server.json in lockstep -- release.yml's publish-registry job verifies
-  # both fields and 400s on drift (that's what wedged v0.66.0). The script is
-  # the single source of truth now; CI no longer rewrites server.json.
+  # Keep server.json in lockstep -- mcp-publisher's `publish` validates that
+  # the referenced npm package exists AND that the version field matches
+  # what npm reports (the registry 400s on drift). The script is the
+  # single source of truth now; CI no longer rewrites server.json.
   node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$VERSION"
   info "server.json bumped"
 fi
 
-step 5 "Commit, tag, and push"
 if [ -n "$(git status --porcelain package.json package-lock.json server.json 2>/dev/null)" ]; then
   git add package.json package-lock.json server.json
   git -c core.hooksPath=/dev/null commit -m "v${VERSION}"
@@ -512,8 +293,7 @@ fi
 
 # Re-verify package.json matches the tag BEFORE pushing -- catching a stale
 # local index that was bumped-after-tag here prevents the "tag pushed without
-# the matching version bump" failure that the CI workflow's
-# `Verify tag matches package.json` step was guarding against.
+# the matching version bump" failure mode.
 PKG_NOW=$(current_pkg_version)
 if [ "$PKG_NOW" != "$VERSION" ]; then
   fail "package.json shows $PKG_NOW but tag is v${VERSION} -- refusing to push"
@@ -526,7 +306,7 @@ fi
 git push origin main --follow-tags
 info "Pushed to origin"
 
-step 6 "Publish to npm"
+step 4 "Publish to npm"
 # The script is the publisher now. ~/.npmrc must carry the automation token
 # (NOT a WebAuthn web session -- the npm publishing rule in CLAUDE.md is
 # explicit on this: `npm login --auth-type=web` overwrites the automation
@@ -561,10 +341,10 @@ else
   info "Published @yawlabs/mcp@${VERSION} to npm"
 fi
 
-step 7 "Publish server.json to MCP registry"
+step 5 "Publish server.json to MCP registry"
 # Check the published-npm first; mcp-publisher's `publish` validates that the
 # referenced npm package exists, and the registry mirror can lag the write
-# path by seconds. Same backoff as the old CI workflow.
+# path by seconds.
 NPM_NOW=""
 for i in 1 2 3 4 5 6 7 8 9 10; do
   NPM_NOW=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
@@ -575,12 +355,12 @@ if [ "$NPM_NOW" != "$VERSION" ]; then
   fail "npm does not show @yawlabs/mcp@${VERSION} after 60s -- refusing to publish to MCP registry (it would 400)"
 fi
 
-# Download + sha256-verify mcp-publisher to a temp dir. Same pin + digest as
-# the old CI workflow.
+# Download + sha256-verify mcp-publisher to a temp dir. Pinned + digest-verified
+# the same way the old CI workflow did.
 WORKDIR=$(mktemp -d)
 # mcp-publisher ships a tarball per (platform, arch). Map the current host to
 # the matching tarball name so this works on a Linux, macOS, or Windows
-# release-driver machine -- the old CI workflow was Linux-only.
+# release-driver machine.
 #
 # We use node (already a hard dep) rather than `uname` because MINGW64 on
 # Windows ARM64 reports x86_64 via `uname -m` even when the kernel is arm64,
@@ -619,12 +399,7 @@ info "mcp-publisher ${MCP_PUBLISHER_VERSION} ready (sha256 verified)"
 # Auth: the registry's `login github` accepts a pre-set GitHub token via
 # `MCP_GITHUB_TOKEN` (or `--token`) and skips the OAuth device flow -- it
 # exchanges the GitHub token for a fresh Registry JWT and writes it to
-# ~/.config/mcp-publisher/token.json. The old CI used `login github-oidc`
-# which mints a GitHub Actions OIDC token (requires `id-token: write` --
-# Actions only); the workstation path uses
-# `MCP_GITHUB_TOKEN=$GITHUB_TOKEN` directly, which is equivalent for our
-# purposes since GITHUB_TOKEN is a YawLabs maintainer PAT with publish
-# rights to the io.github.YawLabs/* namespace. No `gh` CLI required.
+# ~/.config/mcp-publisher/token.json.
 TOKEN_FILE="${HOME}/.config/mcp-publisher/token.json"
 TOKEN_REFRESHED=false
 # Return 0 (true in shell `if`) iff the persisted token is missing, unparseable,
@@ -684,33 +459,8 @@ fi
 "${WORKDIR}/${BIN_NAME}" publish
 info "Published server.json to MCP registry"
 
-step 8 "Hand off per-platform binary uploads"
-# Re-read dist-release/ at this point -- a re-run after a partial failure
-# shouldn't fail because the asset is "already there".
-ASSET=$(ls dist-release/ 2>/dev/null | grep -v '\.sha256$' | head -1)
-SHA_SIDE=$(ls dist-release/*.sha256 2>/dev/null | head -1)
-[ -n "$ASSET" ] || fail "No asset in dist-release/ to attach"
-
-# The GitHub release + asset attach is NOT this script's job (no `gh`,
-# no GHA). The per-host build machine produced dist-release/<asset>;
-# the operator's workstation (with $GITHUB_TOKEN in env) attaches it
-# via the SEPARATE `./release.sh --upload-asset` subcommand once all
-# five per-host artifacts have arrived. Print the exact next-step
-# command so the transcript records what to run, then leave the
-# artifact in dist-release/ for the operator to scp/collect.
-if [ -n "$ASSET" ]; then
-  info "Per-host artifact: dist-release/${ASSET}"
-  info "Attach it from the workstation with:"
-  info "  ./release.sh --upload-asset dist-release/${ASSET} ${VERSION}"
-fi
-# Don't rm -rf dist-release/ here -- the operator needs the artifact
-# to run --upload-asset. The per-host --build-only subcommand does the
-# cleanup at its own exit (see that branch's rm of dist-release/).
-
 # Final verification across the channels this script owns: npm, the
-# MCP registry, and the local git tag. GitHub release verification is
-# the operator's job once they finish --upload-asset for all five
-# platforms.
+# MCP registry, and the local git tag.
 echo ""
 echo -e "${CYAN}Verifying...${NC}"
 NPM_FINAL=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
@@ -739,10 +489,6 @@ echo ""
 echo -e "  npm:        https://www.npmjs.com/package/@yawlabs/mcp"
 echo -e "  registry:   https://registry.modelcontextprotocol.io"
 echo ""
-echo -e "  ${CYAN}This platform's${NC} binary is in dist-release/ on this machine."
-echo -e "  Move it to the workstation (which has \$GITHUB_TOKEN) and run:"
-echo -e "    ${CYAN}./release.sh --upload-asset dist-release/<asset> ${VERSION}${NC}"
-echo -e "  Repeat on each of the other 4 build hosts; the same ./release.sh"
-echo -e "  --upload-asset call attaches each artifact to the same release."
-echo -e "  This is the only step that needs the GitHub token (curl +\$GITHUB_TOKEN, no \`gh\`)."
+echo -e "  Install:    ${CYAN}npm install -g @yawlabs/mcp${NC}"
+echo -e "  Or run:     ${CYAN}npx -y @yawlabs/mcp${NC}"
 echo ""
