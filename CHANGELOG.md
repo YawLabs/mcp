@@ -1,6 +1,15 @@
 # Changelog
 
-All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
+All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
+
+## 0.70.3 -- drop the SEA binary track; npm install is the install story
+
+The per-platform Node SEA (Single Executable Application) build track is removed. Going forward, install via `npm install -g @yawlabs/mcp` (or `npx -y @yawlabs/mcp`). See `docs/v0.70.3-binary-track-decision.md` for the full rationale; short version: the SEA track required a dedicated build host per platform (Node SEA cannot cross-compile), the GCP and AWS path for win32-x64 + linux-arm64 hit a 5-hour OpenSSH bootstrap and a `CPUS_ALL_REGIONS` quota lockout, and the npm install path covers every install target we ship to with one build.
+
+- **`release.sh` simplified to 5 steps.** Lint + typecheck + tests (step 1), build (step 2), bump + commit + tag + push (step 3), publish to npm (step 4), publish `server.json` to the MCP registry (step 5). The previous `--build-only` and `--upload-asset` subcommands are removed; `release.sh` now has one mode and a single entry point.
+- **Build-infra files deleted.** `sea-config.json`, `scripts/build-binary.mjs`, `scripts/build-platform-remote.sh`, `scripts/build-platforms-all.sh`, `scripts/build-win-x64-ephemeral.sh`, `scripts/platforms.json.example`, `scripts/stage-release-asset.mjs`, `scripts/update-manifests.mjs`, and the untracked `bin/platforms.json` + `bin/win32-arm64/` are removed. The `.gitignore` entries for `bin/`, `build-tmp/`, and `dist-release/` go with them.
+- **`postject` devDependency removed.** It was the only Node-SEA-only dep.
+- **Install paths collapsed.** `BINARY_DISTRIBUTION.md` (which documented the SEA build) is replaced with a one-page install guide pointing to npm. Scoop (`YawLabs/scoop-yaw`) and Homebrew (`YawLabs/homebrew-yaw`) taps are not updated for 0.70.3 and may lag -- prefer `npm install -g @yawlabs/mcp` until the taps catch up.
 
 ## 0.70.1 -- `yaw-mcp token` subcommand for trusted local apps
 
