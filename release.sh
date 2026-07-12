@@ -121,7 +121,9 @@ run_npm_check() {
 # required. (The --build-only + --upload-asset subcommands were removed in
 # v0.70.3 when the SEA binary track was dropped -- npm install is the install
 # story now; see docs/v0.70.3-binary-track-decision.md.)
-SKIP_CONFIRM=false
+# Env may pre-set SKIP_CONFIRM=1 to skip the y/N prompt (e.g. CI, scripted
+# release). Default off. The -y/--yes arg below overrides the env to true.
+SKIP_CONFIRM="${SKIP_CONFIRM:-false}"
 REMAINING=()
 i=0
 while [ $i -lt $# ]; do
