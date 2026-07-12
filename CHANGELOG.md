@@ -2,7 +2,7 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + tests + build, bumps, tags, publishes to npm, and creates the GitHub release.
 
-## 0.70.0 -- `yaw-mcp token` subcommand for trusted local apps
+## 0.70.1 -- `yaw-mcp token` subcommand for trusted local apps
 
 Adds a `token` subcommand that prints this machine's Yaw Team session token (the raw `yaw_team` cookie) on stdout, for a TRUSTED LOCAL app to present to a Yaw endpoint that verifies the same HMAC session -- e.g. Vew Meetings' `POST /api/meeting`. Makes NO network call: reads the session persisted by `login` and emits it only when still valid (exp-checked via `team-sync`'s `loadStoredState`), else exits 1 with nothing on stdout.
 
