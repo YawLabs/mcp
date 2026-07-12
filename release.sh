@@ -35,6 +35,18 @@
 # ~/.config/mcp-publisher/token.json for subsequent runs.
 #
 # If interrupted, re-run with the same version -- each step is idempotent.
+#
+# Branch protection: the script's `git push origin main --follow-tags`
+# (step 3) bypasses the YawLabs/mcp "Protect default branch" ruleset
+# (PR review, signed commits, status check "check") and the "Protect
+# release tags" ruleset (block ref creation) under the ruleset's
+# OrganizationAdmin bypass policy -- the SSH key registered to a YawLabs
+# org admin (the `gh_woods` key on this workstation) is a configured
+# bypass actor. If a different operator runs the script, the push will
+# fail with rule-violation output and the operator must open a PR
+# instead. Verified: rulesets #14941666 (default branch) and #14943288
+# (refs/tags/v*), bypass_actors: [{actor_type: OrganizationAdmin,
+# bypass_mode: always}].
 # =============================================================================
 
 set -euo pipefail
