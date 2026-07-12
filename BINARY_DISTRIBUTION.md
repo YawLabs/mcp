@@ -5,14 +5,20 @@ no Node, no `node_modules`, and nothing on `PATH`. This kills the install-store
 mess (npm-global / pnpm-global / bun-global / npx / local-node_modules /
 bundled-app) that `upgrade-cmd.ts` has to classify.
 
-> **Status: SHIPPED.** `.github/workflows/release.yml` builds all 5 platforms
-> on tag push (proven by v0.60.6, all legs green) and publishes binaries +
-> sha256 sidecars to GitHub Releases. Installable now via
+> **Status: SHIPPED, with one operational change.** Each `@yawlabs/mcp` release
+> builds its per-platform binary on a release-driver machine (the script
+> runs `node scripts/build-binary.mjs` for the host's platform/arch, then
+> `node scripts/stage-release-asset.mjs`, then attaches the result to the
+> GitHub Release). To ship binaries for all 5 platforms, run the build on
+> each platform machine and use `release.sh --upload-asset <path> <version>`
+> to attach the artifact to the same GitHub Release. The npm package and
+> the MCP-registry `server.json` are published from the release-driver
+> machine's main `release.sh` invocation. Installable now via
 > `scoop install mcp` (YawLabs/scoop-yaw) and
 > `brew install yawlabs/yaw/yaw-mcp` (YawLabs/homebrew-yaw). The sections
 > below document the build internals; some originally-PoC notes (e.g. the
 > single win32-arm64 build, "re-sign for distribution is out of scope") are
-> superseded by the workflow + the macOS ad-hoc-codesign step now in
+> superseded by the build script + the macOS ad-hoc-codesign step now in
 > `build-binary.mjs`.
 
 ## TL;DR
@@ -135,7 +141,7 @@ Authenticode signature. The user experience depends on the install path:
   behavior for an unsigned binary and will remain until the release
   pipeline is extended with an Authenticode code-signing certificate
   (future work -- needs a cert acquisition and a `signtool` step in
-  `release.yml`).
+  `release.sh`).
 
 macOS: `codesign` / notarization is similarly absent; Gatekeeper will
 quarantine a direct download. Homebrew install clears the quarantine
@@ -193,14 +199,28 @@ compiles to other platforms via `--target`. Untested here (bun not installed).
 ## Cross-platform builds
 
 `scripts/build-binary.mjs` targets the **host** platform/arch (Node SEA cannot
-cross-compile -- the carrier is the host `node` binary). To produce
-linux-x64 / darwin-arm64 / win32-x64 artifacts, run the same script on each
-target (a CI matrix), or switch to `bun build --compile --target=...` /
-`deno compile --target=...`, both of which cross-compile from one host.
+cross-compile -- the carrier is the host `node` binary). The `release.sh` flow
+handles this by:
+1. **Release driver** (any platform): runs the full release (`release.sh <v>`).
+   It builds the host's platform binary, attaches it to the GitHub Release,
+   and publishes npm + the MCP registry.
+2. **Per-platform machines** (Linux x64, macOS arm64/x64, Windows x64/arm64):
+   `release.sh --build-only <v>` to build the host's binary into
+   `dist-release/`, then `release.sh --upload-asset dist-release/<asset> <v>`
+   to attach it to the same GitHub Release. Idempotent: re-running the upload
+   on an already-attached asset is a no-op.
+
+If you need to ship all 5 platforms in one shot, this is the path. The
+trade-off vs. the old 5-platform CI matrix: builds are now manual/serial
+instead of parallel, but you avoid CI runner minutes and the brittle tag-push
+hand-off that broke v0.70.0.
 
 ## Files in the pipeline
 
-- `.github/workflows/release.yml` -- the 5-platform build + publish matrix.
+- `release.sh` -- the single source of truth. Runs lint, typecheck, tests,
+  build (host platform), bump, tag, push, npm publish, MCP-registry publish,
+  GitHub Release creation, asset attach. Also accepts `--build-only` and
+  `--upload-asset PATH` for per-platform machine runs.
 - `scripts/build-binary.mjs` -- esbuild (JS API) -> SEA blob -> postject (JS
   API) -> macOS ad-hoc codesign. Builds the host platform only.
 - `scripts/stage-release-asset.mjs` -- rename to `yaw-mcp-<platform>-<arch>`
@@ -210,11 +230,9 @@ target (a CI matrix), or switch to `bun build --compile --target=...` /
 - `sea-config.json` -- Node SEA config.
 - `bin/` + `build-tmp/` + `dist-release/` -- build artifacts (gitignored).
 
-## Manifest bump: local vs CI
+## Manifest bump: local script
 
-The binary BUILD is CI (`release.yml` on tag push). The manifest BUMP
-(scoop-yaw `bucket/mcp.json` + homebrew-yaw `Formula/yaw-mcp.rb`) is currently
-**local**: after a release, run
+After a release, run
 
 ```
 node scripts/update-manifests.mjs --version <X.Y.Z> --push
@@ -222,13 +240,14 @@ node scripts/update-manifests.mjs --version <X.Y.Z> --push
 
 which pulls the release's `.sha256` sidecars, rewrites both manifests, and
 pushes to the sibling repos over SSH (`gh_woods`). This mirrors Yaw Terminal's
-`release.sh` and needs no cross-repo CI secret.
+`release.sh` and needs no cross-repo CI secret. The script is the same
+generator whether you're on the release-driver machine or a per-platform one.
 
-To make it fully automatic, add a `needs: build` job to `release.yml` that runs
-the same generator and pushes -- but that requires a **cross-repo PAT** secret
-(the default `GITHUB_TOKEN` is scoped to this repo only) with write to
-scoop-yaw + homebrew-yaw. That's a deliberate secret/scope decision; until it's
-made, the local `--push` is the supported path.
+The binary BUILD is per-workstation (driven by `release.sh`); the manifest
+BUMP is still local-and-after-the-fact. To make it fully automatic, the
+script would need a cross-repo PAT (the default `GITHUB_TOKEN` is scoped to
+this repo only) with write to scoop-yaw + homebrew-yaw. That's a deliberate
+secret/scope decision; until it's made, the local `--push` is the supported path.
 
 ## Adopting this pipeline in another `@yawlabs/*` server
 
@@ -247,10 +266,9 @@ the binary (or a different packager) -- not a clean single-binary target.
 
 Checklist to adopt:
 
-1. Copy the four build files AS-IS -- `.github/workflows/release.yml`,
-   `scripts/build-binary.mjs`, `scripts/stage-release-asset.mjs`,
-   `sea-config.json`. They derive the binary name from the package's `bin`
-   field, so **no rename is needed**.
+1. Copy the three build files AS-IS -- `scripts/build-binary.mjs`,
+   `scripts/stage-release-asset.mjs`, `sea-config.json`. They derive the
+   binary name from the package's `bin` field, so **no rename is needed**.
 2. Add `postject` as a devDep (`esbuild` is already one on these servers).
 3. Confirm `src/index.ts` (the target's entry) bundles clean under esbuild
    with all deps inlined (no native addons). `node scripts/build-binary.mjs`
@@ -261,8 +279,10 @@ Checklist to adopt:
    `Formula/<name>.rb`.
 5. `chmod +x` the build artifacts via the scripts (already handled); gitignore
    `bin/ build-tmp/ dist-release/`.
-6. Tag `v*` to fire the build; run `update-manifests.mjs --version <v> --push`
-   after the release lands.
+6. Wire `release.sh` (or an equivalent) for the bump + tag + npm + registry
+   + GitHub Release flow. The release-driver machine runs the full path; per-
+   platform machines use `--build-only` and `--upload-asset` to attach their
+   binaries.
 
 This is the copy-paste path that closes the "make the JS sidecars bundle like
 the Go `micro` editor" goal for each server.
