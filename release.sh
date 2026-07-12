@@ -240,31 +240,48 @@ if [ "$SUBCOMMAND" = "upload-asset" ]; then
   if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -qE 'refs/tags/v[0-9]'; then
     fail "Tag v${VERSION} not found on origin -- run the main release path on the release-driver machine first."
   fi
-  # Release existence + capture release id (needed for the asset upload URL).
-  # A 404 means the release does not exist yet -- the FIRST --upload-asset for a
-  # version creates it (empty, minimal notes); later calls attach to it. This is
-  # the "creates the empty release as a side effect of --upload-asset init"
-  # behavior that was previously documented but never implemented -- without it
-  # there was a chicken-and-egg (the main path never creates the release, and
-  # this step required it to pre-exist). We capture the HTTP status explicitly
-  # (rather than curl -f) so a 401/403 stays a clear auth failure instead of
-  # being mistaken for "absent -> create".
-  extract_rel_id() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).id||""))}catch{process.stdout.write("")}})'; }
+  # Capture release id AND upload_url. The asset upload endpoint lives on
+  # the `uploads.github.com` host (NOT api.github.com -- a POST to the
+  # api host returns 404). The release JSON's `upload_url` field gives us
+  # the correct host with a `{?name,label}` query template; we strip the
+  # template and pass `?name=...` ourselves. This is the only way to
+  # upload from a host that doesn't have the `gh` CLI -- `gh release
+  # upload` abstracts over this, but we removed `gh` from the script by
+  # design. A 404 means the release does not exist yet -- the FIRST
+  # --upload-asset for a version creates it (empty, minimal notes); later
+  # calls attach to it. This is the "creates the empty release as a side
+  # effect of --upload-asset init" behavior that was previously
+  # documented but never implemented -- without it there was a
+  # chicken-and-egg (the main path never creates the release, and this
+  # step required it to pre-exist). We capture the HTTP status explicitly
+  # (rather than curl -f) so a 401/403 stays a clear auth failure
+  # instead of being mistaken for "absent -> create".
+  extract_rel() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);process.stdout.write(String(j.id||"")+"|"+(j.upload_url||""))}catch{process.stdout.write("|")}})'; }
   REL_RESP=$(curl -sS -w '\n%{http_code}' "${GH_AUTH[@]}" "${GH_API}/repos/${GH_REPO}/releases/tags/v${VERSION}")
   REL_CODE=$(printf '%s\n' "$REL_RESP" | tail -n1)
   REL_JSON=$(printf '%s\n' "$REL_RESP" | sed '$d')
   case "$REL_CODE" in
     200)
-      REL_ID=$(printf '%s' "$REL_JSON" | extract_rel_id)
+      REL_PAIR=$(printf '%s' "$REL_JSON" | extract_rel)
+      REL_ID="${REL_PAIR%%|*}"
+      REL_UPLOAD_URL="${REL_PAIR#*|}"
+      # Strip the {?name,label} template from upload_url; we pass ?name=
+      # ourselves in upload_asset().
+      REL_UPLOAD_URL="${REL_UPLOAD_URL%\{*\}}"
       [ -n "$REL_ID" ] || fail "release v${VERSION} returned 200 but its id could not be parsed: $REL_JSON"
+      [ -n "$REL_UPLOAD_URL" ] || fail "release v${VERSION} returned 200 but its upload_url could not be parsed: $REL_JSON"
       info "Tag v${VERSION} and release id ${REL_ID} present on origin"
       ;;
     404)
       warn "No GitHub release for v${VERSION} yet -- creating it (empty, minimal notes)"
       CREATE_BODY=$(node -e 'const v=process.argv[1];process.stdout.write(JSON.stringify({tag_name:"v"+v,name:"v"+v,body:"Release v"+v+". Per-platform binaries are attached as each host build completes."}))' "$VERSION")
       CREATE_JSON=$(curl -sS --fail-with-body -X POST "${GH_AUTH[@]}" -H "Content-Type: application/json" -d "$CREATE_BODY" "${GH_API}/repos/${GH_REPO}/releases" 2>&1) || fail "could not create GitHub release v${VERSION} -- check GITHUB_TOKEN has contents: write (HTTP error above)"
-      REL_ID=$(printf '%s' "$CREATE_JSON" | extract_rel_id)
+      REL_PAIR=$(printf '%s' "$CREATE_JSON" | extract_rel)
+      REL_ID="${REL_PAIR%%|*}"
+      REL_UPLOAD_URL="${REL_PAIR#*|}"
+      REL_UPLOAD_URL="${REL_UPLOAD_URL%\{*\}}"
       [ -n "$REL_ID" ] || fail "created release v${VERSION} but its id could not be parsed: $CREATE_JSON"
+      [ -n "$REL_UPLOAD_URL" ] || fail "created release v${VERSION} but its upload_url could not be parsed: $CREATE_JSON"
       info "Created GitHub release v${VERSION} (id ${REL_ID})"
       ;;
     *)
@@ -293,7 +310,7 @@ if [ "$SUBCOMMAND" = "upload-asset" ]; then
       "${GH_AUTH[@]}" \
       -H "Content-Type: ${mime}" \
       --data-binary "@${file}" \
-      "${GH_API}/repos/${GH_REPO}/releases/${REL_ID}/assets?name=${name}")
+      "${REL_UPLOAD_URL}?name=${name}")
     local code
     code=$(echo "$resp" | tail -n1)
     local body

@@ -405,30 +405,51 @@ run_leg() {
     # build. The remote leg runs from REMOTE_REPO_DIR (passed via
     # REPO_DIR env var) instead of the script's own location.
     #
-    # We use /tmp/ not ~/ because tilde does NOT expand inside the
-    # single-quoted strings in the SSH command below (bash tilde
-    # expansion is positional + unquoted only). Using a /tmp absolute
-    # path is also more discoverable for debugging and avoids per-user
-    # home-dir drift between the orchestrator and the remote host.
+    # The remote side uses /tmp/ (the per-host machines are Linux/Mac, where
+    # /tmp/ is well-defined). The local (orchestrator) staging path must NOT
+    # be a literal /tmp/ -- the orchestrator may run on Windows MSYS where
+    # /tmp/ doesn't resolve, and even on POSIX using a per-leg dir avoids
+    # collision between concurrent legs from the same orchestrator process.
+    # mktemp on MSYS bash hard-codes /tmp/ regardless of -p, so we use
+    # a deterministic path under the staging dir instead. The path is
+    # PER-LEG (includes $plat) so concurrent legs to the same host don't
+    # race on the same file.
     local remote_repo_dir="/tmp/yaw-mcp-build-${VERSION}"
-    local tarball="/tmp/yaw-mcp-build-${VERSION}.tar.gz"
+    local tarball_dir="${LOCAL_CI_ARTIFACTS_DIR:-${STAGE_LOG_DIR:-.}}/_tarballs"
+    mkdir -p "$tarball_dir"
+    local tarball="${tarball_dir}/yaw-mcp-build-${VERSION}-${plat}.tar.gz"
     echo "[$plat] pushing repo snapshot to $ssh_user@$host:$remote_repo_dir" >&2
     # Build the tarball from the orchestrator's local working tree.
     # Exclude everything that gets regenerated on first build (node_modules,
     # bin, build-tmp, dist, dist-release) and the .git dir (we don't
     # need the remote to have the full git history -- the orchestrator's
     # `git rev-parse HEAD` is the source of truth for "what was built").
+    # Also exclude the LOCAL_CI_ARTIFACTS_DIR (the staging dir lives
+    # under the repo, so without this exclusion tar would try to include
+    # its own output file and fail with "file changed as we read it").
+    # NOTE: package-lock.json is INCLUDED -- the per-host leg runs `npm ci`
+    # for a deterministic install, and `npm ci` errors out without the
+    # lockfile.
     (cd "$REPO_ROOT" && tar --exclude='./node_modules' --exclude='./bin' \
         --exclude='./build-tmp' --exclude='./dist' --exclude='./dist-release' \
-        --exclude='./.git' --exclude='./package-lock.json' \
+        --exclude='./.git' \
+        --exclude='./.build-staging' \
         -czf "$tarball" .) || {
       echo "[$plat] failed to build tarball at $tarball" >&2
+      rm -f "$tarball"
       return 1
     }
     # scp the tarball. -P for port on POSIX scp; MSYS-Windows scp on
-    # this box uses -P the same way. Use -o for the ssh options.
+    # this box uses -P the same way. Use -o for the ssh options. We
+    # scp TO a per-leg deterministic remote filename
+    # (`/tmp/yaw-mcp-build-${VERSION}-${plat}.tar.gz`) rather than to a
+    # directory, so the local mktemp'd name doesn't leak across to the
+    # remote side -- the remote untar below references that exact path.
+    # Per-leg names matter when the same host is hit by multiple legs
+    # (linux-x64 + linux-arm64 both target yaw-linux-builder in the
+    # default config).
     scp -i "$ssh_key" -P "$ssh_port" -o IdentitiesOnly=yes \
-      "$tarball" "$ssh_user@$host:/tmp/" || {
+      "$tarball" "$ssh_user@$host:/tmp/yaw-mcp-build-${VERSION}-${plat}.tar.gz" || {
       echo "[$plat] scp of repo tarball failed" >&2
       rm -f "$tarball"
       return 1
@@ -441,8 +462,8 @@ run_leg() {
     # leave stale files).
     $SSH_CMD -i "$ssh_key" -p "$ssh_port" "$ssh_user@$host" \
       "rm -rf '$remote_repo_dir' && mkdir -p '$remote_repo_dir' && \
-       tar -xzf '/tmp/yaw-mcp-build-${VERSION}.tar.gz' -C '$remote_repo_dir' && \
-       rm -f '/tmp/yaw-mcp-build-${VERSION}.tar.gz'" \
+       tar -xzf '/tmp/yaw-mcp-build-${VERSION}-${plat}.tar.gz' -C '$remote_repo_dir' && \
+       rm -f '/tmp/yaw-mcp-build-${VERSION}-${plat}.tar.gz'" \
       || {
       echo "[$plat] remote untar failed" >&2
       rm -f "$tarball"
@@ -461,9 +482,14 @@ run_leg() {
     )
     # `tail -n1` of the captured stdout is the asset path; defensive
     # against a stray trailing newline or info line the leg added.
+    # Note: the asset path is REMOTE (e.g. /tmp/yaw-mcp-build-0.70.2/
+    # dist-release/yaw-mcp-linux-x64) -- a local `[-f $asset]` would
+    # always fail. We don't try to verify the file here; the rsync/scp
+    # below will fail if the remote path doesn't exist, and the post-
+    # leg local `[-f]` check on $plat_dir/<basename> covers the rest.
     asset=$(echo "$asset" | tail -n1 | tr -d '\r')
-    if [ -z "$asset" ] || [ ! -f "$asset" ]; then
-      echo "[$plat] leg did not return a valid asset path (got: '$asset'). See $plat_dir/leg.log" >&2
+    if [ -z "$asset" ]; then
+      echo "[$plat] leg did not return an asset path. See $plat_dir/leg.log" >&2
       return 1
     fi
     # rsync (or scp fallback) the staged binary + .sha256 back to the
