@@ -216,7 +216,17 @@ previous_local_tag() { git tag --sort=-v:refname | grep -v "^v${VERSION}$" | hea
 # the per-host machines don't have it installed, and a fine-grained PAT
 # in env is enough on the workstation.
 if [ "$SUBCOMMAND" = "upload-asset" ]; then
-  : "${GITHUB_TOKEN:?GITHUB_TOKEN env var required for --upload-asset (fine-grained PAT with contents: write on YawLabs/mcp)}"
+  # GitHub-token resolution mirrors step 7's registry-auth fallback: explicit
+  # $GITHUB_TOKEN first, else `gh auth token` on a host with an authed gh CLI.
+  # Preserves the per-host no-gh design (falls through to the hard error below
+  # when neither is available) while making the workstation path seamless.
+  if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+    if GH_FALLBACK_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$GH_FALLBACK_TOKEN" ]; then
+      GITHUB_TOKEN="$GH_FALLBACK_TOKEN"
+      info "--upload-asset auth: using \`gh auth token\` (fallback)"
+    fi
+  fi
+  : "${GITHUB_TOKEN:?GITHUB_TOKEN env var required for --upload-asset (fine-grained PAT with contents: write on YawLabs/mcp). On a host with an authed \`gh\` it is auto-derived; otherwise export it or run \`gh auth login\`.}"
   command -v curl >/dev/null || fail "curl not installed (required for --upload-asset)"
 
   GH_REPO="YawLabs/mcp"
@@ -231,17 +241,36 @@ if [ "$SUBCOMMAND" = "upload-asset" ]; then
     fail "Tag v${VERSION} not found on origin -- run the main release path on the release-driver machine first."
   fi
   # Release existence + capture release id (needed for the asset upload URL).
-  # -f (--fail) surfaces HTTP 401/403/404 in curl's exit code; without it a
-  # bad token / wrong repo / typo'd tag all return a 200 + HTML error body
-  # and the empty-REL_ID check below would just say "release not found"
-  # with no hint about why. --fail-with-body still prints the body so the
-  # operator can see the GitHub error message.
-  REL_JSON=$(curl -sS -f --fail-with-body "${GH_AUTH[@]}" "${GH_API}/repos/${GH_REPO}/releases/tags/v${VERSION}" 2>&1) || fail "could not read release v${VERSION} from GitHub -- check GITHUB_TOKEN, repo, and that the release exists (HTTP error above)"
-  REL_ID=$(echo "$REL_JSON" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).id||""))}catch{process.stdout.write("")}})')
-  if [ -z "$REL_ID" ]; then
-    fail "GitHub release v${VERSION} does not exist -- create it first (curl -X POST ${GH_API}/repos/${GH_REPO}/releases ... or run the main release path on the release-driver machine which creates the empty release as a side effect of --upload-asset init)."
-  fi
-  info "Tag v${VERSION} and release id ${REL_ID} present on origin"
+  # A 404 means the release does not exist yet -- the FIRST --upload-asset for a
+  # version creates it (empty, minimal notes); later calls attach to it. This is
+  # the "creates the empty release as a side effect of --upload-asset init"
+  # behavior that was previously documented but never implemented -- without it
+  # there was a chicken-and-egg (the main path never creates the release, and
+  # this step required it to pre-exist). We capture the HTTP status explicitly
+  # (rather than curl -f) so a 401/403 stays a clear auth failure instead of
+  # being mistaken for "absent -> create".
+  extract_rel_id() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).id||""))}catch{process.stdout.write("")}})'; }
+  REL_RESP=$(curl -sS -w '\n%{http_code}' "${GH_AUTH[@]}" "${GH_API}/repos/${GH_REPO}/releases/tags/v${VERSION}")
+  REL_CODE=$(printf '%s\n' "$REL_RESP" | tail -n1)
+  REL_JSON=$(printf '%s\n' "$REL_RESP" | sed '$d')
+  case "$REL_CODE" in
+    200)
+      REL_ID=$(printf '%s' "$REL_JSON" | extract_rel_id)
+      [ -n "$REL_ID" ] || fail "release v${VERSION} returned 200 but its id could not be parsed: $REL_JSON"
+      info "Tag v${VERSION} and release id ${REL_ID} present on origin"
+      ;;
+    404)
+      warn "No GitHub release for v${VERSION} yet -- creating it (empty, minimal notes)"
+      CREATE_BODY=$(node -e 'const v=process.argv[1];process.stdout.write(JSON.stringify({tag_name:"v"+v,name:"v"+v,body:"Release v"+v+". Per-platform binaries are attached as each host build completes."}))' "$VERSION")
+      CREATE_JSON=$(curl -sS --fail-with-body -X POST "${GH_AUTH[@]}" -H "Content-Type: application/json" -d "$CREATE_BODY" "${GH_API}/repos/${GH_REPO}/releases" 2>&1) || fail "could not create GitHub release v${VERSION} -- check GITHUB_TOKEN has contents: write (HTTP error above)"
+      REL_ID=$(printf '%s' "$CREATE_JSON" | extract_rel_id)
+      [ -n "$REL_ID" ] || fail "created release v${VERSION} but its id could not be parsed: $CREATE_JSON"
+      info "Created GitHub release v${VERSION} (id ${REL_ID})"
+      ;;
+    *)
+      fail "unexpected HTTP ${REL_CODE} reading release v${VERSION} (check GITHUB_TOKEN / repo): ${REL_JSON}"
+      ;;
+  esac
 
   step 2 "Upload asset"
   # Upload via the assets endpoint. -L follows the 422 redirect to a
@@ -361,6 +390,33 @@ if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
   else
     fail "Local main is not at origin/main. Pull first: git pull --ff-only origin main"
   fi
+fi
+
+# --- Guard: refuse a backward or duplicate version, BEFORE the expensive
+# lint/test/build. npm only rejects a below-latest version at publish time
+# (step 6), with a cryptic "Cannot implicitly apply the latest tag" error, after
+# a full build + tag + push has already happened. Catch it here with a clear
+# message. A version that is ALREADY published is a legitimate resume (later
+# steps skip it), so only a not-yet-published version at or below the current
+# npm latest is blocked.
+LATEST_NPM=$(npm view "@yawlabs/mcp" version 2>/dev/null || echo "")
+ALREADY_PUBLISHED=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+if [ -n "$LATEST_NPM" ] && [ "$ALREADY_PUBLISHED" != "$VERSION" ]; then
+  if node -e 'const a=process.argv[1].split(".").map(Number),b=process.argv[2].split(".").map(Number);for(let i=0;i<3;i++){if((a[i]||0)>(b[i]||0))process.exit(0);if((a[i]||0)<(b[i]||0))process.exit(1);}process.exit(1);' "$VERSION" "$LATEST_NPM"; then
+    info "Version ${VERSION} > published latest ${LATEST_NPM}"
+  else
+    fail "Version ${VERSION} is not greater than the published latest ${LATEST_NPM} -- npm will not move the 'latest' tag backward. This is almost always a fat-finger; pick a version > ${LATEST_NPM}."
+  fi
+fi
+
+# --- Guard: on a FRESH bump, a tag v${VERSION} that already exists is a
+# collision (e.g. a fat-finger reusing an old release number, as 0.8.0 did with
+# the 2026-04 tag). Step 5's "tag already exists" branch would silently keep the
+# OLD tag and ship the wrong commit. On a resume the tag legitimately already
+# points at the bump commit, so this only fires on a fresh bump.
+if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+  EXISTING_TAG_COMMIT=$(git rev-list -n1 "v${VERSION}")
+  fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
 fi
 
 if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
