@@ -62,13 +62,18 @@ info() { echo -e "${GREEN}  ✓ $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
-# MCP publisher version + sha256 -- pinned, like any other tool we shell out to.
-# Bump together. mcp-publisher v1.7.9 ships a `login github` device flow that
-# works from a workstation (CI used `login github-oidc`, which is GitHub-Actions
-# only -- the script's workstation path uses the regular flow and reuses the
-# persisted token on subsequent runs).
+# MCP publisher version -- pinned like any other tool we shell out to. The
+# sha256 is fetched at release time from the registry's per-release
+# `registry_<ver>_checksums.txt` (NOT a hard-coded constant), so the script
+# works for any host platform and any future version bump (just update
+# MCP_PUBLISHER_VERSION; the checksums file is the source of truth for both
+# tarball selection and verification).
+#
+# `login github-oidc` is GitHub-Actions-only (requires `id-token: write`), so
+# the script's workstation path uses the regular `login github` OAuth device
+# flow. One-time interactive setup: `mcp-publisher login github` -- the JWT
+# persists at ~/.config/mcp-publisher/token.json for every subsequent run.
 MCP_PUBLISHER_VERSION="v1.7.9"
-MCP_PUBLISHER_SHA256="ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac"
 
 # MINGW64 on Windows ARM64 intermittently segfaults in npm's exit cleanup AFTER
 # a tool has finished and printed its report. The tool's OUTPUT is authoritative:
@@ -407,31 +412,92 @@ fi
 # Download + sha256-verify mcp-publisher to a temp dir. Same pin + digest as
 # the old CI workflow.
 WORKDIR=$(mktemp -d)
-TARBALL="mcp-publisher_linux_amd64.tar.gz"
-info "Downloading mcp-publisher ${MCP_PUBLISHER_VERSION}"
+# mcp-publisher ships a tarball per (platform, arch). Map the current host to
+# the matching tarball name so this works on a Linux, macOS, or Windows
+# release-driver machine -- the old CI workflow was Linux-only.
+#
+# We use node (already a hard dep) rather than `uname` because MINGW64 on
+# Windows ARM64 reports x86_64 via `uname -m` even when the kernel is arm64,
+# which would pick the wrong Windows binary.
+HOST_INFO=$(node -e 'process.stdout.write(process.platform + " " + process.arch)')
+case "$HOST_INFO" in
+  "linux x64")    GOOS=linux;   GOARCH=amd64 ;;
+  "linux arm64")  GOOS=linux;   GOARCH=arm64 ;;
+  "darwin x64")   GOOS=darwin;  GOARCH=amd64 ;;
+  "darwin arm64") GOOS=darwin;  GOARCH=arm64 ;;
+  "win32 x64")    GOOS=windows; GOARCH=amd64 ;;
+  "win32 arm64")  GOOS=windows; GOARCH=arm64 ;;
+  *) fail "Unsupported host for mcp-publisher: $HOST_INFO" ;;
+esac
+TARBALL="mcp-publisher_${GOOS}_${GOARCH}.tar.gz"
+info "Downloading mcp-publisher ${MCP_PUBLISHER_VERSION} (${GOOS}/${GOARCH})"
 curl -fsSL -o "${WORKDIR}/${TARBALL}" \
   "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${TARBALL}"
-(cd "$WORKDIR" && echo "${MCP_PUBLISHER_SHA256}  ${TARBALL}" | sha256sum -c -)
-tar -xzf "${WORKDIR}/${TARBALL}" -C "$WORKDIR" mcp-publisher
-chmod +x "${WORKDIR}/mcp-publisher"
-"${WORKDIR}/mcp-publisher" --help >/dev/null
+
+# Verify against the registry's per-release checksums file. This is the
+# source of truth (signed via the release's attestation) and is the only
+# correct sha256 to check against for the per-platform tarball we picked.
+info "Verifying ${TARBALL} against the release's checksums.txt"
+curl -fsSL -o "${WORKDIR}/checksums.txt" \
+  "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
+(cd "$WORKDIR" && sha256sum -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+
+# Windows tarballs extract to mcp-publisher.exe, POSIX ones to mcp-publisher.
+BIN_NAME="mcp-publisher"
+if [ "$GOOS" = "windows" ]; then BIN_NAME="mcp-publisher.exe"; fi
+tar -xzf "${WORKDIR}/${TARBALL}" -C "$WORKDIR" "$BIN_NAME"
+chmod +x "${WORKDIR}/${BIN_NAME}"
+"${WORKDIR}/${BIN_NAME}" --help >/dev/null
 info "mcp-publisher ${MCP_PUBLISHER_VERSION} ready (sha256 verified)"
 
-# Auth: prefer the persisted token from a prior `login github`; prompt the
-# user to run it interactively the first time. `login github-oidc` is
-# GitHub-Actions-only (requires id-token: write) -- the workstation path is
-# `login github` (OAuth device flow), one-time, token stored at
-# ~/.config/mcp-publisher/token.json.
+# Auth: the registry's `login github` accepts a pre-set GitHub token via
+# `MCP_GITHUB_TOKEN` (or `--token`) and skips the OAuth device flow -- it
+# exchanges the GitHub token for a fresh Registry JWT and writes it to
+# ~/.config/mcp-publisher/token.json. The CI used `login github-oidc` which
+# mints a GitHub Actions OIDC token (requires `id-token: write` -- Actions
+# only); the workstation path uses `MCP_GITHUB_TOKEN=$(gh auth token)`,
+# which is equivalent for our purposes since `gh` here is authed as a
+# YawLabs maintainer with publish rights to the io.github.YawLabs/* namespace.
 TOKEN_FILE="${HOME}/.config/mcp-publisher/token.json"
-if [ ! -f "$TOKEN_FILE" ]; then
-  fail "No mcp-publisher token at ${TOKEN_FILE}. Run once interactively: ${WORKDIR}/mcp-publisher login github"
+TOKEN_REFRESHED=false
+# Return 0 (true in shell `if`) iff the persisted token is missing, unparseable,
+# or expired. Reads the JWT's `exp` claim via node so we don't reinvent the
+# JWT parser in bash.
+TOKEN_STATUS=$(mktemp)
+node -e '
+  const fs = require("fs");
+  const path = process.argv[1];
+  if (!fs.existsSync(path)) { process.stdout.write("missing"); process.exit(0); }
+  let t;
+  try { t = JSON.parse(fs.readFileSync(path, "utf-8")); } catch { process.stdout.write("unparseable"); process.exit(0); }
+  const p = (t.token || "").split(".")[1];
+  if (!p) { process.stdout.write("unparseable"); process.exit(0); }
+  let claims;
+  try { claims = JSON.parse(Buffer.from(p, "base64url").toString()); } catch { process.stdout.write("unparseable"); process.exit(0); }
+  if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now()) {
+    process.stdout.write("valid");
+  } else {
+    process.stdout.write("expired");
+  }
+' "$TOKEN_FILE" > "$TOKEN_STATUS" 2>/dev/null || echo "unparseable" > "$TOKEN_STATUS"
+TOKEN_STATE=$(cat "$TOKEN_STATUS")
+rm -f "$TOKEN_STATUS"
+if [ "$TOKEN_STATE" != "valid" ]; then
+  if ! command -v gh >/dev/null; then
+    fail "mcp-publisher token ${TOKEN_STATE} and \`gh\` is not available to refresh it. Run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+  fi
+  GH_TOKEN_FOR_LOGIN=$(gh auth token 2>/dev/null || echo "")
+  if [ -z "$GH_TOKEN_FOR_LOGIN" ]; then
+    fail "Could not get a GitHub token via \`gh auth token\`. Run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+  fi
+  info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\` (non-interactive: MCP_GITHUB_TOKEN is set)"
+  MCP_GITHUB_TOKEN="$GH_TOKEN_FOR_LOGIN" "${WORKDIR}/${BIN_NAME}" login github
+  TOKEN_REFRESHED=true
+else
+  info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
 fi
-# mcp-publisher reuses the persisted token; the `login` subcommand itself
-# would be interactive, so we don't re-run it. If the registry rejects the
-# token, the next `publish` call will fail with a clear error.
-info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
 
-"${WORKDIR}/mcp-publisher" publish
+"${WORKDIR}/${BIN_NAME}" publish
 info "Published server.json to MCP registry"
 
 step 8 "GitHub release with this platform's binary"
