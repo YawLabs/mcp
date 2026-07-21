@@ -249,10 +249,9 @@ if (subcommand === "compliance") {
   yaw-mcp — one install, every MCP server, managed from the cloud.
 
   Quickstart:
-    1. Install yaw-mcp     yaw-mcp install claude-code
-    2. Verify setup     yaw-mcp doctor
-    3. Yaw Team (optional)  yaw-mcp login --key <license-key>
-                            https://yaw.sh/mcp/dashboard/settings/tokens
+    1. Install yaw-mcp      yaw-mcp install claude-code
+    2. Verify setup         yaw-mcp doctor
+    3. Add a server         yaw-mcp add <slug>   (browse https://yaw.sh/mcp/explore)
 
   Setup (connect a client to yaw-mcp):
     install <client>         Connect one MCP client to yaw-mcp. This wires the
@@ -294,18 +293,11 @@ if (subcommand === "compliance") {
                              fish, or powershell. Redirect to your
                              completions directory to install.
 
-  Account / sync (Yaw Team):
-    login                    Authenticate this machine with a Yaw MCP account.
-                             --key <license> to pass the key inline.
-    logout                   Sign this machine out of the account.
-    sync <push|pull|status>  Replicate your local bundles.json to/from the
-                             account store (env values stripped on push).
-    secrets <action>         Manage synced secret VALUES: set, get, list,
-                             remove, lock, push, pull.
-    stats                    Show your account usage statistics
-                             (--limit, --days, --json).
-    token                    Print this machine's session token for a trusted
-                             local app (e.g. Vew Meetings). --json for fields.
+  Secrets:
+    secrets <action>         Manage the local encrypted secret vault: set,
+                             get, list, remove, lock, rotate, audit.
+                             Reference a stored value from any server's env
+                             as \${secret:NAME}.
 
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP
@@ -318,10 +310,12 @@ if (subcommand === "compliance") {
     help, --help, -h         Show this help.
     --version, -V            Print yaw-mcp version.
 
-  Running \`yaw-mcp\` with no subcommand starts the MCP server (requires a
-  resolved token). Most read-only subcommands accept \`--json\` for
-  machine-readable output. Run \`yaw-mcp <subcommand> --help\` for per-
-  subcommand flag details.
+  Running \`yaw-mcp\` with no subcommand starts the MCP server. No token is
+  required: without one it runs in local mode, loading servers from
+  ~/.yaw-mcp/bundles.json; with YAW_MCP_TOKEN (or a config file) it also
+  pulls your account's servers. Most read-only subcommands accept
+  \`--json\` for machine-readable output. Run \`yaw-mcp <subcommand> --help\`
+  for per-subcommand flag details.
 
   Environment variables:
     YAW_MCP_TOKEN                 API token (overrides every config file).
@@ -366,13 +360,18 @@ if (subcommand === "compliance") {
   Source: https://github.com/YawLabs/mcp
 
 `);
-  process.exit(0);
+  // Set exitCode instead of process.exit(0): this help body is several KB
+  // and a synchronous exit can TRUNCATE it when stdout is a slow pipe
+  // (`yaw-mcp --help | less`, or a terminal capturing to a file). Same
+  // reasoning as dispatch() above -- nothing follows this branch, so
+  // returning lets Node drain the write and exit 0 on its own.
+  process.exitCode = 0;
 } else if (subcommand === "--version" || subcommand === "-V") {
   // __VERSION__ is substituted at build time by tsup (see tsup.config.ts);
   // when running unbundled from source the declare leaves it as undefined,
   // so guard with typeof and fall back to "dev".
   process.stdout.write(`yaw-mcp ${typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev"}\n`);
-  process.exit(0);
+  process.exitCode = 0;
 } else if (subcommand && !subcommand.startsWith("-")) {
   // Bare positional first arg that isn't a known subcommand — almost
   // always a typo. Surface a "did you mean?" instead of falling through
@@ -384,21 +383,37 @@ if (subcommand === "compliance") {
       : " Run `yaw-mcp --help` for the list of subcommands.";
   process.stderr.write(`yaw-mcp: unknown subcommand "${subcommand}".${hint}\n`);
   process.exit(2);
-} else if (subcommand && suggestFlag(subcommand).length > 0) {
+} else {
   // Long-form leading-dash near-miss of a known flag alias (e.g.
   // `--versionn`, `--hepl`). Without this it would fall through to
   // runServer and hang as a stdio MCP server with no diagnostic.
   // suggestFlag returns [] for short single-letter flags and for genuine
   // long server flags with no close match, so those still pass through to
   // runServer below — this only catches typos of the dispatcher's own flags.
-  const suggestions = suggestFlag(subcommand);
-  process.stderr.write(`yaw-mcp: unknown flag "${subcommand}". Did you mean: ${suggestions.join(", ")}?\n`);
-  process.exit(2);
-} else {
-  runServer();
+  // Computed ONCE here (it used to run in both the branch condition and
+  // the body) and reused for the message.
+  const flagSuggestions = subcommand ? suggestFlag(subcommand) : [];
+  if (flagSuggestions.length > 0) {
+    process.stderr.write(`yaw-mcp: unknown flag "${subcommand}". Did you mean: ${flagSuggestions.join(", ")}?\n`);
+    process.exit(2);
+  } else {
+    runServer();
+  }
 }
 
 async function runServer(): Promise<void> {
+  // Last-resort net for stray async failures. Without this a single
+  // unhandled rejection (e.g. an orphaned upstream connect that rejects
+  // late) can tear down the stdio transport with no trace. Log and keep
+  // running rather than dying silently.
+  //
+  // Registered BEFORE the first await below: loadYawMcpConfig() reads and
+  // parses config files, so a malformed config or a permissions error can
+  // reject during startup -- with the handlers installed afterwards that
+  // rejection had no net at all.
+  process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
+  process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
+
   // Resolve token + apiBase via the unified loader: env > local > global
   // for token, env > local > project > global > default for apiBase.
   // Missing token is NOT fatal -- yaw-mcp falls through to local mode
@@ -441,13 +456,6 @@ async function runServer(): Promise<void> {
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
-
-  // Last-resort net for stray async failures. Without this a single
-  // unhandled rejection (e.g. an orphaned upstream connect that rejects
-  // late) can tear down the stdio transport with no trace. Log and keep
-  // running rather than dying silently.
-  process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
-  process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
 
   server.start().catch((err: unknown) => {
     if (err instanceof ConfigError && err.fatal) {

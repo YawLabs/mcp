@@ -155,7 +155,49 @@ export function isAutoLoadEnabled(): boolean {
   return raw === "1" || raw.toLowerCase() === "true";
 }
 
-function resolveNamespaces(args: Record<string, unknown>): string[] {
+// Auto-warm gate for discover(context): when one candidate clearly wins,
+// activate it in the same call instead of making the LLM follow up with an
+// explicit activate. Default ON; set YAW_MCP_AUTO_ACTIVATE=0 to disable.
+// Re-read on every call (same discipline as resolveMinCompliance /
+// isAutoLoadEnabled) so a mid-session env change -- or a test stubbing the
+// env between cases -- takes effect without restarting the process.
+export function isAutoActivateEnabled(): boolean {
+  const raw = process.env.YAW_MCP_AUTO_ACTIVATE;
+  if (raw === undefined || raw === "") return true;
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
+// Marker phrases that identify an INTERNAL routing/cache fault rather than
+// a genuine upstream failure. handleExec substring-matches an errored
+// step's text against these to decide whether to sink the namespace's
+// reliability score, so the phrases MUST stay byte-identical between the
+// message that produces them and the check that reads them -- hence the
+// shared constants instead of two copies of a string literal.
+// TOOL_GONE / RECONNECT_FAILED are emitted by handleToolCall below;
+// DISCONNECTED / UNKNOWN_TOOL are emitted by routeToolCall in proxy.ts
+// (see the guard test in tests/server.test.ts that pins those two).
+export const ROUTING_FAULT_TOOL_GONE = "no longer available";
+export const ROUTING_FAULT_DISCONNECTED = "no longer connected";
+export const ROUTING_FAULT_RECONNECT_FAILED = "auto-reconnect failed";
+export const ROUTING_FAULT_UNKNOWN_TOOL = "Unknown tool:";
+export const ROUTING_FAULT_MARKERS: readonly string[] = [
+  ROUTING_FAULT_TOOL_GONE,
+  ROUTING_FAULT_DISCONNECTED,
+  ROUTING_FAULT_RECONNECT_FAILED,
+  ROUTING_FAULT_UNKNOWN_TOOL,
+];
+
+/** True when an error text came from yaw-mcp's own routing layer (stale
+ *  toolCache, dropped connection, failed auto-reconnect, unknown tool)
+ *  rather than from the upstream server itself. */
+export function isRoutingFaultText(text: string): boolean {
+  return ROUTING_FAULT_MARKERS.some((marker) => text.includes(marker));
+}
+
+/** Namespaces from an activate/deactivate meta-tool args bag. `servers`
+ *  (array) wins over the single `server` form; empty when neither is
+ *  usable. Exported so tests exercise the real resolver, not a copy. */
+export function resolveNamespaces(args: Record<string, unknown>): string[] {
   if (Array.isArray(args.servers) && args.servers.length > 0) {
     return args.servers as string[];
   }
@@ -165,7 +207,20 @@ function resolveNamespaces(args: Record<string, unknown>): string[] {
   return [];
 }
 
-function envEqual(a?: Record<string, string>, b?: Record<string, string>): boolean {
+/** Derive a safe namespace from an imported mcpServers key: lowercase,
+ *  non-alphanumerics to underscore, trimmed of leading/trailing
+ *  underscores, capped at 30 chars. Can return "" (all-special-char key),
+ *  and two different keys can collide -- handleImport reports both. */
+export function sanitizeNamespace(key: string): string {
+  return key
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 30);
+}
+
+/** Shallow value-equality for two env maps (undefined == undefined). */
+export function envEqual(a?: Record<string, string>, b?: Record<string, string>): boolean {
   if (!a && !b) return true;
   if (!a || !b) return false;
   const keysA = Object.keys(a);
@@ -867,13 +922,20 @@ export class ConnectServer {
     this.guideNudgeFired = true;
     const sources = [this.guides.user?.path, this.guides.project?.path].filter(Boolean).join(", ");
     const text = `\n\n[yaw-mcp] Tip: read the \`yaw-mcp://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
-    const last = result.content[result.content.length - 1];
+    // Clone before appending. Some callers hand us a result that is ALSO
+    // held elsewhere -- buildDiscoverOutput stores its result in
+    // discoverCache -- so mutating content in place would bake this
+    // once-per-session hint into the cached body and replay it on every
+    // cache hit for the rest of the TTL. Copy the array (and the one
+    // element we rewrite) so the cached object is untouched.
+    const content = [...result.content];
+    const last = content[content.length - 1];
     if (last && last.type === "text") {
-      last.text = `${last.text}${text}`;
+      content[content.length - 1] = { ...last, text: `${last.text}${text}` };
     } else {
-      result.content.push({ type: "text", text: text.trimStart() });
+      content.push({ type: "text", text: text.trimStart() });
     }
-    return result;
+    return { ...result, content };
   }
 
   private async handleToolCall(
@@ -1063,7 +1125,7 @@ export class ConnectServer {
           content: [
             {
               type: "text",
-              text: `Tool "${name}" is no longer available after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
+              text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
             },
           ],
           isError: true,
@@ -1125,7 +1187,7 @@ export class ConnectServer {
                   content: [
                     {
                       type: "text",
-                      text: `Tool "${name}" is no longer available after reconnecting "${serverConfig.namespace}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
+                      text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after reconnecting "${serverConfig.namespace}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
                     },
                   ],
                   isError: true,
@@ -1150,7 +1212,7 @@ export class ConnectServer {
               content: [
                 {
                   type: "text",
-                  text: `Server "${ns}" disconnected and auto-reconnect failed: ${lastErrMsg}. Use mcp_connect_activate with server "${ns}" to reload it manually.`,
+                  text: `Server "${ns}" disconnected and ${ROUTING_FAULT_RECONNECT_FAILED}: ${lastErrMsg}. Use mcp_connect_activate with server "${ns}" to reload it manually.`,
                 },
               ],
               isError: true,
@@ -1390,11 +1452,10 @@ export class ConnectServer {
   // Auto-warm confidence gate — applied to discover(context) so a single
   // clearly-winning server gets activated without the LLM needing to
   // follow up with a separate activate call. Default ON; flip off with
-  // YAW_MCP_AUTO_ACTIVATE=0 if it causes surprise.
-  private static readonly AUTO_ACTIVATE_ENABLED = (() => {
-    const raw = process.env.YAW_MCP_AUTO_ACTIVATE;
-    return raw === undefined || raw === "" || raw === "1" || raw.toLowerCase() === "true";
-  })();
+  // YAW_MCP_AUTO_ACTIVATE=0 if it causes surprise. The env read lives in
+  // the module-level isAutoActivateEnabled() (re-read per call) rather
+  // than a static initializer, which would latch the value at import.
+  //
   // Top score must clear this floor AND the gap over the runner-up must
   // be convincing before we auto-activate. Values are scale-dependent --
   // BM25 scores are unbounded positive numbers, rerank cosines are in
@@ -1413,14 +1474,14 @@ export class ConnectServer {
   private static readonly MARKETPLACE_HINT_THRESHOLD = 5;
 
   private handleDiscover(context?: string): { content: Array<{ type: string; text: string }> } {
-    return this.buildDiscoverOutput(context, /* alreadyWarmed */ false);
+    return this.buildDiscoverOutput(context, /* warmedNamespace */ null);
   }
 
   private async handleDiscoverWithAutoWarm(
     context?: string,
     progress?: ProgressReporter,
   ): Promise<{ content: Array<{ type: string; text: string }> }> {
-    if (!context || !ConnectServer.AUTO_ACTIVATE_ENABLED) return this.handleDiscover(context);
+    if (!context || !isAutoActivateEnabled()) return this.handleDiscover(context);
 
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) return this.handleDiscover(context);
@@ -1461,36 +1522,40 @@ export class ConnectServer {
       log("info", "Auto-warmed top-ranked server on discover", { namespace: top.namespace, score: top.score });
     }
 
-    return this.buildDiscoverOutput(context, result.ok);
+    // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
+    // banner below must name the server twoStageRank picked, and the
+    // list it renders is sorted by BM25 alone (no rerank), so its head
+    // can be a different namespace entirely.
+    return this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
   }
 
-  private discoverCacheKey(context: string | undefined, autoWarmed: boolean): string {
+  private discoverCacheKey(context: string | undefined, warmedNamespace: string | null): string {
     const activeNamespaces = [...this.connections.entries()]
       .filter(([, c]) => c.status === "connected")
       .map(([ns]) => ns)
       .sort()
       .join(",");
-    return `${this.configVersion ?? ""}|${context ?? ""}|${autoWarmed ? "1" : "0"}|${activeNamespaces}`;
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}`;
   }
 
   private buildDiscoverOutput(
     context: string | undefined,
-    autoWarmed: boolean,
+    warmedNamespace: string | null,
   ): { content: Array<{ type: string; text: string }> } {
-    const key = this.discoverCacheKey(context, autoWarmed);
+    const key = this.discoverCacheKey(context, warmedNamespace);
     const now = Date.now();
     const cached = this.discoverCache;
     if (cached && cached.key === key && cached.expires > now) {
       return cached.result;
     }
-    const result = this.buildDiscoverOutputImpl(context, autoWarmed);
+    const result = this.buildDiscoverOutputImpl(context, warmedNamespace);
     this.discoverCache = { key, result, expires: now + ConnectServer.DISCOVER_CACHE_TTL_MS };
     return result;
   }
 
   private buildDiscoverOutputImpl(
     context: string | undefined,
-    autoWarmed: boolean,
+    warmedNamespace: string | null,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
       return {
@@ -1528,8 +1593,8 @@ export class ConnectServer {
     }
 
     const lines: string[] = [context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n"];
-    if (autoWarmed && sorted.length > 0) {
-      lines.push(`Auto-loaded "${sorted[0].namespace}" — top match for your query.\n`);
+    if (warmedNamespace) {
+      lines.push(`Auto-loaded "${warmedNamespace}" — top match for your query.\n`);
     }
 
     // Compliance filter banner. When YAW_MCP_MIN_COMPLIANCE is active, the
@@ -2319,15 +2384,27 @@ export class ConnectServer {
     // error rates shrink the score so dispatch prefers working servers
     // when multiple match. Never boosts above raw score — all else
     // equal, prefer the one that works.
+    // hasRerank rides along so the re-sort below can keep the two score
+    // scales apart. Without it a BM25 score (unbounded positive) could
+    // leapfrog a semantic-rerank winner (cosine in [0, 1]) purely on
+    // magnitude, silently undoing the reranked-first guarantee
+    // twoStageRank establishes.
     const ranked = rankedRaw
       .map((r) => ({
         namespace: r.namespace,
+        hasRerank: r.hasRerank,
         score:
           r.score *
           healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)) *
           this.learning.boostFactor(r.namespace),
       }))
-      .sort((a, b) => b.score - a.score);
+      .sort((a, b) => {
+        // Same rule as twoStageRank: reranked entries stay ahead of
+        // non-reranked ones; the health/learning penalty only reorders
+        // WITHIN a scale group, never across.
+        if (a.hasRerank !== b.hasRerank) return a.hasRerank ? -1 : 1;
+        return b.score - a.score;
+      });
 
     if (ranked.length === 0) {
       return {
@@ -2810,11 +2887,7 @@ export class ConnectServer {
         // Skip ourselves
         if (key === "yaw-mcp" || key === "mcp.hosting" || key === "mcp-connect") continue;
 
-        const namespace = key
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, "_")
-          .replace(/^_+|_+$/g, "")
-          .slice(0, 30);
+        const namespace = sanitizeNamespace(key);
         if (!namespace) continue;
 
         const entry: (typeof servers)[0] = {
@@ -3199,12 +3272,19 @@ export class ConnectServer {
     }
 
     if (rows.length === 0) {
-      const scope = serverArg ? `Server "${serverArg}"` : "No installed server";
+      // Both scopes must read as a NEGATION. The single-server phrasing
+      // needs its own verb ("does not reference") -- reusing the
+      // all-servers sentence with a "Server \"gh\"" prefix produced
+      // 'Server "gh" references any ${secret:NAME} vault values.', which
+      // asserts the opposite of what happened.
+      const sentence = serverArg
+        ? `Server "${serverArg}" does not reference any \${secret:NAME} vault values.`
+        : "No installed server references any ${secret:NAME} vault values.";
       return {
         content: [
           {
             type: "text",
-            text: `${scope} references any \${secret:NAME} vault values. Add a reference in a server's env (e.g. GITHUB_TOKEN=\${secret:gh}) and store the value with \`yaw-mcp secrets set <name>\`.`,
+            text: `${sentence} Add a reference in a server's env (e.g. GITHUB_TOKEN=\${secret:gh}) and store the value with \`yaw-mcp secrets set <name>\`.`,
           },
         ],
       };
@@ -3555,7 +3635,14 @@ export class ConnectServer {
       // and attribute credit per step here, using the $ref dependency graph
       // so a step that fails on bad INPUT it consumed from an upstream step
       // shares the blame rather than sinking the upstream alone.
-      const stepNs = this.toolRoutes.get(step.tool)?.namespace;
+      // Snapshot the route map for THIS step before the lookup, and use
+      // the snapshot for the call's blame attribution -- the same
+      // discipline handleToolCall documents at its entry. Per-step (not
+      // per-exec): an earlier step can legitimately rebuild routes by
+      // activating a deferred server, so the next step must re-snapshot
+      // rather than reuse a map captured before the pipeline started.
+      const routes = this.toolRoutes;
+      const stepNs = routes.get(step.tool)?.namespace;
       if (stepNs) stepNamespaces.set(key, stepNs);
       const stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, { deferLearning: true });
 
@@ -3564,11 +3651,7 @@ export class ConnectServer {
         // Internal routing/cache faults (stale toolCache, dropped connection,
         // failed auto-reconnect, unknown tool) are NOT the upstream's failure,
         // so don't penalize the namespace's reliability for them.
-        const routingFault =
-          errText.includes("no longer available") ||
-          errText.includes("no longer connected") ||
-          errText.includes("auto-reconnect failed") ||
-          errText.includes("Unknown tool:");
+        const routingFault = isRoutingFaultText(errText);
         if (stepNs && !routingFault) {
           // Invalid-params is recognized either by the transport-level code
           // tag ("[code=-32602]") OR by classifyError on a structured isError
