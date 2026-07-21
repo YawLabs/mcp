@@ -1,6 +1,5 @@
 import { request } from "undici";
 import { log } from "./logger.js";
-import { getSession } from "./team-sync.js";
 
 // Stage-2 rerank client. BM25 narrows the field locally; this service
 // call asks the rerank backend to embed the intent (Voyage voyage-3-
@@ -69,72 +68,13 @@ export async function rerank(intent: string, candidateIds?: string[], limit?: nu
   if (candidateIds && candidateIds.length > 0) payload.candidateIds = candidateIds;
   if (typeof limit === "number" && limit > 0) payload.limit = limit;
 
-  // Path A: try the yaw.sh team-rerank endpoint first when a team
-  // session exists. getSession() is cheap after the first load
-  // (module-scoped cache in team-sync.ts).
-  const session = await getSession().catch(() => null);
-  if (session) {
-    const result = await callTeamRerank(payload);
-    if (result !== null) return result;
-    // null from Path A means "Voyage unavailable" or transient
-    // failure. Don't try Path B in that case -- a Pro user signed
-    // in with the team cookie shouldn't be reaching back at the
-    // legacy MCPH_TOKEN endpoint.
-    return null;
-  }
-
-  // Path B: legacy MCPH_TOKEN-authed endpoint. Used only by account-
-  // mode users on the legacy mcp.hosting backend.
+  // The yaw.sh team-rerank path was removed with the Yaw Team surface
+  // (2026-07-21). The legacy MCPH_TOKEN-authed endpoint is now the only
+  // transport; without it the caller falls back to BM25.
   if (!legacyApiUrl || !legacyToken) return null;
   return callLegacyRerank(payload);
 }
 
-async function callTeamRerank(payload: {
-  intent: string;
-  candidateIds?: string[];
-  limit?: number;
-}): Promise<RerankResult[] | null> {
-  const base = (process.env.YAW_MCP_TEAM_BASE_URL?.replace(/\/$/, "") || DEFAULT_TEAM_BASE_URL).replace(/\/$/, "");
-  // Read the cookie from the team-sync session state. Best-effort: if
-  // the file isn't there or the cookie isn't loaded, fall through to
-  // null (caller falls back to BM25). We import team-sync's internal
-  // path resolver to avoid a separate read-state ceremony.
-  const cookie = await readTeamCookie();
-  if (!cookie) return null;
-  try {
-    const res = await request(`${base}/api/team/rerank`, {
-      method: "POST",
-      headers: {
-        Cookie: `yaw_team=${cookie}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      headersTimeout: RERANK_TIMEOUT_MS,
-      bodyTimeout: RERANK_TIMEOUT_MS,
-    });
-    if (res.statusCode === 503) {
-      await res.body.text().catch(() => {});
-      return null; // rerank unavailable on backend (no Voyage key)
-    }
-    if (res.statusCode === 401) {
-      await res.body.text().catch(() => {});
-      log("debug", "team-rerank 401; session likely expired", {});
-      return null;
-    }
-    if (res.statusCode !== 200) {
-      await res.body.text().catch(() => {});
-      log("warn", "team-rerank request failed", { status: res.statusCode });
-      return null;
-    }
-    const body = (await res.body.json()) as { results?: RerankResult[] };
-    if (!body || !Array.isArray(body.results)) return null;
-    if (body.results.length === 0) return null;
-    return body.results;
-  } catch (err: unknown) {
-    log("debug", "team-rerank request errored", { error: err instanceof Error ? err.message : String(err) });
-    return null;
-  }
-}
 
 async function callLegacyRerank(payload: {
   intent: string;
@@ -171,28 +111,3 @@ async function callLegacyRerank(payload: {
   }
 }
 
-/** Read the yaw_team cookie value from the team-sync in-memory cache.
- *  Returns null when no session exists.
- *
- *  Previously this called getSession() to warm the cache then issued a
- *  second readFile() of the session-state JSON to extract the cookie
- *  field (which getSession() strips before returning TeamSession).  That
- *  caused an unnecessary extra disk read on every rerank call.
- *
- *  The caller (rerank()) has already called getSession() to decide whether
- *  Path A should run.  By the time readTeamCookie() is invoked, the
- *  module-scoped cachedState slot in team-sync is already warm.
- *  getCachedCookie() reads that slot synchronously -- no second getSession()
- *  call, no second readFile(). */
-async function readTeamCookie(): Promise<string | null> {
-  // Lazy-import to avoid a hard dep cycle (team-sync imports from
-  // atomic-write, logger, paths -- not rerank).
-  const teamSync = await import("./team-sync.js");
-  // The caller (rerank()) already called getSession() which populated the
-  // team-sync module-scoped cache.  getCachedCookie() reads that same slot
-  // synchronously -- no extra disk I/O.
-  // Zero-arg call is intentional: getCachedCookie() reads the process-global
-  // in-memory cache; the `home` param used by getSession() for the initial
-  // disk read is irrelevant here -- the cache is already warm.
-  return teamSync.getCachedCookie();
-}

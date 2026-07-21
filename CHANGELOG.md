@@ -2,6 +2,26 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.71.0 -- remove the Yaw Team surface (BREAKING)
+
+The Yaw Team tier is fully retired. The yaw.sh `/api/team/*` and `/api/admin/*` endpoints have been deleted, so every command that spoke to them is removed rather than left to fail at runtime.
+
+**Breaking -- these subcommands no longer exist:**
+
+- `yaw-mcp login` / `logout` / `token` -- team session auth.
+- `yaw-mcp sync` (`push` / `pull` / `status`) -- replicated `bundles.json` via the team resource. The local file was the payload; the transport was team, so there is nothing left to keep.
+- `yaw-mcp stats` -- read team-analytics; it had no local data source.
+- `yaw-mcp set-active` -- wrote the shared team resource.
+- `yaw-mcp secrets push` / `secrets pull`, and the `--force` / `--replace` / `--push` flags. These are now **rejected** with a usage error rather than accepted as no-ops -- a flag that parses and does nothing reads as supported.
+
+**Not affected -- these are local and keep working:**
+
+- **The secrets vault.** `secrets set` / `get` / `list` / `remove` / `lock` / `rotate` / `audit` are entirely local and unchanged. `rotate` still re-encrypts every entry under a new passphrase; only its optional `--push` step is gone, making it a purely local operation.
+- **Reranking.** `rerank.ts` had two transports. The team path is removed; the legacy `MCPH_TOKEN` endpoint is retained, so account-mode reranking works as before and still falls back to BM25 when the backend is unavailable.
+- **Analytics.** Only the team tee-out is gone. Local buffering, flushing, and the connect/dispatch endpoints are unchanged.
+
+`src/team-sync.ts` is deleted in full.
+
 ## 0.70.3 -- drop the SEA binary track; npm install is the install story
 
 The per-platform Node SEA (Single Executable Application) build track is removed. Going forward, install via `npm install -g @yawlabs/mcp` (or `npx -y @yawlabs/mcp`). See `docs/v0.70.3-binary-track-decision.md` for the full rationale; short version: the SEA track required a dedicated build host per platform (Node SEA cannot cross-compile), the GCP and AWS path for win32-x64 + linux-arm64 hit a 5-hour OpenSSH bootstrap and a `CPUS_ALL_REGIONS` quota lockout, and the npm install path covers every install target we ship to with one build.

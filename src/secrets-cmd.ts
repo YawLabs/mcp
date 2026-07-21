@@ -29,7 +29,6 @@ import {
   type VaultFile,
   vaultPath,
 } from "./secrets-vault.js";
-import { getResource, getSession, putResource, TeamSyncAuthError, TeamSyncStaleVersionError } from "./team-sync.js";
 
 export const SECRETS_USAGE = `Usage: yaw-mcp secrets <action> [args]
 
@@ -47,22 +46,13 @@ Actions:
   list                    Show vault entry names (values stay encrypted).
   remove <name>           Delete an entry.
   lock                    Clear the in-process passphrase cache.
-  push                    Upload the vault (encrypted; server gets only
-                          ciphertext) to the mcp_secrets team-resource.
-                          Requires \`yaw-mcp login\` first.
-  pull                    Download the vault from mcp_secrets and write
-                          it locally. Overwrites local vault. Requires
-                          \`yaw-mcp login\` first. Refuses when the local
-                          vault has a different salt (different passphrase
-                          lineage) unless --force is passed.
   rotate                  Re-encrypt every entry under a NEW passphrase
                           (fresh salt + derived key). Re-wraps the
                           ENCRYPTION, NOT the underlying token values -- a
                           leaked token is still leaked; rotate it at its
                           source. Reads the current passphrase, then the
                           new one (env YAW_MCP_VAULT_PASSPHRASE_NEW or a
-                          confirm-twice TTY prompt). Pass --push to also
-                          upload the re-encrypted blob to mcp_secrets.
+                          confirm-twice TTY prompt).
   audit [--secret NAME] [--server NS]
                           Show the local secret-resolution audit trail
                           (~/.yaw-mcp/secrets-audit.log): which secret
@@ -74,13 +64,6 @@ Flags:
   --value <v>             Inline secret value (set only). Beware shell
                           history -- prefer the default stdin prompt.
   --stdin                 Read the secret from raw stdin (set only).
-  --force                 (pull only) Overwrite even when the local vault
-                          salt differs from the remote. Back up first.
-  --replace               (push only) Overwrite even when the remote vault
-                          salt differs from the local (different passphrase
-                          lineage). Coordinate with your team first.
-  --push                  (rotate only) After re-encrypting, push the new
-                          blob to mcp_secrets (requires a login session).
   --secret <name>         (audit only) Filter to one secret name.
   --server <ns>           (audit only) Filter to one server namespace.
 
@@ -93,7 +76,7 @@ Passphrase:
   confirm-twice prompt).`;
 
 export interface SecretsCommandOptions {
-  action?: "set" | "get" | "list" | "remove" | "lock" | "push" | "pull" | "rotate" | "audit";
+  action?: "set" | "get" | "list" | "remove" | "lock" | "rotate" | "audit";
   name?: string;
   value?: string;
   fromStdin?: boolean;
@@ -137,18 +120,6 @@ export function parseSecretsArgs(
       opts.fromStdin = true;
       continue;
     }
-    if (a === "--force") {
-      opts.force = true;
-      continue;
-    }
-    if (a === "--replace") {
-      opts.replace = true;
-      continue;
-    }
-    if (a === "--push") {
-      opts.push = true;
-      continue;
-    }
     if (a === "--value") {
       const v = argv[++i];
       // Reject a following flag (e.g. `secrets set NAME --value --json`)
@@ -187,8 +158,6 @@ export function parseSecretsArgs(
         a !== "list" &&
         a !== "remove" &&
         a !== "lock" &&
-        a !== "push" &&
-        a !== "pull" &&
         a !== "rotate" &&
         a !== "audit"
       ) {
@@ -415,12 +384,6 @@ export async function runSecrets(
   // derives the key. So sync push/pull don't need the passphrase
   // either; they just shuffle the encrypted blob between local and
   // remote.
-  if (opts.action === "push") {
-    return await runSecretsPush(opts, io);
-  }
-  if (opts.action === "pull") {
-    return await runSecretsPull(opts, io);
-  }
   if (opts.action === "rotate") {
     return await runSecretsRotate(opts, io);
   }
@@ -563,156 +526,7 @@ export async function runSecrets(
 
 const MCP_SECRETS_RESOURCE = "mcp_secrets";
 
-async function runSecretsPush(
-  opts: SecretsCommandOptions,
-  io: { out: (s: string) => void; err: (s: string) => void },
-): Promise<SecretsCommandResult> {
-  const home = opts.home ?? homedir();
-  const path = vaultPath(home);
-  const session = await getSession({ home, baseUrl: opts.baseUrl });
-  if (!session) {
-    const msg = "Not signed in. Run `yaw-mcp login --key <license-key>` first.";
-    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-    else io.err(`yaw-mcp secrets push: ${msg}\n`);
-    return { exitCode: 1 };
-  }
-  const loadedPush = await safeLoadVault(path, io, opts.json, "push");
-  if (!loadedPush.ok) return loadedPush.result;
-  const vault = loadedPush.vault;
-  if (!vault) {
-    const msg = `No local vault at ${path} to push. Run \`yaw-mcp secrets set <name>\` first.`;
-    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-    else io.err(`yaw-mcp secrets push: ${msg}\n`);
-    return { exitCode: 1 };
-  }
-  try {
-    // Learn current remote version so the optimistic-concurrency PUT
-    // is accepted. One extra round-trip per push -- acceptable for a
-    // manual command.
-    const remote = await getResource<VaultFile>(MCP_SECRETS_RESOURCE, { home, baseUrl: opts.baseUrl });
-    // Salt-conflict guard: if the remote already has a vault under a
-    // DIFFERENT salt (different passphrase lineage), refuse to push --
-    // pushing would replace the remote's entries with ones the rest of
-    // the team can't decrypt. The user must explicitly opt into the
-    // replacement with --replace (after they have synchronised the new
-    // passphrase out-of-band), or pull and reconcile.
-    const remoteSalt = remote.data?.salt;
-    if (typeof remoteSalt === "string" && remoteSalt.length > 0 && remoteSalt !== vault.salt && !opts.replace) {
-      const msg = "remote vault uses a different passphrase; use `pull` or `push --replace`";
-      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-      else io.err(`yaw-mcp secrets push: ${msg}\n`);
-      return { exitCode: 1 };
-    }
-    const result = await putResource<VaultFile>(MCP_SECRETS_RESOURCE, remote.version, vault, {
-      home,
-      baseUrl: opts.baseUrl,
-    });
-    const count = Object.keys(vault.entries).length;
-    if (opts.json) {
-      io.out(`${JSON.stringify({ ok: true, secret_count: count, new_version: result.version }, null, 2)}\n`);
-    } else {
-      io.out(
-        `Pushed ${count} secret${count === 1 ? "" : "s"} (encrypted, server-opaque) -> mcp_secrets v${result.version}.\n`,
-      );
-    }
-    return { exitCode: 0 };
-  } catch (err) {
-    if (err instanceof TeamSyncStaleVersionError) {
-      const hint = `Remote vault is at v${err.currentVersion}; pull and reconcile before pushing.`;
-      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: hint, currentVersion: err.currentVersion })}\n`);
-      else io.err(`yaw-mcp secrets push: ${hint}\n`);
-      return { exitCode: 1 };
-    }
-    if (err instanceof TeamSyncAuthError) {
-      const msg = "Session expired. Run `yaw-mcp login --key <license-key>` again.";
-      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-      else io.err(`yaw-mcp secrets push: ${msg}\n`);
-      return { exitCode: 1 };
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: message })}\n`);
-    else io.err(`yaw-mcp secrets push: ${message}\n`);
-    return { exitCode: 1 };
-  }
-}
 
-async function runSecretsPull(
-  opts: SecretsCommandOptions,
-  io: { out: (s: string) => void; err: (s: string) => void },
-): Promise<SecretsCommandResult> {
-  const home = opts.home ?? homedir();
-  const path = vaultPath(home);
-  const session = await getSession({ home, baseUrl: opts.baseUrl });
-  if (!session) {
-    const msg = "Not signed in. Run `yaw-mcp login --key <license-key>` first.";
-    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-    else io.err(`yaw-mcp secrets pull: ${msg}\n`);
-    return { exitCode: 1 };
-  }
-  try {
-    const remote = await getResource<VaultFile>(MCP_SECRETS_RESOURCE, { home, baseUrl: opts.baseUrl });
-    // Treat remote as empty when: no data, no salt, OR entries present but
-    // empty ({}) with no salt -- an entries:{} + missing/empty salt shape is
-    // an uninitialised stub, not a real vault worth overwriting local data.
-    const remoteEntries = remote.data?.entries;
-    const remoteHasEntries =
-      remoteEntries !== undefined &&
-      remoteEntries !== null &&
-      typeof remoteEntries === "object" &&
-      Object.keys(remoteEntries).length > 0;
-    if (!remote.data?.salt || !remoteHasEntries) {
-      const msg = "Remote mcp_secrets is empty. Push from this machine to seed it.";
-      if (opts.json) io.out(`${JSON.stringify({ ok: true, empty: true, message: msg })}\n`);
-      else io.out(`${msg}\n`);
-      return { exitCode: 0 };
-    }
-    // Salt-conflict guard: if a non-empty local vault exists whose salt
-    // differs from the remote's, refuse -- the two vaults were derived from
-    // different passphrases and overwriting would make local secrets
-    // irrecoverable.  The user must back up and pass --force to proceed.
-    const loadedPull = await safeLoadVault(path, io, opts.json, "pull");
-    if (!loadedPull.ok) return loadedPull.result;
-    const localVault = loadedPull.vault;
-    const localHasEntries = localVault !== null && Object.keys(localVault.entries).length > 0;
-    if (localHasEntries && localVault.salt !== remote.data.salt && !opts.force) {
-      const msg =
-        `Local vault at ${path} has a different salt than the remote (different passphrase lineage). ` +
-        `Back up ${path} first, then re-run with --force to overwrite.`;
-      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-      else io.err(`yaw-mcp secrets pull: ${msg}\n`);
-      return { exitCode: 1 };
-    }
-    // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
-    await saveVault(path, remote.data);
-    // Invalidate the in-process key cache -- the salt may have changed,
-    // so the next operation must re-derive against the (possibly
-    // identical) passphrase.
-    lock();
-    const count = Object.keys(remote.data.entries).length;
-    if (opts.json) {
-      io.out(
-        `${JSON.stringify({ ok: true, secret_count: count, remote_version: remote.version, written: path }, null, 2)}\n`,
-      );
-    } else {
-      io.out(
-        `Local vault replaced with remote copy: ${count} secret${count === 1 ? "" : "s"} (encrypted) -> ${path}\n`,
-      );
-      io.out("Vault locked -- next secrets command will prompt for the passphrase.\n");
-    }
-    return { exitCode: 0 };
-  } catch (err) {
-    if (err instanceof TeamSyncAuthError) {
-      const msg = "Session expired. Run `yaw-mcp login --key <license-key>` again.";
-      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-      else io.err(`yaw-mcp secrets pull: ${msg}\n`);
-      return { exitCode: 1 };
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    if (opts.json) io.err(`${JSON.stringify({ ok: false, error: message })}\n`);
-    else io.err(`yaw-mcp secrets pull: ${message}\n`);
-    return { exitCode: 1 };
-  }
-}
 
 /**
  * Re-encrypt the whole vault under a new passphrase.
@@ -792,55 +606,16 @@ async function runSecretsRotate(
 
   const count = Object.keys(rotated.entries).length;
 
-  // Optional push of the re-encrypted blob -- only when --push AND a
-  // session exists. No auto-push by design.
-  let pushedVersion: number | null = null;
-  if (opts.push) {
-    const session = await getSession({ home, baseUrl: opts.baseUrl });
-    if (!session) {
-      const msg = "Rotated locally, but --push needs a session. Run `yaw-mcp login --key <license-key>` then push.";
-      if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, note: msg })}\n`);
-      else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
-      // Local rotation succeeded; surface the push gap but don't fail the
-      // whole command -- the rotation is the primary effect.
-      return { exitCode: 0 };
-    }
-    try {
-      const remote = await getResource<VaultFile>(MCP_SECRETS_RESOURCE, { home, baseUrl: opts.baseUrl });
-      const result = await putResource<VaultFile>(MCP_SECRETS_RESOURCE, remote.version, rotated, {
-        home,
-        baseUrl: opts.baseUrl,
-      });
-      pushedVersion = result.version;
-    } catch (err) {
-      if (err instanceof TeamSyncStaleVersionError) {
-        const hint = `Rotated locally. Push skipped -- remote is at v${err.currentVersion}; pull and reconcile, then push.`;
-        if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, note: hint })}\n`);
-        else io.err(`yaw-mcp secrets rotate: ${hint}\n`);
-        return { exitCode: 0 };
-      }
-      if (err instanceof TeamSyncAuthError) {
-        const hint = "Rotated locally. Push skipped -- session expired. Run `yaw-mcp login` again, then push.";
-        if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, note: hint })}\n`);
-        else io.err(`yaw-mcp secrets rotate: ${hint}\n`);
-        return { exitCode: 0 };
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      if (opts.json) io.err(`${JSON.stringify({ ok: true, rotated: true, pushed: false, error: message })}\n`);
-      else io.err(`yaw-mcp secrets rotate: rotated locally but push failed: ${message}\n`);
-      return { exitCode: 0 };
-    }
-  }
-
+  // The optional --push step was removed with the Yaw Team surface
+  // (2026-07-21); rotation is a purely local re-encryption now.
   if (opts.json) {
     io.out(
-      `${JSON.stringify({ ok: true, rotated: true, secret_count: count, pushed: pushedVersion !== null, ...(pushedVersion !== null ? { new_version: pushedVersion } : {}) })}\n`,
+      `${JSON.stringify({ ok: true, rotated: true, secret_count: count })}\n`,
     );
   } else {
     io.out(
       `Rotated ${count} secret${count === 1 ? "" : "s"} under a new passphrase (encryption re-wrapped, token values unchanged).\n`,
     );
-    if (pushedVersion !== null) io.out(`Pushed the re-encrypted vault -> mcp_secrets v${pushedVersion}.\n`);
     io.out("Vault locked -- the next secrets command will prompt for the new passphrase.\n");
   }
   return { exitCode: 0 };

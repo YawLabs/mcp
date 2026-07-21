@@ -9,17 +9,11 @@ import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { log } from "./logger.js";
-import { parseLoginArgs, runLogin } from "./login-cmd.js";
-import { parseLogoutArgs, runLogout } from "./logout-cmd.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "./reset-learning-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
-import { parseSetActiveArgs, runSetActive } from "./set-active-cmd.js";
-import { parseStatsArgs, runStats } from "./stats-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
-import { parseSyncArgs, runSync } from "./sync-cmd.js";
-import { parseTokenArgs, runTokenCmd } from "./token-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
@@ -239,61 +233,6 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   dispatch("list", runList(parsed.options));
-} else if (subcommand === "login") {
-  const parsed = parseLoginArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("login", runLogin(parsed.options));
-} else if (subcommand === "logout") {
-  const parsed = parseLogoutArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("logout", runLogout(parsed.options));
-} else if (subcommand === "token") {
-  const parsed = parseTokenArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("token", runTokenCmd(parsed.options));
-} else if (subcommand === "sync") {
-  const parsed = parseSyncArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("sync", runSync(parsed.options));
-} else if (subcommand === "stats") {
-  const parsed = parseStatsArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("stats", runStats(parsed.options));
 } else if (subcommand === "secrets") {
   const parsed = parseSecretsArgs(process.argv.slice(3));
   if (!parsed.ok) {
@@ -305,17 +244,6 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   dispatch("secrets", runSecrets(parsed.options));
-} else if (subcommand === "set-active") {
-  const parsed = parseSetActiveArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("set-active", runSetActive(parsed.options));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   yaw-mcp — one install, every MCP server, managed from the cloud.

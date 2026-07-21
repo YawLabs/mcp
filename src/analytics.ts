@@ -1,7 +1,6 @@
 import { request } from "undici";
 import type { ErrorCategory } from "./error-category.js";
 import { log } from "./logger.js";
-import { postAnalyticsEvent } from "./team-sync.js";
 import { isLoopbackHost } from "./url-safety.js";
 
 export interface ConnectAnalyticsEvent {
@@ -142,54 +141,6 @@ export function recordConnectEvent(event: Omit<ConnectAnalyticsEvent, "timestamp
   if (buffer.length >= FLUSH_SIZE) {
     flush().catch(() => {});
   }
-  // Tee-out to team-analytics for Yaw Team buyers. Fire-and-
-  // forget; postAnalyticsEvent no-ops when no team session is cached
-  // (Free users + legacy account-mode-only buyers without a yaw_team
-  // cookie). Only tool_call events flow to team-analytics -- the
-  // server-side schema is per-call only, not per-activate or per-
-  // dispatch. Discover / activate / etc. stay in the legacy buffer.
-  if (event.action === "tool_call" && event.namespace && event.toolName) {
-    teeToTeamAnalytics({
-      tool_namespace: event.namespace,
-      tool_name: event.toolName,
-      status: event.success ? "success" : "error",
-      latency_ms: typeof event.latencyMs === "number" ? event.latencyMs : undefined,
-      error_category: event.errorCategory,
-    });
-  }
-}
-
-/** Fire-and-forget POST to yaw.sh /api/team/analytics/event. Never
- *  throws -- postAnalyticsEvent returns { ok: false } on auth failure
- *  or network error, both of which we ignore. Latches a single
- *  module-level state so a one-time loadStoredState miss doesn't keep
- *  hitting the disk on every event. */
-let teamAnalyticsDisabled = false;
-function teeToTeamAnalytics(event: {
-  tool_namespace: string;
-  tool_name: string;
-  status: "success" | "error";
-  latency_ms?: number;
-  error_category?: string;
-}): void {
-  if (teamAnalyticsDisabled) return;
-  postAnalyticsEvent(event)
-    .then((result) => {
-      // 401 from postAnalyticsEvent clears the stored state inside
-      // team-sync.ts; subsequent calls will see no session and return
-      // { ok: false } cheaply. We also latch teamAnalyticsDisabled
-      // here to skip the call entirely.
-      if (!result.ok) teamAnalyticsDisabled = true;
-    })
-    .catch(() => {
-      teamAnalyticsDisabled = true;
-    });
-}
-
-/** Test hook: reset the team-analytics latch so a subsequent run can
- *  re-attempt tee-out. */
-export function _resetTeamAnalyticsForTests(): void {
-  teamAnalyticsDisabled = false;
 }
 
 export function recordDispatchEvent(event: DispatchAnalyticsEvent): void {
@@ -320,10 +271,6 @@ export function initAnalytics(url: string, tok: string): void {
   lastLoggedDispatchStatus = null;
   warnedInsecureBearerSkipConnect = false;
   warnedInsecureBearerSkipDispatch = false;
-  // Also reset the team-analytics latch so a user who signs in mid-session
-  // gets team analytics re-enabled (the latch fires on a failed/missing
-  // session, but sign-in produces a fresh valid one).
-  teamAnalyticsDisabled = false;
   flushTimer = setInterval(() => {
     flush().catch(() => {});
     flushDispatch().catch(() => {});

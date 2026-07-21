@@ -116,37 +116,34 @@ describe("parseSecretsArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/unknown flag "--bogus"/);
   });
 
-  it("push action parses without a name", () => {
-    const r = parseSecretsArgs(["push"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.options.action).toBe("push");
+  // `push` / `pull` and the --force / --replace / --push flags were removed
+  // 2026-07-21 with the Yaw Team surface. They must now be REJECTED, not
+  // silently parsed -- these assertions are what stop them creeping back as
+  // no-op flags that look supported.
+  it("push action is rejected", () => {
+    expect(parseSecretsArgs(["push"]).ok).toBe(false);
   });
 
-  it("pull action parses without a name", () => {
-    const r = parseSecretsArgs(["pull"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.options.action).toBe("pull");
+  it("pull action is rejected", () => {
+    expect(parseSecretsArgs(["pull"]).ok).toBe(false);
   });
 
-  it("pull --force parses", () => {
-    const r = parseSecretsArgs(["pull", "--force"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.options.force).toBe(true);
+  it("--force is rejected as an unknown flag", () => {
+    expect(parseSecretsArgs(["rotate", "--force"]).ok).toBe(false);
+  });
+
+  it("--replace is rejected as an unknown flag", () => {
+    expect(parseSecretsArgs(["rotate", "--replace"]).ok).toBe(false);
+  });
+
+  it("rotate --push is rejected as an unknown flag", () => {
+    expect(parseSecretsArgs(["rotate", "--push"]).ok).toBe(false);
   });
 
   it("rotate action parses without a name", () => {
     const r = parseSecretsArgs(["rotate"]);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.options.action).toBe("rotate");
-  });
-
-  it("rotate --push parses", () => {
-    const r = parseSecretsArgs(["rotate", "--push"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.options.action).toBe("rotate");
-      expect(r.options.push).toBe(true);
-    }
   });
 
   it("audit action parses with filters", () => {
@@ -166,360 +163,12 @@ describe("parseSecretsArgs", () => {
   });
 });
 
-// -----------------------------------------------------------------------
-// runSecrets pull -- empty-remote guard and salt-conflict protection
-// -----------------------------------------------------------------------
-
-vi.mock("../team-sync.js", async (importOriginal) => {
-  const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, getSession: vi.fn(), getResource: vi.fn(), putResource: vi.fn() };
-});
-
-import type { VaultFile } from "../secrets-vault.js";
-import { getResource, getSession } from "../team-sync.js";
-
-/** Build a minimal VaultFile shape for test. */
-function makeVault(salt: string, entries: Record<string, unknown> = {}): VaultFile {
-  return {
-    version: 1,
-    salt,
-    entries: entries as VaultFile["entries"],
-  };
-}
-
-const FAKE_SESSION = {
-  email: "user@example.com",
-  role: "member" as const,
-  order_id: "ord-1",
-  exp: Date.now() + 86400_000,
-};
-
-describe("runSecrets pull -- empty-remote guard", () => {
-  const io = { out: vi.fn(), err: vi.fn() };
-
-  beforeEach(() => {
-    io.out.mockReset();
-    io.err.mockReset();
-    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
-  });
-
-  it("treats remote with entries:{} and no salt as empty", async () => {
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: { version: 1, salt: "", entries: {} },
-      updated_at: null,
-      updated_by: null,
-    });
-    const result = await runSecrets({ action: "pull" }, io);
-    expect(result.exitCode).toBe(0);
-    expect(io.out).toHaveBeenCalledWith(expect.stringContaining("empty"));
-  });
-
-  it("treats remote with entries:{} and a salt as empty (no entries -- stub vault)", async () => {
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: { version: 1, salt: "c2FsdA==", entries: {} },
-      updated_at: null,
-      updated_by: null,
-    });
-    const result = await runSecrets({ action: "pull" }, io);
-    expect(result.exitCode).toBe(0);
-    expect(io.out).toHaveBeenCalledWith(expect.stringContaining("empty"));
-  });
-
-  it("treats remote with null entries as empty", async () => {
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: { version: 1, salt: "c2FsdA==", entries: null as unknown as VaultFile["entries"] },
-      updated_at: null,
-      updated_by: null,
-    });
-    const result = await runSecrets({ action: "pull" }, io);
-    expect(result.exitCode).toBe(0);
-  });
-
-  it("--json empty-remote output carries the same human hint under `message` (parity with prose)", async () => {
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: { version: 1, salt: "", entries: {} },
-      updated_at: null,
-      updated_by: null,
-    });
-    const result = await runSecrets({ action: "pull", json: true }, io);
-    expect(result.exitCode).toBe(0);
-    const out = io.out.mock.calls.map((c) => c[0] as string).join("");
-    const parsed = JSON.parse(out);
-    expect(parsed).toMatchObject({ ok: true, empty: true });
-    expect(parsed.message).toMatch(/push from this machine to seed it/i);
-  });
-});
+// The push / pull test suites were removed 2026-07-21 with the Yaw Team
+// surface -- `secrets push` and `secrets pull` no longer exist. The local
+// vault suites below (set / rotate / audit / TTY) are unaffected.
 
 import { lock, saveVault, vaultPath } from "../secrets-vault.js";
-import { putResource } from "../team-sync.js";
 
-describe("runSecrets pull -- salt-conflict protection", () => {
-  const io = { out: vi.fn(), err: vi.fn() };
-  // Use a tmp dir so loadVault finds a real file on disk.
-  const home = nodePath.join(os.tmpdir(), `yaw-test-pull-${process.pid}`);
-
-  beforeEach(async () => {
-    io.out.mockReset();
-    io.err.mockReset();
-    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
-    // Ensure the home dir exists for vault writes.
-    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-  });
-
-  it("refuses when local non-empty vault has a different salt (no --force)", async () => {
-    // Write a local vault with salt "aaa"
-    await saveVault(
-      vaultPath(home),
-      makeVault("YWFh", { MY_KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any),
-    );
-
-    // Remote has salt "bbb" and a real entry
-    vi.mocked(getResource).mockResolvedValue({
-      version: 2,
-      data: makeVault("YmJi", { OTHER: { iv: "iv2", ciphertext: "ct2", authTag: "at2" } } as any),
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const result = await runSecrets({ action: "pull", home }, io);
-    expect(result.exitCode).toBe(1);
-    expect(io.err).toHaveBeenCalledWith(expect.stringContaining("different salt"));
-    expect(io.err).toHaveBeenCalledWith(expect.stringContaining("--force"));
-  });
-
-  it("proceeds when local non-empty vault has a different salt with --force", async () => {
-    await saveVault(
-      vaultPath(home),
-      makeVault("YWFh", { MY_KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any),
-    );
-
-    vi.mocked(getResource).mockResolvedValue({
-      version: 2,
-      data: makeVault("YmJi", { OTHER: { iv: "iv2", ciphertext: "ct2", authTag: "at2" } } as any),
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const result = await runSecrets({ action: "pull", home, force: true }, io);
-    expect(result.exitCode).toBe(0);
-    expect(io.out).toHaveBeenCalledWith(expect.stringContaining("replaced"));
-  });
-
-  it("proceeds when local vault has same salt (no conflict)", async () => {
-    await saveVault(
-      vaultPath(home),
-      makeVault("c2FtZQ==", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any),
-    );
-
-    vi.mocked(getResource).mockResolvedValue({
-      version: 2,
-      data: makeVault("c2FtZQ==", { KEY2: { iv: "iv2", ciphertext: "ct2", authTag: "at2" } } as any),
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const result = await runSecrets({ action: "pull", home }, io);
-    expect(result.exitCode).toBe(0);
-    expect(io.out).toHaveBeenCalledWith(expect.stringContaining("replaced"));
-  });
-
-  it("proceeds when no local vault exists (first pull)", async () => {
-    // Remove vault if it exists from a prior test run
-    try {
-      await unlink(vaultPath(home));
-    } catch {
-      /* ok */
-    }
-
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: makeVault("bmV3", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any),
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const result = await runSecrets({ action: "pull", home }, io);
-    expect(result.exitCode).toBe(0);
-    expect(io.out).toHaveBeenCalledWith(expect.stringContaining("replaced"));
-  });
-
-  it("error message names the vault path", async () => {
-    await saveVault(
-      vaultPath(home),
-      makeVault("YWFh", { MY_KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any),
-    );
-
-    vi.mocked(getResource).mockResolvedValue({
-      version: 2,
-      data: makeVault("YmJi", { OTHER: { iv: "iv2", ciphertext: "ct2", authTag: "at2" } } as any),
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const result = await runSecrets({ action: "pull", home }, io);
-    expect(result.exitCode).toBe(1);
-    // Error should name the vault path so the user knows what to back up
-    const errOutput = io.err.mock.calls[0][0] as string;
-    expect(errOutput).toContain(vaultPath(home));
-  });
-});
-
-// -----------------------------------------------------------------------
-// runSecrets push -- three additional edge-case paths
-// -----------------------------------------------------------------------
-
-describe("runSecrets push -- edge cases", () => {
-  const io = { out: vi.fn(), err: vi.fn() };
-  const home = nodePath.join(os.tmpdir(), `yaw-test-push-${process.pid}`);
-
-  beforeEach(async () => {
-    io.out.mockReset();
-    io.err.mockReset();
-    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
-    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-  });
-
-  it("(a) no local vault -> exitCode 1 + 'no local vault' message", async () => {
-    // Ensure vault file is absent.
-    try {
-      await unlink(vaultPath(home));
-    } catch {
-      /* ok */
-    }
-
-    const result = await runSecrets({ action: "push", home }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    expect(errOutput.toLowerCase()).toContain("no local vault");
-  });
-
-  it("(b) putResource throws TeamSyncStaleVersionError -> JSON output carries currentVersion", async () => {
-    // Write a real local vault so loadVault succeeds.
-    await saveVault(vaultPath(home), makeVault("YWFh", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any));
-
-    // getResource resolves so we get past the remote-version fetch.
-    vi.mocked(getResource).mockResolvedValue({
-      version: 3,
-      data: null,
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const { TeamSyncStaleVersionError } = await import("../team-sync.js");
-    vi.mocked(putResource).mockRejectedValue(new TeamSyncStaleVersionError(5));
-
-    const result = await runSecrets({ action: "push", home, json: true }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    const parsed = JSON.parse(errOutput);
-    expect(parsed.currentVersion).toBe(5);
-  });
-
-  it("(c) putResource throws TeamSyncAuthError -> exitCode 1 + session-expired message", async () => {
-    await saveVault(vaultPath(home), makeVault("YWFh", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any));
-
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: null,
-      updated_at: null,
-      updated_by: null,
-    });
-
-    const { TeamSyncAuthError } = await import("../team-sync.js");
-    vi.mocked(putResource).mockRejectedValue(new TeamSyncAuthError());
-
-    const result = await runSecrets({ action: "push", home }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    // Must mention session expiry or re-login.
-    expect(errOutput.toLowerCase()).toMatch(/session expired|login/);
-  });
-});
-
-// -----------------------------------------------------------------------
-// runSecrets push / pull -- no-session and auth-error paths
-// -----------------------------------------------------------------------
-
-describe("runSecrets push/pull -- no session + TeamSyncAuthError", () => {
-  const io = { out: vi.fn(), err: vi.fn() };
-  const home = nodePath.join(os.tmpdir(), `yaw-test-auth-${process.pid}`);
-
-  beforeEach(async () => {
-    io.out.mockReset();
-    io.err.mockReset();
-    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-  });
-
-  it("push with no session -> exitCode 1 + login message", async () => {
-    vi.mocked(getSession).mockResolvedValue(null);
-    const result = await runSecrets({ action: "push", home }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    expect(errOutput.toLowerCase()).toMatch(/not signed in|login/);
-  });
-
-  it("pull with no session -> exitCode 1 + login message", async () => {
-    vi.mocked(getSession).mockResolvedValue(null);
-    const result = await runSecrets({ action: "pull", home }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    expect(errOutput.toLowerCase()).toMatch(/not signed in|login/);
-  });
-
-  it("pull: getResource throws TeamSyncAuthError -> exitCode 1 + session-expired message", async () => {
-    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
-    const { TeamSyncAuthError } = await import("../team-sync.js");
-    vi.mocked(getResource).mockRejectedValue(new TeamSyncAuthError());
-    const result = await runSecrets({ action: "pull", home }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    expect(errOutput.toLowerCase()).toMatch(/session expired|login/);
-  });
-});
-
-// -----------------------------------------------------------------------
-// runSecrets push -- salt-conflict guard + --replace flag
-// -----------------------------------------------------------------------
-
-describe("runSecrets push -- salt-conflict guard", () => {
-  const io = { out: vi.fn(), err: vi.fn() };
-  const home = nodePath.join(os.tmpdir(), `yaw-test-push-salt-${process.pid}`);
-
-  beforeEach(async () => {
-    io.out.mockReset();
-    io.err.mockReset();
-    vi.mocked(getSession).mockResolvedValue(FAKE_SESSION);
-    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-    // Write a local vault with salt "aaa" for all tests in this block.
-    await saveVault(vaultPath(home), makeVault("YWFh", { KEY: { iv: "iv", ciphertext: "ct", authTag: "at" } } as any));
-    // Remote has a different salt "bbb" and an existing entry.
-    vi.mocked(getResource).mockResolvedValue({
-      version: 1,
-      data: makeVault("YmJi", { OTHER: { iv: "iv2", ciphertext: "ct2", authTag: "at2" } } as any),
-      updated_at: null,
-      updated_by: null,
-    });
-  });
-
-  it("without --replace returns exitCode 1 when remote salt differs", async () => {
-    const result = await runSecrets({ action: "push", home }, io);
-    expect(result.exitCode).toBe(1);
-    const errOutput = io.err.mock.calls[0][0] as string;
-    expect(errOutput.toLowerCase()).toMatch(/different passphrase|different salt/);
-  });
-
-  it("with --replace proceeds past salt-conflict check", async () => {
-    vi.mocked(putResource).mockResolvedValue({ version: 2, data: null, updated_at: null, updated_by: null });
-    const result = await runSecrets({ action: "push", home, replace: true }, io);
-    expect(result.exitCode).toBe(0);
-    const outOutput = io.out.mock.calls.map((c) => c[0] as string).join("");
-    expect(outOutput).toMatch(/pushed|secret/i);
-  });
-});
 
 // -----------------------------------------------------------------------
 // runSecrets set -- wrong-passphrase and empty-passphrase rejection
