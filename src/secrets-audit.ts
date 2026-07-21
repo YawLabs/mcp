@@ -16,7 +16,7 @@
 //     bound on a long-lived process.
 
 import { existsSync } from "node:fs";
-import { appendFile, chmod, readFile, writeFile } from "node:fs/promises";
+import { appendFile, chmod, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
@@ -88,16 +88,36 @@ export async function appendAuditEvent(input: AuditEventInput, home: string = ho
   }
 }
 
+/** Conservative lower bound on the byte length of one line appendAuditEvent
+ *  writes. The shortest possible event line -- 24-char ISO timestamp, empty
+ *  server, empty secret, `"missing"` -- is 76 bytes including the newline,
+ *  so 64 leaves headroom while staying a valid lower bound. */
+const MIN_AUDIT_LINE_BYTES = 64;
+
 /** Trim the log to the last AUDIT_TAIL_CAP lines if it has grown past it.
  *  Best-effort and swallowed by the caller's try/catch. */
 async function trimToTailCap(path: string): Promise<void> {
+  // Cheap size gate first: a file smaller than cap * MIN_AUDIT_LINE_BYTES
+  // cannot hold more than AUDIT_TAIL_CAP of our lines, so skip the read
+  // entirely. Without it every single append re-read the whole log (a few
+  // hundred KB once the file is near the cap) just to discover it was
+  // under. Caveat: hand-appended lines shorter than the bound could push
+  // the LINE count over the cap while the file stays under the byte gate.
+  // The cap is a best-effort size guard, not an invariant.
+  const { size } = await stat(path);
+  if (size < AUDIT_TAIL_CAP * MIN_AUDIT_LINE_BYTES) return;
   const raw = await readFile(path, "utf8");
   // Split on newlines; the trailing "" after the final newline is dropped.
   const lines = raw.split("\n").filter((l) => l.length > 0);
   if (lines.length <= AUDIT_TAIL_CAP) return;
   const kept = lines.slice(lines.length - AUDIT_TAIL_CAP);
-  // Rewrite in place. Plain writeFile is fine -- a torn write here only
-  // costs audit history, never a secret (the file has none).
+  // Rewrite in place. This read-modify-write is neither atomic nor locked:
+  // a concurrent appendFile from another yaw-mcp process between the read
+  // above and this write is LOST, and an append that interleaves with the
+  // write can leave a garbled line behind. Both are accepted here -- the
+  // cost is audit history, never a secret (the file holds names only), and
+  // readAuditLog skips malformed lines. The size gate above keeps this
+  // window rare: it opens only when the log is genuinely over the cap.
   await writeFile(path, `${kept.join("\n")}\n`, "utf8");
 }
 

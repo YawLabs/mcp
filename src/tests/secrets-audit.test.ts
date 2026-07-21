@@ -83,8 +83,12 @@ describe("appendAuditEvent + readAuditLog", () => {
     // Force atomicWriteFile (first-write path) to reject. The function must
     // swallow it rather than propagate.
     const atomic = await import("../atomic-write.js");
-    vi.spyOn(atomic, "atomicWriteFile").mockRejectedValue(new Error("disk full"));
+    const spy = vi.spyOn(atomic, "atomicWriteFile").mockRejectedValue(new Error("disk full"));
     await expect(appendAuditEvent({ server: "gh", secret: "x", event: "injected" }, home)).resolves.toBeUndefined();
+    // Without this the test passes vacuously the moment the ESM spy stops
+    // intercepting: appendAuditEvent would succeed for real and "did not
+    // throw" would prove nothing about the fail-open path.
+    expect(spy).toHaveBeenCalled();
   });
 
   it("tail-caps the log to AUDIT_TAIL_CAP lines on append", async () => {
