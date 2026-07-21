@@ -155,6 +155,18 @@ describe("parseTryCleanupArgs", () => {
     expect(parseTryCleanupArgs(["demo", "--bogus"]).ok).toBe(false);
   });
 
+  it("rejects --base followed by a flag instead of swallowing it as the URL", () => {
+    const r = parseTryCleanupArgs(["demo", "--base", "--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--base requires a URL/);
+  });
+
+  it("still accepts --base with a real URL", () => {
+    const r = parseTryCleanupArgs(["demo", "--base", "http://localhost:3000"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.baseUrl).toBe("http://localhost:3000");
+  });
+
   it("rejects a bare '-' positional with a clear arg-parse error", () => {
     const r = parseTryCleanupArgs(["-"]);
     expect(r.ok).toBe(false);
@@ -420,6 +432,30 @@ describe("runTry — client config perms (POSIX)", () => {
     expect(r.exitCode).toBe(0);
     // Pre-existing file: we must not silently re-perm the user's file to 0600.
     expect(statSync(clientPath).mode & 0o777).not.toBe(0o600);
+  });
+});
+
+describe("runTry — unparseable ttl (programmatic callers)", () => {
+  it("errors out instead of silently substituting the 1h default", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      ttl: "later", // bypasses parseTryArgs -- programmatic caller bug
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.errText()).toMatch(/invalid ttl "later"/);
+    // Nothing written.
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
   });
 });
 
@@ -705,5 +741,36 @@ describe("scanTrials + gcExpiredTrials", () => {
   it("GC is a no-op when no expired trials exist", async () => {
     const result = await gcExpiredTrials({ home: synthHome, env: {} });
     expect(result.cleared).toBe(0);
+  });
+
+  it("GC unlinks the scanned marker file even when its filename doesn't match its slug", async () => {
+    const baseNow = 1_700_000_000_000;
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const expiredMarker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "old",
+      name: "Old MCP",
+      expiresAt: baseNow - 1,
+      clientPath: join(synthHome, ".claude.json"),
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-old",
+      createdAt: baseNow - 3_600_000,
+    };
+    // Filename intentionally mismatches the slug field ("renamed" vs "old").
+    // Unlinking via trialMarkerPath(marker.slug) would ENOENT, count as
+    // failed, and leave the marker to re-fail on every doctor GC forever.
+    const mismatchedPath = join(trialsDir(synthHome), "renamed.json");
+    writeFileSync(mismatchedPath, JSON.stringify(expiredMarker));
+
+    const result = await gcExpiredTrials({
+      home: synthHome,
+      env: {},
+      now: () => baseNow,
+      postEvent: async () => undefined,
+    });
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(existsSync(mismatchedPath)).toBe(false);
   });
 });

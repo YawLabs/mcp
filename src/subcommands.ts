@@ -18,6 +18,15 @@ export const FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 // this list and not a flag (leading `-`) falls through to "unknown
 // subcommand" before runServer, so `yaw-mcp instal` fails loud instead of
 // starting as an MCP server and opaquely erroring on the missing token.
+//
+// HAND-MAINTAINED: this list MUST track the dispatch chain in
+// src/index.ts. The completion drift guard compares SUBCOMMAND_SPEC
+// against THIS table, so a name left here after its dispatch branch is
+// removed keeps passing the guard while did-you-mean and shell
+// completion suggest a dead command (exactly what happened when commit
+// 45a3462 removed the Yaw Team surface: login/logout/sync/stats/token/
+// set-active lingered here). When you add or remove an index.ts branch,
+// update this list in the same commit.
 export const KNOWN_SUBCOMMANDS = [
   "compliance",
   "audit",
@@ -34,13 +43,7 @@ export const KNOWN_SUBCOMMANDS = [
   "upgrade",
   "try",
   "try-cleanup",
-  "login",
-  "logout",
-  "sync",
-  "stats",
-  "token",
   "secrets",
-  "set-active",
   "help",
   ...FLAG_ALIASES,
 ] as const;

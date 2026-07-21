@@ -60,7 +60,7 @@ export interface ParsedBundlesArgs {
 
 export const BUNDLES_USAGE = `Usage: yaw-mcp bundles [list|match] [--json]
 
-  Curated multi-server bundles — hand-picked stacks you can activate in one step.
+  Curated multi-server bundles -- hand-picked stacks you can activate in one step.
 
   list      List every curated bundle (default, no network).
   match     Partition bundles against your installed servers (reads the backend).
@@ -126,7 +126,7 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   });
 
   if (!config.token) {
-    const msg = "no token resolved. Run `yaw-mcp install <client> --token mcp_pat_…` or set YAW_MCP_TOKEN.";
+    const msg = "no token resolved. Run `yaw-mcp install <client> --token mcp_pat_...` or set YAW_MCP_TOKEN.";
     if (opts.json) {
       const jsonErr = JSON.stringify({ ok: false, error: msg });
       lines.push(jsonErr);
@@ -198,7 +198,7 @@ function renderList(print: (s?: string) => void): void {
     for (const b of list) {
       print(`    ${b.id.padEnd(18)} ${b.name}`);
       print(`                       ${b.description}`);
-      print(`                       → ${bundleActivateHint(b)}`);
+      print(`                       -> ${bundleActivateHint(b)}`);
     }
     print("");
   }
@@ -206,7 +206,8 @@ function renderList(print: (s?: string) => void): void {
 
 function renderMatch(match: BundleMatchResult, installed: string[], print: (s?: string) => void): void {
   const installedList = installed.length === 0 ? "(none)" : installed.slice().sort().join(", ");
-  print(`Checked ${CURATED_BUNDLES.length} bundles against ${installed.length} enabled servers: ${installedList}`);
+  const serverWord = installed.length === 1 ? "server" : "servers";
+  print(`Checked ${CURATED_BUNDLES.length} bundles against ${installed.length} enabled ${serverWord}: ${installedList}`);
   print("");
 
   if (match.ready.length === 0 && match.partial.length === 0) {
@@ -219,7 +220,7 @@ function renderMatch(match: BundleMatchResult, installed: string[], print: (s?: 
     print("Ready to activate (every namespace installed):");
     for (const b of match.ready.slice().sort((a, c) => a.id.localeCompare(c.id))) {
       print(`  ${b.id.padEnd(18)} ${b.description}`);
-      print(`                     → ${bundleActivateHint(b)}`);
+      print(`                     -> ${bundleActivateHint(b)}`);
     }
     print("");
   }

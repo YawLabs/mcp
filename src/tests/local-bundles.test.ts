@@ -283,6 +283,20 @@ describe("loadLocalBundles", () => {
     expect(r.config).toBeNull();
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
   });
+
+  it("malformed project file still falls back to user-global defaultRuntime", async () => {
+    // Server list stays committed to the (malformed) project file, but the
+    // MACHINE-level defaultRuntime knob must still come from user-global --
+    // same rationale as the valid-project fallback.
+    writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
+    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(localBundlesPath(join(synthCwd, CONFIG_DIRNAME)), "{not json");
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config).toBeNull();
+    expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
+    expect(r.defaultRuntime).toBe("oam");
+    expect(r.defaultRuntimePath).toBe(localBundlesPath(join(synthHome, CONFIG_DIRNAME)));
+  });
 });
 
 // Fix 1: readBundlesAt -- ENOENT/EISDIR -> exists:false; other errors -> exists:true

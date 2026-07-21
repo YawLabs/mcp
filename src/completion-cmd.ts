@@ -49,7 +49,14 @@ interface SubcommandSpec {
    *  ':' and parentheses -- zsh `_values` treats ':' as the value/desc
    *  separator. */
   description: string;
-  positional?: string[];
+  /** Positional argument POSITIONS, in order. Each inner array is the set of
+   *  one-of-N alternative candidates that complete at that single position
+   *  (`install` takes ONE client chosen from four, so all four clients live
+   *  together in position 0 -- NOT one candidate per position). An entry like
+   *  "<slug>" is a documentation placeholder for a free-form argument;
+   *  placeholders are filtered out of the generated scripts but keep their
+   *  slot so later positions still line up. */
+  positional?: string[][];
   flags: string[];
 }
 
@@ -64,7 +71,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   {
     name: "install",
     description: "Connect an MCP client to yaw-mcp",
-    positional: [...INSTALL_CLIENTS],
+    positional: [[...INSTALL_CLIENTS]],
     flags: [
       "--scope",
       "--token",
@@ -82,25 +89,25 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   {
     name: "add",
     description: "Add a catalog server to bundles.json",
-    positional: ["<slug>"],
+    positional: [["<slug>"]],
     flags: ["--env", "--dry-run", "--json", "--catalog", "--help"],
   },
-  { name: "remove", description: "Remove a local server", positional: ["<slug-or-namespace>"], flags: ["--help"] },
+  { name: "remove", description: "Remove a local server", positional: [["<slug-or-namespace>"]], flags: ["--help"] },
   { name: "list", description: "List the servers yaw-mcp loads locally", flags: ["--json", "--help"] },
   {
     name: "try",
     description: "Wire a one-off trial of a catalog server",
-    positional: ["<slug>"],
+    positional: [["<slug>"]],
     flags: ["--client", "--ttl", "--env", "--dry-run", "--base", "--help"],
   },
-  { name: "try-cleanup", description: "Remove a wired trial", positional: ["<slug>"], flags: ["--base", "--help"] },
+  { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--base", "--help"] },
   // Inspection.
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
   { name: "servers", description: "List servers in your yaw.sh/mcp dashboard", flags: ["--json", "--help"] },
   {
     name: "bundles",
     description: "Browse curated multi-server bundles",
-    positional: ["list", "match"],
+    positional: [["list", "match"]],
     flags: ["--json", "--help"],
   },
   // Maintenance.
@@ -109,35 +116,16 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   {
     name: "completion",
     description: "Print a shell completion script",
-    positional: ["bash", "zsh", "fish", "powershell"],
+    positional: [["bash", "zsh", "fish", "powershell"]],
     flags: ["--help"],
   },
-  // Account / sync (Yaw Team).
-  { name: "login", description: "Authenticate with a Yaw MCP account", flags: ["--key", "--json", "--help"] },
-  { name: "logout", description: "Sign out of your account", flags: ["--json", "--help"] },
-  {
-    name: "sync",
-    description: "Sync bundles across machines",
-    positional: ["push", "pull", "status"],
-    flags: ["--dry-run", "--json", "--help"],
-  },
-  { name: "stats", description: "Show usage statistics", flags: ["--limit", "--days", "--json", "--help"] },
-  {
-    name: "token",
-    description: "Print the account session token for a trusted local app",
-    flags: ["--json", "--help"],
-  },
+  // Secrets vault (local, encrypted). Actions/flags mirror parseSecretsArgs
+  // in src/secrets-cmd.ts -- keep them in sync.
   {
     name: "secrets",
     description: "Manage stored secrets",
-    positional: ["set", "get", "list", "remove", "lock", "push", "pull"],
-    flags: ["--force", "--value", "--stdin", "--json", "--help"],
-  },
-  {
-    name: "set-active",
-    description: "Enable/disable a team server (authoritative)",
-    positional: ["<namespace>", "on", "off"],
-    flags: ["--json", "--help"],
+    positional: [["set", "get", "list", "remove", "lock", "rotate", "audit"], ["<name>"]],
+    flags: ["--value", "--stdin", "--secret", "--server", "--json", "--help"],
   },
   // Other.
   { name: "audit", description: "Run a full-pass audit of loaded servers", flags: ["--json", "--help"] },
@@ -145,7 +133,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   {
     name: "foundry",
     description: "Export the opt-in dispatch-trace corpus",
-    positional: ["export"],
+    positional: [["export"]],
     flags: ["--out", "--cap", "--json", "--help"],
   },
   { name: "help", description: "Show usage", flags: [] },
@@ -154,10 +142,18 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
 export function parseCompletionArgs(
   argv: string[],
 ): { ok: true; options: { shell: CompletionShell } } | { ok: false; error: string; help?: boolean } {
-  if (argv.includes("--help") || argv.includes("-h")) {
-    return { ok: false, error: COMPLETION_USAGE, help: true };
+  const positional: string[] = [];
+  for (const a of argv) {
+    if (a === "--help" || a === "-h") {
+      return { ok: false, error: COMPLETION_USAGE, help: true };
+    }
+    // Reject unknown flags loudly (same shape as the sibling parsers, e.g.
+    // parseSecretsArgs) instead of silently dropping them.
+    if (a.startsWith("-")) {
+      return { ok: false, error: `yaw-mcp completion: unknown flag "${a}"\n\n${COMPLETION_USAGE}` };
+    }
+    positional.push(a);
   }
-  const positional = argv.filter((a) => !a.startsWith("-"));
   if (positional.length === 0) {
     return { ok: false, error: `yaw-mcp completion: missing shell argument\n\n${COMPLETION_USAGE}` };
   }
@@ -204,24 +200,34 @@ export function renderScript(shell: CompletionShell): string {
 }
 
 /** True when a positional value is a documentation placeholder, not a real
- *  completion candidate. Placeholders look like "<slug>" or "<namespace>". */
+ *  completion candidate. Placeholders look like "<slug>" or "<name>". */
 function isPlaceholder(s: string): boolean {
   return s.startsWith("<") && s.endsWith(">");
+}
+
+/** Completable candidates per positional slot. Filters placeholders out of
+ *  each slot's alternatives and drops slots left empty (free-form args),
+ *  while preserving each slot's ORIGINAL index so the generators' position
+ *  math (cword / token count / zsh slot number) stays aligned with the
+ *  argument the user is actually typing. */
+function realPositionals(spec: SubcommandSpec): Array<{ candidates: string[]; index: number }> {
+  return (spec.positional ?? [])
+    .map((alternatives, index) => ({ candidates: alternatives.filter((a) => !isPlaceholder(a)), index }))
+    .filter(({ candidates }) => candidates.length > 0);
 }
 
 function renderBash(): string {
   const subcommandList = SUBCOMMAND_SPEC.map((s) => s.name).join(" ");
   const topLevelFlags = "--help -h --version -V";
   const cases = SUBCOMMAND_SPEC.map((spec) => {
-    const indexedPositionals = (spec.positional ?? [])
-      .map((p, i) => ({ value: p, index: i }))
-      .filter(({ value }) => !isPlaceholder(value));
-    // Emit one if-block per real positional, using its original array index
-    // to compute the correct cword position (cword == originalIndex + 2 because
-    // COMP_WORDS[0] is "yaw-mcp", COMP_WORDS[1] is the subcommand).
-    const posClauses = indexedPositionals.map(
-      ({ value, index }) =>
-        `    if [[ $cword -eq $((${index} + 2)) ]]; then\n      COMPREPLY=( $(compgen -W "${value}" -- "$cur") )\n      return 0\n    fi`,
+    // Emit one if-block per positional SLOT, offering every alternative for
+    // that slot in a single compgen word list (so `install <TAB>` shows all
+    // four clients at once). The slot's original index computes the cword
+    // position (cword == slotIndex + 2 because COMP_WORDS[0] is "yaw-mcp",
+    // COMP_WORDS[1] is the subcommand).
+    const posClauses = realPositionals(spec).map(
+      ({ candidates, index }) =>
+        `    if [[ $cword -eq $((${index} + 2)) ]]; then\n      COMPREPLY=( $(compgen -W "${candidates.join(" ")}" -- "$cur") )\n      return 0\n    fi`,
     );
     const parts = [
       ...posClauses,
@@ -259,15 +265,14 @@ function renderZsh(): string {
 
   const argsCases = SUBCOMMAND_SPEC.map((spec) => {
     const lines = [`      ${spec.name})`];
-    const indexedPositionals = (spec.positional ?? [])
-      .map((p, i) => ({ value: p, index: i }))
-      .filter(({ value }) => !isPlaceholder(value));
-    if (indexedPositionals.length > 0) {
-      // Emit one _arguments entry per real positional, using its original array
-      // index for the zsh slot number (slot == originalIndex + 1 because zsh
-      // _arguments slot numbering is 1-based and slot 1 is already claimed by
-      // the subcommand dispatch in the outer _arguments call).
-      const posArgs = indexedPositionals.map(({ value, index }) => `'${index + 1}: :(${value})'`).join(" ");
+    const positionals = realPositionals(spec);
+    if (positionals.length > 0) {
+      // Emit one _arguments entry per positional SLOT with every alternative
+      // for that slot in its candidate group, using the slot's original index
+      // for the zsh slot number (slot == slotIndex + 1 because zsh _arguments
+      // slot numbering is 1-based and slot 1 is already claimed by the
+      // subcommand dispatch in the outer _arguments call).
+      const posArgs = positionals.map(({ candidates, index }) => `'${index + 1}: :(${candidates.join(" ")})'`).join(" ");
       lines.push(`        _arguments ${posArgs} '*: :(${spec.flags.join(" ")})'`);
     } else {
       lines.push(`        _arguments '*: :(${spec.flags.join(" ")})'`);
@@ -315,18 +320,17 @@ complete -c yaw-mcp -f`;
   const positionalLines: string[] = [];
   const flagLines: string[] = [];
   for (const spec of SUBCOMMAND_SPEC) {
-    if (spec.positional) {
-      // Preserve the original array index so the position guard uses the
-      // correct argument count. `count (commandline -opc)` in fish returns the
-      // number of tokens before the cursor (including "yaw-mcp" and the
-      // subcommand), so the expected count for originalIndex N is N + 2.
-      spec.positional.forEach((p, i) => {
-        if (isPlaceholder(p)) return;
-        const expectedCount = i + 2;
-        positionalLines.push(
-          `complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}; and test (count (commandline -opc)) -eq ${expectedCount}" -a ${p}`,
-        );
-      });
+    // One `complete` line per positional SLOT, offering every alternative for
+    // that slot in a single space-separated -a list (fish splits it into
+    // individual candidates). The slot's original index keeps the position
+    // guard's argument count right: `count (commandline -opc)` returns the
+    // number of tokens before the cursor (including "yaw-mcp" and the
+    // subcommand), so the expected count for slotIndex N is N + 2.
+    for (const { candidates, index } of realPositionals(spec)) {
+      const expectedCount = index + 2;
+      positionalLines.push(
+        `complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}; and test (count (commandline -opc)) -eq ${expectedCount}" -a "${candidates.join(" ")}"`,
+      );
     }
     for (const f of spec.flags) {
       // `-l` takes a LONG option name (no dashes). Only emit for `--` flags;
@@ -343,15 +347,16 @@ complete -c yaw-mcp -f`;
 function renderPowershell(): string {
   const subcommandNames = SUBCOMMAND_SPEC.map((s) => `'${s.name}'`).join(", ");
   const caseBranches = SUBCOMMAND_SPEC.map((spec) => {
-    const indexedPositionals = (spec.positional ?? [])
-      .map((p, i) => ({ value: p, index: i }))
-      .filter(({ value }) => !isPlaceholder(value));
     const flags = spec.flags.map((f) => `'${f}'`).join(", ");
-    // Emit one guarded block per real positional. $tokens[0] is "yaw-mcp",
+    // Emit one guarded block per positional SLOT, adding every alternative
+    // for that slot to the candidate array. $tokens[0] is "yaw-mcp",
     // $tokens[1] is the subcommand, so the token count when completing
-    // originalIndex N is N + 2 (the cursor is on the next token to be typed).
-    const positionalLines = indexedPositionals
-      .map(({ value, index }) => `      if ($tokens.Count -eq ${index + 2}) { $completions += @('${value}') }`)
+    // slotIndex N is N + 2 (the cursor is on the next token to be typed).
+    const positionalLines = realPositionals(spec)
+      .map(
+        ({ candidates, index }) =>
+          `      if ($tokens.Count -eq ${index + 2}) { $completions += @(${candidates.map((c) => `'${c}'`).join(", ")}) }`,
+      )
       .join("\n");
     const positionalBlock = positionalLines ? `${positionalLines}\n` : "";
     return `    '${spec.name}' {
