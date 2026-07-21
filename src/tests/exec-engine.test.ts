@@ -319,7 +319,7 @@ describe("exec-engine: validateExecRequest", () => {
     if (!r.ok) expect(r.message).toContain("unknown step id");
   });
 
-  it("rejects a step whose args is an array (Array.isArray guard at exec-engine.ts:247)", () => {
+  it("rejects a step whose args is an array (Array.isArray guard in validateExecRequest)", () => {
     // args must be a plain object when provided; an array must be rejected.
     const r = validateExecRequest({ steps: [{ tool: "t", args: [] }] });
     expect(r.ok).toBe(false);

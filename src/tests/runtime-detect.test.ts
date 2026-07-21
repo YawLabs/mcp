@@ -11,8 +11,29 @@ vi.mock("undici", () => ({
   request: vi.fn(),
 }));
 
+import { spawnSync } from "node:child_process";
 import { request } from "undici";
 import { detectRuntimes, initRuntimeDetect, reportRuntimes } from "../runtime-detect.js";
+
+// Is ANY python actually installed here? The assertion below is about the
+// candidate-WALK, not about the machine having python -- so on a python-less
+// box the test must SKIP (visibly) rather than fail on environment state.
+// Mirrors runtime-detect's own PYTHON_CANDIDATES list + win32 shell option.
+const PYTHON_PROBES: Array<[string, string[]]> =
+  process.platform === "win32"
+    ? [
+        ["py", ["-3", "--version"]],
+        ["python", ["--version"]],
+        ["python3", ["--version"]],
+      ]
+    : [
+        ["python3", ["--version"]],
+        ["python", ["--version"]],
+      ];
+const HAS_PYTHON = PYTHON_PROBES.some(
+  ([bin, args]) =>
+    spawnSync(bin, args, { stdio: "ignore", shell: process.platform === "win32", windowsHide: true }).status === 0,
+);
 
 describe("detectRuntimes", () => {
   it("returns a flat snapshot carrying every known runtime key", async () => {
@@ -24,12 +45,14 @@ describe("detectRuntimes", () => {
     }
   });
 
-  it("detects python across the per-platform candidate list", async () => {
+  it.skipIf(!HAS_PYTHON)("detects python across the per-platform candidate list", async () => {
     // The candidate list (py -3 / python / python3 on win32; python3 /
     // python on posix) means python is found even when the hard-coded
-    // legacy name (`python` on win32) is absent. The test runner and all
-    // CI legs ship at least one of these, so a falsey value here is a
-    // real regression in the candidate-walk, not env flake.
+    // legacy name (`python` on win32) is absent. Gated on HAS_PYTHON: with
+    // a python on the box, a falsey value here is a real regression in the
+    // candidate-walk; without one, this asserts nothing about the code, so
+    // it skips (and the skip is visible in the runner output) instead of
+    // failing a python-less machine.
     const snap = await detectRuntimes();
     expect(snap.python).toBeTruthy();
   });

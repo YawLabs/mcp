@@ -92,11 +92,18 @@ export function buildToolList(
     seen.add(meta.name);
   }
 
-  // Active upstream tools
+  // Active upstream tools. The `seen` guard is load-bearing: the
+  // namespaced name is `${namespace}_${tool}`, so (ns=`gh`,
+  // tool=`actions_list`) and (ns=`gh_actions`, tool=`list`) both render as
+  // `gh_actions_list`. Without the check the SAME name would be emitted
+  // twice in tools/list (MCP names must be unique; clients dedupe
+  // arbitrarily or error). First writer wins here, matching the meta-tool
+  // precedence above; buildToolRoutes logs the collision.
   for (const conn of activeConnections.values()) {
     const filter = toolFilters?.get(conn.config.namespace);
     for (const tool of conn.tools) {
       if (filter && !filter.has(tool.name)) continue;
+      if (seen.has(tool.namespacedName)) continue;
       tools.push({
         name: tool.namespacedName,
         description: tool.description,
@@ -110,10 +117,17 @@ export function buildToolList(
   // Deferred tools from inactive-but-configured servers. Active entries
   // above win any collision — a tool the client just saw backed by a
   // live connection must not be silently swapped for a placeholder.
+  //
+  // The per-namespace filter applies here too: a namespace with a live
+  // filter but no connection would otherwise advertise its FULL cached
+  // tool set, so a filtered-out tool reappears the moment its server goes
+  // idle. Filters key on the BARE tool name, same as the active branch.
   for (const server of inactiveWithCache) {
     if (activeConnections.has(server.namespace)) continue;
     if (!server.toolCache || server.toolCache.length === 0) continue;
+    const filter = toolFilters?.get(server.namespace);
     for (const cached of server.toolCache) {
+      if (filter && !filter.has(cached.name)) continue;
       const namespacedName = `${server.namespace}_${cached.name}`;
       if (seen.has(namespacedName)) continue;
       tools.push({
@@ -157,13 +171,27 @@ export function buildToolRoutes(
   }
 
   // Deferred routes. Skip names that already route to an active
-  // connection — the active route is authoritative.
+  // connection — the active route is authoritative, and that shadowing is
+  // intended (no warn). A deferred-vs-DEFERRED collision is different:
+  // two idle servers whose cached names flatten to the same string, first
+  // one wins, and the loser's tool is unreachable until the operator
+  // renames a namespace. Warn on that so it isn't silent.
   for (const server of inactiveWithCache) {
     if (activeConnections.has(server.namespace)) continue;
     if (!server.toolCache || server.toolCache.length === 0) continue;
     for (const cached of server.toolCache) {
       const namespacedName = `${server.namespace}_${cached.name}`;
-      if (routes.has(namespacedName)) continue;
+      const existing = routes.get(namespacedName);
+      if (existing) {
+        if (existing.deferred && existing.namespace !== server.namespace) {
+          log("warn", "Deferred tool route collision; earlier cached server wins", {
+            tool: namespacedName,
+            winningNamespace: existing.namespace,
+            shadowedNamespace: server.namespace,
+          });
+        }
+        continue;
+      }
       routes.set(namespacedName, {
         namespace: server.namespace,
         originalName: cached.name,

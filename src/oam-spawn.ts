@@ -178,11 +178,30 @@ export function rewriteForOam(
   }
 
   if (command === "npx") {
+    // Only -y/--yes are recognized, so any OTHER npx flag (--package, -p,
+    // --node-options, ...) lands in `spec` and would be treated as the
+    // package name. Staying on npx is the safe answer -- reimplementing
+    // npx's arg parser here is not worth it -- but say WHY at debug level:
+    // from the outside, an opted-in server quietly running on node is
+    // indistinguishable from oam being absent.
     const positional = args.filter((a) => a !== "-y" && a !== "--yes");
     const [spec, ...rest] = positional;
     if (!spec) return { command, args };
-    const entry = deps.resolveEntry(packageName(spec));
-    if (!entry) return { command, args }; // not installed locally -> keep npx
+    if (spec.startsWith("-")) {
+      log("debug", "npx launch carries flags yaw-mcp does not parse; staying on npx instead of oam", {
+        flag: spec,
+        args,
+      });
+      return { command, args };
+    }
+    const pkg = packageName(spec);
+    const entry = deps.resolveEntry(pkg);
+    if (!entry) {
+      // oam run needs a real on-disk entry; it can't reproduce npx's
+      // fetch-on-demand. Keep npx.
+      log("debug", "npx package has no on-disk entry; staying on npx instead of oam", { package: pkg });
+      return { command, args };
+    }
     return toOam(entry, rest);
   }
 

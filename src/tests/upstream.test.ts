@@ -23,6 +23,17 @@ vi.mock("../secrets-vault.js", () => ({
   resolveSecretRefs: vi.fn(),
   unlock: vi.fn(),
   vaultPath: vi.fn().mockReturnValue("/tmp/fake-vault.json"),
+  // Real value, not a stub: upstream's collectSecretNames builds its scan
+  // regex from this (single source of truth for the `${secret:NAME}` shape),
+  // so a mocked-away export would break audit-name collection.
+  SECRET_REF_RE: /\$\{secret:([a-zA-Z0-9_.-]+)\}/g,
+}));
+
+// Mock the audit appender: the real one writes to ~/.yaw-mcp/secrets-audit.log,
+// and resolveServerEnv records events on BOTH the success and the missing-refs
+// path -- unit tests must not touch the developer's (or CI's) home dir.
+vi.mock("../secrets-audit.js", () => ({
+  appendAuditEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Stub logger to silence output in tests that don't test logging,
@@ -123,6 +134,7 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 // Import the mocked modules so the wiring tests can configure/assert them.
 import { defaultRuntime } from "../default-runtime.js";
 import { resolveOamSpawn } from "../oam-spawn.js";
+import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock } from "../secrets-vault.js";
 
@@ -448,6 +460,47 @@ describe("resolveServerEnv", () => {
     await expect(connectToUpstream(config)).rejects.toThrow(
       /vault: missing or undecryptable secret refs: MISSING_NAME/,
     );
+  });
+
+  it("records a 'missing' audit event BEFORE refusing the spawn", async () => {
+    // The refusal is the case an operator goes looking for in
+    // `yaw-mcp secrets audit`; recording only on the success path left the
+    // "missing" event kind dead even though the CLI renders it.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { API_KEY: "${secret:MISSING_NAME}" },
+      missing: ["MISSING_NAME"],
+    });
+
+    const config = makeLocalConfig({ env: { API_KEY: "${secret:MISSING_NAME}" } });
+    await expect(connectToUpstream(config)).rejects.toThrow(/missing or undecryptable/);
+
+    expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
+      server: "test",
+      secret: "MISSING_NAME",
+      event: "missing",
+    });
+  });
+
+  it("records an 'injected' audit event per resolved secret NAME (never a value)", async () => {
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { MY_SECRET: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { API_KEY: "cleartext" }, missing: [] });
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("transport error"));
+
+    const config = makeLocalConfig({ env: { API_KEY: "${secret:MY_SECRET}" } });
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+
+    expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
+      server: "test",
+      secret: "MY_SECRET",
+      event: "injected",
+    });
   });
 
   it("throws when YAW_MCP_VAULT_PASSPHRASE is not set and secret refs are present", async () => {

@@ -11,7 +11,7 @@ import { defaultRuntime } from "./default-runtime.js";
 import { log } from "./logger.js";
 import { probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
-import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, vaultPath } from "./secrets-vault.js";
+import { hasSecretRefs, loadVault, resolveSecretRefs, SECRET_REF_RE, unlock, vaultPath } from "./secrets-vault.js";
 import type {
   UpstreamConnection,
   UpstreamPromptDef,
@@ -58,14 +58,14 @@ async function resolveServerEnv(env: Record<string, string>, namespace: string):
   }
   const key = await unlock(vault, passphrase);
   const { resolved, missing } = resolveSecretRefs(env, vault, key);
-  if (missing.length > 0) {
-    throw new Error(`vault: missing or undecryptable secret refs: ${missing.join(", ")}`);
-  }
   // Audit which secrets were consumed for this spawn -- NAME + namespace
   // only, never a value. Wrapped in try/catch (and each append is itself
-  // fail-open) so a broken audit log can never block the spawn. Runs only
-  // after a fully successful resolve (no missing refs reach this point --
-  // we throw above), so every recorded event is an "injected".
+  // fail-open) so a broken audit log can never block the spawn.
+  //
+  // Recorded BEFORE the missing-refs throw below: a FAILED spawn is exactly
+  // the case an operator goes looking for in `yaw-mcp secrets audit`, and
+  // the "missing" event kind is already advertised by that renderer. Audit
+  // first, then refuse.
   try {
     await recordResolveAudit(namespace, env, missing);
   } catch (auditErr) {
@@ -73,6 +73,9 @@ async function resolveServerEnv(env: Record<string, string>, namespace: string):
       namespace,
       error: auditErr instanceof Error ? auditErr.message : String(auditErr),
     });
+  }
+  if (missing.length > 0) {
+    throw new Error(`vault: missing or undecryptable secret refs: ${missing.join(", ")}`);
   }
   return resolved;
 }
@@ -99,7 +102,12 @@ async function recordResolveAudit(namespace: string, env: Record<string, string>
 /** Distinct `${secret:NAME}` names referenced across an env map. */
 function collectSecretNames(env: Record<string, string>): string[] {
   const names = new Set<string>();
-  const re = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
+  // Single source of truth for the ref shape is secrets-vault's
+  // SECRET_REF_RE. It carries /g and is module-shared, and matchAll seeds
+  // its internal clone from the source's lastIndex -- so build a fresh
+  // instance from it rather than scanning with the shared object, which a
+  // stale lastIndex elsewhere could make silently skip leading matches.
+  const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
   for (const v of Object.values(env)) {
     if (typeof v !== "string") continue;
     for (const m of v.matchAll(re)) names.add(m[1]);
@@ -182,9 +190,12 @@ export class ActivationError extends Error {
  * Strategy: for each env value that came from a `${secret:NAME}` ref
  * (i.e. anything that wasn't a literal at config time -- we approximate
  * by redacting EVERY env value of meaningful length), replace exact
- * occurrences with `${secret:NAME}` (when we know the name) or `***`.
- * We also drop ${secret:NAME} literals themselves to `${secret:***}` in
- * case any leaked unresolved.
+ * occurrences with `***ENVKEY***`, where ENVKEY is the env var the value
+ * was bound to (e.g. a leaked GITHUB_TOKEN value becomes
+ * `***GITHUB_TOKEN***`). Naming the key keeps the message actionable --
+ * the reader learns WHICH credential the server rejected without ever
+ * seeing it. We also drop ${secret:NAME} literals themselves to
+ * `${secret:***}` in case any leaked unresolved.
  *
  * The redactor is conservative: short values (<8 chars) are skipped to
  * avoid mangling unrelated substrings; the goal is to catch the high-
@@ -346,12 +357,14 @@ async function connectToUpstreamOnce(
       }
     }
 
-    // Resolve ${secret:NAME} references in the server's env against
-    // the local secret vault.  Requires YAW_MCP_VAULT_PASSPHRASE in
-    // env to unlock the vault; without it (or with no vault), the
-    // literal `${secret:NAME}` is passed through and the child process
-    // surfaces its own "missing env var" error, which is louder than
-    // silently passing an empty string.
+    // Resolve ${secret:NAME} references in the server's env against the
+    // local secret vault. Fail-CLOSED: when the env carries refs and
+    // YAW_MCP_VAULT_PASSPHRASE is unset (or no vault exists, or a name is
+    // missing/undecryptable), resolveServerEnv THROWS and the server never
+    // spawns -- the literal `${secret:NAME}` is NOT passed through to the
+    // child. A ref-free env skips the vault entirely and passes through
+    // unchanged. The throw is a plain Error, so the oam boot-probe
+    // downgrade below deliberately does not retry it.
     const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace);
     resolvedServerEnv = serverEnv;
     const stdioTransport = new StdioClientTransport({

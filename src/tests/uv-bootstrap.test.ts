@@ -14,7 +14,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
+import { spawnSync } from "node:child_process";
 import { __resetUvBootstrap, resolveUvSpawn } from "../uv-bootstrap.js";
+
+// Is uv reachable on this machine? Probed ONCE here instead of inside each
+// test: the previous shape returned early when uv was absent, so the test
+// reported GREEN while asserting nothing. `it.skipIf` makes the skip show up
+// in the runner output, which is the honest signal.
+const UV_PRESENT = spawnSync("uv", ["--version"], { stdio: "ignore" }).status === 0;
 
 describe("resolveUvSpawn", () => {
   beforeEach(() => {
@@ -48,7 +55,7 @@ describe("resolveUvSpawn", () => {
 // The PATH-hit path and the uvx→uv tool run rewrite depend on
 // whether uv is installed on the machine running the tests. Rather
 // than mocking child_process (which would test the mock, not the
-// code) we run these conditionally based on what's actually there.
+// code) we run these conditionally (it.skipIf) on what's actually there.
 describe("resolveUvSpawn with uv present", () => {
   beforeEach(() => {
     __resetUvBootstrap();
@@ -66,19 +73,13 @@ describe("resolveUvSpawn with uv present", () => {
   // isUvSpawnTarget accepts either form.
   const isUvSpawnTarget = (cmd: string): boolean => cmd === "uv" || /uv(\.exe)?$/.test(cmd);
 
-  it("returns a uv spawn target (bare or bootstrapped path) when uv is reachable", async () => {
-    const { spawnSync } = await import("node:child_process");
-    const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
-    if (probe.status !== 0) return;
+  it.skipIf(!UV_PRESENT)("returns a uv spawn target (bare or bootstrapped path) when uv is reachable", async () => {
     const result = await resolveUvSpawn("uv", ["--version"]);
     expect(isUvSpawnTarget(result.command)).toBe(true);
     expect(result.args).toEqual(["--version"]);
   });
 
-  it("rewrites uvx to `uv tool run` when uv is reachable", async () => {
-    const { spawnSync } = await import("node:child_process");
-    const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
-    if (probe.status !== 0) return;
+  it.skipIf(!UV_PRESENT)("rewrites uvx to `uv tool run` when uv is reachable", async () => {
     // uvx is sugar for `uv tool run`. Previously we passed uvx
     // through unchanged when uv was on PATH, which broke when uv.exe
     // was reachable but uvx.exe wasn't (Windows PATHEXT cases, or
@@ -89,19 +90,13 @@ describe("resolveUvSpawn with uv present", () => {
     expect(result.args).toEqual(["tool", "run", "mcp-server-fetch"]);
   });
 
-  it("preserves additional args when rewriting uvx", async () => {
-    const { spawnSync } = await import("node:child_process");
-    const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
-    if (probe.status !== 0) return;
+  it.skipIf(!UV_PRESENT)("preserves additional args when rewriting uvx", async () => {
     const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
     expect(isUvSpawnTarget(result.command)).toBe(true);
     expect(result.args).toEqual(["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"]);
   });
 
-  it("rewrites uvx with empty args", async () => {
-    const { spawnSync } = await import("node:child_process");
-    const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
-    if (probe.status !== 0) return;
+  it.skipIf(!UV_PRESENT)("rewrites uvx with empty args", async () => {
     const result = await resolveUvSpawn("uvx", []);
     expect(isUvSpawnTarget(result.command)).toBe(true);
     expect(result.args).toEqual(["tool", "run"]);
