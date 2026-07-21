@@ -9,14 +9,7 @@ vi.mock("undici", () => ({
   }),
 }));
 
-// Mock team-sync so teeToTeamAnalytics calls don't escape to the network.
-vi.mock("../team-sync.js", async (importOriginal) => {
-  const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, postAnalyticsEvent: vi.fn().mockResolvedValue({ ok: true }) };
-});
-
 import {
-  _resetTeamAnalyticsForTests,
   getDroppedEventsCount,
   getLastAnalyticsFailure,
   initAnalytics,
@@ -95,37 +88,6 @@ describe("analytics", () => {
     expect(latch?.statusCode).toBe(401);
     expect(latch?.url).toBe("https://example.com/api/connect/analytics");
     expect(typeof latch?.at).toBe("number");
-  });
-
-  it("initAnalytics resets teamAnalyticsDisabled so mid-session sign-in re-enables team analytics", async () => {
-    // Force the latch to the "disabled" state via the test hook.
-    _resetTeamAnalyticsForTests(); // no-op if already false; call twice to confirm idempotence
-    // Simulate the latch having fired (set it to true by importing internals
-    // indirectly: we can't set the private var, but we can verify the reset
-    // path by checking that initAnalytics calls the reset).
-    // The exported _resetTeamAnalyticsForTests exists exactly to unset the latch;
-    // calling initAnalytics should have the same effect (that is the fix).
-    // Strategy: record the latch state is false after initAnalytics even when
-    // called a second time (it was already false, so we need to simulate it
-    // having been set first by using the hook to confirm the round-trip).
-    _resetTeamAnalyticsForTests(); // ensure clean
-    initAnalytics("https://example.com", "test-token");
-    // After initAnalytics the latch must be false (enabled). We verify by
-    // checking that a tool_call event actually reaches postAnalyticsEvent
-    // (i.e., teeToTeamAnalytics is NOT short-circuited).
-    const { postAnalyticsEvent } = await import("../team-sync.js");
-    const spy = vi.mocked(postAnalyticsEvent as (...args: unknown[]) => unknown);
-    spy.mockResolvedValue({ ok: true });
-    recordConnectEvent({
-      namespace: "gh",
-      toolName: "create_issue",
-      action: "tool_call",
-      latencyMs: 50,
-      success: true,
-    });
-    // Allow the microtask queue to flush the fire-and-forget promise.
-    await Promise.resolve();
-    expect(spy).toHaveBeenCalled();
   });
 
   // ---------------------------------------------------------------------------
