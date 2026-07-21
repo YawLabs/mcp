@@ -91,4 +91,18 @@ describe("formatCostLabel", () => {
     expect(formatCostLabel({ tools: 22, bytes: 11_200, tokens: 2_800, cached: true })).toBe("22 tools, ~2.8k tokens");
     expect(formatCostLabel({ tools: 50, bytes: 100_000, tokens: 25_000, cached: false })).toBe("50 tools, 25k tokens");
   });
+
+  it("renders the 10k boundary consistently (9999 and 10000 both read '10k')", () => {
+    // Regression: the one-decimal branch used to catch 9999 and render
+    // "10.0k" while 10000 rendered "10k" -- a one-token difference that
+    // flipped the notation. Both must land on the same shape.
+    const at9999 = formatCostLabel({ tools: 40, bytes: 39_996, tokens: 9_999, cached: false });
+    const at10000 = formatCostLabel({ tools: 40, bytes: 40_000, tokens: 10_000, cached: false });
+    expect(at9999).toBe("40 tools, 10k tokens");
+    expect(at10000).toBe("40 tools, 10k tokens");
+    // Just below the rounding boundary still gets the decimal form.
+    expect(formatCostLabel({ tools: 40, bytes: 39_000, tokens: 9_900, cached: false })).toBe("40 tools, 9.9k tokens");
+    // And the low end of the k range is unchanged.
+    expect(formatCostLabel({ tools: 4, bytes: 4_000, tokens: 1_000, cached: false })).toBe("4 tools, 1.0k tokens");
+  });
 });

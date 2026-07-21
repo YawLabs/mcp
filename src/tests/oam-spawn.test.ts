@@ -13,7 +13,7 @@ import {
   resolveNpmEntry,
   rewriteForOam,
   winNormalize,
-} from "./oam-spawn.js";
+} from "../oam-spawn.js";
 
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {

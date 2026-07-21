@@ -34,14 +34,27 @@ vi.mock("../config.js", async (importOriginal) => {
 import { request } from "undici";
 import { fetchConfig } from "../config.js";
 
+// recordDispatchEvent MUST be stubbed here: server.ts calls it on every
+// proxied tool call, and a missing export would throw a TypeError that the
+// production catch-all swallows -- the telemetry would silently never fire
+// and no test would notice.
 vi.mock("../analytics.js", () => ({
   initAnalytics: vi.fn(),
   recordConnectEvent: vi.fn(),
+  recordDispatchEvent: vi.fn(),
   shutdownAnalytics: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { recordDispatchEvent } from "../analytics.js";
 import { buildToolList } from "../proxy.js";
-import { ConnectServer, computeToolOverlaps, isAutoLoadEnabled } from "../server.js";
+import {
+  ConnectServer,
+  computeToolOverlaps,
+  isAutoLoadEnabled,
+  isRoutingFaultText,
+  ROUTING_FAULT_DISCONNECTED,
+  ROUTING_FAULT_UNKNOWN_TOOL,
+} from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { connectToUpstream, disconnectFromUpstream } from "../upstream.js";
 
@@ -535,8 +548,10 @@ describe("ConnectServer", () => {
 
     it("fix#3: all-failed activation still sets isError true", async () => {
       // anyError=true and anyChanged=false. The old code's condition was
-      // `anyError && !anyChanged ? true : undefined`; the fix simplifies
-      // to `anyError ? true : undefined` so the model always sees failures.
+      // `anyError && !anyChanged ? true : undefined`; the current one is
+      // `anyError || (anyCapped && !anyChanged) ? true : undefined`, so a
+      // real failure ALWAYS surfaces (the anyChanged conjunct is gone) and
+      // a cap refusal only errors when nothing loaded at all.
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "bad" })]);
       vi.mocked(connectToUpstream).mockRejectedValue(new Error("bad server down"));
@@ -562,7 +577,9 @@ describe("ConnectServer", () => {
         const result = await priv.handleActivate(["gh", "bad"]);
         // anyError=true (bad refused), anyChanged=true (gh loaded).
         // Old logic: isError = anyError && !anyChanged = false -> undefined.
-        // New logic: isError = anyError ? true : undefined -> true.
+        // Current logic: anyError alone forces true, regardless of
+        // anyChanged (the anyCapped clause is the only one that still
+        // consults it).
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toContain("Refused");
       } finally {
@@ -1656,6 +1673,38 @@ describe("ConnectServer", () => {
       expect(conn.health.totalLatencyMs).toBeGreaterThanOrEqual(0);
     });
 
+    it("records a dispatch telemetry event for a proxied tool call", async () => {
+      // Guards the analytics mock as much as the code: server.ts calls
+      // recordDispatchEvent inside a try/catch, so an unstubbed export
+      // (TypeError) would be swallowed and the telemetry would silently
+      // stop firing. Assert the payload shape, not just the call.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "Issue created" }],
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      await priv.handleToolCall("gh_create_issue", { title: "test" });
+
+      expect(vi.mocked(recordDispatchEvent)).toHaveBeenCalledTimes(1);
+      const event = vi.mocked(recordDispatchEvent).mock.calls[0][0];
+      expect(event.scope).toBe("connect");
+      // The upstream's own tool name, not the namespaced alias.
+      expect(event.toolName).toBe("create_issue");
+      expect(event.requestBytes).toBe(Buffer.byteLength(JSON.stringify({ title: "test" }), "utf8"));
+      expect(event.responseBytesRaw).toBeGreaterThan(0);
+    });
+
+    it("meta-tool calls do NOT emit a dispatch telemetry event", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([]);
+      await priv.handleToolCall("mcp_connect_discover", {});
+      expect(vi.mocked(recordDispatchEvent)).not.toHaveBeenCalled();
+    });
+
     it("tracks error health on failed tool calls", async () => {
       const priv = getPrivate(server);
       const conn = makeConnection("gh", ["create_issue"]);
@@ -1711,6 +1760,37 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("nonexistent_tool", {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Unknown tool");
+    });
+
+    it("every routing-fault message is recognized by isRoutingFaultText", async () => {
+      // handleExec attributes step blame by substring-matching these
+      // markers. Two of the four messages are produced in proxy.ts, so a
+      // reword there (out of server.ts's reach) would silently start
+      // penalizing an upstream for yaw-mcp's own routing miss. Pin the
+      // real strings, not the constants alone.
+      const priv = getPrivate(server);
+
+      // 1. Unknown tool (proxy.ts).
+      const unknown = await priv.handleToolCall("nonexistent_tool", {});
+      expect(unknown.content[0].text).toContain(ROUTING_FAULT_UNKNOWN_TOOL);
+      expect(isRoutingFaultText(unknown.content[0].text)).toBe(true);
+
+      // 2. Route survives but the connection is gone (proxy.ts).
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+      priv.rebuildRoutes();
+      priv.connections.delete("gh");
+      const gone = await priv.handleToolCall("gh_create_issue", {});
+      expect(gone.content[0].text).toContain(ROUTING_FAULT_DISCONNECTED);
+      expect(isRoutingFaultText(gone.content[0].text)).toBe(true);
+
+      // 3. Auto-reconnect exhausted (server.ts) -- covered by the
+      // "returns error when auto-reconnect fails" case above; assert the
+      // marker predicate agrees with the phrasing it asserts.
+      expect(isRoutingFaultText('Server "gh" disconnected and auto-reconnect failed: still down.')).toBe(true);
+
+      // Negative control: a genuine upstream failure is NOT a routing fault.
+      expect(isRoutingFaultText("GITHUB_TOKEN is invalid")).toBe(false);
     });
 
     it("auto-activates a deferred upstream on first tools/call and re-dispatches", async () => {
@@ -2430,6 +2510,28 @@ describe("guide resource + session tracking", () => {
     // One-shot: a second call does NOT add the nudge again.
     const res2 = priv.attachGuideNudge({ content: [{ type: "text", text: "second-body" }] });
     expect(res2.content[0].text).toBe("second-body");
+  });
+
+  it("does not bake the one-shot nudge into the cached discover result", async () => {
+    // attachGuideNudge used to mutate result.content in place. The object
+    // it received from buildDiscoverOutput is the SAME object stored in
+    // discoverCache, so the once-per-session hint got replayed on every
+    // cache hit for the rest of the 3s TTL.
+    const priv = getPrivate(server);
+    priv.config = { servers: [], configVersion: "v1" };
+    priv.guides = {
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
+      project: null,
+    };
+
+    const first = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(first.content[0].text).toContain("yaw-mcp://guide");
+
+    // Second call inside the cache TTL: same body, no nudge.
+    const second = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(second.content[0].text).not.toContain("yaw-mcp://guide");
+    // ...and the cache itself is still clean.
+    expect(priv.discoverCache.result.content[0].text).not.toContain("yaw-mcp://guide");
   });
 
   it("does NOT nudge when no guide is loaded", () => {

@@ -56,6 +56,10 @@ export interface AuditCommandResult {
 // We only redact the value, never the flag name -- the operator still needs
 // to see WHICH flag was passed, just not what was passed to it. Matches the
 // `--flag value` shape; the `--flag=value` shape is handled separately below.
+//
+// Stored lowercase and matched case-insensitively: flag casing is a style
+// choice, not a semantic one, and a case-sensitive Set printed `--Token abc`
+// (or `--API-KEY=...`) with the secret fully in the clear.
 const SECRET_FLAG_NAMES = new Set<string>([
   "--api-key",
   "--apikey",
@@ -74,12 +78,19 @@ const SECRET_FLAG_NAMES = new Set<string>([
  *   ["--token=abc"]       -> ["--token=<redacted>"]
  * Bare flags with no following value are left alone (the redaction target
  * is the value, not the presence of the flag).
+ * Flag matching is CASE-INSENSITIVE: `--Token` / `--API-KEY` redact exactly
+ * like `--token` / `--api-key`. The flag name itself is echoed back with the
+ * operator's original casing.
+ *
+ * Exported for tests -- the redaction is a leak-prevention control, so it is
+ * asserted directly as well as through the `audit` preamble.
  */
-function redactSecretArgs(args: readonly string[]): string[] {
+export function redactSecretArgs(args: readonly string[]): string[] {
+  const isSecretFlag = (s: string): boolean => SECRET_FLAG_NAMES.has(s.toLowerCase());
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i] ?? "";
-    if (SECRET_FLAG_NAMES.has(a)) {
+    if (isSecretFlag(a)) {
       out.push(a);
       if (i + 1 < args.length) {
         out.push("<redacted>");
@@ -88,7 +99,7 @@ function redactSecretArgs(args: readonly string[]): string[] {
       continue;
     }
     const eq = a.indexOf("=");
-    if (eq > 0 && SECRET_FLAG_NAMES.has(a.slice(0, eq))) {
+    if (eq > 0 && isSecretFlag(a.slice(0, eq))) {
       out.push(`${a.slice(0, eq)}=<redacted>`);
       continue;
     }

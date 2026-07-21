@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
 
 describe("parseSecretsArgs", () => {
@@ -167,8 +167,15 @@ describe("parseSecretsArgs", () => {
 // surface -- `secrets push` and `secrets pull` no longer exist. The local
 // vault suites below (set / rotate / audit / TTY) are unaffected.
 
-import { lock, saveVault, vaultPath } from "../secrets-vault.js";
+import { lock, vaultPath } from "../secrets-vault.js";
 
+/** Fresh throwaway HOME per test. mkdtemp (not a fixed tmpdir path) so
+ *  parallel runs can't collide, and rmSync in afterEach so the suite does
+ *  not leave a pile of yaw-test-* directories behind in os.tmpdir(). */
+function makeHome(): string {
+  const dir = mkdtempSync(nodePath.join(os.tmpdir(), "yaw-mcp-cmd-"));
+  return dir;
+}
 
 // -----------------------------------------------------------------------
 // runSecrets set -- wrong-passphrase and empty-passphrase rejection
@@ -176,18 +183,19 @@ import { lock, saveVault, vaultPath } from "../secrets-vault.js";
 
 describe("runSecrets set -- passphrase guards", () => {
   const io = { out: vi.fn(), err: vi.fn() };
-  const home = nodePath.join(os.tmpdir(), `yaw-test-set-${process.pid}`);
+  let home: string;
 
   beforeEach(async () => {
     io.out.mockReset();
     io.err.mockReset();
     lock(); // clear any cached key from a prior test
+    home = makeHome();
     await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-    try {
-      await unlink(vaultPath(home));
-    } catch {
-      /* ok */
-    }
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
   });
 
   it("creates a vault on first set, then rejects a wrong passphrase on a later set", async () => {
@@ -265,7 +273,7 @@ class FakeTTYStdin {
 }
 
 describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
-  const home = nodePath.join(os.tmpdir(), `yaw-test-ctrld-${process.pid}`);
+  let home: string;
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
   const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   const io = { out: vi.fn(), err: vi.fn() };
@@ -275,12 +283,13 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
     io.err.mockReset();
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
     await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-    try {
-      await unlink(vaultPath(home));
-    } catch {
-      /* ok */
-    }
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
   });
 
   it("treats typed chars followed by Ctrl-D (\\u0004) as cancel, NOT a partial submit", async () => {
@@ -305,6 +314,27 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
     expect(errOutput.toLowerCase()).toMatch(/passphrase required/);
     // No vault should have been written under a "abc"-derived key.
   });
+
+  it("treats Ctrl-C (\\u0003) as cancel -> exit 130, without killing the process", async () => {
+    const ETX = String.fromCharCode(3);
+    // A single prompt: type "abc" then ^C. The reader must hand back a
+    // cancellation (exit 130) rather than calling process.exit(130) itself --
+    // if it did, this test would take the whole vitest worker down with it.
+    const stdin = new FakeTTYStdin([`abc${ETX}`]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput.toLowerCase()).toContain("cancelled");
+  });
 });
 
 // -----------------------------------------------------------------------
@@ -313,18 +343,19 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
 
 describe("runSecrets rotate", () => {
   const io = { out: vi.fn(), err: vi.fn() };
-  const home = nodePath.join(os.tmpdir(), `yaw-test-rotate-${process.pid}`);
+  let home: string;
 
   beforeEach(async () => {
     io.out.mockReset();
     io.err.mockReset();
     lock();
+    home = makeHome();
     await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
-    try {
-      await unlink(vaultPath(home));
-    } catch {
-      /* ok */
-    }
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
   });
 
   it("re-encrypts the vault: new passphrase reads, old one no longer does", async () => {
@@ -391,12 +422,17 @@ describe("runSecrets rotate", () => {
 
 describe("runSecrets audit", () => {
   const io = { out: vi.fn(), err: vi.fn() };
-  const home = nodePath.join(os.tmpdir(), `yaw-test-secaudit-${process.pid}`);
+  let home: string;
 
   beforeEach(async () => {
     io.out.mockReset();
     io.err.mockReset();
+    home = makeHome();
     await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
   });
 
   it("reports an empty trail when nothing has been recorded", async () => {

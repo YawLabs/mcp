@@ -1,6 +1,6 @@
 import { request } from "undici";
+import { shouldSendBearer } from "./analytics.js";
 import { log } from "./logger.js";
-import { isLoopbackHost } from "./url-safety.js";
 
 // POST /api/connect/heartbeat — fires when an MCP client (Claude Code,
 // Cursor, Claude Desktop, VS Code, ...) attaches to yaw-mcp via stdio and
@@ -50,30 +50,23 @@ export function initHeartbeat(url: string, tok: string): void {
 }
 
 /**
- * Decide whether it's safe to send `Authorization: Bearer ...` to the
- * given URL. Bearers go over https://, OR over http:// only to loopback.
- * Returns false (and emits a one-time warning) for any other scheme.
+ * `onInsecure` handler for the shared shouldSendBearer predicate (see
+ * analytics.ts -- one implementation of the "is this URL safe to put the
+ * account token on" rule for every background poster). This side owns only
+ * the heartbeat-specific warn text and its one-shot latch.
+ *
+ * A malformed URL does not reach here: shouldSendBearer returns false for
+ * it without calling back, so garbage still fails at the transport layer
+ * with its usual error and never gets a bearer attached.
  */
-function shouldSendBearer(targetUrl: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(targetUrl);
-  } catch {
-    // Malformed URL — let the request fail at the transport layer with
-    // its usual error. Don't attach a bearer to garbage either way.
-    return false;
-  }
-  if (parsed.protocol === "https:") return true;
-  if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return true;
-  if (!warnedInsecureBearerSkip) {
-    log(
-      "warn",
-      "Heartbeat URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
-      { url: targetUrl },
-    );
-    warnedInsecureBearerSkip = true;
-  }
-  return false;
+function warnInsecureBearerSkip(targetUrl: string): void {
+  if (warnedInsecureBearerSkip) return;
+  log(
+    "warn",
+    "Heartbeat URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+    { url: targetUrl },
+  );
+  warnedInsecureBearerSkip = true;
 }
 
 export async function reportHeartbeat(
@@ -89,7 +82,7 @@ export async function reportHeartbeat(
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
-    if (shouldSendBearer(fullUrl)) {
+    if (shouldSendBearer(fullUrl, warnInsecureBearerSkip)) {
       headers.Authorization = `Bearer ${token}`;
     }
     const res = await request(fullUrl, {

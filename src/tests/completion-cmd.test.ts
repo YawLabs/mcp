@@ -68,6 +68,12 @@ describe("parseCompletionArgs", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe(COMPLETION_USAGE);
   });
+
+  it("rejects unknown flags instead of silently ignoring them", () => {
+    const r = parseCompletionArgs(["bash", "--verbose"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('unknown flag "--verbose"');
+  });
 });
 
 describe("renderScript — bash", () => {
@@ -90,6 +96,15 @@ describe("renderScript — bash", () => {
     expect(s).toContain("claude-desktop");
     expect(s).toContain("cursor");
     expect(s).toContain("vscode");
+  });
+
+  it("offers positional alternatives at the SAME argument position (one compgen word list)", () => {
+    const s = renderScript("bash");
+    // All four install clients complete at `install <TAB>`, not one per slot.
+    expect(s).toContain('compgen -W "claude-code claude-desktop cursor vscode"');
+    // Same for bundles actions and completion shells.
+    expect(s).toContain('compgen -W "list match"');
+    expect(s).toContain('compgen -W "bash zsh fish powershell"');
   });
 
   it("includes install flags", () => {
@@ -120,6 +135,13 @@ describe("renderScript — zsh", () => {
       expect(spec.description.length).toBeGreaterThan(0);
     }
   });
+
+  it("offers positional alternatives at the same _arguments slot", () => {
+    const s = renderScript("zsh");
+    expect(s).toContain("'1: :(claude-code claude-desktop cursor vscode)'");
+    expect(s).toContain("'1: :(bash zsh fish powershell)'");
+    expect(s).toContain("'1: :(list match)'");
+  });
 });
 
 describe("renderScript — fish", () => {
@@ -139,6 +161,12 @@ describe("renderScript — fish", () => {
     const s = renderScript("fish");
     expect(s).toMatch(/__fish_seen_subcommand_from install/);
   });
+
+  it("offers positional alternatives at the same argument position", () => {
+    const s = renderScript("fish");
+    expect(s).toContain('-a "claude-code claude-desktop cursor vscode"');
+    expect(s).toContain('-a "list match"');
+  });
 });
 
 describe("renderScript — powershell", () => {
@@ -153,6 +181,12 @@ describe("renderScript — powershell", () => {
     for (const sub of SUBCOMMAND_NAMES) {
       expect(s).toContain(`'${sub}'`);
     }
+  });
+
+  it("offers positional alternatives at the same token position", () => {
+    const s = renderScript("powershell");
+    expect(s).toContain("@('claude-code', 'claude-desktop', 'cursor', 'vscode')");
+    expect(s).toContain("@('list', 'match')");
   });
 });
 
@@ -178,10 +212,25 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     expect(SUBCOMMAND_NAMES).toContain("foundry");
   });
 
-  it("includes the local-server + account commands that were previously missing", () => {
-    for (const sub of ["add", "remove", "list", "try", "try-cleanup", "login", "logout", "sync", "stats", "secrets"]) {
+  it("includes the local-server commands that were previously missing", () => {
+    for (const sub of ["add", "remove", "list", "try", "try-cleanup", "secrets"]) {
       expect(SUBCOMMAND_NAMES).toContain(sub);
     }
+  });
+
+  it("does not advertise the subcommands removed with the Yaw Team surface (45a3462)", () => {
+    for (const dead of ["login", "logout", "sync", "stats", "token", "set-active"]) {
+      expect(SUBCOMMAND_NAMES).not.toContain(dead);
+      expect([...KNOWN_SUBCOMMANDS]).not.toContain(dead);
+    }
+  });
+
+  it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit in, push/pull/--force out)", () => {
+    const secrets = SUBCOMMAND_SPEC.find((s) => s.name === "secrets");
+    expect(secrets).toBeDefined();
+    expect(secrets?.positional?.[0]).toEqual(["set", "get", "list", "remove", "lock", "rotate", "audit"]);
+    expect(secrets?.flags).toEqual(expect.arrayContaining(["--value", "--stdin", "--secret", "--server", "--json"]));
+    expect(secrets?.flags).not.toContain("--force");
   });
 });
 

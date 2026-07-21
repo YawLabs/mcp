@@ -273,6 +273,24 @@ export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {
   }
 
   if (!file) {
+    // Even when the winning project file is present-but-malformed (config
+    // null, warnings surfaced), defaultRuntime is still a MACHINE-level knob
+    // -- fall through to the user-global file for it, same rationale as the
+    // valid-project case below. The scratch array keeps the global file's own
+    // diagnostics out of the result (its servers are shadowed either way).
+    if (sourcePath === projectPath && projectPath !== null) {
+      const scratch: string[] = [];
+      const globalResult = await readBundlesAt(globalPath, scratch);
+      if (globalResult.file?.defaultRuntime !== undefined) {
+        return {
+          config: null,
+          path: sourcePath,
+          warnings,
+          defaultRuntime: globalResult.file.defaultRuntime,
+          defaultRuntimePath: globalPath,
+        };
+      }
+    }
     return { config: null, path: sourcePath, warnings };
   }
 
@@ -324,6 +342,16 @@ export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {
 // overwrite the winner's. Gate both functions through a shared promise chain
 // (same pattern as saveState in persistence.ts) so they execute one at a
 // time within a single process.
+//
+// KNOWN LIMITATION: the chain serializes within ONE process only. Two
+// concurrent yaw-mcp PROCESSES (two terminals running `yaw-mcp add`, or the
+// CLI racing the Yaw Terminal app's own bundles.json writer) still race
+// last-write-wins across the read-modify-write window -- the atomic write
+// protects against torn/partial files, not lost updates. Cross-process
+// locking (lockfile / O_EXCL sidecar with stale-lock recovery) is
+// deliberately out of scope for now: the collision window is one small
+// read+write and the practical rate is low. If lost writes are ever
+// observed, add a lockfile around doUpsertUserBundle / doRemoveUserBundle.
 let bundleWriteChain: Promise<void> = Promise.resolve();
 
 /**

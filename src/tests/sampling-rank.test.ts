@@ -11,7 +11,6 @@ import {
   SAMPLING_TIMEOUT_MS,
   shouldSample,
   shouldTiebreak,
-  tiebreakViaSampling,
 } from "../sampling-rank.js";
 
 const candidates = [
@@ -96,6 +95,26 @@ describe("parseTiebreakResponse", () => {
     expect(parseTiebreakResponse("github vs gitlab -- pick github", candidates)).toBe("github");
   });
 
+  it("prefers the longest match when two namespaces tie on position (hyphen-prefix)", () => {
+    // '-' is a word boundary for \b, so "aws-s3" matches at the SAME index as
+    // "aws-s3-tools" inside "use aws-s3-tools". Iteration order must not
+    // decide the winner -- the longest (exact) match has to win, or the LLM
+    // naming the longer server gets misparsed as the shorter one.
+    const hyphenCandidates = [
+      { namespace: "aws-s3", score: 1.0, tools: [{ name: "list_buckets" }] },
+      { namespace: "aws-s3-tools", score: 0.98, tools: [{ name: "sync_bucket" }] },
+    ];
+    expect(parseTiebreakResponse("use aws-s3-tools for this", hyphenCandidates)).toBe("aws-s3-tools");
+    // Order-independent: same answer with the candidate list reversed.
+    expect(parseTiebreakResponse("use aws-s3-tools for this", [...hyphenCandidates].reverse())).toBe("aws-s3-tools");
+    // The shorter namespace is still parsed correctly when it is the one named.
+    expect(parseTiebreakResponse("use aws-s3 for this", hyphenCandidates)).toBe("aws-s3");
+    // A bare-namespace line still short-circuits on the exact-match branch.
+    expect(parseTiebreakResponse("aws-s3-tools", hyphenCandidates)).toBe("aws-s3-tools");
+    // An earlier-positioned candidate still beats a longer later one.
+    expect(parseTiebreakResponse("aws-s3 beats aws-s3-tools here", hyphenCandidates)).toBe("aws-s3");
+  });
+
   it("handles a namespace containing regex-special characters without throwing", () => {
     // Namespaces like "aws+s3" contain '+', which is a regex quantifier.
     // escapeRegex must neutralize it so the RegExp constructor doesn't throw
@@ -139,7 +158,10 @@ describe("buildCandidates", () => {
   });
 });
 
-describe("tiebreakViaSampling", () => {
+// Single-sample tiebreak == bestOfNViaSampling at n=1. There is no separate
+// tiebreakViaSampling helper any more (it duplicated this path and nothing in
+// production called it), so these pin the n=1 contract directly.
+describe("bestOfNViaSampling (n=1 single-sample tiebreak)", () => {
   function mockServer(
     caps: { sampling?: object } | undefined,
     createMessage?: (params: unknown) => Promise<unknown>,
@@ -152,13 +174,13 @@ describe("tiebreakViaSampling", () => {
 
   it("returns null when client does not support sampling", async () => {
     const server = mockServer(undefined);
-    const out = await tiebreakViaSampling(server, "intent", candidates);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 1);
     expect(out).toBeNull();
   });
 
   it("returns null with fewer than 2 candidates", async () => {
     const server = mockServer({ sampling: {} });
-    const out = await tiebreakViaSampling(server, "intent", [candidates[0]!]);
+    const out = await bestOfNViaSampling(server, "intent", [candidates[0]!], 1);
     expect(out).toBeNull();
   });
 
@@ -167,7 +189,7 @@ describe("tiebreakViaSampling", () => {
       content: { type: "text", text: "github" },
     });
     const server = mockServer({ sampling: {} }, createMessage);
-    const out = await tiebreakViaSampling(server, "intent", candidates);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 1);
     expect(out).toBe("github");
     expect(createMessage).toHaveBeenCalledTimes(1);
   });
@@ -177,7 +199,7 @@ describe("tiebreakViaSampling", () => {
       content: [{ type: "text", text: "gitlab is better" }],
     });
     const server = mockServer({ sampling: {} }, createMessage);
-    const out = await tiebreakViaSampling(server, "intent", candidates);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 1);
     expect(out).toBe("gitlab");
   });
 
@@ -186,14 +208,14 @@ describe("tiebreakViaSampling", () => {
       content: { type: "text", text: "I don't know" },
     });
     const server = mockServer({ sampling: {} }, createMessage);
-    const out = await tiebreakViaSampling(server, "intent", candidates);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 1);
     expect(out).toBeNull();
   });
 
   it("swallows createMessage errors and returns null", async () => {
     const createMessage = vi.fn().mockRejectedValue(new Error("upstream refused"));
     const server = mockServer({ sampling: {} }, createMessage);
-    const out = await tiebreakViaSampling(server, "intent", candidates);
+    const out = await bestOfNViaSampling(server, "intent", candidates, 1);
     expect(out).toBeNull();
   });
 });

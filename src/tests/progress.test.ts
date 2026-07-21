@@ -51,6 +51,18 @@ describe("createProgressReporter", () => {
     });
   });
 
+  it("never emits a progress value below the previous one (MCP monotonicity)", () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const report = createProgressReporter({
+      sendNotification: send,
+      _meta: { progressToken: "tok-mono" },
+    });
+    report("jump ahead", 5);
+    report("caller regressed", 2);
+    report("auto-increment is still behind"); // step 3, below the 5 already sent
+    expect(send.mock.calls.map((c) => c[0].params.progress)).toEqual([5, 5, 5]);
+  });
+
   it("swallows sendNotification rejection without throwing", async () => {
     const send = vi.fn().mockRejectedValue(new Error("transport closed"));
     const report = createProgressReporter({

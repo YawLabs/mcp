@@ -1,3 +1,11 @@
+// Single source of truth for the `${secret:NAME}` reference shape. This
+// file used to keep a byte-identical private copy; importing the real one
+// means a change to the reference syntax can't leave the values-free
+// secrets report matching the old shape. (secrets-vault does touch the
+// filesystem elsewhere in the module, but nothing runs at import time --
+// computeSecretsReport below stays pure.)
+import { SECRET_REF_RE } from "./secrets-vault.js";
+
 export const META_TOOLS = {
   discover: {
     name: "mcp_connect_discover",
@@ -250,7 +258,7 @@ export const META_TOOLS = {
   bundles: {
     name: "mcp_connect_bundles",
     description:
-      "List curated multi-server 'bundles' — presets like `pr-review` (github + linear) or `devops-incident` (github + pagerduty + slack) that commonly ship together. Use this BEFORE mcp_connect_discover when the user's intent maps to a known workflow (on-call triage, PR review, data pipeline debugging) — it returns a ready-to-run `mcp_connect_activate namespaces=[...]` call per bundle. With `action=\"match\"` (recommended after the user's installed list is known) the response partitions bundles into READY (every namespace already installed — activate now) and PARTIAL (some installed, some missing — shows the missing names and the mcp.hosting/explore install URL). With `action=\"list\"` (default) it returns the full curated catalog. Bundles are static client-side data, not a network call.",
+      "List curated multi-server 'bundles' — presets like `pr-review` (github + linear) or `devops-incident` (github + pagerduty + slack) that commonly ship together. Use this BEFORE mcp_connect_discover when the user's intent maps to a known workflow (on-call triage, PR review, data pipeline debugging) — it returns a ready-to-run `mcp_connect_activate namespaces=[...]` call per bundle. With `action=\"match\"` (recommended after the user's installed list is known) the response partitions bundles into READY (every namespace already installed — activate now) and PARTIAL (some installed, some missing — shows the missing names and the https://yaw.sh/mcp/explore install URL). With `action=\"list\"` (default) it returns the full curated catalog. Bundles are static client-side data, not a network call.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -458,11 +466,6 @@ export function buildInstallPayload(args: Record<string, unknown>): InstallPaylo
   return { ok: true, payload };
 }
 
-// `${secret:NAME}` reference matcher -- local copy so the pure report
-// helper below has no I/O dependency on secrets-vault. Kept byte-identical
-// to secrets-vault's SECRET_REF_RE.
-const SECRETS_REPORT_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
-
 export interface SecretsReportRow {
   server: string;
   /** Names the vault HAS and this server references (sorted). */
@@ -490,7 +493,10 @@ export function computeSecretsReport(
     const referenced = new Set<string>();
     for (const v of Object.values(server.env ?? {})) {
       if (typeof v !== "string") continue;
-      for (const m of v.matchAll(SECRETS_REPORT_REF_RE)) referenced.add(m[1]);
+      // String.matchAll clones the regex internally, so sharing the
+      // global-flagged SECRET_REF_RE with secrets-vault's own callers
+      // carries no lastIndex state between calls.
+      for (const m of v.matchAll(SECRET_REF_RE)) referenced.add(m[1]);
     }
     if (referenced.size === 0) continue;
     const injectedSecrets: string[] = [];

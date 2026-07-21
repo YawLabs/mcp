@@ -10,6 +10,50 @@ import type { ConnectConfig } from "./types.js";
 // don't pay the parse cost on absurd inputs.
 const MAX_CONFIG_BODY_BYTES = 5 * 1024 * 1024; // 5 MB
 
+// Non-2xx bodies are diagnostic text we splice into an error message, so
+// they get a far tighter cap than the config payload itself: a runaway
+// HTML error page (proxy interstitial, captive portal, 500-page with a
+// stack trace) must not be buffered whole just to build one line of
+// output. Anything past the cap is dropped with a "(truncated)" marker.
+const MAX_ERROR_BODY_BYTES = 8 * 1024; // 8 KB
+
+// The `type` values the backend is allowed to send. Anything else is a
+// backend/schema drift we can't route (upstream.ts switches on it), so
+// the server is dropped rather than half-loaded. Mirrors the
+// UpstreamServerConfig["type"] union in types.ts.
+const VALID_SERVER_TYPES: ReadonlySet<string> = new Set(["local", "remote"]);
+
+/**
+ * Read at most `maxBytes` of a response body into a string, best-effort.
+ * Used for error paths where we want *some* server text in the message
+ * without letting a hostile / runaway body drive memory. Never throws --
+ * a read failure just yields whatever arrived before it.
+ */
+async function readBodyCapped(body: AsyncIterable<unknown>, maxBytes: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let truncated = false;
+  try {
+    for await (const chunk of body) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      chunks.push(buf);
+      received += buf.length;
+      if (received >= maxBytes) {
+        truncated = true;
+        // Best-effort abandon of the rest so the socket can be released.
+        try {
+          (body as { destroy?: (err?: Error) => void }).destroy?.();
+        } catch {}
+        break;
+      }
+    }
+  } catch {
+    // Partial text is still more useful than none for a diagnostic.
+  }
+  const text = Buffer.concat(chunks).toString("utf8").slice(0, maxBytes);
+  return truncated ? `${text}... (truncated)` : text;
+}
+
 /**
  * Fetch the config from Yaw MCP.
  *
@@ -53,7 +97,7 @@ export async function fetchConfig(
   if (res.statusCode === 401) {
     await res.body.text().catch(() => {});
     throw new ConfigError(
-      `Token rejected (HTTP 401) — the token ${tokenFingerprint(token)} is invalid or revoked.\n  Generate a new token at https://yaw.sh/mcp/dashboard/settings/tokens,\n  then re-run \`yaw-mcp install <client> --token mcp_pat_...\` or set YAW_MCP_TOKEN.`,
+      `Token rejected (HTTP 401) -- the token ${tokenFingerprint(token)} is invalid or revoked.\n  Generate a new token at https://yaw.sh/mcp/dashboard/settings/tokens,\n  then re-run \`yaw-mcp install <client> --token mcp_pat_...\` or set YAW_MCP_TOKEN.`,
       true,
     );
   }
@@ -67,7 +111,7 @@ export async function fetchConfig(
   }
 
   if (res.statusCode !== 200) {
-    const body = await res.body.text().catch(() => "");
+    const body = await readBodyCapped(res.body, MAX_ERROR_BODY_BYTES);
     throw new ConfigError(`Config fetch failed (HTTP ${res.statusCode}): ${body}`, false);
   }
 
@@ -110,7 +154,11 @@ export async function fetchConfig(
     throw new ConfigError("Invalid config response from server", false);
   }
 
-  // Filter out servers missing required fields.
+  // Validate servers in ONE pass, warning once per drop reason. The
+  // reasons are checked in dependency order (presence -> type union ->
+  // namespace shape) so a later check never re-tests something an earlier
+  // one already rejected, and a dropped server produces exactly one log
+  // line explaining why.
   //
   // Intentional schema asymmetry vs. local-bundles.validateEntry: that path
   // SYNTHESIZES id/name/type from a bare namespace (locally-authored entries
@@ -123,12 +171,11 @@ export async function fetchConfig(
       log("warn", "Skipping server with missing required fields", { id: s.id, name: s.name, namespace: s.namespace });
       return false;
     }
-    return true;
-  });
-
-  // Filter out servers with invalid namespaces
-  data.servers = data.servers.filter((s) => {
-    if (!s.namespace || !NAMESPACE_RE.test(s.namespace)) {
+    if (!VALID_SERVER_TYPES.has(s.type)) {
+      log("warn", "Skipping server with unrecognized type", { type: s.type, name: s.name, namespace: s.namespace });
+      return false;
+    }
+    if (!NAMESPACE_RE.test(s.namespace)) {
       log("warn", "Skipping server with invalid namespace", { namespace: s.namespace, name: s.name });
       return false;
     }

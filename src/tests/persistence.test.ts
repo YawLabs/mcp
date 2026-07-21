@@ -189,8 +189,10 @@ describe("persistence.saveState", () => {
   });
 
   it("does NOT reject/throw when atomicWriteFile fails (best-effort swallow)", async () => {
-    // Point saveState at a path whose parent is a regular file so the
-    // underlying atomicWriteFile will throw ENOTDIR. saveState must swallow
+    // Point saveState at a path whose parent is a regular file. The
+    // underlying atomicWriteFile fails in its mkdir -p step with EEXIST
+    // (recursive mkdir only swallows EEXIST for directories, not for a
+    // regular file already sitting at that path). saveState must swallow
     // the error -- callers must never have an unhandled rejection from it.
     const blockingParent = join(dir, "block.txt");
     writeFileSync(blockingParent, "blocker", "utf8");

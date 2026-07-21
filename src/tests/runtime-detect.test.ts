@@ -1,18 +1,66 @@
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ═══════════════════════════════════════════════════════════════════════
-// Runtime detection — coverage of the small reporting surface. The
-// per-binary probe spawns real child processes, which is hard to mock
-// portably; we cover the report path (initialized vs not, success vs
-// failure) which is where the actual bugs live.
+// Runtime detection — coverage of the small reporting surface.
+//
+// `spawn` is mocked rather than exercised for real. That is correctness,
+// not convenience: probeCandidate has a 3s hard timeout (PROBE_TIMEOUT_MS),
+// and a real `node --version` / `python --version` under a parallel suite
+// on Windows -- where every probe goes through cmd.exe -- can exceed it.
+// Any assertion on a probe RESULT then passes or fails with machine load.
+// Mocking makes those deterministic, and lets the python case assert the
+// candidate-WALK itself instead of whether this box happens to have python.
 // ═══════════════════════════════════════════════════════════════════════
 
 vi.mock("undici", () => ({
   request: vi.fn(),
 }));
+vi.mock("node:child_process", () => ({
+  spawn: vi.fn(),
+}));
 
+import { spawn } from "node:child_process";
 import { request } from "undici";
 import { detectRuntimes, initRuntimeDetect, reportRuntimes } from "../runtime-detect.js";
+
+// Stand-in for a spawned probe: emits its output, then closes with `code`.
+// Emission is deferred to a macrotask because probeCandidate attaches its
+// stdout/stderr/close listeners synchronously after spawn() returns.
+function fakeChild(code: number, stdout = "", stderr = "") {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    kill: () => void;
+  };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  setImmediate(() => {
+    if (stdout) child.stdout.emit("data", Buffer.from(stdout));
+    if (stderr) child.stderr.emit("data", Buffer.from(stderr));
+    child.emit("close", code);
+  });
+  return child;
+}
+
+// Output shaped to satisfy each probe's parse() in runtime-detect.
+const PROBE_OUTPUT: Record<string, string> = {
+  node: "v22.22.2",
+  npx: "11.13.0",
+  py: "Python 3.14.3",
+  python: "Python 3.14.3",
+  python3: "Python 3.14.3",
+  uvx: "0.11.7",
+  docker: "Docker version 29.4.2",
+};
+
+// The first python candidate runtime-detect tries on this platform.
+const FIRST_PYTHON = process.platform === "win32" ? "py" : "python3";
+
+beforeEach(() => {
+  vi.mocked(spawn).mockImplementation(((bin: string) => fakeChild(0, PROBE_OUTPUT[bin] ?? "")) as never);
+});
 
 describe("detectRuntimes", () => {
   it("returns a flat snapshot carrying every known runtime key", async () => {
@@ -24,14 +72,25 @@ describe("detectRuntimes", () => {
     }
   });
 
-  it("detects python across the per-platform candidate list", async () => {
+  it("walks past a missing first python candidate to a later one", async () => {
     // The candidate list (py -3 / python / python3 on win32; python3 /
-    // python on posix) means python is found even when the hard-coded
-    // legacy name (`python` on win32) is absent. The test runner and all
-    // CI legs ship at least one of these, so a falsey value here is a
-    // real regression in the candidate-walk, not env flake.
+    // python on posix) exists so python is still found when the first
+    // name is absent. Fail the first candidate and require that a later
+    // one is tried AND its parsed version wins -- the actual contract,
+    // which "is python truthy on this machine" never tested.
+    vi.mocked(spawn).mockImplementation(((bin: string) =>
+      bin === FIRST_PYTHON ? fakeChild(1) : fakeChild(0, "Python 3.12.7")) as never);
+
     const snap = await detectRuntimes();
-    expect(snap.python).toBeTruthy();
+
+    expect(snap.python).toBe("3.12.7");
+    expect(vi.mocked(spawn).mock.calls.some(([bin]) => bin === FIRST_PYTHON)).toBe(true);
+  });
+
+  it("reports python as false when every candidate is absent", async () => {
+    vi.mocked(spawn).mockImplementation((() => fakeChild(1)) as never);
+    const snap = await detectRuntimes();
+    expect(snap.python).toBe(false);
   });
 });
 
@@ -80,9 +139,10 @@ describe("reportRuntimes", () => {
     expect((opts as any).method).toBe("POST");
     const body = JSON.parse((opts as any).body);
     expect(body.runtimes).toBeTypeOf("object");
-    // node should always be detected — we're running this test on Node,
-    // and the probe runs `node --version`.
-    expect(body.runtimes.node).toBeTruthy();
+    // Deterministic via the mocked probe (see the header): the node probe
+    // strips the leading v from "v22.22.2". Previously this asserted on a
+    // real `node --version` spawn and so could time out under load.
+    expect(body.runtimes.node).toBe("22.22.2");
   });
 
   it("swallows network errors silently", async () => {

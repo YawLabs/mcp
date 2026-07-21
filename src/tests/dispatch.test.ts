@@ -34,9 +34,13 @@ vi.mock("../config.js", async (importOriginal) => {
   };
 });
 
+// recordDispatchEvent MUST be stubbed: server.ts calls it on every proxied
+// tool call, and the production catch-all would swallow the TypeError a
+// missing export throws -- the telemetry would silently stop firing.
 vi.mock("../analytics.js", () => ({
   initAnalytics: vi.fn(),
   recordConnectEvent: vi.fn(),
+  recordDispatchEvent: vi.fn(),
   shutdownAnalytics: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -370,7 +374,9 @@ describe("handleDiscoverWithAutoWarm", () => {
     };
     const result = await priv.handleDiscoverWithAutoWarm(undefined);
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
-    expect(result.content[0].text).not.toContain("Auto-activated");
+    // The banner string is "Auto-loaded" -- asserting on "Auto-activated"
+    // (the old wording) passed vacuously no matter what the code did.
+    expect(result.content[0].text).not.toContain("Auto-loaded");
   });
 
   it("does not auto-activate on an ambiguous query (top score below threshold)", async () => {
@@ -385,7 +391,7 @@ describe("handleDiscoverWithAutoWarm", () => {
     // Query has no tokens that match anything — ranked[] empty → fallback
     const result = await priv.handleDiscoverWithAutoWarm("xyzzy");
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
-    expect(result.content[0].text).not.toContain("Auto-activated");
+    expect(result.content[0].text).not.toContain("Auto-loaded");
   });
 
   it("does not auto-activate a server that is already connected", async () => {
@@ -404,7 +410,65 @@ describe("handleDiscoverWithAutoWarm", () => {
     priv.connections.set("gh", makeConnection("gh", [{ name: "create_issue" }]));
     const result = await priv.handleDiscoverWithAutoWarm("file a github issue");
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
-    expect(result.content[0].text).not.toContain("Auto-activated");
+    expect(result.content[0].text).not.toContain("Auto-loaded");
+  });
+
+  it("YAW_MCP_AUTO_ACTIVATE=0 disables the auto-warm entirely", async () => {
+    // The gate used to be a static initializer evaluated at import, so an
+    // env change (or a test stub) after the first import of server.ts was
+    // ignored. It is now read per call.
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "0");
+    try {
+      const priv = getPrivate(server);
+      priv.config = {
+        configVersion: "v1",
+        servers: [
+          makeServerConfig({
+            id: "gh-id",
+            namespace: "gh",
+            name: "GitHub",
+            description: "Repos, issues, and pull requests on GitHub",
+          }),
+        ],
+      };
+      vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+        makeConnection(cfg.namespace, [{ name: "create_issue" }]),
+      );
+
+      const result = await priv.handleDiscoverWithAutoWarm("file a github issue");
+      expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+      expect(result.content[0].text).not.toContain("Auto-loaded");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("names the namespace it actually warmed, not the head of the BM25 list", async () => {
+    // The banner used to print sorted[0] from the BM25-only ranking the
+    // list rendering uses, while the server that got activated came from
+    // twoStageRank. When rerank promotes a different namespace the two
+    // disagree and the banner names a server that was never loaded.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "a-id", namespace: "alpha", name: "Alpha", description: "issues issues issues" }),
+        makeServerConfig({ id: "b-id", namespace: "bravo", name: "Bravo", description: "issues" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "create_issue" }]),
+    );
+    // Force the auto-warm winner to be "bravo" regardless of BM25 order.
+    priv.twoStageRank = async () => [
+      { namespace: "bravo", score: 0.9, hasRerank: true },
+      { namespace: "alpha", score: 0.1, hasRerank: true },
+    ];
+
+    const result = await priv.handleDiscoverWithAutoWarm("issues");
+    expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("bravo");
+    expect(result.content[0].text).toContain('Auto-loaded "bravo"');
+    expect(result.content[0].text).not.toContain('Auto-loaded "alpha"');
   });
 });
 

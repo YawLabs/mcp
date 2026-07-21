@@ -25,8 +25,8 @@
 //   (1 = fatal is reserved and currently UNREACHABLE: a missing token is
 //   treated as healthy local mode, not a fatal error, on both paths.)
 
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type AnalyticsFailure, getDroppedEventsCount, getLastAnalyticsFailure } from "./analytics.js";
@@ -126,6 +126,14 @@ export interface DoctorJsonSnapshot {
   env: Record<string, string | null>;
   state: {
     disabled: boolean;
+    /** Result of pre-parsing state.json, mirroring the text path's STATE
+     *  section. "disabled" means persistence is off; the other values come
+     *  straight from peekStateFile. WITHOUT this, loadState's swallow-and-
+     *  return-empty behaviour made a corrupt file look healthy-and-fresh. */
+    status: "disabled" | "ok" | "missing" | "malformed" | "stale-version" | "unreadable";
+    /** Parse / read error message for the malformed + unreadable cases,
+     *  or the on-disk schema version for stale-version. Null otherwise. */
+    detail: string | null;
     path: string | null;
     savedAt: string | null;
     learningEntries: number | null;
@@ -483,22 +491,50 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // (previously loaded twice here). YAW_MCP_DISABLE_PERSISTENCE
   // short-circuits to a null read; otherwise we read the file a single
   // time and thread it into both blocks.
+  //
+  // The peek runs FIRST, exactly like the text path: loadState swallows a
+  // parse error and hands back an empty state, so a corrupt / stale-schema /
+  // unreadable state.json used to be reported here as healthy-and-fresh
+  // while `doctor` (text) called it out as corrupt. Same detection now.
   const persistDisabled = isPersistenceDisabled(env);
   const stateFilePath = join(userConfigDir(home), STATE_FILENAME);
-  const persisted = persistDisabled ? null : await loadState(stateFilePath);
-  const state: DoctorJsonSnapshot["state"] =
-    persistDisabled || !persisted
-      ? { disabled: true, path: null, savedAt: null, learningEntries: null, packHistoryEntries: null }
-      : (() => {
-          const fresh = persisted.savedAt === 0;
-          return {
-            disabled: false,
-            path: stateFilePath,
-            savedAt: fresh ? null : new Date(persisted.savedAt).toISOString(),
-            learningEntries: fresh ? 0 : Object.keys(persisted.learning).length,
-            packHistoryEntries: fresh ? 0 : persisted.packHistory.length,
-          };
-        })();
+  const statePeek: StatePeek | null = persistDisabled ? null : await peekStateFile(stateFilePath);
+  const stateUsable = statePeek !== null && (statePeek.kind === "ok" || statePeek.kind === "missing");
+  const persisted = stateUsable ? await loadState(stateFilePath) : null;
+  const state: DoctorJsonSnapshot["state"] = ((): DoctorJsonSnapshot["state"] => {
+    if (persistDisabled || statePeek === null) {
+      return {
+        disabled: true,
+        status: "disabled",
+        detail: null,
+        path: null,
+        savedAt: null,
+        learningEntries: null,
+        packHistoryEntries: null,
+      };
+    }
+    if (!stateUsable || !persisted) {
+      return {
+        disabled: false,
+        status: statePeek.kind,
+        detail: statePeekDetail(statePeek),
+        path: stateFilePath,
+        savedAt: null,
+        learningEntries: null,
+        packHistoryEntries: null,
+      };
+    }
+    const fresh = persisted.savedAt === 0;
+    return {
+      disabled: false,
+      status: statePeek.kind,
+      detail: null,
+      path: stateFilePath,
+      savedAt: fresh ? null : new Date(persisted.savedAt).toISOString(),
+      learningEntries: fresh ? 0 : Object.keys(persisted.learning).length,
+      packHistoryEntries: fresh ? 0 : persisted.packHistory.length,
+    };
+  })();
 
   // Reliability rollup — same selectFlakyNamespaces path as renderReliabilitySection
   // and mcp_connect_health, so all three surfaces agree on "flaky."
@@ -810,6 +846,17 @@ async function peekStateFile(filePath: string): Promise<StatePeek> {
   return { kind: "ok" };
 }
 
+/** One-line explanation for a non-ok peek, for the --json state.detail
+ *  field. The text path prints the same facts as `detail:` / `status:`
+ *  lines; this keeps the two surfaces carrying the same information. */
+function statePeekDetail(peek: StatePeek): string | null {
+  if (peek.kind === "malformed" || peek.kind === "unreadable") return peek.message;
+  if (peek.kind === "stale-version") {
+    return `file is v${String(peek.version ?? "?")}, this yaw-mcp reads v${peek.expected}`;
+  }
+  return null;
+}
+
 // Roll up the flaky-dormant list from persisted state.json. Mirrors the
 // cross-session reliability block in mcp_connect_health so the CLI
 // diagnostic and the LLM-facing health tool agree on what counts as
@@ -876,6 +923,16 @@ async function renderTrialsSection(opts: {
 // analytics/tool-report, never the reverse). The "no recent failure"
 // row appears only alongside a sibling that DID fail, so the user can
 // tell which poster is broken vs. which is fine.
+//
+// KNOWN LIMITATION (by design, needs an owner decision before changing):
+// the latches read here are IN-PROCESS module state, set only by the
+// long-lived MCP server process. `yaw-mcp doctor` is a fresh short-lived
+// process that never posts anything, so both getters always return null and
+// this section is effectively unreachable from the CLI. Making it real means
+// either persisting the latches cross-process (a new file under
+// ~/.yaw-mcp/, with its own staleness + concurrency rules) or deleting the
+// section (text + the --json backgroundPosters block) outright. Both are
+// product calls, not cleanups -- do not "fix" this in passing.
 function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): void {
   const { print } = opts;
   const analyticsFailure = getLastAnalyticsFailure();
@@ -884,8 +941,14 @@ function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): 
   if (!analyticsFailure && !reportFailure && dropped === 0) return;
 
   const now = Date.now();
-  const fmt = (f: AnalyticsFailure | ReportFailure): string =>
-    `HTTP ${f.statusCode} from ${f.url}, ${formatRelativeAge(now - f.at)} ago`;
+  // statusCode 0 is the transport-failure sentinel (see tool-report.ts:
+  // ECONNREFUSED / DNS / timeout never produce an HTTP status). Rendering it
+  // as "HTTP 0 from <url>" reads as a bizarre server response; name it for
+  // what it is so the user looks at the network, not at the endpoint.
+  const fmt = (f: AnalyticsFailure | ReportFailure): string => {
+    const what = f.statusCode === 0 ? `network error reaching ${f.url}` : `HTTP ${f.statusCode} from ${f.url}`;
+    return `${what}, ${formatRelativeAge(now - f.at)} ago`;
+  };
 
   print("BACKGROUND POSTERS (recent failures)");
   print(`  analytics:    ${analyticsFailure ? fmt(analyticsFailure) : "(no recent failure)"}`);
@@ -947,22 +1010,38 @@ interface ProbeOptions {
   claudeConfigDir?: string;
 }
 
-function probeClients(opts: ProbeOptions): ClientProbeResult[] {
-  const out: ClientProbeResult[] = [];
+/** One (client, scope) probe slot: the result skeleton plus, when a config
+ *  file is actually on disk, the read the caller still has to perform.
+ *  `read` is null for unavailable clients and for missing files — those
+ *  results are already final. */
+interface ProbeSlot {
+  result: ClientProbeResult;
+  read: { path: string; containerPath: string[] } | null;
+}
+
+const MALFORMED = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true } as const;
+
+/** Enumerate every (client, scope) combo for the current OS and resolve its
+ *  config path. Shared by the sync and async probe variants so the client
+ *  walk, the path resolution and the result shape live in exactly one place —
+ *  the two used to be ~55-line copy-paste twins that could silently drift. */
+function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
   for (const target of INSTALL_TARGETS) {
-    const unavailable = !target.availableOn.includes(opts.os);
-    if (unavailable) {
-      out.push({
-        clientId: target.clientId,
-        scope: target.scopes[0].scope,
-        path: "(n/a)",
-        exists: false,
-        hasMcpEntry: false,
-        hasLegacyEntry: false,
-        legacyEntryName: null,
-        malformed: false,
-        unavailable: true,
-      });
+    if (!target.availableOn.includes(opts.os)) {
+      yield {
+        result: {
+          clientId: target.clientId,
+          scope: target.scopes[0].scope,
+          path: "(n/a)",
+          exists: false,
+          hasMcpEntry: false,
+          hasLegacyEntry: false,
+          legacyEntryName: null,
+          malformed: false,
+          unavailable: true,
+        },
+        read: null,
+      };
       continue;
     }
     // Probe each scope the client supports. For user scope we always
@@ -985,30 +1064,35 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
         continue;
       }
       const exists = existsSync(resolved.absolute);
-      let classified = {
-        hasMcpEntry: false,
-        hasLegacyEntry: false,
-        legacyEntryName: null as string | null,
-        malformed: false,
+      yield {
+        result: {
+          clientId: target.clientId,
+          scope: scope.scope,
+          path: resolved.absolute,
+          exists,
+          hasMcpEntry: false,
+          hasLegacyEntry: false,
+          legacyEntryName: null,
+          malformed: false,
+          unavailable: false,
+        },
+        read: exists ? { path: resolved.absolute, containerPath: resolved.containerPath } : null,
       };
-      if (exists) {
-        try {
-          statSync(resolved.absolute);
-          const raw = readFileSync(resolved.absolute, "utf8");
-          classified = classifyProbeContent(raw, resolved.containerPath);
-        } catch {
-          classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
-        }
-      }
-      out.push({
-        clientId: target.clientId,
-        scope: scope.scope,
-        path: resolved.absolute,
-        exists,
-        ...classified,
-        unavailable: false,
-      });
     }
+  }
+}
+
+function probeClients(opts: ProbeOptions): ClientProbeResult[] {
+  const out: ClientProbeResult[] = [];
+  for (const { result, read } of enumerateProbeSlots(opts)) {
+    if (read) {
+      try {
+        Object.assign(result, classifyProbeContent(readFileSync(read.path, "utf8"), read.containerPath));
+      } catch {
+        Object.assign(result, MALFORMED);
+      }
+    }
+    out.push(result);
   }
   return out;
 }
@@ -1061,64 +1145,18 @@ function classifyProbeContent(
 // async contexts where the synchronous probeClients would block. Doctor
 // itself uses the sync probeClients (it runs once, interactively).
 export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbeResult[]> {
-  const result: ClientProbeResult[] = [];
-  for (const target of INSTALL_TARGETS) {
-    const unavailable = !target.availableOn.includes(opts.os);
-    if (unavailable) {
-      result.push({
-        clientId: target.clientId,
-        scope: target.scopes[0].scope,
-        path: "(n/a)",
-        exists: false,
-        hasMcpEntry: false,
-        hasLegacyEntry: false,
-        legacyEntryName: null,
-        malformed: false,
-        unavailable: true,
-      });
-      continue;
-    }
-    for (const scope of target.scopes) {
-      let resolved: ReturnType<typeof resolveInstallPath>;
+  const out: ClientProbeResult[] = [];
+  for (const { result, read } of enumerateProbeSlots(opts)) {
+    if (read) {
       try {
-        resolved = resolveInstallPath({
-          clientId: target.clientId,
-          scope: scope.scope,
-          os: opts.os,
-          home: opts.home,
-          projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
-          claudeConfigDir: opts.claudeConfigDir,
-        });
+        Object.assign(result, classifyProbeContent(await readFile(read.path, "utf8"), read.containerPath));
       } catch {
-        continue;
+        Object.assign(result, MALFORMED);
       }
-      const exists = existsSync(resolved.absolute);
-      let classified = {
-        hasMcpEntry: false,
-        hasLegacyEntry: false,
-        legacyEntryName: null as string | null,
-        malformed: false,
-      };
-      if (exists) {
-        try {
-          await stat(resolved.absolute);
-          const raw = await readFile(resolved.absolute, "utf8");
-          classified = classifyProbeContent(raw, resolved.containerPath);
-        } catch {
-          classified = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
-        }
-      }
-      result.push({
-        clientId: target.clientId,
-        scope: scope.scope,
-        path: resolved.absolute,
-        exists,
-        ...classified,
-        unavailable: false,
-      });
     }
+    out.push(result);
   }
-  return result;
+  return out;
 }
 
 // Hit the public npm registry for the latest `@yawlabs/mcp` version.
@@ -1246,19 +1284,21 @@ function extractLeadingBinary(command: string): string | null {
   // Drop leading control chars like `! ` (bang-prefixed history
   // references from bash shouldn't even land here, but defensive).
   if (rest.startsWith("!")) return null;
-  // Strip leading env-var assignments.
-  while (/^[A-Z_][A-Z0-9_]*=/i.test(rest)) {
-    const space = rest.indexOf(" ");
-    if (space === -1) return null;
-    rest = rest.slice(space + 1).trimStart();
-  }
-  // Strip `sudo` / `time` / `command` prefixes.
+  // Strip leading env-var assignments AND wrapper prefixes, repeatedly:
+  // real history lines stack them (`sudo time npm audit`, `sudo FOO=1 npm
+  // ci`), and peeling exactly one wrapper left `time` as the "binary".
+  // Both classes are handled in ONE loop so any interleaving works.
   const prefixes = ["sudo", "time", "command", "exec"];
-  const firstWord = rest.split(/\s+/)[0];
-  if (prefixes.includes(firstWord)) {
+  for (;;) {
+    const firstWord = rest.split(/\s+/)[0] ?? "";
+    const isAssignment = /^[A-Z_][A-Z0-9_]*=/i.test(rest);
+    if (!isAssignment && !prefixes.includes(firstWord)) break;
     const space = rest.indexOf(" ");
     if (space === -1) return null;
-    rest = rest.slice(space + 1).trimStart();
+    const next = rest.slice(space + 1).trimStart();
+    // Defensive: a line of pure separators can't shrink further.
+    if (next === rest || next.length === 0) return null;
+    rest = next;
   }
   const first = rest.split(/\s+/)[0];
   if (!first) return null;

@@ -16,23 +16,15 @@
 //
 // Per-entry encryption (not one envelope around the whole vault) means:
 //   1. Adding/rotating a single secret rewrites only its entry, not the
-//      full vault -- smaller diff in the synced blob.
-//   2. The server (Netlify Blobs) sees an opaque object per key, never
-//      plaintext -- mcp_secrets ships only ciphertext + iv + authTag
-//      per entry, plus the salt at the top level.
+//      full vault -- smaller diff, smaller torn-write blast radius.
+//   2. A corrupt or tampered entry fails to decrypt on its own; the other
+//      entries stay readable instead of the whole vault going opaque.
 //
 // The salt is stored AT THE VAULT LEVEL, not per-entry. All entries
 // share the same scrypt-derived key, so the key is derived once per
 // passphrase prompt, not once per entry.
 
 import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCb } from "node:crypto";
-import { promisify } from "node:util";
-
-const scrypt = promisify(scryptCb) as (
-  password: string | Buffer,
-  salt: string | Buffer,
-  keylen: number,
-) => Promise<Buffer>;
 
 /** Length in bytes of the derived key. AES-256-GCM needs 32. */
 export const KEY_LEN = 32;
@@ -110,7 +102,3 @@ export function decryptEntry(entry: EncryptedEntry, key: Buffer): string {
   const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
   return pt.toString("utf8");
 }
-
-// Silence unused-import warning -- the promisified helper exists for
-// callers who don't need the explicit-opts path.
-void scrypt;

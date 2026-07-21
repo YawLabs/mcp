@@ -226,7 +226,14 @@ export async function reportRuntimes(): Promise<void> {
       bodyTimeout: 10_000,
     });
     await res.body.text().catch(() => {});
-    if (res.statusCode >= 400 && res.statusCode !== 404) {
+    if (res.statusCode === 404) {
+      // Tolerated, but NOT a successful report: an older mcp.hosting deploy
+      // simply has no /api/connect/runtimes route. Nothing to retry and
+      // nothing the user must fix, so it stays below warn -- but logging
+      // "Reported runtimes" here would claim the dashboard has data it
+      // never received.
+      log("debug", "Runtime report endpoint not found; skipping (older backend)", { status: res.statusCode });
+    } else if (res.statusCode >= 400) {
       log("warn", "Runtime report failed", { status: res.statusCode });
     } else {
       log("info", "Reported runtimes to Yaw MCP", { runtimes });

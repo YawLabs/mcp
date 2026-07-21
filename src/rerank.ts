@@ -27,8 +27,6 @@ import { log } from "./logger.js";
 
 const RERANK_TIMEOUT_MS = 2_000;
 
-const DEFAULT_TEAM_BASE_URL = "https://yaw.sh";
-
 // Path-B (legacy mcp.hosting) state. Set by initRerank() during
 // ConnectServer.start() when an MCPH_TOKEN is resolved.
 let legacyApiUrl = "";
@@ -101,7 +99,7 @@ async function callLegacyRerank(payload: {
       log("warn", "Rerank request failed", { status: res.statusCode });
       return null;
     }
-    const body = (await res.body.json()) as { results?: RerankResult[]; reason?: string };
+    const body = (await res.body.json()) as { results?: RerankResult[] };
     if (!body || !Array.isArray(body.results)) return null;
     if (body.results.length === 0) return null;
     return body.results;

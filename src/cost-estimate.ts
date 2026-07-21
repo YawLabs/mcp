@@ -101,10 +101,20 @@ export function formatCostLabel(sample: CostSample): string {
   if (sample.tools === 0) return "";
   const n = sample.tokens;
   // Readable orders of magnitude: "120", "1.2k", "22k".
+  //
+  // The 10k cutoff is applied to the ROUNDED value, not the raw one. Testing
+  // the raw n put 9999 in the one-decimal branch, where it rounded up to
+  // "10.0k" while 10000 rendered "10k" -- one token more, and the label got
+  // shorter. Deciding on the rounded value keeps the boundary monotone: both
+  // render "10k".
   let tokensLabel: string;
-  if (n < 1000) tokensLabel = String(n);
-  else if (n < 10_000) tokensLabel = `${(n / 1000).toFixed(1)}k`;
-  else tokensLabel = `${Math.round(n / 1000)}k`;
+  if (n < 1000) {
+    tokensLabel = String(n);
+  } else {
+    const k = n / 1000;
+    const oneDecimal = Math.round(k * 10) / 10;
+    tokensLabel = oneDecimal < 10 ? `${oneDecimal.toFixed(1)}k` : `${Math.round(k)}k`;
+  }
   const pluralTools = sample.tools === 1 ? "tool" : "tools";
   const tilde = sample.cached ? "~" : "";
   return `${sample.tools} ${pluralTools}, ${tilde}${tokensLabel} tokens`;

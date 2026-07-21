@@ -127,7 +127,11 @@ export function resolveRef(refRaw: string, bindings: Record<string, unknown>): u
 
   const [stepIdToken, ...rest] = tokens;
   if (typeof stepIdToken !== "string") {
-    // parseRefPath always emits a string as the first token (see above).
+    // LOAD-BEARING -- do not delete as "unreachable". parseRefPath does NOT
+    // always emit a string first: a bracket-leading ref like "[0]" parses to
+    // the single token [0] (a NUMBER), because the dot-numeric post-pass
+    // starts at index 1 and never touches the first token. Without this
+    // guard such a ref would look up `bindings[0]` instead of failing.
     throw new RefError({ ref: refRaw, reason: "missing step id" });
   }
   if (!Object.hasOwn(bindings, stepIdToken)) {
@@ -204,8 +208,10 @@ export function collectRefDeps(args: unknown): string[] {
   const walk = (node: unknown): void => {
     if (isRefNode(node)) {
       const tokens = parseRefPath(node.$ref);
-      // A malformed ref (parseRefPath -> null) contributes no dep. When it
-      // parses, the first token is always the producer step id (a string).
+      // A malformed ref (parseRefPath -> null) contributes no dep. The
+      // typeof check is not redundant: a bracket-leading ref ("[0]") parses
+      // to a NUMBER first token, which names no producer step -- same case
+      // resolveRef guards against.
       if (tokens && tokens.length > 0 && typeof tokens[0] === "string") {
         deps.add(tokens[0]);
       }

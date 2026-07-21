@@ -74,6 +74,17 @@ export function adaptiveThreshold(
   base: number,
   now: number = Date.now(),
 ): number {
+  // Guard a non-finite base BEFORE it reaches the clamps below. NaN (the
+  // usual source: Number() over a non-numeric MCP_CONNECT_IDLE_THRESHOLD)
+  // fails BOTH `computed < ADAPTIVE_MIN` and `computed > ADAPTIVE_MAX`, so
+  // it falls straight through and returns NaN -- and a caller testing
+  // `idleCalls >= threshold` against NaN never deactivates at all, which is
+  // the exact opposite of the documented "never deactivate faster than
+  // ADAPTIVE_MIN, never wait longer than ADAPTIVE_MAX" contract. +/-Infinity
+  // happens to clamp correctly today but is equally invalid as a baseline;
+  // both snap to the documented floor.
+  if (!Number.isFinite(base)) return ADAPTIVE_MIN;
+
   const cutoff = now - ADAPTIVE_WINDOW_MS;
 
   // Walk the history backwards so we only examine the last

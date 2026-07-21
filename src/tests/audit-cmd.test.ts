@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AUDIT_USAGE, parseAuditArgs, runAudit } from "../audit-cmd.js";
+import { AUDIT_USAGE, parseAuditArgs, redactSecretArgs, runAudit } from "../audit-cmd.js";
 import { gradesCachePath, readGradesCache, writeGrade } from "../grades-cache.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
@@ -187,6 +187,92 @@ describe("runAudit", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(io.err.join("\n")).toContain("compliance suite failed");
+  });
+});
+
+describe("redactSecretArgs", () => {
+  it("redacts the value after a secret flag, keeping the flag name", () => {
+    expect(redactSecretArgs(["--token", "abc", "--port", "3000"])).toEqual([
+      "--token",
+      "<redacted>",
+      "--port",
+      "3000",
+    ]);
+  });
+
+  it("redacts the --flag=value shape", () => {
+    expect(redactSecretArgs(["--api-key=sk-live-123"])).toEqual(["--api-key=<redacted>"]);
+  });
+
+  it("matches the flag case-insensitively (both shapes)", () => {
+    expect(redactSecretArgs(["--Token", "abc"])).toEqual(["--Token", "<redacted>"]);
+    expect(redactSecretArgs(["--API-KEY=sk-live-123"])).toEqual(["--API-KEY=<redacted>"]);
+    expect(redactSecretArgs(["--Password", "hunter2"])).toEqual(["--Password", "<redacted>"]);
+    expect(redactSecretArgs(["-P", "hunter2"])).toEqual(["-P", "<redacted>"]);
+  });
+
+  it("leaves a trailing bare flag alone (nothing to redact)", () => {
+    expect(redactSecretArgs(["serve", "--token"])).toEqual(["serve", "--token"]);
+  });
+
+  it("does not touch non-secret args", () => {
+    expect(redactSecretArgs(["x.js", "--mcp-server", "--verbose"])).toEqual(["x.js", "--mcp-server", "--verbose"]);
+  });
+});
+
+describe("runAudit preamble redaction", () => {
+  let home: string;
+  afterEach(() => {
+    if (home) rmSync(home, { recursive: true, force: true });
+  });
+
+  it("redacts a mixed-case secret flag value in the non-json preamble", async () => {
+    home = makeHome([
+      {
+        namespace: "ctxlint",
+        type: "local",
+        command: "node",
+        args: ["x.js", "--Token", "super-secret-value", "--API-KEY=another-secret", "--port", "3000"],
+      },
+    ]);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 100 }),
+    });
+    expect(r.exitCode).toBe(0);
+    const stdout = io.out.join("\n");
+    expect(stdout).toContain("Auditing");
+    expect(stdout).not.toContain("super-secret-value");
+    expect(stdout).not.toContain("another-secret");
+    expect(stdout).toContain("--Token <redacted>");
+    expect(stdout).toContain("--API-KEY=<redacted>");
+    // Non-secret args survive untouched so the operator still sees the shape.
+    expect(stdout).toContain("--port 3000");
+  });
+
+  it("passes the UNREDACTED args to the runner (redaction is display-only)", async () => {
+    home = makeHome([
+      { namespace: "ctxlint", type: "local", command: "node", args: ["x.js", "--Token", "super-secret-value"] },
+    ]);
+    const io = captureIO();
+    let seenArgs: string[] = [];
+    await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async (target) => {
+        seenArgs = target.args;
+        return { grade: "A", score: 100 };
+      },
+    });
+    expect(seenArgs).toEqual(["x.js", "--Token", "super-secret-value"]);
   });
 });
 

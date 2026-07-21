@@ -49,15 +49,26 @@
 # bypass_mode: always}].
 # =============================================================================
 
-set -euo pipefail
+# -E (errtrace) so the ERR trap below is inherited by functions and command
+# substitutions -- without it a failure inside run_npm_check() or a $(...)
+# never records its line number.
+set -Eeuo pipefail
 # Single EXIT trap: if we're exiting because of an error, print the failure
 # banner; either way, clean up the mcp-publisher temp dir. (Two `trap` calls
 # would override each other; bash only runs the most recent one.)
+#
+# FAIL_LINE is captured by a separate ERR trap rather than read from $LINENO
+# inside cleanup(): $LINENO expands to the line where it is EVALUATED, so the
+# banner used to report its own line ("line 60") for every failure in the
+# script, which is worse than useless when a 500-line release dies mid-run.
+# `fail()` sets it explicitly because an outright `exit 1` does not fire ERR.
 WORKDIR=""
+FAIL_LINE=""
+trap 'FAIL_LINE=$LINENO' ERR
 cleanup() {
   rc=$?
   if [ $rc -ne 0 ]; then
-    echo -e "\n  ✗ Release failed at line $LINENO (exit code $rc)\n" >&2
+    echo -e "\n  ✗ Release failed at line ${FAIL_LINE:-unknown} (exit code $rc)\n" >&2
   fi
   if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     rm -rf "$WORKDIR"
@@ -71,13 +82,17 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 if [ "${NO_COLOR:-0}" = "1" ] || [ ! -t 1 ]; then
-  RED=''; GREEN=''; YELLOW=''; NC=''
+  # CYAN belongs in this list: step() and every banner below use it, so
+  # omitting it emitted raw ANSI into pipes and CI logs even under NO_COLOR=1.
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
 fi
 
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
 info() { echo -e "${GREEN}  ✓ $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
-fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
+# BASH_LINENO[0] is the line of the CALL to fail() -- an explicit `exit 1`
+# never fires the ERR trap, so record the caller's line here instead.
+fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
 # MCP publisher version -- pinned like any other tool we shell out to. The
 # sha256 is fetched at release time from the registry's per-release
@@ -180,6 +195,15 @@ command -v git  >/dev/null || fail "git not installed"
 current_pkg_version() { node -p "require('./package.json').version"; }
 current_server_version() { node -p "require('./server.json').version"; }
 current_head_sha() { git rev-parse HEAD; }
+current_branch() { git rev-parse --abbrev-ref HEAD; }
+
+# Rewrite server.json's version + packages[0].version to $1. Used by both the
+# fresh-bump path and the resume self-heal, so the two can never drift.
+# mcp-publisher's `publish` validates that server.json's version matches what
+# npm reports for the referenced package -- the registry 400s on drift.
+write_server_version() {
+  node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$1"
+}
 
 # ---------- Main path: full release -------------------------------------------
 # 5 steps. The build is just `npm run build` (tsup -> dist/index.js); npm
@@ -277,14 +301,25 @@ step 3 "Bump version to $VERSION, commit, tag, and push"
 CURRENT_VERSION=$(current_pkg_version)
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "package.json already at v${VERSION} -- skipping bump"
+  # ...but do NOT assume server.json came along. A tree where package.json was
+  # bumped and server.json was not (an interrupted prior run, a hand-run
+  # `npm version`, a bad merge) hits this branch, skips the bump entirely, and
+  # then dies at the lockstep guard below with no way forward except editing
+  # the file by hand. Re-read it here and self-heal.
+  SERVER_VERSION=$(current_server_version)
+  if [ "$SERVER_VERSION" = "$VERSION" ]; then
+    info "server.json already at v${VERSION} -- skipping bump"
+  else
+    warn "server.json is at v${SERVER_VERSION} but package.json is v${VERSION} -- rewriting server.json to match"
+    write_server_version "$VERSION"
+    info "server.json bumped"
+  fi
 else
   npm version "$VERSION" --no-git-tag-version
   info "package.json bumped"
-  # Keep server.json in lockstep -- mcp-publisher's `publish` validates that
-  # the referenced npm package exists AND that the version field matches
-  # what npm reports (the registry 400s on drift). The script is the
-  # single source of truth now; CI no longer rewrites server.json.
-  node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$VERSION"
+  # Keep server.json in lockstep. The script is the single source of truth
+  # now; CI no longer rewrites server.json.
+  write_server_version "$VERSION"
   info "server.json bumped"
 fi
 
@@ -315,6 +350,21 @@ fi
 SERVER_NOW=$(current_server_version)
 if [ "$SERVER_NOW" != "$VERSION" ]; then
   fail "server.json shows $SERVER_NOW but tag is v${VERSION} -- refusing to push (registry would 400 on drift)"
+fi
+
+# Re-read the branch here (not at script start -- it can change between steps)
+# and refuse to run the push from anywhere but main. `git push origin main`
+# pushes the LOCAL main ref, not HEAD: from a feature branch it would push a
+# main that does not contain the bump commit, and --follow-tags would skip
+# v${VERSION} because the tag is not reachable from the pushed ref. The push
+# "succeeds", nothing lands, and steps 4-5 publish a version whose commit and
+# tag exist only on this workstation.
+CURRENT_BRANCH=$(current_branch)
+if [ "$CURRENT_BRANCH" != "main" ]; then
+  if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+    fail "Detached HEAD -- refusing to push. Check out main (git checkout main) and re-run ./release.sh ${VERSION}."
+  fi
+  fail "On branch '${CURRENT_BRANCH}', not main -- refusing to run 'git push origin main --follow-tags'. It would push the local main ref (which does NOT contain the v${VERSION} bump commit) and silently skip the tag. Merge or check out main, then re-run ./release.sh ${VERSION}."
 fi
 
 git push origin main --follow-tags

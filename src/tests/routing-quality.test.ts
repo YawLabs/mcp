@@ -3,9 +3,15 @@ import { type RankableServer, rankServers } from "../relevance.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Smart-routing quality gate. Pre-launch exercise from the launch TODO:
-// "run mcp_connect_dispatch with 10 varied English intents against a
+// "run mcp_connect_dispatch with varied English intents against a
 // seeded 15-server config; verify the top-ranked server is correct or
 // within top-3 in all cases."
+//
+// BENCHMARK below carries 14 intents (the original 10, plus 4 added for
+// fetch-mcp v0.2.0's expanded surface). Keep this count in sync when
+// adding cases -- it sets what the accuracy floor actually buys: at 14
+// intents the >=80% top-1 gate tolerates 2 misses (12/14 = 85.7% passes,
+// 11/14 = 78.6% fails).
 //
 // This file runs the BM25 side of that check — no Voyage rerank, so it
 // tests the *floor* of ranking quality (what every user sees even when
@@ -202,8 +208,9 @@ describe("smart-routing quality gate (BM25 floor)", () => {
   // Stronger gate: the expected namespace is also #1 for most intents.
   // We tolerate a small number of "top-3 but not top-1" misses because
   // BM25 alone is lexical — that's what Voyage rerank is for in prod.
-  // If top-1 accuracy drops below 80% here, the corpus got worse OR
-  // the ranker regressed; either way, investigate.
+  // At the current 14 intents the 80% floor tolerates exactly 2 misses;
+  // a 3rd miss fails the gate. If top-1 accuracy drops below 80% here,
+  // the corpus got worse OR the ranker regressed; either way, investigate.
   it("top-1 accuracy meets the BM25-only floor (≥80%)", () => {
     const hits = BENCHMARK.filter(({ intent, expected }) => topN(intent, 1)[0] === expected).length;
     const accuracy = hits / BENCHMARK.length;

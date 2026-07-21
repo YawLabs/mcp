@@ -34,11 +34,14 @@
 export const LEARNING_MIN_OBSERVATIONS = 3;
 export const LEARNING_MAX_BOOST = 1.1;
 export const LEARNING_MIN_BOOST = 0.9;
-// Matches the >=3 / <80% threshold used by formatReliabilityWarning
-// (usage-hints.ts) and the cross-session reliability block in
-// handleHealth. Keep these in sync — otherwise discover says "flaky"
-// about a server that dispatch still happily routes to, or vice versa.
-const PENALTY_RATE_THRESHOLD = 0.8;
+// Success-rate floor below which the penalty branch fires. Exported and
+// re-used verbatim by usage-hints.ts (as RELIABILITY_THRESHOLD) so
+// formatReliabilityWarning / selectFlakyNamespaces / the cross-session
+// reliability block in handleHealth cannot drift from the routing penalty
+// — otherwise discover says "flaky" about a server that dispatch still
+// happily routes to, or vice versa. Same story for
+// LEARNING_MIN_OBSERVATIONS (re-exported as RELIABILITY_MIN_OBSERVATIONS).
+export const PENALTY_RATE_THRESHOLD = 0.8;
 const SATURATION_AT = 10;
 
 export interface NamespaceUsage {
@@ -197,11 +200,19 @@ export class LearningStore {
     this.usage.clear();
     for (const [ns, usage] of Object.entries(snapshot)) {
       // Enforce the store's own invariants rather than trusting upstream
-      // sanitization: reject negatives/NaN (coerce to 0) and clamp
-      // succeeded <= dispatched so the rate computation stays in [0, 1].
-      const dispatched = Number.isFinite(usage.dispatched) ? Math.max(0, usage.dispatched) : 0;
-      const succeededRaw = Number.isFinite(usage.succeeded) ? Math.max(0, usage.succeeded) : 0;
-      const succeeded = Math.min(succeededRaw, dispatched);
+      // sanitization: reject negatives/NaN (coerce to 0), then resolve a
+      // succeeded > dispatched snapshot the SAME direction boostFactor does
+      // -- coerce dispatched UP to succeeded, never clamp succeeded down.
+      // Clamping down would discard earned credit and make
+      // export -> load a lossy, non-identity round-trip (a store whose
+      // succeeded legitimately exceeds dispatched, e.g. after
+      // recordSuccess without a paired recordDispatch, would come back
+      // smaller than it went in). Coercing up keeps the rate in [0, 1] the
+      // same way boostFactor's Math.max(dispatched, succeeded) does, so a
+      // loaded snapshot yields the identical boost factor.
+      const dispatchedRaw = Number.isFinite(usage.dispatched) ? Math.max(0, usage.dispatched) : 0;
+      const succeeded = Number.isFinite(usage.succeeded) ? Math.max(0, usage.succeeded) : 0;
+      const dispatched = Math.max(dispatchedRaw, succeeded);
       const lastUsedAt = Number.isFinite(usage.lastUsedAt) ? usage.lastUsedAt : 0;
       this.usage.set(ns, { dispatched, succeeded, lastUsedAt });
     }

@@ -148,6 +148,62 @@ describe("buildToolList — deferred tools from inactive-but-cached servers", ()
   });
 });
 
+describe("buildToolList — tool filters", () => {
+  it("applies a namespace filter to ACTIVE tools", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+    const filters = new Map([["gh", new Set(["create_issue"])]]);
+    const tools = buildToolList(connections, [], filters);
+    expect(tools.some((t) => t.name === "gh_create_issue")).toBe(true);
+    expect(tools.some((t) => t.name === "gh_list_prs")).toBe(false);
+  });
+
+  it("applies the SAME filter to deferred entries from an idle server", () => {
+    // Without this, a filtered-out tool reappears in tools/list the moment
+    // its server goes idle: the deferred branch would advertise the full
+    // cached set while the filter still applies to the live one.
+    const connections = new Map<string, UpstreamConnection>();
+    const inactive = [makeInactiveServer("gh", [{ name: "create_issue" }, { name: "list_prs" }])];
+    const filters = new Map([["gh", new Set(["create_issue"])]]);
+    const tools = buildToolList(connections, inactive, filters);
+    expect(tools.some((t) => t.name === "gh_create_issue")).toBe(true);
+    expect(tools.some((t) => t.name === "gh_list_prs")).toBe(false);
+  });
+
+  it("leaves an unfiltered namespace's deferred entries alone", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    const inactive = [makeInactiveServer("slack", [{ name: "send_message" }])];
+    const filters = new Map([["gh", new Set(["create_issue"])]]);
+    const tools = buildToolList(connections, inactive, filters);
+    expect(tools.some((t) => t.name === "slack_send_message")).toBe(true);
+  });
+});
+
+describe("buildToolList — cross-namespace name collisions", () => {
+  it("emits ONE entry when two active namespaces flatten to the same name", () => {
+    // (ns=`gh`, tool=`actions_list`) and (ns=`gh_actions`, tool=`list`) both
+    // render as `gh_actions_list`. MCP tool names must be unique, so the
+    // list must not carry the name twice.
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["actions_list"]));
+    connections.set("gh_actions", makeConnection("gh_actions", ["list"]));
+    const tools = buildToolList(connections);
+    expect(tools.filter((t) => t.name === "gh_actions_list")).toHaveLength(1);
+    expect(tools).toHaveLength(Object.keys(META_TOOLS).length + 1);
+  });
+
+  it("does not let an upstream tool duplicate a meta-tool name", () => {
+    const metaName = Object.values(META_TOOLS)[0].name;
+    const connections = new Map<string, UpstreamConnection>();
+    // Craft a connection whose namespaced name IS a meta-tool name.
+    const conn = makeConnection("ns", ["x"]);
+    conn.tools[0].namespacedName = metaName;
+    connections.set("ns", conn);
+    const tools = buildToolList(connections);
+    expect(tools.filter((t) => t.name === metaName)).toHaveLength(1);
+  });
+});
+
 describe("buildToolRoutes — deferred routes", () => {
   it("marks deferred: true for routes generated from toolCache", () => {
     const connections = new Map<string, UpstreamConnection>();
@@ -170,6 +226,50 @@ describe("buildToolRoutes — deferred routes", () => {
     expect(route?.deferred).toBeUndefined();
     expect(route?.namespace).toBe("gh");
     expect(route?.originalName).toBe("create_issue");
+  });
+
+  it("warns when two DEFERRED servers collide on the same namespaced name", () => {
+    // First cached server wins; the loser's tool is unreachable until an
+    // operator renames a namespace, so the collision must not be silent.
+    // (The active-vs-deferred case above is intended shadowing -- no warn.)
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const routes = buildToolRoutes(new Map(), [
+        makeInactiveServer("gh", [{ name: "actions_list" }]),
+        makeInactiveServer("gh_actions", [{ name: "list" }]),
+      ]);
+      // First writer wins.
+      expect(routes.get("gh_actions_list")).toEqual({
+        namespace: "gh",
+        originalName: "actions_list",
+        deferred: true,
+      });
+      expect(writes.some((w) => w.includes("Deferred tool route collision"))).toBe(true);
+    } finally {
+      process.stderr.write = original;
+    }
+  });
+
+  it("does NOT warn when an active route shadows a deferred one", () => {
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const connections = new Map<string, UpstreamConnection>();
+      connections.set("gh", makeConnection("gh", ["actions_list"]));
+      buildToolRoutes(connections, [makeInactiveServer("gh_actions", [{ name: "list" }])]);
+      expect(writes.some((w) => w.includes("collision"))).toBe(false);
+    } finally {
+      process.stderr.write = original;
+    }
   });
 });
 

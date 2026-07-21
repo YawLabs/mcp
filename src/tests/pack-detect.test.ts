@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PackDetector } from "../pack-detect.js";
+import { type PackCall, PackDetector } from "../pack-detect.js";
 
 describe("PackDetector", () => {
   it("returns no chains from empty history", () => {
@@ -169,6 +169,104 @@ describe("PackDetector", () => {
     d.reset();
     expect(d.detectChains()).toEqual([]);
     expect(d.getHistory().length).toBe(0);
+  });
+
+  it("exportSnapshot returns a defensive copy that later recordCalls do not mutate", () => {
+    const d = new PackDetector();
+    d.recordCall("gh", "a", 1_000);
+    d.recordCall("linear", "b", 2_000);
+    const snap = d.exportSnapshot();
+    expect(snap).toEqual([
+      { namespace: "gh", toolName: "a", at: 1_000 },
+      { namespace: "linear", toolName: "b", at: 2_000 },
+    ]);
+
+    // Mutating the export must not reach the detector, and appending to the
+    // detector must not reach the export -- persistence.ts JSON.stringifies
+    // the snapshot asynchronously, so aliasing here would serialize state
+    // captured after the export call.
+    snap[0].namespace = "mutated";
+    d.recordCall("slack", "c", 3_000);
+    expect(snap).toHaveLength(2);
+    expect(d.getHistory()[0].namespace).toBe("gh");
+    expect(d.getHistory()).toHaveLength(3);
+  });
+
+  it("loadSnapshot replaces history and round-trips through exportSnapshot", () => {
+    const d = new PackDetector();
+    d.recordCall("stale", "x", 1);
+    d.loadSnapshot([
+      { namespace: "gh", toolName: "a", at: 1_000_000 },
+      { namespace: "linear", toolName: "b", at: 1_001_000 },
+    ]);
+    // The pre-load call is gone, not merged.
+    expect(d.getHistory().map((c) => c.namespace)).toEqual(["gh", "linear"]);
+    expect(d.exportSnapshot()).toEqual([
+      { namespace: "gh", toolName: "a", at: 1_000_000 },
+      { namespace: "linear", toolName: "b", at: 1_001_000 },
+    ]);
+  });
+
+  it("loadSnapshot trims a snapshot longer than maxHistory, keeping the newest", () => {
+    const d = new PackDetector({ maxHistory: 3 });
+    d.loadSnapshot([
+      { namespace: "gh", toolName: "t", at: 1 },
+      { namespace: "gh", toolName: "t", at: 2 },
+      { namespace: "gh", toolName: "t", at: 3 },
+      { namespace: "gh", toolName: "t", at: 4 },
+      { namespace: "gh", toolName: "t", at: 5 },
+    ]);
+    expect(d.getHistory().map((c) => c.at)).toEqual([3, 4, 5]);
+  });
+
+  it("loadSnapshot keeps a snapshot at or under maxHistory intact", () => {
+    const d = new PackDetector({ maxHistory: 3 });
+    d.loadSnapshot([
+      { namespace: "gh", toolName: "t", at: 1 },
+      { namespace: "gh", toolName: "t", at: 2 },
+      { namespace: "gh", toolName: "t", at: 3 },
+    ]);
+    expect(d.getHistory().map((c) => c.at)).toEqual([1, 2, 3]);
+  });
+
+  it("loadSnapshot drops entries with a missing namespace or tool name", () => {
+    const d = new PackDetector();
+    d.loadSnapshot([
+      { namespace: "", toolName: "t", at: 1 },
+      { namespace: "gh", toolName: "", at: 2 },
+      { namespace: "gh", toolName: "t", at: 3 },
+    ] as ReadonlyArray<PackCall>);
+    expect(d.getHistory()).toEqual([{ namespace: "gh", toolName: "t", at: 3 }]);
+  });
+
+  it("loadSnapshot drops entries whose `at` is not a finite number", () => {
+    // A NaN/undefined/string timestamp off disk defeats burst segmentation:
+    // `call.at - prevAt > maxGapMs` is false for NaN, so every later call
+    // folds into one burst and fabricates packs that never happened.
+    const d = new PackDetector();
+    d.loadSnapshot([
+      { namespace: "gh", toolName: "a", at: Number.NaN },
+      { namespace: "linear", toolName: "b", at: "1000" },
+      { namespace: "slack", toolName: "c", at: undefined },
+      { namespace: "notion", toolName: "d", at: Number.POSITIVE_INFINITY },
+      { namespace: "gh", toolName: "e", at: 1_000 },
+    ] as unknown as ReadonlyArray<PackCall>);
+    expect(d.getHistory()).toEqual([{ namespace: "gh", toolName: "e", at: 1_000 }]);
+  });
+
+  it("a NaN timestamp in a snapshot cannot weld separate bursts into a fake pack", () => {
+    // Without the `at` validation this history segments into ONE burst
+    // ({gh, linear, slack}) instead of three, and detectChains reports a
+    // pack the user never ran.
+    const d = new PackDetector();
+    const t0 = 1_000_000;
+    d.loadSnapshot([
+      { namespace: "gh", toolName: "a", at: t0 },
+      { namespace: "linear", toolName: "b", at: Number.NaN },
+      { namespace: "slack", toolName: "c", at: t0 + 10 * 60_000 },
+    ] as unknown as ReadonlyArray<PackCall>);
+    expect(d.getHistory()).toHaveLength(2);
+    expect(d.detectChains()).toEqual([]);
   });
 
   it("respects a custom maxGapMs", () => {

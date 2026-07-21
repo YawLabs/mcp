@@ -94,12 +94,21 @@ export function parseTiebreakResponse(response: string, candidates: TiebreakCand
     // Allow inline mentions like "I pick github because..." -- pick the
     // earliest-positioned candidate so the LLM's lexical choice wins
     // even when iteration order says otherwise.
+    //
+    // Position ties are broken by LENGTH, longest first. `\b` treats '-'
+    // (and '+', '.', etc.) as a word boundary, so when one namespace is a
+    // prefix of another under that rule -- "aws-s3" vs "aws-s3-tools" --
+    // BOTH match at the same index in "use aws-s3-tools". Without the
+    // length tiebreak the winner would be whichever happened to be
+    // iterated first, silently misparsing the LLM's pick as the shorter
+    // namespace. Longest-match-wins makes the exact mention win.
     let bestNs: string | null = null;
     let bestPos = Number.POSITIVE_INFINITY;
     for (const ns of namespaces) {
       const re = new RegExp(`\\b${escapeRegex(ns)}\\b`, "i");
       const match = re.exec(line);
-      if (match && match.index < bestPos) {
+      if (!match) continue;
+      if (match.index < bestPos || (match.index === bestPos && bestNs !== null && ns.length > bestNs.length)) {
         bestPos = match.index;
         bestNs = ns;
       }
@@ -111,37 +120,6 @@ export function parseTiebreakResponse(response: string, candidates: TiebreakCand
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-// Ask the client LLM to pick a winner among the top-tied candidates.
-// Returns the chosen namespace, or null if sampling is unsupported,
-// declined, failed, or the response doesn't name any candidate.
-// Never throws — a bad tiebreak just falls back to the ranker's order.
-export async function tiebreakViaSampling(
-  server: Server,
-  intent: string,
-  candidates: TiebreakCandidate[],
-): Promise<string | null> {
-  const caps = server.getClientCapabilities();
-  if (!caps?.sampling) return null;
-  if (candidates.length < 2) return null;
-
-  const prompt = buildTiebreakPrompt(intent, candidates);
-  try {
-    const result = await server.createMessage({
-      messages: [{ role: "user", content: { type: "text", text: prompt } }],
-      maxTokens: SAMPLING_MAX_TOKENS,
-      // Hint that we want a cheap, fast response.
-      includeContext: "none",
-    });
-    const text =
-      result && typeof result === "object" && "content" in result && result.content ? extractText(result.content) : "";
-    if (!text) return null;
-    return parseTiebreakResponse(text, candidates);
-  } catch (err) {
-    log("warn", "Sampling tiebreak failed", { error: err instanceof Error ? err.message : String(err) });
-    return null;
-  }
 }
 
 // createMessage can return content as a single block or an array (when
@@ -289,10 +267,11 @@ export function sampleCountForEffort(effort: RouteEffort): number {
 // namespace, ties broken by ranker order (the first candidate in the list
 // wins). N is clamped into [1, MAX_SAMPLES]. The whole aggregate is wrapped
 // in a SAMPLING_TIMEOUT_MS race so total added latency is bounded regardless
-// of N. Reuses the same capability gate and never-throws discipline as
-// tiebreakViaSampling: on timeout, missing sampling capability, fewer than 2
-// candidates, or total failure, returns null and the caller falls back to the
-// ranker's order.
+// of N. This is the ONLY sampling entry point: n=1 is the plain single-sample
+// tiebreak (server.ts's "auto" effort path), so there is no separate
+// single-shot helper to keep in sync. On timeout, missing sampling capability,
+// fewer than 2 candidates, or total failure it returns null and the caller
+// falls back to the ranker's order — it never throws.
 export async function bestOfNViaSampling(
   server: Server,
   intent: string,

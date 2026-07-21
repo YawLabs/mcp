@@ -46,6 +46,15 @@ export function gradesCachePath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, GRADES_FILENAME);
 }
 
+/** Valid range for a cached score, matching the compliance suite's 0-100
+ *  percentage. Range-validated for the same reason the letter is checked
+ *  against GRADE_LETTERS: an out-of-range score (-5, 1e9) is a corrupt or
+ *  hand-edited entry, and rendering it in the `servers` row or the Yaw
+ *  Terminal MCP panel would show a nonsense grade rather than falling back
+ *  to "no cached grade". */
+const MIN_SCORE = 0;
+const MAX_SCORE = 100;
+
 /** Coerce a raw parsed entry into a CachedGrade, or null if malformed. A
  *  single bad entry is dropped rather than discarding the whole cache. */
 function validateEntry(entry: unknown): CachedGrade | null {
@@ -55,6 +64,7 @@ function validateEntry(entry: unknown): CachedGrade | null {
   if (!GRADE_LETTERS.has(grade)) return null;
   const score = typeof e.score === "number" && Number.isFinite(e.score) ? e.score : null;
   if (score === null) return null;
+  if (score < MIN_SCORE || score > MAX_SCORE) return null;
   const gradedAt = typeof e.gradedAt === "string" && e.gradedAt.length > 0 ? e.gradedAt : "";
   if (!gradedAt) return null;
   return { grade: grade as CachedGrade["grade"], score, gradedAt };

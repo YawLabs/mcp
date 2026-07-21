@@ -1,19 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { envEqual, resolveNamespaces, sanitizeNamespace } from "../server.js";
 
-// Test the helper functions exported or used in server.ts
-// Since envEqual and resolveNamespaces are module-private, we test them via
-// re-implementing the same logic here to validate the algorithm.
+// These three helpers are exported from server.ts so the tests exercise the
+// REAL implementations. They used to be module-private, and this file kept
+// hand-copied re-implementations of each one -- which passed happily while
+// the production code drifted, since nothing tied the copy to the original.
 
-describe("envEqual logic", () => {
-  function envEqual(a?: Record<string, string>, b?: Record<string, string>): boolean {
-    if (!a && !b) return true;
-    if (!a || !b) return false;
-    const keysA = Object.keys(a);
-    const keysB = Object.keys(b);
-    if (keysA.length !== keysB.length) return false;
-    return keysA.every((k) => a[k] === b[k]);
-  }
-
+describe("envEqual", () => {
   it("returns true for both undefined", () => {
     expect(envEqual(undefined, undefined)).toBe(true);
   });
@@ -50,17 +43,7 @@ describe("envEqual logic", () => {
   });
 });
 
-describe("resolveNamespaces logic", () => {
-  function resolveNamespaces(args: Record<string, unknown>): string[] {
-    if (Array.isArray(args.servers) && args.servers.length > 0) {
-      return args.servers as string[];
-    }
-    if (typeof args.server === "string" && args.server) {
-      return [args.server];
-    }
-    return [];
-  }
-
+describe("resolveNamespaces", () => {
   it("returns single server as array", () => {
     expect(resolveNamespaces({ server: "gh" })).toEqual(["gh"]);
   });
@@ -84,35 +67,31 @@ describe("resolveNamespaces logic", () => {
   it("returns empty for empty array", () => {
     expect(resolveNamespaces({ servers: [] })).toEqual([]);
   });
+
+  it("ignores a non-string server value", () => {
+    expect(resolveNamespaces({ server: 42 })).toEqual([]);
+  });
 });
 
-describe("namespace sanitization logic", () => {
-  function sanitize(key: string): string {
-    return key
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 30);
-  }
-
+describe("sanitizeNamespace", () => {
   it("lowercases and replaces special chars", () => {
-    expect(sanitize("My GitHub Server")).toBe("my_github_server");
+    expect(sanitizeNamespace("My GitHub Server")).toBe("my_github_server");
   });
 
   it("strips leading/trailing underscores", () => {
-    expect(sanitize("---MCP---")).toBe("mcp");
+    expect(sanitizeNamespace("---MCP---")).toBe("mcp");
   });
 
   it("truncates to 30 characters", () => {
     const long = "a".repeat(50);
-    expect(sanitize(long).length).toBe(30);
+    expect(sanitizeNamespace(long).length).toBe(30);
   });
 
   it("returns empty for all-special-char names", () => {
-    expect(sanitize("!!!")).toBe("");
+    expect(sanitizeNamespace("!!!")).toBe("");
   });
 
   it("detects collisions", () => {
-    expect(sanitize("Server A")).toBe(sanitize("Server-A"));
+    expect(sanitizeNamespace("Server A")).toBe(sanitizeNamespace("Server-A"));
   });
 });

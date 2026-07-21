@@ -199,8 +199,9 @@ describe("runBundlesCommand — match", () => {
     });
     const combined = io.out.join("\n");
     expect(combined).not.toContain("Ready to activate");
-    // But linear should NOT appear in "enabled servers" either.
-    expect(combined).toContain("1 enabled servers: github");
+    // But linear should NOT appear in "enabled servers" either. Singular
+    // "server" -- the header pluralizes on the enabled count.
+    expect(combined).toContain("1 enabled server: github");
   });
 
   it("prints the no-match message when nothing overlaps", async () => {

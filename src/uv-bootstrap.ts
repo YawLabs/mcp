@@ -320,7 +320,23 @@ async function resolveUv(): Promise<string> {
     const extracted = await findBinary(extractDir, binName());
     if (!extracted) throw new Error(`uv binary not found inside ${archiveName}`);
 
-    await fs.rename(extracted, finalBin);
+    // Winner-takes-all rename. On Windows this can fail EPERM/EBUSY when a
+    // concurrent winner already renamed its copy onto finalBin AND is
+    // executing it (Win32 refuses to replace a file with an open image
+    // handle) -- a lost race, not a broken install. Every racer verified the
+    // same UV_VERSION archive against the same published sha256, so an
+    // existing non-empty finalBin is a good binary: treat the failure as
+    // success. Rethrow only when there is nothing usable there.
+    try {
+      await fs.rename(extracted, finalBin);
+    } catch (err) {
+      const st = await fs.stat(finalBin).catch(() => null);
+      if (!st?.isFile() || st.size === 0) throw err;
+      log("info", "uv install race lost; using the copy another process installed", {
+        bin: finalBin,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     await fs.chmod(finalBin, 0o755).catch(() => {}); // no-op on Windows
   } finally {
     await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});

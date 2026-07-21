@@ -37,7 +37,7 @@ import { request } from "undici";
 import { atomicWriteFile } from "./atomic-write.js";
 import { resolveCatalogSlug } from "./catalog.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
-import { mergeClientConfig, readNested } from "./install-cmd.js";
+import { mergeClientConfig } from "./install-cmd.js";
 import {
   buildLaunchEntry,
   CURRENT_OS,
@@ -249,7 +249,10 @@ export function parseTryCleanupArgs(
     if (a === "-h" || a === "--help") return { ok: false, error: TRY_CLEANUP_USAGE, help: true };
     if (a === "--base") {
       const v = argv[++i];
-      if (!v) return { ok: false, error: "--base requires a URL" };
+      // Reject a following flag (e.g. `try-cleanup slug --base --help`, which
+      // would otherwise set baseUrl="--help" and swallow the flag). A URL
+      // never starts with "--". Mirrors parseTryArgs.
+      if (!v || v.startsWith("--")) return { ok: false, error: "--base requires a URL" };
       opts.baseUrl = v;
       continue;
     }
@@ -430,7 +433,18 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const os = opts.os ?? CURRENT_OS;
   const now = opts.now ? opts.now() : Date.now();
   const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
-  const ttlMs = opts.ttl ? (parseDurationMs(opts.ttl) ?? DEFAULT_TTL_MS) : DEFAULT_TTL_MS;
+  // The CLI pre-validates --ttl in parseTryArgs, so only programmatic callers
+  // can reach this with an unparseable value -- error out rather than
+  // silently substituting the 1h default (which would mask the caller's bug).
+  let ttlMs = DEFAULT_TTL_MS;
+  if (opts.ttl !== undefined) {
+    const parsedTtl = parseDurationMs(opts.ttl);
+    if (parsedTtl === null) {
+      printErr(`yaw-mcp try: invalid ttl "${opts.ttl}" (cannot parse; try 30m, 1h, 2d).`);
+      return { exitCode: 2, written: [] };
+    }
+    ttlMs = parsedTtl;
+  }
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
 
   // Step 1: fetch the canonical launch shape.
@@ -776,6 +790,10 @@ export function formatTtl(ms: number): string {
  *  summary so doctor can render it inline. */
 export interface TrialScanEntry {
   marker: TrialMarker;
+  /** Absolute path of the scanned marker file. GC must unlink THIS path --
+   *  not trialMarkerPath(marker.slug) -- so a marker whose filename doesn't
+   *  match its slug field is still reclaimed instead of re-failing forever. */
+  path: string;
   /** ms until expiry; negative when already expired. */
   msUntilExpiry: number;
   expired: boolean;
@@ -821,7 +839,7 @@ export async function scanTrials(opts: { home?: string; now?: () => number } = {
       }
       const msUntilExpiry = parsed.expiresAt - now;
       const expired = msUntilExpiry <= 0;
-      const entry: TrialScanEntry = { marker: parsed, msUntilExpiry, expired };
+      const entry: TrialScanEntry = { marker: parsed, path, msUntilExpiry, expired };
       if (expired) result.expired.push(entry);
       else result.live.push(entry);
     } catch {
@@ -852,7 +870,7 @@ export async function gcExpiredTrials(opts: {
   const anonId = await loadOrCreateAnonId(home);
   let cleared = 0;
   let failed = 0;
-  for (const { marker } of scan.expired) {
+  for (const { marker, path } of scan.expired) {
     try {
       if (existsSync(marker.clientPath)) {
         const raw = await readFile(marker.clientPath, "utf8");
@@ -874,7 +892,9 @@ export async function gcExpiredTrials(opts: {
           }
         }
       }
-      await unlink(trialMarkerPath(marker.slug, home));
+      // Unlink the file that was actually scanned -- deriving the path from
+      // marker.slug would orphan a marker whose filename mismatches its slug.
+      await unlink(path);
       await postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId }).catch(() => undefined);
       cleared++;
     } catch (e) {
@@ -884,6 +904,3 @@ export async function gcExpiredTrials(opts: {
   }
   return { cleared, failed };
 }
-
-// Re-export `readNested` so tests can use it for inspection.
-export { readNested };

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -7,10 +7,11 @@ import {
   CURRENT_SCHEMA_VERSION,
   isAllowed,
   LOCAL_CONFIG_FILENAME,
-  loadEffectiveProfile,
   loadYawMcpConfig,
+  type Profile,
   profileAllows,
   tokenFingerprint,
+  toProfile,
 } from "../config-loader.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
@@ -296,8 +297,8 @@ describe("tokenFingerprint", () => {
     expect(tokenFingerprint(null)).toBe("(none)");
   });
 
-  it("masks long tokens to first-8…last-4", () => {
-    expect(tokenFingerprint("mcp_pat_abcdef1234567890")).toBe("mcp_pat_…7890");
+  it("masks long tokens to first-8...last-4", () => {
+    expect(tokenFingerprint("mcp_pat_abcdef1234567890")).toBe("mcp_pat_...7890");
   });
 
   it("masks short tokens with last-2 only", () => {
@@ -318,6 +319,73 @@ describe("loadYawMcpConfig — empty/invalid string fields are ignored", () => {
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.apiBase).toBe("https://yaw.sh/mcp");
     expect(r.apiBaseSource).toBe("default");
+  });
+});
+
+describe("loadYawMcpConfig — unusable apiBase in a file warns instead of throwing", () => {
+  it("loads the rest of the file and falls back to the default apiBase", async () => {
+    // A plaintext non-loopback apiBase fails validateApiBase. That must
+    // not reject the load: throwing here crashed startup (index.ts calls
+    // runServer without a rejection handler) and blanked the allow/deny
+    // profile (server.ts swallows the load into null).
+    writeConfig(synthHome, CONFIG_FILENAME, {
+      token: "mcp_pat_global_aaaa",
+      apiBase: "http://example.com",
+      servers: ["github"],
+      blocked: ["slack"],
+      installNudge: true,
+    });
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+
+    expect(r.apiBase).toBe("https://yaw.sh/mcp");
+    expect(r.apiBaseSource).toBe("default");
+    // Everything else in the file survives.
+    expect(r.token).toBe("mcp_pat_global_aaaa");
+    expect(r.tokenSource).toBe("global");
+    expect(r.servers).toEqual(["github"]);
+    expect(r.blocked).toEqual(["slack"]);
+    expect(r.installNudge).toBe(true);
+    expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
+    // And the problem is surfaced for `yaw-mcp doctor`.
+    const w = r.warnings.find((x) => x.includes("apiBase"));
+    expect(w).toBeDefined();
+    expect(w).toMatch(/apiBase ignored/);
+  });
+
+  it("falls through to the next scope's valid apiBase", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "https://global.example" });
+    writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { apiBase: "ftp://nope.example" });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.apiBase).toBe("https://global.example");
+    expect(r.apiBaseSource).toBe("global");
+    expect(r.warnings.some((w) => w.includes("apiBase ignored"))).toBe(true);
+  });
+
+  it("still THROWS for an unusable apiBase from the env override", async () => {
+    // The env path has no per-field fallback to degrade to and is set by
+    // the operator on this run, so a bad value stays loud.
+    await expect(
+      loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: { YAW_MCP_URL: "http://example.com" } }),
+    ).rejects.toThrow(/apiBase \(source: env\)/);
+  });
+});
+
+describe("loadYawMcpConfig — legacy migration runs once per process", () => {
+  it("does not re-walk for a (cwd, home) pair it has already migrated", async () => {
+    // First load primes the memo (nothing to migrate yet).
+    await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+
+    // Drop a pre-0.12 flat config AFTER that first load. Because the
+    // migration is memoized per (cwd, home), the second load must not
+    // walk again -- the legacy file stays exactly where it is.
+    const legacy = join(synthHome, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ token: "mcp_pat_legacy_aaaa" }));
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.token).toBeNull();
+    expect(existsSync(legacy)).toBe(true);
+    expect(existsSync(join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME))).toBe(false);
   });
 });
 
@@ -353,16 +421,23 @@ describe("isAllowed / profileAllows", () => {
   });
 });
 
-describe("loadEffectiveProfile", () => {
+// Production derives the Profile with loadYawMcpConfig + toProfile in one
+// pass (server.ts), so the tests exercise that same pairing -- the old
+// loadEffectiveProfile wrapper had no callers outside this file.
+async function resolveProfile(cwd: string, home: string): Promise<Profile | null> {
+  return toProfile(await loadYawMcpConfig({ cwd, home, env: {} }));
+}
+
+describe("toProfile (loadYawMcpConfig -> Profile)", () => {
   it("returns null when no allow/deny rules are set anywhere", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_aaaa" });
-    const p = await loadEffectiveProfile(synthCwd, synthHome);
+    const p = await resolveProfile(synthCwd, synthHome);
     expect(p).toBeNull();
   });
 
   it("returns a profile with servers + blocked when global sets them", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"], blocked: ["slack"] });
-    const p = await loadEffectiveProfile(synthCwd, synthHome);
+    const p = await resolveProfile(synthCwd, synthHome);
     expect(p).not.toBeNull();
     expect(p?.servers).toEqual(["github"]);
     expect(p?.blocked).toEqual(["slack"]);
@@ -374,7 +449,7 @@ describe("loadEffectiveProfile", () => {
   it("exposes both project and user paths when both contribute", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
     writeConfig(synthCwd, CONFIG_FILENAME, { blocked: ["slack"] });
-    const p = await loadEffectiveProfile(synthCwd, synthHome);
+    const p = await resolveProfile(synthCwd, synthHome);
     expect(p).not.toBeNull();
     // Allow-list from global (project didn't set servers), blocked from project.
     expect(p?.servers).toEqual(["github"]);
@@ -386,7 +461,7 @@ describe("loadEffectiveProfile", () => {
   it("project allow-list takes precedence over global", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github", "postgres"] });
     writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["github"] });
-    const p = await loadEffectiveProfile(synthCwd, synthHome);
+    const p = await resolveProfile(synthCwd, synthHome);
     expect(p?.servers).toEqual(["github"]);
   });
 });

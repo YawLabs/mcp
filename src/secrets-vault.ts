@@ -17,10 +17,10 @@
 // re-prompt. The cache is cleared on `yaw-mcp secrets lock` or on
 // process exit -- nothing persists across processes.
 //
-// Phase 6b ships local-only management. Sync is implemented in
-// Phase 6c via the mcp_secrets team-resource on yaw.sh (server gets
-// an opaque ciphertext blob; never sees plaintext).
+// The vault is local-only: it is never uploaded anywhere. Every
+// operation reads and writes the on-disk file above.
 
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -158,11 +158,30 @@ export async function saveVault(path: string, vault: VaultFile): Promise<void> {
 
 let cachedKey: Buffer | null = null;
 let cachedSalt: string | null = null;
+/** Fingerprint of the passphrase that produced `cachedKey` (see
+ *  passphraseFingerprint). Lets a cache hit prove the SUPPLIED passphrase
+ *  is the one the cached key came from, without paying scrypt again. */
+let cachedFingerprint: Buffer | null = null;
+
+/** Random per-process HMAC key for the passphrase fingerprint. Never
+ *  written to disk and regenerated on every process start, so a
+ *  fingerprint is meaningless outside the process that made it (and an
+ *  attacker who can read this process's memory already has the derived
+ *  key, which is strictly worse). */
+const FINGERPRINT_HMAC_KEY = randomBytes(32);
+
+/** Cheap, constant-time-comparable stand-in for "which passphrase
+ *  produced the cached key". Salt-bound so the same passphrase against a
+ *  different vault does not collide. */
+function passphraseFingerprint(passphrase: string, salt: string): Buffer {
+  return createHmac("sha256", FINGERPRINT_HMAC_KEY).update(salt).update(":").update(passphrase, "utf8").digest();
+}
 
 export function lock(): void {
   if (cachedKey) cachedKey.fill(0); // best-effort zeroize
   cachedKey = null;
   cachedSalt = null;
+  cachedFingerprint = null;
 }
 
 /** Derive the key for the given vault if not cached, else return the
@@ -176,14 +195,31 @@ export function lock(): void {
  *      first entry as a canary; failure => wrong passphrase.
  *    - neither (fresh/empty vault) -> nothing to verify against; accept.
  *      The next setSecret stamps vault.check (via ensureCheck) so the
- *      saved vault carries a token future unlocks verify against. */
+ *      saved vault carries a token future unlocks verify against.
+ *
+ *  The cache short-circuit ALSO checks the passphrase: it is taken only
+ *  when the supplied passphrase fingerprints to the one that produced the
+ *  cached key. Otherwise we fall through to the full derive + verify path.
+ *  Without that, a long-lived process (the hub resolving ${secret:...} at
+ *  spawn time) would accept ANY passphrase once the first unlock had
+ *  succeeded. */
 export async function unlock(vault: VaultFile, passphrase: string): Promise<Buffer> {
-  if (cachedKey && cachedSalt === vault.salt) return cachedKey;
+  const fingerprint = passphraseFingerprint(passphrase, vault.salt);
+  if (
+    cachedKey &&
+    cachedSalt === vault.salt &&
+    cachedFingerprint &&
+    cachedFingerprint.length === fingerprint.length &&
+    timingSafeEqual(cachedFingerprint, fingerprint)
+  ) {
+    return cachedKey;
+  }
   const salt = Buffer.from(vault.salt, "base64");
   const key = await deriveKey(passphrase, salt);
   verifyKey(vault, key);
   cachedKey = key;
   cachedSalt = vault.salt;
+  cachedFingerprint = fingerprint;
   return key;
 }
 
@@ -299,8 +335,20 @@ export function listKeys(vault: VaultFile): string[] {
   return Object.keys(vault.entries).sort();
 }
 
+/** Names a `${secret:NAME}` reference can actually address -- the same
+ *  character class SECRET_REF_RE captures, anchored. A name outside this
+ *  set (spaces, colons, braces) can be stored, but no bundles.json env
+ *  value could ever reference it, so setSecret rejects it up front rather
+ *  than leaving a permanently-unreachable entry in the vault. */
+export const SECRET_NAME_RE = /^[a-zA-Z0-9_.-]+$/;
+
 export function setSecret(vault: VaultFile, key: Buffer, name: string, value: string): VaultFile {
   if (!name) throw new Error("secret name is required");
+  if (!SECRET_NAME_RE.test(name)) {
+    throw new Error(
+      `invalid secret name "${name}" -- use letters, digits, "_", "." or "-" only; other characters can never be referenced as \${secret:NAME}`,
+    );
+  }
   // ensureCheck stamps vault.check on first save so future unlocks can
   // verify the passphrase before caching the derived key.
   return ensureCheck(
@@ -316,12 +364,18 @@ export function setSecret(vault: VaultFile, key: Buffer, name: string, value: st
 }
 
 export function removeSecret(vault: VaultFile, name: string): VaultFile {
-  if (!(name in vault.entries)) return vault;
+  // Object.hasOwn, not `in`: entries comes from JSON.parse and carries
+  // Object.prototype, so `"toString" in entries` is true for every vault.
+  if (!Object.hasOwn(vault.entries, name)) return vault;
   const { [name]: _removed, ...rest } = vault.entries;
   return { ...vault, entries: rest };
 }
 
 export function getSecret(vault: VaultFile, key: Buffer, name: string): string | null {
+  // Own-property check first so an inherited member (`toString`,
+  // `constructor`, ...) is reported as absent instead of being handed to
+  // decryptEntry as a bogus entry.
+  if (!Object.hasOwn(vault.entries, name)) return null;
   const entry = vault.entries[name];
   if (!entry) return null;
   return decryptEntry(entry, key);
@@ -345,9 +399,13 @@ export function newVault(): VaultFile {
  *     with the secret. Inline composition (e.g. `Bearer ${secret:GH}`)
  *     also works -- the regex replaces just the reference span.
  */
-/** Matches a `${secret:NAME}` reference. Exported so callers that only
- *  need the NAMES referenced in an env map (e.g. the values-free
- *  mcp_connect_secrets meta-tool) can scan without decrypting anything.
+/** Matches a `${secret:NAME}` reference. Consumed by resolveSecretRefs
+ *  below, and exported for the callers that only need the NAMES referenced
+ *  in an env map and so can scan without decrypting anything:
+ *    - meta-tools.ts -- the values-free `mcp_connect_secrets` report.
+ *    - upstream.ts   -- the spawn-time ref scan + the stderr redactor.
+ *  Keep those importing this constant rather than re-declaring a local
+ *  copy; three copies of one regex drift.
  *  Global flag => callers using `.exec`/`.matchAll` must mind lastIndex
  *  (reset by creating a fresh RegExp or using String.matchAll, which
  *  clones internally). */
@@ -367,7 +425,9 @@ export function resolveSecretRefs(
     }
     resolved[k] = v.replace(SECRET_REF_RE, (full, name: string) => {
       if (decrypted.has(name)) return decrypted.get(name) as string;
-      const entry = vault.entries[name];
+      // Own-property lookup: SECRET_REF_RE happily captures `toString`,
+      // which `entries[name]` would otherwise resolve off Object.prototype.
+      const entry = Object.hasOwn(vault.entries, name) ? vault.entries[name] : undefined;
       if (!entry) {
         if (!missing.includes(name)) missing.push(name);
         return full; // leave literal so the child errors cleanly

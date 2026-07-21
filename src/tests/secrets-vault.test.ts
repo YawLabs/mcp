@@ -159,6 +159,41 @@ describe("secrets-vault: set/get/list/remove", () => {
     await expect(unlock(vault, "hunter3")).rejects.toThrow(/wrong passphrase/i);
   });
 
+  it("inherited Object.prototype members are not vault entries", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    // `"toString" in entries` is true for every JSON-parsed vault -- own-key
+    // checks are what stop `secrets get toString` from finding an "entry".
+    expect(getSecret(vault, key, "toString")).toBeNull();
+    expect(removeSecret(vault, "constructor")).toBe(vault);
+    const { resolved, missing } = resolveSecretRefs({ X: "${secret:toString}" }, vault, key);
+    expect(resolved.X).toBe("${secret:toString}");
+    expect(missing).toEqual(["toString"]);
+  });
+
+  it("unlock rejects a wrong passphrase even when a key is already cached for this vault", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    // NOTE: no lock() here -- the key is still cached under this salt, which
+    // is exactly the long-lived-process case. The cache hit must not hand
+    // the key back for a passphrase that never unlocked this vault.
+    await expect(unlock(vault, "hunter3")).rejects.toThrow(/wrong passphrase/i);
+    // ...and the correct passphrase still resolves from cache.
+    await expect(unlock(vault, "hunter2")).resolves.toBeInstanceOf(Buffer);
+  });
+
+  it("setSecret rejects a name no ${secret:NAME} reference could address", async () => {
+    const vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    for (const bad of ["has space", "a:b", "a{b}", "a/b", "a$b"]) {
+      expect(() => setSecret(vault, key, bad, "v")).toThrow(/invalid secret name/i);
+    }
+    // The reference-safe character class is accepted.
+    expect(listKeys(setSecret(vault, key, "GH_token.v2-1", "v"))).toEqual(["GH_token.v2-1"]);
+  });
+
   it("setSecret stamps a vault.check verification token", async () => {
     let vault = newVault();
     expect(vault.check).toBeUndefined();

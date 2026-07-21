@@ -145,41 +145,50 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
   });
 
-  // 6. Returns null (no project migration) when walk reaches $HOME itself.
+  // 6. Returns null (no project migration) when the walk reaches $HOME itself.
   it("does not migrate a legacy file sitting at $HOME as a project file", async () => {
-    // Place a legacy file directly at $HOME -- this is the GLOBAL scope,
-    // handled by the global migration path, NOT by the project walk-up.
-    writeLegacy(home, LEGACY_PROJECT_FILENAME);
-
-    // cwd is directly under home so the walk immediately hits the $HOME
-    // boundary and stops -- the legacy file at $HOME is excluded.
-    const _projectSub = mkdtempSync(join(home, "proj-"));
-
-    // Run with a fresh home that has no global config dir yet so we can
-    // distinguish global migration (which DOES move the file) from project
-    // migration (which should NOT touch it at the home level).
-    // We'll use a separate home for this test to avoid the global migration
-    // picking up the file: use a nested temp dir where the "home" for the
-    // migrator is the projectSub itself.
-    //
-    // Re-run with a sub-dir as home so the global migration has no effect,
-    // and check that nothing in projectSub's parent (.yaw-mcp/ at home) is
-    // created via the project walk-up path.
+    // `.yaw-mcp.local.json` at $HOME. The local variant is deliberate: the
+    // global migration only handles `.yaw-mcp.json`, so the ONLY code path
+    // that could touch this file is the project walk-up -- which must stop
+    // strictly before $HOME.
     const innerHome = mkdtempSync(join(home, "inner-home-"));
     const innerCwd = mkdtempSync(join(innerHome, "cwd-"));
-    // Put the legacy file at innerHome -- the global migration WILL move it;
-    // we just want to confirm no SECOND move happens via project walk-up.
-    writeLegacy(innerHome, LEGACY_LOCAL_FILENAME); // use local variant to avoid global match
+    const legacyAtHome = writeLegacy(innerHome, LEGACY_LOCAL_FILENAME);
 
-    // The walk from innerCwd up to innerHome should stop at innerHome and
-    // not attempt a project migration for LEGACY_LOCAL_FILENAME sitting there.
     await migrateLegacyConfigPaths({ cwd: innerCwd, home: innerHome });
 
-    // The local-scope file at innerHome is NOT under any project root in the
-    // walk-up (since walk stops before home); so no project config.local.json
-    // should be created by the project walk -- only the global-path migration
-    // could have touched files at innerHome level.
-    // Confirm: no .yaw-mcp/config.local.json in innerCwd (walk never reached innerHome as project).
-    await expect(stat(join(innerCwd, CONFIG_DIRNAME, "config.local.json"))).rejects.toThrow();
+    // A regressed guard would treat innerHome as the project root and write
+    // innerHome/.yaw-mcp/config.local.json -- assert against THAT path, not
+    // innerCwd's (which the walker could never have picked as the root,
+    // making the old assertion vacuous).
+    await expect(stat(join(innerHome, CONFIG_DIRNAME, "config.local.json"))).rejects.toThrow();
+    // ...and the legacy file is still sitting untouched at $HOME.
+    await expect(stat(legacyAtHome)).resolves.toBeDefined();
+  });
+
+  // 7. No-op when cwd is OUTSIDE $HOME entirely.
+  it("is a no-op when cwd is outside $HOME (no walk to the filesystem root)", async () => {
+    // A cwd outside $HOME used to send the walker all the way to the
+    // filesystem root, destructively renaming any `.yaw-mcp.json` it passed
+    // into a `.yaw-mcp/` that findProjectConfigDir (bounded at $HOME) never
+    // reads -- i.e. silent token loss. The migrator's bound now matches the
+    // loader's: outside $HOME it does nothing.
+    const outside = mkdtempSync(join(tmpdir(), "yaw-mcp-migrate-outside-"));
+    try {
+      const legacyProject = writeLegacy(outside, LEGACY_PROJECT_FILENAME);
+      const legacyLocal = writeLegacy(outside, LEGACY_LOCAL_FILENAME);
+
+      await migrateLegacyConfigPaths({ cwd: outside, home });
+
+      // Both legacy files stay exactly where they are...
+      await expect(stat(legacyProject)).resolves.toBeDefined();
+      await expect(stat(legacyLocal)).resolves.toBeDefined();
+      // ...and no `.yaw-mcp/` was created out there.
+      await expect(stat(join(outside, CONFIG_DIRNAME))).rejects.toThrow();
+      // The synthetic $HOME is untouched too (nothing was hoisted into it).
+      await expect(stat(join(userConfigDir(home), "config.json"))).rejects.toThrow();
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

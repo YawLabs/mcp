@@ -73,6 +73,14 @@ let lastFailure: AnalyticsFailure | null = null;
 // diagnostic surfaced by `yaw-mcp doctor`.
 let lastLoggedConnectStatus: number | null = null;
 let lastLoggedDispatchStatus: number | null = null;
+// Same latch discipline for the TRANSPORT-error path (no HTTP status at
+// all: ECONNREFUSED, DNS failure, timeout). An offline workstation would
+// otherwise emit an identical warn line every FLUSH_INTERVAL for the life
+// of the process. Keyed on the error message so a *different* failure
+// still re-logs once. Reset on a 2xx for the same path and on
+// initAnalytics.
+let lastLoggedConnectError: string | null = null;
+let lastLoggedDispatchError: string | null = null;
 // One-shot latches: warn once per process (reset by initAnalytics) when
 // the configured apiUrl is not https and not loopback, so the operator
 // sees the misconfiguration without a warn line every 30s.
@@ -84,11 +92,24 @@ let warnedInsecureBearerSkipDispatch = false;
 /**
  * Returns true when it is safe to send `Authorization: Bearer ...` to
  * the given URL. Bearers are allowed over https://, or over http:// only
- * to loopback (127.0.0.1, ::1, localhost). Pure predicate -- no side
- * effects. Callers are responsible for one-shot warn logging via their
- * own per-path latch.
+ * to loopback (127.0.0.1, ::1, localhost).
+ *
+ * Shared by every background poster that carries the account token
+ * (analytics flush, dispatch-events flush, heartbeat) -- one predicate so
+ * a future tightening (say, dropping plaintext loopback) lands in all of
+ * them at once instead of drifting per-caller.
+ *
+ * The predicate itself is pure except for the optional `onInsecure`
+ * callback, which is invoked exactly when a well-formed URL is rejected
+ * for being neither https nor loopback. Callers own the warn text and the
+ * one-shot latch; pass nothing to get a silent predicate.
+ *
+ * A URL that does not parse returns false WITHOUT calling `onInsecure`:
+ * it is not an insecure-transport misconfiguration, it is garbage that
+ * `request()` will reject at the transport layer with a more useful
+ * error. Warning "not https and not loopback" about it would misdirect.
  */
-function shouldSendBearer(targetUrl: string): boolean {
+export function shouldSendBearer(targetUrl: string, onInsecure?: (url: string) => void): boolean {
   let parsed: URL;
   try {
     parsed = new URL(targetUrl);
@@ -97,7 +118,31 @@ function shouldSendBearer(targetUrl: string): boolean {
   }
   if (parsed.protocol === "https:") return true;
   if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return true;
+  onInsecure?.(targetUrl);
   return false;
+}
+
+// Per-path `onInsecure` handlers for shouldSendBearer. Each owns its own
+// one-shot latch so the connect flush firing first cannot suppress the
+// dispatch-events warning (and vice versa).
+function warnInsecureBearerConnect(url: string): void {
+  if (warnedInsecureBearerSkipConnect) return;
+  log(
+    "warn",
+    "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+    { url },
+  );
+  warnedInsecureBearerSkipConnect = true;
+}
+
+function warnInsecureBearerDispatch(url: string): void {
+  if (warnedInsecureBearerSkipDispatch) return;
+  log(
+    "warn",
+    "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
+    { url },
+  );
+  warnedInsecureBearerSkipDispatch = true;
 }
 
 export function getLastAnalyticsFailure(): AnalyticsFailure | null {
@@ -161,15 +206,8 @@ async function flush(): Promise<void> {
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/analytics`;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (shouldSendBearer(url)) {
+    if (shouldSendBearer(url, warnInsecureBearerConnect)) {
       headers.Authorization = `Bearer ${token}`;
-    } else if (!warnedInsecureBearerSkipConnect) {
-      log(
-        "warn",
-        "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
-        { url },
-      );
-      warnedInsecureBearerSkipConnect = true;
     }
     const res = await request(url, {
       method: "POST",
@@ -200,6 +238,7 @@ async function flush(): Promise<void> {
     } else {
       lastFailure = null;
       lastLoggedConnectStatus = null;
+      lastLoggedConnectError = null;
     }
     // Drain response body
     await res.body.text().catch(() => {});
@@ -208,7 +247,16 @@ async function flush(): Promise<void> {
     const room = MAX_BUFFER - buffer.length;
     if (room > 0) buffer.push(...events.slice(0, room));
     if (events.length > Math.max(0, room)) droppedEvents += events.length - Math.max(0, room);
-    log("warn", "Analytics flush error", { error: err.message });
+    // Transport error: no HTTP status exists, so statusCode 0 marks it as
+    // such for `yaw-mcp doctor` -- same sentinel tool-report.ts uses. Without
+    // this the offline case was invisible to doctor AND warn-spammed every
+    // FLUSH_INTERVAL, since the latch below never applied here.
+    const errMsg = err?.message ?? "unknown error";
+    if (lastLoggedConnectError !== errMsg) {
+      log("warn", "Analytics flush error", { error: errMsg });
+      lastLoggedConnectError = errMsg;
+    }
+    lastFailure = { statusCode: 0, url, at: Date.now() };
   }
 }
 
@@ -219,15 +267,8 @@ async function flushDispatch(): Promise<void> {
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/dispatch-events`;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (shouldSendBearer(url)) {
+    if (shouldSendBearer(url, warnInsecureBearerDispatch)) {
       headers.Authorization = `Bearer ${token}`;
-    } else if (!warnedInsecureBearerSkipDispatch) {
-      log(
-        "warn",
-        "Analytics URL is not https and not loopback; sending without Authorization header to avoid leaking the bearer token",
-        { url },
-      );
-      warnedInsecureBearerSkipDispatch = true;
     }
     const res = await request(url, {
       method: "POST",
@@ -254,13 +295,20 @@ async function flushDispatch(): Promise<void> {
     } else {
       lastFailure = null;
       lastLoggedDispatchStatus = null;
+      lastLoggedDispatchError = null;
     }
     await res.body.text().catch(() => {});
   } catch (err: any) {
     const room = MAX_BUFFER - dispatchBuffer.length;
     if (room > 0) dispatchBuffer.push(...events.slice(0, room));
     if (events.length > Math.max(0, room)) droppedEvents += events.length - Math.max(0, room);
-    log("warn", "Dispatch-events flush error", { error: err.message });
+    // See flush() above for the statusCode-0 sentinel + log-latch rationale.
+    const errMsg = err?.message ?? "unknown error";
+    if (lastLoggedDispatchError !== errMsg) {
+      log("warn", "Dispatch-events flush error", { error: errMsg });
+      lastLoggedDispatchError = errMsg;
+    }
+    lastFailure = { statusCode: 0, url, at: Date.now() };
   }
 }
 
@@ -269,8 +317,18 @@ export function initAnalytics(url: string, tok: string): void {
   token = tok;
   lastLoggedConnectStatus = null;
   lastLoggedDispatchStatus = null;
+  lastLoggedConnectError = null;
+  lastLoggedDispatchError = null;
   warnedInsecureBearerSkipConnect = false;
   warnedInsecureBearerSkipDispatch = false;
+  // Clear any timer from a prior init before installing a new one. A second
+  // initAnalytics (re-auth, config reload, a test re-initing between cases)
+  // would otherwise orphan the old interval: it keeps firing forever against
+  // the NEW apiUrl/token, doubling the flush rate on every re-init.
+  if (flushTimer) {
+    clearInterval(flushTimer);
+    flushTimer = null;
+  }
   flushTimer = setInterval(() => {
     flush().catch(() => {});
     flushDispatch().catch(() => {});

@@ -21,7 +21,7 @@ import { loadYawMcpConfig } from "./config-loader.js";
 import { describeDefaultRuntime, describeServerRuntime, type ServerRuntimeInfo } from "./default-runtime.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { type OamProbe, probeOam } from "./oam-spawn.js";
-import type { ConnectConfig, UpstreamServerConfig } from "./types.js";
+import type { ConnectConfig } from "./types.js";
 
 export interface ServersCommandOptions {
   home?: string;
@@ -111,7 +111,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
 
   if (!config.token) {
     printErr(
-      "yaw-mcp servers: no token resolved. Run `yaw-mcp install <client> --token mcp_pat_…` or set YAW_MCP_TOKEN.",
+      "yaw-mcp servers: no token resolved. Run `yaw-mcp install <client> --token mcp_pat_...` or set YAW_MCP_TOKEN.",
     );
     return { exitCode: 1, lines };
   }
@@ -177,8 +177,12 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   // helper doctor uses, so both surfaces agree.
   const probe = (opts.oamProbe ?? probeOam)();
   const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
-  const runtimes = new Map<UpstreamServerConfig, ServerRuntimeInfo>(
-    merged.servers.map((s) => [s, describeServerRuntime(s, dflt.runtime, probe)]),
+  // Keyed by namespace (unique per config), NOT by server object identity --
+  // the servers above flow through spread-copies (filter/grade overlay), and
+  // an identity-keyed map silently loses every lookup the moment any future
+  // step copies the objects again.
+  const runtimes = new Map<string, ServerRuntimeInfo>(
+    merged.servers.map((s) => [s.namespace, describeServerRuntime(s, dflt.runtime, probe)]),
   );
 
   if (opts.json) {
@@ -192,7 +196,7 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     const payload = {
       ...merged,
       servers: merged.servers.map((s) => {
-        const v = runtimes.get(s);
+        const v = runtimes.get(s.namespace);
         return { ...s, effectiveRuntime: v?.runtime ?? null, effectiveRuntimeReason: v?.reason ?? "" };
       }),
       filter: opts.filter ?? null,
@@ -230,7 +234,7 @@ function runtimeCell(v: ServerRuntimeInfo | undefined): string {
 
 function renderTable(
   cfg: ConnectConfig,
-  runtimes: Map<UpstreamServerConfig, ServerRuntimeInfo>,
+  runtimes: Map<string, ServerRuntimeInfo>,
   print: (s?: string) => void,
 ): void {
   const servers = cfg.servers;
@@ -257,7 +261,7 @@ function renderTable(
     name: s.name,
     type: s.type,
     status: s.isActive ? "enabled" : "disabled",
-    runtime: runtimeCell(runtimes.get(s)),
+    runtime: runtimeCell(runtimes.get(s.namespace)),
     grade: s.complianceGrade ?? "-",
     tools: s.toolCache ? String(s.toolCache.length) : "?",
   }));

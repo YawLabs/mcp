@@ -18,6 +18,31 @@ describe("isLoopbackHost", () => {
     expect(isLoopbackHost("[::1]")).toBe(true);
   });
 
+  it("returns true across 127.0.0.0/8, not just 127.0.0.1", () => {
+    expect(isLoopbackHost("127.0.0.2")).toBe(true);
+    expect(isLoopbackHost("127.1.2.3")).toBe(true);
+    expect(isLoopbackHost("127.255.255.254")).toBe(true);
+  });
+
+  it("returns true for *.localhost subdomains (RFC 6761)", () => {
+    expect(isLoopbackHost("api.localhost")).toBe(true);
+    expect(isLoopbackHost("a.b.localhost")).toBe(true);
+  });
+
+  it("does not treat a localhost-prefixed domain as loopback", () => {
+    expect(isLoopbackHost("localhost.evil.com")).toBe(false);
+    expect(isLoopbackHost("notlocalhost")).toBe(false);
+    expect(isLoopbackHost(".localhost")).toBe(false);
+  });
+
+  it("does not treat a 127-prefixed domain or malformed quad as loopback", () => {
+    expect(isLoopbackHost("127.0.0.1.evil.com")).toBe(false);
+    expect(isLoopbackHost("127.0.0.256")).toBe(false);
+    expect(isLoopbackHost("127.0.0")).toBe(false);
+    expect(isLoopbackHost("1127.0.0.1")).toBe(false);
+    expect(isLoopbackHost("128.0.0.1")).toBe(false);
+  });
+
   it("returns false for example.com", () => {
     expect(isLoopbackHost("example.com")).toBe(false);
   });
@@ -70,6 +95,21 @@ describe("validateApiBase", () => {
     // The WHATWG URL parser requires brackets for IPv6 literals.
     // http://::1 is not a valid URL and throws before the loopback check.
     expect(() => validateApiBase("http://::1")).toThrow("apiBase must be a valid URL (got: http://::1)");
+  });
+
+  it("accepts http:// to any 127.0.0.0/8 address", () => {
+    expect(validateApiBase("http://127.0.0.2:8080").hostname).toBe("127.0.0.2");
+    expect(validateApiBase("http://127.1.2.3").hostname).toBe("127.1.2.3");
+  });
+
+  it("accepts http:// to a *.localhost subdomain", () => {
+    expect(validateApiBase("http://stub.localhost:3000").hostname).toBe("stub.localhost");
+  });
+
+  it("rejects http:// to a localhost-prefixed domain", () => {
+    expect(() => validateApiBase("http://localhost.evil.com")).toThrow(
+      "apiBase must use https (or http for loopback only). Got: http://localhost.evil.com",
+    );
   });
 
   it("rejects http:// to a non-loopback host", () => {
