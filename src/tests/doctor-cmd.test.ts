@@ -7,10 +7,23 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
   writeFileSync(join(root, ".yaw-mcp", filename), JSON.stringify(obj));
 }
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// doctor reads the tool-report failure latch through this getter. The latch
+// is in-process module state that only the long-lived server sets, so it is
+// unreachable from a fresh CLI process -- mocking the getter is the only way
+// to exercise the BACKGROUND POSTERS renderer. Defaults to the healthy
+// (null) case so every other test in this file sees today's behaviour.
+vi.mock("../tool-report.js", () => ({
+  getLastReportFailure: vi.fn(() => null),
+  initToolReport: vi.fn(),
+  reportTools: vi.fn(),
+}));
+
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
+import { getLastReportFailure } from "../tool-report.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -24,8 +37,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // synthCwd lives INSIDE synthHome (see beforeEach), so this single
+  // recursive remove takes both -- a second rmSync(synthCwd) would always
+  // be a no-op against an already-deleted path.
   rmSync(synthHome, { recursive: true, force: true });
-  rmSync(synthCwd, { recursive: true, force: true });
 });
 
 function captureOut() {
@@ -74,7 +89,10 @@ describe("runDoctor — output content", () => {
     const txt = cap.text();
     expect(txt).not.toContain("supersecret");
     expect(txt).not.toContain("DO_NOT_LEAK");
-    expect(txt).toMatch(/mcp_pat_…1234/);
+    // Accept either elision glyph -- the mask character is config-loader's
+    // call (ASCII "..." vs "…"); what this test pins is that the fingerprint
+    // keeps the prefix + last 4 and nothing else.
+    expect(txt).toMatch(/mcp_pat_(…|\.\.\.)1234/);
   });
 
   it("reports the source for token and apiBase", async () => {
@@ -305,6 +323,25 @@ describe("scanShellHistoryForShadows", () => {
     expect(hits).toEqual([]);
   });
 
+  it("strips STACKED wrapper prefixes, not just the first one", () => {
+    // `sudo time npm audit` used to resolve to "time" (one wrapper peeled),
+    // so the npm hit was lost entirely.
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["sudo time npm audit", "command exec gh pr list", "sudo FOO=1 time kubectl get pods"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "kubectl")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "time")).toBeUndefined();
+  });
+
+  it("returns null (no hit) for a line that is nothing but wrappers", () => {
+    writeFileSync(join(synthHome, ".bash_history"), ["sudo", "sudo time", "FOO=1"].join("\n"));
+    expect(scanShellHistoryForShadows({ home: synthHome, env: {} })).toEqual([]);
+  });
+
   it("sorts hits by count descending", () => {
     writeFileSync(
       join(synthHome, ".bash_history"),
@@ -313,6 +350,59 @@ describe("scanShellHistoryForShadows", () => {
     const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
     expect(hits[0].cli).toBe("npm");
     expect(hits[0].count).toBe(3);
+  });
+});
+
+describe("runDoctor — BACKGROUND POSTERS section", () => {
+  const latch = vi.mocked(getLastReportFailure);
+  afterEach(() => {
+    latch.mockReturnValue(null);
+  });
+
+  it("renders statusCode 0 as a network error, never 'HTTP 0'", async () => {
+    // tool-report.ts uses statusCode 0 as the transport-failure sentinel
+    // (ECONNREFUSED / DNS / timeout produce no HTTP status).
+    latch.mockReturnValue({ statusCode: 0, url: "https://yaw.sh/mcp/api/connect/servers/srv/tools", at: Date.now() });
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    const txt = cap.text();
+    expect(txt).toContain("BACKGROUND POSTERS");
+    expect(txt).toMatch(/tool-report: {2}network error reaching https:\/\/yaw\.sh/);
+    expect(txt).not.toContain("HTTP 0");
+  });
+
+  it("still renders a real status code as HTTP <code>", async () => {
+    latch.mockReturnValue({ statusCode: 401, url: "https://yaw.sh/mcp/api/connect/servers/srv/tools", at: Date.now() });
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    expect(cap.text()).toMatch(/tool-report: {2}HTTP 401 from https:\/\/yaw\.sh/);
+  });
+
+  it("stays silent when no poster has failed", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    expect(cap.text()).not.toContain("BACKGROUND POSTERS");
   });
 });
 
@@ -705,7 +795,7 @@ describe("runDoctor — --json", () => {
     expect(text).not.toContain("supersecret");
     expect(text).not.toContain("DO_NOT_LEAK");
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.token.fingerprint).toMatch(/…1234/);
+    expect(parsed.token.fingerprint).toMatch(/(…|\.\.\.)1234/);
     expect(parsed.token.fingerprint).not.toContain("DO_NOT_LEAK");
   });
 
@@ -763,6 +853,89 @@ describe("runDoctor — --json", () => {
     expect(parsed.state.savedAt).toBeNull();
   });
 
+  it("reports a corrupt state.json as malformed instead of healthy-fresh", async () => {
+    // loadState swallows the parse error and hands back an empty state, so
+    // the JSON path used to report savedAt:null + 0 entries -- indistinguishable
+    // from a brand-new install -- while the text path called the file corrupt.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", STATE_FILENAME), "{ not json at all");
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.status).toBe("malformed");
+    expect(parsed.state.disabled).toBe(false);
+    expect(parsed.state.path).toBe(join(synthHome, ".yaw-mcp", STATE_FILENAME));
+    expect(typeof parsed.state.detail).toBe("string");
+    // Crucially NOT the healthy-fresh shape (learningEntries: 0).
+    expect(parsed.state.learningEntries).toBeNull();
+    expect(parsed.state.packHistoryEntries).toBeNull();
+    // A corrupt file yields no reliability data either.
+    expect(parsed.reliability).toEqual([]);
+  });
+
+  it("reports a schema-mismatched state.json as stale-version", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
+      JSON.stringify({ version: STATE_SCHEMA_VERSION + 99, savedAt: Date.now(), learning: {}, packHistory: [] }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.status).toBe("stale-version");
+    expect(parsed.state.detail).toContain(`v${STATE_SCHEMA_VERSION}`);
+  });
+
+  it("reports status 'missing' (not corrupt) when state.json has never been written", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.status).toBe("missing");
+    expect(parsed.state.disabled).toBe(false);
+    expect(parsed.state.savedAt).toBeNull();
+    expect(parsed.state.learningEntries).toBe(0);
+  });
+
+  it("marks state.status 'disabled' when persistence is off", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.status).toBe("disabled");
+    expect(parsed.state.detail).toBeNull();
+  });
+
   it("includes reliability entries for flaky persisted namespaces", async () => {
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
@@ -811,10 +984,11 @@ describe("runDoctor — --json", () => {
     expect(parsed.env).toHaveProperty("YAW_MCP_AUTO_LOAD");
   });
 
-  it("upgrade.stale is true when registry reports a newer version", async () => {
+  it("upgrade.stale stays false on a dev build (the 'dev' version short-circuits the check)", async () => {
     // Doctor only flags stale when VERSION !== "dev". Under vitest
-    // VERSION is "dev" so stale should always be false even with a
-    // fetch hook override — this test documents that.
+    // VERSION is "dev", so stale is false regardless of what the registry
+    // says -- that is the behaviour this test pins. The stale=true path is
+    // covered by the UPGRADE AVAILABLE tests, which pass currentVersion.
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
