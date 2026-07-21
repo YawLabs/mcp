@@ -1,4 +1,4 @@
-import type { NamespaceUsage } from "./learning.js";
+import { LEARNING_MIN_OBSERVATIONS, type NamespaceUsage, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import type { DetectedPack } from "./pack-detect.js";
 
 // Inline usage hints for discover() output. Two signals:
@@ -27,8 +27,14 @@ const MIN_SUCCESS_TO_SHOW = 1;
 // handleHealth and `yaw-mcp doctor` can share the same "what counts as
 // flaky" definition — otherwise the various views would disagree about
 // which namespaces qualify and the LLM / operator ends up confused.
-export const RELIABILITY_MIN_OBSERVATIONS = 3;
-export const RELIABILITY_THRESHOLD = 0.8;
+//
+// These are ALIASES of the learning-store constants, not copies: the
+// reliability hint must describe exactly the population LearningStore's
+// penalty branch depresses, so the numbers are imported rather than
+// mirrored-by-comment. Change them in learning.ts and both surfaces move
+// together.
+export const RELIABILITY_MIN_OBSERVATIONS = LEARNING_MIN_OBSERVATIONS;
+export const RELIABILITY_THRESHOLD = PENALTY_RATE_THRESHOLD;
 
 // Flatten detected packs into a per-namespace peer list. Each pack is
 // a set of 2-3 namespaces that co-occurred in ≥2 bursts; the map

@@ -1,4 +1,4 @@
-import { classifyError, type ErrorCategory } from "./error-category";
+import { classifyError, type ErrorCategory } from "./error-category.js";
 
 export interface ToolCallResultShape {
   content?: Array<{ type: string; text?: string }>;

@@ -109,7 +109,10 @@ describe("LearningStore", () => {
     it("rate stays in [0,1] when dispatched < succeeded", () => {
       const store = new LearningStore();
       store.loadSnapshot({ ns: { dispatched: 2, succeeded: 5, lastUsedAt: 1 } });
-      // dispatched=2, succeeded=5: coerce -> dispatched=5, rate=1.0 -> no penalty.
+      // loadSnapshot resolves succeeded > dispatched the SAME direction
+      // boostFactor does: dispatched is coerced UP to 5, succeeded keeps its
+      // earned 5. Rate = 1.0, so no penalty fires.
+      expect(store.get("ns")).toEqual({ dispatched: 5, succeeded: 5, lastUsedAt: 1 });
       const factor = store.boostFactor("ns");
       expect(factor).toBeGreaterThanOrEqual(1.0);
     });
@@ -177,6 +180,26 @@ describe("LearningStore", () => {
       // boost factors must be identical after round-trip
       expect(store2.boostFactor("gh")).toBe(store.boostFactor("gh"));
       expect(store2.boostFactor("slack")).toBe(store.boostFactor("slack"));
+    });
+
+    it("round-trips a succeeded > dispatched store without losing credit", () => {
+      // recordSuccess without a paired recordDispatch legitimately produces
+      // succeeded > dispatched in memory. export -> load must be an identity
+      // on the boost factor: clamping succeeded DOWN to dispatched would
+      // silently delete earned credit on every restart.
+      const store = new LearningStore();
+      for (let i = 0; i < 5; i++) store.recordSuccess("solo");
+      const before = store.boostFactor("solo");
+
+      const store2 = new LearningStore();
+      store2.loadSnapshot(store.exportSnapshot());
+
+      expect(store2.get("solo")?.succeeded).toBe(5);
+      expect(store2.boostFactor("solo")).toBe(before);
+      // Loading the loaded snapshot is a fixed point -- no further drift.
+      const store3 = new LearningStore();
+      store3.loadSnapshot(store2.exportSnapshot());
+      expect(store3.get("solo")).toEqual(store2.get("solo"));
     });
 
     it("round-tripping an empty store produces an empty store", () => {

@@ -117,6 +117,10 @@ describe("validateEntry -- exercised via readGradesCache", () => {
     { label: "empty gradedAt string", entry: { grade: "A", score: 90, gradedAt: "" } },
     { label: "null entry", entry: null },
     { label: "array entry", entry: [1, 2, 3] },
+    // Score is a 0-100 percentage; anything outside that is corrupt.
+    { label: "negative score", entry: { grade: "A", score: -5, gradedAt: "2026-01-01T00:00:00.000Z" } },
+    { label: "score above 100", entry: { grade: "A", score: 1e9, gradedAt: "2026-01-01T00:00:00.000Z" } },
+    { label: "score just above 100", entry: { grade: "A", score: 100.1, gradedAt: "2026-01-01T00:00:00.000Z" } },
   ];
 
   for (const { label, entry } of cases) {
@@ -126,6 +130,19 @@ describe("validateEntry -- exercised via readGradesCache", () => {
       expect(result).toEqual({});
     });
   }
+
+  it("keeps entries at both ends of the 0-100 score range", async () => {
+    writeGradesFile(
+      synthHome,
+      JSON.stringify({
+        floor: { grade: "F", score: 0, gradedAt: "2026-06-01T00:00:00.000Z" },
+        ceiling: { grade: "A", score: 100, gradedAt: "2026-06-01T00:00:00.000Z" },
+      }),
+    );
+    const result = await readGradesCache(synthHome);
+    expect(result.floor?.score).toBe(0);
+    expect(result.ceiling?.score).toBe(100);
+  });
 
   it("returns true (entry kept) for a valid entry with grade letter lowercased in JSON", async () => {
     // grade.toUpperCase() is applied inside validateEntry -- lowercase input should work

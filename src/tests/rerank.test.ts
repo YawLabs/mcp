@@ -207,8 +207,6 @@ describe("rerank client", () => {
     const body = JSON.parse((call[1] as any).body);
     expect(body).toEqual({ intent: "query" });
   });
-
-  // Path-A / Path-B fallback-blocking contract:
 });
 
 describe("handleDispatch two-stage ranking", () => {
@@ -216,6 +214,12 @@ describe("handleDispatch two-stage ranking", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // initRerank sets MODULE-level state in rerank.ts. Set it here rather
+    // than relying on the "rerank client" describe above having run first --
+    // otherwise these cases only pass when the file executes top-to-bottom,
+    // and running this describe alone (-t filter, .only, shard) silently
+    // skips the rerank call and every assertion falls through to BM25.
+    initRerank("https://yaw.sh/mcp", "test-token");
     server = new ConnectServer("https://yaw.sh/mcp", "test-token");
   });
 
