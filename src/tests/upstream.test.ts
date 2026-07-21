@@ -462,20 +462,28 @@ describe("resolveServerEnv", () => {
     );
   });
 
-  it("records a 'missing' audit event BEFORE refusing the spawn", async () => {
+  it("records 'missing' but NOT 'injected' when a refused spawn had one resolvable ref", async () => {
     // The refusal is the case an operator goes looking for in
     // `yaw-mcp secrets audit`; recording only on the success path left the
     // "missing" event kind dead even though the CLI renders it.
+    //
+    // Two refs -- one resolvable (OK_NAME), one missing -- because
+    // resolution is all-or-nothing: the missing ref refuses the spawn, so
+    // the resolvable one never reaches a child env either. Recording it as
+    // "injected" answered "did this server ever receive OK_NAME?" with a
+    // false yes. "injected" must keep meaning "went into a spawn env".
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
-    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: {} } as any);
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { OK_NAME: {} } } as any);
     vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
     vi.mocked(resolveSecretRefs).mockReturnValue({
-      resolved: { API_KEY: "${secret:MISSING_NAME}" },
+      resolved: { API_KEY: "${secret:MISSING_NAME}", OTHER: "resolved-cleartext" },
       missing: ["MISSING_NAME"],
     });
 
-    const config = makeLocalConfig({ env: { API_KEY: "${secret:MISSING_NAME}" } });
+    const config = makeLocalConfig({
+      env: { API_KEY: "${secret:MISSING_NAME}", OTHER: "${secret:OK_NAME}" },
+    });
     await expect(connectToUpstream(config)).rejects.toThrow(/missing or undecryptable/);
 
     expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
@@ -483,6 +491,10 @@ describe("resolveServerEnv", () => {
       secret: "MISSING_NAME",
       event: "missing",
     });
+    // The ref that DID resolve must not be logged as injected -- the spawn
+    // was refused, so nothing was injected at all.
+    expect(vi.mocked(appendAuditEvent)).not.toHaveBeenCalledWith(expect.objectContaining({ event: "injected" }));
+    expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledTimes(1);
   });
 
   it("records an 'injected' audit event per resolved secret NAME (never a value)", async () => {

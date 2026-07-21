@@ -22,6 +22,7 @@ import {
   removeSecret,
   rotateVault,
   saveVault,
+  SECRET_NAME_RE,
   setSecret,
   unlock,
   type VaultFile,
@@ -170,6 +171,22 @@ export function parseSecretsArgs(
   if (!opts.action) return { ok: false, error: `yaw-mcp secrets: missing action\n\n${SECRETS_USAGE}` };
   if ((opts.action === "set" || opts.action === "get" || opts.action === "remove") && !opts.name) {
     return { ok: false, error: `yaw-mcp secrets ${opts.action}: <name> is required\n\n${SECRETS_USAGE}` };
+  }
+  // Reject a name no ${secret:NAME} reference could ever address BEFORE any
+  // prompt or key derivation. setSecret enforces the same rule, but only
+  // after resolvePassphrase, the ~100ms scrypt derivation and the no-echo
+  // value prompt -- so `yaw-mcp secrets set "my token"` used to make the
+  // user type two secrets before hearing the name was never valid. The
+  // regex is IMPORTED from secrets-vault.js, never re-spelled here: a
+  // duplicated copy of this pattern was itself a finding in this repo.
+  // Only `set` is checked. get/remove already short-circuit to `No secret
+  // named "..."` without a prompt, and a vault written before the rule
+  // existed must stay readable/removable by its legacy name.
+  if (opts.action === "set" && opts.name !== undefined && !SECRET_NAME_RE.test(opts.name)) {
+    return {
+      ok: false,
+      error: `yaw-mcp secrets set: invalid secret name "${opts.name}" -- use letters, digits, "_", "." or "-" only; other characters can never be referenced as \${secret:NAME}\n\n${SECRETS_USAGE}`,
+    };
   }
   return { ok: true, options: opts };
 }
@@ -497,7 +514,9 @@ export async function runSecrets(
     try {
       // setSecret rejects a name no ${secret:NAME} reference could ever
       // address (spaces, colons, braces) -- surface that as a normal CLI
-      // error instead of an unhandled rejection.
+      // error instead of an unhandled rejection. For the CLI path
+      // parseSecretsArgs already rejected it before any prompt; this is
+      // the backstop for programmatic callers of runSecrets.
       vault = setSecret(vault, key, name, value);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

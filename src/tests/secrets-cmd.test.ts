@@ -161,6 +161,39 @@ describe("parseSecretsArgs", () => {
     const r = parseSecretsArgs(["audit", "--secret"]);
     expect(r.ok).toBe(false);
   });
+
+  // The name character-class check used to live ONLY in setSecret, which
+  // runs after the passphrase prompt, the scrypt derivation and the no-echo
+  // value prompt -- so the user typed two secrets before being told the name
+  // was never valid. The parser owns it now.
+  it("rejects a set name with a space, and says what is allowed", () => {
+    const r = parseSecretsArgs(["set", "my token"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/invalid secret name "my token"/);
+      expect(r.error).toMatch(/letters, digits/);
+      expect((r as { help?: boolean }).help).toBeUndefined();
+    }
+  });
+
+  it("rejects a set name with a colon or braces (unreferenceable as ${secret:NAME})", () => {
+    expect(parseSecretsArgs(["set", "gh:token"]).ok).toBe(false);
+    expect(parseSecretsArgs(["set", "{gh}"]).ok).toBe(false);
+  });
+
+  it("accepts the full allowed character class for a set name", () => {
+    const r = parseSecretsArgs(["set", "GH.token-1_x"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.name).toBe("GH.token-1_x");
+  });
+
+  // Deliberately scoped to `set`: get/remove already short-circuit to
+  // `No secret named "..."` without prompting, and a vault written before
+  // the rule existed must stay readable and removable by its legacy name.
+  it("does not apply the name check to get/remove", () => {
+    expect(parseSecretsArgs(["get", "my token"]).ok).toBe(true);
+    expect(parseSecretsArgs(["remove", "my token"]).ok).toBe(true);
+  });
 });
 
 // The push / pull test suites were removed 2026-07-21 with the Yaw Team
@@ -334,6 +367,85 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
     expect(r.exitCode).toBe(130);
     const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(errOutput.toLowerCase()).toContain("cancelled");
+  });
+});
+
+// -----------------------------------------------------------------------
+// Invalid secret name -- rejected by the PARSER, so the command body (and
+// its passphrase prompt, scrypt derivation and vault read) never runs.
+// -----------------------------------------------------------------------
+
+describe("secrets set -- invalid name fails before any prompt", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  /** Mirror the CLI dispatcher (src/index.ts:237): parse first, and reach
+   *  runSecrets ONLY when the parse succeeded. `ran` records whether the
+   *  command body executed -- everything the finding is about (prompt,
+   *  ~100ms scrypt, vault read) lives behind it. */
+  async function dispatch(
+    argv: string[],
+    stdin: FakeTTYStdin,
+  ): Promise<{ ran: boolean; exitCode: number; error: string }> {
+    const parsed = parseSecretsArgs(argv);
+    // index.ts writes parsed.error to stderr and exits 2 on a parse failure.
+    if (!parsed.ok) return { ran: false, exitCode: 2, error: parsed.error };
+    const r = await runSecrets(
+      {
+        ...parsed.options,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    return { ran: true, exitCode: r.exitCode, error: io.err.mock.calls.map((c) => c[0] as string).join("") };
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it('rejects `set "my token"` at parse time -- no passphrase prompt, no value prompt, vault untouched', async () => {
+    // Seed a vault so a read/write by the command body would be observable.
+    const seed = await runSecrets(
+      { action: "set", name: "github", value: "ghp_abc", passphrase: "seed-passphrase-xyz", home },
+      io,
+    );
+    expect(seed.exitCode).toBe(0);
+    const before = readFileSync(vaultPath(home), "utf8");
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+
+    // stdin is preloaded with a passphrase AND a secret value: if the check
+    // regresses to setSecret-only, the command body consumes BOTH prompts
+    // before reporting the bad name -- which is exactly the UX being fixed.
+    const stdin = new FakeTTYStdin(["seed-passphrase-xyz\r", "some-value\r"]);
+    const r = await dispatch(["set", "my token"], stdin);
+
+    expect(r.ran).toBe(false);
+    expect(r.exitCode).toBe(2);
+    expect(r.error).toMatch(/invalid secret name "my token"/);
+    expect(r.error).toMatch(/letters, digits/);
+    // Nothing was written to the terminal -- both prompts go through
+    // stdout.write, so zero calls means the user was never asked anything.
+    expect(stdout.write).not.toHaveBeenCalled();
+    // ...and the vault on disk is byte-identical: no entry, no re-save.
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 });
 
