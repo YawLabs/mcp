@@ -20,7 +20,7 @@
 //     can trace where their config went.
 
 import { mkdir, rename, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME, userConfigDir } from "./paths.js";
 
@@ -87,7 +87,7 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
     // but warn so the user knows the legacy is orphaned and can delete
     // it manually. We do NOT silently overwrite the new file; that
     // would lose whatever the user wrote there.
-    log("warn", "yaw-mcp config: legacy file exists alongside new location — legacy is ignored", {
+    log("warn", "yaw-mcp config: legacy file exists alongside new location -- legacy is ignored", {
       scope,
       legacy,
       target,
@@ -105,7 +105,7 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
       to: target,
     });
   } catch (err) {
-    log("warn", "yaw-mcp config: legacy migration failed — leaving file in place", {
+    log("warn", "yaw-mcp config: legacy migration failed -- leaving file in place", {
       scope,
       legacy,
       target,
@@ -152,16 +152,38 @@ export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<vo
   }
 }
 
+function normalizeForCompare(p: string): string {
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
+
+// True iff `dir` is STRICTLY under `homeResolved` ($HOME itself is false).
+// Deliberately identical to the bound findProjectConfigDir uses in
+// paths.ts -- see findLegacyProjectRoot for why they must agree.
+function isUnderHome(dir: string, homeResolved: string): boolean {
+  if (normalizeForCompare(dir) === normalizeForCompare(homeResolved)) return false;
+  const rel = relative(homeResolved, dir);
+  const relNorm = normalizeForCompare(rel);
+  return relNorm !== "" && !relNorm.startsWith("..") && !isAbsolute(rel);
+}
+
 // Walk up from `cwd` looking for either a legacy `.yaw-mcp.json` or
-// `.yaw-mcp.local.json`, stopping EXCLUSIVELY before $HOME so a file at
-// $HOME is handled by the global migration path alone. Returns the
-// directory that contains the legacy file(s), or null if none found.
+// `.yaw-mcp.local.json`. Returns the directory that contains the legacy
+// file(s), or null if none found.
+//
+// The walk is bounded to directories STRICTLY under $HOME, matching
+// findProjectConfigDir (paths.ts). The bounds MUST agree: this migrator
+// destructively renames `.yaw-mcp.json` -> `.yaw-mcp/config.json`, so
+// migrating a directory the loader will never look in silently loses the
+// user's token. The previous version walked to the filesystem root for
+// any cwd outside $HOME (the `dir === homeResolved` check never fired),
+// which both hoisted files from unrelated ancestors and moved them into
+// a location nothing reads. Outside $HOME the walk is now a no-op.
 async function findLegacyProjectRoot(cwd: string, home: string): Promise<string | null> {
   const homeResolved = resolve(home);
   let dir = resolve(cwd);
   let prev = "";
   while (dir !== prev) {
-    if (dir === homeResolved) return null;
+    if (!isUnderHome(dir, homeResolved)) return null;
     const legacyProject = join(dir, LEGACY_PROJECT_FILENAME);
     const legacyLocal = join(dir, LEGACY_LOCAL_FILENAME);
     if ((await exists(legacyProject)) || (await exists(legacyLocal))) return dir;

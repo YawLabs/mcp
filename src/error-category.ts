@@ -53,6 +53,14 @@ const RX_HTTP_403 = /\b403\b/;
 const RX_HTTP_404 = /\b404\b/;
 const RX_HTTP_429 = /\b429\b/;
 const RX_NO_TOKEN = /no [a-z_]*token (configured|set)/i;
+// "timeout" as a standalone word, anywhere in the message. A leading-space
+// match (the previous shape) missed the single most common client error in
+// the corpus -- axios's "timeout of 5000ms exceeded", which starts the
+// string -- and sent it to upstream_error, where reward.ts treats it as a
+// benign catch-all and grants the call FULL credit. \b on both sides keeps
+// identifier-shaped text (connectTimeoutMs, set_timeout, timeout_ms) from
+// false-positiving, since JS word boundaries treat `_` as a word char.
+const RX_TIMEOUT = /\btimeout\b/;
 
 export function classifyError(text: string | undefined | null): ErrorCategory {
   if (!text) return "upstream_error";
@@ -61,7 +69,7 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
   // Timeout: MCP error -32001 is the canonical timeout code from
   // @modelcontextprotocol/sdk, plus the bare "timed out" / "timeout"
   // shapes that show up when an upstream returns its own timeout text.
-  if (t.includes("-32001") || t.includes("timed out") || t.includes(" timeout")) {
+  if (t.includes("-32001") || t.includes("timed out") || RX_TIMEOUT.test(t)) {
     return "timeout";
   }
 

@@ -8,6 +8,20 @@ describe("classifyError", () => {
   const cases: Array<[string, string, (typeof ERROR_CATEGORIES)[number]]> = [
     ["ssh_exec timeout", "Error calling ssh_ssh_exec [code=-32001]: MCP error -32001: Request timed out", "timeout"],
     ["bare 'timed out' phrasing", "upstream: connection timed out after 30s", "timeout"],
+    // axios's canonical message -- "timeout" is the FIRST word, so the old
+    // " timeout" (leading-space) test missed it and it fell through to
+    // upstream_error, which reward.ts scores as a full-credit call.
+    ["axios timeout shape (start of string)", "timeout of 5000ms exceeded", "timeout"],
+    ["axios timeout shape wrapped by a client", "Error: timeout of 30000ms exceeded", "timeout"],
+    ["timeout followed by punctuation", "Request failed (timeout: 10s)", "timeout"],
+    // Word-boundary discipline: identifier-shaped text must NOT read as a
+    // timeout. `_` is a word char in JS regex, so \btimeout\b skips both.
+    [
+      "identifier-shaped 'connectTimeoutMs' is not a timeout",
+      "Error: invalid value for connectTimeoutMs in server config",
+      "upstream_error",
+    ],
+    ["identifier-shaped 'set_timeout' is not a timeout", "Error thrown inside set_timeout handler", "upstream_error"],
     [
       "zod validation -32602 with missing array",
       'MCP error -32602: Input validation error: Invalid arguments for tool aws_metrics_query: [{"expected":"array","code":"invalid_type","path":["queries"]}]',

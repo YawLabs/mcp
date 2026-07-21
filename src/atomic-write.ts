@@ -57,9 +57,15 @@ export async function atomicWriteFile(
  * mkdir -p with an optional POSIX mode applied to every directory we
  * actually CREATE (pre-existing parents are not re-chmodded -- we don't
  * want to tighten the user's $HOME just because we wrote a vault under it).
- * Walks the path from root to leaf, stat-then-mkdir at each segment; on
- * a successful mkdir, chmod to dirMode. On Windows or when dirMode is
- * undefined this is just a recursive mkdir.
+ *
+ * The mode is passed to mkdir(2) itself, so each directory is BORN at
+ * dirMode -- there is no window where a freshly-created parent sits at
+ * the umask default (typically 0o755) and lets others list it. The chmod
+ * afterwards only normalizes the umask masking (mkdir's mode is `mode &
+ * ~umask`, e.g. a umask of 0o027 would land 0o700 at 0o750); it can only
+ * ever tighten toward the requested mode, never widen a window.
+ *
+ * On Windows or when dirMode is undefined this is just a recursive mkdir.
  */
 async function mkdirpWithMode(dir: string, dirMode: number | undefined): Promise<void> {
   if (dirMode === undefined || process.platform === "win32") {
@@ -90,10 +96,15 @@ async function mkdirpWithMode(dir: string, dirMode: number | undefined): Promise
   }
   if (toCreate.length === 0) return; // every parent already exists
   // recursive:true tolerates a concurrent racer creating any of these dirs
-  // between our stat and our mkdir.
-  await mkdir(resolved, { recursive: true });
+  // between our stat and our mkdir. `mode` applies to every directory this
+  // call creates, so they're born restricted rather than chmodded after
+  // the fact.
+  await mkdir(resolved, { recursive: true, mode: dirMode });
   for (const created of toCreate) {
     try {
+      // Normalizes the umask masking applied by mkdir(2) above. Only
+      // narrows the gap to the requested mode; the birth mode already
+      // ruled out an over-permissive window.
       await chmod(created, dirMode);
     } catch {
       // Best-effort -- some filesystems (FAT-shaped mounts) reject chmod.

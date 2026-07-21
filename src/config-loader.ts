@@ -95,12 +95,12 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     parsed = parseJsonc(raw);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`${path}: invalid JSON (${msg}) — file ignored`);
+    warnings.push(`${path}: invalid JSON (${msg}) -- file ignored`);
     log("warn", "Config file is not valid JSON; ignoring", { path, error: msg });
     return null;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    warnings.push(`${path}: root must be a JSON object — file ignored`);
+    warnings.push(`${path}: root must be a JSON object -- file ignored`);
     return null;
   }
   const obj = parsed as Record<string, unknown>;
@@ -113,13 +113,22 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   }
 
   const token = typeof obj.token === "string" && obj.token.length > 0 ? obj.token : undefined;
-  const apiBase = typeof obj.apiBase === "string" && obj.apiBase.length > 0 ? obj.apiBase : undefined;
+  let apiBase = typeof obj.apiBase === "string" && obj.apiBase.length > 0 ? obj.apiBase : undefined;
   if (apiBase !== undefined) {
     try {
       validateApiBase(apiBase);
     } catch (err) {
+      // Fail-open, like every other per-field problem in this reader: an
+      // unusable apiBase drops THAT FIELD and warns. Throwing here would
+      // reject the whole file (losing its allow/deny lists and installNudge)
+      // and, worse, propagate out of loadYawMcpConfig -- where the server
+      // boot path swallows it into a null config (disabling the profile
+      // entirely) and the CLI path has no handler at all. The env-var
+      // source is still hard-validated in loadYawMcpConfig.
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`${path}: ${msg}`);
+      warnings.push(`${path}: ${msg} -- apiBase ignored`);
+      log("warn", "Config file has an unusable apiBase; ignoring the field", { path, error: msg });
+      apiBase = undefined;
     }
   }
   const servers = Array.isArray(obj.servers)
@@ -193,6 +202,32 @@ function unionBlocked(files: LoadedConfigFile[]): string[] | undefined {
   return touched ? [...set] : undefined;
 }
 
+// migrateLegacyConfigPaths stat-walks from cwd up to $HOME on every call.
+// loadYawMcpConfig runs several times in a single process (server boot,
+// doctor, each CLI subcommand, every profile refresh), and the migration
+// is idempotent and one-way: once it has run to completion for a given
+// (cwd, home) pair there is nothing left to move. Memoize the in-flight /
+// settled promise so the walk is paid once per process (and concurrent
+// callers share one walk rather than racing each other on rename).
+const migrationOnce = new Map<string, Promise<void>>();
+
+function migrateLegacyConfigPathsOnce(cwd: string, home: string): Promise<void> {
+  const key = `${cwd} ${home}`;
+  let pending = migrationOnce.get(key);
+  if (pending === undefined) {
+    // Fail-open (matches the migrator's own contract): a rejection is
+    // logged, never propagated, and never re-tried -- a broken filesystem
+    // state must not brick startup or re-throw on every later load.
+    pending = migrateLegacyConfigPaths({ cwd, home }).catch((err) => {
+      log("warn", "Legacy config migration failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    migrationOnce.set(key, pending);
+  }
+  return pending;
+}
+
 export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<ResolvedConfig> {
   const cwd = resolve(opts.cwd ?? process.cwd());
   const home = resolve(opts.home ?? homedir());
@@ -204,8 +239,9 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   // Fold any pre-0.12 flat config dotfiles into `.yaw-mcp/` before the
   // resolver runs — otherwise a user who upgrades from 0.11.x would
   // silently lose their token until they moved the file by hand.
-  // Fail-open: migration errors are logged, never thrown.
-  await migrateLegacyConfigPaths({ cwd, home });
+  // Fail-open: migration errors are logged, never thrown. Memoized per
+  // (cwd, home) so repeat loads in one process don't re-walk the tree.
+  await migrateLegacyConfigPathsOnce(cwd, home);
 
   const projectConfigDir = await findProjectConfigDir(cwd, home).catch((err) => {
     log("warn", "Failed searching for project .yaw-mcp/ dir", {
@@ -295,7 +331,7 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
 export function tokenFingerprint(token: string | null): string {
   if (!token) return "(none)";
   if (token.length <= 8) return `***${token.slice(-2)}`;
-  return `${token.slice(0, 8)}…${token.slice(-4)}`;
+  return `${token.slice(0, 8)}...${token.slice(-4)}`;
 }
 
 // --- Profile compatibility layer ---------------------------------------
@@ -339,14 +375,6 @@ export function toProfile(config: ResolvedConfig): Profile | null {
     result.userPath = global.path;
   }
   return result;
-}
-
-/** Load the effective profile for a session. Thin wrapper around
- *  loadYawMcpConfig + toProfile — kept as a named function so server.ts
- *  can import it without reaching into ResolvedConfig internals. */
-export async function loadEffectiveProfile(cwd: string, home?: string): Promise<Profile | null> {
-  const config = await loadYawMcpConfig({ cwd, home });
-  return toProfile(config);
 }
 
 /** Returns true iff `namespace` is allowed by the resolved allow/deny lists. */
