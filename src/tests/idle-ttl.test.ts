@@ -61,6 +61,20 @@ describe("adaptiveThreshold", () => {
     expect(adaptiveThreshold("gh", [], 1, NOW)).toBe(ADAPTIVE_MIN);
   });
 
+  it("snaps a non-finite base to ADAPTIVE_MIN instead of returning NaN", () => {
+    // The realistic source is Number(process.env.MCP_CONNECT_IDLE_THRESHOLD)
+    // over a non-numeric value. NaN fails BOTH clamp comparisons, so before
+    // the guard this returned NaN -- and `idleCalls >= NaN` is always false,
+    // i.e. the namespace never deactivated at all. That is the opposite of
+    // the documented "never deactivate faster than ADAPTIVE_MIN" floor.
+    expect(adaptiveThreshold("gh", [], Number.NaN, NOW)).toBe(ADAPTIVE_MIN);
+    // Also with activity present, so the bonus path cannot mask it.
+    const history = [record("gh", 10_000), record("gh", 20_000)];
+    expect(adaptiveThreshold("gh", history, Number.NaN, NOW)).toBe(ADAPTIVE_MIN);
+    expect(adaptiveThreshold("gh", [], Number.POSITIVE_INFINITY, NOW)).toBe(ADAPTIVE_MIN);
+    expect(adaptiveThreshold("gh", [], Number.NEGATIVE_INFINITY, NOW)).toBe(ADAPTIVE_MIN);
+  });
+
   it("clamps final result to ADAPTIVE_MAX (50)", () => {
     // Contrived: base=40 + full bonus cap 20 = 60 → clamped to 50.
     const history: ToolCallRecord[] = [];

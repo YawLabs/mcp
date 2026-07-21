@@ -156,10 +156,18 @@ export class PackDetector {
   // Replace in-memory history with the given snapshot. Respects the
   // configured maxHistory cap — if the snapshot exceeds it, the oldest
   // entries are dropped, matching the cap behavior of recordCall.
+  //
+  // `at` is validated as a finite number, not just present: the snapshot
+  // comes off disk (persistence.ts) where a hand-edited or torn file can
+  // carry null / "12345" / NaN. segmentBursts compares `call.at - prevAt >
+  // maxGapMs`, and every comparison against NaN is false, so a single NaN
+  // timestamp silently welds the whole history into one giant burst and
+  // manufactures packs that never happened.
   loadSnapshot(snapshot: ReadonlyArray<PackCall>): void {
     const clean: PackCall[] = [];
     for (const c of snapshot) {
       if (!c?.namespace || !c.toolName) continue;
+      if (typeof c.at !== "number" || !Number.isFinite(c.at)) continue;
       clean.push({ namespace: c.namespace, toolName: c.toolName, at: c.at });
     }
     if (clean.length > this.maxHistory) {

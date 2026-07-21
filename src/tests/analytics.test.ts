@@ -10,6 +10,7 @@ vi.mock("undici", () => ({
 }));
 
 import {
+  getAnalyticsSnapshot,
   getDroppedEventsCount,
   getLastAnalyticsFailure,
   initAnalytics,
@@ -19,6 +20,12 @@ import {
 } from "../analytics.js";
 
 const mockedRequest = vi.mocked(request);
+
+/** Parse the JSON body an undici `request` mock call was given. */
+function bodyOf(call: unknown[] | undefined): { events: Array<Record<string, unknown>> } {
+  expect(call).toBeDefined();
+  return JSON.parse((call?.[1] as { body: string }).body);
+}
 
 describe("analytics", () => {
   beforeEach(() => {
@@ -36,7 +43,7 @@ describe("analytics", () => {
     mockedRequest.mockReset();
   });
 
-  it("recordConnectEvent adds event to buffer", () => {
+  it("recordConnectEvent buffers the event and POSTs it, stamped, on flush", async () => {
     initAnalytics("https://example.com", "test-token");
     recordConnectEvent({
       namespace: "gh",
@@ -45,13 +52,65 @@ describe("analytics", () => {
       latencyMs: 100,
       success: true,
     });
-    // Event was recorded (buffer is internal, but we can verify via shutdown flush)
+
+    // One event is well under FLUSH_SIZE, so nothing is on the wire yet.
+    expect(getAnalyticsSnapshot().bufferedConnect).toBe(1);
+    expect(mockedRequest).not.toHaveBeenCalled();
+
+    await shutdownAnalytics();
+
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    const call = mockedRequest.mock.calls[0];
+    expect(String(call[0])).toBe("https://example.com/api/connect/analytics");
+    expect((call[1] as { method: string }).method).toBe("POST");
+    const body = bodyOf(call);
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0]).toMatchObject({
+      namespace: "gh",
+      toolName: "create_issue",
+      action: "tool_call",
+      latencyMs: 100,
+      success: true,
+    });
+    // recordConnectEvent stamps the timestamp; the caller never supplies one.
+    expect(Number.isNaN(Date.parse(body.events[0].timestamp as string))).toBe(false);
+    // The buffer is drained, not just copied.
+    expect(getAnalyticsSnapshot().bufferedConnect).toBe(0);
   });
 
-  it("recordConnectEvent drops events beyond MAX_BUFFER", () => {
+  it("recordConnectEvent flushes automatically once FLUSH_SIZE events are buffered", async () => {
     initAnalytics("https://example.com", "test-token");
-    // Fill beyond 5000
-    for (let i = 0; i < 5100; i++) {
+    const FLUSH_SIZE = 50;
+    for (let i = 0; i < FLUSH_SIZE; i++) {
+      recordConnectEvent({
+        namespace: `ns-${i}`,
+        toolName: null,
+        action: "discover",
+        latencyMs: null,
+        success: true,
+      });
+    }
+    // The 50th push calls flush(), which calls request() before its first
+    // await -- so the POST is observable synchronously, no timer advance.
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    const body = bodyOf(mockedRequest.mock.calls[0]);
+    expect(body.events).toHaveLength(FLUSH_SIZE);
+    expect(body.events[0].namespace).toBe("ns-0");
+    expect(body.events[FLUSH_SIZE - 1].namespace).toBe(`ns-${FLUSH_SIZE - 1}`);
+    // Let the in-flight flush settle inside the test rather than after it.
+    await shutdownAnalytics();
+  });
+
+  it("recordConnectEvent caps the buffer at MAX_BUFFER and counts the overflow as dropped", () => {
+    // Empty url/token so flush() is a no-op. With a real apiUrl every 50th
+    // push synchronously splices FLUSH_SIZE events back out of the buffer, so
+    // it never approaches the cap and the premise of this test evaporates.
+    initAnalytics("", "");
+    const MAX_BUFFER = 5000;
+    const EXTRA = 100;
+    const droppedBefore = getDroppedEventsCount();
+
+    for (let i = 0; i < MAX_BUFFER + EXTRA; i++) {
       recordConnectEvent({
         namespace: "gh",
         toolName: null,
@@ -60,7 +119,11 @@ describe("analytics", () => {
         success: true,
       });
     }
-    // Should not throw — events beyond 5000 are silently dropped
+
+    // The cap holds exactly: the buffer stops growing and every push past it
+    // is counted, so an offline backlog is visible to `yaw-mcp doctor`.
+    expect(getAnalyticsSnapshot().bufferedConnect).toBe(MAX_BUFFER);
+    expect(getDroppedEventsCount() - droppedBefore).toBe(EXTRA);
   });
 
   it("a 401 flush sets the failure latch with the captured shape", async () => {
@@ -88,6 +151,43 @@ describe("analytics", () => {
     expect(latch?.statusCode).toBe(401);
     expect(latch?.url).toBe("https://example.com/api/connect/analytics");
     expect(typeof latch?.at).toBe("number");
+  });
+
+  it("a transport error sets the failure latch with statusCode 0 and warns once", async () => {
+    // An offline machine never gets an HTTP status, so statusCode 0 is the
+    // transport-error sentinel `yaw-mcp doctor` reads (same convention as
+    // tool-report.ts). Before this the offline case was invisible to doctor
+    // AND re-warned on every flush interval.
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      mockedRequest.mockRejectedValue(new Error("ECONNREFUSED"));
+      initAnalytics("https://example.com", "test-token");
+      recordConnectEvent({
+        namespace: "gh",
+        toolName: null,
+        action: "discover",
+        latencyMs: null,
+        success: true,
+      });
+      // shutdownAnalytics retries the re-enqueued batch up to 3 times, so
+      // this also exercises the log latch across repeated identical failures.
+      await shutdownAnalytics();
+
+      const latch = getLastAnalyticsFailure();
+      expect(latch).not.toBeNull();
+      expect(latch?.statusCode).toBe(0);
+      expect(latch?.url).toBe("https://example.com/api/connect/analytics");
+      expect(typeof latch?.at).toBe("number");
+
+      expect(mockedRequest.mock.calls.length).toBeGreaterThan(1);
+      const warnLines = stderr.mock.calls
+        .map((c) => String(c[0]))
+        .filter((line) => line.includes("Analytics flush error"));
+      expect(warnLines).toHaveLength(1);
+      expect(warnLines[0]).toContain("ECONNREFUSED");
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   // ---------------------------------------------------------------------------

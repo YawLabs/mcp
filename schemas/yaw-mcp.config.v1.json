@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/mcp.config.v1.json",
+  "$id": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json",
   "title": "Yaw MCP CLI configuration (.yaw-mcp/config.json)",
   "description": "Configuration file for the @yawlabs/mcp CLI (bin `yaw-mcp`), which manages MCP servers via the Yaw MCP registry. Resolved in precedence order (most-specific to least-specific): <project>/.yaw-mcp/config.local.json  >  <project>/.yaw-mcp/config.json  >  ~/.yaw-mcp/config.json. The project `.yaw-mcp/` directory is found by walking up from the current directory, stopping just before $HOME. Environment variables YAW_MCP_TOKEN and YAW_MCP_URL override file values. JSONC (comments) is permitted.",
   "type": "object",
