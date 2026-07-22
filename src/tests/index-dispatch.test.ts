@@ -55,6 +55,30 @@ describe("suggestFlag", () => {
     }
   });
 
+  it("suggests the alias for a case-variant of a long flag (--HELP -> --help)", () => {
+    // Ship blocker regression: the "never suggest yourself" skip used to be
+    // case-INSENSITIVE, so `--HELP` dropped `--help` from the candidate pool.
+    // Every remaining alias is >2 edits away, so suggestFlag returned [] and
+    // index.ts fell through to runServer -- booting a stdio MCP server that
+    // hangs on a dead prompt with no output. The skip must be an exact RAW
+    // match; index.ts already dispatches the raw spellings by === earlier.
+    expect(suggestFlag("--HELP")).toEqual(["--help"]);
+    expect(suggestFlag("--VERSION")).toEqual(["--version"]);
+  });
+
+  it("suggests the alias for a mixed-case variant (--Help / --Version)", () => {
+    expect(suggestFlag("--Help")).toContain("--help");
+    expect(suggestFlag("--VerSion")).toContain("--version");
+  });
+
+  it("never suggests itself for a raw-identical alias", () => {
+    // Unreachable from index.ts (raw === dispatch happens first) but the
+    // helper must not emit `unknown flag "--help". Did you mean: --help?`.
+    for (const alias of FLAG_ALIASES) {
+      expect(suggestFlag(alias)).not.toContain(alias);
+    }
+  });
+
   it("passes through short single-letter flags (no hijack of -v as -V)", () => {
     // A genuine server flag `-v` must NOT be intercepted by a case-only
     // match against `-V`; length-gating keeps short flags falling through.
@@ -95,7 +119,10 @@ const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 let workDir: string;
 let bundlePath: string;
 
-async function runEntry(env: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
+async function runEntry(
+  env: Record<string, string>,
+  args: string[] = [],
+): Promise<{ code: number | null; stderr: string }> {
   // Scrub inherited YAW_MCP_* so a developer's own token / URL cannot
   // change which branch the child takes.
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -103,7 +130,7 @@ async function runEntry(env: Record<string, string>): Promise<{ code: number | n
     if (k.startsWith("YAW_MCP_")) delete childEnv[k];
   }
   return await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [bundlePath], {
+    const child = spawn(process.execPath, [bundlePath, ...args], {
       cwd: workDir,
       env: { ...childEnv, ...env },
       stdio: ["ignore", "pipe", "pipe"],
@@ -150,7 +177,13 @@ describe("runServer startup failure", () => {
       define: { __VERSION__: JSON.stringify("0.0.0-test") },
       logLevel: "silent",
     });
-  }, 60_000);
+    // Timeout is deliberately far above the observed cost. This bundles the
+    // whole dependency graph (~500 KB) and it finishes in ~1s standalone, but
+    // it runs while the other 74 test files do too: on a loaded box it has
+    // been seen to exceed 60s and fail the suite as a hook timeout, taking
+    // the three tests below down as "skipped". The ceiling is for contention,
+    // not for the work itself.
+  }, 180_000);
 
   afterAll(async () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
@@ -163,6 +196,17 @@ describe("runServer startup failure", () => {
     // Proof the .catch() -- not the last-resort handler -- caught it: the
     // handler would emit a JSON log line and let the process exit 0.
     expect(stderr).not.toContain('"unhandledRejection"');
+  });
+
+  it("exits 2 on a mis-cased flag instead of booting a stdio server", async () => {
+    // End-to-end proof for the suggestFlag case-variant fix: `yaw-mcp --HELP`
+    // used to reach runServer and sit there as a stdio MCP server -- a dead
+    // prompt with no output (this harness closes stdin, so it merely exited 0
+    // instead of hanging like a real terminal would).
+    const { code, stderr } = await runEntry({}, ["--HELP"]);
+    expect(code).toBe(2);
+    expect(stderr).toContain('unknown flag "--HELP"');
+    expect(stderr).toContain("--help");
   });
 
   it("still registers the last-resort handlers before the first await", async () => {
