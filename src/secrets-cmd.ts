@@ -9,6 +9,13 @@
 //   1. YAW_MCP_VAULT_PASSPHRASE env var
 //   2. Interactive prompt on stdin (TTY only, --no-echo via raw mode)
 //   3. Error -- no passphrase available
+//
+// Destructive paths are gated the way install-cmd gates an existing-entry
+// collision -- confirm on a TTY, and off a TTY either refuse naming the
+// flag to re-run with (remove) or proceed with a message that says what
+// really happened (set over an existing name). See the block in runSecrets
+// for why the two differ. --force skips only the confirmation, never the
+// passphrase.
 
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -36,14 +43,19 @@ export const SECRETS_USAGE = `Usage: yaw-mcp secrets <action> [args]
 Actions:
   set <name>              Store a secret. Reads value from stdin (one
                           line, no echo). Override with --value <v> or
-                          --stdin (raw, multi-line) for scripting.
+                          --stdin (raw, multi-line) for scripting. Setting
+                          a name that already exists REPLACES it (confirmed
+                          first on a TTY; scripted runs proceed and say
+                          "Replaced" instead of "Stored").
   get <name>              Decrypt and print one secret value to stdout.
                           NOTE: this prints the secret in CLEARTEXT (with
                           or without --json). Redirect to a file or pipe
                           to a consumer; avoid running it interactively so
                           the value does not land in terminal scrollback.
   list                    Show vault entry names (values stay encrypted).
-  remove <name>           Delete an entry.
+  remove <name>           Delete an entry. Unrecoverable, so it asks you
+                          to confirm on a TTY (bare Enter = no) and refuses
+                          without --force when there is no TTY to ask on.
   lock                    Forget the passphrase cached in THIS process's
                           memory. The cache never outlives the process, so
                           for a one-shot CLI run this is close to a no-op --
@@ -68,6 +80,10 @@ Flags:
   --value <v>             Inline secret value (set only). Beware shell
                           history -- prefer the default stdin prompt.
   --stdin                 Read the secret from raw stdin (set only).
+  --force                 Skip the destructive-action confirmation
+                          (remove, and a set that overwrites an existing
+                          name). Required for remove when stdin is not a
+                          TTY. NEVER skips the passphrase.
   --secret <name>         (audit only) Filter to one secret name.
   --server <ns>           (audit only) Filter to one server namespace.
 
@@ -85,6 +101,9 @@ export interface SecretsCommandOptions {
   value?: string;
   fromStdin?: boolean;
   json?: boolean;
+  /** Skip the destructive-action confirmation (remove, and a set that
+   *  overwrites an existing name). Never skips the passphrase. */
+  force?: boolean;
   /** For `audit`: filter to one secret name. */
   secretFilter?: string;
   /** For `audit`: filter to one server namespace. */
@@ -114,6 +133,10 @@ export function parseSecretsArgs(
     }
     if (a === "--stdin") {
       opts.fromStdin = true;
+      continue;
+    }
+    if (a === "--force") {
+      opts.force = true;
       continue;
     }
     if (a === "--value") {
@@ -244,6 +267,44 @@ function cancelledResult(
   return { exitCode: 130 };
 }
 
+/** Standard result for a confirmation the user declined (or let default
+ *  to no). Exit 1, matching install-cmd's "Aborted." abort path -- the
+ *  command did not do what was asked, so it must not report success. */
+function abortedResult(
+  io: { out: (s: string) => void; err: (s: string) => void },
+  json: boolean | undefined,
+  action: string,
+): SecretsCommandResult {
+  const msg = "Aborted.";
+  if (json) io.err(`${JSON.stringify({ ok: false, error: msg, aborted: true })}\n`);
+  else io.err(`yaw-mcp secrets ${action}: ${msg}\n`);
+  return { exitCode: 1 };
+}
+
+/** Can we prompt? Both ends must be a TTY: stdin to read the answer,
+ *  stdout to show the question. Reads the INJECTED streams (never
+ *  process.stdin directly) so tests drive it the same way they drive the
+ *  passphrase prompts. */
+function isInteractiveTTY(opts: SecretsCommandOptions): boolean {
+  const stdin = opts.io?.stdin ?? process.stdin;
+  const stdout = opts.io?.stdout ?? process.stdout;
+  return (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
+}
+
+/** Ask a destructive-action question on the TTY. Defaults to NO: only an
+ *  explicit y/yes proceeds, so a bare Enter (or ^D, or anything else)
+ *  leaves the vault alone. Echoes what is typed -- a confirmation is not
+ *  a secret -- but otherwise shares the passphrase reader, so ^C still
+ *  cancels the whole command instead of counting as "no". */
+async function promptYesNo(opts: SecretsCommandOptions, question: string): Promise<boolean | Cancelled> {
+  const stdin = opts.io?.stdin ?? process.stdin;
+  const stdout = opts.io?.stdout ?? process.stdout;
+  const answer = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, `${question} [y/N] `, true);
+  if (answer === CANCELLED) return CANCELLED;
+  const a = answer.trim().toLowerCase();
+  return a === "y" || a === "yes";
+}
+
 /** Read the passphrase. Env var wins; falls back to a stdin prompt
  *  that disables terminal echo via raw mode. Returns null when no
  *  passphrase can be obtained (non-TTY + no env), or CANCELLED when the
@@ -264,13 +325,12 @@ async function resolvePassphrase(opts: SecretsCommandOptions): Promise<string | 
   }
   const stdin = opts.io?.stdin ?? process.stdin;
   const stdout = opts.io?.stdout ?? process.stdout;
-  const isTTY = (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
-  if (!isTTY) return null;
+  if (!isInteractiveTTY(opts)) return null;
   // Reject an empty passphrase (bare Enter / EOF with nothing typed):
   // deriving a key from "" would otherwise unlock any vault. Re-prompt up
   // to a few times, then give up so we never spin forever on a closed pipe.
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
-    const entered = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout);
+    const entered = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout);
     if (entered === CANCELLED) return CANCELLED;
     if (entered.length > 0) return entered;
     stdout.write("Passphrase cannot be empty.\n");
@@ -299,16 +359,15 @@ async function resolveNewPassphrase(opts: SecretsCommandOptions): Promise<string
   }
   const stdin = opts.io?.stdin ?? process.stdin;
   const stdout = opts.io?.stdout ?? process.stdout;
-  const isTTY = (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
-  if (!isTTY) return null;
+  if (!isInteractiveTTY(opts)) return null;
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
-    const first = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout, "New vault passphrase: ");
+    const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "New vault passphrase: ");
     if (first === CANCELLED) return CANCELLED;
     if (first.length === 0) {
       stdout.write("Passphrase cannot be empty.\n");
       continue;
     }
-    const second = await readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm new passphrase: ");
+    const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm new passphrase: ");
     if (second === CANCELLED) return CANCELLED;
     if (first === second) return first;
     stdout.write("Passphrases did not match. Try again.\n");
@@ -330,10 +389,15 @@ const CTRL_C = "\x03"; // ETX -- cancel the whole command
 const CTRL_D = "\x04"; // EOT -- cancel this entry (caller re-prompts)
 const DEL = "\x7f"; // what most terminals send for Backspace
 
-function readPassphraseFromTTY(
+/** Raw-mode line reader for the controlling TTY. Shared by the passphrase
+ *  prompts (echo OFF -- the default) and the destructive-action
+ *  confirmation (echo ON, so the user can see the y/n they typed). One
+ *  reader means ^C / ^D / Backspace behave identically at every prompt. */
+function readLineFromTTY(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WritableStream,
   prompt = "Vault passphrase: ",
+  echo = false,
 ): Promise<string | Cancelled> {
   stdout.write(prompt);
   return new Promise<string | Cancelled>((resolve) => {
@@ -381,10 +445,14 @@ function readPassphraseFromTTY(
           return;
         }
         if (ch === "\b" || ch === DEL) {
-          if (chunks.length > 0) chunks.pop();
+          if (chunks.length > 0) {
+            chunks.pop();
+            if (echo) stdout.write("\b \b");
+          }
           continue;
         }
         chunks.push(ch);
+        if (echo) stdout.write(ch);
       }
     }
     stdin.on("data", onData);
@@ -396,8 +464,11 @@ async function readStdinValue(io?: SecretsCommandOptions["io"], forceRaw?: boole
   const stdout = io?.stdout ?? process.stdout;
   const isTTY = (stdin as { isTTY?: boolean }).isTTY === true;
   if (isTTY && !forceRaw) {
-    stdout.write("Secret value: ");
-    return readPassphraseFromTTY(stdin as NodeJS.ReadStream, stdout);
+    // Pass the label as the reader's PROMPT rather than writing it first:
+    // the reader writes its own prompt, so pre-writing one printed
+    // "Secret value: Vault passphrase: " and asked the user for the wrong
+    // thing at the value prompt.
+    return readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Secret value: ");
   }
   // Piped stdin -- read all and trim trailing newline.
   const chunks: string[] = [];
@@ -472,6 +543,51 @@ export async function runSecrets(
     }
   }
 
+  // ----- destructive-action confirmation --------------------------------
+  // Same shape as install-cmd's existing-entry collision gate: prompt when
+  // stdin+stdout are a TTY, and when they are not, either refuse naming the
+  // flag to re-run with, or proceed -- per action.
+  //
+  // The asymmetry between remove and set is deliberate:
+  //   remove -- UNRECOVERABLE. The ciphertext is gone and nothing in this
+  //             tool can bring it back, so a non-interactive run has to opt
+  //             in explicitly with --force.
+  //   set    -- an overwrite is a SWAP the user is performing with the new
+  //             value already in hand, and re-setting a name is the normal
+  //             credential-rotation path. Requiring --force there would
+  //             break every rotation script, so a non-TTY run proceeds --
+  //             the success message just has to say it REPLACED a value
+  //             rather than claiming a fresh write.
+  //
+  // Both gates run BEFORE the passphrase prompt so a declined confirmation
+  // never costs the user a passphrase entry. --force skips only the
+  // confirmation: the passphrase and its scrypt derivation still happen.
+  const replacing =
+    opts.action === "set" && loaded.vault !== null && Object.hasOwn(loaded.vault.entries, opts.name as string);
+
+  if (opts.action === "remove" && !opts.force) {
+    if (isInteractiveTTY(opts)) {
+      const confirmed = await promptYesNo(opts, `Permanently delete secret "${opts.name}"? This cannot be undone.`);
+      if (confirmed === CANCELLED) return cancelledResult(io, opts.json);
+      if (!confirmed) return abortedResult(io, opts.json, "remove");
+    } else {
+      const msg = `refusing to delete "${opts.name}" without confirmation and stdin is not a TTY.`;
+      const hint = "Re-run with --force to delete it. This cannot be undone.";
+      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: `${msg} ${hint}` })}\n`);
+      else io.err(`yaw-mcp secrets remove: ${msg}\n  ${hint}\n`);
+      return { exitCode: 2 };
+    }
+  }
+
+  if (replacing && !opts.force && isInteractiveTTY(opts)) {
+    const confirmed = await promptYesNo(
+      opts,
+      `Secret "${opts.name}" already exists. Replace it? The stored value is overwritten.`,
+    );
+    if (confirmed === CANCELLED) return cancelledResult(io, opts.json);
+    if (!confirmed) return abortedResult(io, opts.json, "set");
+  }
+
   // Remaining actions all need the vault + passphrase.
   let vault = loaded.vault ?? newVault();
   const isFresh = !existsSync(path);
@@ -526,7 +642,11 @@ export async function runSecrets(
     }
     // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
     await saveVault(path, vault);
-    if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh })}\n`);
+    // "Replaced" vs "Stored" is the only signal a scripted run gets that it
+    // just destroyed a previous value (the non-TTY path proceeds without a
+    // confirmation), so the two cases must never print the same line.
+    if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh, replaced: replacing })}\n`);
+    else if (replacing) io.out(`Replaced secret "${name}".\n`);
     else io.out(`${isFresh ? "Created vault and " : ""}Stored secret "${name}".\n`);
     return { exitCode: 0 };
   }

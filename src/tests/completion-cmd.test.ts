@@ -315,12 +315,19 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     }
   });
 
-  it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit in, push/pull/--force out)", () => {
+  it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit/--force in, push/pull out)", () => {
     const secrets = SUBCOMMAND_SPEC.find((s) => s.name === "secrets");
     expect(secrets).toBeDefined();
     expect(secrets?.positional?.[0]).toEqual(["set", "get", "list", "remove", "lock", "rotate", "audit"]);
-    expect(secrets?.flags).toEqual(expect.arrayContaining(["--value", "--stdin", "--secret", "--server", "--json"]));
-    expect(secrets?.flags).not.toContain("--force");
+    // --force gates the destructive paths (`remove`, and a `set` that
+    // overwrites an existing name), so it MUST be completable -- a user who
+    // cannot tab it will not discover the only way to script a remove.
+    expect(secrets?.flags).toEqual(
+      expect.arrayContaining(["--value", "--stdin", "--force", "--secret", "--server", "--json"]),
+    );
+    // The Yaw Team surface's sync flags stay gone.
+    expect(secrets?.flags).not.toContain("--replace");
+    expect(secrets?.flags).not.toContain("--push");
   });
 });
 

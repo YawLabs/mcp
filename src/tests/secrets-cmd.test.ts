@@ -116,10 +116,11 @@ describe("parseSecretsArgs", () => {
     if (!r.ok) expect(r.error).toMatch(/unknown flag "--bogus"/);
   });
 
-  // `push` / `pull` and the --force / --replace / --push flags were removed
-  // 2026-07-21 with the Yaw Team surface. They must now be REJECTED, not
-  // silently parsed -- these assertions are what stop them creeping back as
-  // no-op flags that look supported.
+  // `push` / `pull` and the --replace / --push flags were removed 2026-07-21
+  // with the Yaw Team surface. They must now be REJECTED, not silently
+  // parsed -- these assertions are what stop them creeping back as no-op
+  // flags that look supported. (--force came BACK on its own terms: it now
+  // gates the destructive confirmations, not a vault sync.)
   it("push action is rejected", () => {
     expect(parseSecretsArgs(["push"]).ok).toBe(false);
   });
@@ -128,8 +129,24 @@ describe("parseSecretsArgs", () => {
     expect(parseSecretsArgs(["pull"]).ok).toBe(false);
   });
 
-  it("--force is rejected as an unknown flag", () => {
-    expect(parseSecretsArgs(["rotate", "--force"]).ok).toBe(false);
+  it("--force parses and sets force (skips the destructive confirmation)", () => {
+    const r = parseSecretsArgs(["remove", "github", "--force"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.action).toBe("remove");
+      expect(r.options.name).toBe("github");
+      expect(r.options.force).toBe(true);
+    }
+  });
+
+  it("force is undefined when --force is absent (no accidental default-yes)", () => {
+    const r = parseSecretsArgs(["remove", "github"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.force).toBeUndefined();
+  });
+
+  it("documents --force in the usage text (it is the only way to script a remove)", () => {
+    expect(SECRETS_USAGE).toContain("--force");
   });
 
   it("--replace is rejected as an unknown flag", () => {
@@ -567,5 +584,346 @@ describe("runSecrets audit", () => {
     expect(parsed.events[0].server).toBe("gh");
     // No value field in any emitted event.
     expect(Object.keys(parsed.events[0]).sort()).toEqual(["event", "secret", "server", "ts"]);
+  });
+});
+
+// -----------------------------------------------------------------------
+// Destructive-action confirmation (remove, and a set that overwrites).
+//
+// Before this gate existed, `secrets remove TOKEN` deleted immediately and
+// exited 0, and `secrets set TOKEN` over an existing name silently replaced
+// the value while printing the same 'Stored secret "TOKEN".' as a fresh
+// write. Both destroy a credential that may exist nowhere else.
+//
+// The two paths are asymmetric ON PURPOSE and each half is asserted below:
+// remove is unrecoverable (non-TTY must pass --force), a set overwrite is a
+// swap with the new value already in hand (non-TTY proceeds, but the
+// message must say "Replaced").
+// -----------------------------------------------------------------------
+
+const CONFIRM_PASS = "confirm-passphrase-xyz";
+
+/** Non-TTY stdin/stdout pair, so these tests never depend on whether the
+ *  vitest worker's process.stdin happens to be a TTY. */
+function nonTTYIo(stderr: NodeJS.WritableStream): {
+  stdin: NodeJS.ReadableStream;
+  stdout: NodeJS.WritableStream;
+  stderr: NodeJS.WritableStream;
+} {
+  return {
+    stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+    stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
+    stderr,
+  };
+}
+
+describe("runSecrets remove -- confirmation gate", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  /** Seed a one-entry vault and return its exact on-disk bytes, so a test
+   *  can assert the file was not touched at all. */
+  async function seed(): Promise<string> {
+    const r = await runSecrets({ action: "set", name: "TOKEN", value: "ghp_abc", passphrase: CONFIRM_PASS, home }, io);
+    expect(r.exitCode).toBe(0);
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    return readFileSync(vaultPath(home), "utf8");
+  }
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const promptText = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("TTY + bare Enter does NOT delete (the prompt defaults to no)", async () => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin(["\r"]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText().toLowerCase()).toContain("aborted");
+    // The user was actually asked, and the vault is byte-identical.
+    expect(promptText().toLowerCase()).toContain("delete");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("TTY + explicit y deletes the entry", async () => {
+    await seed();
+    const stdin = new FakeTTYStdin(["y\r"]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain('Removed "TOKEN"');
+    lock();
+
+    io.err.mockReset();
+    const after = await runSecrets({ action: "get", name: "TOKEN", passphrase: CONFIRM_PASS, home }, io);
+    expect(after.exitCode).toBe(1);
+    expect(errText()).toContain('No secret named "TOKEN"');
+  });
+
+  it("TTY + ^C at the prompt cancels with 130 and leaves the vault alone", async () => {
+    const before = await seed();
+    const ETX = String.fromCharCode(3);
+    const stdin = new FakeTTYStdin([ETX]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("non-TTY without --force refuses (exit 2), names the flag, and leaves the vault byte-identical", async () => {
+    const before = await seed();
+    const r = await runSecrets(
+      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, home, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(r.exitCode).toBe(2);
+    expect(errText()).toContain("--force");
+    expect(errText().toLowerCase()).toContain("not a tty");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("non-TTY with --force deletes", async () => {
+    await seed();
+    const r = await runSecrets(
+      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, force: true, home, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain('Removed "TOKEN"');
+    lock();
+
+    io.out.mockReset();
+    const listed = await runSecrets({ action: "list", home, json: true }, io);
+    expect(listed.exitCode).toBe(0);
+    expect(JSON.parse(outText()).keys).toEqual([]);
+  });
+
+  it("--force skips the confirmation but NOT the passphrase", async () => {
+    const before = await seed();
+    // No passphrase hook, no env var, no TTY to prompt on: --force must not
+    // turn into a free pass at the vault.
+    const r = await runSecrets({ action: "remove", name: "TOKEN", force: true, home, io: nonTTYIo(stderr) }, io);
+    expect(r.exitCode).toBe(1);
+    expect(errText().toLowerCase()).toMatch(/passphrase required/);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("a missing name still reports not-found, never the --force refusal", async () => {
+    await seed();
+    const r = await runSecrets(
+      { action: "remove", name: "NOPE", passphrase: CONFIRM_PASS, home, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain('No secret named "NOPE"');
+    expect(errText()).not.toContain("--force");
+  });
+});
+
+describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const promptText = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+
+  async function seed(): Promise<string> {
+    const r = await runSecrets(
+      { action: "set", name: "TOKEN", value: "old-value", passphrase: CONFIRM_PASS, home },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    return readFileSync(vaultPath(home), "utf8");
+  }
+
+  async function readBack(): Promise<string | undefined> {
+    lock();
+    const probe = { out: vi.fn(), err: vi.fn() };
+    const r = await runSecrets({ action: "get", name: "TOKEN", passphrase: CONFIRM_PASS, home, json: true }, probe);
+    if (r.exitCode !== 0) return undefined;
+    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    return line ? (JSON.parse(line).value as string) : undefined;
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("TTY + bare Enter leaves the existing value in place", async () => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin(["\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "TOKEN",
+        value: "new-value",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText().toLowerCase()).toContain("aborted");
+    expect(promptText().toLowerCase()).toContain("already exists");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(await readBack()).toBe("old-value");
+  });
+
+  it("TTY + explicit y replaces the value and says Replaced, not Stored", async () => {
+    await seed();
+    const stdin = new FakeTTYStdin(["y\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "TOKEN",
+        value: "new-value",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain('Replaced secret "TOKEN".');
+    expect(outText()).not.toContain("Stored secret");
+    expect(await readBack()).toBe("new-value");
+  });
+
+  it("non-TTY overwrite PROCEEDS without --force (credential rotation must stay scriptable)", async () => {
+    await seed();
+    const r = await runSecrets(
+      { action: "set", name: "TOKEN", value: "rotated", passphrase: CONFIRM_PASS, home, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // ...but the message must NOT look like a fresh write.
+    expect(outText()).toContain('Replaced secret "TOKEN".');
+    expect(outText()).not.toContain("Stored secret");
+    expect(await readBack()).toBe("rotated");
+  });
+
+  it("a fresh name still says Stored, and --json carries replaced:false", async () => {
+    const r = await runSecrets(
+      { action: "set", name: "FRESH", value: "v", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText()).replaced).toBe(false);
+
+    io.out.mockReset();
+    lock();
+    const again = await runSecrets(
+      { action: "set", name: "FRESH", value: "v2", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(again.exitCode).toBe(0);
+    expect(JSON.parse(outText()).replaced).toBe(true);
+  });
+
+  it("--force skips the overwrite prompt on a TTY (nothing is asked)", async () => {
+    await seed();
+    // Empty queue: if the gate tried to prompt, the read would never settle
+    // and this test would time out instead of passing.
+    const stdin = new FakeTTYStdin([]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "TOKEN",
+        value: "forced",
+        passphrase: CONFIRM_PASS,
+        force: true,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(promptText()).toBe("");
+    expect(await readBack()).toBe("forced");
+  });
+
+  it("prompts for the VALUE with a value label, not a second passphrase label", async () => {
+    // The value prompt used to print "Secret value: Vault passphrase: " --
+    // the label was written by the caller AND by the reader.
+    const stdin = new FakeTTYStdin(["typed-value\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "FRESH",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(promptText()).toContain("Secret value: ");
+    expect(promptText()).not.toContain("Vault passphrase: ");
   });
 });
