@@ -207,7 +207,9 @@ function renderList(print: (s?: string) => void): void {
 function renderMatch(match: BundleMatchResult, installed: string[], print: (s?: string) => void): void {
   const installedList = installed.length === 0 ? "(none)" : installed.slice().sort().join(", ");
   const serverWord = installed.length === 1 ? "server" : "servers";
-  print(`Checked ${CURATED_BUNDLES.length} bundles against ${installed.length} enabled ${serverWord}: ${installedList}`);
+  print(
+    `Checked ${CURATED_BUNDLES.length} bundles against ${installed.length} enabled ${serverWord}: ${installedList}`,
+  );
   print("");
 
   if (match.ready.length === 0 && match.partial.length === 0) {

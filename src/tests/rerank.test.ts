@@ -47,7 +47,6 @@ vi.mock("../tool-report.js", () => ({
 }));
 
 import { request } from "undici";
-import { log } from "../logger.js";
 import { initRerank, rerank } from "../rerank.js";
 import { ConnectServer } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";

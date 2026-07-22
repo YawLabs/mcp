@@ -232,11 +232,7 @@ function runtimeCell(v: ServerRuntimeInfo | undefined): string {
   }
 }
 
-function renderTable(
-  cfg: ConnectConfig,
-  runtimes: Map<string, ServerRuntimeInfo>,
-  print: (s?: string) => void,
-): void {
+function renderTable(cfg: ConnectConfig, runtimes: Map<string, ServerRuntimeInfo>, print: (s?: string) => void): void {
   const servers = cfg.servers;
   if (servers.length === 0) {
     print("No servers configured yet. Visit https://yaw.sh/mcp to add one.");

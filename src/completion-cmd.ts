@@ -272,7 +272,9 @@ function renderZsh(): string {
       // for the zsh slot number (slot == slotIndex + 1 because zsh _arguments
       // slot numbering is 1-based and slot 1 is already claimed by the
       // subcommand dispatch in the outer _arguments call).
-      const posArgs = positionals.map(({ candidates, index }) => `'${index + 1}: :(${candidates.join(" ")})'`).join(" ");
+      const posArgs = positionals
+        .map(({ candidates, index }) => `'${index + 1}: :(${candidates.join(" ")})'`)
+        .join(" ");
       lines.push(`        _arguments ${posArgs} '*: :(${spec.flags.join(" ")})'`);
     } else {
       lines.push(`        _arguments '*: :(${spec.flags.join(" ")})'`);

@@ -73,7 +73,6 @@ export async function rerank(intent: string, candidateIds?: string[], limit?: nu
   return callLegacyRerank(payload);
 }
 
-
 async function callLegacyRerank(payload: {
   intent: string;
   candidateIds?: string[];
@@ -108,4 +107,3 @@ async function callLegacyRerank(payload: {
     return null;
   }
 }
-

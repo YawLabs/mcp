@@ -192,12 +192,7 @@ describe("runAudit", () => {
 
 describe("redactSecretArgs", () => {
   it("redacts the value after a secret flag, keeping the flag name", () => {
-    expect(redactSecretArgs(["--token", "abc", "--port", "3000"])).toEqual([
-      "--token",
-      "<redacted>",
-      "--port",
-      "3000",
-    ]);
+    expect(redactSecretArgs(["--token", "abc", "--port", "3000"])).toEqual(["--token", "<redacted>", "--port", "3000"]);
   });
 
   it("redacts the --flag=value shape", () => {
