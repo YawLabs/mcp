@@ -149,6 +149,14 @@ describe("parseSecretsArgs", () => {
     expect(SECRETS_USAGE).toContain("--force");
   });
 
+  // The confirmation needs stdin AND stdout to be a TTY, so the usage text
+  // must not tell the user it is only about stdin -- `remove NAME | jq` from
+  // an interactive shell hits the refusal with a TTY stdin.
+  it("usage text does not blame stdin alone for the non-interactive remove refusal", () => {
+    expect(SECRETS_USAGE).toMatch(/stdin or stdout/);
+    expect(SECRETS_USAGE).not.toMatch(/Required for remove when stdin is not a/);
+  });
+
   it("--replace is rejected as an unknown flag", () => {
     expect(parseSecretsArgs(["rotate", "--replace"]).ok).toBe(false);
   });
@@ -675,6 +683,31 @@ describe("runSecrets remove -- confirmation gate", () => {
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 
+  // The bare-Enter default above only pins "empty means no". It does NOT pin
+  // the y/yes CHECK itself: relaxing promptYesNo to `answer.length > 0` (any
+  // non-empty answer = consent) keeps every bare-Enter test green while
+  // turning a typed "n" into a delete. On the unrecoverable path that is the
+  // worst possible regression, so an explicit no is asserted directly.
+  it.each(["n", "no"])('TTY + explicit "%s" does NOT delete', async (answer) => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin([`${answer}\r`]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Aborted.");
+    // The user was actually asked, and the vault is byte-identical.
+    expect(promptText().toLowerCase()).toContain("delete");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
   it("TTY + explicit y deletes the entry", async () => {
     await seed();
     const stdin = new FakeTTYStdin(["y\r"]);
@@ -698,6 +731,31 @@ describe("runSecrets remove -- confirmation gate", () => {
     expect(errText()).toContain('No secret named "TOKEN"');
   });
 
+  // Every other confirmation test injects opts.passphrase, which
+  // short-circuits resolvePassphrase -- so none of them can tell whether the
+  // gate runs before or after it. This one OMITS the passphrase (and the env
+  // var is deleted in beforeEach), so the passphrase would have to come from
+  // a real prompt. If the gate moved to after the passphrase resolution, the
+  // single queued chunk would be eaten by "Vault passphrase: " instead, which
+  // is exactly the cost the ordering exists to avoid.
+  it("a declined confirmation costs no passphrase entry (the gate runs BEFORE the prompt)", async () => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin(["n\r"]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Aborted.");
+    expect(promptText()).not.toContain("Vault passphrase: ");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
   it("TTY + ^C at the prompt cancels with 130 and leaves the vault alone", async () => {
     const before = await seed();
     const ETX = String.fromCharCode(3);
@@ -716,6 +774,75 @@ describe("runSecrets remove -- confirmation gate", () => {
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 
+  // The confirm prompt echoes what is typed (a y/n is not a secret), so any
+  // byte the reader buffers goes straight back to the terminal. A raw ESC
+  // sent back is EXECUTED by the terminal rather than displayed -- an arrow
+  // key at the [y/N] prompt repainted the screen and desynced what the user
+  // saw from what the answer buffer held.
+  const ESC = String.fromCharCode(27);
+
+  it("an ESC byte at the confirm prompt is dropped: not echoed, and the answer still reads as y", async () => {
+    await seed();
+    const stdin = new FakeTTYStdin([`${ESC}y\r`]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    // Buffered, the ESC would make the answer "\x1by" -- which is not "y",
+    // so the delete would silently turn into an abort.
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain('Removed "TOKEN"');
+    expect(promptText()).not.toContain(ESC);
+  });
+
+  it("an arrow-key sequence at the confirm prompt never echoes the raw ESC back to the terminal", async () => {
+    const before = await seed();
+    // Up-arrow is ESC + "[A". The decision is unaffected either way (neither
+    // "[A" nor "\x1b[A" is consent) -- what matters is that the terminal is
+    // never handed the escape byte.
+    const stdin = new FakeTTYStdin([`${ESC}[A\r`]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Aborted.");
+    expect(promptText()).not.toContain(ESC);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  // Backspace still has to work, and it must never eat the prompt text
+  // itself: "yy" then two Backspaces then "y" is a plain y.
+  it("Backspace still edits the answer and cannot chew past the start of the buffer", async () => {
+    await seed();
+    const BS = String.fromCharCode(127);
+    const stdin = new FakeTTYStdin([`yy${BS}${BS}${BS}${BS}y\r`]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain('Removed "TOKEN"');
+  });
+
   it("non-TTY without --force refuses (exit 2), names the flag, and leaves the vault byte-identical", async () => {
     const before = await seed();
     const r = await runSecrets(
@@ -724,7 +851,57 @@ describe("runSecrets remove -- confirmation gate", () => {
     );
     expect(r.exitCode).toBe(2);
     expect(errText()).toContain("--force");
-    expect(errText().toLowerCase()).toContain("not a tty");
+    expect(errText()).toContain("neither stdin nor stdout is a TTY");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  // The gate needs BOTH ends (stdin to read the answer, stdout to show the
+  // question), so the refusal has to name the end that actually failed.
+  // Blaming stdin unconditionally sent `remove NAME --json | jq` -- run from
+  // an interactive shell, so stdin IS a TTY -- to the wrong half of the pipe.
+  it("names stdout when stdout is the half that is not a TTY (`remove NAME --json | jq`)", async () => {
+    const before = await seed();
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: {
+          stdin: { isTTY: true } as unknown as NodeJS.ReadableStream,
+          stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
+          stderr,
+        },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(2);
+    expect(errText()).toContain("stdout is not a TTY");
+    expect(errText()).not.toContain("stdin is not a TTY");
+    expect(errText()).toContain("--force");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("names stdin when stdin is the half that is not a TTY (`echo x | remove NAME`)", async () => {
+    const before = await seed();
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: {
+          stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+          stdout: { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream,
+          stderr,
+        },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(2);
+    expect(errText()).toContain("stdin is not a TTY");
+    expect(errText()).not.toContain("stdout is not a TTY");
+    expect(errText()).toContain("--force");
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
   });
 
@@ -735,6 +912,38 @@ describe("runSecrets remove -- confirmation gate", () => {
       io,
     );
     expect(r.exitCode).toBe(0);
+    expect(outText()).toContain('Removed "TOKEN"');
+    lock();
+
+    io.out.mockReset();
+    const listed = await runSecrets({ action: "list", home, json: true }, io);
+    expect(listed.exitCode).toBe(0);
+    expect(JSON.parse(outText()).keys).toEqual([]);
+  });
+
+  // --force's headline behavior is "skip the interactive confirm", and the
+  // only place that is observable is a TTY -- the non-TTY tests above pass
+  // whether or not the prompt is actually skipped, because there is no
+  // prompt to skip. Mirrors the set-side "--force skips the overwrite prompt
+  // on a TTY" test.
+  it("--force skips the confirmation prompt on a TTY (nothing is asked, and it still deletes)", async () => {
+    await seed();
+    // Empty queue: if the gate tried to prompt, the read would never settle
+    // and this test would time out instead of passing.
+    const stdin = new FakeTTYStdin([]);
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: CONFIRM_PASS,
+        force: true,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(promptText()).toBe("");
     expect(outText()).toContain('Removed "TOKEN"');
     lock();
 
@@ -830,6 +1039,31 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
     );
     expect(r.exitCode).toBe(1);
     expect(errText().toLowerCase()).toContain("aborted");
+    expect(promptText().toLowerCase()).toContain("already exists");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(await readBack()).toBe("old-value");
+  });
+
+  // Same gap as the remove side: bare Enter alone does not pin the y/yes
+  // check, so a typed no is asserted here too. Both gates share promptYesNo,
+  // and a regression there overwrites a credential the user just declined to
+  // replace.
+  it.each(["n", "no"])('TTY + explicit "%s" leaves the existing value in place', async (answer) => {
+    const before = await seed();
+    const stdin = new FakeTTYStdin([`${answer}\r`]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "TOKEN",
+        value: "new-value",
+        passphrase: CONFIRM_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Aborted.");
     expect(promptText().toLowerCase()).toContain("already exists");
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
     expect(await readBack()).toBe("old-value");

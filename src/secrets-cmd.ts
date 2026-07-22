@@ -82,8 +82,9 @@ Flags:
   --stdin                 Read the secret from raw stdin (set only).
   --force                 Skip the destructive-action confirmation
                           (remove, and a set that overwrites an existing
-                          name). Required for remove when stdin is not a
-                          TTY. NEVER skips the passphrase.
+                          name). Required for remove when stdin or stdout
+                          is not a TTY (both ends are needed to ask). NEVER
+                          skips the passphrase.
   --secret <name>         (audit only) Filter to one secret name.
   --server <ns>           (audit only) Filter to one server namespace.
 
@@ -281,14 +282,35 @@ function abortedResult(
   return { exitCode: 1 };
 }
 
-/** Can we prompt? Both ends must be a TTY: stdin to read the answer,
- *  stdout to show the question. Reads the INJECTED streams (never
- *  process.stdin directly) so tests drive it the same way they drive the
- *  passphrase prompts. */
-function isInteractiveTTY(opts: SecretsCommandOptions): boolean {
+/** Which ends are a TTY. Reads the INJECTED streams (never process.stdin
+ *  directly) so tests drive it the same way they drive the passphrase
+ *  prompts. Split out from isInteractiveTTY because the refusal message
+ *  has to name the end that ACTUALLY failed. */
+function ttyEnds(opts: SecretsCommandOptions): { stdin: boolean; stdout: boolean } {
   const stdin = opts.io?.stdin ?? process.stdin;
   const stdout = opts.io?.stdout ?? process.stdout;
-  return (stdin as { isTTY?: boolean }).isTTY === true && (stdout as { isTTY?: boolean }).isTTY === true;
+  return {
+    stdin: (stdin as { isTTY?: boolean }).isTTY === true,
+    stdout: (stdout as { isTTY?: boolean }).isTTY === true,
+  };
+}
+
+/** Can we prompt? Both ends must be a TTY: stdin to read the answer,
+ *  stdout to show the question. */
+function isInteractiveTTY(opts: SecretsCommandOptions): boolean {
+  const ends = ttyEnds(opts);
+  return ends.stdin && ends.stdout;
+}
+
+/** Name the end(s) that are not a TTY, for the non-interactive refusal.
+ *  Naming stdin unconditionally was wrong for the common
+ *  `yaw-mcp secrets remove NAME --json | jq` shape: run from an interactive
+ *  shell that has a perfectly good TTY stdin and only a piped STDOUT, so the
+ *  message sent the user to inspect the wrong half of their pipeline. */
+function nonTTYEnds(opts: SecretsCommandOptions): string {
+  const ends = ttyEnds(opts);
+  if (!ends.stdin && !ends.stdout) return "neither stdin nor stdout is a TTY";
+  return ends.stdin ? "stdout is not a TTY" : "stdin is not a TTY";
 }
 
 /** Ask a destructive-action question on the TTY. Defaults to NO: only an
@@ -451,6 +473,14 @@ function readLineFromTTY(
           }
           continue;
         }
+        // Drop every remaining control byte instead of buffering + echoing
+        // it. On the echo path (the y/n confirmation) a raw ESC written back
+        // is EXECUTED by the terminal rather than displayed, so an arrow key
+        // at the [y/N] prompt repainted the screen AND left an invisible byte
+        // in the buffer -- "\x1by" is not "y", so the answer silently flipped.
+        // Everything meaningful (\n \r ^C ^D \b) is handled above, so nothing
+        // reachable here is input the user can see or intended to type.
+        if (ch < " ") continue;
         chunks.push(ch);
         if (echo) stdout.write(ch);
       }
@@ -571,7 +601,7 @@ export async function runSecrets(
       if (confirmed === CANCELLED) return cancelledResult(io, opts.json);
       if (!confirmed) return abortedResult(io, opts.json, "remove");
     } else {
-      const msg = `refusing to delete "${opts.name}" without confirmation and stdin is not a TTY.`;
+      const msg = `refusing to delete "${opts.name}" without confirmation and ${nonTTYEnds(opts)}.`;
       const hint = "Re-run with --force to delete it. This cannot be undone.";
       if (opts.json) io.err(`${JSON.stringify({ ok: false, error: `${msg} ${hint}` })}\n`);
       else io.err(`yaw-mcp secrets remove: ${msg}\n  ${hint}\n`);
