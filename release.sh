@@ -122,6 +122,16 @@ esac
 # verify command (no npm-run wrapper) for tools that print no completion marker.
 run_npm_check() {
   local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc=0
+  # SKIP_LINT=1 escape hatch, matching every sibling @yawlabs release.sh. The
+  # win32-arm64 biome binary segfaults (139) on THIS repo for every input --
+  # `npm run lint`, `npx biome check src/`, a single file, and the direct
+  # node_modules binary all die with zero output, so neither the done_re nor the
+  # verify_cmd tolerance path below can ever engage. Types and tests still gate
+  # the release; formatting goes unverified on this host.
+  if [ "${SKIP_LINT:-}" = "1" ] && [[ "$script" == lint* ]]; then
+    warn "SKIP_LINT=1 -- skipping '$label' (biome segfaults on win32-arm64)"
+    return 0
+  fi
   # `|| rc=$?` is load-bearing: under `set -e` a bare `out=$(npm run ...)` whose
   # command substitution exits non-zero aborts the function THERE, before the
   # analysis below runs.
