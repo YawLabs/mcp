@@ -125,7 +125,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "secrets",
     description: "Manage stored secrets",
     positional: [["set", "get", "list", "remove", "lock", "rotate", "audit"], ["<name>"]],
-    flags: ["--value", "--stdin", "--secret", "--server", "--json", "--help"],
+    flags: ["--value", "--stdin", "--force", "--secret", "--server", "--json", "--help"],
   },
   // Other.
   { name: "audit", description: "Run a full-pass audit of loaded servers", flags: ["--json", "--help"] },
@@ -351,13 +351,20 @@ function renderPowershell(): string {
   const caseBranches = SUBCOMMAND_SPEC.map((spec) => {
     const flags = spec.flags.map((f) => `'${f}'`).join(", ");
     // Emit one guarded block per positional SLOT, adding every alternative
-    // for that slot to the candidate array. $tokens[0] is "yaw-mcp",
-    // $tokens[1] is the subcommand, so the token count when completing
-    // slotIndex N is N + 2 (the cursor is on the next token to be typed).
+    // for that slot to the candidate array. The guard compares the slot's
+    // index against $argIndex -- the NORMALIZED index of the argument being
+    // completed, where 0 is the first argument after the subcommand.
+    //
+    // It must NOT compare a raw $tokens.Count: this switch only runs once the
+    // user is past the subcommand, so a `Count -eq 2` test for slot 0 is dead
+    // code and no positional candidate would ever be offered. A raw count is
+    // also ambiguous, because a partially typed word is already part of
+    // $tokens ("install <TAB>" and "install cl<TAB>" are both slot 0 but have
+    // different counts); $argIndex normalizes that away below.
     const positionalLines = realPositionals(spec)
       .map(
         ({ candidates, index }) =>
-          `      if ($tokens.Count -eq ${index + 2}) { $completions += @(${candidates.map((c) => `'${c}'`).join(", ")}) }`,
+          `      if ($argIndex -eq ${index}) { $completions += @(${candidates.map((c) => `'${c}'`).join(", ")}) }`,
       )
       .join("\n");
     const positionalBlock = positionalLines ? `${positionalLines}\n` : "";
@@ -370,9 +377,17 @@ ${positionalBlock}      $completions += @(${flags})
 # Install: append this script to your profile ($PROFILE) and reload.
 Register-ArgumentCompleter -CommandName yaw-mcp -ScriptBlock {
   param($wordToComplete, $commandAst, $cursorPosition)
-  $tokens = $commandAst.CommandElements | ForEach-Object { $_.ToString() }
+  $tokens = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })
   $completions = @()
-  if ($tokens.Count -le 2) {
+  # $argIndex is the normalized index of the positional being completed: 0 is
+  # the first argument AFTER the subcommand. $tokens[0] is "yaw-mcp" and
+  # $tokens[1] is the subcommand, hence -2. A partially typed word is already
+  # one of $tokens, so back off one more when $wordToComplete is non-empty --
+  # that keeps "install <TAB>" and "install cl<TAB>" both on slot 0. Negative
+  # means the user is still on the subcommand itself.
+  $argIndex = $tokens.Count - 2
+  if ($wordToComplete -ne '') { $argIndex-- }
+  if ($argIndex -lt 0) {
     $completions = @(${subcommandNames}, '--help', '-h', '--version', '-V')
   } else {
     switch ($tokens[1]) {

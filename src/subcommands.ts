@@ -61,10 +61,13 @@ export function suggestSubcommand(input: string, limit = 3): string[] {
 
 /**
  * Suggest the closest known flag alias for a long-form leading-dash typo
- * (e.g. `--versionn` -> `--version`, `--hepl` -> `--help`). Restricted to
- * inputs longer than a single-letter flag (length > 2) so a genuine short
- * flag like a server's own lowercase `-v` is NOT hijacked by a case-only
- * match against `-V`.
+ * (e.g. `--versionn` -> `--version`, `--hepl` -> `--help`). A wrong-case
+ * spelling counts as a typo too (`--HELP` -> `--help`): index.ts dispatches
+ * only the exact raw spellings, so without a suggestion here the mis-cased
+ * flag falls through to runServer and hangs. Restricted to inputs longer
+ * than a single-letter flag (length > 2) so a genuine short flag like a
+ * server's own lowercase `-v` is NOT hijacked by a case-only match against
+ * `-V` -- that gate is what keeps case-insensitive matching safe here.
  *
  * Uses pure levenshtein distance <= 2 (without the prefix/substring tiers
  * that closestNames adds). Prefix matching is unsafe here: `--vers` is a
@@ -81,7 +84,16 @@ export function suggestFlag(input: string, limit = 2): string[] {
   const q = input.toLowerCase();
   const hits: Array<{ name: string; d: number }> = [];
   for (const alias of FLAG_ALIASES) {
-    if (alias.toLowerCase() === q) continue; // exact match -- never "did you mean yourself"
+    // Never "did you mean yourself" -- but the skip must be an exact RAW
+    // match, not a case-insensitive one. index.ts dispatches every raw
+    // spelling (`--help` / `-h` / `--version` / `-V`) by === before this
+    // runs, so a raw-identical flag never reaches here; a case-insensitive
+    // skip therefore only ever discards the one alias the user most likely
+    // meant. That dropped `--help` from the pool for `--HELP`, left every
+    // remaining alias >2 edits away, returned [], and let index.ts fall
+    // through to runServer -- booting a stdio MCP server that hangs with no
+    // output on a dead prompt.
+    if (alias === input) continue;
     const d = levenshtein(q, alias.toLowerCase());
     if (d <= 2) hits.push({ name: alias, d });
   }

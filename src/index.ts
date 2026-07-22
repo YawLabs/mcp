@@ -397,7 +397,25 @@ if (subcommand === "compliance") {
     process.stderr.write(`yaw-mcp: unknown flag "${subcommand}". Did you mean: ${flagSuggestions.join(", ")}?\n`);
     process.exit(2);
   } else {
-    runServer();
+    // Startup failure path. runServer() registers a last-resort
+    // unhandledRejection handler (see below) BEFORE its first await, so a
+    // fatal startup rejection -- e.g. loadYawMcpConfig() throwing on a
+    // non-https, non-loopback YAW_MCP_URL -- would otherwise be swallowed
+    // by that handler: logged as a JSON line, no server started, and the
+    // process exiting 0 as if all was well. Attaching a real catch here
+    // restores the "print the error and exit 1" contract. It only covers
+    // the startup promise; a genuine POST-startup rejection (an orphaned
+    // upstream connect that rejects late) still lands on the handler
+    // inside runServer, which logs and keeps the server running.
+    //
+    // Same buffered-write reasoning as dispatch(): set process.exitCode
+    // instead of calling process.exit(), so the stderr write is drained
+    // before Node exits on its own.
+    runServer().catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`yaw-mcp: ${msg}\n`);
+      process.exitCode = 1;
+    });
   }
 }
 

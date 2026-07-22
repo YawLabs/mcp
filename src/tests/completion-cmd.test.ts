@@ -188,7 +188,97 @@ describe("renderScript — powershell", () => {
     expect(s).toContain("@('claude-code', 'claude-desktop', 'cursor', 'vscode')");
     expect(s).toContain("@('list', 'match')");
   });
+
+  it("guards positional slots on a normalized $argIndex, never on a raw token count", () => {
+    const s = renderScript("powershell");
+    // The per-subcommand switch only runs once at least one argument follows
+    // the subcommand, so a raw `$tokens.Count -eq N` slot guard is dead code:
+    // slot 0's `-eq 2` can never be true inside that branch and NO positional
+    // candidate was ever offered (install clients, secrets actions, bundles
+    // list/match, completion shells, foundry export).
+    expect(s).not.toMatch(/\$tokens\.Count -eq \d+/);
+    expect(s).toContain("$argIndex = $tokens.Count - 2");
+    expect(s).toContain("if ($wordToComplete -ne '') { $argIndex-- }");
+    expect(s).toContain("if ($argIndex -lt 0) {");
+    // Slot 0 candidates are emitted under the normalized index.
+    expect(s).toContain(
+      "if ($argIndex -eq 0) { $completions += @('claude-code', 'claude-desktop', 'cursor', 'vscode') }",
+    );
+    expect(s).toContain("if ($argIndex -eq 0) { $completions += @('bash', 'zsh', 'fish', 'powershell') }");
+    expect(s).toContain("if ($argIndex -eq 0) { $completions += @('list', 'match') }");
+    expect(s).toContain("if ($argIndex -eq 0) { $completions += @('export') }");
+    expect(s).toContain(
+      "if ($argIndex -eq 0) { $completions += @('set', 'get', 'list', 'remove', 'lock', 'rotate', 'audit') }",
+    );
+  });
+
+  it("resolves the real completion cases (subcommand, slot 0, slot 1, flags)", () => {
+    const s = renderScript("powershell");
+    const complete = (tokens: string[], word: string) => simulatePowershell(s, tokens, word);
+
+    // Still on the subcommand itself -- with or without a partial word.
+    expect(complete(["yaw-mcp"], "")).toContain("install");
+    expect(complete(["yaw-mcp", "ins"], "ins")).toEqual(["install"]);
+
+    // `yaw-mcp install <TAB>` and `yaw-mcp install cl<TAB>` both land on slot 0.
+    const installEmpty = complete(["yaw-mcp", "install"], "");
+    expect(installEmpty).toEqual(expect.arrayContaining([...INSTALL_CLIENTS]));
+    // Flags must still be offered alongside the positional candidates.
+    expect(installEmpty).toEqual(expect.arrayContaining(["--scope", "--token", "--dry-run"]));
+    expect(complete(["yaw-mcp", "install", "cl"], "cl")).toEqual(["claude-code", "claude-desktop"]);
+
+    // Slot 1: `yaw-mcp secrets set <TAB>` is past the action list, so only the
+    // free-form <name> slot (no candidates) plus flags remain.
+    expect(complete(["yaw-mcp", "secrets"], "")).toEqual(expect.arrayContaining(["set", "rotate", "audit"]));
+    const secretsSlot1 = complete(["yaw-mcp", "secrets", "set"], "");
+    expect(secretsSlot1).not.toContain("set");
+    expect(secretsSlot1).toEqual(expect.arrayContaining(["--value", "--stdin"]));
+
+    // A subcommand with no positionals falls straight through to its flags.
+    expect(complete(["yaw-mcp", "doctor"], "")).toEqual(["--json", "--help"]);
+  });
 });
+
+const INSTALL_CLIENTS = ["claude-code", "claude-desktop", "cursor", "vscode"];
+
+/**
+ * Minimal interpreter for the exact shape `renderPowershell` emits, so the
+ * cases above assert BEHAVIOR (what a user sees on TAB) rather than just the
+ * presence of a substring. Mirrors PowerShell semantics for this script:
+ * $tokens is CommandElements (a partially typed word is already one of them),
+ * a negative normalized index means the subcommand list, otherwise the branch
+ * for $tokens[1] contributes its matching slot candidates plus its flags, and
+ * the whole set is prefix-filtered by $wordToComplete.
+ */
+function simulatePowershell(script: string, tokens: string[], wordToComplete: string): string[] {
+  const parseList = (list: string): string[] => Array.from(list.matchAll(/'([^']*)'/g), (m) => m[1]);
+
+  const subcommandLine = script.match(/if \(\$argIndex -lt 0\) \{\n\s*\$completions = @\((.*)\)\n/);
+  if (!subcommandLine) throw new Error("no normalized subcommand branch in the generated script");
+
+  let argIndex = tokens.length - 2;
+  if (wordToComplete !== "") argIndex--;
+
+  let candidates: string[];
+  if (argIndex < 0) {
+    candidates = parseList(subcommandLine[1]);
+  } else {
+    const sub = tokens[1];
+    const branch = script.match(new RegExp(`\\n    '${sub}' \\{\\n([\\s\\S]*?)\\n    \\}`));
+    if (!branch) throw new Error(`no switch branch for "${sub}"`);
+    candidates = [];
+    for (const line of branch[1].split("\n")) {
+      const guarded = line.match(/if \(\$argIndex -eq (\d+)\) \{ \$completions \+= @\((.*)\) \}/);
+      if (guarded) {
+        if (Number(guarded[1]) === argIndex) candidates.push(...parseList(guarded[2]));
+        continue;
+      }
+      const plain = line.match(/^\s*\$completions \+= @\((.*)\)\s*$/);
+      if (plain) candidates.push(...parseList(plain[1]));
+    }
+  }
+  return candidates.filter((c) => c.startsWith(wordToComplete));
+}
 
 describe("SUBCOMMAND_SPEC coverage", () => {
   it("covers every dispatched subcommand (no drift vs the real KNOWN_SUBCOMMANDS table)", () => {
@@ -225,12 +315,19 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     }
   });
 
-  it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit in, push/pull/--force out)", () => {
+  it("keeps the secrets entry in sync with parseSecretsArgs (rotate/audit/--force in, push/pull out)", () => {
     const secrets = SUBCOMMAND_SPEC.find((s) => s.name === "secrets");
     expect(secrets).toBeDefined();
     expect(secrets?.positional?.[0]).toEqual(["set", "get", "list", "remove", "lock", "rotate", "audit"]);
-    expect(secrets?.flags).toEqual(expect.arrayContaining(["--value", "--stdin", "--secret", "--server", "--json"]));
-    expect(secrets?.flags).not.toContain("--force");
+    // --force gates the destructive paths (`remove`, and a `set` that
+    // overwrites an existing name), so it MUST be completable -- a user who
+    // cannot tab it will not discover the only way to script a remove.
+    expect(secrets?.flags).toEqual(
+      expect.arrayContaining(["--value", "--stdin", "--force", "--secret", "--server", "--json"]),
+    );
+    // The Yaw Team surface's sync flags stay gone.
+    expect(secrets?.flags).not.toContain("--replace");
+    expect(secrets?.flags).not.toContain("--push");
   });
 });
 

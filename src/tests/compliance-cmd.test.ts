@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMPLIANCE_USAGE,
+  formatLaunchFailure,
   isRenderableReport,
   projectForPublish,
   resolveNpxLaunch,
@@ -138,6 +139,80 @@ describe("resolveNpxLaunch", () => {
     });
     expect(code).toBe(0);
   }, 60_000);
+});
+
+// The diagnostic printed when BOTH strategies are out (no npx-cli.js on disk
+// AND an argument we refuse to shell-quote). quoteForShell rejects a different
+// character set per platform -- `%` only on win32, `'` only on POSIX -- so a
+// message that always says "quotes / newlines" names nothing actually at fault
+// for a percent-encoded target.
+describe("formatLaunchFailure", () => {
+  it("names the win32 character class and echoes the offending % argument", () => {
+    const msg = formatLaunchFailure(["-y", "pkg", "https://example.com/%7Bid%7D"], "win32");
+    // Installing npm stays the leading remedy -- it removes the shell path.
+    expect(msg).toContain("Install npm");
+    expect(msg).toContain("percent signs");
+    expect(msg).toContain('"https://example.com/%7Bid%7D"');
+    // `%` is inert on POSIX; don't send a Windows operator after single quotes.
+    expect(msg).not.toContain("single quotes");
+  });
+
+  it("names the POSIX character class and echoes the offending ' argument", () => {
+    const msg = formatLaunchFailure(["-y", "npx -y it's-a-server"], "linux");
+    expect(msg).toContain("Install npm");
+    expect(msg).toContain("single quotes");
+    expect(msg).toContain("it's-a-server");
+    // cmd.exe's %VAR% expansion is a win32-only concern.
+    expect(msg).not.toContain("percent signs");
+  });
+
+  it("escapes a control character in the echoed argument instead of breaking the line", () => {
+    const msg = formatLaunchFailure(["-y", "a\nb"], "linux");
+    expect(msg).toContain('"a\\nb"');
+    // 4 lines of prose + trailing newline; the echoed \n must not add one.
+    expect(msg.split("\n")).toHaveLength(5);
+  });
+
+  it("still explains itself if no single argument is to blame", () => {
+    const msg = formatLaunchFailure(["-y", "pkg"], "linux");
+    expect(msg).toContain("Install npm");
+    expect(msg).toContain("cannot be safely quoted");
+  });
+});
+
+// Wiring: the unlaunchable path inside runComplianceCommand must print THAT
+// message, not a hardcoded one. node:fs is mocked so no npx-cli.js resolves,
+// and the platform is pinned so the assertion holds on any CI runner. The
+// command returns before spawning anything.
+describe("runComplianceCommand unlaunchable path", () => {
+  it("surfaces the platform-accurate message and exits 1 without spawning", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, default: actual, existsSync: () => false };
+    });
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const target = "https://example.com/%7Bid%7D";
+      const code = await mod.runComplianceCommand([target], cap.io);
+      expect(code).toBe(1);
+      expect(cap.out()).toBe("");
+      // Content first: the old text named only "quotes / newlines", neither of
+      // which appears in this target -- `%` is what quoteForShell rejected.
+      expect(cap.err()).toContain("percent signs");
+      expect(cap.err()).toContain(target);
+      expect(cap.err()).toBe(
+        mod.formatLaunchFailure(["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", target], "win32"),
+      );
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
 });
 
 // printSummary does score.toFixed(1); a report that reaches it without a

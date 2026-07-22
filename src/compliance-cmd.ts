@@ -130,6 +130,37 @@ function quoteForShell(arg: string, platform: NodeJS.Platform): string | null {
   return `'${arg}'`;
 }
 
+/** Operator-facing name for the characters quoteForShell refuses on a given
+ *  platform. Lives beside quoteForShell so the two cannot drift. */
+function unquotableCharsFor(platform: NodeJS.Platform): string {
+  return platform === "win32"
+    ? "double quotes, percent signs, newlines or NUL bytes"
+    : "single quotes, newlines or NUL bytes";
+}
+
+/**
+ * Failure text for "no npx-cli.js on disk AND an argument we refuse to quote".
+ * Names the character class that actually applies on THIS platform and echoes
+ * the offending argument: the old wording said "quotes / newlines" on every
+ * platform, so a target rejected for a `%` (win32-only) or a `'` (POSIX-only)
+ * got an explanation naming nothing that was wrong with it. Installing npm is
+ * still the primary remedy -- it removes the shell fallback entirely.
+ */
+export function formatLaunchFailure(npxArgs: string[], platform: NodeJS.Platform = process.platform): string {
+  const offender = npxArgs.find((a) => quoteForShell(a, platform) === null);
+  const detail =
+    offender === undefined
+      ? "and the target arguments cannot be safely quoted for a shell fallback.\n"
+      : // JSON.stringify so a newline / NUL in the argument is shown escaped
+        // instead of mangling the diagnostic it appears in.
+        `and this argument cannot be safely quoted for a shell fallback: ${JSON.stringify(offender)}\n`;
+  return (
+    "\nFailed to launch mcp-compliance: npm's npx-cli.js was not found next to this node binary,\n" +
+    detail +
+    `Install npm, or pass a target without ${unquotableCharsFor(platform)}.\n`
+  );
+}
+
 /**
  * Decide how to spawn `npx <args>`.
  *
@@ -233,11 +264,7 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRe
     const npxArgs = ["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", ...args];
     const launch = resolveNpxLaunch(npxArgs);
     if (!launch) {
-      fail(
-        "\nFailed to launch mcp-compliance: npm's npx-cli.js was not found next to this node binary,\n" +
-          "and the target arguments cannot be safely quoted for a shell fallback. Install npm, or pass\n" +
-          "a target without quotes / newlines.\n",
-      );
+      fail(formatLaunchFailure(npxArgs));
       return;
     }
 

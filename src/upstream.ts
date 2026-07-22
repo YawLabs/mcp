@@ -65,7 +65,9 @@ async function resolveServerEnv(env: Record<string, string>, namespace: string):
   // Recorded BEFORE the missing-refs throw below: a FAILED spawn is exactly
   // the case an operator goes looking for in `yaw-mcp secrets audit`, and
   // the "missing" event kind is already advertised by that renderer. Audit
-  // first, then refuse.
+  // first, then refuse. recordResolveAudit itself suppresses "injected" on
+  // the refusal path -- nothing reaches a child env when the spawn is
+  // refused, so "injected" would be a lie (see its doc comment).
   try {
     await recordResolveAudit(namespace, env, missing);
   } catch (auditErr) {
@@ -82,20 +84,29 @@ async function resolveServerEnv(env: Record<string, string>, namespace: string):
 
 /**
  * Append one audit event per secret reference this spawn touched:
- *   - "injected" for each distinct secret NAME that was successfully
- *     resolved (referenced in env AND not in the `missing` set),
- *   - "missing" for each name the vault lacked.
+ *   - "missing" for each name the vault lacked,
+ *   - "injected" for each distinct secret NAME that was referenced AND
+ *     actually reaches the child env.
  * Names only -- the value is never read here, let alone written.
+ *
+ * The two kinds are mutually exclusive per call, and that is the whole
+ * point: resolution is all-or-nothing. When ANY ref is missing, the caller
+ * refuses the spawn, so NOTHING is injected -- not even the refs that
+ * resolved fine. Recording those as "injected" anyway told an operator
+ * asking "did this server ever receive my prod token?" a false yes.
+ * So: missing refs present -> record ONLY the "missing" events (a refused
+ * spawn must still leave a trail); otherwise -> record "injected", which
+ * keeps meaning "went into a spawn env".
  */
 async function recordResolveAudit(namespace: string, env: Record<string, string>, missing: string[]): Promise<void> {
-  const missingSet = new Set(missing);
-  const referenced = collectSecretNames(env);
-  for (const name of referenced) {
-    if (missingSet.has(name)) continue;
-    await appendAuditEvent({ server: namespace, secret: name, event: "injected" });
+  if (missing.length > 0) {
+    for (const name of new Set(missing)) {
+      await appendAuditEvent({ server: namespace, secret: name, event: "missing" });
+    }
+    return;
   }
-  for (const name of missingSet) {
-    await appendAuditEvent({ server: namespace, secret: name, event: "missing" });
+  for (const name of collectSecretNames(env)) {
+    await appendAuditEvent({ server: namespace, secret: name, event: "injected" });
   }
 }
 
