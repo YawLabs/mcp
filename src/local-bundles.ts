@@ -336,6 +336,16 @@ export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {
 // loadLocalBundles), so the add/remove commands warn separately when a
 // project file would shadow the write -- they don't silently target it.
 //
+// LOSSY REWRITE: add/remove serialize the file back out via JSON.stringify
+// (readRawUserBundles -> {version, servers, defaultRuntime?} -> atomicWriteFile).
+// The reader (readBundlesAt) accepts JSONC comments and tolerates unknown
+// top-level keys, but this write path preserves NEITHER: any `//` or `/* */`
+// comments the user hand-added, and any top-level key beyond version/servers/
+// defaultRuntime, are dropped the first time `add`/`remove` touches the file.
+// bundles.json is a tool-managed file; hand-edits survive READS but not the
+// next tool-driven WRITE. (Per-server unknown fields inside a server object
+// ARE preserved -- readRawUserBundles round-trips the raw server entries.)
+//
 // In-process serializer: concurrent upsert/remove calls on the same file
 // would race -- both would read the same on-disk snapshot, both would
 // produce a different modified copy, and the loser's write would silently
@@ -459,7 +469,10 @@ async function doUpsertUserBundle(
   // stamp CURRENT when the file had none (readRawUserBundles guarantees a
   // numeric version when the file existed, so this only fills the fresh case).
   file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600);
+  // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
+  // (matching secrets-vault): bundles.json can carry per-server `--env`
+  // secrets, so its parent dir must not be group/other-listable.
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
     try {
       await chmod(path, 0o600);
@@ -502,7 +515,10 @@ async function doRemoveUserBundle(
   if (file.servers.length === before) return { path, removed: false };
   // Preserve a newer on-disk schema version rather than downgrading it.
   file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600);
+  // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
+  // (matching secrets-vault): bundles.json can carry per-server `--env`
+  // secrets, so its parent dir must not be group/other-listable.
+  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
     try {
       await chmod(path, 0o600);

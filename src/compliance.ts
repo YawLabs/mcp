@@ -27,12 +27,19 @@ const GRADE_ORDER: Record<ComplianceGrade, number> = {
   F: 0,
 };
 
-type GradeClassification =
+export type GradeClassification =
   | { kind: "ungraded" }
   | { kind: "unrecognized"; raw: string }
   | { kind: "graded"; rank: number };
 
-function classifyGrade(grade: string | undefined | null): GradeClassification {
+/**
+ * Three-way classification of a grade string: ungraded (absent/empty),
+ * unrecognized (present but not A-F), or graded (with its integer rank).
+ * Exported so callers can distinguish "unrecognized grade" from "below
+ * min" -- passesMinCompliance collapses both to `false`, which is fine
+ * for the routing decision but wrong for the user-facing message.
+ */
+export function classifyGrade(grade: string | undefined | null): GradeClassification {
   if (grade === undefined || grade === null) return { kind: "ungraded" };
   const trimmed = grade.trim();
   if (trimmed === "") return { kind: "ungraded" };

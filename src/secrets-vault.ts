@@ -27,7 +27,14 @@ import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
-import { decryptEntry, deriveKey, type EncryptedEntry, encryptEntry, generateSalt } from "./secrets-crypto.js";
+import {
+  decryptEntry,
+  deriveKey,
+  type EncryptedEntry,
+  encryptEntry,
+  generateSalt,
+  SALT_LEN,
+} from "./secrets-crypto.js";
 
 export const SECRETS_FILENAME = "secrets.json";
 export const SECRETS_SCHEMA_VERSION = 1;
@@ -88,6 +95,23 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
   const obj = parsed as Record<string, unknown>;
   if (typeof obj.salt !== "string" || !obj.entries || typeof obj.entries !== "object") {
     throw new Error(`vault at ${path} is corrupt: missing or invalid salt/entries`);
+  }
+  // The salt is a string (checked above), but a truncated / non-base64 salt
+  // would derive the WRONG key and fail every decrypt with an opaque auth-tag
+  // error far from here. Decode it and assert the byte length up front (mirrors
+  // the per-entry validation below) so a corrupt salt surfaces a clear, named
+  // error at load time.
+  if (Buffer.from(obj.salt, "base64").length !== SALT_LEN) {
+    throw new Error(`vault at ${path} is corrupt: salt (expected ${SALT_LEN} bytes)`);
+  }
+  // Reject a vault stamped with a schema NEWER than this build understands:
+  // reading it under the old reader could silently drop or misinterpret a
+  // field a future version added. Equal-or-older loads fine (forward reads
+  // stay compatible); only a strictly-greater version is refused.
+  if (typeof obj.version === "number" && obj.version > SECRETS_SCHEMA_VERSION) {
+    throw new Error(
+      `vault at ${path} was written by a newer yaw-mcp (schema version ${obj.version} > ${SECRETS_SCHEMA_VERSION}); upgrade yaw-mcp to read it`,
+    );
   }
   // Validate each entry's shape up front rather than deferring to decrypt
   // time -- a malformed entry (missing/non-string iv/ciphertext/authTag) is
@@ -392,9 +416,16 @@ export function newVault(): VaultFile {
  *
  * Behavior on misses:
  *   - The referenced secret doesn't exist in the vault: leave the
- *     literal `${secret:NAME}` in place. The child process will then
- *     surface its own "missing env var" or "invalid token" error,
- *     which is louder than yaw-mcp silently passing an empty string.
+ *     literal `${secret:NAME}` in place and report the name in `missing`.
+ *     NOTE: the leave-literal only matters to NON-SPAWN callers. The prod
+ *     spawn caller (upstream.ts resolveServerEnv) fail-CLOSES on ANY miss --
+ *     it throws on a non-empty `missing` and the child never spawns, so a
+ *     literal never reaches a child env. The older "leave it so the child
+ *     surfaces its own error" rationale is therefore stale for the spawn
+ *     path; resolution there is all-or-nothing. The literal (vs an empty
+ *     string) only stays observable to callers that consult `missing`
+ *     WITHOUT refusing -- e.g. a values-free scan -- where a literal is the
+ *     safer, non-lossy default.
  *   - The vault entry decrypts cleanly: replace the entire env value
  *     with the secret. Inline composition (e.g. `Bearer ${secret:GH}`)
  *     also works -- the regex replaces just the reference span.
@@ -430,7 +461,7 @@ export function resolveSecretRefs(
       const entry = Object.hasOwn(vault.entries, name) ? vault.entries[name] : undefined;
       if (!entry) {
         if (!missing.includes(name)) missing.push(name);
-        return full; // leave literal so the child errors cleanly
+        return full; // leave literal; reported via `missing` (see doc above)
       }
       try {
         const value = decryptEntry(entry, key);

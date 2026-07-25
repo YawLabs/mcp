@@ -245,6 +245,34 @@ describe("loadYawMcpConfig — servers/blocked merging", () => {
   });
 });
 
+describe("loadYawMcpConfig — non-string servers/blocked entries (fix F1)", () => {
+  it("an all-invalid servers array falls through to the parent scope instead of shadowing it with allow-all", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
+    // Local scope has ONLY non-string entries. Pre-fix it filtered to []
+    // -- which isAllowed treats as allow-all -- and shadowed the global
+    // allow-list. It must instead fall through so global's ["github"] wins.
+    writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, JSON.stringify({ servers: [123, { namespace: "x" }] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual(["github"]);
+    expect(r.warnings.some((w) => w.includes("'servers' dropped"))).toBe(true);
+  });
+
+  it("keeps valid string entries and warns about the dropped ones", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: ["github", 123, "slack"] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual(["github", "slack"]);
+    expect(r.warnings.some((w) => w.includes("'servers' dropped 1 non-string entry"))).toBe(true);
+  });
+
+  it("a genuinely empty servers array is preserved (explicit 'no filter', not all-invalid)", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: [] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual([]);
+    // No drop warning for a legitimately empty array.
+    expect(r.warnings.some((w) => w.includes("'servers' dropped"))).toBe(false);
+  });
+});
+
 describe("loadYawMcpConfig — walk-up project discovery", () => {
   it("finds .yaw-mcp/ in a parent directory", async () => {
     writeConfig(synthCwd, CONFIG_FILENAME, { apiBase: "https://parent.example" });
@@ -290,6 +318,21 @@ describe("checkPermissions (POSIX only)", () => {
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.warnings).toEqual([]);
   });
+
+  // Fix F2: a project-scope token is IGNORED, so chmod-600 advice for it is
+  // irrelevant noise on a committed file -- skip the perms check entirely.
+  it.skipIf(process.platform === "win32")(
+    "does not emit chmod-600 advice for a loose-perms project-scope token (fix F2)",
+    async () => {
+      const file = writeConfig(synthCwd, CONFIG_FILENAME, { token: "mcp_pat_project_aaaa" });
+      chmodSync(file, 0o644);
+      const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+      // The token is still ignored + warned as project-shared...
+      expect(r.warnings.some((w) => w.includes("IGNORED"))).toBe(true);
+      // ...but there is no perms advice, because moving the token is the fix.
+      expect(r.warnings.some((w) => w.includes("readable by group/other"))).toBe(false);
+    },
+  );
 });
 
 describe("tokenFingerprint", () => {

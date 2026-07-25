@@ -58,7 +58,10 @@ export function healthFactor(
 //
 // We deliberately hide low-sample error rates (<3 calls) — flagging a
 // server as unhealthy after a single flaky call would train the model
-// to skip perfectly-fine servers just because the first call 500'd.
+// to skip perfectly-fine servers just because the first call 500'd. At or
+// above the observation floor we surface ANY nonzero rate, so the warning
+// covers exactly the population errorRateFactor penalizes (no silently
+// down-ranked servers).
 export function formatHealthWarning(
   health: ConnectionHealth | undefined,
   activationFailure: ActivationFailure | undefined,
@@ -71,7 +74,13 @@ export function formatHealthWarning(
   }
   if (health && health.totalCalls >= OBSERVATION_FLOOR) {
     const rate = health.errorCount / health.totalCalls;
-    if (rate >= 0.3) {
+    // Warn on ANY nonzero error rate above the observation floor, not just
+    // >=30%. errorRateFactor already down-ranks a server for any rate>0, so a
+    // 1-29%-error server was being silently penalized in ranking with no line
+    // in the health block to explain it. Tying the warning to the same
+    // rate>0 condition keeps the penalty visible instead of silent -- the
+    // OBSERVATION_FLOOR still suppresses single-flake noise on tiny samples.
+    if (rate > 0) {
       const lastErr = health.lastErrorMessage ? `: ${truncateForWarning(health.lastErrorMessage)}` : "";
       return `warn: ${health.errorCount} of last ${health.totalCalls} calls failed${lastErr}`;
     }

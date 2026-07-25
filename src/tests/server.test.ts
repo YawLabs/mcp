@@ -612,6 +612,45 @@ describe("ConnectServer", () => {
       expect(priv.connections.has("gh")).toBe(false);
     });
 
+    it("dispatch honors the compliance floor via the shared activate path (not just handleActivate)", async () => {
+      // The floor gate lives inside runActivateOne now, so a dispatch that
+      // ranks a below-grade server first must refuse it before any spawn.
+      // handleActivate's own early check does NOT cover the dispatch path —
+      // this pins that the gate moved down into the shared activate flow.
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "D" })]);
+
+      const result = await priv.handleDispatch("github issue", 1);
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain('Refused to load "gh"');
+      expect(text).toContain("grade D");
+      // Gate short-circuits before connectToUpstream — no below-grade spawn.
+      expect(connectToUpstream).not.toHaveBeenCalled();
+      expect(priv.connections.has("gh")).toBe(false);
+    });
+
+    it("reports an unrecognized grade distinctly from a below-min grade", async () => {
+      // passesMinCompliance fails closed on a garbled grade, but the message
+      // must not call an unrecognized "Pass" grade "below B".
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+      const priv = getPrivate(server);
+      // "Pass" is intentionally off the Grade union: it simulates a backend
+      // emitting a grade format yaw-mcp doesn't recognize (the case A6 fixes).
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "Pass" as never }),
+      ]);
+
+      const result = await priv.handleActivate(["gh"]);
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain('Refused to load "gh"');
+      expect(text).toContain("unrecognized compliance grade");
+      expect(text).toContain('"Pass"');
+      expect(text).not.toContain("grade Pass is below");
+    });
+
     it("allows activation when the grade meets the minimum", async () => {
       vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
       const priv = getPrivate(server);

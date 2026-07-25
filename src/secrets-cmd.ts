@@ -331,11 +331,13 @@ async function promptYesNo(opts: SecretsCommandOptions, question: string): Promi
  *  that disables terminal echo via raw mode. Returns null when no
  *  passphrase can be obtained (non-TTY + no env), or CANCELLED when the
  *  user hit ^C at the prompt. */
-async function resolvePassphrase(opts: SecretsCommandOptions): Promise<string | null | Cancelled> {
+async function resolvePassphrase(opts: SecretsCommandOptions, confirm = false): Promise<string | null | Cancelled> {
   if (opts.passphrase !== undefined) return opts.passphrase.length > 0 ? opts.passphrase : null;
   const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
   // An empty env var ("") is treated the same as absent -- deriving a key
-  // from "" would otherwise silently unlock any vault.
+  // from "" would otherwise silently unlock any vault. The env path is
+  // single-shot even when `confirm` is set: a scripted value has no second
+  // entry to compare against, and a CI passphrase is not a typo to catch.
   if (typeof fromEnv === "string" && fromEnv.length > 0) {
     if (fromEnv.length < MIN_PASSPHRASE_WARN_LEN) {
       const stderr = opts.io?.stderr ?? process.stderr;
@@ -348,6 +350,25 @@ async function resolvePassphrase(opts: SecretsCommandOptions): Promise<string | 
   const stdin = opts.io?.stdin ?? process.stdin;
   const stdout = opts.io?.stdout ?? process.stdout;
   if (!isInteractiveTTY(opts)) return null;
+  // Creating a vault: it has no check marker yet, so unlock() accepts ANY
+  // passphrase -- a first-set typo would silently BECOME the vault's
+  // (unrecoverable) passphrase. Confirm it twice, like rotate's
+  // resolveNewPassphrase, so the two entries must agree before we commit.
+  if (confirm) {
+    for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
+      const first = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Vault passphrase: ");
+      if (first === CANCELLED) return CANCELLED;
+      if (first.length === 0) {
+        stdout.write("Passphrase cannot be empty.\n");
+        continue;
+      }
+      const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm passphrase: ");
+      if (second === CANCELLED) return CANCELLED;
+      if (first === second) return first;
+      stdout.write("Passphrases did not match. Try again.\n");
+    }
+    return null;
+  }
   // Reject an empty passphrase (bare Enter / EOF with nothing typed):
   // deriving a key from "" would otherwise unlock any vault. Re-prompt up
   // to a few times, then give up so we never spin forever on a closed pipe.
@@ -622,7 +643,16 @@ export async function runSecrets(
   let vault = loaded.vault ?? newVault();
   const isFresh = !existsSync(path);
 
-  const passphrase = await resolvePassphrase(opts);
+  // A vault with no check marker AND no entries has nothing for unlock() to
+  // verify a passphrase against, so it accepts ANY passphrase -- the first
+  // interactive `set` silently ESTABLISHES the vault passphrase, and a typo
+  // there creates a vault the user can never unlock again. Confirm it twice
+  // on the TTY (like rotate's new passphrase). Only `set` reaches here on a
+  // fresh vault -- get/remove short-circuit above -- and the env-var path
+  // stays single-shot inside resolvePassphrase.
+  const creatingVault = opts.action === "set" && !vault.check && Object.keys(vault.entries).length === 0;
+
+  const passphrase = await resolvePassphrase(opts, creatingVault);
   if (passphrase === CANCELLED) return cancelledResult(io, opts.json);
   if (passphrase === null) {
     const msg = "Passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.";

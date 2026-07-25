@@ -285,21 +285,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const home = opts.home ?? homedir();
   const yawMcpConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
   const yawMcpConfigComposed = writeYawMcpConfig
-    ? await composeYawMcpConfig(yawMcpConfigPath, token as string)
+    ? await composeYawMcpConfig(yawMcpConfigPath, token as string, opts.dryRun ?? false)
     : { json: "" };
   if ("backupPath" in yawMcpConfigComposed && yawMcpConfigComposed.backupPath) {
     const reason = yawMcpConfigComposed.backupReason;
+    // Under --dry-run nothing is written (composeYawMcpConfig skips the
+    // actual backup write), so phrase the note in the conditional.
+    const backedUp = opts.dryRun ? "would be backed up" : "backed up";
     if (reason === "malformed") {
       log(
-        `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; backed up to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
+        `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; ${backedUp} to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
       );
     } else if (reason === "token-rotation") {
       log(
-        `yaw-mcp install: existing ${yawMcpConfigPath} backed up before token rotation to ${yawMcpConfigComposed.backupPath} (previous token preserved for recovery).`,
+        `yaw-mcp install: existing ${yawMcpConfigPath} ${backedUp} before token rotation to ${yawMcpConfigComposed.backupPath} (previous token preserved for recovery).`,
       );
     } else {
       log(
-        `yaw-mcp install: existing ${yawMcpConfigPath} was not a JSON object; backed up to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
+        `yaw-mcp install: existing ${yawMcpConfigPath} was not a JSON object; ${backedUp} to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
       );
     }
   }
@@ -320,6 +323,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           claudeConfigDir: opts.claudeConfigDir,
         })
       : null;
+
+  // Surface a malformed/non-object settings.json rather than silently
+  // skipping the permissions patch (the patch itself is best-effort, so
+  // this never fails the install -- but the user needs to know the file
+  // was left unpatched, distinct from the "already present" no-op which
+  // stays silent).
+  if (settingsPatch?.malformed) {
+    err(
+      `yaw-mcp install: warning — could not patch ${settingsPatch.path} (${settingsPatch.malformedReason}); left unchanged. Add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow by hand, or you may be re-prompted for each yaw-mcp tool call.`,
+    );
+  }
 
   if (opts.dryRun) {
     log("\n--- dry run: would write the following ---");
@@ -411,15 +425,22 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
  *  `permissions.allow`, and return both the path and the rendered JSON.
  *  Returns `changed: false` when the pattern is already present — caller
  *  can skip the write entirely. Returns null for scopes that have no
- *  corresponding settings file. Malformed existing files are left
- *  untouched (changed: false, with a warning printed by the caller). */
+ *  corresponding settings file. Malformed or non-object existing files are
+ *  left untouched (changed: false, malformed: true, malformedReason set);
+ *  the caller emits a warning so the skip isn't silent. */
 async function prepareClaudeCodeSettingsPatch(opts: {
   scope: InstallScope;
   home: string;
   projectDir: string | undefined;
   os: InstallOS;
   claudeConfigDir: string | undefined;
-}): Promise<{ path: string; nextJson: string; changed: boolean } | null> {
+}): Promise<{
+  path: string;
+  nextJson: string;
+  changed: boolean;
+  malformed?: boolean;
+  malformedReason?: string;
+} | null> {
   const path = resolveClaudeCodeSettingsPath(opts.scope, {
     home: opts.home,
     projectDir: opts.projectDir,
@@ -437,13 +458,15 @@ async function prepareClaudeCodeSettingsPatch(opts: {
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
           existing = parsed as Record<string, unknown>;
         } else {
-          // Not an object — leave alone, return no-change.
-          return { path, nextJson: "", changed: false };
+          // Not an object — leave alone, but flag it so the caller can warn
+          // (otherwise the settings.json is silently never patched).
+          return { path, nextJson: "", changed: false, malformed: true, malformedReason: "not a JSON object" };
         }
       }
-    } catch {
-      // Malformed settings.json — don't try to rewrite; let the user fix it.
-      return { path, nextJson: "", changed: false };
+    } catch (e) {
+      // Malformed settings.json — don't try to rewrite; flag it so the
+      // caller can warn (let the user fix it by hand).
+      return { path, nextJson: "", changed: false, malformed: true, malformedReason: (e as Error).message };
     }
   }
 
@@ -600,8 +623,11 @@ export function removeFromClientConfig(
  *  + best-effort chmod) so the salvaged token never sits world-readable --
  *  the backup carries the same secret the main file does. Best-effort:
  *  returns undefined if the write fails so the install can still proceed. */
-async function writeBackup(path: string, raw: string): Promise<string | undefined> {
+async function writeBackup(path: string, raw: string, dryRun = false): Promise<string | undefined> {
   const candidate = `${path}.bak-${Date.now()}`;
+  // Under --dry-run we still want the candidate path (so the caller can
+  // print a "would back up ..." note) but must NOT touch the filesystem.
+  if (dryRun) return candidate;
   try {
     await atomicWriteFile(candidate, raw, "utf8", 0o600);
     if (process.platform !== "win32") {
@@ -623,6 +649,7 @@ type BackupReason = "malformed" | "token-rotation" | "non-object";
 async function composeYawMcpConfig(
   path: string,
   token: string,
+  dryRun = false,
 ): Promise<{ json: string; backupPath?: string; backupReason?: BackupReason }> {
   let existing: Record<string, unknown> = {};
   let backupPath: string | undefined;
@@ -648,7 +675,7 @@ async function composeYawMcpConfig(
           // the file as `<path>.bak-<ts>`.
           const existingToken = (existing as { token?: unknown }).token;
           if (typeof existingToken === "string" && existingToken.length > 0 && existingToken !== token) {
-            backupPath = await writeBackup(path, raw);
+            backupPath = await writeBackup(path, raw, dryRun);
             if (backupPath) backupReason = "token-rotation";
           }
         } else {
@@ -656,7 +683,7 @@ async function composeYawMcpConfig(
           // we still discard it and write our object shape, so back up the
           // original bytes first -- same recovery guarantee as the
           // unparseable case below.
-          backupPath = await writeBackup(path, raw);
+          backupPath = await writeBackup(path, raw, dryRun);
           if (backupPath) backupReason = "non-object";
         }
       } catch {
@@ -664,7 +691,7 @@ async function composeYawMcpConfig(
         // a user who had a real token (or anything else) in there can
         // recover it. The new config still gets written -- the user
         // explicitly asked to install.
-        backupPath = await writeBackup(path, raw);
+        backupPath = await writeBackup(path, raw, dryRun);
         if (backupPath) backupReason = "malformed";
       }
     }
@@ -714,13 +741,15 @@ export function parseInstallArgs(argv: string[]):
       }
       case "--token": {
         const v = next();
-        if (!v) return { ok: false, error: "--token requires a value" };
+        // Reject a following flag swallowed as the value (`--token --force`
+        // must not set token="--force"), mirroring the enum-flag guards.
+        if (!v || v.startsWith("--")) return { ok: false, error: "--token requires a value" };
         opts.token = v;
         break;
       }
       case "--project-dir": {
         const v = next();
-        if (!v) return { ok: false, error: "--project-dir requires a value" };
+        if (!v || v.startsWith("--")) return { ok: false, error: "--project-dir requires a value" };
         opts.projectDir = v;
         break;
       }

@@ -565,11 +565,17 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // expiry-gc telemetry). Previously the JSON path returned early and
   // skipped GC entirely, leaving expired trials wired up. Best-effort:
   // any sweep failure is swallowed, matching renderTrialsSection.
-  const trialGc = await gcExpiredTrials({ home, env, postEvent: opts.postTryEvent, now: opts.now }).catch(() => ({
-    cleared: 0,
-    failed: 0,
-  }));
+  // Scan once, then hand the scan to the GC pass so the trials dir isn't
+  // read twice (GC only unlinks expired markers, so live/malformed in this
+  // pre-sweep scan match the post-sweep readout state).
   const trialScan = await scanTrials({ home, now: opts.now });
+  const trialGc = await gcExpiredTrials({
+    home,
+    env,
+    postEvent: opts.postTryEvent,
+    now: opts.now,
+    scan: trialScan,
+  }).catch(() => ({ cleared: 0, failed: 0 }));
   const trials: DoctorJsonSnapshot["trials"] = {
     cleared: trialGc.cleared,
     live: trialScan.live.map(({ marker, msUntilExpiry }) => ({
@@ -900,8 +906,10 @@ async function renderTrialsSection(opts: {
   now?: () => number;
 }): Promise<void> {
   const { home, env, print, postEvent, now } = opts;
-  const gc = await gcExpiredTrials({ home, env, postEvent, now }).catch(() => ({ cleared: 0, failed: 0 }));
+  // Scan once, then hand the scan to the GC pass (GC only unlinks expired
+  // markers, so live/malformed here match the post-sweep readout state).
   const scan = await scanTrials({ home, now });
+  const gc = await gcExpiredTrials({ home, env, postEvent, now, scan }).catch(() => ({ cleared: 0, failed: 0 }));
   if (scan.live.length === 0 && gc.cleared === 0 && scan.malformed.length === 0) return;
   print("TRIALS (yaw-mcp try)");
   if (gc.cleared > 0) {

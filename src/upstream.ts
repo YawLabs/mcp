@@ -214,7 +214,15 @@ export class ActivationError extends Error {
  */
 function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
-  for (const [k, v] of Object.entries(env)) {
+  // Replace longest values first. When one secret value is a substring of
+  // another (e.g. a token and that same token with a suffix), a short-first
+  // pass can redact the inner value and leave a real-secret suffix exposed.
+  // Descending-by-length order guarantees the containing value is redacted
+  // whole before any of its substrings is considered.
+  const entries = Object.entries(env).sort(
+    ([, a], [, b]) => (typeof b === "string" ? b.length : 0) - (typeof a === "string" ? a.length : 0),
+  );
+  for (const [k, v] of entries) {
     if (typeof v !== "string" || v.length < 8) continue;
     // Skip values that are themselves an unresolved ${secret:...} literal.
     if (v.startsWith("${secret:") && v.endsWith("}")) continue;
@@ -500,19 +508,33 @@ async function connectToUpstreamOnce(
   try {
     const connection: UpstreamConnection = { status: "disconnected" } as UpstreamConnection;
 
-    // Detect unexpected disconnects
+    // Detect unexpected disconnects. Before the connection is marked ready
+    // below, status is still "disconnected", so a close in the initial fetch
+    // window can only mean the child died mid-init. fetchResources/Prompts
+    // swallow errors (they return []), so without a flag a child dying in
+    // that window would slip through and be returned as a live "connected"
+    // connection over a dead client. Record it and reject after the fetches.
+    let closedBeforeReady = false;
     client.onclose = () => {
       if (connection.status === "connected") {
         connection.status = "error";
         connection.error = "Upstream disconnected unexpectedly";
         log("warn", "Upstream disconnected unexpectedly", { namespace: config.namespace });
         if (onDisconnect) onDisconnect(config.namespace);
+      } else {
+        closedBeforeReady = true;
       }
     };
 
     const tools = await fetchToolsFromUpstream(client, config.namespace);
     const resources = await fetchResourcesFromUpstream(client, config.namespace);
     const prompts = await fetchPromptsFromUpstream(client, config.namespace);
+
+    // Client closed while we were still fetching capabilities -- treat it as
+    // a boot failure rather than returning a dead "connected" connection.
+    if (closedBeforeReady) {
+      throw new ActivationError(`Server "${config.namespace}" disconnected during initialization`, "protocol_error");
+    }
 
     // Populate the connection object (referenced by onclose handler above)
     Object.assign(connection, {

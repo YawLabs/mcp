@@ -83,6 +83,31 @@ export interface LoadConfigOptions {
 
 const DEFAULT_API_BASE = "https://yaw.sh/mcp";
 
+/** Filter a config array field down to its string entries. Warns when
+ *  non-string entries are dropped (mirroring the apiBase field, which warns
+ *  rather than silently swallowing an unusable value). Returns undefined
+ *  when the field isn't an array OR when every entry was invalid: a
+ *  non-empty array that filters to [] must fall THROUGH to the parent scope
+ *  rather than resolve to [] -- an empty allow-list means allow-all in
+ *  isAllowed, so a `servers:[123]` at a specific scope would otherwise
+ *  silently shadow a valid parent scope's allow-list with allow-all. A
+ *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
+function filterStringArray(raw: unknown, field: string, path: string, warnings: string[]): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const strings = raw.filter((v): v is string => typeof v === "string");
+  const dropped = raw.length - strings.length;
+  if (dropped > 0) {
+    warnings.push(
+      `${path}: '${field}' dropped ${dropped} non-string ${dropped === 1 ? "entry" : "entries"} -- only string namespaces are honored.`,
+    );
+  }
+  // All entries invalid (non-empty array that filtered to []): treat as
+  // unset so the resolver falls through to the parent scope instead of
+  // resolving to an empty (allow-all) list that shadows it.
+  if (strings.length === 0 && raw.length > 0) return undefined;
+  return strings;
+}
+
 async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]): Promise<LoadedConfigFile | null> {
   let raw: string;
   try {
@@ -131,12 +156,8 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
       apiBase = undefined;
     }
   }
-  const servers = Array.isArray(obj.servers)
-    ? obj.servers.filter((v): v is string => typeof v === "string")
-    : undefined;
-  const blocked = Array.isArray(obj.blocked)
-    ? obj.blocked.filter((v): v is string => typeof v === "string")
-    : undefined;
+  const servers = filterStringArray(obj.servers, "servers", path, warnings);
+  const blocked = filterStringArray(obj.blocked, "blocked", path, warnings);
   // Only a literal boolean is honored — a non-boolean (string "true",
   // number 1) is ignored rather than coerced, so a typo can't silently
   // flip on a privacy-sensitive nudge.
@@ -147,8 +168,12 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
       warnings.push(
         `${path}: 'token' found in a project-shared config file is IGNORED -- yaw-mcp never reads a token from this scope to avoid committing credentials. Move it to ${CONFIG_DIRNAME}/${LOCAL_CONFIG_FILENAME} (machine-local, gitignore by convention) or ~/${CONFIG_DIRNAME}/${CONFIG_FILENAME} (user-global).`,
       );
+      // Skip the perms check: a project-scope token is IGNORED (warned
+      // above) and lives in a committed file, so chmod-600 advice would be
+      // irrelevant noise -- the fix is to MOVE the token, not tighten perms.
+    } else {
+      await checkPermissions(path, warnings);
     }
-    await checkPermissions(path, warnings);
   }
 
   return { path, scope, version, token, apiBase, servers, blocked, installNudge };

@@ -132,6 +132,20 @@ describe("parseInstallArgs", () => {
     expect(r.ok).toBe(false);
   });
 
+  it("rejects --token that swallows a following flag as its value", () => {
+    // `--token --force` must not set token="--force"; the free-form flag
+    // guards mirror the enum-flag allow-list rejection.
+    const r = parseInstallArgs(["claude-code", "--token", "--force"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("--token requires a value");
+  });
+
+  it("rejects --project-dir that swallows a following flag as its value", () => {
+    const r = parseInstallArgs(["claude-code", "--project-dir", "--dry-run"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("--project-dir requires a value");
+  });
+
   it("rejects more than one positional", () => {
     const r = parseInstallArgs(["claude-code", "cursor"]);
     expect(r.ok).toBe(false);
@@ -310,6 +324,34 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
     expect(r.written).not.toContain(join(settingsDir, "settings.json"));
     // Contents untouched.
     expect(readFileSync(join(settingsDir, "settings.json"), "utf8")).toBe(initial);
+  });
+
+  it("warns (not silent) when settings.json is malformed and cannot be patched", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const malformed = "{ this is not json";
+    writeFileSync(join(settingsDir, "settings.json"), malformed);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      io: cap.io,
+    });
+    // Settings patch is best-effort, so the install itself still succeeds.
+    expect(r.exitCode).toBe(0);
+    // But the malformed file is surfaced, not silently skipped -- and the
+    // warning names the file + the by-hand fix.
+    expect(cap.stderr()).toMatch(/could not patch/);
+    expect(cap.stderr()).toMatch(/settings\.json/);
+    expect(cap.stderr()).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    // The malformed file is left untouched.
+    expect(readFileSync(join(settingsDir, "settings.json"), "utf8")).toBe(malformed);
+    // settings.json is not in the written list (no patch applied).
+    expect(r.written).not.toContain(join(settingsDir, "settings.json"));
   });
 
   it("does not touch settings.json for non-claude-code clients", async () => {
@@ -820,6 +862,36 @@ describe("runInstall — --dry-run", () => {
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
     expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
     expect(cap.stdout()).toMatch(/dry run/i);
+  });
+
+  it("does NOT write a .bak-* sibling when rotating an existing token under --dry-run", async () => {
+    // Seed an EXISTING token config so a real install would back it up
+    // (token-rotation path). Under --dry-run the backup write must be
+    // skipped entirely -- composeYawMcpConfig ran before the dry-run guard,
+    // so the guard alone doesn't prevent the backup; the dryRun flag does.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const cfgPath = join(synthHome, ".yaw-mcp", "config.json");
+    const originalBytes = JSON.stringify({ token: "mcp_pat_old_aaaa", version: 1 });
+    writeFileSync(cfgPath, originalBytes, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_new_bbbb",
+      dryRun: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    // No backup sibling created.
+    const backups = readdirSync(join(synthHome, ".yaw-mcp")).filter((f) => f.startsWith("config.json.bak-"));
+    expect(backups).toHaveLength(0);
+    // Original config untouched (dry-run writes nothing).
+    expect(readFileSync(cfgPath, "utf8")).toBe(originalBytes);
+    // The note still surfaces, phrased in the conditional.
+    expect(cap.stdout()).toMatch(/would be backed up/);
   });
 
   it("redacts the token in the printed ~/.yaw-mcp/config.json dump", async () => {

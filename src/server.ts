@@ -16,7 +16,7 @@ import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalyti
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
-import { type ComplianceGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
+import { type ComplianceGrade, classifyGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { loadYawMcpConfig, type Profile, profileAllows, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
@@ -143,6 +143,20 @@ export function resolveMinCompliance(): ComplianceGrade | null {
   return parseMinCompliance(process.env.YAW_MCP_MIN_COMPLIANCE);
 }
 
+// Human-readable reason a server is refused under a compliance floor.
+// passesMinCompliance returns a single boolean for both "unrecognized
+// grade" and "recognized grade below the minimum", so a naive message
+// would call an unrecognized "Pass" grade "below B". classifyGrade
+// splits the two so the refusal names the real problem. Ungraded servers
+// never reach here (they pass the floor).
+function complianceRefusalReason(grade: string | undefined | null, min: ComplianceGrade): string {
+  const c = classifyGrade(grade);
+  if (c.kind === "unrecognized") {
+    return `unrecognized compliance grade "${c.raw}" (not A-F); failing closed under YAW_MCP_MIN_COMPLIANCE=${min}`;
+  }
+  return `compliance grade ${grade ?? "unknown"} is below YAW_MCP_MIN_COMPLIANCE=${min}`;
+}
+
 // Opt-in auto-load. Set YAW_MCP_AUTO_LOAD=1 (or "true") to pre-activate the
 // top recurring pack from persisted history on startup — no LLM round
 // trip required. Default off: auto-activation normally rides on an
@@ -198,8 +212,14 @@ export function isRoutingFaultText(text: string): boolean {
  *  (array) wins over the single `server` form; empty when neither is
  *  usable. Exported so tests exercise the real resolver, not a copy. */
 export function resolveNamespaces(args: Record<string, unknown>): string[] {
-  if (Array.isArray(args.servers) && args.servers.length > 0) {
-    return args.servers as string[];
+  if (Array.isArray(args.servers)) {
+    // Filter to non-empty strings before trusting the array — the raw
+    // value is untyped tool input, so a `servers: [1, null, ""]` bag must
+    // not flow through as namespaces. Mirrors the `tools` filter in
+    // handleToolCall. A present-but-all-invalid array falls through to the
+    // single `server` form, and an all-invalid bag yields no namespaces.
+    const filtered = args.servers.filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (filtered.length > 0) return filtered;
   }
   if (typeof args.server === "string" && args.server) {
     return [args.server];
@@ -375,6 +395,15 @@ export class ConnectServer {
   // With this set: prewarm only disconnects when the namespace was NOT
   // claimed by an explicit activate while P1 was in flight.
   private prewarmNamespaces = new Set<string>();
+  // Slot reservations for the concurrent-server cap. A namespace is added
+  // here synchronously (before the first `await connectToUpstream`) once it
+  // clears the cap check, and removed when its activation settles. Counting
+  // these pending reservations alongside connected servers closes a TOCTOU
+  // gap: two DISTINCT namespaces activating concurrently would otherwise
+  // both pass the cap check against the same connected set and overshoot
+  // YAW_MCP_SERVER_CAP. Distinct from activationInflight (which dedupes
+  // repeat activations of the SAME namespace) — this bounds the TOTAL count.
+  private pendingActivations = new Set<string>();
   // Usage learning — nudges dispatch toward namespaces that have been
   // genuinely useful. Counts persist across yaw-mcp restarts via state.json
   // (see persistence.ts). YAW_MCP_DISABLE_PERSISTENCE=1 makes it session
@@ -1098,14 +1127,18 @@ export class ConnectServer {
     // the fresh routes. activateOne dedupes concurrent activations and
     // handles elicitation + retries.
     if (route?.deferred) {
-      progress?.(`Loading "${route.namespace}" on first tools/call…`);
-      const activation = await this.activateOne(route.namespace, progress);
+      // Capture the namespace before the re-snapshot below reassigns
+      // `route` (which can go undefined). The messages downstream must
+      // name the namespace we activated, matching the reconnect path.
+      const deferredNs = route.namespace;
+      progress?.(`Loading "${deferredNs}" on first tools/call…`);
+      const activation = await this.activateOne(deferredNs, progress);
       if (!activation.ok) {
         return {
           content: [
             {
               type: "text",
-              text: `Server "${route.namespace}" could not be loaded on first call: ${activation.message}`,
+              text: `Server "${deferredNs}" could not be loaded on first call: ${activation.message}`,
             },
           ],
           isError: true,
@@ -1125,7 +1158,7 @@ export class ConnectServer {
           content: [
             {
               type: "text",
-              text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after loading "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
+              text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after loading "${deferredNs}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
             },
           ],
           isError: true,
@@ -1714,7 +1747,14 @@ export class ConnectServer {
       let complianceLabel = "";
       if (server.complianceGrade) {
         if (minCompliance !== null && !passesMinCompliance(server.complianceGrade, minCompliance)) {
-          complianceLabel = ` (grade ${server.complianceGrade} — below YAW_MCP_MIN_COMPLIANCE=${minCompliance}, won't auto-activate)`;
+          // Distinguish an unrecognized grade string from a recognized
+          // grade that ranks below the floor — both fail the filter, but
+          // calling an unrecognized "Pass" grade "below B" is misleading.
+          const label =
+            classifyGrade(server.complianceGrade).kind === "unrecognized"
+              ? `unrecognized, won't auto-activate`
+              : `below YAW_MCP_MIN_COMPLIANCE=${minCompliance}, won't auto-activate`;
+          complianceLabel = ` (grade ${server.complianceGrade} — ${label})`;
         } else {
           complianceLabel = ` [${server.complianceGrade}]`;
         }
@@ -2000,15 +2040,46 @@ export class ConnectServer {
       };
     }
 
+    // Compliance floor gate. Refuse to spawn an upstream whose reported
+    // grade is below YAW_MCP_MIN_COMPLIANCE. Enforced here (not only in
+    // handleActivate) so EVERY activation path — dispatch, discover auto-
+    // warm, deferred lazy-activation, autoLoadRecurringPack — honors the
+    // floor before connectToUpstream. Ungraded servers pass (see
+    // passesMinCompliance). handleActivate keeps its own early check for
+    // the multi-namespace refusal message, but this is the real gate.
+    const minCompliance = resolveMinCompliance();
+    if (minCompliance !== null && !passesMinCompliance(serverConfig.complianceGrade, minCompliance)) {
+      return {
+        ok: false,
+        isChanged: false,
+        message: `Refused to load "${namespace}": ${complianceRefusalReason(serverConfig.complianceGrade, minCompliance)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`,
+      };
+    }
+
     // Concurrent-load cap. Connected servers count; error-state
     // connections don't, because they aren't contributing tools to
     // the LLM's context. We compute the slot list fresh here — it's
     // cheap (Map iteration) and guaranteed to reflect state after
     // any auto-unloads that fired between the check and this call.
+    // Pending reservations (pendingActivations) count too: a DIFFERENT
+    // namespace mid-`await connectToUpstream` occupies a slot even though
+    // its connection isn't in this.connections yet. Without this, two
+    // concurrent activations of distinct namespaces both pass the check
+    // against the same connected set and overshoot the cap (TOCTOU).
     const loadedSlots: LoadedSlot[] = [];
+    const counted = new Set<string>();
     for (const [ns, conn] of this.connections) {
       if (conn.status === "connected") {
         loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        counted.add(ns);
+      }
+    }
+    for (const ns of this.pendingActivations) {
+      // Skip self (not reserved yet) and anything already counted as a
+      // live connection, so a reservation never double-occupies a slot.
+      if (ns !== namespace && !counted.has(ns)) {
+        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        counted.add(ns);
       }
     }
     const capDecision = evaluateServerCap(namespace, loadedSlots, this.serverCap);
@@ -2021,88 +2092,100 @@ export class ConnectServer {
       };
     }
 
-    // Merge any session-elicited env over the server's configured env.
-    // Elicited values only apply inside this yaw-mcp process lifetime.
-    const elicited = this.elicitedEnv.get(namespace);
-    const effectiveConfig = elicited ? { ...serverConfig, env: { ...serverConfig.env, ...elicited } } : serverConfig;
+    // Reserve our slot synchronously — before the first `await` below — so
+    // a concurrent activation of a different namespace sees us in the count
+    // above. Released in the finally regardless of outcome; on success the
+    // namespace lives in this.connections (counted there), so there is no
+    // gap. maybeElicitAndRetry re-enters runActivateOne for the SAME
+    // namespace, which the Set makes idempotent (and evaluateServerCap
+    // treats a self-reservation as "already counts", so it never blocks).
+    this.pendingActivations.add(namespace);
+    try {
+      // Merge any session-elicited env over the server's configured env.
+      // Elicited values only apply inside this yaw-mcp process lifetime.
+      const elicited = this.elicitedEnv.get(namespace);
+      const effectiveConfig = elicited ? { ...serverConfig, env: { ...serverConfig.env, ...elicited } } : serverConfig;
 
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        progress?.(
-          attempt === 0 ? `Spawning "${namespace}" upstream…` : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
-        );
-        const connection = await connectToUpstream(
-          effectiveConfig,
-          this.onUpstreamDisconnect,
-          this.onUpstreamListChanged,
-        );
-        progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
-        this.connections.set(namespace, connection);
-        this.idleCallCounts.set(namespace, 0);
-        const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
-        this.toolCache.set(namespace, toolMeta);
-
-        // Persist the tool list so inactive servers can still be ranked
-        // on cold starts. Fire-and-forget — failure is non-fatal.
-        if (toolMeta.length > 0) {
-          reportTools(serverConfig.id, toolMeta).catch((err: Error) =>
-            log("warn", "reportTools failed", { namespace, error: err?.message }),
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          progress?.(
+            attempt === 0 ? `Spawning "${namespace}" upstream…` : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
           );
-        }
+          const connection = await connectToUpstream(
+            effectiveConfig,
+            this.onUpstreamDisconnect,
+            this.onUpstreamListChanged,
+          );
+          progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
+          this.connections.set(namespace, connection);
+          this.idleCallCounts.set(namespace, 0);
+          const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
+          this.toolCache.set(namespace, toolMeta);
 
-        const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
-        // Activation succeeded — clear any stale penalty so a recovered
-        // server isn't permanently demoted for a transient past failure.
-        this.activationFailures.delete(namespace);
-        return {
-          ok: true,
-          isChanged: true,
-          serverId: serverConfig.id,
-          message: `Loaded "${namespace}" — ${connection.tools.length} tools: ${toolNames}`,
-        };
-      } catch (err) {
-        lastError = err;
-        if (attempt === 0) {
-          const msg = err instanceof Error ? err.message : String(err);
-          log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
-          // Fixed 1s delay before the single retry. The expression `1000 * 2 ** attempt`
-          // evaluates to 1000ms here (attempt=0, 2^0=1) -- this is NOT exponential
-          // backoff; it is one fixed step.
-          await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+          // Persist the tool list so inactive servers can still be ranked
+          // on cold starts. Fire-and-forget — failure is non-fatal.
+          if (toolMeta.length > 0) {
+            reportTools(serverConfig.id, toolMeta).catch((err: Error) =>
+              log("warn", "reportTools failed", { namespace, error: err?.message }),
+            );
+          }
+
+          const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
+          // Activation succeeded — clear any stale penalty so a recovered
+          // server isn't permanently demoted for a transient past failure.
+          this.activationFailures.delete(namespace);
+          return {
+            ok: true,
+            isChanged: true,
+            serverId: serverConfig.id,
+            message: `Loaded "${namespace}" — ${connection.tools.length} tools: ${toolNames}`,
+          };
+        } catch (err) {
+          lastError = err;
+          if (attempt === 0) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
+            // Fixed 1s delay before the single retry. The expression `1000 * 2 ** attempt`
+            // evaluates to 1000ms here (attempt=0, 2^0=1) -- this is NOT exponential
+            // backoff; it is one fixed step.
+            await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+          }
         }
       }
+
+      // Before giving up, see if the failure looks like a missing credential
+      // and the client supports elicitation. If both hold, ask the user for
+      // the missing values and retry exactly once — one round-trip max.
+      //
+      // Guarded by the haven't-just-tried-this-credential check: if elicited
+      // values are already present for every detected name, don't ask twice.
+      const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress);
+      if (elicitedRetry) return elicitedRetry;
+
+      log("error", "Failed to activate upstream", {
+        namespace,
+        error: lastError instanceof Error ? lastError.message : String(lastError),
+      });
+
+      // Record the failure so dispatch down-ranks this namespace for a
+      // few minutes. The TTL is short enough that a fixed server (user
+      // edited dashboard env, for example) recovers quickly on next poll.
+      this.activationFailures.set(namespace, {
+        at: Date.now(),
+        message: lastError instanceof Error ? lastError.message : String(lastError),
+      });
+
+      // Prefer the ActivationError's message (includes stderr tail + category
+      // hint) over the raw SDK error. Falls back cleanly for transport errors.
+      const message =
+        lastError instanceof ActivationError
+          ? `Failed to load "${namespace}": ${lastError.message}`
+          : `Failed to load "${namespace}": ${lastError instanceof Error ? lastError.message : String(lastError)}`;
+      return { ok: false, isChanged: false, message };
+    } finally {
+      this.pendingActivations.delete(namespace);
     }
-
-    // Before giving up, see if the failure looks like a missing credential
-    // and the client supports elicitation. If both hold, ask the user for
-    // the missing values and retry exactly once — one round-trip max.
-    //
-    // Guarded by the haven't-just-tried-this-credential check: if elicited
-    // values are already present for every detected name, don't ask twice.
-    const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress);
-    if (elicitedRetry) return elicitedRetry;
-
-    log("error", "Failed to activate upstream", {
-      namespace,
-      error: lastError instanceof Error ? lastError.message : String(lastError),
-    });
-
-    // Record the failure so dispatch down-ranks this namespace for a
-    // few minutes. The TTL is short enough that a fixed server (user
-    // edited dashboard env, for example) recovers quickly on next poll.
-    this.activationFailures.set(namespace, {
-      at: Date.now(),
-      message: lastError instanceof Error ? lastError.message : String(lastError),
-    });
-
-    // Prefer the ActivationError's message (includes stderr tail + category
-    // hint) over the raw SDK error. Falls back cleanly for transport errors.
-    const message =
-      lastError instanceof ActivationError
-        ? `Failed to load "${namespace}": ${lastError.message}`
-        : `Failed to load "${namespace}": ${lastError instanceof Error ? lastError.message : String(lastError)}`;
-    return { ok: false, isChanged: false, message };
   }
 
   // If the activation error names a missing credential (e.g. "GITHUB_TOKEN
@@ -2258,8 +2341,7 @@ export class ConnectServer {
       if (minCompliance !== null) {
         const cfg = this.config?.servers.find((s) => s.namespace === namespace);
         if (cfg && !passesMinCompliance(cfg.complianceGrade, minCompliance)) {
-          const grade = cfg.complianceGrade ?? "unknown";
-          const message = `Refused to load "${namespace}": compliance grade ${grade} is below YAW_MCP_MIN_COMPLIANCE=${minCompliance}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
+          const message = `Refused to load "${namespace}": ${complianceRefusalReason(cfg.complianceGrade, minCompliance)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
           results.push(message);
           // Deliberately an error even when OTHER namespaces load fine
           // (unlike cap refusals below): a compliance floor is a hard
@@ -3658,15 +3740,21 @@ export class ConnectServer {
           // body (the common MCP self-validation pattern, which carries no
           // code tag). When the failing step consumed $ref data from earlier
           // steps, the bad input likely came from a producer — split the blame
-          // (0.5 each) instead of full-blaming this server. Other errors are
-          // this server's own failure (0.0).
+          // instead of full-blaming this server. Other errors are this
+          // server's own failure (0.0).
           const inputShaped = errText.includes("[code=-32602]") || classifyError(errText) === "validation_error";
           const deps = collectRefDeps(step.args);
           if (inputShaped && deps.length > 0) {
+            // The consumer failed and was never booked, so record its half
+            // credit as a fresh dispatch. Each producer, however, ALREADY
+            // booked its own dispatch when its step succeeded (recordOutcome
+            // below) — booking it again here would double-count one real
+            // dispatch (dispatched=2). Dock its earned credit with a
+            // delta-only adjustment instead, leaving the dispatch count intact.
             this.learning.recordOutcome(stepNs, 0.5);
             for (const dep of deps) {
               const depNs = stepNamespaces.get(dep);
-              if (depNs) this.learning.recordOutcome(depNs, 0.5);
+              if (depNs) this.learning.adjustSucceeded(depNs, -0.5);
             }
           } else {
             this.learning.recordOutcome(stepNs, 0);

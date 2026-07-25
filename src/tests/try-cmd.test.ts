@@ -433,6 +433,29 @@ describe("runTry — client config perms (POSIX)", () => {
     // Pre-existing file: we must not silently re-perm the user's file to 0600.
     expect(statSync(clientPath).mode & 0o777).not.toBe(0o600);
   });
+
+  posixOnly("tightens perms on an EMPTY pre-existing client file", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    // File exists but is empty -> `try` materializes its content, so it
+    // counts as freshly created (the perms decision keys off content, not
+    // mere existence). It must not be left at the born-0644.
+    writeFileSync(clientPath, "", { mode: 0o644 });
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+  });
 });
 
 describe("runTry — unparseable ttl (programmatic callers)", () => {

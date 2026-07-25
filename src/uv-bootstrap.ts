@@ -181,19 +181,20 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
     // non-user-controlled. Both derive from cacheDir() + fixed
     // ("uv"/UV_VERSION/archiveName/extract-<pid>-<ts>) segments -- no
     // user input flows in. The PowerShell -Command string below
-    // single-quote-escapes them (' -> ''), which is safe ONLY for
-    // single-line, single-quote-free inputs. A newline or an
-    // unescapable construct would break out of the quoted literal, so
-    // we hard-validate here and throw rather than build a command we
-    // can't prove safe. If a future change ever routes user input into
-    // either path, this guard must be revisited (proper arg-array
-    // escaping), not relaxed.
+    // single-quote-escapes them (' -> ''), which correctly handles any
+    // apostrophe (a single-quoted PS literal treats only ' specially, and
+    // doubling it is the canonical escape -- so a username like O'Brien is
+    // fine). A CR/LF is the one construct that could still break the
+    // -Command parse across the process boundary, so we hard-validate
+    // against those and throw rather than build a command we can't prove
+    // safe. If a future change ever routes user input into either path,
+    // this guard must be revisited (proper arg-array escaping), not relaxed.
     for (const [label, p] of [
       ["archivePath", archivePath],
       ["destDir", destDir],
     ] as const) {
-      if (/['\r\n]/.test(p)) {
-        throw new Error(`Refusing to extract uv archive: ${label} contains a quote or newline (${JSON.stringify(p)})`);
+      if (/[\r\n]/.test(p)) {
+        throw new Error(`Refusing to extract uv archive: ${label} contains a newline (${JSON.stringify(p)})`);
       }
     }
     await runCommand("powershell.exe", [

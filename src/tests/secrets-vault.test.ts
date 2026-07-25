@@ -237,6 +237,30 @@ describe("secrets-vault: set/get/list/remove", () => {
     await expect(loadVault(path)).rejects.toThrow(/vault corrupt at entry bad/);
   });
 
+  it("loadVault rejects a vault whose salt does not decode to SALT_LEN bytes", async () => {
+    const path = join(synthHome, ".yaw-mcp", "secrets.json");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    // A string salt that decodes to 8 bytes, not 16 -- it would derive the
+    // wrong key and fail every decrypt with an opaque auth-tag error.
+    const badSalt = { version: 1, salt: Buffer.from("tooshort").toString("base64"), entries: {} };
+    writeFileSync(path, `${JSON.stringify(badSalt)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/corrupt: salt/);
+  });
+
+  it("loadVault rejects a NEWER schema version but still loads the current one", async () => {
+    const path = join(synthHome, ".yaw-mcp", "secrets.json");
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const salt = generateSalt().toString("base64");
+    // A schema newer than this build understands is refused loudly.
+    writeFileSync(path, `${JSON.stringify({ version: 99, salt, entries: {} })}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/newer/i);
+    // Equal (current) version still loads -- forward reads stay compatible.
+    writeFileSync(path, `${JSON.stringify({ version: 1, salt, entries: {} })}\n`);
+    await expect(loadVault(path)).resolves.not.toBeNull();
+  });
+
   it("loadVault preserves a valid check field round-trip", async () => {
     let vault = newVault();
     const key = await unlock(vault, "hunter2");

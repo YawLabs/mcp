@@ -367,6 +367,34 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).toContain(shortVal);
     expect(err!.stderrTail).not.toContain("***SHORT***");
   });
+
+  it("redacts the longest secret whole when one value is a substring of another", async () => {
+    // INNER is a prefix of OUTER. If the redactor replaced values in
+    // insertion order (short-first), INNER would be redacted inside OUTER
+    // first, leaving OUTER's real "_SUFFIX_9999" tail exposed. Longest-first
+    // ordering must redact OUTER whole instead.
+    const innerValue = "ghp_AbCdEfGh12345678";
+    const outerValue = `${innerValue}_SUFFIX_9999`;
+    const config = makeLocalConfig({ env: { INNER_TOKEN: innerValue, OUTER_TOKEN: outerValue } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`authentication failed: ${outerValue}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    // Neither raw value, nor OUTER's tail, may survive.
+    expect(err!.stderrTail).not.toContain(outerValue);
+    expect(err!.stderrTail).not.toContain("_SUFFIX_9999");
+    expect(err!.stderrTail).toContain("***OUTER_TOKEN***");
+  });
 });
 
 // ---------------------------------------------------------------------------
