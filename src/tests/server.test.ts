@@ -1566,6 +1566,59 @@ describe("ConnectServer", () => {
       const result = await priv.handleActivate(["big"]);
       expect(result.isError).toBeUndefined();
     });
+
+    it("two distinct namespaces activating concurrently do not overshoot the cap", async () => {
+      // TOCTOU guard: the existing cap tests pre-seed connections
+      // synchronously, so they never exercise the pendingActivations
+      // reservation. Here "a" is held mid-`await connectToUpstream` (its
+      // connect promise stays pending), so its slot only exists as a
+      // reservation in pendingActivations — not yet in this.connections.
+      // With cap=1, "b" racing the check must see that reservation and be
+      // refused. Without the pendingActivations counting (server.ts
+      // 2077-2084) both would pass the check against the same empty
+      // connected set and connect, overshooting the cap.
+      const priv = getPrivate(server);
+      priv.serverCap = 1;
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "a" }),
+        makeServerConfig({ id: "2", namespace: "b" }),
+      ]);
+
+      // Hold "a"'s upstream connect open so its reservation sits in
+      // pendingActivations while "b" races the cap check.
+      let resolveA: (conn: UpstreamConnection) => void = () => {};
+      const aPromise = new Promise<UpstreamConnection>((r) => {
+        resolveA = r;
+      });
+      vi.mocked(connectToUpstream).mockReturnValueOnce(aPromise);
+
+      const pA = priv.activateOne("a");
+      // "a" reserved its slot synchronously — before the first await —
+      // even though no connection exists in the map yet.
+      expect(priv.pendingActivations.has("a")).toBe(true);
+      expect(priv.connections.has("a")).toBe(false);
+
+      // "b" races against a full cap (the pending reservation occupies the
+      // single slot) and must be refused as capped.
+      const rB = await priv.activateOne("b");
+      expect(rB.ok).toBe(false);
+      expect(rB.capped).toBe(true);
+      // "b" never spawned an upstream — only "a"'s connect fired.
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+      expect(priv.connections.has("b")).toBe(false);
+
+      // Let "a" finish; it claims the one and only slot.
+      resolveA(makeConnection("a", ["t"]));
+      const rA = await pA;
+      expect(rA.ok).toBe(true);
+      expect(priv.connections.has("a")).toBe(true);
+
+      // Total connected never exceeded the cap of 1.
+      const connectedCount = [...priv.connections.values()].filter(
+        (c: UpstreamConnection) => c.status === "connected",
+      ).length;
+      expect(connectedCount).toBe(1);
+    });
   });
 
   describe("handleReadTool", () => {
@@ -2380,6 +2433,78 @@ describe("activateOne dedup", () => {
     vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["x"]));
     const r2 = await priv.activateOne("gh");
     expect(r2.ok).toBe(true);
+  });
+});
+
+describe("exec step-level split-blame attribution", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("splits blame when a $ref-consuming step fails with a validation error", async () => {
+    // A two-step pipeline across DISTINCT namespaces: producer "prod"
+    // succeeds and feeds its output into consumer "cons" via {$ref:"p"}.
+    // "cons" then fails with an input-shaped (validation) error. The
+    // split-blame logic (server.ts 3745-3758) must:
+    //   - leave the producer's dispatch count at 1 (it already booked its
+    //     own dispatch on success) and only DOCK its earned credit by 0.5
+    //     via delta-only adjustSucceeded — NOT re-book a fresh dispatch.
+    //   - book the failing consumer its own half-credit recordOutcome(0.5).
+    // A revert of the producer line to recordOutcome(depNs, 0.5) would
+    // push prod.dispatched to 2 (and succeeded to 1.5), failing the
+    // assertions below.
+    const priv = getPrivate(server);
+
+    const prodConn = makeConnection("prod", ["make"]);
+    // Plain non-JSON, non-error-shaped success -> computeOutcomeReward 1.0.
+    prodConn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "prod-ok" }] });
+
+    const consConn = makeConnection("cons", ["use"]);
+    // Upstream self-validation failure: structured isError body carrying
+    // the -32602 code, so classifyError -> validation_error (inputShaped).
+    consConn.client.callTool = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "MCP error -32602: Input validation error" }],
+      isError: true,
+    });
+
+    priv.connections.set("prod", prodConn);
+    priv.connections.set("cons", consConn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "prod" }), makeServerConfig({ namespace: "cons" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [
+        { id: "p", tool: "prod_make", args: {} },
+        { id: "c", tool: "cons_use", args: { x: { $ref: "p" } } },
+      ],
+      return: "c",
+    });
+
+    // The pipeline fails on the consumer step and surfaces the error.
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.failedStep).toBe("c");
+    expect(parsed.error).toContain("-32602");
+
+    // Producer: dispatch booked ONCE on its success, credit docked 0.5 by
+    // the delta-only adjustSucceeded. A recordOutcome revert would make
+    // dispatched=2 / succeeded=1.5 and fail here.
+    const prod = priv.learning.get("prod");
+    expect(prod?.dispatched).toBe(1);
+    expect(prod?.succeeded).toBeCloseTo(0.5, 5);
+
+    // Consumer: booked its own fresh half-credit dispatch.
+    const cons = priv.learning.get("cons");
+    expect(cons?.dispatched).toBe(1);
+    expect(cons?.succeeded).toBeCloseTo(0.5, 5);
   });
 });
 

@@ -483,6 +483,65 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
     expect(existsSync(vaultPath(home))).toBe(false);
   });
 
+  it("a valid first entry then ^C at the Confirm prompt cancels with 130 -- no vault is written", async () => {
+    // The existing ^C-on-creation coverage cancels at the FIRST ("Vault
+    // passphrase:") prompt. This one accepts a valid first entry and hits ^C
+    // at the SECOND ("Confirm passphrase:") prompt: resolvePassphrase must
+    // still hand back a cancellation (exit 130), distinct from a mismatch
+    // (which re-prompts) and from a first-prompt cancel.
+    const ETX = String.fromCharCode(3);
+    const stdin = new FakeTTYStdin(["good-passphrase-xyz\r", ETX]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    // The cancel landed at the confirm prompt, so that prompt was reached.
+    expect(promptText()).toContain("Confirm passphrase: ");
+    expect(errText().toLowerCase()).toContain("cancelled");
+    // Nothing committed to disk.
+    expect(existsSync(vaultPath(home))).toBe(false);
+  });
+
+  it("a mismatch on the first confirm attempt then a matching pair on the second CREATES the vault", async () => {
+    // attempt 0: "wrong-a" != "wrong-b" -> "did not match", re-prompt.
+    // attempt 1: the pair agrees -> accepted (MAX_PASSPHRASE_PROMPTS is 3, so
+    // the retry is well within budget). Value comes from --value, so no third
+    // prompt. Existing coverage only exercised match-first and all-mismatch.
+    const stdin = new FakeTTYStdin(["wrong-a\r", "wrong-b\r", "good-passphrase-xyz\r", "good-passphrase-xyz\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // The user saw the mismatch feedback before the accepted retry.
+    expect(promptText()).toContain("did not match");
+
+    // The vault was created under the SECOND (matching) passphrase, so the
+    // secret is retrievable with it.
+    lock();
+    io.out.mockReset();
+    const got = await runSecrets(
+      { action: "get", name: "github", passphrase: "good-passphrase-xyz", home, json: true },
+      io,
+    );
+    expect(got.exitCode).toBe(0);
+    const okLine = io.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    expect(okLine && JSON.parse(okLine).value).toBe("ghp_abc");
+  });
+
   it("the env-var passphrase path stays single-shot (no confirm prompt on creation)", async () => {
     process.env.YAW_MCP_VAULT_PASSPHRASE = "env-passphrase-xyz";
     const stdin = new FakeTTYStdin([]);

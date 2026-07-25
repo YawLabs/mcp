@@ -354,6 +354,45 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
     expect(r.written).not.toContain(join(settingsDir, "settings.json"));
   });
 
+  // Distinct from the malformed (unparseable-bytes) case above: this file
+  // parses cleanly as JSON but is NOT a plain object (array or null). The
+  // parse succeeds, so the catch branch never fires; instead the non-object
+  // branch returns malformedReason "not a JSON object". runInstall must still
+  // warn ("could not patch" + "(not a JSON object)") and skip the patch
+  // rather than throw or silently no-op.
+  it.each([
+    ["array", "[]"],
+    ["null", "null"],
+  ])("warns and skips the patch when settings.json is valid JSON but not an object (%s)", async (_label, contents) => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, "settings.json"), contents);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      io: cap.io,
+    });
+    // Settings patch is best-effort, so the install itself still succeeds
+    // (no throw, exit 0).
+    expect(r.exitCode).toBe(0);
+    // The skip is surfaced, not silent -- warning names the by-hand fix and
+    // the specific reason for THIS branch ("not a JSON object"), which
+    // distinguishes it from the unparseable-bytes malformed case.
+    expect(cap.stderr()).toMatch(/could not patch/);
+    expect(cap.stderr()).toContain("(not a JSON object)");
+    expect(cap.stderr()).toMatch(/settings\.json/);
+    expect(cap.stderr()).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    // The non-object file is left byte-for-byte untouched.
+    expect(readFileSync(join(settingsDir, "settings.json"), "utf8")).toBe(contents);
+    // settings.json is not in the written list (no patch applied).
+    expect(r.written).not.toContain(join(settingsDir, "settings.json"));
+  });
+
   it("does not touch settings.json for non-claude-code clients", async () => {
     const cap = captureIo();
     const r = await runInstall({

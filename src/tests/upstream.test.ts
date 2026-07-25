@@ -64,6 +64,12 @@ vi.mock("../uv-bootstrap.js", () => ({
 const _sdkBehavior = {
   clientConnect: (): Promise<void> => Promise.reject(new Error("connect not configured")),
   clientClose: (): Promise<void> => Promise.resolve(),
+  // listResources/listPrompts route through these hooks so a test can override
+  // one to fire client.onclose mid-fetch (the closedBeforeReady path). Both
+  // default to the empty-inventory shape the connect-flow tests rely on; the
+  // MockClient instance is passed so an override can reach its onclose handler.
+  clientListResources: (_client: any): Promise<any> => Promise.resolve({ resources: [] }),
+  clientListPrompts: (_client: any): Promise<any> => Promise.resolve({ prompts: [] }),
   stderrEmitter: null as EventEmitter | null,
   // The {command,args,env} the stdio transport was last constructed with --
   // lets a test assert what actually gets spawned (e.g. the oam-rewritten cmd).
@@ -75,18 +81,23 @@ const _sdkBehavior = {
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
   function MockClient() {
-    return {
+    const client: any = {
       connect: () => _sdkBehavior.clientConnect(),
       close: () => _sdkBehavior.clientClose(),
       // listTools succeeds with an empty set so tests can drive the connect
       // flow to a SUCCESSFUL completion (the boot-probe fallback tests need
       // the second attempt to come up healthy).
       listTools: () => Promise.resolve({ tools: [] }),
-      listResources: () => Promise.resolve({ resources: [] }),
-      listPrompts: () => Promise.resolve({ prompts: [] }),
+      // listResources/listPrompts go through _sdkBehavior so a test can make
+      // one fire client.onclose before resolving (closedBeforeReady path).
+      // The captured `client` is the same object connectToUpstream assigns
+      // onclose to, so the override can reach the live handler.
+      listResources: () => _sdkBehavior.clientListResources(client),
+      listPrompts: () => _sdkBehavior.clientListPrompts(client),
       onclose: undefined as (() => void) | undefined,
       setNotificationHandler: () => {},
     };
+    return client;
   }
   return { Client: MockClient };
 });
@@ -789,5 +800,83 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
     expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// closedBeforeReady -- the child dies mid-init. initialize + tools/list
+// succeed, then client.onclose fires DURING the resources/prompts fetch
+// window while connection.status is still "disconnected". The post-fetch
+// guard must reject with an ActivationError ("disconnected during
+// initialization", protocol_error) rather than return a dead "connected"
+// connection over an already-closed client (fetchResources/Prompts swallow
+// errors, so without the closedBeforeReady flag the dead child would slip
+// through). See upstream.ts:517-537.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream closedBeforeReady", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    // Handshake succeeds so the flow reaches the capability-fetch window.
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.stdioConstructions = [];
+    _sdkBehavior.lastStdioArgs = null;
+    vi.mocked(resolveOamSpawn).mockReset();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+    // Restore the default empty-inventory resolvers so a mid-fetch onclose
+    // override can never leak into another suite.
+    _sdkBehavior.clientListResources = (_client: any) => Promise.resolve({ resources: [] });
+    _sdkBehavior.clientListPrompts = (_client: any) => Promise.resolve({ prompts: [] });
+  });
+
+  it("rejects with protocol_error when onclose fires during the resources fetch (status still 'disconnected')", async () => {
+    // The child dies while listResources is in flight. onclose runs with
+    // connection.status still "disconnected", so closedBeforeReady flips true
+    // and the guard after the three fetches rejects.
+    _sdkBehavior.clientListResources = (client: any) => {
+      client.onclose?.();
+      return Promise.resolve({ resources: [] });
+    };
+
+    const config = makeLocalConfig();
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.message).toContain("disconnected during initialization");
+    expect(err!.message).toContain("test"); // namespaced in the message
+    expect(err!.category).toBe("protocol_error");
+  });
+
+  it("rejects with protocol_error when onclose fires during the prompts fetch (last fetch in the window)", async () => {
+    // Same failure mode, but the close lands on the final fetch of the
+    // initialization window rather than the first.
+    _sdkBehavior.clientListPrompts = (client: any) => {
+      client.onclose?.();
+      return Promise.resolve({ prompts: [] });
+    };
+
+    const config = makeLocalConfig();
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.message).toContain("disconnected during initialization");
+    expect(err!.category).toBe("protocol_error");
   });
 });

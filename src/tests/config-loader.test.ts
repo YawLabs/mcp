@@ -273,6 +273,38 @@ describe("loadYawMcpConfig — non-string servers/blocked entries (fix F1)", () 
   });
 });
 
+// Gap 15: filterStringArray runs on the BLOCKED field too (config-loader.ts:160).
+// Mirrors the servers tests above, but blocked merges via unionBlocked -- so
+// the all-invalid case must leave r.blocked UNDEFINED (not [] / an empty
+// deny-list), which is what proves the field fell through rather than
+// resolving to an empty union.
+describe("loadYawMcpConfig — non-string blocked entries (fix F1, blocked field)", () => {
+  it("keeps valid string entries and warns about the dropped ones", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: ["slack", 42] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blocked).toEqual(["slack"]);
+    expect(r.warnings.some((w) => w.includes("'blocked' dropped 1 non-string entry"))).toBe(true);
+  });
+
+  it("an all-invalid blocked array resolves to undefined, not an empty deny-list", async () => {
+    // Only non-string entries. filterStringArray returns undefined (not []),
+    // so unionBlocked stays untouched and r.blocked is undefined -- a []
+    // here would be a spurious "empty deny-list" resolved from junk input.
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: [123] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blocked).toBeUndefined();
+    expect(r.warnings.some((w) => w.includes("'blocked' dropped"))).toBe(true);
+  });
+
+  it("a genuinely empty blocked array is preserved (explicit, not all-invalid)", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { blocked: [] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blocked).toEqual([]);
+    // No drop warning for a legitimately empty array.
+    expect(r.warnings.some((w) => w.includes("'blocked' dropped"))).toBe(false);
+  });
+});
+
 describe("loadYawMcpConfig — walk-up project discovery", () => {
   it("finds .yaw-mcp/ in a parent directory", async () => {
     writeConfig(synthCwd, CONFIG_FILENAME, { apiBase: "https://parent.example" });
