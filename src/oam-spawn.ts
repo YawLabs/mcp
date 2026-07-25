@@ -174,6 +174,10 @@ export function rewriteForOam(
   if (command === "node") {
     const [entry, ...rest] = args;
     if (!entry) return { command, args };
+    // A leading-dash arg is a node flag (--enable-source-maps, --inspect, ...),
+    // not the entry file; oam would eat it and mis-launch. Stay on node --
+    // mirrors the npx flag guard below.
+    if (entry.startsWith("-")) return { command, args };
     return toOam(entry, rest);
   }
 

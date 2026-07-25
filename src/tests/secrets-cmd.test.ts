@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
@@ -392,6 +392,173 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
     expect(r.exitCode).toBe(130);
     const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(errOutput.toLowerCase()).toContain("cancelled");
+  });
+});
+
+// -----------------------------------------------------------------------
+// Vault CREATION on first set confirms the passphrase twice. A vault with
+// no check marker accepts ANY passphrase at unlock, so there is no later
+// "wrong passphrase" guard to catch a first-set typo -- the confirm is the
+// only line of defense against establishing an unrecoverable passphrase.
+// The env-var path stays single-shot.
+// -----------------------------------------------------------------------
+
+describe("runSecrets set -- confirm-twice on vault creation", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  const promptText = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    lock();
+  });
+
+  it("matching entries create the vault, and the second (Confirm) prompt is shown", async () => {
+    // Two matching passphrase entries; the value comes from --value so no
+    // third prompt is needed.
+    const stdin = new FakeTTYStdin(["super-secret-pass\r", "super-secret-pass\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(promptText()).toContain("Confirm passphrase: ");
+
+    // The vault unlocks under the confirmed passphrase.
+    lock();
+    const got = await runSecrets(
+      { action: "get", name: "github", passphrase: "super-secret-pass", home, json: true },
+      io,
+    );
+    expect(got.exitCode).toBe(0);
+  });
+
+  it("a first-set typo (the two entries disagree) is rejected -- no vault is written", async () => {
+    // Three disagreeing pairs exhaust the re-prompt budget, so no passphrase
+    // is ever accepted. Without the confirm, the first typo would have BECOME
+    // the vault passphrase and locked the user out permanently.
+    const stdin = new FakeTTYStdin([
+      "typo-aaa\r",
+      "typo-bbb\r",
+      "typo-aaa\r",
+      "typo-bbb\r",
+      "typo-aaa\r",
+      "typo-bbb\r",
+    ]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText().toLowerCase()).toMatch(/passphrase required/);
+    expect(promptText()).toContain("did not match");
+    expect(existsSync(vaultPath(home))).toBe(false);
+  });
+
+  it("a valid first entry then ^C at the Confirm prompt cancels with 130 -- no vault is written", async () => {
+    // The existing ^C-on-creation coverage cancels at the FIRST ("Vault
+    // passphrase:") prompt. This one accepts a valid first entry and hits ^C
+    // at the SECOND ("Confirm passphrase:") prompt: resolvePassphrase must
+    // still hand back a cancellation (exit 130), distinct from a mismatch
+    // (which re-prompts) and from a first-prompt cancel.
+    const ETX = String.fromCharCode(3);
+    const stdin = new FakeTTYStdin(["good-passphrase-xyz\r", ETX]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    // The cancel landed at the confirm prompt, so that prompt was reached.
+    expect(promptText()).toContain("Confirm passphrase: ");
+    expect(errText().toLowerCase()).toContain("cancelled");
+    // Nothing committed to disk.
+    expect(existsSync(vaultPath(home))).toBe(false);
+  });
+
+  it("a mismatch on the first confirm attempt then a matching pair on the second CREATES the vault", async () => {
+    // attempt 0: "wrong-a" != "wrong-b" -> "did not match", re-prompt.
+    // attempt 1: the pair agrees -> accepted (MAX_PASSPHRASE_PROMPTS is 3, so
+    // the retry is well within budget). Value comes from --value, so no third
+    // prompt. Existing coverage only exercised match-first and all-mismatch.
+    const stdin = new FakeTTYStdin(["wrong-a\r", "wrong-b\r", "good-passphrase-xyz\r", "good-passphrase-xyz\r"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // The user saw the mismatch feedback before the accepted retry.
+    expect(promptText()).toContain("did not match");
+
+    // The vault was created under the SECOND (matching) passphrase, so the
+    // secret is retrievable with it.
+    lock();
+    io.out.mockReset();
+    const got = await runSecrets(
+      { action: "get", name: "github", passphrase: "good-passphrase-xyz", home, json: true },
+      io,
+    );
+    expect(got.exitCode).toBe(0);
+    const okLine = io.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    expect(okLine && JSON.parse(okLine).value).toBe("ghp_abc");
+  });
+
+  it("the env-var passphrase path stays single-shot (no confirm prompt on creation)", async () => {
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "env-passphrase-xyz";
+    const stdin = new FakeTTYStdin([]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        value: "ghp_abc",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // The env var supplied the passphrase -- no prompt of either kind.
+    expect(promptText()).not.toContain("Confirm passphrase: ");
+    expect(promptText()).not.toContain("Vault passphrase: ");
   });
 });
 

@@ -412,9 +412,9 @@ describe("runTry — client config perms (POSIX)", () => {
     expect(statSync(clientPath).mode & 0o777).toBe(0o600);
   });
 
-  posixOnly("does NOT tighten perms on a pre-existing user-owned client file", async () => {
+  posixOnly("tightens perms when writing an inline secret into a pre-existing user file", async () => {
     const clientPath = join(synthHome, ".claude.json");
-    // User's own file, group/other-readable.
+    // User's own content-bearing file, group/other-readable.
     writeFileSync(clientPath, JSON.stringify({ mcpServers: {} }), { mode: 0o644 });
     const cap = captureIO();
     const r = await runTry({
@@ -430,7 +430,61 @@ describe("runTry — client config perms (POSIX)", () => {
       postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
-    // Pre-existing file: we must not silently re-perm the user's file to 0600.
+    // We wrote a plaintext secret into the user's file, so it must be
+    // owner-only -- protecting the credential we injected wins over leaving
+    // the pre-existing perms as-is.
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+  });
+
+  posixOnly("tightens perms on an EMPTY pre-existing client file", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    // File exists but is empty -> `try` materializes its content, so it
+    // counts as freshly created (the perms decision keys off content, not
+    // mere existence). It must not be left at the born-0644.
+    writeFileSync(clientPath, "", { mode: 0o644 });
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+  });
+
+  posixOnly("does NOT tighten perms when the trial entry carries no inline secret", async () => {
+    // Negative arm of the perms contract: SAMPLE has requiredEnvVars:[] and no
+    // --env override, so the trial entry's env resolves to undefined
+    // (entryHasSecrets === false) and tightenPerms === false. There is nothing
+    // secret in the written config, so `try` must NOT force 0600 -- the file is
+    // left at the umask default (typically 0644). Pins the false branch so a
+    // regression that unconditionally chmods every written config to 0600 is
+    // caught (the three tests above only cover the secret-bearing true arm).
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    const clientPath = join(synthHome, ".claude.json");
+    expect(existsSync(clientPath)).toBe(true);
+    // No inline secret was written, so the config keeps its umask-default
+    // perms rather than being tightened to owner-only.
     expect(statSync(clientPath).mode & 0o777).not.toBe(0o600);
   });
 });

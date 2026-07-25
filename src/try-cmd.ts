@@ -41,6 +41,7 @@ import { mergeClientConfig } from "./install-cmd.js";
 import {
   buildLaunchEntry,
   CURRENT_OS,
+  INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
@@ -179,8 +180,13 @@ export function parseTryArgs(
     switch (a) {
       case "--client": {
         const v = next();
-        if (!v || !["claude-code", "claude-desktop", "cursor", "vscode"].includes(v)) {
-          return { ok: false, error: "--client requires claude-code|claude-desktop|cursor|vscode" };
+        // Validate against the canonical client set so a new INSTALL_TARGETS
+        // entry is accepted here without touching this literal.
+        if (!v || !INSTALL_TARGETS.some((t) => t.clientId === v)) {
+          return {
+            ok: false,
+            error: `--client requires ${INSTALL_TARGETS.map((t) => t.clientId).join("|")}`,
+          };
         }
         opts.clientId = v as InstallClientId;
         break;
@@ -401,11 +407,17 @@ async function autoDetectClient(opts: {
     if (!p.unavailable && p.exists && !p.malformed) return p.clientId;
   }
   // Second: any client that's available on this OS (config file not
-  // yet created -- we'll create it).
+  // yet created -- we'll create it). claude-code is availableOn every
+  // InstallOS (see INSTALL_TARGETS), so it is always present and never
+  // `unavailable` -- this loop always returns it (first in probe order)
+  // when nothing else matches, which IS the claude-code fallback.
   for (const p of probes) {
     if (!p.unavailable) return p.clientId;
   }
-  return "claude-code";
+  // Unreachable: the loop above always returns (claude-code is available on
+  // every OS). Throw rather than return a redundant literal so a future
+  // INSTALL_TARGETS change that breaks the invariant fails loud.
+  throw new Error("autoDetectClient: no available install client for this OS");
 }
 
 export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult> {
@@ -554,10 +566,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   };
 
   // Step 6: read existing client config (if any).
-  // Track whether the client file pre-existed: if it did, it is the user's
-  // own file and we must NOT tighten its perms (step 7's chmod is scoped to
-  // the freshly-created case). If it did not, `try` is creating it and a
-  // best-effort 0600 is appropriate when the entry carries secrets inline.
+  // Track whether the client file pre-existed so we know whether to read it
+  // below. NOTE: step 7's perms-tightening keys off whether the file had
+  // CONTENT (`rawClient`), not mere existence -- an empty-but-existing file
+  // is materialized fresh here, so it should be born 0600 like a created
+  // file rather than left at the user's 0644. A pre-existing file WITH
+  // content is the user's own and its perms are left untouched.
   // We also retain the RAW text so the write below can route through the
   // comment-preserving `editJsoncEntry` -- a read-modify-write through
   // JSON.parse + JSON.stringify drops every `//` and `/* */` the user has
@@ -641,16 +655,25 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 1, written: [] };
   }
 
+  // When the launch entry carries inline env (secrets), the written config
+  // must be owner-only (0600) -- whether `try` created the file or merged the
+  // entry into the user's pre-existing config. We just wrote a plaintext
+  // credential into it, and atomicWriteFile renames a fresh tmp over the
+  // target (a new inode), so without an explicit mode the file is born at the
+  // umask default (~0644) with the secret world-readable. Entries with no
+  // inline env skip the 0600 (nothing secret to protect). No-op on Windows
+  // (POSIX perms don't apply).
+  const entryHasSecrets = entry.env !== undefined && Object.keys(entry.env).length > 0;
+  const tightenPerms = entryHasSecrets && process.platform !== "win32";
   try {
-    await atomicWriteFile(resolved.absolute, clientJson);
+    // Born-0600 on the create path closes the TOCTOU window where a 0644
+    // file with secrets exists between rename and the post-hoc chmod.
+    await atomicWriteFile(resolved.absolute, clientJson, "utf8", tightenPerms ? 0o600 : undefined);
     written.push(resolved.absolute);
-    // Best-effort 0600 ONLY when `try` freshly created the client file AND
-    // the entry carries inline env (secrets). We deliberately scope this to
-    // the freshly-created case: a pre-existing file is the user's own, and
-    // tightening its perms could surprise them (and atomicWriteFile's rename
-    // replaces the inode, so an unconditional chmod would silently re-perm
-    // their file on every trial). No-op on Windows (POSIX perms don't apply).
-    if (!clientPreExisted && entry.env && Object.keys(entry.env).length > 0 && process.platform !== "win32") {
+    // Belt-and-suspenders chmod normalizes any umask masking applied to the
+    // born mode above (e.g. a umask that widened 0600 -> nothing extra, but
+    // this pins it exactly to owner-only).
+    if (tightenPerms) {
       try {
         await chmod(resolved.absolute, 0o600);
       } catch {
@@ -859,12 +882,16 @@ export async function gcExpiredTrials(opts: {
   baseUrl?: string;
   postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   now?: () => number;
+  /** Precomputed scan to sweep. When omitted, gcExpiredTrials scans itself.
+   *  doctor passes the scan it already needs for readout so the trials dir
+   *  is scanned once per invocation instead of once here + once for readout. */
+  scan?: TrialScanResult;
 }): Promise<{ cleared: number; failed: number }> {
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
   const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   const postEvent = opts.postEvent ?? defaultPostEvent;
-  const scan = await scanTrials({ home, now: opts.now });
+  const scan = opts.scan ?? (await scanTrials({ home, now: opts.now }));
   if (scan.expired.length === 0) return { cleared: 0, failed: 0 };
 
   const anonId = await loadOrCreateAnonId(home);

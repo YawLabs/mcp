@@ -69,8 +69,14 @@ export class LearningStore {
 
   recordSuccess(namespace: string): void {
     const prev = this.usage.get(namespace);
+    // Symmetric with recordDispatch (which leaves succeeded at 0): a bare
+    // success leaves dispatched at 0 rather than seeding it to 1, so it never
+    // fabricates a dispatch the caller never recorded (which would imply a
+    // 100% rate from a call that recorded no dispatch). boostFactor coerces
+    // dispatched up to succeeded (Math.max), so the rate still lands in [0, 1]
+    // -- see the coerce comment there.
     this.usage.set(namespace, {
-      dispatched: prev?.dispatched ?? 1,
+      dispatched: prev?.dispatched ?? 0,
       succeeded: (prev?.succeeded ?? 0) + 1,
       lastUsedAt: Date.now(),
     });

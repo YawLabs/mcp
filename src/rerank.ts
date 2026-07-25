@@ -8,26 +8,21 @@ import { log } from "./logger.js";
 // the BM25 order when rerank is unavailable. Rerank is an optimization,
 // not a requirement.
 //
-// Two backend paths in this build:
+// One backend path in this build:
 //
-//   Path A (preferred):  yaw.sh `/api/team/rerank`, authed via the
-//                        yaw_team cookie.  Yaw Team buyers
-//                        get rerank automatically once signed in.
-//                        Document embeddings are precomputed at
-//                        catalog-export time and shipped inside the
-//                        Netlify Function bundle.
+//   Yaw MCP `/api/connect/rerank`, authed via MCPH_TOKEN/YAW_MCP_TOKEN.
+//   Set by initRerank() during ConnectServer.start() when a token is
+//   resolved; without it the caller falls back to BM25.
 //
-//   Path B (legacy):     Yaw MCP `/api/connect/rerank`, authed
-//                        via MCPH_TOKEN/YAW_MCP_TOKEN. Retained as a
-//                        fallback for the account-mode users that
-//                        haven't yet migrated to the new cookie. Will
-//                        be removed when Phase 9c (EKS sunset) lands.
+// The yaw.sh `/api/team/rerank` path (formerly the preferred path, authed
+// via the yaw_team cookie) was removed with the Yaw Team surface on
+// 2026-07-21, leaving this endpoint as the only rerank transport.
 //
-// Free users skip both paths entirely (no session, no token).
+// Free users skip rerank entirely (no token).
 
 const RERANK_TIMEOUT_MS = 2_000;
 
-// Path-B (legacy mcp.hosting) state. Set by initRerank() during
+// Legacy (mcp.hosting) rerank endpoint state. Set by initRerank() during
 // ConnectServer.start() when an MCPH_TOKEN is resolved.
 let legacyApiUrl = "";
 let legacyToken = "";

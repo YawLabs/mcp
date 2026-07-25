@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -454,5 +454,37 @@ describe("upsertUserBundle / removeUserBundle serializer (fix 2)", () => {
     expect(writtenNs).toContain("gamma");
     expect(writtenNs).toContain("delta");
     expect(writtenNs).not.toContain("beta");
+  });
+});
+
+// Gap 14: the write path passes dirMode 0o700 to atomicWriteFile so a
+// freshly-created ~/.yaw-mcp/ is born owner-only (bundles.json can carry
+// per-server `--env` secrets, so its parent must not be group/other-listable).
+// The serializer tests above reach the create-fresh-dir path via upsert but
+// never stat the dir's mode -- these assert the 0o700 birth directly.
+describe("write path births ~/.yaw-mcp/ owner-only (0o700)", () => {
+  // POSIX-only: Windows chmod is a no-op and mode bits aren't meaningful there.
+  it.skipIf(process.platform === "win32")("upsertUserBundle births a fresh .yaw-mcp/ at 0o700", async () => {
+    // synthHome has no .yaw-mcp/ yet (nothing pre-created it this test), so
+    // doUpsertUserBundle -> atomicWriteFile creates it fresh at dirMode 0o700.
+    await upsertUserBundle(
+      { namespace: "github", name: "GitHub", command: "npx", args: [], isActive: true },
+      { home: synthHome },
+    );
+    expect(statSync(join(synthHome, CONFIG_DIRNAME)).mode & 0o777).toBe(0o700);
+  });
+
+  // doRemoveUserBundle early-returns (removed:false) when the file is absent,
+  // so it can only reach its own atomicWriteFile once the dir already exists.
+  // Seed via upsert (which births the dir at 0o700), then exercise the remove
+  // write path and confirm it keeps the parent owner-only.
+  it.skipIf(process.platform === "win32")("removeUserBundle's write path keeps .yaw-mcp/ at 0o700", async () => {
+    await upsertUserBundle(
+      { namespace: "gone", name: "Gone", command: "npx", args: [], isActive: true },
+      { home: synthHome },
+    );
+    const res = await removeUserBundle("gone", { home: synthHome });
+    expect(res.removed).toBe(true);
+    expect(statSync(join(synthHome, CONFIG_DIRNAME)).mode & 0o777).toBe(0o700);
   });
 });

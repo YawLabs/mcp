@@ -347,6 +347,12 @@ export async function shutdownAnalytics(): Promise<void> {
   for (let i = 0; i < 3 && dispatchBuffer.length > 0; i++) {
     await flushDispatch();
   }
+  // Anything still buffered after the bounded drain is about to be discarded
+  // by the hard-clear below (a backlog larger than 3*FLUSH_SIZE, or events a
+  // persistent failure left re-queued). Count it as dropped so the loss shows
+  // up in getDroppedEventsCount() / the snapshot instead of vanishing
+  // silently.
+  droppedEvents += buffer.length + dispatchBuffer.length;
   buffer.length = 0;
   dispatchBuffer.length = 0;
 }

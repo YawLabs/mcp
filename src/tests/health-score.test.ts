@@ -80,6 +80,24 @@ describe("formatHealthWarning", () => {
     expect(formatHealthWarning({ totalCalls: 2, errorCount: 2, totalLatencyMs: 5 }, undefined)).toBeNull();
   });
 
+  it("surfaces a sub-30% nonzero error rate so the ranking penalty isn't silent", () => {
+    // 1 of 5 = 20% error, above the observation floor. errorRateFactor
+    // down-ranks this (factor 0.8), so the health block must show it rather
+    // than staying silent below the old 30% warn threshold.
+    const w = formatHealthWarning({ totalCalls: 5, errorCount: 1, totalLatencyMs: 5 }, undefined);
+    expect(w).toBe("warn: 1 of last 5 calls failed");
+  });
+
+  it("stays silent for a nonzero error rate below WARN_RATE_FLOOR", () => {
+    // 1 of 100 = 1% error, above the 3-call observation floor but below the
+    // 10% WARN_RATE_FLOOR. Because totalCalls/errorCount never decay, a lone
+    // old error in a large sample must NOT emit a permanent "N of last M
+    // failed" line at a negligible penalty -- that would train the model to
+    // skip a fine server. Reverting the gate at health-score.ts:88 to rate>0
+    // would surface this line and fail the assertion.
+    expect(formatHealthWarning({ totalCalls: 100, errorCount: 1, totalLatencyMs: 5 }, undefined)).toBeNull();
+  });
+
   it("warns when the recent error rate clears 30%", () => {
     const w = formatHealthWarning(
       { totalCalls: 10, errorCount: 3, totalLatencyMs: 5, lastErrorMessage: "503 Service Unavailable" },

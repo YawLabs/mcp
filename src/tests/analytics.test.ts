@@ -328,6 +328,45 @@ describe("analytics", () => {
     expect(after - before).toBeGreaterThanOrEqual(100);
   });
 
+  it("shutdownAnalytics counts an undrained backlog as dropped instead of discarding it silently", async () => {
+    // Empty url/token so flush() is a no-op and the bounded 3*FLUSH_SIZE drain
+    // makes no progress -- the whole backlog survives to the hard-clear.
+    initAnalytics("", "");
+    const before = getDroppedEventsCount();
+    // More than shutdown's 3*FLUSH_SIZE (150) drain budget, under MAX_BUFFER so
+    // none are dropped on push -- the loss can only come from the hard-clear.
+    const N = 3 * 50 + 20;
+    for (let i = 0; i < N; i++) {
+      recordConnectEvent({ namespace: "gh", toolName: null, action: "discover", latencyMs: null, success: true });
+    }
+
+    await shutdownAnalytics();
+
+    expect(getDroppedEventsCount() - before).toBe(N);
+    expect(getAnalyticsSnapshot().bufferedConnect).toBe(0);
+  });
+
+  it("shutdownAnalytics counts an undrained DISPATCH backlog as dropped instead of discarding it silently", async () => {
+    // Symmetric to the connect-backlog case above, but for the dispatchBuffer
+    // half of the `buffer.length + dispatchBuffer.length` sum at
+    // analytics.ts:355. Empty url/token so flushDispatch() is a no-op and the
+    // bounded 3*FLUSH_SIZE drain makes no progress -- the whole dispatch
+    // backlog survives to the hard-clear. Only dispatch events are pushed, so
+    // the drop delta comes purely from the dispatchBuffer term; mutating that
+    // term to just buffer.length would leave the delta at 0 and fail this.
+    initAnalytics("", "");
+    const before = getDroppedEventsCount();
+    const N = 3 * 50 + 20;
+    for (let i = 0; i < N; i++) {
+      recordDispatchEvent({ scope: "connect", serverId: "srv", toolName: "t", requestBytes: 1, responseBytesRaw: 1 });
+    }
+
+    await shutdownAnalytics();
+
+    expect(getDroppedEventsCount() - before).toBe(N);
+    expect(getAnalyticsSnapshot().bufferedDispatch).toBe(0);
+  });
+
   it("a subsequent 200 flush clears the latch", async () => {
     // First, force a persistent 401 to set the latch.
     mockedRequest.mockResolvedValue({

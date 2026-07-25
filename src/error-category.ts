@@ -114,7 +114,7 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
     t.includes("unauthorized") ||
     t.includes("forbidden") ||
     t.includes("permission denied") ||
-    RX_NO_TOKEN.test(text)
+    RX_NO_TOKEN.test(t)
   ) {
     return "unauthorized";
   }

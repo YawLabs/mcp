@@ -94,11 +94,12 @@ describe("LearningStore", () => {
         store.recordSuccess("solo");
       }
       const u = store.get("solo");
-      // recordSuccess seeds dispatched to 1 on first call (no prior entry),
-      // so after 5 pure successes dispatched is 1 and succeeded is 5.
-      // The coerce in boostFactor must treat dispatched as at least succeeded
-      // (i.e. max(1, 5) = 5) so the rate stays in [0, 1] and no penalty fires.
-      expect(u?.dispatched).toBe(1);
+      // recordSuccess leaves dispatched at 0 (symmetric with recordDispatch,
+      // which leaves succeeded at 0), so after 5 pure successes dispatched is
+      // 0 and succeeded is 5. The coerce in boostFactor must treat dispatched
+      // as at least succeeded (i.e. max(0, 5) = 5) so the rate stays in [0, 1]
+      // and no penalty fires.
+      expect(u?.dispatched).toBe(0);
       expect(u?.succeeded).toBe(5);
       // boostFactor must be >= 1.0, not NaN or penalty.
       const factor = store.boostFactor("solo");

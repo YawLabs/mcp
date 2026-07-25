@@ -127,6 +127,13 @@ describe("rewriteForOam", () => {
     });
   });
 
+  it("stays on node when the first arg is a node flag, not the entry", () => {
+    expect(rewriteForOam("node", ["--enable-source-maps", "/srv/index.js"], oam)).toEqual({
+      command: "node",
+      args: ["--enable-source-maps", "/srv/index.js"],
+    });
+  });
+
   it("leaves docker untouched (not Node-based)", () => {
     expect(rewriteForOam("docker", ["run", "-i", "img"], oam)).toEqual({
       command: "docker",

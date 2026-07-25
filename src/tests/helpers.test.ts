@@ -71,6 +71,19 @@ describe("resolveNamespaces", () => {
   it("ignores a non-string server value", () => {
     expect(resolveNamespaces({ server: 42 })).toEqual([]);
   });
+
+  it("filters an all-junk servers array then falls through to a valid single server", () => {
+    // The `servers` array is present but every element is non-string
+    // junk, so it filters to [] and does NOT short-circuit — the resolver
+    // falls through to the usable single `server` form.
+    expect(resolveNamespaces({ servers: [1, null, ""], server: "gh" })).toEqual(["gh"]);
+  });
+
+  it("yields no namespaces for an all-invalid servers array with no server", () => {
+    // Present-but-all-invalid `servers` filters to [] and there is no
+    // single `server` to fall back on — the resolver returns [].
+    expect(resolveNamespaces({ servers: [1, null, ""] })).toEqual([]);
+  });
 });
 
 describe("sanitizeNamespace", () => {

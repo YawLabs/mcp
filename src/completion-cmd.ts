@@ -128,7 +128,12 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--value", "--stdin", "--force", "--secret", "--server", "--json", "--help"],
   },
   // Other.
-  { name: "audit", description: "Run a full-pass audit of loaded servers", flags: ["--json", "--help"] },
+  {
+    name: "audit",
+    description: "Grade a stdio server against the compliance suite",
+    positional: [["<namespace>"]],
+    flags: ["--json", "--help"],
+  },
   { name: "compliance", description: "Run the compliance suite against a server", flags: ["--publish", "--help"] },
   {
     name: "foundry",

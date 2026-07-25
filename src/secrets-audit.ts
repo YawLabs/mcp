@@ -16,7 +16,7 @@
 //     bound on a long-lived process.
 
 import { existsSync } from "node:fs";
-import { appendFile, chmod, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, chmod, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
@@ -73,9 +73,11 @@ export async function appendAuditEvent(input: AuditEventInput, home: string = ho
     const line = `${JSON.stringify(event)}\n`;
 
     if (!existsSync(path)) {
-      // First write: atomicWriteFile mkdirs ~/.yaw-mcp/ for us, then we
-      // lock the mode down. Both best-effort.
-      await atomicWriteFile(path, line);
+      // First write: atomicWriteFile mkdirs ~/.yaw-mcp/ (born 0o700) and
+      // writes the log born 0o600, so the file and any parent dir it creates
+      // are locked down from birth -- matching saveVault. The chmod below
+      // just normalizes the umask masking.
+      await atomicWriteFile(path, line, "utf8", 0o600, 0o700);
     } else {
       await appendFile(path, line, "utf8");
     }
@@ -111,14 +113,16 @@ async function trimToTailCap(path: string): Promise<void> {
   const lines = raw.split("\n").filter((l) => l.length > 0);
   if (lines.length <= AUDIT_TAIL_CAP) return;
   const kept = lines.slice(lines.length - AUDIT_TAIL_CAP);
-  // Rewrite in place. This read-modify-write is neither atomic nor locked:
-  // a concurrent appendFile from another yaw-mcp process between the read
-  // above and this write is LOST, and an append that interleaves with the
-  // write can leave a garbled line behind. Both are accepted here -- the
-  // cost is audit history, never a secret (the file holds names only), and
-  // readAuditLog skips malformed lines. The size gate above keeps this
+  // Rewrite via atomicWriteFile (temp + rename, born 0o600): the swap is
+  // atomic, so a concurrent appendFile from another yaw-mcp process can no
+  // longer interleave at the byte level to leave a garbled half-line. The
+  // residual race is benign -- an append landing between the readFile above
+  // and the rename is cleanly LOST, but the file is always a complete, valid
+  // NDJSON snapshot, never torn. The cost is at most a few dropped audit
+  // lines, never a secret (the file holds names only), and readAuditLog
+  // skips any malformed line regardless. The size gate above keeps even that
   // window rare: it opens only when the log is genuinely over the cap.
-  await writeFile(path, `${kept.join("\n")}\n`, "utf8");
+  await atomicWriteFile(path, `${kept.join("\n")}\n`, "utf8", 0o600);
 }
 
 export interface AuditFilter {

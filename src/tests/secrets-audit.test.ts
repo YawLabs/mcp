@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -110,5 +110,23 @@ describe("appendAuditEvent + readAuditLog", () => {
     // The newest event is retained; the oldest were trimmed.
     expect((events as AuditEvent[])[events.length - 1].secret).toBe("newest");
     expect(events.some((e) => e.secret === "n0")).toBe(false);
+  });
+});
+
+describe("appendAuditEvent -- POSIX perms on first write", () => {
+  const posixOnly = process.platform === "win32" ? it.skip : it;
+
+  posixOnly("the log is born 0o600 and the created .yaw-mcp dir is 0o700", async () => {
+    // Fresh home: neither the log nor its parent .yaw-mcp/ exists yet, so the
+    // first append takes atomicWriteFile's create path -- the log born 0o600
+    // (plus a post-hoc chmod) and the parent dir born 0o700. The dir gets NO
+    // redundant chmod backup, so statting it to 0o700 pins that the birth mode
+    // is what locks it down, matching saveVault.
+    await appendAuditEvent({ server: "gh", secret: "token", event: "injected" }, home);
+
+    const logPath = auditLogPath(home);
+    const dirPath = join(home, ".yaw-mcp");
+    expect(statSync(logPath).mode & 0o777).toBe(0o600);
+    expect(statSync(dirPath).mode & 0o777).toBe(0o700);
   });
 });
