@@ -19,6 +19,12 @@ import type { ConnectionHealth } from "./types.js";
 export const ACTIVATION_FAILURE_TTL_MS = 5 * 60 * 1000;
 const OBSERVATION_FLOOR = 3;
 const MIN_FACTOR = 0.5;
+// Minimum error rate that earns a human-visible warning line in discover().
+// Below this we still let errorRateFactor nudge ranking, but stay silent:
+// totalCalls/errorCount never decay, so a single stale error in a large
+// sample (1 in 1000) must not emit a permanent "N of last M failed" line at
+// a negligible penalty -- that would train the model to skip a fine server.
+const WARN_RATE_FLOOR = 0.1;
 
 export interface ActivationFailure {
   at: number;
@@ -58,10 +64,10 @@ export function healthFactor(
 //
 // We deliberately hide low-sample error rates (<3 calls) — flagging a
 // server as unhealthy after a single flaky call would train the model
-// to skip perfectly-fine servers just because the first call 500'd. At or
-// above the observation floor we surface ANY nonzero rate, so the warning
-// covers exactly the population errorRateFactor penalizes (no silently
-// down-ranked servers).
+// to skip perfectly-fine servers just because the first call 500'd. Above
+// the floor we surface a MEANINGFUL rate (>= WARN_RATE_FLOOR) -- a lower gate
+// than the old 30% so a genuinely flaky server isn't silent, but NOT rate>0,
+// since the never-decaying counters would then warn forever on one old error.
 export function formatHealthWarning(
   health: ConnectionHealth | undefined,
   activationFailure: ActivationFailure | undefined,
@@ -74,13 +80,12 @@ export function formatHealthWarning(
   }
   if (health && health.totalCalls >= OBSERVATION_FLOOR) {
     const rate = health.errorCount / health.totalCalls;
-    // Warn on ANY nonzero error rate above the observation floor, not just
-    // >=30%. errorRateFactor already down-ranks a server for any rate>0, so a
-    // 1-29%-error server was being silently penalized in ranking with no line
-    // in the health block to explain it. Tying the warning to the same
-    // rate>0 condition keeps the penalty visible instead of silent -- the
-    // OBSERVATION_FLOOR still suppresses single-flake noise on tiny samples.
-    if (rate > 0) {
+    // Warn once the rate is meaningful (>= WARN_RATE_FLOOR) -- a lower gate
+    // than the old >=30% so a genuinely flaky server (which errorRateFactor is
+    // already down-ranking) no longer hides, but NOT rate>0: totalCalls /
+    // errorCount never decay, so a lone early error would otherwise emit a
+    // permanent "N of last M failed" line at a negligible 1/M penalty.
+    if (rate >= WARN_RATE_FLOOR) {
       const lastErr = health.lastErrorMessage ? `: ${truncateForWarning(health.lastErrorMessage)}` : "";
       return `warn: ${health.errorCount} of last ${health.totalCalls} calls failed${lastErr}`;
     }

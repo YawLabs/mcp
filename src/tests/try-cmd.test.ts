@@ -412,9 +412,9 @@ describe("runTry — client config perms (POSIX)", () => {
     expect(statSync(clientPath).mode & 0o777).toBe(0o600);
   });
 
-  posixOnly("does NOT tighten perms on a pre-existing user-owned client file", async () => {
+  posixOnly("tightens perms when writing an inline secret into a pre-existing user file", async () => {
     const clientPath = join(synthHome, ".claude.json");
-    // User's own file, group/other-readable.
+    // User's own content-bearing file, group/other-readable.
     writeFileSync(clientPath, JSON.stringify({ mcpServers: {} }), { mode: 0o644 });
     const cap = captureIO();
     const r = await runTry({
@@ -430,8 +430,10 @@ describe("runTry — client config perms (POSIX)", () => {
       postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
-    // Pre-existing file: we must not silently re-perm the user's file to 0600.
-    expect(statSync(clientPath).mode & 0o777).not.toBe(0o600);
+    // We wrote a plaintext secret into the user's file, so it must be
+    // owner-only -- protecting the credential we injected wins over leaving
+    // the pre-existing perms as-is.
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
   });
 
   posixOnly("tightens perms on an EMPTY pre-existing client file", async () => {

@@ -290,19 +290,22 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   if ("backupPath" in yawMcpConfigComposed && yawMcpConfigComposed.backupPath) {
     const reason = yawMcpConfigComposed.backupReason;
     // Under --dry-run nothing is written (composeYawMcpConfig skips the
-    // actual backup write), so phrase the note in the conditional.
+    // actual backup write), so phrase the WHOLE note in the conditional --
+    // both the verb and the "preserved for recovery" clause, or the note
+    // asserts a backup that never happened.
     const backedUp = opts.dryRun ? "would be backed up" : "backed up";
+    const preserved = opts.dryRun ? "would be preserved" : "preserved";
     if (reason === "malformed") {
       log(
-        `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; ${backedUp} to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
+        `yaw-mcp install: existing ${yawMcpConfigPath} was malformed; ${backedUp} to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes ${preserved} for recovery).`,
       );
     } else if (reason === "token-rotation") {
       log(
-        `yaw-mcp install: existing ${yawMcpConfigPath} ${backedUp} before token rotation to ${yawMcpConfigComposed.backupPath} (previous token preserved for recovery).`,
+        `yaw-mcp install: existing ${yawMcpConfigPath} ${backedUp} before token rotation to ${yawMcpConfigComposed.backupPath} (previous token ${preserved} for recovery).`,
       );
     } else {
       log(
-        `yaw-mcp install: existing ${yawMcpConfigPath} was not a JSON object; ${backedUp} to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes preserved for recovery).`,
+        `yaw-mcp install: existing ${yawMcpConfigPath} was not a JSON object; ${backedUp} to ${yawMcpConfigComposed.backupPath} before overwriting (original bytes ${preserved} for recovery).`,
       );
     }
   }

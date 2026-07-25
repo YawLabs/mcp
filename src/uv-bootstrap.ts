@@ -184,8 +184,10 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
     // single-quote-escapes them (' -> ''), which correctly handles any
     // apostrophe (a single-quoted PS literal treats only ' specially, and
     // doubling it is the canonical escape -- so a username like O'Brien is
-    // fine). A CR/LF is the one construct that could still break the
-    // -Command parse across the process boundary, so we hard-validate
+    // fine). A CR/LF -- or a Unicode single-quote variant (U+2018/2019/201A/
+    // 201B), which PowerShell also treats as a single-quoted-string delimiter
+    // and the ASCII-only '' escaping above does NOT neutralize -- could still
+    // break the -Command parse across the process boundary, so we hard-validate
     // against those and throw rather than build a command we can't prove
     // safe. If a future change ever routes user input into either path,
     // this guard must be revisited (proper arg-array escaping), not relaxed.
@@ -193,8 +195,10 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
       ["archivePath", archivePath],
       ["destDir", destDir],
     ] as const) {
-      if (/[\r\n]/.test(p)) {
-        throw new Error(`Refusing to extract uv archive: ${label} contains a newline (${JSON.stringify(p)})`);
+      if (/[\r\n‘’‚‛]/.test(p)) {
+        throw new Error(
+          `Refusing to extract uv archive: ${label} contains a newline or smart quote (${JSON.stringify(p)})`,
+        );
       }
     }
     await runCommand("powershell.exe", [

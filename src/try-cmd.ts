@@ -655,18 +655,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 1, written: [] };
   }
 
-  // `rawClient === null` is exactly the create path above (missing OR
-  // empty file, routed through mergeClientConfig): we materialized the
-  // content, so it counts as freshly created. A file that HAD content
-  // (`rawClient !== null`) is the user's own and its perms are left alone --
-  // tightening them could surprise them, and atomicWriteFile's rename
-  // replaces the inode, so an unconditional chmod would silently re-perm
-  // their file on every trial.
-  const clientCreated = rawClient === null;
+  // When the launch entry carries inline env (secrets), the written config
+  // must be owner-only (0600) -- whether `try` created the file or merged the
+  // entry into the user's pre-existing config. We just wrote a plaintext
+  // credential into it, and atomicWriteFile renames a fresh tmp over the
+  // target (a new inode), so without an explicit mode the file is born at the
+  // umask default (~0644) with the secret world-readable. Entries with no
+  // inline env skip the 0600 (nothing secret to protect). No-op on Windows
+  // (POSIX perms don't apply).
   const entryHasSecrets = entry.env !== undefined && Object.keys(entry.env).length > 0;
-  // Tighten perms ONLY when `try` materialized the file AND the entry
-  // carries inline env (secrets). No-op on Windows (POSIX perms don't apply).
-  const tightenPerms = clientCreated && entryHasSecrets && process.platform !== "win32";
+  const tightenPerms = entryHasSecrets && process.platform !== "win32";
   try {
     // Born-0600 on the create path closes the TOCTOU window where a 0644
     // file with secrets exists between rename and the post-hoc chmod.
