@@ -1,8 +1,14 @@
 import { EventEmitter } from "node:events";
+import {
+  PromptListChangedNotificationSchema,
+  ResourceListChangedNotificationSchema,
+  ToolListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ActivationError,
   connectToUpstream,
+  disconnectFromUpstream,
   fetchPromptsFromUpstream,
   fetchResourcesFromUpstream,
   fetchToolsFromUpstream,
@@ -70,6 +76,16 @@ const _sdkBehavior = {
   // MockClient instance is passed so an override can reach its onclose handler.
   clientListResources: (_client: any): Promise<any> => Promise.resolve({ resources: [] }),
   clientListPrompts: (_client: any): Promise<any> => Promise.resolve({ prompts: [] }),
+  // listTools routes through the same indirection so the list-changed chain
+  // tests can hand out deferred promises per call and control resolution
+  // order. Default is the empty-inventory shape every other suite relies on.
+  clientListTools: (_client: any): Promise<any> => Promise.resolve({ tools: [] }),
+  // Every (schema, handler) pair passed to client.setNotificationHandler, in
+  // registration order -- the list-changed chain tests invoke the captured
+  // handler directly rather than driving a real transport.
+  notificationHandlers: [] as Array<{ schema: unknown; handler: (notification: any) => unknown }>,
+  // Remote transport constructions (SSE vs streamable HTTP), in order.
+  remoteConstructions: [] as Array<{ kind: "sse" | "http"; url: string }>,
   stderrEmitter: null as EventEmitter | null,
   // The {command,args,env} the stdio transport was last constructed with --
   // lets a test assert what actually gets spawned (e.g. the oam-rewritten cmd).
@@ -87,7 +103,7 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
       // listTools succeeds with an empty set so tests can drive the connect
       // flow to a SUCCESSFUL completion (the boot-probe fallback tests need
       // the second attempt to come up healthy).
-      listTools: () => Promise.resolve({ tools: [] }),
+      listTools: () => _sdkBehavior.clientListTools(client),
       // listResources/listPrompts go through _sdkBehavior so a test can make
       // one fire client.onclose before resolving (closedBeforeReady path).
       // The captured `client` is the same object connectToUpstream assigns
@@ -95,7 +111,9 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
       listResources: () => _sdkBehavior.clientListResources(client),
       listPrompts: () => _sdkBehavior.clientListPrompts(client),
       onclose: undefined as (() => void) | undefined,
-      setNotificationHandler: () => {},
+      setNotificationHandler: (schema: unknown, handler: (notification: any) => unknown) => {
+        _sdkBehavior.notificationHandlers.push({ schema, handler });
+      },
     };
     return client;
   }
@@ -131,19 +149,24 @@ vi.mock("../default-runtime.js", () => ({
 }));
 
 // Remote transports -- not needed for env/redact tests but must not throw.
+// Each construction is recorded so the remote-config tests can assert WHICH
+// transport the `transport: "sse"` switch selected.
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: function MockSSE() {
+  SSEClientTransport: function MockSSE(url: URL) {
+    _sdkBehavior.remoteConstructions.push({ kind: "sse", url: String(url) });
     return {};
   },
 }));
 vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
-  StreamableHTTPClientTransport: function MockHTTP() {
+  StreamableHTTPClientTransport: function MockHTTP(url: URL) {
+    _sdkBehavior.remoteConstructions.push({ kind: "http", url: String(url) });
     return {};
   },
 }));
 
 // Import the mocked modules so the wiring tests can configure/assert them.
 import { defaultRuntime } from "../default-runtime.js";
+import { log } from "../logger.js";
 import { resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
@@ -878,5 +901,556 @@ describe("connectToUpstream closedBeforeReady", () => {
     expect(err).toBeInstanceOf(ActivationError);
     expect(err!.message).toContain("disconnected during initialization");
     expect(err!.category).toBe("protocol_error");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared helpers for the chain / disconnect / activation-error suites below.
+// ---------------------------------------------------------------------------
+
+/** Explicit deferred. The chain tests decide resolution ORDER themselves --
+ *  never a setTimeout race, which would make the assertions timing-dependent. */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/** Drain the microtask queue (and anything it queues in turn). setImmediate
+ *  fires in the check phase, which runs only after microtasks are exhausted --
+ *  so "nothing further happened" after a flush() is a real assertion, not a
+ *  bet on a timer. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+/** The handler connectToUpstream registered for a given notification schema
+ *  (most recent registration wins -- a suite may connect more than once). */
+function handlerFor(schema: unknown): (notification: unknown) => Promise<void> {
+  const entry = [..._sdkBehavior.notificationHandlers].reverse().find((h) => h.schema === schema);
+  if (!entry) throw new Error("no notification handler was registered for that schema");
+  return entry.handler as (notification: unknown) => Promise<void>;
+}
+
+/** Restore the default empty-inventory list hooks so an override can never
+ *  leak out of the suite that installed it. */
+function resetListHooks(): void {
+  _sdkBehavior.clientListTools = (_client: any) => Promise.resolve({ tools: [] });
+  _sdkBehavior.clientListResources = (_client: any) => Promise.resolve({ resources: [] });
+  _sdkBehavior.clientListPrompts = (_client: any) => Promise.resolve({ prompts: [] });
+}
+
+// ---------------------------------------------------------------------------
+// list-changed notification chains (upstream.ts:560-604)
+//
+// Each category (tools/resources/prompts) serializes its refreshes onto its
+// own promise chain. Two back-to-back notifications from one upstream must
+// produce SEQUENTIAL fetches, not concurrent ones: with concurrency, whichever
+// listX() happens to resolve last wins connection.<category>, so a slow fetch
+// from an EARLIER notification silently clobbers the newer inventory, and
+// onListChanged fires twice in the wrong order (each rebuilding routes).
+// ---------------------------------------------------------------------------
+
+interface ListChangedCategory {
+  label: string;
+  method: string;
+  schema: unknown;
+  /** Install a per-call fetch implementation for this category. */
+  install: (impl: () => Promise<unknown>) => void;
+  /** A listX() result carrying a single entry with the given name. */
+  result: (name: string) => unknown;
+  /** The names currently stored on the connection for this category. */
+  read: (connection: any) => (string | undefined)[];
+}
+
+const LIST_CHANGED_CATEGORIES: ListChangedCategory[] = [
+  {
+    label: "tools",
+    method: "notifications/tools/list_changed",
+    schema: ToolListChangedNotificationSchema,
+    install: (impl) => {
+      _sdkBehavior.clientListTools = impl;
+    },
+    result: (name) => ({ tools: [{ name, inputSchema: { type: "object" } }] }),
+    read: (connection) => connection.tools.map((t: any) => t.name),
+  },
+  {
+    label: "resources",
+    method: "notifications/resources/list_changed",
+    schema: ResourceListChangedNotificationSchema,
+    install: (impl) => {
+      _sdkBehavior.clientListResources = impl;
+    },
+    result: (name) => ({ resources: [{ uri: `file:///${name}`, name }] }),
+    read: (connection) => connection.resources.map((r: any) => r.name),
+  },
+  {
+    label: "prompts",
+    method: "notifications/prompts/list_changed",
+    schema: PromptListChangedNotificationSchema,
+    install: (impl) => {
+      _sdkBehavior.clientListPrompts = impl;
+    },
+    result: (name) => ({ prompts: [{ name }] }),
+    read: (connection) => connection.prompts.map((p: any) => p.name),
+  },
+];
+
+describe("connectToUpstream list-changed chains", () => {
+  let stderr: { restore: () => void; writes: string[] };
+
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.notificationHandlers = [];
+    _sdkBehavior.stdioConstructions = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+    stderr = captureStderr();
+  });
+
+  afterEach(() => {
+    stderr.restore();
+    vi.clearAllMocks();
+    resetListHooks();
+    _sdkBehavior.notificationHandlers = [];
+  });
+
+  it("registers one handler per category when onListChanged is provided", async () => {
+    await connectToUpstream(makeLocalConfig(), undefined, vi.fn());
+    expect(_sdkBehavior.notificationHandlers.map((h) => h.schema)).toEqual([
+      ToolListChangedNotificationSchema,
+      ResourceListChangedNotificationSchema,
+      PromptListChangedNotificationSchema,
+    ]);
+  });
+
+  it("registers no handlers at all when onListChanged is omitted", async () => {
+    await connectToUpstream(makeLocalConfig());
+    expect(_sdkBehavior.notificationHandlers).toEqual([]);
+  });
+
+  for (const category of LIST_CHANGED_CATEGORIES) {
+    it(`serializes back-to-back ${category.label} notifications so the LAST one wins`, async () => {
+      const onListChanged = vi.fn();
+      const connection = await connectToUpstream(makeLocalConfig(), undefined, onListChanged);
+      expect(category.read(connection)).toEqual([]);
+
+      // Fetch #1 (notification #1) is deliberately the SLOW one -- it does not
+      // settle until the test resolves `slowFirst`. Fetch #2 settles
+      // immediately. Serialized, #2 runs last and its result is the final
+      // state. Run concurrently, #1's late result would clobber #2's.
+      const slowFirst = deferred();
+      const started: number[] = [];
+      let calls = 0;
+      category.install(() => {
+        calls += 1;
+        const nth = calls;
+        started.push(nth);
+        return nth === 1
+          ? slowFirst.promise.then(() => category.result("from-first-notification"))
+          : Promise.resolve(category.result("from-second-notification"));
+      });
+
+      const handler = handlerFor(category.schema);
+      const first = handler({ method: category.method });
+      const second = handler({ method: category.method });
+
+      // Both notifications have been delivered and every microtask has run,
+      // yet only ONE fetch has been issued: the second is queued behind the
+      // first rather than racing it. Nothing has been published downstream.
+      await flush();
+      expect(started).toEqual([1]);
+      expect(onListChanged).not.toHaveBeenCalled();
+
+      slowFirst.resolve();
+      await Promise.all([first, second]);
+
+      // The second fetch only STARTED once the first finished ...
+      expect(started).toEqual([1, 2]);
+      // ... and the newest notification's inventory is what stuck.
+      expect(category.read(connection)).toEqual(["from-second-notification"]);
+      // One route rebuild per notification, no double-fire on either.
+      expect(onListChanged).toHaveBeenCalledTimes(2);
+      expect(onListChanged).toHaveBeenNthCalledWith(1, "test");
+      expect(onListChanged).toHaveBeenNthCalledWith(2, "test");
+    });
+  }
+
+  it("keeps the three chains independent -- a wedged tools fetch does not block resources", async () => {
+    const onListChanged = vi.fn();
+    const connection = await connectToUpstream(makeLocalConfig(), undefined, onListChanged);
+
+    const wedged = deferred();
+    _sdkBehavior.clientListTools = () => wedged.promise.then(() => ({ tools: [] }));
+    _sdkBehavior.clientListResources = () => Promise.resolve({ resources: [{ uri: "file:///r", name: "r" }] });
+
+    const toolsPending = handlerFor(ToolListChangedNotificationSchema)({ method: "notifications/tools/list_changed" });
+    await handlerFor(ResourceListChangedNotificationSchema)({ method: "notifications/resources/list_changed" });
+
+    expect(connection.resources.map((r) => r.name)).toEqual(["r"]);
+    expect(onListChanged).toHaveBeenCalledTimes(1);
+
+    // Unwedge so the pending tools chain settles before the test ends.
+    wedged.resolve();
+    await toolsPending;
+    expect(onListChanged).toHaveBeenCalledTimes(2);
+  });
+
+  it("catches a throwing tools refresh, logs it, and leaves the chain usable", async () => {
+    const onListChanged = vi.fn();
+    const connection = await connectToUpstream(makeLocalConfig(), undefined, onListChanged);
+
+    let calls = 0;
+    _sdkBehavior.clientListTools = () => {
+      calls += 1;
+      return calls === 1
+        ? Promise.reject(new Error("tools/list exploded"))
+        : Promise.resolve({ tools: [{ name: "recovered", inputSchema: { type: "object" } }] });
+    };
+
+    const handler = handlerFor(ToolListChangedNotificationSchema);
+
+    // fetchToolsFromUpstream RETHROWS as an ActivationError (unlike the
+    // resources/prompts fetchers, which swallow). The chain link must still
+    // RESOLVE -- a rejected link would poison every later notification.
+    await expect(handler({ method: "notifications/tools/list_changed" })).resolves.toBeUndefined();
+    // Nothing was published: the previous inventory stands and no route
+    // rebuild was triggered off a failed fetch.
+    expect(connection.tools).toEqual([]);
+    expect(onListChanged).not.toHaveBeenCalled();
+    expect(
+      stderr.writes.some(
+        (w) => w.includes("Failed to refresh tools from upstream") && w.includes("tools/list exploded"),
+      ),
+    ).toBe(true);
+
+    // The next notification on the SAME chain still runs.
+    await handler({ method: "notifications/tools/list_changed" });
+    expect(connection.tools.map((t) => t.name)).toEqual(["recovered"]);
+    expect(onListChanged).toHaveBeenCalledTimes(1);
+  });
+
+  // fetchResourcesFromUpstream / fetchPromptsFromUpstream SWALLOW their errors
+  // and return [], so a throwing onListChanged is the only thing that can reach
+  // those two catch arms -- and it is a real risk: the callback rebuilds routes
+  // in server.ts. The chain has to absorb it rather than wedge every later
+  // notification for that category.
+  for (const category of LIST_CHANGED_CATEGORIES.filter((c) => c.label !== "tools")) {
+    it(`catches a throwing onListChanged without breaking the ${category.label} chain`, async () => {
+      const onListChanged = vi.fn().mockImplementationOnce(() => {
+        throw new Error("route rebuild failed");
+      });
+      const connection = await connectToUpstream(makeLocalConfig(), undefined, onListChanged);
+
+      category.install(() => Promise.resolve(category.result("a")));
+      const handler = handlerFor(category.schema);
+      await expect(handler({ method: category.method })).resolves.toBeUndefined();
+
+      // The fetch result landed before the callback threw.
+      expect(category.read(connection)).toEqual(["a"]);
+      expect(
+        stderr.writes.some(
+          (w) => w.includes(`Failed to refresh ${category.label} from upstream`) && w.includes("route rebuild failed"),
+        ),
+      ).toBe(true);
+
+      // The chain survives: the next notification still refreshes.
+      category.install(() => Promise.resolve(category.result("b")));
+      await handler({ method: category.method });
+      expect(category.read(connection)).toEqual(["b"]);
+      expect(onListChanged).toHaveBeenCalledTimes(2);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// disconnectFromUpstream (upstream.ts:615-626) -- a wedged upstream failing to
+// close cleanly is the NORMAL case (the child is already gone / the pipe is
+// broken), so the catch arm must swallow it and the function must still run to
+// completion. A throw here would abort whatever teardown loop called it.
+// ---------------------------------------------------------------------------
+
+describe("disconnectFromUpstream", () => {
+  let stderr: { restore: () => void; writes: string[] };
+
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.notificationHandlers = [];
+    _sdkBehavior.stdioConstructions = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+    stderr = captureStderr();
+  });
+
+  afterEach(() => {
+    stderr.restore();
+    vi.clearAllMocks();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+  });
+
+  it("marks the connection disconnected and closes the client", async () => {
+    const connection = await connectToUpstream(makeLocalConfig());
+    expect(connection.status).toBe("connected");
+
+    const close = vi.fn().mockResolvedValue(undefined);
+    _sdkBehavior.clientClose = close;
+
+    await expect(disconnectFromUpstream(connection)).resolves.toBeUndefined();
+    expect(connection.status).toBe("disconnected");
+    expect(close).toHaveBeenCalledOnce();
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Disconnected from upstream", { namespace: "test" });
+  });
+
+  it("does not throw when close() rejects -- logs the failure and finishes the teardown", async () => {
+    const connection = await connectToUpstream(makeLocalConfig());
+    _sdkBehavior.clientClose = () => Promise.reject(new Error("EPIPE: broken pipe"));
+
+    await expect(disconnectFromUpstream(connection)).resolves.toBeUndefined();
+
+    // Status is set BEFORE the close attempt, so a failed close still leaves
+    // the connection marked dead rather than stuck on "connected".
+    expect(connection.status).toBe("disconnected");
+    expect(
+      stderr.writes.some((w) => w.includes("Error disconnecting from upstream") && w.includes("EPIPE: broken pipe")),
+    ).toBe(true);
+    // The tail of the function still runs -- a failed close is not a short circuit.
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Disconnected from upstream", { namespace: "test" });
+  });
+
+  it("does not throw when close() throws synchronously", async () => {
+    const connection = await connectToUpstream(makeLocalConfig());
+    _sdkBehavior.clientClose = () => {
+      throw new Error("transport already destroyed");
+    };
+
+    await expect(disconnectFromUpstream(connection)).resolves.toBeUndefined();
+    expect(connection.status).toBe("disconnected");
+    expect(stderr.writes.some((w) => w.includes("transport already destroyed"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unexpected disconnect AFTER the connection went live (upstream.ts:518-527).
+// Distinct from closedBeforeReady: here status is already "connected", so the
+// handler must mark the connection errored and hand the namespace to the
+// reconnect callback instead of silently leaving a dead "connected" entry.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream onclose after ready", () => {
+  let stderr: { restore: () => void; writes: string[] };
+
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.notificationHandlers = [];
+    _sdkBehavior.stdioConstructions = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+    stderr = captureStderr();
+  });
+
+  afterEach(() => {
+    stderr.restore();
+    vi.clearAllMocks();
+  });
+
+  it("flips the live connection to error and notifies onDisconnect", async () => {
+    const onDisconnect = vi.fn();
+    const connection = await connectToUpstream(makeLocalConfig(), onDisconnect);
+    expect(connection.status).toBe("connected");
+
+    connection.client.onclose?.();
+
+    expect(connection.status).toBe("error");
+    expect(connection.error).toBe("Upstream disconnected unexpectedly");
+    expect(onDisconnect).toHaveBeenCalledWith("test");
+    expect(stderr.writes.some((w) => w.includes("Upstream disconnected unexpectedly"))).toBe(true);
+  });
+
+  it("still marks the connection errored when no onDisconnect callback was supplied", async () => {
+    const connection = await connectToUpstream(makeLocalConfig());
+    expect(() => connection.client.onclose?.()).not.toThrow();
+    expect(connection.status).toBe("error");
+    expect(connection.error).toBe("Upstream disconnected unexpectedly");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Activation failure categorization (upstream.ts:442-489). The dispatch and
+// activate handlers compose their user-facing messages off `category`, so a
+// mis-bucketed failure produces advice that points at the wrong thing ("check
+// your PATH" for a server that actually refused the handshake).
+// ---------------------------------------------------------------------------
+
+/** Minimal remote server config (no command, no vault involvement). */
+function makeRemoteConfig(overrides: Record<string, unknown> = {}): any {
+  return {
+    id: "remote-srv",
+    name: "Remote Server",
+    namespace: "test",
+    type: "remote",
+    url: "https://mcp.example.test/mcp",
+    isActive: true,
+    ...overrides,
+  };
+}
+
+describe("connectToUpstream activation failure categories", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("not configured"));
+    _sdkBehavior.stdioConstructions = [];
+    _sdkBehavior.lastStdioArgs = null;
+    _sdkBehavior.remoteConstructions = [];
+    _sdkBehavior.notificationHandlers = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** Drive a connect that is expected to fail and hand back the error. */
+  async function failedConnect(config: any): Promise<ActivationError> {
+    try {
+      await connectToUpstream(config);
+    } catch (err) {
+      return err as ActivationError;
+    }
+    throw new Error("expected connectToUpstream to reject");
+  }
+
+  it("buckets ENOENT as spawn_failure with a PATH-oriented message", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("spawn uvx ENOENT"));
+
+    const err = await failedConnect(makeLocalConfig({ command: "uvx" }));
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain("Command 'uvx' is not on PATH or is not executable.");
+    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    // The child never wrote to stderr, so there is no tail to attach.
+    expect(err.stderrTail).toBeUndefined();
+    expect((err.cause as Error).message).toBe("spawn uvx ENOENT");
+  });
+
+  it("buckets EACCES as spawn_failure too (second categorizer arm)", async () => {
+    // Deliberately avoids the ENOENT/"not found" wording so this exercises the
+    // permissions arm rather than the first regex.
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("spawn EACCES"));
+
+    const err = await failedConnect(makeLocalConfig({ command: "./server.sh" }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(err.message).toContain("Command './server.sh' is not on PATH or is not executable.");
+  });
+
+  it("falls through to 'unknown' and surfaces the raw error when nothing matches", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("Error POSTing to endpoint (HTTP 500)"));
+
+    const err = await failedConnect(makeLocalConfig());
+
+    expect(err.category).toBe("unknown");
+    // Unknown failures keep the underlying message rather than inventing PATH
+    // advice for a server that clearly started.
+    expect(err.message).toContain("Error POSTing to endpoint (HTTP 500)");
+    expect(err.message).not.toContain("is not on PATH");
+    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+  });
+
+  it("buckets a local handshake timeout as init_timeout and attaches the stderr tail", async () => {
+    _sdkBehavior.clientConnect = () => {
+      // Something WAS written before the child wedged -- that tail is the part
+      // that usually explains the hang, so it must survive into the message.
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from("waiting for database..."));
+      // Never settles: the only way out is the connect timer.
+      return new Promise<void>(() => {});
+    };
+
+    const err = await failedConnect(makeLocalConfig({ connectTimeoutMs: 5 }));
+
+    expect(err.category).toBe("init_timeout");
+    expect(err.message).toContain(`Server "test" started but didn't complete the MCP handshake within 0.005s.`);
+    expect(err.message).toContain("stderr tail: waiting for database...");
+    expect(err.stderrTail).toBe("waiting for database...");
+  });
+
+  it("buckets a stderr-producing early exit as install_failure", async () => {
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from("npm ERR! 404 Not Found - @acme/nope"));
+      return Promise.reject(new Error("connection closed"));
+    };
+
+    const err = await failedConnect(makeLocalConfig());
+
+    expect(err.category).toBe("install_failure");
+    expect(err.message).toContain(`Server "test" failed to start. stderr: npm ERR! 404 Not Found - @acme/nope`);
+  });
+
+  it("rejects a local config with no command before anything is spawned", async () => {
+    const err = await connectToUpstream(makeLocalConfig({ command: undefined })).catch((e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ActivationError);
+    expect((err as Error).message).toBe("command is required for local servers");
+    expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
+  });
+
+  it("rejects a remote config with no url before any transport is built", async () => {
+    const err = await connectToUpstream(makeRemoteConfig({ url: undefined })).catch((e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ActivationError);
+    expect((err as Error).message).toBe("url is required for remote servers");
+    expect(_sdkBehavior.remoteConstructions).toHaveLength(0);
+  });
+
+  it("buckets a remote timeout as init_timeout naming the URL, not the command", async () => {
+    _sdkBehavior.clientConnect = () => new Promise<void>(() => {});
+
+    const err = await failedConnect(makeRemoteConfig({ connectTimeoutMs: 5 }));
+
+    expect(err.category).toBe("init_timeout");
+    expect(err.message).toContain(
+      "Remote server at https://mcp.example.test/mcp did not respond within 0.005s. Verify the URL is reachable.",
+    );
+    // Remote failures never carry a child stderr tail.
+    expect(err.stderrTail).toBeUndefined();
+  });
+
+  it("buckets a remote connection refusal as protocol_error", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("fetch failed"));
+
+    const err = await failedConnect(makeRemoteConfig());
+
+    expect(err.category).toBe("protocol_error");
+    expect(err.message).toContain("Remote server at https://mcp.example.test/mcp refused the connection.");
+  });
+
+  it("selects the SSE transport only when transport is 'sse'", async () => {
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("fetch failed"));
+
+    await failedConnect(makeRemoteConfig({ transport: "sse", url: "https://mcp.example.test/sse" }));
+    await failedConnect(makeRemoteConfig());
+
+    expect(_sdkBehavior.remoteConstructions).toEqual([
+      { kind: "sse", url: "https://mcp.example.test/sse" },
+      { kind: "http", url: "https://mcp.example.test/mcp" },
+    ]);
   });
 });

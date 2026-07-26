@@ -157,11 +157,21 @@ export function buildToolRoutes(
     for (const tool of conn.tools) {
       const existing = routes.get(tool.namespacedName);
       if (existing && existing.namespace !== conn.config.namespace) {
-        log("warn", "Tool route collision; later upstream shadows earlier", {
+        // FIRST writer wins, and the `continue` below is load-bearing.
+        // buildToolList skips a duplicate namespacedName (see the `seen`
+        // guard), so the schema the model is shown belongs to the FIRST
+        // upstream. Letting routes.set fall through here made dispatch
+        // last-writer-wins, so a collision meant the client validated
+        // against one upstream's inputSchema and the call executed a
+        // DIFFERENT upstream's tool -- and a later-activated server could
+        // silently capture an earlier one's traffic. The two surfaces must
+        // agree on the winner; first is the safe direction to agree on.
+        log("warn", "Tool route collision; keeping the first upstream, ignoring the later one", {
           tool: tool.namespacedName,
-          shadowedNamespace: existing.namespace,
-          winningNamespace: conn.config.namespace,
+          keptNamespace: existing.namespace,
+          ignoredNamespace: conn.config.namespace,
         });
+        continue;
       }
       routes.set(tool.namespacedName, {
         namespace: conn.config.namespace,
