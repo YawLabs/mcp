@@ -109,7 +109,7 @@ describe("renderScript — bash", () => {
 
   it("includes install flags", () => {
     const s = renderScript("bash");
-    for (const flag of ["--token", "--scope", "--force", "--dry-run"]) {
+    for (const flag of ["--scope", "--force", "--dry-run"]) {
       expect(s).toContain(flag);
     }
   });
@@ -224,7 +224,9 @@ describe("renderScript — powershell", () => {
     const installEmpty = complete(["yaw-mcp", "install"], "");
     expect(installEmpty).toEqual(expect.arrayContaining([...INSTALL_CLIENTS]));
     // Flags must still be offered alongside the positional candidates.
-    expect(installEmpty).toEqual(expect.arrayContaining(["--scope", "--token", "--dry-run"]));
+    expect(installEmpty).toEqual(expect.arrayContaining(["--scope", "--dry-run"]));
+    // deprecated flags still work but are no longer suggested
+    expect(installEmpty).not.toContain("--token");
     expect(complete(["yaw-mcp", "install", "cl"], "cl")).toEqual(["claude-code", "claude-desktop"]);
 
     // Slot 1: `yaw-mcp secrets set <TAB>` is past the action list, so only the

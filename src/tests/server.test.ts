@@ -120,7 +120,7 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("Disabled servers:");
-      expect(text).toContain("old — Old Server (disabled in dashboard)");
+      expect(text).toContain('old — Old Server ("isActive": false in bundles.json)');
     });
 
     it("shows cached tools for inactive connections", () => {
@@ -226,8 +226,8 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).toContain("https://yaw.sh/mcp/explore");
-      expect(text).toContain("within 60s");
+      expect(text).toContain("https://yaw.sh/mcp/catalog/");
+      expect(text).toContain("yaw-mcp add <slug>");
     });
 
     it("omits the marketplace hint once the user has plenty of servers", () => {
@@ -244,7 +244,7 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).not.toContain("https://yaw.sh/mcp/explore");
+      expect(text).not.toContain("https://yaw.sh/mcp/catalog/");
     });
 
     it("includes the marketplace pointer in the empty-state message", () => {
@@ -256,7 +256,7 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("No servers installed");
-      expect(text).toContain("https://yaw.sh/mcp/explore");
+      expect(text).toContain("https://yaw.sh/mcp/catalog/");
     });
   });
 
@@ -441,7 +441,8 @@ describe("ConnectServer", () => {
       expect(result.isError).toBe(true);
       const text = result.content[0].text;
       expect(text).toContain("installed but disabled");
-      expect(text).toContain("https://yaw.sh/mcp");
+      expect(text).toContain('"isActive": true');
+      expect(text).toContain("~/.yaw-mcp/bundles.json");
     });
 
     it("skips already-active servers", async () => {
@@ -1594,7 +1595,7 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([]);
       const result = await priv.handleReadTool("gh", "create_issue");
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("not installed on this account");
+      expect(result.content[0].text).toContain("is not in ~/.yaw-mcp/bundles.json");
     });
 
     it("reads the schema from a loaded server without reconnecting", async () => {
@@ -1979,7 +1980,7 @@ describe("ConnectServer", () => {
       expect(text).toContain("Bundles partially installed:");
       expect(text).toContain("devops-incident");
       expect(text).toContain("missing: pagerduty");
-      expect(text).toContain("https://yaw.sh/mcp/explore");
+      expect(text).toContain("yaw-mcp add ");
     });
 
     it("routes meta-tool exec through a two-step pipeline with $ref binding", async () => {

@@ -73,14 +73,15 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     description: "Connect an MCP client to yaw-mcp",
     positional: [[...INSTALL_CLIENTS]],
     flags: [
+      // --token and --no-yaw-mcp-config are still ACCEPTED (they warn and are
+      // ignored) but are no longer suggested -- completing a deprecated flag
+      // teaches it to new users.
       "--scope",
-      "--token",
       "--project-dir",
       "--os",
       "--force",
       "--skip",
       "--dry-run",
-      "--no-yaw-mcp-config",
       "--list",
       "--all",
     ],

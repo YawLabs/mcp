@@ -311,7 +311,7 @@ export class ConnectServer {
   // Session-scoped credential overrides supplied by the user via MCP
   // elicitation when a server's stderr indicated a missing env var.
   // Cleared on shutdown — persistence belongs in the Yaw MCP
-  // dashboard, these are a "get me running now" shortcut.
+  // bundles.json, these are a "get me running now" shortcut.
   private elicitedEnv = new Map<string, Record<string, string>>();
   // In-flight activation promises, keyed by namespace. Dedupes
   // concurrent activation attempts for the same namespace so that two
@@ -529,7 +529,7 @@ export class ConnectServer {
   // their tools in tools/list before activation; first tools/call on any
   // of those tools triggers lazy activation via activateOne in
   // handleToolCall. Merges in any in-session toolCache (this.toolCache)
-  // that hasn't yet been persisted to the dashboard, so recently-used
+  // that hasn't yet been persisted to bundles.json, so recently-used
   // servers that got idle-evicted still appear as deferred.
   private getDeferredServers(): UpstreamServerConfig[] {
     const out: UpstreamServerConfig[] = [];
@@ -666,7 +666,7 @@ export class ConnectServer {
     // Dormant servers (isActive but no persisted toolCache yet) are
     // invisible in tools/list because getDeferredServers() filters on
     // toolCache presence. That breaks the "I toggled it on in the
-    // dashboard and it disappeared" user experience. Pre-warm each one
+    // bundles.json and it disappeared" user experience. Pre-warm each one
     // in the background: activate → populate the in-memory toolCache
     // → disconnect so we're not holding 9 upstream processes idle.
     // Fire-and-forget so this doesn't gate transport readiness.
@@ -680,7 +680,7 @@ export class ConnectServer {
     // Opt-in auto-load of the top recurring pack. Requires persistence
     // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
     // after prewarm so both paths see the same config snapshot; they're
-    // independent (prewarm populates toolCache for dashboard-toggled
+    // independent (prewarm populates toolCache for newly-enabled
     // servers, this one spins up the recurring workflow's servers for
     // real). Fire-and-forget — startup shouldn't block on it.
     if (isAutoLoadEnabled() && this.persistenceReady) {
@@ -1297,7 +1297,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No servers installed. Browse the yaw-mcp catalog at https://yaw.sh/mcp/explore — add any server from there to your yaw-mcp account and it will appear here within 60s.",
+            text: "No servers installed. Browse the catalog at https://yaw.sh/mcp/catalog/ and add one with `yaw-mcp add <slug>` — it lands in ~/.yaw-mcp/bundles.json. Restart this MCP client afterwards; yaw-mcp reads bundles.json once at startup.",
           },
         ],
       };
@@ -1537,7 +1537,7 @@ export class ConnectServer {
     if (inactive.length > 0) {
       lines.push("\nDisabled servers:");
       for (const server of inactive) {
-        lines.push(`  ${server.namespace} — ${server.name} (disabled in dashboard)`);
+        lines.push(`  ${server.namespace} — ${server.name} ("isActive": false in bundles.json)`);
       }
     }
 
@@ -1566,13 +1566,13 @@ export class ConnectServer {
 
     // Marketplace hint — steer sparse-config users to the catalog without
     // nagging power users. Threshold counts installed servers (active +
-    // inactive) in the user's config; anyone under the cutoff gets a
-    // one-line pointer at https://yaw.sh/mcp/explore. No backend API is
-    // hit — the catalog is a human-browsable SPA, so this is a URL hint,
-    // not a full meta-tool.
+    // inactive) in the user's bundles.json; anyone under the cutoff gets a
+    // one-line pointer at the public catalog. No API is hit — the catalog
+    // is a static browsable surface, so this is a URL hint, not a full
+    // meta-tool.
     if (this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
       lines.push(
-        "Browse the yaw-mcp catalog at https://yaw.sh/mcp/explore — add any server from there to your yaw-mcp account and it will appear here within 60s.",
+        "Browse the catalog at https://yaw.sh/mcp/catalog/ and add servers with `yaw-mcp add <slug>` — they land in ~/.yaw-mcp/bundles.json and load on the next client restart.",
       );
     }
 
@@ -1731,7 +1731,7 @@ export class ConnectServer {
       return {
         ok: false,
         isChanged: false,
-        message: `"${namespace}" is installed but disabled. Enable it at https://yaw.sh/mcp to activate.`,
+        message: `"${namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and restart this MCP client to activate.`,
       };
     }
     const serverConfig = anyMatch;
@@ -1866,7 +1866,7 @@ export class ConnectServer {
 
       // Record the failure so dispatch down-ranks this namespace for a
       // few minutes. The TTL is short enough that a fixed server (user
-      // edited dashboard env, for example) recovers quickly on next poll.
+      // edited bundles.json env, for example) recovers on the next client restart.
       this.activationFailures.set(namespace, {
         at: Date.now(),
         message: lastError instanceof Error ? lastError.message : String(lastError),
@@ -2476,7 +2476,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `"${serverArg}" is not installed on this account. Call mcp_connect_discover to list available servers.`,
+            text: `"${serverArg}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover to list available servers.`,
           },
         ],
         isError: true,
@@ -2752,7 +2752,7 @@ export class ConnectServer {
   // run `mcp_connect_activate` snippet; `action=match` cross-references
   // the installed server list and partitions into fully-ready vs
   // partially-installed so the caller only sees bundles that are actually
-  // actionable on this account.
+  // actionable with the servers in bundles.json.
   private handleBundles(action: "list" | "match"): { content: Array<{ type: string; text: string }> } {
     if (action === "list") {
       const lines: string[] = [`Curated server bundles (${CURATED_BUNDLES.length}):\n`];
@@ -2763,7 +2763,7 @@ export class ConnectServer {
       }
       lines.push("");
       lines.push(
-        'Call mcp_connect_bundles with action="match" to filter these against servers already installed on this account.',
+        'Call mcp_connect_bundles with action="match" to filter these against the servers already in the user\'s bundles.json.',
       );
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
@@ -2777,7 +2777,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No curated bundles match your currently installed servers. Browse https://yaw.sh/mcp/explore to add the servers a bundle needs, then re-run mcp_connect_bundles.",
+            text: "No curated bundles match your currently installed servers. Browse the catalog at https://yaw.sh/mcp/catalog/ and add what a bundle needs with `yaw-mcp add <slug>`, then restart this MCP client and re-run mcp_connect_bundles.",
           },
         ],
       };
@@ -2801,7 +2801,7 @@ export class ConnectServer {
         const { bundle, have, missing } = entry;
         lines.push(`  ${bundle.id} — ${bundle.description}`);
         lines.push(`    have: ${have.join(", ")}`);
-        lines.push(`    missing: ${missing.join(", ")} (install from https://yaw.sh/mcp/explore)`);
+        lines.push(`    missing: ${missing.join(", ")} (add with: yaw-mcp add ${missing.join(" && yaw-mcp add ")})`);
       }
     }
 

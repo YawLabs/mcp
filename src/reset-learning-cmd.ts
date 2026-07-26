@@ -4,7 +4,7 @@
 // once doctor has flagged a namespace as flaky, its penalty keeps
 // suppressing routing to it until enough new successes pile up.
 // If the user fixed the underlying issue (rotated the token, swapped
-// the upstream, re-authed the account) the history is now stale and
+// the upstream, rotated its credentials) the history is now stale and
 // that penalty has overstayed its welcome — this command wipes it.
 //
 // Scope is intentionally "all or nothing." A per-namespace flag feels

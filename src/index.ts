@@ -245,12 +245,12 @@ if (subcommand === "compliance") {
   dispatch("secrets", runSecrets(parsed.options));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
-  yaw-mcp — one install, every MCP server, managed from the cloud.
+  yaw-mcp — one install, every MCP server, managed from one place.
 
   Quickstart:
     1. Install yaw-mcp      yaw-mcp install claude-code
     2. Verify setup         yaw-mcp doctor
-    3. Add a server         yaw-mcp add <slug>   (browse https://yaw.sh/mcp/explore)
+    3. Add a server         yaw-mcp add <slug>   (browse https://yaw.sh/mcp/catalog/)
 
   Setup (connect a client to yaw-mcp):
     install <client>         Connect one MCP client to yaw-mcp. This wires the
@@ -308,16 +308,13 @@ if (subcommand === "compliance") {
     help, --help, -h         Show this help.
     --version, -V            Print yaw-mcp version.
 
-  Running \`yaw-mcp\` with no subcommand starts the MCP server. No token is
-  required: without one it runs in local mode, loading servers from
-  ~/.yaw-mcp/bundles.json; with YAW_MCP_TOKEN (or a config file) it also
-  pulls your account's servers. Most read-only subcommands accept
+  Running \`yaw-mcp\` with no subcommand starts the MCP server, loading your
+  servers from ~/.yaw-mcp/bundles.json. It runs entirely on your machine --
+  there is no account and no sign-in. Most read-only subcommands accept
   \`--json\` for machine-readable output. Run \`yaw-mcp <subcommand> --help\`
   for per-subcommand flag details.
 
   Environment variables:
-    YAW_MCP_TOKEN                 API token (overrides every config file).
-    YAW_MCP_URL                   API base URL (default https://yaw.sh/mcp).
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
     YAW_MCP_MIN_COMPLIANCE        Minimum grade to auto-activate (A|B|C|D|F).
     YAW_MCP_AUTO_LOAD             Auto-activate the namespaces of the highest-
@@ -340,18 +337,22 @@ if (subcommand === "compliance") {
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
-    YAW_MCP_BASE_URL              Base URL for \`yaw-mcp try\` signup/telemetry
-                               links (default https://yaw.sh/mcp).
+    YAW_MCP_BASE_URL              Base URL \`yaw-mcp try\` resolves its links
+                               against (default https://yaw.sh/mcp).
 
-  Config resolution (highest precedence first):
-    1. YAW_MCP_TOKEN / YAW_MCP_URL env vars
-    2. <project>/.yaw-mcp/config.local.json   machine-local overrides (gitignore)
-    3. <project>/.yaw-mcp/config.json         project-shared (checked in; never
-                                           put a token here — apiBase only)
-    4. ~/.yaw-mcp/config.json                 user-global default
+  Config resolution (highest precedence first) -- for the \`servers\` allow-list
+  and \`blocked\` deny-list:
+    1. <project>/.yaw-mcp/config.local.json   machine-local overrides (gitignore)
+    2. <project>/.yaw-mcp/config.json         project-shared (checked in)
+    3. ~/.yaw-mcp/config.json                 user-global default
 
-  Token rotation: yaw-mcp reads config at startup. Restart the MCP client
-  (or kill yaw-mcp; the client will respawn it) after editing any config.
+  yaw-mcp reads config at startup. Restart the MCP client (or kill yaw-mcp;
+  the client will respawn it) after editing any config.
+
+  The \`token\` and \`apiBase\` config keys, and the \`--token\` /
+  \`--no-yaw-mcp-config\` install flags, are deprecated and ignored -- yaw-mcp
+  no longer contacts a hosted API. They are still accepted for one release.
+  If you have a token on disk, delete it and revoke it at its source.
 
   Docs:   https://yaw.sh/mcp
   Source: https://github.com/YawLabs/mcp

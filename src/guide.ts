@@ -6,7 +6,7 @@
 // rendered text via the `yaw-mcp://guide` resource; hosts like Claude
 // Code surface that text to the model so it picks up project-specific
 // routing conventions ("use the `gh` server for GitHub, not bash") and
-// credential guidance ("keys go in the dashboard, not `.mcp.json`")
+// credential guidance ("keys go in the local vault, not `.mcp.json`")
 // without the user restating them every session.
 //
 // Fail-open: a missing file returns null; an unreadable one logs and

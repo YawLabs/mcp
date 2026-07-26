@@ -8,32 +8,28 @@
 //
 // Design notes:
 //   - The trial entry is upstream-shape so the user can evaluate the
-//     server end-to-end without onboarding yaw-mcp first. The whole point
-//     of `try` is that a 30-second eval should not require account
-//     creation; yaw-mcp's value-add (centralized auth, learning, compliance
-//     gating) is offered AFTER the user has decided the server is worth
-//     keeping (the 3-line nudge at the end is the signup hint).
+//     server end-to-end without onboarding yaw-mcp first. yaw-mcp's
+//     value-add (learning, compliance gating, one connection for many
+//     servers) is offered AFTER the user has decided the server is worth
+//     keeping.
 //   - The Windows `cmd /c` wrap is delegated to `buildLaunchEntry` —
 //     same code path the canonical `yaw-mcp install` flow uses, so a
 //     future fix to the wrapping logic propagates to trials for free.
 //   - Trial marker fields are versioned (`schemaVersion`) so the GC
 //     pass can refuse to delete entries it doesn't understand.
-//   - The anonId is a SHA-256 hash of os.hostname() + os.userInfo(),
-//     truncated to 16 hex chars. NOT a stable cross-machine identifier,
-//     just enough to deduplicate "this same machine tried server X"
-//     events for the funnel. Persisted on first run; never sent in
-//     anything richer than the {slug, action, anonId} triple.
-//   - The /api/try/event POST is fire-and-forget: a network blip must
-//     never block the trial from working. Errors are swallowed silently
-//     after a single best-effort attempt (no retry — analytics already
-//     handles the retry concern for the long-tail telemetry surface).
+//   - NOTHING IS SENT ANYWHERE. `try` used to POST a {slug, action, anonId}
+//     triple to /api/try/event; that endpoint died with the hosted backend
+//     and the poster is now a no-op, so no trial event leaves the machine.
+//     The anonId (a truncated SHA-256 of hostname + userInfo) is still
+//     computed and persisted for the seam's signature, but has no consumer.
+//     Removing the postEvent seam outright — it is injected by ~15 tests and
+//     by doctor's trial GC — is worth its own pass.
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir, hostname, userInfo } from "node:os";
 import { join, resolve } from "node:path";
-import { request } from "undici";
 import { atomicWriteFile } from "./atomic-write.js";
 import { resolveCatalogSlug } from "./catalog.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
@@ -365,22 +361,16 @@ async function defaultFetchExplore(_baseUrl: string, slug: string): Promise<Expl
   return out;
 }
 
-async function defaultPostEvent(baseUrl: string, body: TryEventBody): Promise<void> {
-  const url = `${baseUrl.replace(/\/$/, "")}/api/try/event`;
-  try {
-    const res = await request(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-      headersTimeout: 5_000,
-      bodyTimeout: 5_000,
-    });
-    // Drain to avoid keeping the socket open.
-    await res.body.text().catch(() => {});
-  } catch (err) {
-    // Fire-and-forget: a network blip must not block the trial.
-    log("debug", "try-event post failed", { error: (err as Error).message });
-  }
+/** No-op. This used to POST to `<baseUrl>/api/try/event`; that endpoint went
+ *  away with the hosted backend and now 404s, so the call was doing nothing
+ *  but burning a 5s timeout budget on every `try` / `try-cleanup` / expiry-GC.
+ *
+ *  The `postEvent` seam is deliberately KEPT rather than ripped out: it is an
+ *  injection point in ~15 tests and in doctor's trial GC, and collapsing it
+ *  would churn far more than it cleans. Removing the seam entirely (along with
+ *  TryEventBody and doctor's postTryEvent option) is worth doing on its own. */
+async function defaultPostEvent(_baseUrl: string, _body: TryEventBody): Promise<void> {
+  return;
 }
 
 /** Auto-detect which AI client to install the trial into. Probes in the
