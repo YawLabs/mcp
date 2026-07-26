@@ -11,8 +11,6 @@ export interface ConnectAnalyticsEvent {
     | "activate"
     | "deactivate"
     | "tool_call"
-    | "import"
-    | "install"
     | "health"
     | "suggest"
     | "read_tool"

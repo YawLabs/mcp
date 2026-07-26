@@ -31,7 +31,6 @@ vi.mock("../config.js", async (importOriginal) => {
   };
 });
 
-import { request } from "undici";
 import { fetchConfig } from "../config.js";
 
 // recordDispatchEvent MUST be stubbed here: server.ts calls it on every
@@ -800,9 +799,10 @@ describe("ConnectServer", () => {
       expect(text).toContain("tailscale");
       expect(text).toContain("ran 14x recently");
       expect(text).toContain("install @yawlabs/tailscale-mcp");
-      // The mcp_connect_install sketch is present with the right namespace.
-      expect(text).toContain('namespace: "tailscale"');
-      expect(text).toContain('args: ["-y", "@yawlabs/tailscale-mcp"]');
+      // The nudge points at the CLI, not a meta-tool: `yaw-mcp add <slug>`
+      // is what actually writes ~/.yaw-mcp/bundles.json.
+      expect(text).toContain("run: yaw-mcp add tailscale");
+      expect(text).not.toContain("mcp_connect_install");
     });
 
     it("never leaks a raw history line / argument into the nudge output", () => {
@@ -2729,220 +2729,6 @@ describe("guide resource + session tracking", () => {
     // guideRead gates the nudge, so even with a guide loaded we shouldn't nudge.
     expect(res.content[0].text).toBe("body");
   });
-});
-
-describe("handleImport path validation", () => {
-  let server: ConnectServer;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("rejects a resolved path whose basename is not an allowed MCP config filename", async () => {
-    const priv = getPrivate(server);
-    // Traversal that normalizes to a resolved basename of "passwd" —
-    // must be rejected even though the raw string has "mcp.json" in it.
-    const result = await priv.handleImport("mcp.json/../etc/passwd");
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Only MCP config files are allowed");
-  });
-
-  it("still accepts a real allowed basename", async () => {
-    const priv = getPrivate(server);
-    // This path points to a file that doesn't exist; we just want to
-    // confirm the basename check doesn't reject it before readFile runs.
-    const result = await priv.handleImport("./nonexistent/mcp.json");
-    // Either readFile errors or mcpServers-shape check errors — but
-    // NOT the allowed-filename check.
-    expect(result.content[0].text).not.toContain("Only MCP config files are allowed");
-  });
-
-  it("rejects a resolved path outside both homedir and cwd (existence-oracle probe)", async () => {
-    const priv = getPrivate(server);
-    // An absolute path with an allowed basename but sitting outside
-    // the user's home and cwd — canonical example is `/var/log/...`
-    // on posix. On Windows, resolve() forces drive-absolute, so any
-    // drive root that isn't the user's profile or project works too.
-    const probePath =
-      process.platform === "win32"
-        ? "D:\\weirdplace\\claude_desktop_config.json"
-        : "/var/log/claude_desktop_config.json";
-    const result = await priv.handleImport(probePath);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/home directory or the current working directory/);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// handleInstall integration tests. Mocks the undici `request` call that
-// talks to /api/connect/servers so we can exercise each status-code
-// branch without a live backend. Also covers the network-error mapping
-// (H2) — raw error codes from undici must not leak to the model.
-// ─────────────────────────────────────────────────────────────────────────
-describe("handleInstall", () => {
-  let server: ConnectServer;
-
-  const validArgs = {
-    name: "GitHub",
-    namespace: "gh",
-    type: "local" as const,
-    command: "npx",
-    args: ["-y", "@modelcontextprotocol/server-github"],
-  };
-
-  function mockInstallResponse(statusCode: number, bodyJson: unknown = {}) {
-    vi.mocked(request).mockResolvedValueOnce({
-      statusCode,
-      body: {
-        text: vi.fn().mockResolvedValue(""),
-        json: vi.fn().mockResolvedValue(bodyJson),
-      },
-    } as any);
-  }
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("returns the activate-call hint on 201 happy path", async () => {
-    mockInstallResponse(201, { id: "srv-1", namespace: "gh" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBeFalsy();
-    const text = result.content[0].text;
-    expect(text).toContain('Installed "GitHub"');
-    expect(text).toContain('mcp_connect_activate({ server: "gh" })');
-    expect(text).toContain("into this session");
-  });
-
-  it("omits 'into this session' for remote installs", async () => {
-    mockInstallResponse(201, { id: "srv-2", namespace: "notion" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall({
-      name: "Notion",
-      namespace: "notion",
-      type: "remote",
-      url: "https://mcp.notion.com/mcp",
-    });
-    expect(result.content[0].text).toContain('mcp_connect_activate({ server: "notion" })');
-    expect(result.content[0].text).not.toContain("into this session");
-  });
-
-  it("forwards the plan_limit_exceeded JSON body verbatim on 403", async () => {
-    const errorBody = {
-      code: "plan_limit_exceeded",
-      error: "You've reached the 3-server limit on the free plan.",
-      upgradeUrl: "https://yaw.sh/mcp/dashboard/billing",
-    };
-    mockInstallResponse(403, errorBody);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    // The full JSON body must be in the text so the model can show
-    // the upgrade URL; this is the load-bearing bit of the contract.
-    expect(result.content[0].text).toContain("plan_limit_exceeded");
-    expect(result.content[0].text).toContain("https://yaw.sh/mcp/dashboard/billing");
-  });
-
-  it("returns a namespace-collision message on 409", async () => {
-    mockInstallResponse(409, { error: "namespace already in use" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('Namespace "gh" is already installed');
-    expect(result.content[0].text).toContain("mcp_connect_activate");
-  });
-
-  it("returns the backend's error field on generic 4xx", async () => {
-    mockInstallResponse(400, { error: "namespace must match regex" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Install failed");
-    expect(result.content[0].text).toContain("namespace must match regex");
-  });
-
-  it("falls back to HTTP status when the error body is empty", async () => {
-    mockInstallResponse(502, {});
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("HTTP 502");
-  });
-
-  it("maps undici timeout codes to a friendly timeout message", async () => {
-    const err: Error & { code?: string } = new Error("Headers timeout fired");
-    err.code = "UND_ERR_HEADERS_TIMEOUT";
-    vi.mocked(request).mockRejectedValueOnce(err);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("timed out");
-    // Raw error internals must not leak.
-    expect(result.content[0].text).not.toContain("UND_ERR_HEADERS_TIMEOUT");
-    expect(result.content[0].text).not.toContain("Headers timeout fired");
-  });
-
-  it("maps ECONNREFUSED to a network-unreachable message", async () => {
-    const err: Error & { code?: string } = new Error("connect ECONNREFUSED 127.0.0.1:443");
-    err.code = "ECONNREFUSED";
-    vi.mocked(request).mockRejectedValueOnce(err);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("network unreachable or DNS failure");
-    expect(result.content[0].text).not.toContain("127.0.0.1");
-  });
-
-  it("unwraps err.cause.code when the top-level error has no code", async () => {
-    const err = new Error("fetch failed", { cause: { code: "ENOTFOUND" } });
-    vi.mocked(request).mockRejectedValueOnce(err);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.content[0].text).toContain("network unreachable or DNS failure");
-  });
-
-  it("falls back to a generic message for unrecognized errors", async () => {
-    vi.mocked(request).mockRejectedValueOnce(new Error("something weird happened"));
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Install failed unexpectedly");
-    // The raw error string must not appear in user-facing text.
-    expect(result.content[0].text).not.toContain("something weird happened");
-  });
-
-  it("returns the validation error text without hitting the network on bad input", async () => {
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall({ name: "X", type: "local" }); // missing namespace
-    expect(result.isError).toBe(true);
-    // No network call should have been made.
-    expect(vi.mocked(request)).not.toHaveBeenCalled();
-  });
-
-  it("warns but still returns success when config refresh times out", async () => {
-    mockInstallResponse(201, { id: "srv-3", namespace: "gh" });
-    // Make fetchConfig hang so the 3s refresh race loses.
-    vi.mocked(fetchConfig).mockImplementationOnce(
-      () => new Promise((resolve) => setTimeout(() => resolve({ servers: [], configVersion: "v2" }), 10_000)),
-    );
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBeFalsy();
-    // Hint must tell the model to wait ~60s before calling activate.
-    expect(result.content[0].text).toContain("within ~60s");
-    expect(result.content[0].text).toContain('mcp_connect_activate({ server: "gh" })');
-  }, 10_000);
 });
 
 describe("prewarmDormantServers", () => {

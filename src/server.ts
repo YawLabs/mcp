@@ -1,6 +1,4 @@
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -11,7 +9,6 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
@@ -46,7 +43,7 @@ import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge 
 import { LearningStore } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { buildInstallPayload, computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
+import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { loadState, saveState } from "./persistence.js";
 import { createProgressReporter, type ProgressReporter } from "./progress.js";
@@ -225,18 +222,6 @@ export function resolveNamespaces(args: Record<string, unknown>): string[] {
     return [args.server];
   }
   return [];
-}
-
-/** Derive a safe namespace from an imported mcpServers key: lowercase,
- *  non-alphanumerics to underscore, trimmed of leading/trailing
- *  underscores, capped at 30 chars. Can return "" (all-special-char key),
- *  and two different keys can collide -- handleImport reports both. */
-export function sanitizeNamespace(key: string): string {
-  return key
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 30);
 }
 
 /** Shallow value-equality for two env maps (undefined == undefined). */
@@ -1033,30 +1018,6 @@ export class ConnectServer {
           errorCategory: category,
         });
       }
-      return this.attachGuideNudge(result);
-    }
-    if (name === META_TOOLS.import_config.name) {
-      const result = await this.handleImport(args.filepath as string);
-      recordConnectEvent({
-        namespace: null,
-        toolName: null,
-        action: "import",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
-      return this.attachGuideNudge(result);
-    }
-    if (name === META_TOOLS.install.name) {
-      const result = await this.handleInstall(args);
-      recordConnectEvent({
-        namespace: typeof args.namespace === "string" ? args.namespace : null,
-        toolName: null,
-        action: "install",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.health.name) {
@@ -1891,7 +1852,10 @@ export class ConnectServer {
   //     with the installed set),
   //   - skip if the per-CLI cooldown hasn't elapsed (shouldNudge).
   // Surviving CLIs are recorded (recordNudge) so they stay suppressed for
-  // the cooldown, and rendered as one line + an mcp_connect_install sketch.
+  // the cooldown, and rendered as one line + the `yaw-mcp add <slug>` CLI
+  // command that installs the server. The nudge points at the CLI rather
+  // than a meta-tool: adding a server writes ~/.yaw-mcp/bundles.json, which
+  // is the CLI's job, and the model can surface the command to the user.
   //
   // Privacy: the only data emitted is the aggregate integer count + the
   // first-party package / namespace / name. No raw history line, command
@@ -1931,8 +1895,7 @@ export class ConnectServer {
     const lines: string[] = ["\nInstall candidates (from your recent shell usage; history stays local):"];
     for (const { cli, count, target } of candidates) {
       lines.push(`  ${cli.padEnd(10)} (ran ${count}x recently) -> install ${target.package}`);
-      const sketch = `mcp_connect_install({ name: ${JSON.stringify(target.name)}, namespace: ${JSON.stringify(target.namespace)}, type: "local", command: "npx", args: ["-y", ${JSON.stringify(target.package)}] })`;
-      lines.push(`     ${sketch}`);
+      lines.push(`     run: yaw-mcp add ${target.namespace}`);
       // Suppress this CLI for the cooldown now that we've surfaced it.
       recordNudge(cli, this.nudgeHome);
     }
@@ -2869,328 +2832,6 @@ export class ConnectServer {
     };
     this.pollTimer = setTimeout(poll, intervalMs);
     if (this.pollTimer.unref) this.pollTimer.unref();
-  }
-
-  private async handleImport(
-    filepath: string,
-  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-    if (this.localMode) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "mcp_connect_import is not available in local mode. Add servers by editing ~/.yaw-mcp/bundles.json directly, or set YAW_MCP_TOKEN to use a Yaw MCP account.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    if (!filepath) {
-      return { content: [{ type: "text", text: "filepath is required." }], isError: true };
-    }
-
-    // Security: only allow known MCP config filenames. The check must
-    // run on the RESOLVED path's basename, not the caller-supplied
-    // string — otherwise `some/dir/mcp.json/../../../etc/passwd` would
-    // have basename "passwd" and correctly fail, but a path like
-    // `/weird/place/claude_desktop_config.json` would succeed at the
-    // basename check even though the intent was to restrict reads to
-    // well-known MCP config locations. Computing the basename on
-    // `resolved` normalizes `..` segments and handles ~ expansion
-    // before we decide whether the file is allowed.
-    const ALLOWED_FILENAMES = ["claude_desktop_config.json", "mcp.json", "settings.json", "mcp_config.json"];
-
-    try {
-      const resolved =
-        filepath.startsWith("~/") || filepath.startsWith("~\\")
-          ? resolve(homedir(), filepath.slice(2))
-          : resolve(filepath);
-      const resolvedBasename = resolved.split(/[/\\]/).pop() || "";
-      if (!ALLOWED_FILENAMES.includes(resolvedBasename)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Only MCP config files are allowed: ${ALLOWED_FILENAMES.join(", ")}. Got: ${resolvedBasename}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      // Scope the file read to the user's home dir OR cwd. The
-      // basename allowlist above stops arbitrary reads from proving
-      // contents, but a caller can still probe for file existence at
-      // odd paths (e.g. `/var/log/claude_desktop_config.json`). All
-      // legitimate imports live under home (Claude Desktop configs)
-      // or cwd (project-local `.mcp.json`), so anything outside both
-      // is almost certainly an oracle probe — refuse it.
-      //
-      // `path.relative` returns an absolute-looking string when the
-      // two paths sit on different Windows drives (no relative-traversal
-      // between C: and D: exists), so the `..`-prefix check alone
-      // isn't enough on Windows — also treat an absolute return value
-      // as "outside".
-      const isUnder = (base: string, p: string) => {
-        const rel = relative(base, p);
-        return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-      };
-      if (!isUnder(homedir(), resolved) && !isUnder(process.cwd(), resolved)) {
-        return {
-          content: [
-            { type: "text", text: "Import path must be under your home directory or the current working directory." },
-          ],
-          isError: true,
-        };
-      }
-      const raw = await readFile(resolved, "utf-8");
-      const parsed = JSON.parse(raw);
-
-      // Only parse if file has mcpServers key
-      if (!parsed.mcpServers || typeof parsed.mcpServers !== "object" || Array.isArray(parsed.mcpServers)) {
-        return {
-          content: [{ type: "text", text: `No mcpServers object found in ${resolved}` }],
-          isError: true,
-        };
-      }
-      const mcpServers: Record<string, any> = parsed.mcpServers;
-
-      // Note: env vars are NOT sent to the cloud for security — users must set them in the dashboard
-      const servers: Array<{
-        name: string;
-        namespace: string;
-        type: string;
-        command?: string;
-        args?: string[];
-        url?: string;
-      }> = [];
-
-      for (const [key, value] of Object.entries(mcpServers)) {
-        if (!value || typeof value !== "object") continue;
-        // Skip ourselves
-        if (key === "yaw-mcp" || key === "mcp.hosting" || key === "mcp-connect") continue;
-
-        const namespace = sanitizeNamespace(key);
-        if (!namespace) continue;
-
-        const entry: (typeof servers)[0] = {
-          name: key,
-          namespace,
-          type: (value as any).url ? "remote" : "local",
-        };
-
-        if ((value as any).command && typeof (value as any).command === "string")
-          entry.command = (value as any).command;
-        if (Array.isArray((value as any).args)) entry.args = (value as any).args;
-        // env vars deliberately NOT sent — set them in the Yaw MCP dashboard
-        if ((value as any).url && typeof (value as any).url === "string") entry.url = (value as any).url;
-
-        servers.push(entry);
-      }
-
-      if (servers.length === 0) {
-        return { content: [{ type: "text", text: `No servers found in ${resolved}` }], isError: true };
-      }
-
-      // Detect namespace collisions from sanitization
-      const nsToKeys = new Map<string, string[]>();
-      for (const s of servers) {
-        const existing = nsToKeys.get(s.namespace) ?? [];
-        existing.push(s.name);
-        nsToKeys.set(s.namespace, existing);
-      }
-      const collisions = [...nsToKeys.entries()].filter(([, keys]) => keys.length > 1);
-
-      // POST to the bulk import endpoint
-      const res = await request(`${this.apiUrl.replace(/\/$/, "")}/api/connect/import`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ servers }),
-        headersTimeout: 15_000,
-        bodyTimeout: 15_000,
-      });
-
-      let body: any;
-      try {
-        body = await res.body.json();
-      } catch {
-        body = {};
-      }
-
-      if (res.statusCode >= 400) {
-        return {
-          content: [{ type: "text", text: `Import failed: ${body.error || `HTTP ${res.statusCode}`}` }],
-          isError: true,
-        };
-      }
-
-      // Refresh config to pick up imported servers
-      await this.fetchAndApplyConfig().catch((err: Error) =>
-        log("warn", "Post-import config refresh failed", { error: err?.message }),
-      );
-
-      const namespaceList = servers.map((s) => s.namespace).join(", ");
-      const collisionWarning =
-        collisions.length > 0
-          ? `\n\nWarning: namespace collisions detected — these names mapped to the same namespace:\n${collisions.map(([ns, keys]) => `  ${ns} ← ${keys.join(", ")}`).join("\n")}\nOnly one will be kept.`
-          : "";
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Imported ${body.imported || 0} servers (${namespaceList})${body.skipped ? `, ${body.skipped} skipped (already exist)` : ""} from ${resolved}.${collisionWarning}\n\nNote: environment variables (API keys, tokens) were NOT imported for security — set them at yaw.sh/mcp.\nUse mcp_connect_discover to see imported servers.`,
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const { code, text } = this.mapNetworkError(err, "Import");
-      log("warn", "handleImport error", {
-        error: err instanceof Error ? err.message : String(err),
-        code,
-      });
-      return { content: [{ type: "text", text }], isError: true };
-    }
-  }
-
-  // Install a new MCP server on the user's Yaw MCP account. Validates
-  // via the shared buildInstallPayload helper so local/remote + namespace
-  // shape errors fail here with a clear message instead of burning a
-  // round-trip to the backend. On 403 plan-limit we forward the structured
-  // error body verbatim (JSON) — the model surfaces that to the user so
-  // the upgrade URL is visible in chat. On 201 we force a config refetch
-  // so `discover` sees the new namespace without waiting for the 60s
-  // poll.
-  private async handleInstall(
-    args: Record<string, unknown>,
-  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-    if (this.localMode) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "mcp_connect_install is not available in local mode. Add servers by editing ~/.yaw-mcp/bundles.json directly, or set YAW_MCP_TOKEN to use a Yaw MCP account.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    const built = buildInstallPayload(args);
-    if (!built.ok) {
-      return { content: [{ type: "text", text: built.message }], isError: true };
-    }
-    const payload = built.payload;
-
-    try {
-      const res = await request(`${this.apiUrl.replace(/\/$/, "")}/api/connect/servers`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-        headersTimeout: 15_000,
-        bodyTimeout: 15_000,
-      });
-
-      let body: any;
-      try {
-        body = await res.body.json();
-      } catch {
-        body = {};
-      }
-
-      // Plan-cap: forward the backend's structured body so the model can
-      // render the upgrade URL. Returning the JSON verbatim is the
-      // load-bearing bit of the yaw-mcp install-tool contract — see
-      // buildPlanLimitExceededError in mcp-hosting/src/lib/plans.ts.
-      if (res.statusCode === 403 && body && body.code === "plan_limit_exceeded") {
-        return {
-          content: [{ type: "text", text: JSON.stringify(body, null, 2) }],
-          isError: true,
-        };
-      }
-
-      if (res.statusCode === 409) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Namespace "${payload.namespace}" is already installed. Use mcp_connect_activate to load its tools, or pick a different namespace.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      if (res.statusCode >= 400) {
-        return {
-          content: [{ type: "text", text: `Install failed: ${body.error || `HTTP ${res.statusCode}`}` }],
-          isError: true,
-        };
-      }
-
-      // Refresh config so the new server shows up in discover immediately.
-      // Race against a 3s timeout — if the backend is slow, the install
-      // itself already succeeded and the next 60s poll will catch the new
-      // namespace; better to return than hang the tool call. If the race
-      // loses, we tell the model to expect a brief delay so it doesn't
-      // immediately call activate on a namespace the client hasn't seen.
-      let configFresh = true;
-      try {
-        await Promise.race([
-          this.fetchAndApplyConfig(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("refresh timeout")), 3000)),
-        ]);
-      } catch (err) {
-        configFresh = false;
-        log("warn", "Post-install config refresh failed", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-
-      const activateCall = `mcp_connect_activate({ server: "${payload.namespace}" })`;
-      const activateHint = configFresh
-        ? `Call ${activateCall} to load its tools${payload.type === "local" ? " into this session" : ""}.`
-        : `The new server will appear in mcp_connect_discover within ~60s. If the first ${activateCall} reports an unknown namespace, wait a minute and retry.`;
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Installed "${payload.name}" (namespace "${payload.namespace}"). ${activateHint}`,
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const { code, text } = this.mapNetworkError(err, "Install");
-      log("warn", "handleInstall error", {
-        error: err instanceof Error ? err.message : String(err),
-        code,
-      });
-      return { content: [{ type: "text", text }], isError: true };
-    }
-  }
-
-  // Map a raw undici/network error to a user-facing string instead of
-  // leaking `err.message` (e.g. "getaddrinfo ENOTFOUND yaw.sh") verbatim to
-  // the model. Returns the extracted node error code (for ops logging) and a
-  // clean message keyed by the failing operation verb ("Install"/"Import").
-  // Callers keep the raw error in the log; the LLM/user only sees `text`.
-  private mapNetworkError(err: unknown, op: "Install" | "Import"): { code: string | undefined; text: string } {
-    const code =
-      typeof err === "object" && err !== null
-        ? (err as { code?: string; cause?: { code?: string } }).code || (err as any).cause?.code
-        : undefined;
-    let text: string;
-    if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
-      text = `${op} timed out talking to yaw.sh/mcp. Retry in a moment.`;
-    } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
-      text = `Couldn't reach yaw.sh/mcp (network unreachable or DNS failure). Check your connection and retry.`;
-    } else {
-      text = `${op} failed unexpectedly. Check yaw-mcp logs on this machine for the underlying error.`;
-    }
-    return { code, text };
   }
 
   // Signature-on-demand: return one tool's full input schema without
