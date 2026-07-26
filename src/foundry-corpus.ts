@@ -11,7 +11,7 @@
 //   weights/tokenization doesn't drop real-world choices out of contention.
 //   It does NOT claim `chosen` was the objectively correct server; richer
 //   ground-truth labels (re-dispatch / graded-reward / thumbs) are a future
-//   enrichment. Because it scores the BM25 floor (no Voyage key needed), it
+//   enrichment. Because it scores the BM25 floor (no semantic stage), it
 //   runs in CI exactly like routing-quality.test.ts.
 //
 // The corpus is a checked-in fixture, not live data. A maintainer runs

@@ -15,13 +15,13 @@ export interface UpstreamServerConfig {
   url?: string;
   isActive: boolean;
   /**
-   * Per-server connect timeout in milliseconds, as set in the dashboard.
+   * Per-server connect timeout in milliseconds, as set in bundles.json.
    * Overrides the global MCP_CONNECT_TIMEOUT env var for this specific server.
    * Absent means "use the global default".
    */
   connectTimeoutMs?: number;
   // Free-text summary used by the BM25 ranker for dispatch + context-aware
-  // discover. Set in the Yaw MCP dashboard; absent on older deployments.
+  // discover. Optional in bundles.json; absent on most entries.
   description?: string;
   // Tools yaw-mcp reported back after the first activation in some earlier
   // session — used to rank servers that aren't currently connected, so
@@ -43,7 +43,7 @@ export interface UpstreamServerConfig {
    * hatch when a config-level default of "oam" is set (bundles.json
    * `defaultRuntime` / YAW_MCP_DEFAULT_RUNTIME; see default-runtime.ts).
    * Absent = the config-level default, or node when none is set. Per-server
-   * -- set in bundles.json or the dashboard. See oam-spawn.ts.
+   * -- set in bundles.json. See oam-spawn.ts.
    */
   runtime?: "oam" | "node";
 }

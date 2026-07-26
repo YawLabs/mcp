@@ -4,16 +4,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock external dependencies before importing the module under test
-vi.mock("undici", () => ({
-  request: vi.fn().mockResolvedValue({
-    statusCode: 200,
-    body: {
-      text: vi.fn().mockResolvedValue(""),
-      json: vi.fn().mockResolvedValue({ servers: [], configVersion: "v1" }),
-    },
-  }),
-}));
-
 vi.mock("../upstream.js", async (importOriginal) => {
   const actual = (await importOriginal()) as any;
   return {
@@ -23,29 +13,6 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../config.js", async (importOriginal) => {
-  const actual = (await importOriginal()) as any;
-  return {
-    ...actual,
-    fetchConfig: vi.fn().mockResolvedValue({ servers: [], configVersion: "v1" }),
-  };
-});
-
-import { request } from "undici";
-import { fetchConfig } from "../config.js";
-
-// recordDispatchEvent MUST be stubbed here: server.ts calls it on every
-// proxied tool call, and a missing export would throw a TypeError that the
-// production catch-all swallows -- the telemetry would silently never fire
-// and no test would notice.
-vi.mock("../analytics.js", () => ({
-  initAnalytics: vi.fn(),
-  recordConnectEvent: vi.fn(),
-  recordDispatchEvent: vi.fn(),
-  shutdownAnalytics: vi.fn().mockResolvedValue(undefined),
-}));
-
-import { recordDispatchEvent } from "../analytics.js";
 import { buildToolList } from "../proxy.js";
 import {
   ConnectServer,
@@ -105,7 +72,7 @@ describe("ConnectServer", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -153,7 +120,7 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("Disabled servers:");
-      expect(text).toContain("old — Old Server (disabled in dashboard)");
+      expect(text).toContain('old — Old Server ("isActive": false in bundles.json)');
     });
 
     it("shows cached tools for inactive connections", () => {
@@ -259,8 +226,8 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).toContain("https://yaw.sh/mcp/explore");
-      expect(text).toContain("within 60s");
+      expect(text).toContain("https://yaw.sh/mcp/catalog/");
+      expect(text).toContain("yaw-mcp add <slug>");
     });
 
     it("omits the marketplace hint once the user has plenty of servers", () => {
@@ -277,7 +244,7 @@ describe("ConnectServer", () => {
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).not.toContain("https://yaw.sh/mcp/explore");
+      expect(text).not.toContain("https://yaw.sh/mcp/catalog/");
     });
 
     it("includes the marketplace pointer in the empty-state message", () => {
@@ -289,7 +256,7 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("No servers installed");
-      expect(text).toContain("https://yaw.sh/mcp/explore");
+      expect(text).toContain("https://yaw.sh/mcp/catalog/");
     });
   });
 
@@ -474,7 +441,8 @@ describe("ConnectServer", () => {
       expect(result.isError).toBe(true);
       const text = result.content[0].text;
       expect(text).toContain("installed but disabled");
-      expect(text).toContain("https://yaw.sh/mcp");
+      expect(text).toContain('"isActive": true');
+      expect(text).toContain("~/.yaw-mcp/bundles.json");
     });
 
     it("skips already-active servers", async () => {
@@ -800,9 +768,10 @@ describe("ConnectServer", () => {
       expect(text).toContain("tailscale");
       expect(text).toContain("ran 14x recently");
       expect(text).toContain("install @yawlabs/tailscale-mcp");
-      // The mcp_connect_install sketch is present with the right namespace.
-      expect(text).toContain('namespace: "tailscale"');
-      expect(text).toContain('args: ["-y", "@yawlabs/tailscale-mcp"]');
+      // The nudge points at the CLI, not a meta-tool: `yaw-mcp add <slug>`
+      // is what actually writes ~/.yaw-mcp/bundles.json.
+      expect(text).toContain("run: yaw-mcp add tailscale");
+      expect(text).not.toContain("mcp_connect_install");
     });
 
     it("never leaks a raw history line / argument into the nudge output", () => {
@@ -871,22 +840,6 @@ describe("ConnectServer", () => {
       // Second call within the cooldown is suppressed.
       const second = priv.buildInstallCandidatesLines(priv.getProfiledActiveServers()).join("\n");
       expect(second).toBe("");
-    });
-
-    it("nudge output is NOT sent to analytics (local-only by construction)", async () => {
-      const { recordConnectEvent } = await import("../analytics.js");
-      const priv = getPrivate(server);
-      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
-      priv.installNudge = true;
-      primeHistory(server, HEAVY("tailscale"));
-
-      priv.handleDiscover();
-      // discover is read-only telemetry-wise; the nudge path adds no
-      // analytics event carrying history data.
-      const calls = vi.mocked(recordConnectEvent).mock.calls;
-      for (const [arg] of calls) {
-        expect(JSON.stringify(arg)).not.toContain("tailscale");
-      }
     });
   });
 
@@ -1641,7 +1594,7 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([]);
       const result = await priv.handleReadTool("gh", "create_issue");
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("not installed on this account");
+      expect(result.content[0].text).toContain("is not in ~/.yaw-mcp/bundles.json");
     });
 
     it("reads the schema from a loaded server without reconnecting", async () => {
@@ -1763,38 +1716,6 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toBe("Issue created");
       expect(conn.health.totalCalls).toBe(1);
       expect(conn.health.totalLatencyMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it("records a dispatch telemetry event for a proxied tool call", async () => {
-      // Guards the analytics mock as much as the code: server.ts calls
-      // recordDispatchEvent inside a try/catch, so an unstubbed export
-      // (TypeError) would be swallowed and the telemetry would silently
-      // stop firing. Assert the payload shape, not just the call.
-      const priv = getPrivate(server);
-      const conn = makeConnection("gh", ["create_issue"]);
-      conn.client.callTool = vi.fn().mockResolvedValue({
-        content: [{ type: "text", text: "Issue created" }],
-      });
-      priv.connections.set("gh", conn);
-      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-      priv.rebuildRoutes();
-
-      await priv.handleToolCall("gh_create_issue", { title: "test" });
-
-      expect(vi.mocked(recordDispatchEvent)).toHaveBeenCalledTimes(1);
-      const event = vi.mocked(recordDispatchEvent).mock.calls[0][0];
-      expect(event.scope).toBe("connect");
-      // The upstream's own tool name, not the namespaced alias.
-      expect(event.toolName).toBe("create_issue");
-      expect(event.requestBytes).toBe(Buffer.byteLength(JSON.stringify({ title: "test" }), "utf8"));
-      expect(event.responseBytesRaw).toBeGreaterThan(0);
-    });
-
-    it("meta-tool calls do NOT emit a dispatch telemetry event", async () => {
-      const priv = getPrivate(server);
-      priv.config = makeConfig([]);
-      await priv.handleToolCall("mcp_connect_discover", {});
-      expect(vi.mocked(recordDispatchEvent)).not.toHaveBeenCalled();
     });
 
     it("tracks error health on failed tool calls", async () => {
@@ -2058,7 +1979,7 @@ describe("ConnectServer", () => {
       expect(text).toContain("Bundles partially installed:");
       expect(text).toContain("devops-incident");
       expect(text).toContain("missing: pagerduty");
-      expect(text).toContain("https://yaw.sh/mcp/explore");
+      expect(text).toContain("yaw-mcp add ");
     });
 
     it("routes meta-tool exec through a two-step pipeline with $ref binding", async () => {
@@ -2241,67 +2162,7 @@ describe("ConnectServer", () => {
     });
   });
 
-  describe("YAW_MCP_POLL_INTERVAL env var", () => {
-    // vi.unstubAllEnvs() restores every stubbed env var after each case so
-    // test order can't leak into unrelated suites.
-    afterEach(() => {
-      vi.unstubAllEnvs();
-    });
-
-    it("defaults to a ~60s poll when the env var is unset", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-
-    it("respects a custom interval when YAW_MCP_POLL_INTERVAL is set to a positive integer", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "300");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-
-    it("disables polling entirely when YAW_MCP_POLL_INTERVAL=0", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "0");
-      const priv = getPrivate(server);
-      priv.pollTimer = null;
-      priv.startPolling();
-      expect(priv.pollTimer).toBeNull();
-    });
-
-    it("falls back to the default when the env var is garbage", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "not-a-number");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-
-    it("falls back to the default when the env var is negative", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "-30");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-  });
-
   describe("shutdown", () => {
-    it("clears poll timer", async () => {
-      const priv = getPrivate(server);
-      priv.pollTimer = setTimeout(() => {}, 60000);
-
-      await server.shutdown();
-      expect(priv.pollTimer).toBeNull();
-    });
-
     it("disconnects all upstream connections", async () => {
       const priv = getPrivate(server);
       priv.connections.set("gh", makeConnection("gh"));
@@ -2319,7 +2180,7 @@ describe("argsEqual (via reconcileConfig)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2368,13 +2229,11 @@ describe("argsEqual (via reconcileConfig)", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// Concurrency and atomicity regression tests. These cover the three
-// races exposed by the review:
+// Concurrency and atomicity regression tests. These cover the races
+// exposed by the review:
 //   1. activateOne — two concurrent callers for the same namespace must
 //      share one spawn, not race to double-spawn.
-//   2. fetchAndApplyConfig — this.config must be set before reconcile's
-//      awaits so readers don't observe the stale config mid-reconcile.
-//   3. handleToolCall — the routes map captured at method entry must be
+//   2. handleToolCall — the routes map captured at method entry must be
 //      used for the actual call, even if rebuildRoutes fires during
 //      the auto-reconnect awaits.
 // ─────────────────────────────────────────────────────────────────────────
@@ -2383,7 +2242,7 @@ describe("activateOne dedup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2441,7 +2300,7 @@ describe("exec step-level split-blame attribution", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2508,67 +2367,12 @@ describe("exec step-level split-blame attribution", () => {
   });
 });
 
-describe("fetchAndApplyConfig atomicity", () => {
-  let server: ConnectServer;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("updates this.config and configVersion before reconcileConfig's awaits", async () => {
-    const priv = getPrivate(server);
-    // Seed the "old" config: one active upstream gh.
-    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-    priv.configVersion = "old-v";
-    priv.connections.set("gh", makeConnection("gh"));
-
-    // The new config removes gh. reconcileConfig will disconnect it
-    // and await the disconnect. That await is our observation point:
-    // by then, this.config should already be the NEW config.
-    vi.mocked(fetchConfig).mockResolvedValueOnce({ servers: [], configVersion: "new-v" } as any);
-
-    let seenVersion: string | null = null;
-    let seenServerCount: number | null = null;
-    vi.mocked(disconnectFromUpstream).mockImplementationOnce(async () => {
-      seenVersion = priv.configVersion;
-      seenServerCount = priv.config.servers.length;
-    });
-
-    await priv.fetchAndApplyConfig();
-
-    // If the old code ordering were still in place, these would see
-    // the stale config (configVersion "old-v", 1 server).
-    expect(seenVersion).toBe("new-v");
-    expect(seenServerCount).toBe(0);
-  });
-
-  it("prunes expired activationFailures before fetching new config", async () => {
-    const priv = getPrivate(server);
-    const sixMinutesAgo = Date.now() - 6 * 60 * 1000;
-    priv.activationFailures.set("old", { at: sixMinutesAgo, message: "stale" });
-    priv.activationFailures.set("recent", { at: Date.now(), message: "fresh" });
-
-    // 304 shortcut — we only care that the prune sweep ran at the top.
-    vi.mocked(fetchConfig).mockResolvedValueOnce(null as any);
-
-    await priv.fetchAndApplyConfig();
-
-    expect(priv.activationFailures.has("old")).toBe(false);
-    expect(priv.activationFailures.has("recent")).toBe(true);
-  });
-});
-
 describe("handleToolCall route snapshot", () => {
   let server: ConnectServer;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2607,7 +2411,7 @@ describe("guide resource + session tracking", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2731,226 +2535,12 @@ describe("guide resource + session tracking", () => {
   });
 });
 
-describe("handleImport path validation", () => {
-  let server: ConnectServer;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("rejects a resolved path whose basename is not an allowed MCP config filename", async () => {
-    const priv = getPrivate(server);
-    // Traversal that normalizes to a resolved basename of "passwd" —
-    // must be rejected even though the raw string has "mcp.json" in it.
-    const result = await priv.handleImport("mcp.json/../etc/passwd");
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Only MCP config files are allowed");
-  });
-
-  it("still accepts a real allowed basename", async () => {
-    const priv = getPrivate(server);
-    // This path points to a file that doesn't exist; we just want to
-    // confirm the basename check doesn't reject it before readFile runs.
-    const result = await priv.handleImport("./nonexistent/mcp.json");
-    // Either readFile errors or mcpServers-shape check errors — but
-    // NOT the allowed-filename check.
-    expect(result.content[0].text).not.toContain("Only MCP config files are allowed");
-  });
-
-  it("rejects a resolved path outside both homedir and cwd (existence-oracle probe)", async () => {
-    const priv = getPrivate(server);
-    // An absolute path with an allowed basename but sitting outside
-    // the user's home and cwd — canonical example is `/var/log/...`
-    // on posix. On Windows, resolve() forces drive-absolute, so any
-    // drive root that isn't the user's profile or project works too.
-    const probePath =
-      process.platform === "win32"
-        ? "D:\\weirdplace\\claude_desktop_config.json"
-        : "/var/log/claude_desktop_config.json";
-    const result = await priv.handleImport(probePath);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/home directory or the current working directory/);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// handleInstall integration tests. Mocks the undici `request` call that
-// talks to /api/connect/servers so we can exercise each status-code
-// branch without a live backend. Also covers the network-error mapping
-// (H2) — raw error codes from undici must not leak to the model.
-// ─────────────────────────────────────────────────────────────────────────
-describe("handleInstall", () => {
-  let server: ConnectServer;
-
-  const validArgs = {
-    name: "GitHub",
-    namespace: "gh",
-    type: "local" as const,
-    command: "npx",
-    args: ["-y", "@modelcontextprotocol/server-github"],
-  };
-
-  function mockInstallResponse(statusCode: number, bodyJson: unknown = {}) {
-    vi.mocked(request).mockResolvedValueOnce({
-      statusCode,
-      body: {
-        text: vi.fn().mockResolvedValue(""),
-        json: vi.fn().mockResolvedValue(bodyJson),
-      },
-    } as any);
-  }
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("returns the activate-call hint on 201 happy path", async () => {
-    mockInstallResponse(201, { id: "srv-1", namespace: "gh" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBeFalsy();
-    const text = result.content[0].text;
-    expect(text).toContain('Installed "GitHub"');
-    expect(text).toContain('mcp_connect_activate({ server: "gh" })');
-    expect(text).toContain("into this session");
-  });
-
-  it("omits 'into this session' for remote installs", async () => {
-    mockInstallResponse(201, { id: "srv-2", namespace: "notion" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall({
-      name: "Notion",
-      namespace: "notion",
-      type: "remote",
-      url: "https://mcp.notion.com/mcp",
-    });
-    expect(result.content[0].text).toContain('mcp_connect_activate({ server: "notion" })');
-    expect(result.content[0].text).not.toContain("into this session");
-  });
-
-  it("forwards the plan_limit_exceeded JSON body verbatim on 403", async () => {
-    const errorBody = {
-      code: "plan_limit_exceeded",
-      error: "You've reached the 3-server limit on the free plan.",
-      upgradeUrl: "https://yaw.sh/mcp/dashboard/billing",
-    };
-    mockInstallResponse(403, errorBody);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    // The full JSON body must be in the text so the model can show
-    // the upgrade URL; this is the load-bearing bit of the contract.
-    expect(result.content[0].text).toContain("plan_limit_exceeded");
-    expect(result.content[0].text).toContain("https://yaw.sh/mcp/dashboard/billing");
-  });
-
-  it("returns a namespace-collision message on 409", async () => {
-    mockInstallResponse(409, { error: "namespace already in use" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('Namespace "gh" is already installed');
-    expect(result.content[0].text).toContain("mcp_connect_activate");
-  });
-
-  it("returns the backend's error field on generic 4xx", async () => {
-    mockInstallResponse(400, { error: "namespace must match regex" });
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Install failed");
-    expect(result.content[0].text).toContain("namespace must match regex");
-  });
-
-  it("falls back to HTTP status when the error body is empty", async () => {
-    mockInstallResponse(502, {});
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("HTTP 502");
-  });
-
-  it("maps undici timeout codes to a friendly timeout message", async () => {
-    const err: Error & { code?: string } = new Error("Headers timeout fired");
-    err.code = "UND_ERR_HEADERS_TIMEOUT";
-    vi.mocked(request).mockRejectedValueOnce(err);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("timed out");
-    // Raw error internals must not leak.
-    expect(result.content[0].text).not.toContain("UND_ERR_HEADERS_TIMEOUT");
-    expect(result.content[0].text).not.toContain("Headers timeout fired");
-  });
-
-  it("maps ECONNREFUSED to a network-unreachable message", async () => {
-    const err: Error & { code?: string } = new Error("connect ECONNREFUSED 127.0.0.1:443");
-    err.code = "ECONNREFUSED";
-    vi.mocked(request).mockRejectedValueOnce(err);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("network unreachable or DNS failure");
-    expect(result.content[0].text).not.toContain("127.0.0.1");
-  });
-
-  it("unwraps err.cause.code when the top-level error has no code", async () => {
-    const err = new Error("fetch failed", { cause: { code: "ENOTFOUND" } });
-    vi.mocked(request).mockRejectedValueOnce(err);
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.content[0].text).toContain("network unreachable or DNS failure");
-  });
-
-  it("falls back to a generic message for unrecognized errors", async () => {
-    vi.mocked(request).mockRejectedValueOnce(new Error("something weird happened"));
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Install failed unexpectedly");
-    // The raw error string must not appear in user-facing text.
-    expect(result.content[0].text).not.toContain("something weird happened");
-  });
-
-  it("returns the validation error text without hitting the network on bad input", async () => {
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall({ name: "X", type: "local" }); // missing namespace
-    expect(result.isError).toBe(true);
-    // No network call should have been made.
-    expect(vi.mocked(request)).not.toHaveBeenCalled();
-  });
-
-  it("warns but still returns success when config refresh times out", async () => {
-    mockInstallResponse(201, { id: "srv-3", namespace: "gh" });
-    // Make fetchConfig hang so the 3s refresh race loses.
-    vi.mocked(fetchConfig).mockImplementationOnce(
-      () => new Promise((resolve) => setTimeout(() => resolve({ servers: [], configVersion: "v2" }), 10_000)),
-    );
-    const priv = getPrivate(server);
-    const result = await priv.handleInstall(validArgs);
-    expect(result.isError).toBeFalsy();
-    // Hint must tell the model to wait ~60s before calling activate.
-    expect(result.content[0].text).toContain("within ~60s");
-    expect(result.content[0].text).toContain('mcp_connect_activate({ server: "gh" })');
-  }, 10_000);
-});
-
 describe("prewarmDormantServers", () => {
   let server: ConnectServer;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -3055,7 +2645,7 @@ describe("auto-load on startup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -3204,7 +2794,7 @@ describe("prewarm race: explicit activate during prewarm inflight", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -3297,7 +2887,7 @@ describe("reconcileConfig: detects type and connectTimeoutMs changes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {

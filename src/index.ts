@@ -2,8 +2,7 @@ import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
-import { ConfigError } from "./config.js";
-import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
+import { loadYawMcpConfig } from "./config-loader.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
@@ -246,12 +245,12 @@ if (subcommand === "compliance") {
   dispatch("secrets", runSecrets(parsed.options));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
-  yaw-mcp — one install, every MCP server, managed from the cloud.
+  yaw-mcp — one install, every MCP server, managed from one place.
 
   Quickstart:
     1. Install yaw-mcp      yaw-mcp install claude-code
     2. Verify setup         yaw-mcp doctor
-    3. Add a server         yaw-mcp add <slug>   (browse https://yaw.sh/mcp/explore)
+    3. Add a server         yaw-mcp add <slug>   (browse https://yaw.sh/mcp/catalog/)
 
   Setup (connect a client to yaw-mcp):
     install <client>         Connect one MCP client to yaw-mcp. This wires the
@@ -278,11 +277,11 @@ if (subcommand === "compliance") {
   Inspection:
     doctor                   Diagnose setup: config, token, clients, learning,
                              upgrade, flaky-namespace reliability rollup.
-    servers [<filter>]       List servers in your yaw.sh/mcp dashboard; the
-                             positional arg substring-filters by namespace.
+    servers [<filter>]       DEPRECATED -- account mode is gone; this always
+                             fails. Use \`list\` instead.
     bundles [list|match]     Browse curated multi-server bundles. \`list\` shows
                              all; \`match\` partitions against your enabled
-                             servers (ready vs. partially installed).
+                             local servers (ready vs. partially installed).
 
   Maintenance:
     upgrade                  Show (or --run) the command that bumps
@@ -301,8 +300,7 @@ if (subcommand === "compliance") {
 
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP
-                             server. --publish posts the report to
-                             yaw.sh/mcp and prints the public URL.
+                             server and print the grade.
     audit <namespace>        Run the compliance suite against a stdio server
                              from your bundles.json and cache its A-F grade in
                              ~/.yaw-mcp/grades.json (shown in \`servers\` + the
@@ -310,17 +308,13 @@ if (subcommand === "compliance") {
     help, --help, -h         Show this help.
     --version, -V            Print yaw-mcp version.
 
-  Running \`yaw-mcp\` with no subcommand starts the MCP server. No token is
-  required: without one it runs in local mode, loading servers from
-  ~/.yaw-mcp/bundles.json; with YAW_MCP_TOKEN (or a config file) it also
-  pulls your account's servers. Most read-only subcommands accept
+  Running \`yaw-mcp\` with no subcommand starts the MCP server, loading your
+  servers from ~/.yaw-mcp/bundles.json. It runs entirely on your machine --
+  there is no account and no sign-in. Most read-only subcommands accept
   \`--json\` for machine-readable output. Run \`yaw-mcp <subcommand> --help\`
   for per-subcommand flag details.
 
   Environment variables:
-    YAW_MCP_TOKEN                 API token (overrides every config file).
-    YAW_MCP_URL                   API base URL (default https://yaw.sh/mcp).
-    YAW_MCP_POLL_INTERVAL         Dashboard polling interval, seconds (default 60).
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
     YAW_MCP_MIN_COMPLIANCE        Minimum grade to auto-activate (A|B|C|D|F).
     YAW_MCP_AUTO_LOAD             Auto-activate the namespaces of the highest-
@@ -343,18 +337,22 @@ if (subcommand === "compliance") {
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
-    YAW_MCP_BASE_URL              Base URL for \`yaw-mcp try\` signup/telemetry
-                               links (default https://yaw.sh/mcp).
+    YAW_MCP_BASE_URL              Base URL \`yaw-mcp try\` resolves its links
+                               against (default https://yaw.sh/mcp).
 
-  Config resolution (highest precedence first):
-    1. YAW_MCP_TOKEN / YAW_MCP_URL env vars
-    2. <project>/.yaw-mcp/config.local.json   machine-local overrides (gitignore)
-    3. <project>/.yaw-mcp/config.json         project-shared (checked in; never
-                                           put a token here — apiBase only)
-    4. ~/.yaw-mcp/config.json                 user-global default
+  Config resolution (highest precedence first) -- for the \`servers\` allow-list
+  and \`blocked\` deny-list:
+    1. <project>/.yaw-mcp/config.local.json   machine-local overrides (gitignore)
+    2. <project>/.yaw-mcp/config.json         project-shared (checked in)
+    3. ~/.yaw-mcp/config.json                 user-global default
 
-  Token rotation: yaw-mcp reads config at startup. Restart the MCP client
-  (or kill yaw-mcp; the client will respawn it) after editing any config.
+  yaw-mcp reads config at startup. Restart the MCP client (or kill yaw-mcp;
+  the client will respawn it) after editing any config.
+
+  The \`token\` and \`apiBase\` config keys, and the \`--token\` /
+  \`--no-yaw-mcp-config\` install flags, are deprecated and ignored -- yaw-mcp
+  no longer contacts a hosted API. They are still accepted for one release.
+  If you have a token on disk, delete it and revoke it at its source.
 
   Docs:   https://yaw.sh/mcp
   Source: https://github.com/YawLabs/mcp
@@ -399,10 +397,10 @@ if (subcommand === "compliance") {
   } else {
     // Startup failure path. runServer() registers a last-resort
     // unhandledRejection handler (see below) BEFORE its first await, so a
-    // fatal startup rejection -- e.g. loadYawMcpConfig() throwing on a
-    // non-https, non-loopback YAW_MCP_URL -- would otherwise be swallowed
-    // by that handler: logged as a JSON line, no server started, and the
-    // process exiting 0 as if all was well. Attaching a real catch here
+    // fatal startup rejection -- an unreadable config dir, a transport
+    // that fails to connect -- would otherwise be swallowed by that
+    // handler: logged as a JSON line, no server started, and the process
+    // exiting 0 as if all was well. Attaching a real catch here
     // restores the "print the error and exit 1" contract. It only covers
     // the startup promise; a genuine POST-startup rejection (an orphaned
     // upstream connect that rejects late) still lands on the handler
@@ -432,12 +430,10 @@ async function runServer(): Promise<void> {
   process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
   process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
 
-  // Resolve token + apiBase via the unified loader: env > local > global
-  // for token, env > local > project > global > default for apiBase.
-  // Missing token is NOT fatal -- yaw-mcp falls through to local mode
-  // where server definitions come from ~/.yaw-mcp/bundles.json instead
-  // of the backend. Empty bundles.json + no token also fine; yaw-mcp
-  // starts with an empty server list.
+  // Load config for its warnings (schema-version drift, malformed files,
+  // retired `token` / `apiBase` keys still on disk) and for the allow/deny
+  // lists. Server definitions come from ~/.yaw-mcp/bundles.json; an empty
+  // (or absent) bundles.json is fine, yaw-mcp starts with an empty list.
   const config = await loadYawMcpConfig();
 
   // Surface non-fatal config warnings on startup so the user sees them
@@ -447,20 +443,11 @@ async function runServer(): Promise<void> {
     log("warn", "Config warning", { warning: w });
   }
 
-  if (config.token) {
-    log("info", "yaw-mcp startup (account mode)", {
-      apiBase: config.apiBase,
-      apiBaseSource: config.apiBaseSource,
-      tokenSource: config.tokenSource,
-      tokenFingerprint: tokenFingerprint(config.token),
-    });
-  } else {
-    log("info", "yaw-mcp startup (local mode)", {
-      hint: "no YAW_MCP_TOKEN set; loading servers from ~/.yaw-mcp/bundles.json (if present)",
-    });
-  }
+  log("info", "yaw-mcp startup", {
+    hint: "loading servers from ~/.yaw-mcp/bundles.json (if present)",
+  });
 
-  const server = new ConnectServer(config.apiBase, config.token);
+  const server = new ConnectServer();
 
   let shuttingDown = false;
   const shutdown = async (): Promise<void> => {
@@ -476,11 +463,6 @@ async function runServer(): Promise<void> {
   process.on("SIGINT", shutdown);
 
   server.start().catch((err: unknown) => {
-    if (err instanceof ConfigError && err.fatal) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`\n  yaw-mcp: ${msg}\n\n`);
-      process.exit(1);
-    }
     const msg = err instanceof Error ? err.message : String(err);
     log("error", "Fatal startup error", { error: msg });
     process.exit(1);

@@ -20,7 +20,7 @@
 // Exception: the top-level `defaultRuntime` knob ("oam" | "node") is a
 // MACHINE-level preference, not a server definition, so it applies in
 // BOTH modes -- backend server defs don't carry `runtime`, and the
-// account dashboard has no per-machine concept of "oam is installed
+// a shared bundles.json has no per-machine concept of "oam is installed
 // here". See default-runtime.ts for the resolution order
 // (YAW_MCP_DEFAULT_RUNTIME env > this file's defaultRuntime > unset).
 
@@ -82,7 +82,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   }
   const name = typeof e.name === "string" && e.name.length > 0 ? e.name : namespace;
   // Default type to "local" -- bundles.json is the local-mode file by
-  // definition. Existing dashboard configs use "local" for stdio/spawned
+  // definition. Existing configs use "local" for stdio/spawned
   // servers and "remote" for HTTP/SSE; users can override via the field.
   const type: "local" | "remote" = e.type === "remote" ? "remote" : "local";
   const transport =
@@ -117,7 +117,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   const isActive = e.isActive !== false;
 
   // Synthesize an id from the namespace when absent. The id is mainly
-  // for dashboard parity; local mode doesn't strictly need it but the
+  // a stable handle; not strictly needed, but the
   // downstream code paths use it as a stable handle.
   const id = typeof e.id === "string" && e.id.length > 0 ? e.id : `local-${namespace}`;
 

@@ -144,7 +144,9 @@ export async function resolveCatalogSlug(
   // A remote/HTTP server has no stdio spawn command; refuse rather than
   // tokenize a URL into a broken entry. Matches the app's resolveSlug.
   if (install.url || install.type === "remote" || /^(remote|https?|sse|url)$/.test(runtime)) {
-    throw new Error(`"${slug}" is a remote server -- add it from the Yaw MCP dashboard, not the local CLI.`);
+    throw new Error(
+      `"${slug}" is a remote (HTTP) server, which has no stdio command to spawn. Add it by hand to ~/.yaw-mcp/bundles.json with "type": "remote" and its "url".`,
+    );
   }
   const cmdStr = typeof install.command === "string" ? install.command.trim() : "";
   if (!cmdStr) {

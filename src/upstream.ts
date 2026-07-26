@@ -477,12 +477,12 @@ async function connectToUpstreamOnce(
       }
     }
 
-    // Append a deep-link to the dashboard so the LLM can render a
-    // clickable "fix this here" pointer rather than a generic "edit
-    // your server config." The dashboard reads the #server-<id> hash
-    // on mount and scrolls to + highlights the matching card.
-    if (config.id) {
-      message = `${message} → Edit at https://yaw.sh/mcp/dashboard/connect#server-${config.id}`;
+    // Point at the config the user can actually edit. This used to append a
+    // dashboard deep-link (#server-<id>); that dashboard is gone and the URL
+    // 404s, so naming the local file and namespace is both accurate and more
+    // actionable -- the LLM can tell the user exactly what to open.
+    if (config.namespace) {
+      message = `${message} → Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
     }
 
     const redactedTail = trimmedStderr ? redactSecretsInOutput(trimmedStderr, resolvedServerEnv) : undefined;

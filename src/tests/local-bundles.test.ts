@@ -6,6 +6,7 @@ import {
   BUNDLES_FILENAME,
   loadLocalBundles,
   localBundlesPath,
+  NAMESPACE_RE,
   removeUserBundle,
   upsertUserBundle,
 } from "../local-bundles.js";
@@ -34,6 +35,49 @@ function writeBundles(dir: string, content: unknown) {
 describe("localBundlesPath", () => {
   it("joins dir with the canonical filename", () => {
     expect(localBundlesPath("/some/dir")).toBe(join("/some/dir", BUNDLES_FILENAME));
+  });
+});
+
+// NAMESPACE_RE is defined and exported here and gates every entry that
+// validateEntry admits from bundles.json. These cases used to live in
+// config.test.ts (the remote-config fetcher was the other consumer); they
+// moved with the deletion of that module so the regex keeps its coverage.
+describe("namespace validation regex", () => {
+  it("accepts valid namespaces", () => {
+    expect(NAMESPACE_RE.test("gh")).toBe(true);
+    expect(NAMESPACE_RE.test("slack")).toBe(true);
+    expect(NAMESPACE_RE.test("my_server_1")).toBe(true);
+    expect(NAMESPACE_RE.test("a")).toBe(true);
+  });
+
+  it("rejects namespaces starting with number", () => {
+    expect(NAMESPACE_RE.test("1server")).toBe(false);
+  });
+
+  it("rejects namespaces starting with underscore", () => {
+    expect(NAMESPACE_RE.test("_server")).toBe(false);
+  });
+
+  it("rejects namespaces with uppercase", () => {
+    expect(NAMESPACE_RE.test("GitHub")).toBe(false);
+  });
+
+  it("rejects namespaces with special characters", () => {
+    expect(NAMESPACE_RE.test("my-server")).toBe(false);
+    expect(NAMESPACE_RE.test("my.server")).toBe(false);
+    expect(NAMESPACE_RE.test("my/server")).toBe(false);
+  });
+
+  it("rejects empty string", () => {
+    expect(NAMESPACE_RE.test("")).toBe(false);
+  });
+
+  it("rejects namespaces longer than 30 chars", () => {
+    expect(NAMESPACE_RE.test("a".repeat(31))).toBe(false);
+  });
+
+  it("accepts exactly 30 chars", () => {
+    expect(NAMESPACE_RE.test("a".repeat(30))).toBe(true);
   });
 });
 

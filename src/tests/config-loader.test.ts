@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,7 +10,6 @@ import {
   loadYawMcpConfig,
   type Profile,
   profileAllows,
-  tokenFingerprint,
   toProfile,
 } from "../config-loader.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -33,14 +32,11 @@ afterEach(() => {
 });
 
 // Writes <root>/.yaw-mcp/<filename> with the given JSON object.
-// Default perms 0o600 on POSIX so fixtures don't trip the loose-perms
-// warning. Tests that need 644 call chmodSync after this.
 function writeConfig(root: string, filename: string, obj: unknown): string {
   const dir = join(root, CONFIG_DIRNAME);
   mkdirSync(dir, { recursive: true });
   const p = join(dir, filename);
   writeFileSync(p, JSON.stringify(obj, null, 2));
-  if (process.platform !== "win32") chmodSync(p, 0o600);
   return p;
 }
 
@@ -49,120 +45,100 @@ function writeConfigRaw(root: string, filename: string, body: string): string {
   mkdirSync(dir, { recursive: true });
   const p = join(dir, filename);
   writeFileSync(p, body);
-  if (process.platform !== "win32") chmodSync(p, 0o600);
   return p;
 }
 
-describe("loadYawMcpConfig — defaults & env-only", () => {
-  it("returns defaults when no files exist and no env is set", async () => {
+describe("loadYawMcpConfig — defaults", () => {
+  it("returns defaults when no files exist", async () => {
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBeNull();
-    expect(r.tokenSource).toBe("missing");
-    expect(r.apiBase).toBe("https://yaw.sh/mcp");
-    expect(r.apiBaseSource).toBe("default");
     expect(r.loadedFiles).toEqual([]);
     expect(r.warnings).toEqual([]);
     expect(r.projectConfigDir).toBeNull();
-  });
-
-  it("reads YAW_MCP_TOKEN + YAW_MCP_URL from env when no files exist", async () => {
-    const r = await loadYawMcpConfig({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_env_aaaa", YAW_MCP_URL: "https://staging.mcp.hosting" },
-    });
-    expect(r.token).toBe("mcp_pat_env_aaaa");
-    expect(r.tokenSource).toBe("env");
-    expect(r.apiBase).toBe("https://staging.mcp.hosting");
-    expect(r.apiBaseSource).toBe("env");
+    expect(r.servers).toBeUndefined();
+    expect(r.blocked).toBeUndefined();
   });
 });
 
-describe("loadYawMcpConfig — global ~/.yaw-mcp/config.json", () => {
-  it("loads token + apiBase from user-global when env is empty", async () => {
+// `token` / `apiBase` used to drive the hosted backend. They are now inert,
+// but the deprecation is SOFT: an existing config carrying either key must
+// still load (allow/deny lists and installNudge intact) and must surface a
+// warning telling the user to delete the key and revoke the PAT.
+describe("loadYawMcpConfig — deprecated token / apiBase keys", () => {
+  it("still loads a config carrying a token, and warns instead of failing", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, {
       version: 1,
       token: "mcp_pat_global_aaaa",
-      apiBase: "https://corp.mcp.hosting",
+      servers: ["github"],
+      blocked: ["slack"],
+      installNudge: true,
     });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBe("mcp_pat_global_aaaa");
-    expect(r.tokenSource).toBe("global");
-    expect(r.apiBase).toBe("https://corp.mcp.hosting");
-    expect(r.apiBaseSource).toBe("global");
+
+    // The file loaded: every non-deprecated field survived.
     expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
-  });
+    expect(r.servers).toEqual(["github"]);
+    expect(r.blocked).toEqual(["slack"]);
+    expect(r.installNudge).toBe(true);
 
-  it("env still wins over global file", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_global_aaaa" });
-    const r = await loadYawMcpConfig({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_env_bbbb" },
-    });
-    expect(r.token).toBe("mcp_pat_env_bbbb");
-    expect(r.tokenSource).toBe("env");
-  });
-});
-
-describe("loadYawMcpConfig — precedence", () => {
-  it("local file beats global file for token", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_global_aaaa" });
-    writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { token: "mcp_pat_local_bbbb" });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBe("mcp_pat_local_bbbb");
-    expect(r.tokenSource).toBe("local");
-    expect(r.loadedFiles.map((f) => f.scope).sort()).toEqual(["global", "local"]);
-  });
-
-  it("apiBase precedence: env > local > project > global > default", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "https://global.example" });
-    writeConfig(synthCwd, CONFIG_FILENAME, { apiBase: "https://project.example" });
-    writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { apiBase: "https://local.example" });
-
-    const localWins = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(localWins.apiBase).toBe("https://local.example");
-    expect(localWins.apiBaseSource).toBe("local");
-
-    rmSync(join(synthCwd, CONFIG_DIRNAME, LOCAL_CONFIG_FILENAME));
-    const projectWins = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(projectWins.apiBase).toBe("https://project.example");
-    expect(projectWins.apiBaseSource).toBe("project");
-
-    rmSync(join(synthCwd, CONFIG_DIRNAME, CONFIG_FILENAME));
-    const globalWins = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(globalWins.apiBase).toBe("https://global.example");
-    expect(globalWins.apiBaseSource).toBe("global");
-
-    const envWins = await loadYawMcpConfig({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_URL: "https://env.example" },
-    });
-    expect(envWins.apiBase).toBe("https://env.example");
-    expect(envWins.apiBaseSource).toBe("env");
-  });
-
-  it("project file token does NOT contribute to token resolution (only warns)", async () => {
-    // Committed file is the wrong place for a token; we ignore it for
-    // resolution and surface a warning instead.
-    writeConfig(synthCwd, CONFIG_FILENAME, { token: "mcp_pat_should_not_use_aaaa" });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBeNull();
-    expect(r.tokenSource).toBe("missing");
-    expect(r.warnings.some((w) => w.includes("project-shared"))).toBe(true);
-  });
-
-  // Fix 4: warning wording must explicitly say the token is IGNORED and where to move it.
-  it("project-file token warning says IGNORED and names valid destinations (fix 4)", async () => {
-    writeConfig(synthCwd, CONFIG_FILENAME, { token: "mcp_pat_project_aaaa" });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    const w = r.warnings.find((w) => w.includes("token"));
+    const w = r.warnings.find((x) => x.includes("'token'"));
     expect(w).toBeDefined();
-    // Must say the token is ignored, not just "should not appear".
-    expect(w).toMatch(/IGNORED/i);
-    // Must name at least one valid destination so the user knows what to do.
-    expect(w).toMatch(/config\.local\.json|user-global/i);
+    // Says what changed, where to fix it, and to revoke the PAT.
+    expect(w).toMatch(/no longer used/);
+    expect(w).toMatch(/local-only/);
+    expect(w).toContain(join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME));
+    expect(w).toMatch(/[Rr]evoke that PAT/);
+  });
+
+  it("warns for apiBase, without the PAT-revocation clause", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "https://corp.example" });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    const w = r.warnings.find((x) => x.includes("'apiBase'"));
+    expect(w).toBeDefined();
+    expect(w).toMatch(/no longer used/);
+    expect(w).not.toMatch(/PAT/);
+  });
+
+  it("folds both keys into a single warning", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_aaaa", apiBase: "https://corp.example" });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]).toContain("'token' and 'apiBase'");
+    expect(r.warnings[0]).toMatch(/[Rr]evoke that PAT/);
+  });
+
+  it("warns per file, so every scope holding a stale key gets named", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_global_aaaa" });
+    writeConfig(synthCwd, CONFIG_FILENAME, { apiBase: "https://project.example" });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings).toHaveLength(2);
+    expect(r.warnings.some((w) => w.includes(join(synthHome, CONFIG_DIRNAME)))).toBe(true);
+    expect(r.warnings.some((w) => w.includes(join(synthCwd, CONFIG_DIRNAME)))).toBe(true);
+  });
+
+  it("warns on key PRESENCE, not on a usable value (an empty token still needs deleting)", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { token: "" });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("'token'"))).toBe(true);
+  });
+
+  it("does not warn for a config with no deprecated keys", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { version: 1, servers: ["github"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings).toEqual([]);
+  });
+
+  // A plaintext, non-loopback apiBase used to be rejected by validateApiBase.
+  // It is now just another deprecated key: no URL validation, no throw --
+  // nothing dials it. The env override (YAW_MCP_URL) is likewise inert; it
+  // must not throw either, since nothing reads it any more.
+  it("never throws on an unusable apiBase, from a file or from the env", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "not a url at all" });
+    const fromFile = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(fromFile.warnings.some((w) => w.includes("'apiBase'"))).toBe(true);
+
+    await expect(
+      loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: { YAW_MCP_URL: "http://example.com" } }),
+    ).resolves.toBeDefined();
   });
 });
 
@@ -174,29 +150,30 @@ describe("loadYawMcpConfig — JSONC support", () => {
       `{
   // user-global config with comments
   "version": 1,
-  "token": "mcp_pat_jsonc_aaaa", /* end-of-line block */
-  "apiBase": "https://yaw.sh/mcp"
+  "servers": ["github"], /* end-of-line block */
+  "blocked": ["slack"]
 }`,
     );
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBe("mcp_pat_jsonc_aaaa");
+    expect(r.servers).toEqual(["github"]);
+    expect(r.blocked).toEqual(["slack"]);
     expect(r.warnings).toEqual([]);
   });
 });
 
 describe("loadYawMcpConfig — schema versioning", () => {
   it("warns when a file declares a newer schema version than this yaw-mcp supports", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { version: CURRENT_SCHEMA_VERSION + 1, token: "mcp_pat_aaaa" });
+    writeConfig(synthHome, CONFIG_FILENAME, { version: CURRENT_SCHEMA_VERSION + 1, servers: ["github"] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBe("mcp_pat_aaaa");
+    expect(r.servers).toEqual(["github"]);
     expect(r.warnings.some((w) => w.includes("schema version"))).toBe(true);
   });
 
   it("loads silently when version is current or absent", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { version: CURRENT_SCHEMA_VERSION, token: "x" });
+    writeConfig(synthHome, CONFIG_FILENAME, { version: CURRENT_SCHEMA_VERSION, servers: ["x"] });
     const r1 = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r1.warnings).toEqual([]);
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "x" });
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["x"] });
     const r2 = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r2.warnings).toEqual([]);
   });
@@ -204,18 +181,18 @@ describe("loadYawMcpConfig — schema versioning", () => {
 
 describe("loadYawMcpConfig — fail-open on bad files", () => {
   it("malformed JSON in local file falls back to global", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_global_aaaa" });
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
     writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, "{ this is not json");
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBe("mcp_pat_global_aaaa");
-    expect(r.tokenSource).toBe("global");
+    expect(r.servers).toEqual(["github"]);
+    expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
   });
 
   it("non-object root is ignored with a warning", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify(["not", "an", "object"]));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBeNull();
+    expect(r.loadedFiles).toEqual([]);
     expect(r.warnings.some((w) => w.includes("must be a JSON object"))).toBe(true);
   });
 });
@@ -307,12 +284,12 @@ describe("loadYawMcpConfig — non-string blocked entries (fix F1, blocked field
 
 describe("loadYawMcpConfig — walk-up project discovery", () => {
   it("finds .yaw-mcp/ in a parent directory", async () => {
-    writeConfig(synthCwd, CONFIG_FILENAME, { apiBase: "https://parent.example" });
+    writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["parent-scoped"] });
     const deep = join(synthCwd, "apps", "web", "src");
     mkdirSync(deep, { recursive: true });
     const r = await loadYawMcpConfig({ cwd: deep, home: synthHome, env: {} });
-    expect(r.apiBase).toBe("https://parent.example");
-    expect(r.apiBaseSource).toBe("project");
+    expect(r.servers).toEqual(["parent-scoped"]);
+    expect(r.loadedFiles.map((f) => f.scope)).toEqual(["project"]);
     expect(r.projectConfigDir).toBe(join(synthCwd, CONFIG_DIRNAME));
   });
 
@@ -320,129 +297,12 @@ describe("loadYawMcpConfig — walk-up project discovery", () => {
     // A `.yaw-mcp/` at $HOME is the user-global scope. findProjectConfigDir
     // stops exclusive of $HOME, so even cwd deep inside $HOME shouldn't
     // claim it as project.
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_global_aaaa" });
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
     const sub = join(synthHome, "projects", "p1");
     mkdirSync(sub, { recursive: true });
     const r = await loadYawMcpConfig({ cwd: sub, home: synthHome, env: {} });
     expect(r.projectConfigDir).toBeNull();
     expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
-  });
-});
-
-describe("checkPermissions (POSIX only)", () => {
-  it.skipIf(process.platform === "win32")("warns on world-readable file with token", async () => {
-    const file = writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_loose_aaaa" });
-    chmodSync(file, 0o644);
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.warnings.some((w) => w.includes("readable by group/other"))).toBe(true);
-  });
-
-  it.skipIf(process.platform === "win32")("does not warn on 0600 file", async () => {
-    const file = writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_strict_aaaa" });
-    chmodSync(file, 0o600);
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.warnings).toEqual([]);
-  });
-
-  it.skipIf(process.platform === "win32")("does not warn on file without a token even if loose perms", async () => {
-    const file = writeConfig(synthHome, CONFIG_FILENAME, { servers: ["a"] });
-    chmodSync(file, 0o644);
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.warnings).toEqual([]);
-  });
-
-  // Fix F2: a project-scope token is IGNORED, so chmod-600 advice for it is
-  // irrelevant noise on a committed file -- skip the perms check entirely.
-  it.skipIf(process.platform === "win32")(
-    "does not emit chmod-600 advice for a loose-perms project-scope token (fix F2)",
-    async () => {
-      const file = writeConfig(synthCwd, CONFIG_FILENAME, { token: "mcp_pat_project_aaaa" });
-      chmodSync(file, 0o644);
-      const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-      // The token is still ignored + warned as project-shared...
-      expect(r.warnings.some((w) => w.includes("IGNORED"))).toBe(true);
-      // ...but there is no perms advice, because moving the token is the fix.
-      expect(r.warnings.some((w) => w.includes("readable by group/other"))).toBe(false);
-    },
-  );
-});
-
-describe("tokenFingerprint", () => {
-  it("returns (none) for null", () => {
-    expect(tokenFingerprint(null)).toBe("(none)");
-  });
-
-  it("masks long tokens to first-8...last-4", () => {
-    expect(tokenFingerprint("mcp_pat_abcdef1234567890")).toBe("mcp_pat_...7890");
-  });
-
-  it("masks short tokens with last-2 only", () => {
-    expect(tokenFingerprint("ab")).toBe("***ab");
-  });
-});
-
-describe("loadYawMcpConfig — empty/invalid string fields are ignored", () => {
-  it("empty token string is treated as missing", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "" });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBeNull();
-    expect(r.tokenSource).toBe("missing");
-  });
-
-  it("non-string apiBase is ignored", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { apiBase: 123 });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.apiBase).toBe("https://yaw.sh/mcp");
-    expect(r.apiBaseSource).toBe("default");
-  });
-});
-
-describe("loadYawMcpConfig — unusable apiBase in a file warns instead of throwing", () => {
-  it("loads the rest of the file and falls back to the default apiBase", async () => {
-    // A plaintext non-loopback apiBase fails validateApiBase. That must
-    // not reject the load: throwing here crashed startup (index.ts calls
-    // runServer without a rejection handler) and blanked the allow/deny
-    // profile (server.ts swallows the load into null).
-    writeConfig(synthHome, CONFIG_FILENAME, {
-      token: "mcp_pat_global_aaaa",
-      apiBase: "http://example.com",
-      servers: ["github"],
-      blocked: ["slack"],
-      installNudge: true,
-    });
-
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-
-    expect(r.apiBase).toBe("https://yaw.sh/mcp");
-    expect(r.apiBaseSource).toBe("default");
-    // Everything else in the file survives.
-    expect(r.token).toBe("mcp_pat_global_aaaa");
-    expect(r.tokenSource).toBe("global");
-    expect(r.servers).toEqual(["github"]);
-    expect(r.blocked).toEqual(["slack"]);
-    expect(r.installNudge).toBe(true);
-    expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
-    // And the problem is surfaced for `yaw-mcp doctor`.
-    const w = r.warnings.find((x) => x.includes("apiBase"));
-    expect(w).toBeDefined();
-    expect(w).toMatch(/apiBase ignored/);
-  });
-
-  it("falls through to the next scope's valid apiBase", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "https://global.example" });
-    writeConfig(synthCwd, LOCAL_CONFIG_FILENAME, { apiBase: "ftp://nope.example" });
-    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.apiBase).toBe("https://global.example");
-    expect(r.apiBaseSource).toBe("global");
-    expect(r.warnings.some((w) => w.includes("apiBase ignored"))).toBe(true);
-  });
-
-  it("still THROWS for an unusable apiBase from the env override", async () => {
-    // The env path has no per-field fallback to degrade to and is set by
-    // the operator on this run, so a bad value stays loud.
-    await expect(
-      loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: { YAW_MCP_URL: "http://example.com" } }),
-    ).rejects.toThrow(/apiBase \(source: env\)/);
   });
 });
 
@@ -455,10 +315,10 @@ describe("loadYawMcpConfig — legacy migration runs once per process", () => {
     // migration is memoized per (cwd, home), the second load must not
     // walk again -- the legacy file stays exactly where it is.
     const legacy = join(synthHome, ".yaw-mcp.json");
-    writeFileSync(legacy, JSON.stringify({ token: "mcp_pat_legacy_aaaa" }));
+    writeFileSync(legacy, JSON.stringify({ servers: ["legacy-only"] }));
 
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
-    expect(r.token).toBeNull();
+    expect(r.servers).toBeUndefined();
     expect(existsSync(legacy)).toBe(true);
     expect(existsSync(join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME))).toBe(false);
   });
@@ -505,7 +365,7 @@ async function resolveProfile(cwd: string, home: string): Promise<Profile | null
 
 describe("toProfile (loadYawMcpConfig -> Profile)", () => {
   it("returns null when no allow/deny rules are set anywhere", async () => {
-    writeConfig(synthHome, CONFIG_FILENAME, { token: "mcp_pat_aaaa" });
+    writeConfig(synthHome, CONFIG_FILENAME, { version: 1, installNudge: true });
     const p = await resolveProfile(synthCwd, synthHome);
     expect(p).toBeNull();
   });

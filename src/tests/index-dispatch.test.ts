@@ -110,9 +110,9 @@ describe("KNOWN_SUBCOMMANDS table", () => {
 // so this suite bundles it the way the shipped binary is built (esbuild,
 // esm, node target) into a throwaway dir and runs it as a real process.
 // Regression guarded: `runServer()` used to be fire-and-forget, so a fatal
-// startup rejection (loadYawMcpConfig() throwing on a non-https,
-// non-loopback YAW_MCP_URL) landed on the last-resort unhandledRejection
-// handler -- logged as a JSON line, no server started, process exiting 0.
+// startup rejection landed on the last-resort unhandledRejection handler --
+// logged as a JSON line, no server started, process exiting 0. The `.catch()`
+// on runServer() is what makes that path print and exit 1 instead.
 const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
@@ -189,13 +189,20 @@ describe("runServer startup failure", () => {
     if (workDir) await rm(workDir, { recursive: true, force: true });
   });
 
-  it("exits 1 and prints a plain error line on a fatal startup config error", async () => {
+  // YAW_MCP_URL used to be hard-validated at load and a non-https,
+  // non-loopback value aborted startup. yaw-mcp is local-only now: nothing
+  // dials that URL, so the var is inert and MUST NOT brick the server. This
+  // is the deprecation's regression guard -- a user with a stale
+  // YAW_MCP_URL exported in their shell profile still gets a working server.
+  it("boots normally with a would-be-unsafe YAW_MCP_URL instead of dying", async () => {
     const { code, stderr } = await runEntry({ YAW_MCP_URL: "http://evil.example.com" });
-    expect(code).toBe(1);
-    expect(stderr).toContain("yaw-mcp: apiBase (source: env)");
-    // Proof the .catch() -- not the last-resort handler -- caught it: the
-    // handler would emit a JSON log line and let the process exit 0.
+    expect(code).not.toBe(1);
+    // The old fatal line is gone, and nothing fell through to the
+    // last-resort handler either.
+    expect(stderr).not.toContain("yaw-mcp: apiBase");
     expect(stderr).not.toContain('"unhandledRejection"');
+    // It got past config load and actually started.
+    expect(stderr).toContain('"yaw-mcp startup"');
   });
 
   it("exits 2 on a mis-cased flag instead of booting a stdio server", async () => {

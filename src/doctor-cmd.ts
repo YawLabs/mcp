@@ -1,13 +1,10 @@
 // `yaw-mcp doctor` — prints a one-screen diagnostic of the user's yaw-mcp setup.
 // Goal: when a support ticket comes in ("nothing is working"), the user
 // pastes the doctor output and we can usually pinpoint the issue from
-// it alone (no token / wrong token source / wrong API base / which
-// clients have yaw-mcp wired up vs. don't / file permissions).
+// it alone (which config files loaded / which clients have yaw-mcp wired
+// up vs. don't / what the local bundles + learning state look like).
 //
 // The output is plain text so it survives Discord / Slack pasting.
-// Tokens are always fingerprinted (never raw) — see tokenFingerprint in
-// config-loader.ts for the exact masking (the visible slice varies with
-// token length; short tokens reveal fewer characters).
 //
 // Side effects: doctor is NOT purely read-only. It runs the expired-trial
 // GC pass (gcExpiredTrials, both the text and --json paths), which is a
@@ -19,24 +16,27 @@
 // and never aborts the diagnostic.
 //
 // Exit codes:
-//   0  healthy (token present, no warnings) OR local mode (no token —
-//      yaw-mcp still starts and serves ~/.yaw-mcp/bundles.json)
-//   2  warnings (e.g., schema-version mismatch, loose file permissions)
-//   (1 = fatal is reserved and currently UNREACHABLE: a missing token is
-//   treated as healthy local mode, not a fatal error, on both paths.)
+//   0  healthy — every config file parsed cleanly and raised no warnings
+//   2  warnings (e.g., schema-version mismatch, a retired `token` /
+//      `apiBase` key still sitting in a config file)
+//   (1 = fatal is reserved and currently UNREACHABLE: nothing doctor
+//   inspects is fatal — a bad config file degrades to a warning.)
+//
+// The exit-2 gate is UNCONDITIONALLY "any warning". It used to be gated on
+// `config.token !== null`, which meant a warning-producing config exited 0
+// whenever no token was configured -- i.e. always, once account mode went
+// away. Do not re-introduce a precondition here.
 
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type AnalyticsFailure, getDroppedEventsCount, getLastAnalyticsFailure } from "./analytics.js";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
   loadYawMcpConfig,
   type ResolvedConfig,
-  tokenFingerprint,
 } from "./config-loader.js";
 import {
   type DefaultRuntimeInfo,
@@ -59,7 +59,6 @@ import { loadLocalBundles } from "./local-bundles.js";
 import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
-import { getLastReportFailure, type ReportFailure } from "./tool-report.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
   BINARY_DOWNLOAD_URL,
@@ -106,23 +105,32 @@ export interface DoctorOptions {
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
 // text sections so support / dashboard consumers can pick fields with jq.
-// The raw token is NEVER included — only its fingerprint.
 //
 // Sections deliberately NOT mirrored (text-only, by design):
 //   - SHADOWED CLI USAGE is carried as `shellShadows` (same data, renamed).
 //   - UPGRADE AVAILABLE's method-aware terminal hint is text-only; the JSON
 //     `upgrade` block carries the version facts but no install-method copy.
-// Everything else (CONFIG FILES, TOKEN, API BASE, ENVIRONMENT, STATE,
-// RELIABILITY, TRIALS, BACKGROUND POSTERS, INSTALLED CLIENTS, WARNINGS,
-// DIAGNOSIS) has a structured field below.
+// Everything else (CONFIG FILES, ENVIRONMENT, STATE, RELIABILITY, TRIALS,
+// INSTALLED CLIENTS, WARNINGS, DIAGNOSIS) has a structured field below.
 export interface DoctorJsonSnapshot {
   timestamp: string;
   version: string;
   platform: InstallOS;
-  token: { fingerprint: string; source: string };
-  apiBase: { value: string; source: string };
+  // DEPRECATED — every member is always `null`. yaw-mcp is local-only; there
+  // is no token and no API base to report. The NESTED SHAPE is retained
+  // rather than flattened to a bare `null` for the same reason as
+  // `backgroundPosters` below: a consumer reading `.token.source` or
+  // `.apiBase.value` keeps parsing instead of throwing on a null deref.
+  // Dropped in a later release.
+  token: { fingerprint: null; source: null };
+  apiBase: { value: null; source: null };
   loadedFiles: Array<{ scope: string; path: string; schemaVersion?: number; schemaAhead: boolean }>;
   warnings: string[];
+  // Behavior-modifier env vars, null when unset. `YAW_MCP_POLL_INTERVAL` is
+  // DEPRECATED and always null -- the remote config poll loop it tuned was
+  // removed with the hosted backend. The key is retained (same reasoning as
+  // backgroundPosters below) so consumers reading it keep working through
+  // the deprecation window.
   env: Record<string, string | null>;
   state: {
     disabled: boolean;
@@ -157,13 +165,16 @@ export interface DoctorJsonSnapshot {
     live: Array<{ slug: string; clientName: string; clientPath: string; msUntilExpiry: number }>;
     malformed: string[];
   };
-  // Background HTTP poster failure latches (analytics, tool-report). A
-  // non-null entry is the 401/403 token-lost-write-scope signal; both null
-  // is the healthy case. Mirrors the text path's BACKGROUND POSTERS section.
-  backgroundPosters: {
-    analytics: { statusCode: number; url: string; at: string } | null;
-    toolReport: { statusCode: number; url: string; at: string } | null;
-  };
+  // DEPRECATED — both members are always `null`. The background HTTP
+  // posters (analytics, tool-report) that populated this were removed with
+  // the hosted backend. The NESTED SHAPE is retained deliberately, not
+  // flattened to a bare `null`: the latches that fed it were in-process
+  // server state and `doctor` runs as a fresh process, so this block
+  // already emitted `{"analytics": null, "toolReport": null}` in practice.
+  // Keeping the object means `doctor --json` output is byte-identical for
+  // external consumers, including anyone reading `.backgroundPosters.analytics`
+  // — flattening to `null` would throw for them. Dropped in a later release.
+  backgroundPosters: { analytics: null; toolReport: null };
   // oam runtime visibility: whether the oam binary is usable (installed AND
   // >= minVersion), the config-level default, and the per-server effective
   // runtime for locally-defined servers (bundles.json). Mirrors the text
@@ -260,21 +271,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   }
   print("");
 
-  print("TOKEN");
-  print(`  value:  ${tokenFingerprint(config.token)}`);
-  print(`  source: ${config.tokenSource}`);
-  print("");
-
-  print("API BASE");
-  print(`  value:  ${config.apiBase}`);
-  print(`  source: ${config.apiBaseSource}`);
-  print("");
-
   // Behavior-modifier env vars that yaw-mcp actually reads at runtime.
   // Surfaced here so support diagnostics can see at a glance whether an
   // override is active (e.g., "my auto-load isn't working" — doctor
-  // says AUTO_LOAD is not set). TOKEN / URL / DISABLE_PERSISTENCE have
-  // their own dedicated sections and are intentionally omitted.
+  // says AUTO_LOAD is not set). DISABLE_PERSISTENCE has its own dedicated
+  // section and is intentionally omitted.
   renderEnvSection({ env, print });
 
   // oam runtime visibility — which runtime each server would ACTUALLY get
@@ -316,14 +317,6 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // hanging around). Best-effort: any sweep failure is logged via
   // try-cmd's debug logger; doctor itself never errors out on it.
   await renderTrialsSection({ home, env, print, postEvent: opts.postTryEvent, now: opts.now });
-
-  // Background HTTP posters (analytics, tool-report) fire-and-forget by
-  // design, but a 401/403 there means the user's token has lost write
-  // scope and their analytics is silently disappearing. Latches in the
-  // poster modules capture only the most recent rejection per module;
-  // the section is rendered ONLY when at least one latch is set so
-  // healthy installs stay quiet.
-  renderBackgroundPostersSection({ print });
 
   // Probe every supported client/scope combo on the current OS. Honor
   // CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
@@ -421,29 +414,22 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   }
 
   let exitCode = 0;
-  // Warnings are emitted to stderr UNCONDITIONALLY (regardless of token
-  // state) so a pipeline that captures only stdout still sees them. The
-  // text WARNINGS section above is part of the human report (stdout); the
-  // stderr stream below is the always-on signal. Local mode exits 0,
-  // but warning lines still print here so they don't get masked by the
-  // "fully functional" diagnosis below.
+  // Warnings are emitted to stderr UNCONDITIONALLY so a pipeline that
+  // captures only stdout still sees them. The text WARNINGS section above
+  // is part of the human report (stdout); the stderr stream below is the
+  // always-on signal.
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErr(`warning: ${w}\n`);
   }
-  if (config.token === null) {
-    // No token is NOT an error: yaw-mcp runs in local mode, serving
-    // whatever is in ~/.yaw-mcp/bundles.json. runServer() (index.ts) treats
-    // a missing token as non-fatal, so doctor must agree -- reporting
-    // "cannot start" here was a false alarm that the Yaw MCP panel surfaced
-    // as a blocking ATTENTION banner.
-    print("DIAGNOSIS");
-    print("  Local mode -- fully functional, no account needed. yaw-mcp serves");
-    print("  whatever servers are configured locally in ~/.yaw-mcp/bundles.json.");
-  } else if (config.warnings.length > 0) {
+  // Any warning is exit 2. See the exit-code note at the top of this file:
+  // this gate must stay unconditional. The old form ran the warning branch
+  // only when a token was resolved, so once account mode went away a
+  // malformed config would have exited 0 with the warnings buried.
+  if (config.warnings.length > 0) {
     exitCode = 2;
     print("DIAGNOSIS");
-    print("  Token present, but warnings above need attention.");
+    print("  Warnings above need attention.");
   } else {
     print("DIAGNOSIS");
     print(
@@ -473,7 +459,6 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
 
   const envVarNames = [
-    "YAW_MCP_POLL_INTERVAL",
     "YAW_MCP_SERVER_CAP",
     "YAW_MCP_MIN_COMPLIANCE",
     "YAW_MCP_AUTO_LOAD",
@@ -481,7 +466,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     "YAW_MCP_PRUNE_RESPONSES",
     "YAW_MCP_DEFAULT_RUNTIME",
   ] as const;
-  const envOverrides: Record<string, string | null> = {};
+  // DEPRECATED key, seeded first so it keeps its position in the emitted
+  // object. YAW_MCP_POLL_INTERVAL configured the remote config poll loop,
+  // which went with the hosted backend; nothing reads the var any more, so
+  // it reports null even when it IS set. The key survives the deprecation
+  // window so `.env.YAW_MCP_POLL_INTERVAL` consumers don't break on a
+  // missing property. Dropped in a later release.
+  const envOverrides: Record<string, string | null> = { YAW_MCP_POLL_INTERVAL: null };
   for (const name of envVarNames) {
     const raw = env[name];
     envOverrides[name] = raw === undefined || raw === "" ? null : raw;
@@ -605,23 +596,10 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     })),
   };
 
-  // Background HTTP poster failure latches — same getters the text path's
-  // renderBackgroundPostersSection reads. A non-null entry is the
-  // 401/403 token-lost-write-scope signal.
-  const analyticsFailure = getLastAnalyticsFailure();
-  const reportFailure = getLastReportFailure();
-  const backgroundPosters: DoctorJsonSnapshot["backgroundPosters"] = {
-    analytics: analyticsFailure
-      ? {
-          statusCode: analyticsFailure.statusCode,
-          url: analyticsFailure.url,
-          at: new Date(analyticsFailure.at).toISOString(),
-        }
-      : null,
-    toolReport: reportFailure
-      ? { statusCode: reportFailure.statusCode, url: reportFailure.url, at: new Date(reportFailure.at).toISOString() }
-      : null,
-  };
+  // DEPRECATED key, emitted with its original nested shape (both members
+  // null) so `doctor --json` output is unchanged for consumers during the
+  // deprecation window. See DoctorJsonSnapshot.backgroundPosters.
+  const backgroundPosters: DoctorJsonSnapshot["backgroundPosters"] = { analytics: null, toolReport: null };
 
   // Mirrors the text path's hook handling (see runDoctor): an explicit
   // registryFetch bypasses the VITEST guard, and currentVersion overrides
@@ -639,17 +617,15 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   let summary: string;
   // Always-on warning stream: mirrors the text path so JSON-mode pipelines
   // that capture stdout (the JSON blob) still surface config warnings on
-  // stderr, even in local mode where exit code is 0.
+  // stderr even when the exit code is 0.
   const writeErrJson = opts.err ?? ((s: string) => process.stderr.write(s));
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErrJson(`warning: ${w}\n`);
   }
-  if (config.token === null) {
-    // Local mode -- not an error (see runDoctor's text branch).
-    summary = "Local mode -- fully functional, no account needed.";
-  } else if (config.warnings.length > 0) {
+  // Unconditional warning gate, identical to the text path.
+  if (config.warnings.length > 0) {
     exitCode = 2;
-    summary = "Token present, but warnings need attention.";
+    summary = "Warnings need attention.";
   } else {
     summary = stale ? "Healthy, but an upgrade is available." : "All good. yaw-mcp should start cleanly.";
   }
@@ -658,8 +634,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     timestamp,
     version: VERSION,
     platform: os,
-    token: { fingerprint: tokenFingerprint(config.token), source: config.tokenSource },
-    apiBase: { value: config.apiBase, source: config.apiBaseSource },
+    // DEPRECATED keys, emitted with their original nested shape and null
+    // members so `doctor --json` stays parseable for consumers reading
+    // `.token.source` / `.apiBase.value`. See DoctorJsonSnapshot.
+    token: { fingerprint: null, source: null },
+    apiBase: { value: null, source: null },
     loadedFiles: config.loadedFiles.map((f) => ({
       scope: f.scope,
       path: f.path,
@@ -699,7 +678,6 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) => void }): void {
   const { env, print } = opts;
   const vars: Array<{ name: string; defaultHint: string }> = [
-    { name: "YAW_MCP_POLL_INTERVAL", defaultHint: "default 60s" },
     { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
     { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
     { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
@@ -920,51 +898,6 @@ async function renderTrialsSection(opts: {
   }
   for (const path of scan.malformed) {
     print(`  ! malformed marker at ${path} (delete by hand)`);
-  }
-  print("");
-}
-
-// Render the BACKGROUND POSTERS section -- only when at least one
-// latch is set. The point is to be silent when everything is working;
-// a healthy install must not see this header. Reads the latches via
-// the module getters (no cross-module circular: doctor depends on
-// analytics/tool-report, never the reverse). The "no recent failure"
-// row appears only alongside a sibling that DID fail, so the user can
-// tell which poster is broken vs. which is fine.
-//
-// KNOWN LIMITATION (by design, needs an owner decision before changing):
-// the latches read here are IN-PROCESS module state, set only by the
-// long-lived MCP server process. `yaw-mcp doctor` is a fresh short-lived
-// process that never posts anything, so both getters always return null and
-// this section is effectively unreachable from the CLI. Making it real means
-// either persisting the latches cross-process (a new file under
-// ~/.yaw-mcp/, with its own staleness + concurrency rules) or deleting the
-// section (text + the --json backgroundPosters block) outright. Both are
-// product calls, not cleanups -- do not "fix" this in passing.
-function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): void {
-  const { print } = opts;
-  const analyticsFailure = getLastAnalyticsFailure();
-  const reportFailure = getLastReportFailure();
-  const dropped = getDroppedEventsCount();
-  if (!analyticsFailure && !reportFailure && dropped === 0) return;
-
-  const now = Date.now();
-  // statusCode 0 is the transport-failure sentinel (see tool-report.ts:
-  // ECONNREFUSED / DNS / timeout never produce an HTTP status). Rendering it
-  // as "HTTP 0 from <url>" reads as a bizarre server response; name it for
-  // what it is so the user looks at the network, not at the endpoint.
-  const fmt = (f: AnalyticsFailure | ReportFailure): string => {
-    const what = f.statusCode === 0 ? `network error reaching ${f.url}` : `HTTP ${f.statusCode} from ${f.url}`;
-    return `${what}, ${formatRelativeAge(now - f.at)} ago`;
-  };
-
-  print("BACKGROUND POSTERS (recent failures)");
-  print(`  analytics:    ${analyticsFailure ? fmt(analyticsFailure) : "(no recent failure)"}`);
-  print(`  tool-report:  ${reportFailure ? fmt(reportFailure) : "(no recent failure)"}`);
-  if (dropped > 0) {
-    print(
-      `  dropped:      ${dropped} analytics event${dropped === 1 ? "" : "s"} dropped (buffer full or non-retryable flush)`,
-    );
   }
   print("");
 }

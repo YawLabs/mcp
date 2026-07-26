@@ -73,14 +73,15 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     description: "Connect an MCP client to yaw-mcp",
     positional: [[...INSTALL_CLIENTS]],
     flags: [
+      // --token and --no-yaw-mcp-config are still ACCEPTED (they warn and are
+      // ignored) but are no longer suggested -- completing a deprecated flag
+      // teaches it to new users.
       "--scope",
-      "--token",
       "--project-dir",
       "--os",
       "--force",
       "--skip",
       "--dry-run",
-      "--no-yaw-mcp-config",
       "--list",
       "--all",
     ],
@@ -103,7 +104,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--base", "--help"] },
   // Inspection.
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
-  { name: "servers", description: "List servers in your yaw.sh/mcp dashboard", flags: ["--json", "--help"] },
+  { name: "servers", description: "DEPRECATED -- account mode removed, use list", flags: ["--json", "--help"] },
   {
     name: "bundles",
     description: "Browse curated multi-server bundles",
@@ -134,7 +135,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: [["<namespace>"]],
     flags: ["--json", "--help"],
   },
-  { name: "compliance", description: "Run the compliance suite against a server", flags: ["--publish", "--help"] },
+  { name: "compliance", description: "Run the compliance suite against a server", flags: ["--help"] },
   {
     name: "foundry",
     description: "Export the opt-in dispatch-trace corpus",

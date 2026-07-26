@@ -1,29 +1,34 @@
-// yaw-mcp config loader for token, apiBase, version, servers, blocked.
+// yaw-mcp config loader for version, servers, blocked, installNudge.
 //
 // Config lives in three optional files, highest-precedence first:
 //
 //   1. <project>/.yaw-mcp/config.local.json  — machine-local override; gitignore by convention
-//   2. <project>/.yaw-mcp/config.json        — project-shared file (committed); MUST NOT contain a token
+//   2. <project>/.yaw-mcp/config.json        — project-shared file (committed)
 //   3. ~/.yaw-mcp/config.json                — user-global default
 //
 // The project `.yaw-mcp/` directory is discovered by walking up from cwd
 // (see paths.ts findProjectConfigDir), stopping exclusively before $HOME
 // so a `.yaw-mcp/` sitting at $HOME is treated as user-global only.
 //
-// Token precedence:    YAW_MCP_TOKEN env  >  local  >  global   (project never holds a token)
-// apiBase precedence:  YAW_MCP_URL env    >  local  >  project  >  global  >  https://yaw.sh/mcp
+// DEPRECATED KEYS: `token` and `apiBase` are no longer read by anything --
+// yaw-mcp is local-only and never contacts a hosted API. A file carrying
+// either key still loads (soft deprecation: rejecting it would break every
+// existing install), but the loader emits a warning telling the user to
+// delete the key and revoke the PAT. Deleting the apiBase precedence chain
+// also closes a real hole: a committed project-scope `apiBase` could
+// redirect the API base while a global-scope token was attached, sending
+// that token to an attacker-chosen host.
 //
 // servers/blocked merging: allow-list picks the most specific scope that
 // sets it (local > project > global); deny-list unions across all scopes.
 
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
 import { migrateLegacyConfigPaths } from "./migrate.js";
-import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
-import { validateApiBase } from "./url-safety.js";
+import { findProjectConfigDir, userConfigDir } from "./paths.js";
 
 export const CONFIG_FILENAME = "config.json";
 export const LOCAL_CONFIG_FILENAME = "config.local.json";
@@ -38,8 +43,6 @@ export interface LoadedConfigFile {
   path: string;
   scope: ConfigScope;
   version?: number;
-  token?: string;
-  apiBase?: string;
   servers?: string[];
   blocked?: string[];
   /** Opt-in flag for the shadow-driven install nudge. Off (undefined)
@@ -47,14 +50,7 @@ export interface LoadedConfigFile {
   installNudge?: boolean;
 }
 
-export type TokenSource = "env" | "local" | "global" | "missing";
-export type ApiBaseSource = "env" | "local" | "project" | "global" | "default";
-
 export interface ResolvedConfig {
-  token: string | null;
-  tokenSource: TokenSource;
-  apiBase: string;
-  apiBaseSource: ApiBaseSource;
   /** Allow-list (local > project > global). Undefined when no scope sets it. */
   servers?: string[];
   /** Deny-list (union across all scopes that set it). */
@@ -77,11 +73,34 @@ export interface LoadConfigOptions {
   cwd?: string;
   /** Home directory override for tests. Defaults to os.homedir(). */
   home?: string;
-  /** Process env override for tests. Defaults to process.env. */
+  /** Process env override for tests. Currently unread: the only env vars
+   *  this loader ever consulted were YAW_MCP_TOKEN / YAW_MCP_URL, both
+   *  retired with the hosted backend. Kept on the options type so the many
+   *  existing call sites (server boot, doctor, every CLI subcommand) keep
+   *  compiling through the deprecation window. */
   env?: NodeJS.ProcessEnv;
 }
 
-const DEFAULT_API_BASE = "https://yaw.sh/mcp";
+/** Config keys that used to drive the hosted backend and are now inert.
+ *  Detected (not consumed) so the loader can tell the user to clean up. */
+const DEPRECATED_KEYS = ["token", "apiBase"] as const;
+
+/** Build the soft-deprecation warning for a file that still carries
+ *  `token` / `apiBase`. Named separately so the exact wording is
+ *  assertable from tests and identical on every surface (startup log,
+ *  `doctor`, `doctor --json` warnings array). */
+function deprecatedKeyWarning(path: string, keys: string[]): string {
+  const quoted = keys.map((k) => `'${k}'`).join(" and ");
+  const isAre = keys.length > 1 ? "are" : "is";
+  const them = keys.length > 1 ? "them" : "it";
+  const revoke = keys.includes("token")
+    ? ` Revoke that PAT at its source -- deleting it here does not deactivate it.`
+    : "";
+  return (
+    `${path}: ${quoted} ${isAre} no longer used -- yaw-mcp is local-only and never contacts a hosted API. ` +
+    `Delete ${them} from ${path}.${revoke}`
+  );
+}
 
 /** Filter a config array field down to its string entries. Warns when
  *  non-string entries are dropped (mirroring the apiBase field, which warns
@@ -137,25 +156,17 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     );
   }
 
-  const token = typeof obj.token === "string" && obj.token.length > 0 ? obj.token : undefined;
-  let apiBase = typeof obj.apiBase === "string" && obj.apiBase.length > 0 ? obj.apiBase : undefined;
-  if (apiBase !== undefined) {
-    try {
-      validateApiBase(apiBase);
-    } catch (err) {
-      // Fail-open, like every other per-field problem in this reader: an
-      // unusable apiBase drops THAT FIELD and warns. Throwing here would
-      // reject the whole file (losing its allow/deny lists and installNudge)
-      // and, worse, propagate out of loadYawMcpConfig -- where the server
-      // boot path swallows it into a null config (disabling the profile
-      // entirely) and the CLI path has no handler at all. The env-var
-      // source is still hard-validated in loadYawMcpConfig.
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`${path}: ${msg} -- apiBase ignored`);
-      log("warn", "Config file has an unusable apiBase; ignoring the field", { path, error: msg });
-      apiBase = undefined;
-    }
+  // Soft deprecation: detect the retired hosted-backend keys, warn, and
+  // keep loading. A hard error here would break every config file written
+  // by a pre-local-only yaw-mcp -- and the rest of the file (allow/deny
+  // lists, installNudge) is still perfectly valid. Key PRESENCE is the
+  // trigger, not a usable value: `"token": ""` still needs cleaning up.
+  const staleKeys = DEPRECATED_KEYS.filter((k) => k in obj);
+  if (staleKeys.length > 0) {
+    warnings.push(deprecatedKeyWarning(path, [...staleKeys]));
+    log("warn", "Config file carries retired hosted-backend keys", { path, keys: staleKeys.join(",") });
   }
+
   const servers = filterStringArray(obj.servers, "servers", path, warnings);
   const blocked = filterStringArray(obj.blocked, "blocked", path, warnings);
   // Only a literal boolean is honored — a non-boolean (string "true",
@@ -163,35 +174,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   // flip on a privacy-sensitive nudge.
   const installNudge = typeof obj.installNudge === "boolean" ? obj.installNudge : undefined;
 
-  if (token) {
-    if (scope === "project") {
-      warnings.push(
-        `${path}: 'token' found in a project-shared config file is IGNORED -- yaw-mcp never reads a token from this scope to avoid committing credentials. Move it to ${CONFIG_DIRNAME}/${LOCAL_CONFIG_FILENAME} (machine-local, gitignore by convention) or ~/${CONFIG_DIRNAME}/${CONFIG_FILENAME} (user-global).`,
-      );
-      // Skip the perms check: a project-scope token is IGNORED (warned
-      // above) and lives in a committed file, so chmod-600 advice would be
-      // irrelevant noise -- the fix is to MOVE the token, not tighten perms.
-    } else {
-      await checkPermissions(path, warnings);
-    }
-  }
-
-  return { path, scope, version, token, apiBase, servers, blocked, installNudge };
-}
-
-async function checkPermissions(path: string, warnings: string[]): Promise<void> {
-  if (process.platform === "win32") return;
-  try {
-    const st = await stat(path);
-    const mode = st.mode & 0o777;
-    if ((mode & 0o077) !== 0) {
-      warnings.push(
-        `${path}: contains a token but is readable by group/other (mode ${mode.toString(8)}). Run \`chmod 600 ${path}\` to restrict.`,
-      );
-    }
-  } catch {
-    // Stat failure is rare; not worth surfacing.
-  }
+  return { path, scope, version, servers, blocked, installNudge };
 }
 
 /** Merge servers (allow-list): most specific scope wins. */
@@ -256,14 +239,13 @@ function migrateLegacyConfigPathsOnce(cwd: string, home: string): Promise<void> 
 export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<ResolvedConfig> {
   const cwd = resolve(opts.cwd ?? process.cwd());
   const home = resolve(opts.home ?? homedir());
-  const env = opts.env ?? process.env;
 
   const warnings: string[] = [];
   const loadedFiles: LoadedConfigFile[] = [];
 
   // Fold any pre-0.12 flat config dotfiles into `.yaw-mcp/` before the
   // resolver runs — otherwise a user who upgrades from 0.11.x would
-  // silently lose their token until they moved the file by hand.
+  // silently lose their allow/deny lists until they moved the file by hand.
   // Fail-open: migration errors are logged, never thrown. Memoized per
   // (cwd, home) so repeat loads in one process don't re-walk the tree.
   await migrateLegacyConfigPathsOnce(cwd, home);
@@ -299,50 +281,7 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   const global = await readConfigAt(globalPath, "global", warnings);
   if (global) loadedFiles.push(global);
 
-  let token: string | null = null;
-  let tokenSource: TokenSource = "missing";
-  if (typeof env.YAW_MCP_TOKEN === "string" && env.YAW_MCP_TOKEN.length > 0) {
-    token = env.YAW_MCP_TOKEN;
-    tokenSource = "env";
-  } else if (local?.token) {
-    token = local.token;
-    tokenSource = "local";
-  } else if (global?.token) {
-    token = global.token;
-    tokenSource = "global";
-  }
-
-  let apiBase = DEFAULT_API_BASE;
-  let apiBaseSource: ApiBaseSource = "default";
-  if (typeof env.YAW_MCP_URL === "string" && env.YAW_MCP_URL.length > 0) {
-    apiBase = env.YAW_MCP_URL;
-    apiBaseSource = "env";
-  } else if (local?.apiBase) {
-    apiBase = local.apiBase;
-    apiBaseSource = "local";
-  } else if (project?.apiBase) {
-    apiBase = project.apiBase;
-    apiBaseSource = "project";
-  } else if (global?.apiBase) {
-    apiBase = global.apiBase;
-    apiBaseSource = "global";
-  }
-
-  // Final guard — catches the env-override path (per-file validation
-  // covers local/project/global at read time) and any future source.
-  // The DEFAULT_API_BASE is https, so the default path never throws.
-  try {
-    validateApiBase(apiBase);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`apiBase (source: ${apiBaseSource}): ${msg}`);
-  }
-
   return {
-    token,
-    tokenSource,
-    apiBase,
-    apiBaseSource,
     servers: pickServers(loadedFiles),
     blocked: unionBlocked(loadedFiles),
     installNudge: pickInstallNudge(loadedFiles),
@@ -350,13 +289,6 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
     loadedFiles,
     warnings,
   };
-}
-
-/** Last-4-of-token fingerprint for safe display in `yaw-mcp doctor`. */
-export function tokenFingerprint(token: string | null): string {
-  if (!token) return "(none)";
-  if (token.length <= 8) return `***${token.slice(-2)}`;
-  return `${token.slice(0, 8)}...${token.slice(-4)}`;
 }
 
 // --- Profile compatibility layer ---------------------------------------

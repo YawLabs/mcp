@@ -1,6 +1,4 @@
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -11,13 +9,10 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { request } from "undici";
-import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { type ComplianceGrade, classifyGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
-import { ConfigError, fetchConfig } from "./config.js";
 import { loadYawMcpConfig, type Profile, profileAllows, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
@@ -34,19 +29,13 @@ import {
 import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js";
 import { closestNames } from "./fuzzy.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
-import {
-  ACTIVATION_FAILURE_TTL_MS,
-  type ActivationFailure,
-  formatHealthWarning,
-  healthFactor,
-} from "./health-score.js";
-import { initHeartbeat, reportHeartbeat } from "./heartbeat.js";
+import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
 import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
 import { LearningStore } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
-import { buildInstallPayload, computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
+import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { loadState, saveState } from "./persistence.js";
 import { createProgressReporter, type ProgressReporter } from "./progress.js";
@@ -69,7 +58,6 @@ import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
 import { type RankableServer, rankServers, tokenize } from "./relevance.js";
-import { initRerank, rerank } from "./rerank.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
   firstResultText,
@@ -78,7 +66,6 @@ import {
   isRewardGraderEnabled,
   isUncertainReward,
 } from "./reward-grader.js";
-import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
 import {
   bestOfNViaSampling,
   buildCandidates,
@@ -88,39 +75,12 @@ import {
 } from "./sampling-rank.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
-import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
 import { ensureUv } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
-
-// Poll interval for fetching config from Yaw MCP (milliseconds).
-//
-// Resolution order:
-//   1. YAW_MCP_POLL_INTERVAL env var (integer seconds). 0 disables polling
-//      entirely — config is fetched once at startup and never again; users
-//      must restart their MCP client to pick up dashboard changes.
-//   2. Default: 60 seconds. Matches the server-side `Cache-Control:
-//      private, max-age=60` on /api/connect/config, so each poll either
-//      hits the ETag short-circuit (304) or returns a body once per
-//      minute.
-//
-// Users who want a quieter client set e.g. YAW_MCP_POLL_INTERVAL=300 (5min)
-// or YAW_MCP_POLL_INTERVAL=0 (one-shot at startup only).
-const DEFAULT_POLL_INTERVAL_MS = 60_000;
-
-function resolvePollIntervalMs(): number {
-  const raw = process.env.YAW_MCP_POLL_INTERVAL;
-  if (raw === undefined || raw === "") return DEFAULT_POLL_INTERVAL_MS;
-  const seconds = Number.parseInt(raw, 10);
-  if (!Number.isFinite(seconds) || seconds < 0) {
-    log("warn", "Invalid YAW_MCP_POLL_INTERVAL; falling back to 60s default", { value: raw });
-    return DEFAULT_POLL_INTERVAL_MS;
-  }
-  return seconds * 1000;
-}
 
 // Opt-out for cross-session persistence. Set YAW_MCP_DISABLE_PERSISTENCE=1
 // (or "true") to keep learning + pack-history scoped to the current
@@ -227,18 +187,6 @@ export function resolveNamespaces(args: Record<string, unknown>): string[] {
   return [];
 }
 
-/** Derive a safe namespace from an imported mcpServers key: lowercase,
- *  non-alphanumerics to underscore, trimmed of leading/trailing
- *  underscores, capped at 30 chars. Can return "" (all-special-char key),
- *  and two different keys can collide -- handleImport reports both. */
-export function sanitizeNamespace(key: string): string {
-  return key
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 30);
-}
-
 /** Shallow value-equality for two env maps (undefined == undefined). */
 export function envEqual(a?: Record<string, string>, b?: Record<string, string>): boolean {
   if (!a && !b) return true;
@@ -310,15 +258,6 @@ export class ConnectServer {
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
   private configVersion: string | null = null;
-  private pollTimer: ReturnType<typeof setTimeout> | null = null;
-  // Captures the AI client's Implementation block once the first MCP
-  // `initialize` lands (see this.server.oninitialized). Non-null means a
-  // client is attached. The per-poll heartbeat refresh reuses these
-  // exact values so its upsert always targets the same
-  // (accountId, clientName) key the attach beacon created; re-reading
-  // getClientVersion() per poll risked a transient undefined becoming a
-  // split-brain 'unknown' row on the backend.
-  private attachedClient: { name?: string; version?: string } | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -372,7 +311,7 @@ export class ConnectServer {
   // Session-scoped credential overrides supplied by the user via MCP
   // elicitation when a server's stderr indicated a missing env var.
   // Cleared on shutdown — persistence belongs in the Yaw MCP
-  // dashboard, these are a "get me running now" shortcut.
+  // bundles.json, these are a "get me running now" shortcut.
   private elicitedEnv = new Map<string, Record<string, string>>();
   // In-flight activation promises, keyed by namespace. Dedupes
   // concurrent activation attempts for the same namespace so that two
@@ -466,10 +405,7 @@ export class ConnectServer {
   private stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STATE_SAVE_DEBOUNCE_MS = 1000;
 
-  constructor(
-    private apiUrl: string,
-    private token: string | null,
-  ) {
+  constructor() {
     this.server = new Server(
       { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
       {
@@ -485,15 +421,6 @@ export class ConnectServer {
     // is implicit -- the client advertises whether IT supports receiving
     // them, which we check via getClientCapabilities() before prompting.
     this.setupHandlers();
-  }
-
-  /** True when no token was resolved at startup. In local mode the
-   *  config source is `~/.yaw-mcp/bundles.json` and all backend POSTs
-   *  (analytics, heartbeat, rerank, runtime-detect, tool-report,
-   *  /api/connect/install, /api/connect/import) are skipped or return
-   *  a clear error. */
-  private get localMode(): boolean {
-    return this.token === null;
   }
 
   // Builtin resources served directly by yaw-mcp (not proxied from an
@@ -602,7 +529,7 @@ export class ConnectServer {
   // their tools in tools/list before activation; first tools/call on any
   // of those tools triggers lazy activation via activateOne in
   // handleToolCall. Merges in any in-session toolCache (this.toolCache)
-  // that hasn't yet been persisted to the dashboard, so recently-used
+  // that hasn't yet been persisted to bundles.json, so recently-used
   // servers that got idle-evicted still appear as deferred.
   private getDeferredServers(): UpstreamServerConfig[] {
     const out: UpstreamServerConfig[] = [];
@@ -695,64 +622,34 @@ export class ConnectServer {
       });
     }
 
-    // Load config -- backend in account mode, bundles.json in local mode.
-    // Non-fatal errors allow startup with an empty config in either path.
-    if (this.localMode) {
-      const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
-        log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
-        return { config: null, path: null, warnings: [] };
-      });
-      for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
-      this.config = result.config ?? { servers: [], configVersion: "" };
-      // Deduplicate by namespace -- keep first occurrence. Mirrors the
-      // backend-config dedup in fetchAndApplyConfig: reconcileConfig and the
-      // routing state assume one server per namespace, so a duplicate in
-      // bundles.json must be filtered here too (the local-mode path doesn't
-      // go through fetchAndApplyConfig's filter).
-      const seenNs = new Set<string>();
-      this.config.servers = this.config.servers.filter((s) => {
-        if (seenNs.has(s.namespace)) {
-          log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
-          return false;
-        }
-        seenNs.add(s.namespace);
-        return true;
-      });
-      this.configVersion = this.config.configVersion;
-      log("info", "Local mode: loaded bundles", {
-        path: result.path,
-        serverCount: this.config.servers.length,
-      });
-      // Reconcile so the loaded servers populate the routing state.
-      await this.reconcileConfig(this.config);
-    } else {
-      try {
-        await this.fetchAndApplyConfig();
-      } catch (err: any) {
-        if (err instanceof ConfigError && err.fatal) {
-          throw err;
-        }
-        log("warn", "Initial config fetch failed, starting with empty config", { error: err.message });
-        this.config = { servers: [], configVersion: "" };
+    // Load config from bundles.json -- the only config source. Non-fatal
+    // errors allow startup with an empty config.
+    const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
+      log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
+      return { config: null, path: null, warnings: [] };
+    });
+    for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
+    this.config = result.config ?? { servers: [], configVersion: "" };
+    // Deduplicate by namespace -- keep first occurrence. reconcileConfig
+    // and the routing state assume one server per namespace, so a
+    // duplicate in bundles.json has to be filtered before either sees it.
+    const seenNs = new Set<string>();
+    this.config.servers = this.config.servers.filter((s) => {
+      if (seenNs.has(s.namespace)) {
+        log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
+        return false;
       }
-    }
+      seenNs.add(s.namespace);
+      return true;
+    });
+    this.configVersion = this.config.configVersion;
+    log("info", "Loaded bundles", {
+      path: result.path,
+      serverCount: this.config.servers.length,
+    });
+    // Reconcile so the loaded servers populate the routing state.
+    await this.reconcileConfig(this.config);
 
-    // Backend telemetry only when an account is attached. The init
-    // functions store apiUrl + token in module state; later report*
-    // calls short-circuit when either is empty, so skipping the inits
-    // here makes every downstream telemetry call a no-op in local mode.
-    if (!this.localMode) {
-      initAnalytics(this.apiUrl, this.token as string);
-      initToolReport(this.apiUrl, this.token as string);
-      initRerank(this.apiUrl, this.token as string);
-      initRuntimeDetect(this.apiUrl, this.token as string);
-      initHeartbeat(this.apiUrl, this.token as string);
-      // Background runtime probe -- fire-and-forget, the dashboard just
-      // ignores stale snapshots. Subsequent reports happen on each new
-      // yaw-mcp startup, which is sufficient for "what runtimes are
-      // installed" since it changes rarely.
-      reportRuntimes().catch((err: Error) => log("warn", "reportRuntimes failed", { error: err?.message }));
-    }
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
     // awaits the same in-flight promise rather than triggering a
@@ -763,34 +660,14 @@ export class ConnectServer {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
 
-    // Fire-once stage-4b beacon: the MCP SDK invokes `oninitialized`
-    // after the parent client (Claude Code, Cursor, etc.) completes
-    // the initialize handshake. We pull clientInfo from the SDK
-    // (getClientVersion returns the Implementation block from the
-    // initialize request) and POST it to /api/connect/heartbeat. Set
-    // BEFORE server.connect so the assignment can't race the first
-    // initialize on a fast client. Fire-and-forget — failure is
-    // telemetry loss, never a CLI-blocking error.
-    this.server.oninitialized = (): void => {
-      const info = this.server.getClientVersion();
-      // Capture once; the poll-loop refresh reuses these exact values so
-      // the beacon and the refresh never disagree on the upsert key.
-      this.attachedClient = { name: info?.name, version: info?.version };
-      reportHeartbeat(info?.name, info?.version).catch((err: Error) =>
-        log("warn", "reportHeartbeat failed", { error: err?.message }),
-      );
-    };
-
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-
-    this.startPolling();
 
     // Dormant servers (isActive but no persisted toolCache yet) are
     // invisible in tools/list because getDeferredServers() filters on
     // toolCache presence. That breaks the "I toggled it on in the
-    // dashboard and it disappeared" user experience. Pre-warm each one
-    // in the background: activate → reportTools persists the tool set
+    // bundles.json and it disappeared" user experience. Pre-warm each one
+    // in the background: activate → populate the in-memory toolCache
     // → disconnect so we're not holding 9 upstream processes idle.
     // Fire-and-forget so this doesn't gate transport readiness.
     this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
@@ -803,7 +680,7 @@ export class ConnectServer {
     // Opt-in auto-load of the top recurring pack. Requires persistence
     // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
     // after prewarm so both paths see the same config snapshot; they're
-    // independent (prewarm populates toolCache for dashboard-toggled
+    // independent (prewarm populates toolCache for newly-enabled
     // servers, this one spins up the recurring workflow's servers for
     // real). Fire-and-forget — startup shouldn't block on it.
     if (isAutoLoadEnabled() && this.persistenceReady) {
@@ -811,7 +688,6 @@ export class ConnectServer {
     }
 
     log("info", "yaw-mcp started", {
-      apiUrl: this.apiUrl,
       servers: this.config?.servers.length ?? 0,
     });
   }
@@ -911,10 +787,9 @@ export class ConnectServer {
               return;
             }
             this.prewarmNamespaces.delete(server.namespace);
-            // Immediately disconnect — toolCache is already in
-            // this.toolCache and reportTools persisted it upstream,
-            // so getDeferredServers() surfaces the server without
-            // us holding the upstream process alive.
+            // Immediately disconnect — the tool list is already in
+            // this.toolCache, so getDeferredServers() surfaces the
+            // server without us holding the upstream process alive.
             const conn = this.connections.get(server.namespace);
             if (conn) {
               await disconnectFromUpstream(conn).catch(() => {});
@@ -979,7 +854,6 @@ export class ConnectServer {
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const progress = createProgressReporter(extra);
     if (name === META_TOOLS.discover.name) {
-      recordConnectEvent({ namespace: null, toolName: null, action: "discover", latencyMs: null, success: true });
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
       // calling tools. Ambiguous queries fall through to the manual list.
@@ -991,7 +865,6 @@ export class ConnectServer {
       // Per-call override of the routing effort dial (off|auto|aggressive);
       // falls back to YAW_MCP_ROUTE_EFFORT when absent. See sampling-rank.ts.
       const routeEffort = typeof args.routeEffort === "string" ? args.routeEffort : undefined;
-      recordConnectEvent({ namespace: null, toolName: null, action: "activate", latencyMs: null, success: true });
       return this.attachGuideNudge(await this.handleDispatch(intent, budget, progress, routeEffort));
     }
     if (name === META_TOOLS.activate.name) {
@@ -1006,107 +879,35 @@ export class ConnectServer {
           ? (args.tools as string[])
           : undefined;
       const result = await this.handleActivate(namespaces, progress, toolsFilter);
-      const category = result.isError ? classifyError(result.content?.[0]?.text) : undefined;
-      for (const ns of namespaces) {
-        recordConnectEvent({
-          namespace: ns,
-          toolName: null,
-          action: "activate",
-          latencyMs: null,
-          success: !result.isError,
-          errorCategory: category,
-        });
-      }
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.deactivate.name) {
       const namespaces = resolveNamespaces(args);
       const result = await this.handleDeactivate(namespaces);
-      const category = result.isError ? classifyError(result.content?.[0]?.text) : undefined;
-      for (const ns of namespaces) {
-        recordConnectEvent({
-          namespace: ns,
-          toolName: null,
-          action: "deactivate",
-          latencyMs: null,
-          success: !result.isError,
-          errorCategory: category,
-        });
-      }
-      return this.attachGuideNudge(result);
-    }
-    if (name === META_TOOLS.import_config.name) {
-      const result = await this.handleImport(args.filepath as string);
-      recordConnectEvent({
-        namespace: null,
-        toolName: null,
-        action: "import",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
-      return this.attachGuideNudge(result);
-    }
-    if (name === META_TOOLS.install.name) {
-      const result = await this.handleInstall(args);
-      recordConnectEvent({
-        namespace: typeof args.namespace === "string" ? args.namespace : null,
-        toolName: null,
-        action: "install",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.health.name) {
-      recordConnectEvent({ namespace: null, toolName: null, action: "health", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleHealth());
     }
     if (name === META_TOOLS.read_tool.name) {
       const serverArg = typeof args.server === "string" ? args.server : "";
       const toolArg = typeof args.tool === "string" ? args.tool : "";
       const result = await this.handleReadTool(serverArg, toolArg, progress);
-      recordConnectEvent({
-        namespace: serverArg || null,
-        toolName: toolArg || null,
-        action: "read_tool",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.suggest.name) {
-      recordConnectEvent({ namespace: null, toolName: null, action: "suggest", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleSuggest());
     }
     if (name === META_TOOLS.exec.name) {
       const result = await this.handleExec(args);
-      recordConnectEvent({
-        namespace: null,
-        toolName: null,
-        action: "exec",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
       const action = args.action === "match" ? "match" : "list";
-      recordConnectEvent({ namespace: null, toolName: null, action: "bundles", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleBundles(action));
     }
     if (name === META_TOOLS.secrets.name) {
       const serverArg = typeof args.server === "string" ? args.server : undefined;
-      recordConnectEvent({
-        namespace: serverArg ?? null,
-        toolName: null,
-        action: "secrets",
-        latencyMs: null,
-        success: true,
-      });
       return this.attachGuideNudge(await this.handleSecretsReport(serverArg));
     }
 
@@ -1275,72 +1076,25 @@ export class ConnectServer {
         }
       }
 
-      recordConnectEvent({
-        namespace: route.namespace,
-        toolName: route.originalName,
-        action: "tool_call",
-        latencyMs,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
-
       // Prune the response before it hits the LLM. Rules are
       // conservative (drop null / undefined / empty collections,
       // collapse runs of blank lines) so we trim obvious dead weight
       // without changing meaning. Disable with YAW_MCP_PRUNE_RESPONSES=0
       // if a caller needs the exact upstream bytes through.
+      //
+      // Error responses skip pruning entirely — the text IS the error
+      // message, and stripping nulls or collapsing whitespace could
+      // obscure it.
       if (!result.isError && Array.isArray(result.content)) {
         try {
           const pr = pruneContent(result.content as Content[]);
           // Only swap in the pruned body when it's actually smaller,
           // per the MIN_SAVINGS_RATIO check inside pruneContent.
           if (pr.bytesPruned < pr.bytesRaw) result.content = pr.content;
-          try {
-            const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-            recordDispatchEvent({
-              scope: "connect",
-              serverId: null,
-              toolName: route.originalName,
-              requestBytes: argsBytes,
-              responseBytesRaw: pr.bytesRaw,
-              responseBytesPruned: pr.bytesPruned,
-            });
-          } catch {
-            // JSON.stringify can throw on cyclic structures — telemetry
-            // is strictly best-effort, never fail the tool call for it.
-          }
         } catch (err: any) {
-          // Pruner should never throw, but if it does, fall back to the
-          // pre-F1 telemetry path so the dispatch event still lands.
+          // Pruner should never throw; if it does, pass the upstream
+          // content through untouched rather than failing the call.
           log("warn", "pruneContent failed", { error: err?.message });
-          try {
-            const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-            const resultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
-            recordDispatchEvent({
-              scope: "connect",
-              serverId: null,
-              toolName: route.originalName,
-              requestBytes: argsBytes,
-              responseBytesRaw: resultBytes,
-            });
-          } catch {}
-        }
-      } else {
-        // Error responses skip pruning — the text IS the error message,
-        // stripping nulls or collapsing whitespace could obscure it.
-        try {
-          const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-          const resultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
-          recordDispatchEvent({
-            scope: "connect",
-            serverId: null,
-            toolName: route.originalName,
-            requestBytes: argsBytes,
-            responseBytesRaw: resultBytes,
-          });
-        } catch {
-          // JSON.stringify can throw on cyclic structures — telemetry
-          // is strictly best-effort, never fail the tool call for it.
         }
       }
       // Cross-session learning signal — GRADED, not binary. recordOutcome
@@ -1424,62 +1178,22 @@ export class ConnectServer {
     };
   }
 
-  // BM25 first-stage cap — wider than the budget so the semantic rerank
-  // has room to promote a server that BM25 missed on lexical grounds.
-  // 25 is comfortably under the /api/connect/rerank candidate cap (50)
-  // while leaving real reordering room.
+  // BM25 shortlist cap — wider than the budget so downstream re-sorts
+  // (health penalty, learning boost, sampling tiebreak) have room to
+  // promote a server BM25 ranked below the head of the list.
   private static readonly BM25_TOP_K = 25;
 
-  // Two-stage ranking: local BM25 to shortlist candidates, then a call
-  // to /api/connect/rerank for semantic reordering. When rerank is
-  // unavailable (no Voyage key on the backend, network hiccup, timeout,
-  // empty response), fall back silently to the BM25 order — rerank is
-  // an optimization, not a requirement.
+  // Local BM25 ranking over the profiled active servers. Shared by
+  // discover's auto-warm gate and dispatch so both pick the same winner
+  // for the same intent.
   private async twoStageRank(
     context: string,
     servers: UpstreamServerConfig[],
-  ): Promise<Array<{ namespace: string; score: number; hasRerank: boolean }>> {
+  ): Promise<Array<{ namespace: string; score: number }>> {
     const bm25Input = servers.map((s) => this.rankableFor(s));
     const bm25 = rankServers(context, bm25Input);
     if (bm25.length === 0) return [];
-
-    const shortlist = bm25.slice(0, ConnectServer.BM25_TOP_K);
-    const idByNamespace = new Map(servers.map((s) => [s.namespace, s.id]));
-    const candidateIds = shortlist
-      .map((r) => idByNamespace.get(r.namespace))
-      .filter((id): id is string => typeof id === "string" && id.length > 0);
-    if (candidateIds.length === 0) return shortlist.map((r) => ({ ...r, hasRerank: false }));
-
-    const rerankResults = await rerank(context, candidateIds);
-    if (!rerankResults) return shortlist.map((r) => ({ ...r, hasRerank: false }));
-
-    // Map id → namespace so we can reorder the BM25 shortlist by the
-    // rerank scores. Any BM25 candidate missing from rerank output
-    // (e.g., not yet embedded) falls back to its BM25 score but sorts
-    // after reranked winners.
-    const namespaceById = new Map(servers.map((s) => [s.id, s.namespace]));
-    const rerankScoreByNamespace = new Map<string, number>();
-    for (const r of rerankResults) {
-      const ns = namespaceById.get(r.id);
-      if (ns) rerankScoreByNamespace.set(ns, r.score);
-    }
-
-    const reordered: Array<{ namespace: string; score: number; hasRerank: boolean }> = [];
-    for (const item of shortlist) {
-      const s = rerankScoreByNamespace.get(item.namespace);
-      reordered.push({
-        namespace: item.namespace,
-        score: s ?? item.score,
-        hasRerank: s !== undefined,
-      });
-    }
-    reordered.sort((a, b) => {
-      // Reranked entries always sort above non-reranked (no mixing
-      // comparison between a cosine similarity and a BM25 score).
-      if (a.hasRerank !== b.hasRerank) return a.hasRerank ? -1 : 1;
-      return b.score - a.score;
-    });
-    return reordered;
+    return bm25.slice(0, ConnectServer.BM25_TOP_K);
   }
 
   // Auto-warm confidence gate — applied to discover(context) so a single
@@ -1490,15 +1204,11 @@ export class ConnectServer {
   // than a static initializer, which would latch the value at import.
   //
   // Top score must clear this floor AND the gap over the runner-up must
-  // be convincing before we auto-activate. Values are scale-dependent --
-  // BM25 scores are unbounded positive numbers, rerank cosines are in
-  // [0, 1] -- so we keep separate thresholds and pick based on whether
-  // the top entry was reranked. Tuned by intuition; revisit when we
-  // have real usage data.
+  // be convincing before we auto-activate. BM25 scores are unbounded
+  // positive numbers. Tuned by intuition; revisit when we have real
+  // usage data.
   private static readonly AUTO_ACTIVATE_MIN_SCORE_BM25 = 1.0;
   private static readonly AUTO_ACTIVATE_MARGIN_BM25 = 1.3;
-  private static readonly AUTO_ACTIVATE_MIN_SCORE_COSINE = 0.5;
-  private static readonly AUTO_ACTIVATE_MARGIN_COSINE = 1.25;
 
   // Below this installed-server count, discover() appends a one-line
   // marketplace pointer so sparse-config users see where to add more.
@@ -1519,25 +1229,18 @@ export class ConnectServer {
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) return this.handleDiscover(context);
 
-    // Use the same two-stage ranker dispatch uses so discover + dispatch
-    // pick the same winner for the same intent. BM25 shortlists locally;
-    // the backend cosines the shortlist against stored embeddings. When
-    // rerank is unavailable this silently falls back to BM25-only.
+    // Use the same ranker dispatch uses so discover + dispatch pick the
+    // same winner for the same intent.
     const ranked = await this.twoStageRank(context, activeServers);
     if (ranked.length === 0) return this.handleDiscover(context);
 
     // Only auto-warm if one candidate dominates: top score clears the
     // floor and either stands alone or beats the runner-up by the
-    // margin. Use scale-appropriate thresholds -- without this, the
-    // BM25-tuned floor (1.0) would essentially never fire when rerank
-    // is up (cosines in [0, 1]), so discover and dispatch would silently
-    // pick different winners depending on backend mode.
+    // margin.
     const top = ranked[0];
     const second = ranked[1];
-    const minScore = top?.hasRerank
-      ? ConnectServer.AUTO_ACTIVATE_MIN_SCORE_COSINE
-      : ConnectServer.AUTO_ACTIVATE_MIN_SCORE_BM25;
-    const margin = top?.hasRerank ? ConnectServer.AUTO_ACTIVATE_MARGIN_COSINE : ConnectServer.AUTO_ACTIVATE_MARGIN_BM25;
+    const minScore = ConnectServer.AUTO_ACTIVATE_MIN_SCORE_BM25;
+    const margin = ConnectServer.AUTO_ACTIVATE_MARGIN_BM25;
     const topWinsDecisively =
       top !== undefined &&
       top.score >= minScore &&
@@ -1556,9 +1259,8 @@ export class ConnectServer {
     }
 
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
-    // banner below must name the server twoStageRank picked, and the
-    // list it renders is sorted by BM25 alone (no rerank), so its head
-    // can be a different namespace entirely.
+    // banner below must name the server twoStageRank picked, which is
+    // not necessarily the head of the list the output renders.
     return this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
   }
 
@@ -1595,7 +1297,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No servers installed. Browse the yaw-mcp catalog at https://yaw.sh/mcp/explore — add any server from there to your yaw-mcp account and it will appear here within 60s.",
+            text: "No servers installed. Browse the catalog at https://yaw.sh/mcp/catalog/ and add one with `yaw-mcp add <slug>` — it lands in ~/.yaw-mcp/bundles.json. Restart this MCP client afterwards; yaw-mcp reads bundles.json once at startup.",
           },
         ],
       };
@@ -1835,7 +1537,7 @@ export class ConnectServer {
     if (inactive.length > 0) {
       lines.push("\nDisabled servers:");
       for (const server of inactive) {
-        lines.push(`  ${server.namespace} — ${server.name} (disabled in dashboard)`);
+        lines.push(`  ${server.namespace} — ${server.name} ("isActive": false in bundles.json)`);
       }
     }
 
@@ -1864,13 +1566,13 @@ export class ConnectServer {
 
     // Marketplace hint — steer sparse-config users to the catalog without
     // nagging power users. Threshold counts installed servers (active +
-    // inactive) in the user's config; anyone under the cutoff gets a
-    // one-line pointer at https://yaw.sh/mcp/explore. No backend API is
-    // hit — the catalog is a human-browsable SPA, so this is a URL hint,
-    // not a full meta-tool.
+    // inactive) in the user's bundles.json; anyone under the cutoff gets a
+    // one-line pointer at the public catalog. No API is hit — the catalog
+    // is a static browsable surface, so this is a URL hint, not a full
+    // meta-tool.
     if (this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
       lines.push(
-        "Browse the yaw-mcp catalog at https://yaw.sh/mcp/explore — add any server from there to your yaw-mcp account and it will appear here within 60s.",
+        "Browse the catalog at https://yaw.sh/mcp/catalog/ and add servers with `yaw-mcp add <slug>` — they land in ~/.yaw-mcp/bundles.json and load on the next client restart.",
       );
     }
 
@@ -1891,7 +1593,10 @@ export class ConnectServer {
   //     with the installed set),
   //   - skip if the per-CLI cooldown hasn't elapsed (shouldNudge).
   // Surviving CLIs are recorded (recordNudge) so they stay suppressed for
-  // the cooldown, and rendered as one line + an mcp_connect_install sketch.
+  // the cooldown, and rendered as one line + the `yaw-mcp add <slug>` CLI
+  // command that installs the server. The nudge points at the CLI rather
+  // than a meta-tool: adding a server writes ~/.yaw-mcp/bundles.json, which
+  // is the CLI's job, and the model can surface the command to the user.
   //
   // Privacy: the only data emitted is the aggregate integer count + the
   // first-party package / namespace / name. No raw history line, command
@@ -1931,8 +1636,7 @@ export class ConnectServer {
     const lines: string[] = ["\nInstall candidates (from your recent shell usage; history stays local):"];
     for (const { cli, count, target } of candidates) {
       lines.push(`  ${cli.padEnd(10)} (ran ${count}x recently) -> install ${target.package}`);
-      const sketch = `mcp_connect_install({ name: ${JSON.stringify(target.name)}, namespace: ${JSON.stringify(target.namespace)}, type: "local", command: "npx", args: ["-y", ${JSON.stringify(target.package)}] })`;
-      lines.push(`     ${sketch}`);
+      lines.push(`     run: yaw-mcp add ${target.namespace}`);
       // Suppress this CLI for the cooldown now that we've surfaced it.
       recordNudge(cli, this.nudgeHome);
     }
@@ -1941,7 +1645,7 @@ export class ConnectServer {
 
   // Activate a single server by namespace. Shared by handleActivate,
   // handleDispatch, and handleDiscoverWithAutoWarm so error handling,
-  // retries, caching, and tool-report round-trips live in one place.
+  // retries, and caching live in one place.
   //
   // Dedup guarantee: two concurrent callers for the same namespace
   // share one in-flight activation. Without this, a tool call landing
@@ -2027,7 +1731,7 @@ export class ConnectServer {
       return {
         ok: false,
         isChanged: false,
-        message: `"${namespace}" is installed but disabled. Enable it at https://yaw.sh/mcp to activate.`,
+        message: `"${namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and restart this MCP client to activate.`,
       };
     }
     const serverConfig = anyMatch;
@@ -2123,14 +1827,6 @@ export class ConnectServer {
           const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
           this.toolCache.set(namespace, toolMeta);
 
-          // Persist the tool list so inactive servers can still be ranked
-          // on cold starts. Fire-and-forget — failure is non-fatal.
-          if (toolMeta.length > 0) {
-            reportTools(serverConfig.id, toolMeta).catch((err: Error) =>
-              log("warn", "reportTools failed", { namespace, error: err?.message }),
-            );
-          }
-
           const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
           // server isn't permanently demoted for a transient past failure.
@@ -2170,7 +1866,7 @@ export class ConnectServer {
 
       // Record the failure so dispatch down-ranks this namespace for a
       // few minutes. The TTL is short enough that a fixed server (user
-      // edited dashboard env, for example) recovers quickly on next poll.
+      // edited bundles.json env, for example) recovers on the next client restart.
       this.activationFailures.set(namespace, {
         at: Date.now(),
         message: lastError instanceof Error ? lastError.message : String(lastError),
@@ -2458,35 +2154,20 @@ export class ConnectServer {
     }
 
     progress?.(`Ranking ${activeServers.length} servers…`);
-    // Two-stage: local BM25 filters to a shortlist, /api/connect/rerank
-    // semantically reorders it via Voyage. Falls back to BM25 alone when
-    // rerank is off or times out, so dispatch is robust in every mode.
     const rankedRaw = await this.twoStageRank(trimmed, activeServers);
     // Apply health-aware penalty: recent activation failures and high
     // error rates shrink the score so dispatch prefers working servers
     // when multiple match. Never boosts above raw score — all else
     // equal, prefer the one that works.
-    // hasRerank rides along so the re-sort below can keep the two score
-    // scales apart. Without it a BM25 score (unbounded positive) could
-    // leapfrog a semantic-rerank winner (cosine in [0, 1]) purely on
-    // magnitude, silently undoing the reranked-first guarantee
-    // twoStageRank establishes.
     const ranked = rankedRaw
       .map((r) => ({
         namespace: r.namespace,
-        hasRerank: r.hasRerank,
         score:
           r.score *
           healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)) *
           this.learning.boostFactor(r.namespace),
       }))
-      .sort((a, b) => {
-        // Same rule as twoStageRank: reranked entries stay ahead of
-        // non-reranked ones; the health/learning penalty only reorders
-        // WITHIN a scale group, never across.
-        if (a.hasRerank !== b.hasRerank) return a.hasRerank ? -1 : 1;
-        return b.score - a.score;
-      });
+      .sort((a, b) => b.score - a.score);
 
     if (ranked.length === 0) {
       return {
@@ -2500,7 +2181,7 @@ export class ConnectServer {
       };
     }
 
-    // Sampling tiebreak: when BM25+rerank+health rank the top-2
+    // Sampling tiebreak: when BM25+health rank the top-2
     // candidates within a close margin, ask the client LLM to choose.
     // Uses the same model the user is already running — no extra
     // provider key, no extra cost from yaw-mcp's side. Silently skips if
@@ -2713,68 +2394,6 @@ export class ConnectServer {
     }
   }
 
-  private async fetchAndApplyConfig(): Promise<void> {
-    // Local mode has no backend to poll -- bundles.json is loaded once
-    // at start() and never refreshed within the session. Restart yaw-mcp
-    // (or the MCP client that launched it) to pick up bundles.json
-    // edits. Defense-in-depth: startPolling() already skips in local
-    // mode, but the import/install handlers also call this in their
-    // post-write refresh path.
-    if (this.localMode) return;
-
-    // Evict expired activation failures. healthFactor() checks the TTL
-    // at read-time, so stale entries never produce a wrong penalty --
-    // but without a sweep the map grows unbounded across a long
-    // session. Piggyback the sweep on each poll so it costs nothing
-    // extra.
-    this.pruneExpiredActivationFailures();
-
-    // Pass the known configVersion so the server can short-circuit with
-    // 304 Not Modified when nothing changed -- saves DB query, JSON
-    // serialization, and response body on the hot 60s poll path.
-    const newConfig = await fetchConfig(this.apiUrl, this.token as string, this.configVersion ?? undefined);
-
-    if (newConfig === null) {
-      return; // 304 Not Modified — keep current config
-    }
-
-    if (newConfig.configVersion && newConfig.configVersion === this.configVersion) {
-      return; // No changes (server didn't return 304 but hash matches)
-    }
-
-    // Deduplicate by namespace — keep first occurrence
-    const seen = new Set<string>();
-    newConfig.servers = newConfig.servers.filter((s) => {
-      if (seen.has(s.namespace)) {
-        log("warn", "Duplicate namespace in config, skipping", { namespace: s.namespace });
-        return false;
-      }
-      seen.add(s.namespace);
-      return true;
-    });
-
-    // Swap the config reference BEFORE reconcileConfig awaits. Other
-    // handlers (handleActivate, handleDispatch, handleDiscover) read
-    // this.config synchronously and can interleave at every await
-    // point below. With the old order, a caller in the middle of
-    // reconcile would see the stale config — and could try to
-    // activate a namespace that's about to be disconnected, racing
-    // the reconcile. Setting config first means readers see the
-    // intended-future state; the connection map is the authority for
-    // "what's actually running" and catches up shortly after.
-    this.config = newConfig;
-    this.configVersion = newConfig.configVersion;
-    await this.reconcileConfig(newConfig);
-  }
-
-  private pruneExpiredActivationFailures(now: number = Date.now()): void {
-    for (const [ns, failure] of this.activationFailures) {
-      if (now - failure.at > ACTIVATION_FAILURE_TTL_MS) {
-        this.activationFailures.delete(ns);
-      }
-    }
-  }
-
   private async reconcileConfig(newConfig: ConnectConfig): Promise<void> {
     const newServersByNs = new Map(newConfig.servers.map((s) => [s.namespace, s]));
     let changed = false;
@@ -2829,370 +2448,6 @@ export class ConnectServer {
     }
   }
 
-  private startPolling(): void {
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-    }
-    // No backend to poll in local mode -- bundles.json is read-once.
-    if (this.localMode) {
-      log("info", "Local mode: polling disabled (no backend). Restart yaw-mcp to pick up bundles.json edits.");
-      return;
-    }
-    const intervalMs = resolvePollIntervalMs();
-    if (intervalMs === 0) {
-      log("info", "Config polling disabled (YAW_MCP_POLL_INTERVAL=0). Restart yaw-mcp to pick up dashboard changes.");
-      return;
-    }
-    const poll = async () => {
-      try {
-        await this.fetchAndApplyConfig();
-      } catch (err: any) {
-        log("warn", "Config poll failed", { error: err.message });
-      }
-      // Liveness refresh: while an AI client is attached, re-report the
-      // heartbeat on every poll so the dashboard's 3-minute "AI client
-      // connected" window stays satisfied. The attach beacon in
-      // oninitialized fires only once; without this refresh the badge
-      // reverts to "no AI client connected" ~3 min into every session.
-      // isRefresh=true so the backend bumps last_seen_at without
-      // inflating initialize_count. yaw-mcp is a stdio child of the AI
-      // client, so when the client closes this loop dies with it and
-      // last_seen_at goes stale on schedule -- which is the desired
-      // "client disconnected" signal.
-      if (this.attachedClient) {
-        reportHeartbeat(this.attachedClient.name, this.attachedClient.version, true).catch((err: Error) =>
-          log("warn", "reportHeartbeat refresh failed", { error: err?.message }),
-        );
-      }
-      this.pollTimer = setTimeout(poll, intervalMs);
-      if (this.pollTimer.unref) this.pollTimer.unref();
-    };
-    this.pollTimer = setTimeout(poll, intervalMs);
-    if (this.pollTimer.unref) this.pollTimer.unref();
-  }
-
-  private async handleImport(
-    filepath: string,
-  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-    if (this.localMode) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "mcp_connect_import is not available in local mode. Add servers by editing ~/.yaw-mcp/bundles.json directly, or set YAW_MCP_TOKEN to use a Yaw MCP account.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    if (!filepath) {
-      return { content: [{ type: "text", text: "filepath is required." }], isError: true };
-    }
-
-    // Security: only allow known MCP config filenames. The check must
-    // run on the RESOLVED path's basename, not the caller-supplied
-    // string — otherwise `some/dir/mcp.json/../../../etc/passwd` would
-    // have basename "passwd" and correctly fail, but a path like
-    // `/weird/place/claude_desktop_config.json` would succeed at the
-    // basename check even though the intent was to restrict reads to
-    // well-known MCP config locations. Computing the basename on
-    // `resolved` normalizes `..` segments and handles ~ expansion
-    // before we decide whether the file is allowed.
-    const ALLOWED_FILENAMES = ["claude_desktop_config.json", "mcp.json", "settings.json", "mcp_config.json"];
-
-    try {
-      const resolved =
-        filepath.startsWith("~/") || filepath.startsWith("~\\")
-          ? resolve(homedir(), filepath.slice(2))
-          : resolve(filepath);
-      const resolvedBasename = resolved.split(/[/\\]/).pop() || "";
-      if (!ALLOWED_FILENAMES.includes(resolvedBasename)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Only MCP config files are allowed: ${ALLOWED_FILENAMES.join(", ")}. Got: ${resolvedBasename}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      // Scope the file read to the user's home dir OR cwd. The
-      // basename allowlist above stops arbitrary reads from proving
-      // contents, but a caller can still probe for file existence at
-      // odd paths (e.g. `/var/log/claude_desktop_config.json`). All
-      // legitimate imports live under home (Claude Desktop configs)
-      // or cwd (project-local `.mcp.json`), so anything outside both
-      // is almost certainly an oracle probe — refuse it.
-      //
-      // `path.relative` returns an absolute-looking string when the
-      // two paths sit on different Windows drives (no relative-traversal
-      // between C: and D: exists), so the `..`-prefix check alone
-      // isn't enough on Windows — also treat an absolute return value
-      // as "outside".
-      const isUnder = (base: string, p: string) => {
-        const rel = relative(base, p);
-        return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-      };
-      if (!isUnder(homedir(), resolved) && !isUnder(process.cwd(), resolved)) {
-        return {
-          content: [
-            { type: "text", text: "Import path must be under your home directory or the current working directory." },
-          ],
-          isError: true,
-        };
-      }
-      const raw = await readFile(resolved, "utf-8");
-      const parsed = JSON.parse(raw);
-
-      // Only parse if file has mcpServers key
-      if (!parsed.mcpServers || typeof parsed.mcpServers !== "object" || Array.isArray(parsed.mcpServers)) {
-        return {
-          content: [{ type: "text", text: `No mcpServers object found in ${resolved}` }],
-          isError: true,
-        };
-      }
-      const mcpServers: Record<string, any> = parsed.mcpServers;
-
-      // Note: env vars are NOT sent to the cloud for security — users must set them in the dashboard
-      const servers: Array<{
-        name: string;
-        namespace: string;
-        type: string;
-        command?: string;
-        args?: string[];
-        url?: string;
-      }> = [];
-
-      for (const [key, value] of Object.entries(mcpServers)) {
-        if (!value || typeof value !== "object") continue;
-        // Skip ourselves
-        if (key === "yaw-mcp" || key === "mcp.hosting" || key === "mcp-connect") continue;
-
-        const namespace = sanitizeNamespace(key);
-        if (!namespace) continue;
-
-        const entry: (typeof servers)[0] = {
-          name: key,
-          namespace,
-          type: (value as any).url ? "remote" : "local",
-        };
-
-        if ((value as any).command && typeof (value as any).command === "string")
-          entry.command = (value as any).command;
-        if (Array.isArray((value as any).args)) entry.args = (value as any).args;
-        // env vars deliberately NOT sent — set them in the Yaw MCP dashboard
-        if ((value as any).url && typeof (value as any).url === "string") entry.url = (value as any).url;
-
-        servers.push(entry);
-      }
-
-      if (servers.length === 0) {
-        return { content: [{ type: "text", text: `No servers found in ${resolved}` }], isError: true };
-      }
-
-      // Detect namespace collisions from sanitization
-      const nsToKeys = new Map<string, string[]>();
-      for (const s of servers) {
-        const existing = nsToKeys.get(s.namespace) ?? [];
-        existing.push(s.name);
-        nsToKeys.set(s.namespace, existing);
-      }
-      const collisions = [...nsToKeys.entries()].filter(([, keys]) => keys.length > 1);
-
-      // POST to the bulk import endpoint
-      const res = await request(`${this.apiUrl.replace(/\/$/, "")}/api/connect/import`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ servers }),
-        headersTimeout: 15_000,
-        bodyTimeout: 15_000,
-      });
-
-      let body: any;
-      try {
-        body = await res.body.json();
-      } catch {
-        body = {};
-      }
-
-      if (res.statusCode >= 400) {
-        return {
-          content: [{ type: "text", text: `Import failed: ${body.error || `HTTP ${res.statusCode}`}` }],
-          isError: true,
-        };
-      }
-
-      // Refresh config to pick up imported servers
-      await this.fetchAndApplyConfig().catch((err: Error) =>
-        log("warn", "Post-import config refresh failed", { error: err?.message }),
-      );
-
-      const namespaceList = servers.map((s) => s.namespace).join(", ");
-      const collisionWarning =
-        collisions.length > 0
-          ? `\n\nWarning: namespace collisions detected — these names mapped to the same namespace:\n${collisions.map(([ns, keys]) => `  ${ns} ← ${keys.join(", ")}`).join("\n")}\nOnly one will be kept.`
-          : "";
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Imported ${body.imported || 0} servers (${namespaceList})${body.skipped ? `, ${body.skipped} skipped (already exist)` : ""} from ${resolved}.${collisionWarning}\n\nNote: environment variables (API keys, tokens) were NOT imported for security — set them at yaw.sh/mcp.\nUse mcp_connect_discover to see imported servers.`,
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const { code, text } = this.mapNetworkError(err, "Import");
-      log("warn", "handleImport error", {
-        error: err instanceof Error ? err.message : String(err),
-        code,
-      });
-      return { content: [{ type: "text", text }], isError: true };
-    }
-  }
-
-  // Install a new MCP server on the user's Yaw MCP account. Validates
-  // via the shared buildInstallPayload helper so local/remote + namespace
-  // shape errors fail here with a clear message instead of burning a
-  // round-trip to the backend. On 403 plan-limit we forward the structured
-  // error body verbatim (JSON) — the model surfaces that to the user so
-  // the upgrade URL is visible in chat. On 201 we force a config refetch
-  // so `discover` sees the new namespace without waiting for the 60s
-  // poll.
-  private async handleInstall(
-    args: Record<string, unknown>,
-  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-    if (this.localMode) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "mcp_connect_install is not available in local mode. Add servers by editing ~/.yaw-mcp/bundles.json directly, or set YAW_MCP_TOKEN to use a Yaw MCP account.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    const built = buildInstallPayload(args);
-    if (!built.ok) {
-      return { content: [{ type: "text", text: built.message }], isError: true };
-    }
-    const payload = built.payload;
-
-    try {
-      const res = await request(`${this.apiUrl.replace(/\/$/, "")}/api/connect/servers`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-        headersTimeout: 15_000,
-        bodyTimeout: 15_000,
-      });
-
-      let body: any;
-      try {
-        body = await res.body.json();
-      } catch {
-        body = {};
-      }
-
-      // Plan-cap: forward the backend's structured body so the model can
-      // render the upgrade URL. Returning the JSON verbatim is the
-      // load-bearing bit of the yaw-mcp install-tool contract — see
-      // buildPlanLimitExceededError in mcp-hosting/src/lib/plans.ts.
-      if (res.statusCode === 403 && body && body.code === "plan_limit_exceeded") {
-        return {
-          content: [{ type: "text", text: JSON.stringify(body, null, 2) }],
-          isError: true,
-        };
-      }
-
-      if (res.statusCode === 409) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Namespace "${payload.namespace}" is already installed. Use mcp_connect_activate to load its tools, or pick a different namespace.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      if (res.statusCode >= 400) {
-        return {
-          content: [{ type: "text", text: `Install failed: ${body.error || `HTTP ${res.statusCode}`}` }],
-          isError: true,
-        };
-      }
-
-      // Refresh config so the new server shows up in discover immediately.
-      // Race against a 3s timeout — if the backend is slow, the install
-      // itself already succeeded and the next 60s poll will catch the new
-      // namespace; better to return than hang the tool call. If the race
-      // loses, we tell the model to expect a brief delay so it doesn't
-      // immediately call activate on a namespace the client hasn't seen.
-      let configFresh = true;
-      try {
-        await Promise.race([
-          this.fetchAndApplyConfig(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("refresh timeout")), 3000)),
-        ]);
-      } catch (err) {
-        configFresh = false;
-        log("warn", "Post-install config refresh failed", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-
-      const activateCall = `mcp_connect_activate({ server: "${payload.namespace}" })`;
-      const activateHint = configFresh
-        ? `Call ${activateCall} to load its tools${payload.type === "local" ? " into this session" : ""}.`
-        : `The new server will appear in mcp_connect_discover within ~60s. If the first ${activateCall} reports an unknown namespace, wait a minute and retry.`;
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Installed "${payload.name}" (namespace "${payload.namespace}"). ${activateHint}`,
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      const { code, text } = this.mapNetworkError(err, "Install");
-      log("warn", "handleInstall error", {
-        error: err instanceof Error ? err.message : String(err),
-        code,
-      });
-      return { content: [{ type: "text", text }], isError: true };
-    }
-  }
-
-  // Map a raw undici/network error to a user-facing string instead of
-  // leaking `err.message` (e.g. "getaddrinfo ENOTFOUND yaw.sh") verbatim to
-  // the model. Returns the extracted node error code (for ops logging) and a
-  // clean message keyed by the failing operation verb ("Install"/"Import").
-  // Callers keep the raw error in the log; the LLM/user only sees `text`.
-  private mapNetworkError(err: unknown, op: "Install" | "Import"): { code: string | undefined; text: string } {
-    const code =
-      typeof err === "object" && err !== null
-        ? (err as { code?: string; cause?: { code?: string } }).code || (err as any).cause?.code
-        : undefined;
-    let text: string;
-    if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
-      text = `${op} timed out talking to yaw.sh/mcp. Retry in a moment.`;
-    } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
-      text = `Couldn't reach yaw.sh/mcp (network unreachable or DNS failure). Check your connection and retry.`;
-    } else {
-      text = `${op} failed unexpectedly. Check yaw-mcp logs on this machine for the underlying error.`;
-    }
-    return { code, text };
-  }
-
   // Signature-on-demand: return one tool's full input schema without
   // persistently activating its server. When the server is already
   // loaded we read from the in-memory connection. When it isn't, we
@@ -3221,7 +2476,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `"${serverArg}" is not installed on this account. Call mcp_connect_discover to list available servers.`,
+            text: `"${serverArg}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover to list available servers.`,
           },
         ],
         isError: true,
@@ -3497,7 +2752,7 @@ export class ConnectServer {
   // run `mcp_connect_activate` snippet; `action=match` cross-references
   // the installed server list and partitions into fully-ready vs
   // partially-installed so the caller only sees bundles that are actually
-  // actionable on this account.
+  // actionable with the servers in bundles.json.
   private handleBundles(action: "list" | "match"): { content: Array<{ type: string; text: string }> } {
     if (action === "list") {
       const lines: string[] = [`Curated server bundles (${CURATED_BUNDLES.length}):\n`];
@@ -3508,7 +2763,7 @@ export class ConnectServer {
       }
       lines.push("");
       lines.push(
-        'Call mcp_connect_bundles with action="match" to filter these against servers already installed on this account.',
+        'Call mcp_connect_bundles with action="match" to filter these against the servers already in the user\'s bundles.json.',
       );
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
@@ -3522,7 +2777,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No curated bundles match your currently installed servers. Browse https://yaw.sh/mcp/explore to add the servers a bundle needs, then re-run mcp_connect_bundles.",
+            text: "No curated bundles match your currently installed servers. Browse the catalog at https://yaw.sh/mcp/catalog/ and add what a bundle needs with `yaw-mcp add <slug>`, then restart this MCP client and re-run mcp_connect_bundles.",
           },
         ],
       };
@@ -3546,7 +2801,7 @@ export class ConnectServer {
         const { bundle, have, missing } = entry;
         lines.push(`  ${bundle.id} — ${bundle.description}`);
         lines.push(`    have: ${have.join(", ")}`);
-        lines.push(`    missing: ${missing.join(", ")} (install from https://yaw.sh/mcp/explore)`);
+        lines.push(`    missing: ${missing.join(", ")} (add with: yaw-mcp add ${missing.join(" && yaw-mcp add ")})`);
       }
     }
 
@@ -3815,11 +3070,6 @@ export class ConnectServer {
   async shutdown(): Promise<void> {
     log("info", "Shutting down yaw-mcp");
 
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
-    }
-
     // Flush any pending state save before we stop accepting writes.
     // Cancels the debounce timer so no stale snapshot writes after.
     if (this.stateSaveTimer) {
@@ -3829,8 +3079,6 @@ export class ConnectServer {
     if (this.persistenceReady) {
       await this.flushStateSave();
     }
-
-    await shutdownAnalytics();
 
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));

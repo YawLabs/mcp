@@ -82,7 +82,7 @@ describe("resolveCatalogSlug", () => {
   ])("refuses a remote server (%s)", async (_label, install) => {
     const servers: CatalogServer[] = [{ slug: "remote-one", install }];
     await expect(resolveCatalogSlug("remote-one", { fetchCatalog: makeFetch(servers) })).rejects.toThrow(
-      '"remote-one" is a remote server -- add it from the Yaw MCP dashboard, not the local CLI.',
+      /is a remote \(HTTP\) server.*bundles\.json/,
     );
   });
 

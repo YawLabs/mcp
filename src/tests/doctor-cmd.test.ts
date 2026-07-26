@@ -7,23 +7,11 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
   writeFileSync(join(root, ".yaw-mcp", filename), JSON.stringify(obj));
 }
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-// doctor reads the tool-report failure latch through this getter. The latch
-// is in-process module state that only the long-lived server sets, so it is
-// unreachable from a fresh CLI process -- mocking the getter is the only way
-// to exercise the BACKGROUND POSTERS renderer. Defaults to the healthy
-// (null) case so every other test in this file sees today's behaviour.
-vi.mock("../tool-report.js", () => ({
-  getLastReportFailure: vi.fn(() => null),
-  initToolReport: vi.fn(),
-  reportTools: vi.fn(),
-}));
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
-import { getLastReportFailure } from "../tool-report.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -52,60 +40,53 @@ function captureOut() {
 }
 
 describe("runDoctor — exit codes", () => {
-  it("exits 0 in local mode when no token is anywhere", async () => {
+  it("exits 0 on a clean setup with no config files at all", async () => {
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
-    expect(r.exitCode).toBe(0);
-    expect(cap.text()).toMatch(/Local mode/);
-  });
-
-  it("exits 0 when a token is in env and there are no warnings", async () => {
-    const cap = captureOut();
-    const r = await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-    });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/All good/);
   });
 
-  it("exits 2 when token is present but warnings exist (newer schema)", async () => {
-    writeYawMcpConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
+  it("exits 2 whenever a warning exists (newer schema)", async () => {
+    writeYawMcpConfig(synthHome, "config.json", { version: 999, servers: ["github"] });
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(r.exitCode).toBe(2);
-    expect(cap.text()).toMatch(/warnings above need attention/);
+    expect(cap.text()).toMatch(/Warnings above need attention/);
+  });
+
+  // Regression guard. The exit-2 branch used to be gated on a resolved token
+  // (`config.token === null` short-circuited to a clean exit 0). With account
+  // mode gone that precondition was never satisfiable, so a warning-producing
+  // config would have exited 0 forever. The gate is now unconditional.
+  it("exits 2 on a warning even though nothing resembling a token exists", async () => {
+    writeYawMcpConfig(synthHome, "config.json", { version: 999 });
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("exits 2 for a malformed config file", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "config.json"), "{ not json at all");
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(r.exitCode).toBe(2);
   });
 });
 
 describe("runDoctor — output content", () => {
-  it("fingerprints the token (never prints raw)", async () => {
-    const cap = captureOut();
-    const raw = "mcp_pat_supersecret_DO_NOT_LEAK_aaaa1234";
-    await runDoctor({ cwd: synthCwd, home: synthHome, env: { YAW_MCP_TOKEN: raw }, os: "linux", out: cap.out });
-    const txt = cap.text();
-    expect(txt).not.toContain("supersecret");
-    expect(txt).not.toContain("DO_NOT_LEAK");
-    // Accept either elision glyph -- the mask character is config-loader's
-    // call (ASCII "..." vs "…"); what this test pins is that the fingerprint
-    // keeps the prefix + last 4 and nothing else.
-    expect(txt).toMatch(/mcp_pat_(…|\.\.\.)1234/);
-  });
-
-  it("reports the source for token and apiBase", async () => {
-    writeYawMcpConfig(synthHome, "config.json", { token: "mcp_pat_aaaa", apiBase: "https://corp.example" });
+  it("no longer prints TOKEN / API BASE sections", async () => {
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
-    expect(cap.text()).toMatch(/source: global/);
-    expect(cap.text()).toMatch(/https:\/\/corp\.example/);
+    const txt = cap.text();
+    expect(txt).not.toMatch(/^TOKEN$/m);
+    expect(txt).not.toMatch(/^API BASE$/m);
   });
 
   it("lists each loaded config file with scope", async () => {
-    writeYawMcpConfig(synthHome, "config.json", { token: "mcp_pat_aaaa" });
-    writeYawMcpConfig(synthCwd, "config.json", { apiBase: "https://example" });
+    writeYawMcpConfig(synthHome, "config.json", { servers: ["github"] });
+    writeYawMcpConfig(synthCwd, "config.json", { blocked: ["slack"] });
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
@@ -353,72 +334,24 @@ describe("scanShellHistoryForShadows", () => {
   });
 });
 
-describe("runDoctor — BACKGROUND POSTERS section", () => {
-  const latch = vi.mocked(getLastReportFailure);
-  afterEach(() => {
-    latch.mockReturnValue(null);
-  });
-
-  it("renders statusCode 0 as a network error, never 'HTTP 0'", async () => {
-    // tool-report.ts uses statusCode 0 as the transport-failure sentinel
-    // (ECONNREFUSED / DNS / timeout produce no HTTP status).
-    latch.mockReturnValue({ statusCode: 0, url: "https://yaw.sh/mcp/api/connect/servers/srv/tools", at: Date.now() });
-    const cap = captureOut();
-    await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-      skipRegistryCheck: true,
-    });
-    const txt = cap.text();
-    expect(txt).toContain("BACKGROUND POSTERS");
-    expect(txt).toMatch(/tool-report: {2}network error reaching https:\/\/yaw\.sh/);
-    expect(txt).not.toContain("HTTP 0");
-  });
-
-  it("still renders a real status code as HTTP <code>", async () => {
-    latch.mockReturnValue({ statusCode: 401, url: "https://yaw.sh/mcp/api/connect/servers/srv/tools", at: Date.now() });
-    const cap = captureOut();
-    await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-      skipRegistryCheck: true,
-    });
-    expect(cap.text()).toMatch(/tool-report: {2}HTTP 401 from https:\/\/yaw\.sh/);
-  });
-
-  it("stays silent when no poster has failed", async () => {
-    const cap = captureOut();
-    await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-      skipRegistryCheck: true,
-    });
-    expect(cap.text()).not.toContain("BACKGROUND POSTERS");
-  });
-});
-
 describe("runDoctor — surfaces config-loader warnings", () => {
-  it("relays the project-token warning into doctor output", async () => {
+  it("relays the deprecated-token warning into doctor output and exits 2", async () => {
     writeYawMcpConfig(synthCwd, "config.json", { token: "mcp_pat_committed_aaaa" });
+    const errs: string[] = [];
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_env_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
+      err: (s) => errs.push(s),
     });
-    // Token resolved (env), but the warning about committed-file token still surfaces.
-    expect(cap.text()).toMatch(/project-shared config file is IGNORED/);
+    // Both surfaces carry it: the human WARNINGS section on stdout, and the
+    // always-on stderr stream for stdout-capturing pipelines.
+    expect(cap.text()).toMatch(/'token' is no longer used/);
+    expect(cap.text()).toMatch(/revoke that PAT/i);
+    expect(errs.join("")).toMatch(/'token' is no longer used/);
     expect(r.exitCode).toBe(2);
   });
 });
@@ -602,7 +535,6 @@ describe("runDoctor — ENVIRONMENT section", () => {
     // Every tracked var must be listed so support can see at a glance
     // whether the user set it. Default-hint strings prove the row is
     // rendered with the "(not set — …)" form rather than a raw value.
-    expect(txt).toMatch(/YAW_MCP_POLL_INTERVAL\s+\(not set — default 60s\)/);
     expect(txt).toMatch(/YAW_MCP_SERVER_CAP\s+\(not set — default 6\)/);
     expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+\(not set — filter inactive\)/);
     expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+\(not set — auto-load inactive\)/);
@@ -629,7 +561,6 @@ describe("runDoctor — ENVIRONMENT section", () => {
     expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+B/);
     expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+1/);
     // Unset vars should still show their default hint.
-    expect(txt).toMatch(/YAW_MCP_POLL_INTERVAL\s+\(not set/);
     expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set/);
   });
 });
@@ -758,7 +689,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -771,35 +702,40 @@ describe("runDoctor — --json", () => {
     expect(parsed).toMatchObject({
       version: expect.any(String),
       platform: "linux",
-      token: { source: "env" },
-      apiBase: { value: expect.any(String), source: expect.any(String) },
       diagnosis: { exitCode: 0, summary: expect.any(String) },
     });
     // Text-mode section headers MUST NOT appear.
     expect(cap.text()).not.toMatch(/CONFIG FILES|TOKEN\n|DIAGNOSIS/);
   });
 
-  it("never includes the raw token value", async () => {
+  // The `token` / `apiBase` blocks are retired but MUST keep their keys and
+  // their nested shape -- a consumer doing `.token.source` or
+  // `.apiBase.value` would throw on a bare null. Same contract as
+  // `backgroundPosters` and `env.YAW_MCP_POLL_INTERVAL`.
+  it("keeps token / apiBase as nested objects with null members", async () => {
     const cap = captureOut();
-    const raw = "mcp_pat_supersecret_DO_NOT_LEAK_aaaa1234";
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: raw },
+      env: { YAW_MCP_TOKEN: "mcp_pat_DO_NOT_LEAK_1234", YAW_MCP_URL: "https://corp.example" },
       os: "linux",
       out: cap.out,
       json: true,
       skipRegistryCheck: true,
     });
-    const text = r.lines.join("");
-    expect(text).not.toContain("supersecret");
-    expect(text).not.toContain("DO_NOT_LEAK");
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.token.fingerprint).toMatch(/(…|\.\.\.)1234/);
-    expect(parsed.token.fingerprint).not.toContain("DO_NOT_LEAK");
+    expect(parsed).toHaveProperty("token");
+    expect(parsed).toHaveProperty("apiBase");
+    expect(parsed.token).toEqual({ fingerprint: null, source: null });
+    expect(parsed.apiBase).toEqual({ value: null, source: null });
+    // Nested, not flattened: `.token.source` must not throw.
+    expect(parsed.token.source).toBeNull();
+    expect(parsed.apiBase.value).toBeNull();
+    // And nothing token-shaped from the env leaks into the blob.
+    expect(r.lines.join("")).not.toContain("DO_NOT_LEAK");
   });
 
-  it("exit code in diagnosis matches returned exitCode (local mode, no token)", async () => {
+  it("exit code in diagnosis matches returned exitCode on a clean setup", async () => {
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -813,12 +749,11 @@ describe("runDoctor — --json", () => {
     expect(r.exitCode).toBe(0);
     const parsed = JSON.parse(r.lines[0]);
     expect(parsed.diagnosis.exitCode).toBe(0);
-    expect(parsed.diagnosis.summary).toMatch(/Local mode/);
-    expect(parsed.token.fingerprint).toBe("(none)");
+    expect(parsed.diagnosis.summary).toMatch(/All good/);
   });
 
   it("surfaces warnings in the JSON snapshot", async () => {
-    writeYawMcpConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
+    writeYawMcpConfig(synthHome, "config.json", { version: 999, servers: ["github"] });
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -980,8 +915,28 @@ describe("runDoctor — --json", () => {
     });
     const parsed = JSON.parse(r.lines[0]);
     expect(parsed.env.YAW_MCP_SERVER_CAP).toBe("12");
-    expect(parsed.env.YAW_MCP_POLL_INTERVAL).toBeNull();
+    expect(parsed.env.YAW_MCP_AUTO_ACTIVATE).toBeNull();
     expect(parsed.env).toHaveProperty("YAW_MCP_AUTO_LOAD");
+  });
+
+  it("keeps the deprecated YAW_MCP_POLL_INTERVAL env key, reading null even when the var IS set", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_POLL_INTERVAL: "300" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    // The remote config poll loop this tuned went with the hosted backend,
+    // so nothing reads the var any more. The KEY survives the deprecation
+    // window (same contract as backgroundPosters) so a consumer reading
+    // `.env.YAW_MCP_POLL_INTERVAL` doesn't hit an undefined property.
+    expect(Object.hasOwn(parsed.env, "YAW_MCP_POLL_INTERVAL")).toBe(true);
+    expect(parsed.env.YAW_MCP_POLL_INTERVAL).toBeNull();
   });
 
   it("upgrade.stale stays false on a dev build (the 'dev' version short-circuits the check)", async () => {
@@ -1033,8 +988,14 @@ describe("runDoctor — --json", () => {
       skipRegistryCheck: true,
     });
     const parsed = JSON.parse(r.lines[0]);
-    // Healthy install: both present, trials empty, posters null.
     expect(parsed.trials).toEqual({ cleared: 0, live: [], malformed: [] });
+    // backgroundPosters is soft-deprecated: the posters that fed it are
+    // gone, but the key AND its nested shape must survive one minor so
+    // `doctor --json` output is byte-identical for external consumers.
+    // The latches were in-process server state and doctor is a fresh
+    // process, so this already emitted both members as null in practice —
+    // flattening to a bare `null` would break `.backgroundPosters.analytics`.
+    expect(Object.hasOwn(parsed, "backgroundPosters")).toBe(true);
     expect(parsed.backgroundPosters).toEqual({ analytics: null, toolReport: null });
   });
 

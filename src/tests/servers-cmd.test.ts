@@ -1,21 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CONFIG_DIRNAME } from "../paths.js";
-import { parseServersArgs, runServersCommand } from "../servers-cmd.js";
-import type { ConnectConfig, UpstreamServerConfig } from "../types.js";
-
-function makeServer(over: Partial<UpstreamServerConfig> = {}): UpstreamServerConfig {
-  return {
-    id: "srv-1",
-    name: "Example",
-    namespace: "ex",
-    type: "remote",
-    isActive: true,
-    ...over,
-  };
-}
+import { describe, expect, it } from "vitest";
+import { parseServersArgs, runServersCommand, SERVERS_DEPRECATED_MESSAGE } from "../servers-cmd.js";
 
 function captureIO(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
   const out: string[] = [];
@@ -53,6 +37,15 @@ describe("parseServersArgs", () => {
     if (!r.ok) expect(r.error).toContain("Usage: yaw-mcp servers");
   });
 
+  it("--help usage marks the command deprecated and points at `list`", () => {
+    const r = parseServersArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("DEPRECATED");
+      expect(r.error).toContain("yaw-mcp list");
+    }
+  });
+
   it("accepts a positional namespace filter", () => {
     const r = parseServersArgs(["github"]);
     expect(r).toEqual({ ok: true, options: { json: false, filter: "github" } });
@@ -76,473 +69,54 @@ describe("parseServersArgs", () => {
   });
 });
 
-describe("runServersCommand", () => {
-  let home: string;
-
-  beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "yaw-mcp-servers-"));
-    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
-    // Seed a global config with a token so the fetcher branch is reached.
-    writeFileSync(
-      join(home, CONFIG_DIRNAME, "config.json"),
-      JSON.stringify({ version: 1, token: "mcp_pat_test" }),
-      "utf8",
-    );
-  });
-
-  afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
-  });
-
-  it("exits 1 with a usage hint when no token is resolvable", async () => {
-    rmSync(join(home, CONFIG_DIRNAME, "config.json"));
+describe("runServersCommand (deprecated stub)", () => {
+  it("always exits non-zero", async () => {
     const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => {
-        throw new Error("fetcher should not run");
-      },
-    });
+    const r = await runServersCommand({ out: io.push, err: io.pushErr });
+    expect(r.exitCode).not.toBe(0);
     expect(r.exitCode).toBe(1);
-    expect(io.err.join("")).toContain("no token resolved");
   });
 
-  it("renders a table when servers are returned", async () => {
+  it("explains that account mode is gone and points at `yaw-mcp list` on stderr", async () => {
     const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "abcdef12345",
-      servers: [
-        makeServer({ namespace: "linear", name: "Linear", type: "remote", isActive: true, complianceGrade: "A" }),
-        makeServer({
-          namespace: "gh",
-          name: "GitHub",
-          type: "local",
-          isActive: true,
-          toolCache: Array(42).fill({ name: "t" }),
-        }),
-        makeServer({ namespace: "slack", name: "Slack", type: "remote", isActive: false, complianceGrade: "B" }),
-      ],
-    };
-    const r = await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
-    expect(r.exitCode).toBe(0);
-    const combined = io.out.join("\n");
-    expect(combined).toContain("3 servers (2 enabled, 1 disabled)");
-    expect(combined).toContain("config abcdef12"); // 8-char slug
-    expect(combined).toContain("NAMESPACE");
-    expect(combined).toContain("GitHub");
-    expect(combined).toContain("Linear");
-    expect(combined).toContain("enabled");
-    expect(combined).toContain("disabled");
-    // Tools is the last column, so "42" is right-aligned with no trailing space.
-    expect(combined).toMatch(/ +42$/m);
-  });
-
-  it("sorts rows alphabetically by namespace for determinism", async () => {
-    const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [
-        makeServer({ namespace: "zeta", name: "Zeta" }),
-        makeServer({ namespace: "alpha", name: "Alpha" }),
-        makeServer({ namespace: "mu", name: "Mu" }),
-      ],
-    };
-    await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
-    const rendered = io.out.join("\n");
-    const alphaAt = rendered.indexOf("alpha");
-    const muAt = rendered.indexOf("mu");
-    const zetaAt = rendered.indexOf("zeta");
-    expect(alphaAt).toBeGreaterThan(-1);
-    expect(muAt).toBeGreaterThan(alphaAt);
-    expect(zetaAt).toBeGreaterThan(muAt);
-  });
-
-  it("prints a friendly message when the account has zero servers", async () => {
-    const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({ configVersion: "v0", servers: [] }),
-    });
-    expect(r.exitCode).toBe(0);
-    expect(io.out.join("")).toContain("No servers configured yet");
-  });
-
-  it("emits JSON when --json is set", async () => {
-    const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "gh", name: "GitHub" })],
-    };
-    const r = await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
-    expect(r.exitCode).toBe(0);
-    const combined = io.out.join("\n");
-    // Should be parseable JSON.
-    const parsed = JSON.parse(combined);
-    expect(parsed.configVersion).toBe("v1");
-    expect(parsed.servers).toHaveLength(1);
-    expect(parsed.servers[0].namespace).toBe("gh");
-    // Should NOT contain the human-readable header.
-    expect(combined).not.toContain("NAMESPACE");
-  });
-
-  it("treats --json + empty servers as `{servers: []}` JSON, not the friendly message", async () => {
-    const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({ configVersion: "v0", servers: [] }),
-    });
-    expect(r.exitCode).toBe(0);
-    const parsed = JSON.parse(io.out.join("\n"));
-    expect(parsed.servers).toEqual([]);
-    expect(io.out.join("\n")).not.toContain("No servers configured yet");
-  });
-
-  it("exits 2 on fetch error and pipes the message to stderr", async () => {
-    const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => {
-        throw new Error(
-          "Token rejected (HTTP 401) — the token mcp_pat_…abcd is invalid or revoked.\n  Generate a new token at https://yaw.sh/mcp/dashboard/settings/tokens,\n  then re-run `yaw-mcp install <client> --token mcp_pat_...` or set YAW_MCP_TOKEN.",
-        );
-      },
-    });
-    expect(r.exitCode).toBe(2);
+    await runServersCommand({ out: io.push, err: io.pushErr });
     const combinedErr = io.err.join("");
-    expect(combinedErr).toContain("Token rejected");
-    expect(combinedErr).toContain("https://yaw.sh/mcp/dashboard/settings/tokens");
+    expect(combinedErr).toContain("account mode has been removed");
+    expect(combinedErr).toContain("yaw-mcp list");
+    // Message goes to stderr only in text mode -- stdout stays empty so a
+    // script piping stdout gets nothing rather than a pseudo-listing.
+    expect(io.out).toEqual([]);
   });
 
-  it("exits 2 on an unexpected 304 (null response)", async () => {
+  it("still exits non-zero under --json (the panel's signed-in signal)", async () => {
     const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => null,
-    });
-    expect(r.exitCode).toBe(2);
-    expect(io.err.join("")).toContain("unexpected 304");
+    const r = await runServersCommand({ json: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(1);
   });
 
-  it("shows `-` in the grade column for ungraded servers", async () => {
+  it("emits parseable JSON on stdout under --json, with the reason on stderr", async () => {
     const io = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({
-        configVersion: "v1",
-        servers: [makeServer({ namespace: "x", name: "X" })],
-      }),
-    });
-    // grade column shows "-" when complianceGrade is undefined
-    expect(io.out.join("\n")).toMatch(/-\s+\?$/m);
-  });
-
-  it("shows the effective runtime per server (RUNTIME column) with why on fallback", async () => {
-    const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [
-        // Backend defs never carry `runtime` -- the per-server field here
-        // mimics a dashboard-set override; the rest exercise the default.
-        makeServer({ namespace: "fetch", name: "Fetch", type: "local", command: "npx", runtime: "oam" }),
-        makeServer({ namespace: "plain", name: "Plain", type: "local", command: "npx" }),
-        makeServer({ namespace: "dockerized", name: "Docker", type: "local", command: "docker", runtime: "oam" }),
-        makeServer({ namespace: "linear", name: "Linear", type: "remote" }),
-      ],
-    };
-    await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-      oamProbe: () => ({ bin: "/usr/local/bin/oam", version: "0.6.0", belowMin: false }),
-    });
-    const combined = io.out.join("\n");
-    expect(combined).toContain("RUNTIME");
-    expect(combined).toMatch(/fetch\s+Fetch\s+local\s+enabled\s+oam\b/);
-    expect(combined).toMatch(/plain\s+Plain\s+local\s+enabled\s+node\b/);
-    expect(combined).toMatch(/dockerized\s+Docker\s+local\s+enabled\s+node \(not node-based\)/);
-    expect(combined).toMatch(/linear\s+Linear\s+remote\s+enabled\s+-\s/);
-  });
-
-  it("marks the oam->node fallback in the table when oam is missing or too old", async () => {
-    const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "fetch", name: "Fetch", type: "local", command: "npx", runtime: "oam" })],
-    };
-    const run = (probe: { bin: string | null; version: string | null; belowMin: boolean }) =>
-      runServersCommand({
-        home,
-        env: {},
-        out: io.push,
-        err: io.pushErr,
-        fetcher: async () => cfg,
-        oamProbe: () => probe,
-      });
-    await run({ bin: null, version: null, belowMin: false });
-    expect(io.out.join("\n")).toContain("node (no oam)");
-    io.out.length = 0;
-    await run({ bin: null, version: "0.5.0", belowMin: true });
-    expect(io.out.join("\n")).toContain("node (oam too old)");
-  });
-
-  it("emits effectiveRuntime + effectiveRuntimeReason in --json", async () => {
-    const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [
-        makeServer({ namespace: "fetch", name: "Fetch", type: "local", command: "npx", runtime: "oam" }),
-        makeServer({ namespace: "linear", name: "Linear", type: "remote" }),
-      ],
-    };
-    await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-      oamProbe: () => ({ bin: null, version: "0.5.0", belowMin: true }),
-    });
+    await runServersCommand({ json: true, out: io.push, err: io.pushErr });
     const parsed = JSON.parse(io.out.join("\n"));
-    const fetchRow = parsed.servers.find((s: { namespace: string }) => s.namespace === "fetch");
-    expect(fetchRow.effectiveRuntime).toBe("node");
-    expect(fetchRow.effectiveRuntimeReason).toContain("below min");
-    // The configured per-server field is preserved alongside the verdict.
-    expect(fetchRow.runtime).toBe("oam");
-    const remoteRow = parsed.servers.find((s: { namespace: string }) => s.namespace === "linear");
-    expect(remoteRow.effectiveRuntime).toBeNull();
+    expect(parsed.ok).toBe(false);
+    expect(parsed.deprecated).toBe(true);
+    expect(parsed.error).toBe(SERVERS_DEPRECATED_MESSAGE);
+    expect(io.err.join("")).toContain("account mode has been removed");
   });
 
-  it("honors YAW_MCP_DEFAULT_RUNTIME for servers without a per-server runtime", async () => {
+  it("does NOT emit a servers array in any mode", async () => {
     const io = captureIO();
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "plain", name: "Plain", type: "local", command: "npx" })],
-    };
-    await runServersCommand({
-      home,
-      env: { YAW_MCP_DEFAULT_RUNTIME: "oam" },
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-      oamProbe: () => ({ bin: "/usr/local/bin/oam", version: "0.6.0", belowMin: false }),
-    });
-    const parsed = JSON.parse(io.out.join("\n"));
-    expect(parsed.servers[0].effectiveRuntime).toBe("oam");
-    expect(parsed.servers[0].effectiveRuntimeReason).toContain("default");
+    await runServersCommand({ json: true, out: io.push, err: io.pushErr });
+    // Yaw Terminal's sidecar reads `signedIn` from `servers --json`. A
+    // servers array here (even empty) plus a zero exit would read as an
+    // account; the non-zero exit above is what routes it to local mode.
+    expect(JSON.parse(io.out.join("\n")).servers).toBeUndefined();
   });
 
-  it("filters by substring on namespace (case-insensitive)", async () => {
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [
-        makeServer({ namespace: "github", name: "GitHub" }),
-        makeServer({ namespace: "gitlab", name: "GitLab" }),
-        makeServer({ namespace: "slack", name: "Slack" }),
-      ],
-    };
+  it("ignores a namespace filter rather than erroring on it", async () => {
     const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      filter: "GIT",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
-    expect(r.exitCode).toBe(0);
-    const combined = io.out.join("\n");
-    expect(combined).toContain("github");
-    expect(combined).toContain("gitlab");
-    expect(combined).not.toContain("slack");
-    // Summary reflects filter result, not the full server list.
-    expect(combined).toContain("2 servers");
-  });
-
-  it("filter also applies to --json output", async () => {
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "github" }), makeServer({ namespace: "slack" })],
-    };
-    const io = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      filter: "git",
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
-    const parsed = JSON.parse(io.out.join("\n"));
-    expect(parsed.servers).toHaveLength(1);
-    expect(parsed.servers[0].namespace).toBe("github");
-  });
-
-  it("--json distinguishes filter-matched-nothing from no-servers (fix 9)", async () => {
-    // Case A: filter set, matched nothing -> filter echoed, filterMatched=false.
-    const ioA = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      filter: "stripe",
-      json: true,
-      out: ioA.push,
-      err: ioA.pushErr,
-      fetcher: async () => ({ configVersion: "v1", servers: [makeServer({ namespace: "github" })] }),
-    });
-    const a = JSON.parse(ioA.out.join("\n"));
-    expect(a.servers).toEqual([]);
-    expect(a.filter).toBe("stripe");
-    expect(a.filterMatched).toBe(false);
-
-    // Case B: no filter, account genuinely has no servers -> filter=null.
-    const ioB = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: ioB.push,
-      err: ioB.pushErr,
-      fetcher: async () => ({ configVersion: "v0", servers: [] }),
-    });
-    const b = JSON.parse(ioB.out.join("\n"));
-    expect(b.servers).toEqual([]);
-    expect(b.filter).toBeNull();
-    expect(b.filterMatched).toBeNull();
-  });
-
-  it("prints a no-match message when filter matches nothing", async () => {
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "github" })],
-    };
-    const io = captureIO();
-    const r = await runServersCommand({
-      home,
-      env: {},
-      filter: "stripe",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(io.out.join("\n")).toContain('No servers match "stripe"');
-  });
-
-  it("overlays a cached grade onto the server row (json)", async () => {
-    const io = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({
-        configVersion: "v1",
-        servers: [makeServer({ namespace: "ctxlint", name: "ctxlint" })],
-      }),
-      gradesReader: async () => ({ ctxlint: { grade: "A", score: 100, gradedAt: "t" } }),
-    });
-    const parsed = JSON.parse(io.out.join("\n"));
-    expect(parsed.servers[0].complianceGrade).toBe("A");
-  });
-
-  it("cached grade wins over the backend's grade", async () => {
-    const io = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({
-        configVersion: "v1",
-        servers: [makeServer({ namespace: "x", complianceGrade: "C" })],
-      }),
-      gradesReader: async () => ({ x: { grade: "A", score: 100, gradedAt: "t" } }),
-    });
-    const parsed = JSON.parse(io.out.join("\n"));
-    expect(parsed.servers[0].complianceGrade).toBe("A");
-  });
-
-  it("servers without a cached grade keep the backend value", async () => {
-    const io = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({
-        configVersion: "v1",
-        servers: [makeServer({ namespace: "graded", complianceGrade: "B" }), makeServer({ namespace: "ungraded" })],
-      }),
-      gradesReader: async () => ({ other: { grade: "A", score: 100, gradedAt: "t" } }),
-    });
-    const parsed = JSON.parse(io.out.join("\n"));
-    const byNs = Object.fromEntries(
-      parsed.servers.map((s: { namespace: string; complianceGrade?: string }) => [s.namespace, s.complianceGrade]),
-    );
-    expect(byNs.graded).toBe("B");
-    expect(byNs.ungraded).toBeUndefined();
-  });
-
-  it("renders the cached grade in the table grade column", async () => {
-    const io = captureIO();
-    await runServersCommand({
-      home,
-      env: {},
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => ({
-        configVersion: "v1",
-        servers: [makeServer({ namespace: "ctxlint", name: "ctxlint" })],
-      }),
-      gradesReader: async () => ({ ctxlint: { grade: "A", score: 100, gradedAt: "t" } }),
-    });
-    // The grade column should show "A" (not "-") for the cached namespace.
-    expect(io.out.join("\n")).toMatch(/ctxlint.*\bA\b/);
+    const r = await runServersCommand({ filter: "github", out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(1);
+    expect(io.err.join("")).toContain("account mode has been removed");
   });
 });

@@ -1,13 +1,4 @@
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -16,9 +7,10 @@ import {
   INSTALL_USAGE,
   mergeClientConfig,
   mergePermissionsAllow,
+  NO_CONFIG_FLAG_DEPRECATION,
   parseInstallArgs,
-  redactConfigToken,
   runInstall,
+  TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
 
@@ -292,7 +284,6 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -316,7 +307,6 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -338,7 +328,6 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     // Settings patch is best-effort, so the install itself still succeeds.
@@ -374,7 +363,6 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     // Settings patch is best-effort, so the install itself still succeeds
@@ -400,7 +388,6 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -409,37 +396,31 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
 });
 
 describe("runInstall — happy path (claude-code, user scope, fresh install)", () => {
-  it("writes client config, ~/.yaw-mcp/config.json, and patches settings.json permissions", async () => {
+  it("writes client config and patches settings.json permissions, and never touches ~/.yaw-mcp/config.json", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_fresh_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    // Three files touched: ~/.claude.json (mcpServers), ~/.yaw-mcp/config.json (token),
-    // and ~/.claude/settings.json (permissions.allow so the client stops prompting).
-    expect(r.written.length).toBe(3);
+    // Two files touched: ~/.claude.json (mcpServers) and ~/.claude/settings.json
+    // (permissions.allow so the client stops prompting). ~/.yaw-mcp/config.json
+    // used to be a third -- it carried the account token, which is gone.
+    expect(r.written.length).toBe(2);
 
     const clientPath = join(synthHome, ".claude.json");
-    const yawMcpPath = join(synthHome, ".yaw-mcp", "config.json");
     const settingsPath = join(synthHome, ".claude", "settings.json");
     expect(existsSync(clientPath)).toBe(true);
-    expect(existsSync(yawMcpPath)).toBe(true);
     expect(existsSync(settingsPath)).toBe(true);
+    expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
 
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
     expect(client.mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcp@latest"]);
-    // Token is NOT embedded in client config — lives in ~/.yaw-mcp/config.json instead.
     expect(client.mcpServers[ENTRY_NAME].env).toBeUndefined();
-
-    const yawMcpCfg = JSON.parse(readFileSync(yawMcpPath, "utf8"));
-    expect(yawMcpCfg.token).toBe("mcp_pat_fresh_aaaa");
-    expect(yawMcpCfg.version).toBe(1);
 
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(settings.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
@@ -456,7 +437,6 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -479,7 +459,6 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       dryRun: true,
       io: cap.io,
     });
@@ -506,7 +485,6 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       skip: true,
       io: cap.io,
     });
@@ -531,7 +509,6 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
         os: "linux",
         home: synthHome,
         claudeConfigDir: wrapperDir,
-        token: "mcp_pat_wrapper_aaaa",
         io: cap.io,
       });
       expect(r.exitCode).toBe(0);
@@ -552,9 +529,10 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
       expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
       expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
 
-      // ~/.yaw-mcp/config.json still lives in home — it's the yaw-mcp-side
-      // config, not Claude-side, and unaffected by CLAUDE_CONFIG_DIR.
-      expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(true);
+      // ~/.yaw-mcp/config.json is never written any more, in the wrapper
+      // dir or in home.
+      expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
+      expect(existsSync(join(wrapperDir, "config.json"))).toBe(false);
     } finally {
       rmSync(wrapperDir, { recursive: true, force: true });
     }
@@ -571,7 +549,6 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
         home: synthHome,
         projectDir: synthCwd,
         claudeConfigDir: wrapperDir,
-        token: "mcp_pat_wrapper_local_aaaa",
         io: cap.io,
       });
       expect(r.exitCode).toBe(0);
@@ -598,7 +575,6 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
       os: "linux",
       home: synthHome,
       claudeConfigDir: "",
-      token: "mcp_pat_empty_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -615,7 +591,6 @@ describe("runInstall — Windows uses cmd /c", () => {
       scope: "user",
       os: "windows",
       home: synthHome,
-      token: "mcp_pat_w_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -634,7 +609,6 @@ describe("runInstall — VS Code servers shape", () => {
       os: "linux",
       home: synthHome,
       projectDir: synthCwd,
-      token: "mcp_pat_vs_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -656,7 +630,6 @@ describe("runInstall — preserves existing entries", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
@@ -679,7 +652,6 @@ describe("runInstall — collision handling", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: { ...cap.io, isTTY: false },
     });
     expect(r.exitCode).toBe(1);
@@ -700,7 +672,6 @@ describe("runInstall — collision handling", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       force: true,
       io: cap.io,
     });
@@ -720,7 +691,6 @@ describe("runInstall — collision handling", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       skip: true,
       io: cap.io,
     });
@@ -742,7 +712,6 @@ describe("runInstall — collision handling", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       promptAnswer: "overwrite",
       io: { ...cap.io, isTTY: true },
     });
@@ -761,7 +730,6 @@ describe("runInstall — malformed existing JSON", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(1);
@@ -769,81 +737,57 @@ describe("runInstall — malformed existing JSON", () => {
   });
 });
 
-describe("runInstall — token resolution", () => {
-  it("uses existing ~/.yaw-mcp/config.json token when --token is omitted", async () => {
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "config.json"), JSON.stringify({ token: "mcp_pat_existing_aaaa" }));
+// SOFT deprecation, not a removal: `--token` and `--no-yaw-mcp-config` must
+// keep parsing, keep exiting 0, and warn -- a scripted
+// `yaw-mcp install --all --token mcp_pat_...` in someone's provisioning
+// script must not start failing.
+describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
+  it("accepts --token, warns on stderr, exits 0, and writes no ~/.yaw-mcp/config.json", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
       scope: "user",
       os: "linux",
       home: synthHome,
+      token: "mcp_pat_scripted_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    // The token in ~/.yaw-mcp/config.json should remain (not erased).
-    const cfg = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "config.json"), "utf8"));
-    expect(cfg.token).toBe("mcp_pat_existing_aaaa");
-  });
-
-  it("succeeds with exit 0 in local mode when no token is anywhere", async () => {
-    const cap = captureIo();
-    const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
-      os: "linux",
-      home: synthHome,
-      io: cap.io,
-    });
-    // No token = local mode = success, no ~/.yaw-mcp/config.json seeded
-    expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toMatch(/local mode/i);
+    expect(cap.stderr()).toContain(TOKEN_FLAG_DEPRECATION);
+    // The PAT itself is never echoed back.
+    expect(cap.stderr()).not.toContain("mcp_pat_scripted_aaaa");
+    expect(cap.stdout()).not.toContain("mcp_pat_scripted_aaaa");
+    // The client install still happened; the token file did not.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
-  it("backs up a malformed ~/.yaw-mcp/config.json before overwriting (token recovery path)", async () => {
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    const malformedPath = join(synthHome, ".yaw-mcp", "config.json");
-    const malformedBytes = '{"token": "mcp_pat_old_aaaa", "version": 1';
-    writeFileSync(malformedPath, malformedBytes, "utf8");
+  it("names the deprecation reason and tells the user to revoke the PAT", () => {
+    expect(TOKEN_FLAG_DEPRECATION).toMatch(/deprecated and ignored/);
+    expect(TOKEN_FLAG_DEPRECATION).toMatch(/local-only/);
+    expect(TOKEN_FLAG_DEPRECATION).toMatch(/revoke that PAT/);
+  });
+
+  it("accepts --no-yaw-mcp-config, warns, and exits 0", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_new_bbbb",
+      skipYawMcpConfig: true,
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    // New config has the new token.
-    const cfg = JSON.parse(readFileSync(malformedPath, "utf8"));
-    expect(cfg.token).toBe("mcp_pat_new_bbbb");
-    // A .bak-* sibling exists with the original malformed bytes.
-    const siblings = readdirSync(join(synthHome, ".yaw-mcp"));
-    const backups = siblings.filter((f) => f.startsWith("config.json.bak-"));
-    expect(backups).toHaveLength(1);
-    const backupAbs = join(synthHome, ".yaw-mcp", backups[0]);
-    const backedUp = readFileSync(backupAbs, "utf8");
-    expect(backedUp).toBe(malformedBytes);
-    // The backup carries the salvaged (token-bearing) bytes, so it must be
-    // owner-only -- never world-readable. POSIX-only assertion.
-    if (process.platform !== "win32") {
-      expect(statSync(backupAbs).mode & 0o777).toBe(0o600);
-    }
-    // User-facing message names the backup path.
-    expect(cap.stdout()).toMatch(/was malformed/);
-    expect(cap.stdout()).toMatch(/backed up to/);
+    expect(cap.stderr()).toContain(NO_CONFIG_FLAG_DEPRECATION);
   });
 
-  it("backs up a valid-JSON-but-non-object ~/.yaw-mcp/config.json before overwriting", async () => {
-    // Valid JSON that isn't an object (here, an array) used to be silently
-    // discarded with NO backup -- only the parse-error path backed up.
+  it("leaves an existing ~/.yaw-mcp/config.json completely untouched", async () => {
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     const cfgPath = join(synthHome, ".yaw-mcp", "config.json");
-    const nonObjectBytes = '["mcp_pat_old_aaaa"]';
-    writeFileSync(cfgPath, nonObjectBytes, "utf8");
+    const originalBytes = JSON.stringify({ token: "mcp_pat_existing_aaaa", version: 1 });
+    writeFileSync(cfgPath, originalBytes, "utf8");
+
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -854,30 +798,33 @@ describe("runInstall — token resolution", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    // New config is now a proper object carrying the new token.
-    const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
-    expect(cfg.token).toBe("mcp_pat_new_bbbb");
-    // A .bak-* sibling exists with the original non-object bytes.
-    const backups = readdirSync(join(synthHome, ".yaw-mcp")).filter((f) => f.startsWith("config.json.bak-"));
-    expect(backups).toHaveLength(1);
-    expect(readFileSync(join(synthHome, ".yaw-mcp", backups[0]), "utf8")).toBe(nonObjectBytes);
+    // Byte-identical: no rewrite, no rotation, and no `.bak-*` sibling.
+    expect(readFileSync(cfgPath, "utf8")).toBe(originalBytes);
+    expect(readdirSync(join(synthHome, ".yaw-mcp")).filter((f) => f.startsWith("config.json.bak-"))).toHaveLength(0);
   });
 
-  it("--token overrides existing ~/.yaw-mcp/config.json token", async () => {
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "config.json"), JSON.stringify({ token: "mcp_pat_old_aaaa" }));
+  it("warns ONCE under --all, not once per client", async () => {
     const cap = captureIo();
     const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
+      all: true,
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_new_bbbb",
+      token: "mcp_pat_all_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const cfg = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "config.json"), "utf8"));
-    expect(cfg.token).toBe("mcp_pat_new_bbbb");
+    const hits = cap.stderr().split(TOKEN_FLAG_DEPRECATION).length - 1;
+    expect(hits).toBe(1);
+    expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
+  });
+
+  it("a scripted `install --all --token <pat>` parses and runs clean end to end", async () => {
+    const parsed = parseInstallArgs(["--all", "--token", "mcp_pat_scripted_zzzz"]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const cap = captureIo();
+    const r = await runInstall({ ...parsed.options, os: "linux", home: synthHome, io: cap.io });
+    expect(r.exitCode).toBe(0);
   });
 });
 
@@ -889,51 +836,20 @@ describe("runInstall — --dry-run", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       dryRun: true,
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
-    // Would-write list covers client config + yaw-mcp config + settings.json patch.
-    expect(r.wouldWrite.length).toBe(3);
+    // Would-write list covers client config + settings.json patch.
+    expect(r.wouldWrite.length).toBe(2);
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
     expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
     expect(cap.stdout()).toMatch(/dry run/i);
   });
 
-  it("does NOT write a .bak-* sibling when rotating an existing token under --dry-run", async () => {
-    // Seed an EXISTING token config so a real install would back it up
-    // (token-rotation path). Under --dry-run the backup write must be
-    // skipped entirely -- composeYawMcpConfig ran before the dry-run guard,
-    // so the guard alone doesn't prevent the backup; the dryRun flag does.
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    const cfgPath = join(synthHome, ".yaw-mcp", "config.json");
-    const originalBytes = JSON.stringify({ token: "mcp_pat_old_aaaa", version: 1 });
-    writeFileSync(cfgPath, originalBytes, "utf8");
-
-    const cap = captureIo();
-    const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
-      os: "linux",
-      home: synthHome,
-      token: "mcp_pat_new_bbbb",
-      dryRun: true,
-      io: cap.io,
-    });
-    expect(r.exitCode).toBe(0);
-    // No backup sibling created.
-    const backups = readdirSync(join(synthHome, ".yaw-mcp")).filter((f) => f.startsWith("config.json.bak-"));
-    expect(backups).toHaveLength(0);
-    // Original config untouched (dry-run writes nothing).
-    expect(readFileSync(cfgPath, "utf8")).toBe(originalBytes);
-    // The note still surfaces, phrased in the conditional.
-    expect(cap.stdout()).toMatch(/would be backed up/);
-  });
-
-  it("redacts the token in the printed ~/.yaw-mcp/config.json dump", async () => {
+  it("never echoes a passed --token into the dry-run dump", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -945,50 +861,9 @@ describe("runInstall — --dry-run", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const out = cap.stdout();
-    // The raw PAT must never appear in dry-run output.
-    expect(out).not.toContain("mcp_pat_super_secret_value");
-    // The redaction marker stands in for it, and the path is still shown.
-    expect(out).toContain("mcp_pat_***");
-    expect(out).toContain(join(synthHome, ".yaw-mcp", "config.json"));
-  });
-});
-
-describe("redactConfigToken", () => {
-  it("replaces the token value, preserves other fields and indentation", () => {
-    const json = `${JSON.stringify({ version: 1, token: "mcp_pat_secret" }, null, 2)}\n`;
-    const out = redactConfigToken(json);
-    expect(out).not.toContain("mcp_pat_secret");
-    expect(out).toContain('"token": "mcp_pat_***"');
-    expect(out).toContain('"version": 1');
-    // Two-space indentation preserved (no reflow).
-    expect(out).toMatch(/^ {2}"token":/m);
-  });
-
-  it("is a no-op when there is no token field", () => {
-    const json = `${JSON.stringify({ version: 1 }, null, 2)}\n`;
-    expect(redactConfigToken(json)).toBe(json);
-  });
-});
-
-describe("runInstall — --no-yaw-mcp-config", () => {
-  it("writes only the client config and the settings.json permissions patch", async () => {
-    const cap = captureIo();
-    const r = await runInstall({
-      clientId: "claude-code",
-      scope: "user",
-      os: "linux",
-      home: synthHome,
-      token: "mcp_pat_aaaa",
-      skipYawMcpConfig: true,
-      io: cap.io,
-    });
-    expect(r.exitCode).toBe(0);
-    // --no-yaw-mcp-config skips ~/.yaw-mcp/config.json but still patches settings.json
-    // so the user doesn't get re-prompted for every tool call.
-    expect(r.written.length).toBe(2);
-    expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
-    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(true);
+    // Nothing renders the token any more -- the config.json dump is gone.
+    expect(cap.stdout()).not.toContain("mcp_pat_super_secret_value");
+    expect(cap.stderr()).not.toContain("mcp_pat_super_secret_value");
   });
 });
 
@@ -1000,7 +875,6 @@ describe("runInstall — Claude Desktop on Linux refused", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       io: cap.io,
     });
     expect(r.exitCode).toBe(2);
@@ -1017,7 +891,6 @@ describe("runInstall — mutually exclusive flags", () => {
       scope: "user",
       os: "linux",
       home: synthHome,
-      token: "mcp_pat_aaaa",
       force: true,
       skip: true,
       io: cap.io,
@@ -1156,13 +1029,12 @@ describe("runInstall --list (read-only)", () => {
 });
 
 describe("runInstall --all", () => {
-  it("installs into every user-scope client on linux and writes ~/.yaw-mcp/config.json once", async () => {
+  it("installs into every user-scope client on linux", async () => {
     const cap = captureIo();
     const r = await runInstall({
       os: "linux",
       home: synthHome,
       cwd: synthCwd,
-      token: "mcp_pat_all",
       all: true,
       io: cap.io,
     });
@@ -1176,9 +1048,8 @@ describe("runInstall --all", () => {
     const out = cap.stdout();
     expect(out).toContain("skip vscode");
     expect(out).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
-    // Token written to global yaw-mcp config exactly once.
-    const yawMcpCfg = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "config.json"), "utf8"));
-    expect(yawMcpCfg.token).toBe("mcp_pat_all");
+    // ~/.yaw-mcp/config.json is not part of an install any more.
+    expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
   it("refuses with exit 1 when no clients are installable on the OS", async () => {
@@ -1189,7 +1060,6 @@ describe("runInstall --all", () => {
       os: "plan9" as unknown as "linux",
       home: synthHome,
       cwd: synthCwd,
-      token: "mcp_pat_abc",
       all: true,
       io: cap.io,
     });
@@ -1206,7 +1076,6 @@ describe("runInstall --all", () => {
       os: "linux",
       home: synthHome,
       cwd: synthCwd,
-      token: "mcp_pat_x",
       all: true,
       io: cap.io,
     });
@@ -1229,7 +1098,6 @@ describe("runInstall --all", () => {
       os: "linux",
       home: synthHome,
       cwd: synthCwd,
-      token: "mcp_pat_collide",
       all: true,
       io: cap.io,
     });
@@ -1255,7 +1123,6 @@ describe("runInstall --all", () => {
       os: "linux",
       home: synthHome,
       cwd: synthCwd,
-      token: "mcp_pat_collide",
       all: true,
       force: true,
       io: cap.io,
@@ -1266,9 +1133,12 @@ describe("runInstall --all", () => {
 });
 
 describe("install usage", () => {
-  it("warns that --token exposes the PAT to the process table on shared machines", () => {
-    expect(INSTALL_USAGE).toMatch(/process table/i);
-    expect(INSTALL_USAGE).toMatch(/shell\s+history/i);
-    expect(INSTALL_USAGE).toMatch(/~\/\.yaw-mcp\/config\.json/);
+  it("lists --token and --no-yaw-mcp-config as deprecated rather than dropping them", () => {
+    // They must still be discoverable -- a user whose script breaks needs to
+    // find out WHY from `install --help`, not just see the flag vanish.
+    expect(INSTALL_USAGE).toMatch(/Deprecated \(accepted, ignored, warns\)/);
+    expect(INSTALL_USAGE).toContain("--token");
+    expect(INSTALL_USAGE).toContain("--no-yaw-mcp-config");
+    expect(INSTALL_USAGE).toMatch(/local-only/);
   });
 });

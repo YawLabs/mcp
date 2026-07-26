@@ -1,7 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { request } from "undici";
 
 interface ComplianceReport {
   grade: string;
@@ -13,10 +12,10 @@ interface ComplianceReport {
 }
 
 export const COMPLIANCE_USAGE =
-  "\n  Usage: yaw-mcp compliance <target> [extraArgs...] [--publish]\n\n" +
+  "\n  Usage: yaw-mcp compliance <target> [extraArgs...]\n\n" +
   "  Examples:\n" +
   '    yaw-mcp compliance "npx -y @modelcontextprotocol/server-filesystem /tmp"\n' +
-  "    yaw-mcp compliance https://example.com/mcp --publish\n\n";
+  "    yaw-mcp compliance https://example.com/mcp\n\n";
 
 /** Injectable output sinks. Every sibling subcommand (audit, doctor, ...)
  *  takes out/err hooks so tests can capture output without spying on the
@@ -47,40 +46,17 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
     return 0;
   }
 
-  const publish = argv.includes("--publish");
-  const args = argv.filter((a) => a !== "--publish");
-
-  if (args.length === 0) {
+  if (argv.length === 0) {
     // Missing required <target> is an arg error -> exit 2, matching the
     // 2-for-usage-errors convention every other subcommand follows.
     err(COMPLIANCE_USAGE);
     return 2;
   }
 
-  const apiUrl = process.env.YAW_MCP_URL ?? "https://yaw.sh/mcp";
-
-  const report = await runTest(args, err);
+  const report = await runTest(argv, err);
   if (!report) return 1;
 
   printSummary(report, out);
-
-  if (publish) {
-    const result = await publishReport(apiUrl, report, err);
-    if (!result) return 1;
-    // The POST 200 body is cast, not validated -- an unexpected shape would
-    // otherwise print "Published: undefined". Require non-empty url strings.
-    const reportUrl = typeof result.reportUrl === "string" ? result.reportUrl.trim() : "";
-    const badgeUrl = typeof result.badgeUrl === "string" ? result.badgeUrl.trim() : "";
-    if (!reportUrl || !badgeUrl) {
-      err("\nPublish failed: server returned 200 but no report/badge URL.\n");
-      return 1;
-    }
-    out(`\nPublished: ${reportUrl}\n`);
-    out(`Badge:     ${badgeUrl}\n`);
-    if (result.deleteToken) {
-      out(`\nDelete token (save this): ${result.deleteToken}\n`);
-    }
-  }
 
   return 0;
 }
@@ -364,82 +340,4 @@ function printSummary(report: ComplianceReport, out: (s: string) => void): void 
       `${summary.requiredPassed}/${summary.required} required\n` +
       `Target: ${url}\n`,
   );
-}
-
-// Shape of a single test entry in the published payload. The raw report's
-// tests are unknown[] and may carry arbitrary fields the suite echoed back
-// (env, argv, stack traces). Project each to a fixed allowlist so nothing
-// unexpected is exfiltrated to the publish endpoint.
-interface PublishedTest {
-  name?: string;
-  status?: string;
-  required?: boolean;
-  message?: string;
-}
-
-interface PublishedReport {
-  grade: string;
-  score: number;
-  url: string;
-  summary: ComplianceReport["summary"];
-  tests: PublishedTest[];
-}
-
-// Project the full (opaque, index-signature-bearing) report down to an
-// explicit allowlist before publishing. Uploading `report` verbatim would
-// ship any extra top-level fields AND any extra per-test fields the suite
-// happened to include (e.g. echoed env/args) -- this strips all of that.
-export function projectForPublish(report: ComplianceReport): PublishedReport {
-  const tests = Array.isArray(report.tests) ? report.tests : [];
-  return {
-    grade: report.grade,
-    score: report.score,
-    url: report.url,
-    summary: {
-      total: report.summary.total,
-      passed: report.summary.passed,
-      failed: report.summary.failed,
-      required: report.summary.required,
-      requiredPassed: report.summary.requiredPassed,
-    },
-    tests: tests.map((t) => {
-      const test = (t ?? {}) as Record<string, unknown>;
-      const projected: PublishedTest = {};
-      if (typeof test.name === "string") projected.name = test.name;
-      if (typeof test.status === "string") projected.status = test.status;
-      if (typeof test.required === "boolean") projected.required = test.required;
-      if (typeof test.message === "string") projected.message = test.message;
-      return projected;
-    }),
-  };
-}
-
-async function publishReport(
-  apiUrl: string,
-  report: ComplianceReport,
-  err: (s: string) => void,
-): Promise<{ reportUrl: string; badgeUrl: string; deleteToken?: string } | null> {
-  try {
-    const res = await request(`${apiUrl.replace(/\/$/, "")}/api/compliance/ext`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(projectForPublish(report)),
-    });
-    if (res.statusCode !== 200) {
-      const body = await res.body.text().catch(() => "");
-      err(`\nPublish failed: HTTP ${res.statusCode}${body ? ` -- ${body}` : ""}\n`);
-      return null;
-    }
-    const parsed = (await res.body.json()) as {
-      hash: string;
-      reportUrl: string;
-      badgeUrl: string;
-      deleteToken?: string;
-    };
-    return parsed;
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : String(e);
-    err(`\nPublish failed: ${message}\n`);
-    return null;
-  }
 }

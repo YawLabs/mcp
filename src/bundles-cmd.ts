@@ -10,18 +10,18 @@
 //           network, no token needed. Good for browsing or sharing in
 //           onboarding docs.
 //
-//   match   Pulls the user's installed server namespaces from the backend
-//           and partitions the bundles into "ready to activate" vs
-//           "partially installed" vs "ignored" (zero overlap). Requires
-//           a resolvable token and a working connection to yaw.sh/mcp.
+//   match   Reads the servers yaw-mcp actually loads (bundles.json, project
+//           file winning over user-global) and partitions the bundles into
+//           "ready to activate" vs "partially installed" vs "ignored" (zero
+//           overlap). Also local: no network, no token needed.
 //
 // Output is human-readable text by default. `--json` on either action
 // emits a machine-readable shape for pipeline use.
 //
 // Exit codes:
-//   0  listed / matched successfully
-//   1  match needs a token and none resolved
-//   2  match could not reach the backend (network, auth, non-2xx)
+//   0  always -- both actions are local reads with no failure mode. A
+//      malformed bundles.json degrades to "no servers" plus a warning on
+//      stderr rather than an error exit.
 
 import {
   type BundleMatchResult,
@@ -30,22 +30,17 @@ import {
   type CuratedBundle,
   matchBundles,
 } from "./bundles.js";
-import { ConfigError, fetchConfig } from "./config.js";
-import { loadYawMcpConfig } from "./config-loader.js";
-import type { ConnectConfig } from "./types.js";
+import { loadLocalBundles } from "./local-bundles.js";
 
 export type BundlesAction = "list" | "match";
 
 export interface BundlesCommandOptions {
   home?: string;
-  env?: NodeJS.ProcessEnv;
   cwd?: string;
   action?: BundlesAction;
   json?: boolean;
   out?: (s: string) => void;
   err?: (s: string) => void;
-  /** Test hook: skip the real backend call. */
-  fetcher?: (apiBase: string, token: string) => Promise<ConnectConfig | null>;
 }
 
 export interface BundlesCommandResult {
@@ -62,8 +57,8 @@ export const BUNDLES_USAGE = `Usage: yaw-mcp bundles [list|match] [--json]
 
   Curated multi-server bundles -- hand-picked stacks you can activate in one step.
 
-  list      List every curated bundle (default, no network).
-  match     Partition bundles against your installed servers (reads the backend).
+  list      List every curated bundle (default).
+  match     Partition bundles against the servers in your bundles.json.
 
   --json    Emit machine-readable JSON instead of a table.`;
 
@@ -118,57 +113,20 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
     return { exitCode: 0, lines };
   }
 
-  // action === "match" — needs a token + backend.
-  const config = await loadYawMcpConfig({
-    cwd: opts.cwd,
-    home: opts.home,
-    env: opts.env,
-  });
+  // action === "match" — reads the same local bundles.json server.ts loads at
+  // startup, so the CLI's partition and the LLM-facing `mcp_connect_bundles`
+  // partition are computed over the identical server set.
+  const loaded = await loadLocalBundles({ cwd: opts.cwd, home: opts.home });
 
-  if (!config.token) {
-    const msg = "no token resolved. Run `yaw-mcp install <client> --token mcp_pat_...` or set YAW_MCP_TOKEN.";
-    if (opts.json) {
-      const jsonErr = JSON.stringify({ ok: false, error: msg });
-      lines.push(jsonErr);
-      writeErr(`${jsonErr}\n`);
-    } else {
-      printErr(`yaw-mcp bundles match: ${msg}`);
-    }
-    return { exitCode: 1, lines };
-  }
-
-  const fetcher = opts.fetcher ?? fetchConfig;
-  let backend: ConnectConfig | null;
-  try {
-    backend = await fetcher(config.apiBase, config.token);
-  } catch (err) {
-    const msg = err instanceof ConfigError || err instanceof Error ? err.message : String(err);
-    if (opts.json) {
-      const jsonErr = JSON.stringify({ ok: false, error: msg });
-      lines.push(jsonErr);
-      writeErr(`${jsonErr}\n`);
-    } else {
-      printErr(`yaw-mcp bundles match: ${msg}`);
-    }
-    return { exitCode: 2, lines };
-  }
-
-  if (!backend) {
-    const msg = "backend returned 304 without a conditional request.";
-    if (opts.json) {
-      const jsonErr = JSON.stringify({ ok: false, error: msg });
-      lines.push(jsonErr);
-      writeErr(`${jsonErr}\n`);
-    } else {
-      printErr(`yaw-mcp bundles match: ${msg}`);
-    }
-    return { exitCode: 2, lines };
-  }
+  // Surface load warnings so a malformed bundles.json reads as "this file is
+  // broken" instead of "you have no servers." stderr keeps stdout clean for
+  // a --json consumer.
+  for (const w of loaded.warnings) printErr(`warning: ${w}`);
 
   // Only count enabled servers — disabled ones won't auto-activate so
   // they shouldn't count toward a bundle being "ready." This mirrors
   // the filter the LLM-facing `mcp_connect_bundles` uses.
-  const installed = backend.servers.filter((s) => s.isActive).map((s) => s.namespace);
+  const installed = (loaded.config?.servers ?? []).filter((s) => s.isActive).map((s) => s.namespace);
   const match = matchBundles(installed);
 
   if (opts.json) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { envEqual, resolveNamespaces, sanitizeNamespace } from "../server.js";
+import { envEqual, resolveNamespaces } from "../server.js";
 
 // These three helpers are exported from server.ts so the tests exercise the
 // REAL implementations. They used to be module-private, and this file kept
@@ -83,28 +83,5 @@ describe("resolveNamespaces", () => {
     // Present-but-all-invalid `servers` filters to [] and there is no
     // single `server` to fall back on — the resolver returns [].
     expect(resolveNamespaces({ servers: [1, null, ""] })).toEqual([]);
-  });
-});
-
-describe("sanitizeNamespace", () => {
-  it("lowercases and replaces special chars", () => {
-    expect(sanitizeNamespace("My GitHub Server")).toBe("my_github_server");
-  });
-
-  it("strips leading/trailing underscores", () => {
-    expect(sanitizeNamespace("---MCP---")).toBe("mcp");
-  });
-
-  it("truncates to 30 characters", () => {
-    const long = "a".repeat(50);
-    expect(sanitizeNamespace(long).length).toBe(30);
-  });
-
-  it("returns empty for all-special-char names", () => {
-    expect(sanitizeNamespace("!!!")).toBe("");
-  });
-
-  it("detects collisions", () => {
-    expect(sanitizeNamespace("Server A")).toBe(sanitizeNamespace("Server-A"));
   });
 });

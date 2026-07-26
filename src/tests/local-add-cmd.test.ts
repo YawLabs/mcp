@@ -482,6 +482,115 @@ describe("runList", () => {
     expect(Array.isArray(parsed.warnings)).toBe(true);
     expect(parsed.warnings).toHaveLength(0);
   });
+
+  // Compliance-grade overlay. `yaw-mcp audit` writes ~/.yaw-mcp/grades.json and
+  // `list` is its only reader in local mode -- without these, grading is
+  // write-only and a regression here is invisible.
+  const addFetch = async (): Promise<void> => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+  };
+
+  it("overlays a cached compliance grade onto the server row (json)", async () => {
+    await addFetch();
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({ fetch: { grade: "A", score: 100, gradedAt: "t" } }),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.servers[0].namespace).toBe("fetch");
+    expect(parsed.servers[0].complianceGrade).toBe("A");
+  });
+
+  it("leaves a never-audited server ungraded in json", async () => {
+    await addFetch();
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({ somethingelse: { grade: "A", score: 100, gradedAt: "t" } }),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.servers[0].complianceGrade).toBeUndefined();
+  });
+
+  it("renders the cached grade in the GRADE column", async () => {
+    await addFetch();
+    const io = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({ fetch: { grade: "B", score: 80, gradedAt: "t" } }),
+    });
+    expect(io.text()).toMatch(/GRADE/);
+    expect(io.text()).toMatch(/fetch\s+Fetch\s+active\s+B\s/);
+  });
+
+  it("shows `-` in the GRADE column for a never-audited server", async () => {
+    await addFetch();
+    const io = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    expect(io.text()).toMatch(/fetch\s+Fetch\s+active\s+-\s/);
+  });
+
+  it("reads the real grades.json when no reader override is supplied", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    await addFetch();
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "grades.json"),
+      JSON.stringify({ fetch: { grade: "C", score: 71, gradedAt: "2026-01-01T00:00:00.000Z" } }),
+    );
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(JSON.parse(io.text()).servers[0].complianceGrade).toBe("C");
+  });
+
+  it("degrades to no overlay when grades.json is garbage", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    await addFetch();
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "grades.json"), "{ not json");
+    const io = captureIO();
+    const r = await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(io.text()).servers[0].complianceGrade).toBeUndefined();
+  });
 });
 
 describe("upsertUserBundle round-trip", () => {

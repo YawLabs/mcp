@@ -8,7 +8,7 @@
 // account), so the O(N*M) prep cost is negligible.
 //
 // We deliberately skip stemming / synonyms / embeddings here — BM25 with
-// good field weights captures the 80% case, and Stage 2 (Voyage rerank on
+// good field weights captures the 80% case, and a semantic Stage 2 (on
 // the server side) will handle semantic matches when it lands.
 
 export interface RankableTool {
