@@ -537,7 +537,6 @@ describe("runDoctor — ENVIRONMENT section", () => {
     // Every tracked var must be listed so support can see at a glance
     // whether the user set it. Default-hint strings prove the row is
     // rendered with the "(not set — …)" form rather than a raw value.
-    expect(txt).toMatch(/YAW_MCP_POLL_INTERVAL\s+\(not set — default 60s\)/);
     expect(txt).toMatch(/YAW_MCP_SERVER_CAP\s+\(not set — default 6\)/);
     expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+\(not set — filter inactive\)/);
     expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+\(not set — auto-load inactive\)/);
@@ -564,7 +563,6 @@ describe("runDoctor — ENVIRONMENT section", () => {
     expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+B/);
     expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+1/);
     // Unset vars should still show their default hint.
-    expect(txt).toMatch(/YAW_MCP_POLL_INTERVAL\s+\(not set/);
     expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set/);
   });
 });
@@ -915,8 +913,28 @@ describe("runDoctor — --json", () => {
     });
     const parsed = JSON.parse(r.lines[0]);
     expect(parsed.env.YAW_MCP_SERVER_CAP).toBe("12");
-    expect(parsed.env.YAW_MCP_POLL_INTERVAL).toBeNull();
+    expect(parsed.env.YAW_MCP_AUTO_ACTIVATE).toBeNull();
     expect(parsed.env).toHaveProperty("YAW_MCP_AUTO_LOAD");
+  });
+
+  it("keeps the deprecated YAW_MCP_POLL_INTERVAL env key, reading null even when the var IS set", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_POLL_INTERVAL: "300" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    // The remote config poll loop this tuned went with the hosted backend,
+    // so nothing reads the var any more. The KEY survives the deprecation
+    // window (same contract as backgroundPosters) so a consumer reading
+    // `.env.YAW_MCP_POLL_INTERVAL` doesn't hit an undefined property.
+    expect(Object.hasOwn(parsed.env, "YAW_MCP_POLL_INTERVAL")).toBe(true);
+    expect(parsed.env.YAW_MCP_POLL_INTERVAL).toBeNull();
   });
 
   it("upgrade.stale stays false on a dev build (the 'dev' version short-circuits the check)", async () => {

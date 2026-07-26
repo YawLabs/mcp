@@ -121,6 +121,11 @@ export interface DoctorJsonSnapshot {
   apiBase: { value: string; source: string };
   loadedFiles: Array<{ scope: string; path: string; schemaVersion?: number; schemaAhead: boolean }>;
   warnings: string[];
+  // Behavior-modifier env vars, null when unset. `YAW_MCP_POLL_INTERVAL` is
+  // DEPRECATED and always null -- the remote config poll loop it tuned was
+  // removed with the hosted backend. The key is retained (same reasoning as
+  // backgroundPosters below) so consumers reading it keep working through
+  // the deprecation window.
   env: Record<string, string | null>;
   state: {
     disabled: boolean;
@@ -466,7 +471,6 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
 
   const envVarNames = [
-    "YAW_MCP_POLL_INTERVAL",
     "YAW_MCP_SERVER_CAP",
     "YAW_MCP_MIN_COMPLIANCE",
     "YAW_MCP_AUTO_LOAD",
@@ -474,7 +478,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     "YAW_MCP_PRUNE_RESPONSES",
     "YAW_MCP_DEFAULT_RUNTIME",
   ] as const;
-  const envOverrides: Record<string, string | null> = {};
+  // DEPRECATED key, seeded first so it keeps its position in the emitted
+  // object. YAW_MCP_POLL_INTERVAL configured the remote config poll loop,
+  // which went with the hosted backend; nothing reads the var any more, so
+  // it reports null even when it IS set. The key survives the deprecation
+  // window so `.env.YAW_MCP_POLL_INTERVAL` consumers don't break on a
+  // missing property. Dropped in a later release.
+  const envOverrides: Record<string, string | null> = { YAW_MCP_POLL_INTERVAL: null };
   for (const name of envVarNames) {
     const raw = env[name];
     envOverrides[name] = raw === undefined || raw === "" ? null : raw;
@@ -679,7 +689,6 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) => void }): void {
   const { env, print } = opts;
   const vars: Array<{ name: string; defaultHint: string }> = [
-    { name: "YAW_MCP_POLL_INTERVAL", defaultHint: "default 60s" },
     { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
     { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
     { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },

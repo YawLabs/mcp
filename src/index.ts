@@ -2,7 +2,6 @@ import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
-import { ConfigError } from "./config.js";
 import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
@@ -320,7 +319,6 @@ if (subcommand === "compliance") {
   Environment variables:
     YAW_MCP_TOKEN                 API token (overrides every config file).
     YAW_MCP_URL                   API base URL (default https://yaw.sh/mcp).
-    YAW_MCP_POLL_INTERVAL         Dashboard polling interval, seconds (default 60).
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
     YAW_MCP_MIN_COMPLIANCE        Minimum grade to auto-activate (A|B|C|D|F).
     YAW_MCP_AUTO_LOAD             Auto-activate the namespaces of the highest-
@@ -476,11 +474,6 @@ async function runServer(): Promise<void> {
   process.on("SIGINT", shutdown);
 
   server.start().catch((err: unknown) => {
-    if (err instanceof ConfigError && err.fatal) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`\n  yaw-mcp: ${msg}\n\n`);
-      process.exit(1);
-    }
     const msg = err instanceof Error ? err.message : String(err);
     log("error", "Fatal startup error", { error: msg });
     process.exit(1);

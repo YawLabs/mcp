@@ -23,15 +23,6 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../config.js", async (importOriginal) => {
-  const actual = (await importOriginal()) as any;
-  return {
-    ...actual,
-    fetchConfig: vi.fn().mockResolvedValue({ servers: [], configVersion: "v1" }),
-  };
-});
-
-import { fetchConfig } from "../config.js";
 import { buildToolList } from "../proxy.js";
 import {
   ConnectServer,
@@ -2181,67 +2172,7 @@ describe("ConnectServer", () => {
     });
   });
 
-  describe("YAW_MCP_POLL_INTERVAL env var", () => {
-    // vi.unstubAllEnvs() restores every stubbed env var after each case so
-    // test order can't leak into unrelated suites.
-    afterEach(() => {
-      vi.unstubAllEnvs();
-    });
-
-    it("defaults to a ~60s poll when the env var is unset", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-
-    it("respects a custom interval when YAW_MCP_POLL_INTERVAL is set to a positive integer", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "300");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-
-    it("disables polling entirely when YAW_MCP_POLL_INTERVAL=0", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "0");
-      const priv = getPrivate(server);
-      priv.pollTimer = null;
-      priv.startPolling();
-      expect(priv.pollTimer).toBeNull();
-    });
-
-    it("falls back to the default when the env var is garbage", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "not-a-number");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-
-    it("falls back to the default when the env var is negative", () => {
-      vi.stubEnv("YAW_MCP_POLL_INTERVAL", "-30");
-      const priv = getPrivate(server);
-      priv.startPolling();
-      expect(priv.pollTimer).not.toBeNull();
-      clearTimeout(priv.pollTimer);
-      priv.pollTimer = null;
-    });
-  });
-
   describe("shutdown", () => {
-    it("clears poll timer", async () => {
-      const priv = getPrivate(server);
-      priv.pollTimer = setTimeout(() => {}, 60000);
-
-      await server.shutdown();
-      expect(priv.pollTimer).toBeNull();
-    });
-
     it("disconnects all upstream connections", async () => {
       const priv = getPrivate(server);
       priv.connections.set("gh", makeConnection("gh"));
@@ -2308,13 +2239,11 @@ describe("argsEqual (via reconcileConfig)", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// Concurrency and atomicity regression tests. These cover the three
-// races exposed by the review:
+// Concurrency and atomicity regression tests. These cover the races
+// exposed by the review:
 //   1. activateOne — two concurrent callers for the same namespace must
 //      share one spawn, not race to double-spawn.
-//   2. fetchAndApplyConfig — this.config must be set before reconcile's
-//      awaits so readers don't observe the stale config mid-reconcile.
-//   3. handleToolCall — the routes map captured at method entry must be
+//   2. handleToolCall — the routes map captured at method entry must be
 //      used for the actual call, even if rebuildRoutes fires during
 //      the auto-reconnect awaits.
 // ─────────────────────────────────────────────────────────────────────────
@@ -2445,61 +2374,6 @@ describe("exec step-level split-blame attribution", () => {
     const cons = priv.learning.get("cons");
     expect(cons?.dispatched).toBe(1);
     expect(cons?.succeeded).toBeCloseTo(0.5, 5);
-  });
-});
-
-describe("fetchAndApplyConfig atomicity", () => {
-  let server: ConnectServer;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("updates this.config and configVersion before reconcileConfig's awaits", async () => {
-    const priv = getPrivate(server);
-    // Seed the "old" config: one active upstream gh.
-    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-    priv.configVersion = "old-v";
-    priv.connections.set("gh", makeConnection("gh"));
-
-    // The new config removes gh. reconcileConfig will disconnect it
-    // and await the disconnect. That await is our observation point:
-    // by then, this.config should already be the NEW config.
-    vi.mocked(fetchConfig).mockResolvedValueOnce({ servers: [], configVersion: "new-v" } as any);
-
-    let seenVersion: string | null = null;
-    let seenServerCount: number | null = null;
-    vi.mocked(disconnectFromUpstream).mockImplementationOnce(async () => {
-      seenVersion = priv.configVersion;
-      seenServerCount = priv.config.servers.length;
-    });
-
-    await priv.fetchAndApplyConfig();
-
-    // If the old code ordering were still in place, these would see
-    // the stale config (configVersion "old-v", 1 server).
-    expect(seenVersion).toBe("new-v");
-    expect(seenServerCount).toBe(0);
-  });
-
-  it("prunes expired activationFailures before fetching new config", async () => {
-    const priv = getPrivate(server);
-    const sixMinutesAgo = Date.now() - 6 * 60 * 1000;
-    priv.activationFailures.set("old", { at: sixMinutesAgo, message: "stale" });
-    priv.activationFailures.set("recent", { at: Date.now(), message: "fresh" });
-
-    // 304 shortcut — we only care that the prune sweep ran at the top.
-    vi.mocked(fetchConfig).mockResolvedValueOnce(null as any);
-
-    await priv.fetchAndApplyConfig();
-
-    expect(priv.activationFailures.has("old")).toBe(false);
-    expect(priv.activationFailures.has("recent")).toBe(true);
   });
 });
 

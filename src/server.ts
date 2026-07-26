@@ -13,7 +13,6 @@ import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { type ComplianceGrade, classifyGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
-import { ConfigError, fetchConfig } from "./config.js";
 import { loadYawMcpConfig, type Profile, profileAllows, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
@@ -30,12 +29,7 @@ import {
 import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js";
 import { closestNames } from "./fuzzy.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
-import {
-  ACTIVATION_FAILURE_TTL_MS,
-  type ActivationFailure,
-  formatHealthWarning,
-  healthFactor,
-} from "./health-score.js";
+import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
 import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
 import { LearningStore } from "./learning.js";
@@ -87,32 +81,6 @@ import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlaky
 import { ensureUv } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
-
-// Poll interval for fetching config from Yaw MCP (milliseconds).
-//
-// Resolution order:
-//   1. YAW_MCP_POLL_INTERVAL env var (integer seconds). 0 disables polling
-//      entirely — config is fetched once at startup and never again; users
-//      must restart their MCP client to pick up dashboard changes.
-//   2. Default: 60 seconds. Matches the server-side `Cache-Control:
-//      private, max-age=60` on /api/connect/config, so each poll either
-//      hits the ETag short-circuit (304) or returns a body once per
-//      minute.
-//
-// Users who want a quieter client set e.g. YAW_MCP_POLL_INTERVAL=300 (5min)
-// or YAW_MCP_POLL_INTERVAL=0 (one-shot at startup only).
-const DEFAULT_POLL_INTERVAL_MS = 60_000;
-
-function resolvePollIntervalMs(): number {
-  const raw = process.env.YAW_MCP_POLL_INTERVAL;
-  if (raw === undefined || raw === "") return DEFAULT_POLL_INTERVAL_MS;
-  const seconds = Number.parseInt(raw, 10);
-  if (!Number.isFinite(seconds) || seconds < 0) {
-    log("warn", "Invalid YAW_MCP_POLL_INTERVAL; falling back to 60s default", { value: raw });
-    return DEFAULT_POLL_INTERVAL_MS;
-  }
-  return seconds * 1000;
-}
 
 // Opt-out for cross-session persistence. Set YAW_MCP_DISABLE_PERSISTENCE=1
 // (or "true") to keep learning + pack-history scoped to the current
@@ -290,7 +258,6 @@ export class ConnectServer {
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
   private configVersion: string | null = null;
-  private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -665,8 +632,8 @@ export class ConnectServer {
       });
     }
 
-    // Load config -- backend in account mode, bundles.json in local mode.
-    // Non-fatal errors allow startup with an empty config in either path.
+    // Load config from bundles.json. Non-fatal errors allow startup with
+    // an empty config.
     if (this.localMode) {
       const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
         log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
@@ -674,11 +641,9 @@ export class ConnectServer {
       });
       for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
       this.config = result.config ?? { servers: [], configVersion: "" };
-      // Deduplicate by namespace -- keep first occurrence. Mirrors the
-      // backend-config dedup in fetchAndApplyConfig: reconcileConfig and the
-      // routing state assume one server per namespace, so a duplicate in
-      // bundles.json must be filtered here too (the local-mode path doesn't
-      // go through fetchAndApplyConfig's filter).
+      // Deduplicate by namespace -- keep first occurrence. reconcileConfig
+      // and the routing state assume one server per namespace, so a
+      // duplicate in bundles.json has to be filtered before either sees it.
       const seenNs = new Set<string>();
       this.config.servers = this.config.servers.filter((s) => {
         if (seenNs.has(s.namespace)) {
@@ -696,15 +661,14 @@ export class ConnectServer {
       // Reconcile so the loaded servers populate the routing state.
       await this.reconcileConfig(this.config);
     } else {
-      try {
-        await this.fetchAndApplyConfig();
-      } catch (err: any) {
-        if (err instanceof ConfigError && err.fatal) {
-          throw err;
-        }
-        log("warn", "Initial config fetch failed, starting with empty config", { error: err.message });
-        this.config = { servers: [], configVersion: "" };
-      }
+      // A token used to select a remote config fetch. That backend is gone,
+      // so there is nothing to load here -- start empty rather than pretend
+      // an account has servers. The token / apiBase plumbing that still
+      // routes execution down this branch is removed in a follow-up.
+      log("warn", "A token is set but the hosted backend is retired; starting with an empty config", {
+        hint: "move your servers into ~/.yaw-mcp/bundles.json (`yaw-mcp add <slug>`) and unset YAW_MCP_TOKEN",
+      });
+      this.config = { servers: [], configVersion: "" };
     }
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
@@ -719,8 +683,6 @@ export class ConnectServer {
 
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-
-    this.startPolling();
 
     // Dormant servers (isActive but no persisted toolCache yet) are
     // invisible in tools/list because getDeferredServers() filters on
@@ -2454,68 +2416,6 @@ export class ConnectServer {
     }
   }
 
-  private async fetchAndApplyConfig(): Promise<void> {
-    // Local mode has no backend to poll -- bundles.json is loaded once
-    // at start() and never refreshed within the session. Restart yaw-mcp
-    // (or the MCP client that launched it) to pick up bundles.json
-    // edits. Defense-in-depth: startPolling() already skips in local
-    // mode, but the import/install handlers also call this in their
-    // post-write refresh path.
-    if (this.localMode) return;
-
-    // Evict expired activation failures. healthFactor() checks the TTL
-    // at read-time, so stale entries never produce a wrong penalty --
-    // but without a sweep the map grows unbounded across a long
-    // session. Piggyback the sweep on each poll so it costs nothing
-    // extra.
-    this.pruneExpiredActivationFailures();
-
-    // Pass the known configVersion so the server can short-circuit with
-    // 304 Not Modified when nothing changed -- saves DB query, JSON
-    // serialization, and response body on the hot 60s poll path.
-    const newConfig = await fetchConfig(this.apiUrl, this.token as string, this.configVersion ?? undefined);
-
-    if (newConfig === null) {
-      return; // 304 Not Modified — keep current config
-    }
-
-    if (newConfig.configVersion && newConfig.configVersion === this.configVersion) {
-      return; // No changes (server didn't return 304 but hash matches)
-    }
-
-    // Deduplicate by namespace — keep first occurrence
-    const seen = new Set<string>();
-    newConfig.servers = newConfig.servers.filter((s) => {
-      if (seen.has(s.namespace)) {
-        log("warn", "Duplicate namespace in config, skipping", { namespace: s.namespace });
-        return false;
-      }
-      seen.add(s.namespace);
-      return true;
-    });
-
-    // Swap the config reference BEFORE reconcileConfig awaits. Other
-    // handlers (handleActivate, handleDispatch, handleDiscover) read
-    // this.config synchronously and can interleave at every await
-    // point below. With the old order, a caller in the middle of
-    // reconcile would see the stale config — and could try to
-    // activate a namespace that's about to be disconnected, racing
-    // the reconcile. Setting config first means readers see the
-    // intended-future state; the connection map is the authority for
-    // "what's actually running" and catches up shortly after.
-    this.config = newConfig;
-    this.configVersion = newConfig.configVersion;
-    await this.reconcileConfig(newConfig);
-  }
-
-  private pruneExpiredActivationFailures(now: number = Date.now()): void {
-    for (const [ns, failure] of this.activationFailures) {
-      if (now - failure.at > ACTIVATION_FAILURE_TTL_MS) {
-        this.activationFailures.delete(ns);
-      }
-    }
-  }
-
   private async reconcileConfig(newConfig: ConnectConfig): Promise<void> {
     const newServersByNs = new Map(newConfig.servers.map((s) => [s.namespace, s]));
     let changed = false;
@@ -2568,33 +2468,6 @@ export class ConnectServer {
       this.rebuildRoutes();
       await this.notifyAllListsChanged();
     }
-  }
-
-  private startPolling(): void {
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-    }
-    // No backend to poll in local mode -- bundles.json is read-once.
-    if (this.localMode) {
-      log("info", "Local mode: polling disabled (no backend). Restart yaw-mcp to pick up bundles.json edits.");
-      return;
-    }
-    const intervalMs = resolvePollIntervalMs();
-    if (intervalMs === 0) {
-      log("info", "Config polling disabled (YAW_MCP_POLL_INTERVAL=0). Restart yaw-mcp to pick up dashboard changes.");
-      return;
-    }
-    const poll = async () => {
-      try {
-        await this.fetchAndApplyConfig();
-      } catch (err: any) {
-        log("warn", "Config poll failed", { error: err.message });
-      }
-      this.pollTimer = setTimeout(poll, intervalMs);
-      if (this.pollTimer.unref) this.pollTimer.unref();
-    };
-    this.pollTimer = setTimeout(poll, intervalMs);
-    if (this.pollTimer.unref) this.pollTimer.unref();
   }
 
   // Signature-on-demand: return one tool's full input schema without
@@ -3218,11 +3091,6 @@ export class ConnectServer {
 
   async shutdown(): Promise<void> {
     log("info", "Shutting down yaw-mcp");
-
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
-    }
 
     // Flush any pending state save before we stop accepting writes.
     // Cancels the debounce timer so no stale snapshot writes after.

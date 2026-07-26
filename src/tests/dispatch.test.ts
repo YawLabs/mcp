@@ -24,14 +24,6 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../config.js", async (importOriginal) => {
-  const actual = (await importOriginal()) as any;
-  return {
-    ...actual,
-    fetchConfig: vi.fn().mockResolvedValue({ servers: [], configVersion: "v1" }),
-  };
-});
-
 import { ConnectServer } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream } from "../upstream.js";
