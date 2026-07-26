@@ -341,4 +341,3 @@ function printSummary(report: ComplianceReport, out: (s: string) => void): void 
       `Target: ${url}\n`,
   );
 }
-

@@ -841,7 +841,6 @@ describe("ConnectServer", () => {
       const second = priv.buildInstallCandidatesLines(priv.getProfiledActiveServers()).join("\n");
       expect(second).toBe("");
     });
-
   });
 
   describe("per-tool load", () => {
