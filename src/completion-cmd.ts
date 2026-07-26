@@ -93,7 +93,16 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: [["<slug>"]],
     flags: ["--env", "--dry-run", "--json", "--catalog", "--help"],
   },
-  { name: "remove", description: "Remove a local server", positional: [["<slug-or-namespace>"]], flags: ["--help"] },
+  // --force / --yes gate the destructive removal (confirm on a TTY, refuse off
+  // one), so they MUST be completable -- a user who cannot tab --force will not
+  // discover the only way to script a remove. Mirrors parseRemoveArgs in
+  // src/local-add-cmd.ts -- keep them in sync.
+  {
+    name: "remove",
+    description: "Remove a local server",
+    positional: [["<slug-or-namespace>"]],
+    flags: ["--force", "--yes", "--help"],
+  },
   { name: "list", description: "List the servers yaw-mcp loads locally", flags: ["--json", "--help"] },
   // Consent gate for a project-local .yaw-mcp/bundles.json. Flags mirror
   // parseTrustArgs in src/trust-cmd.ts -- keep them in sync.
