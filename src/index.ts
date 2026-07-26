@@ -13,6 +13,7 @@ import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
+import { parseTrustArgs, runTrust } from "./trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 
@@ -243,6 +244,17 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   dispatch("secrets", runSecrets(parsed.options));
+} else if (subcommand === "trust") {
+  const parsed = parseTrustArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  dispatch("trust", runTrust(parsed.options));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   yaw-mcp — one install, every MCP server, managed from one place.
@@ -268,6 +280,13 @@ if (subcommand === "compliance") {
     remove <slug>            Remove a server (by slug or namespace) from
                              bundles.json.
     list                     List the servers yaw-mcp loads locally.
+    trust                    Approve this project's .yaw-mcp/bundles.json so
+                             yaw-mcp loads it. A project file is usually
+                             committed to the repo and every server in it is
+                             a command yaw-mcp spawns AS YOU, so an unapproved
+                             one is ignored (your user-global bundles.json
+                             still loads). Shows the exact commands before
+                             asking. \`--list\` / \`--revoke\` manage approvals.
     try <slug>               Wire a one-off trial of a catalog MCP server
                              directly into your AI client (bypassing yaw-mcp).
                              No account needed; expires after --ttl (default
@@ -334,6 +353,12 @@ if (subcommand === "compliance") {
                                \`"runtime": "node"\` opts out. Same knob as
                                bundles.json top-level \`defaultRuntime\`
                                (env wins). Unset = node (today's default).
+    YAW_MCP_TRUST_PROJECT         Set to \`1\` to skip the consent check on a
+                               project-local .yaw-mcp/bundles.json and load
+                               it unconditionally. FOR CI/AUTOMATION ONLY --
+                               it lets any repo you run yaw-mcp inside spawn
+                               arbitrary commands as you. Default: the file
+                               must be approved with \`yaw-mcp trust\`.
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).

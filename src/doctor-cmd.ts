@@ -55,10 +55,11 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
-import { loadLocalBundles } from "./local-bundles.js";
+import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./local-bundles.js";
 import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
+import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
   BINARY_DOWNLOAD_URL,
@@ -68,6 +69,36 @@ import {
   refineInstallMethod,
 } from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
+
+/**
+ * Warning text for a project bundles.json that is NOT being loaded because
+ * it has not been approved (or that IS being loaded only because the escape
+ * hatch is set). Returns null when there is nothing to say.
+ *
+ * This belongs in doctor because the gate is deliberately silent-ish at
+ * runtime: the server logs a warning to a stream most users never read, so
+ * from their side "my project's servers stopped appearing" has no visible
+ * cause. Any warning takes doctor to exit 2, which is the right signal --
+ * the setup genuinely needs a decision from the user.
+ */
+async function projectTrustWarning(opts: {
+  cwd: string;
+  home: string;
+  env: NodeJS.ProcessEnv;
+}): Promise<string | null> {
+  const probe = await probeProjectTrust(opts).catch(() => null);
+  if (!probe || probe.path === null) return null;
+  // "none" = no project file at all; "unreadable" already surfaces through
+  // the normal bundles read path; "trusted" is the healthy case.
+  if (probe.status === "none" || probe.status === "unreadable" || probe.status === "trusted") return null;
+  if (probe.bypassed) {
+    // The escape hatch is only worth flagging when it is actually loading
+    // something unreviewed -- staying quiet otherwise keeps doctor from
+    // nagging a CI box where the var is set but every file is approved.
+    return `${probe.path}: loaded WITHOUT approval because ${TRUST_BYPASS_ENV} is set -- every command in that file spawns as you, unreviewed. Unset it and run \`yaw-mcp trust\` to review and approve the file instead.`;
+  }
+  return untrustedProjectWarning(probe);
+}
 
 export interface DoctorOptions {
   cwd?: string;
@@ -260,6 +291,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   print("");
 
   const config = await loadYawMcpConfig({ cwd, home, env });
+  // Project-trust gate (see trust.ts). Folded into config.warnings so it
+  // renders in WARNINGS, hits the always-on stderr stream, and drives the
+  // exit-2 gate like every other warning.
+  const trustWarning = await projectTrustWarning({ cwd, home, env });
+  if (trustWarning) config.warnings = [...config.warnings, trustWarning];
 
   print("CONFIG FILES");
   if (config.loadedFiles.length === 0) {
@@ -455,6 +491,10 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const timestamp = new Date().toISOString();
   const config = await loadYawMcpConfig({ cwd, home, env });
+  // Same project-trust fold as the text path, so `doctor --json` reports the
+  // gate in `.warnings` and exits 2 identically.
+  const trustWarning = await projectTrustWarning({ cwd, home, env });
+  if (trustWarning) config.warnings = [...config.warnings, trustWarning];
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
 

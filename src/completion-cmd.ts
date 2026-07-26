@@ -95,6 +95,13 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   },
   { name: "remove", description: "Remove a local server", positional: [["<slug-or-namespace>"]], flags: ["--help"] },
   { name: "list", description: "List the servers yaw-mcp loads locally", flags: ["--json", "--help"] },
+  // Consent gate for a project-local .yaw-mcp/bundles.json. Flags mirror
+  // parseTrustArgs in src/trust-cmd.ts -- keep them in sync.
+  {
+    name: "trust",
+    description: "Approve a project-local bundles.json",
+    flags: ["--yes", "--list", "--revoke", "--json", "--help"],
+  },
   {
     name: "try",
     description: "Wire a one-off trial of a catalog server",

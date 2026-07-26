@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -11,6 +11,9 @@ import {
   upsertUserBundle,
 } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+// The consent gate itself is covered in trust.test.ts; here it only has to be
+// SATISFIED, so the project-precedence cases keep testing precedence.
+import { grantTrust } from "../trust.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -30,6 +33,27 @@ afterEach(() => {
 function writeBundles(dir: string, content: unknown) {
   mkdirSync(join(dir, CONFIG_DIRNAME), { recursive: true });
   writeFileSync(localBundlesPath(join(dir, CONFIG_DIRNAME)), JSON.stringify(content));
+}
+
+/** Path keys are built with join(), never POSIX literals: the SUT routes
+ *  through path.join, which yields backslashes on the Windows runner. */
+function projectBundlesPath(dir: string): string {
+  return localBundlesPath(join(dir, CONFIG_DIRNAME));
+}
+
+/** Approve a project bundles.json exactly the way `yaw-mcp trust` does --
+ *  pinned to the bytes currently on disk. Tests that are about PRECEDENCE
+ *  (project wins over global) rather than CONSENT call this so they exercise
+ *  the approved path; the consent tests below deliberately do not. */
+async function trustProject(dir: string): Promise<void> {
+  const path = projectBundlesPath(dir);
+  await grantTrust(path, readFileSync(path), { home: synthHome });
+}
+
+/** Write a project bundles.json AND approve it. */
+async function writeTrustedProjectBundles(dir: string, content: unknown): Promise<void> {
+  writeBundles(dir, content);
+  await trustProject(dir);
 }
 
 describe("localBundlesPath", () => {
@@ -155,7 +179,7 @@ describe("loadLocalBundles", () => {
 
   it("falls back to user-global defaultRuntime when the winning project file doesn't set it", async () => {
     writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
-    writeBundles(synthCwd, { version: 1, servers: [] });
+    await writeTrustedProjectBundles(synthCwd, { version: 1, servers: [] });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     // Servers follow winner-takes-all (project), but defaultRuntime is a
     // MACHINE-level knob: a committed team bundles.json that doesn't mention
@@ -168,14 +192,14 @@ describe("loadLocalBundles", () => {
 
   it("project defaultRuntime wins over user-global when both are set", async () => {
     writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
-    writeBundles(synthCwd, { version: 1, defaultRuntime: "node", servers: [] });
+    await writeTrustedProjectBundles(synthCwd, { version: 1, defaultRuntime: "node", servers: [] });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.defaultRuntime).toBe("node");
     expect(r.defaultRuntimePath).toBe(localBundlesPath(join(synthCwd, CONFIG_DIRNAME)));
   });
 
-  it("loads from project-local <cwd>/.yaw-mcp/bundles.json", async () => {
-    writeBundles(synthCwd, {
+  it("loads from an APPROVED project-local <cwd>/.yaw-mcp/bundles.json", async () => {
+    await writeTrustedProjectBundles(synthCwd, {
       version: 1,
       servers: [{ namespace: "slack", name: "Slack", command: "uvx", args: ["mcp-server-slack"] }],
     });
@@ -184,12 +208,12 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].namespace).toBe("slack");
   });
 
-  it("project-local wins entirely over user-global (no merge)", async () => {
+  it("an APPROVED project-local file wins entirely over user-global (no merge)", async () => {
     writeBundles(synthHome, {
       version: 1,
       servers: [{ namespace: "github", name: "GitHub-Global", command: "npx" }],
     });
-    writeBundles(synthCwd, {
+    await writeTrustedProjectBundles(synthCwd, {
       version: 1,
       servers: [{ namespace: "slack", name: "Slack-Project", command: "uvx" }],
     });
@@ -316,25 +340,27 @@ describe("loadLocalBundles", () => {
     expect(r1.config?.configVersion).toMatch(/^local-/);
   });
 
-  it("project file with invalid JSON does NOT fall through to global", async () => {
+  it("an APPROVED project file with invalid JSON does NOT fall through to global", async () => {
     writeBundles(synthHome, {
       version: 1,
       servers: [{ namespace: "github", name: "GitHub-Global", command: "npx" }],
     });
     mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(localBundlesPath(join(synthCwd, CONFIG_DIRNAME)), "{not json");
+    writeFileSync(projectBundlesPath(synthCwd), "{not json");
+    await trustProject(synthCwd);
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config).toBeNull();
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
   });
 
-  it("malformed project file still falls back to user-global defaultRuntime", async () => {
+  it("an APPROVED malformed project file still falls back to user-global defaultRuntime", async () => {
     // Server list stays committed to the (malformed) project file, but the
     // MACHINE-level defaultRuntime knob must still come from user-global --
     // same rationale as the valid-project fallback.
     writeBundles(synthHome, { version: 1, defaultRuntime: "oam", servers: [] });
     mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(localBundlesPath(join(synthCwd, CONFIG_DIRNAME)), "{not json");
+    writeFileSync(projectBundlesPath(synthCwd), "{not json");
+    await trustProject(synthCwd);
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config).toBeNull();
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
