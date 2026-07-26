@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
@@ -1326,5 +1326,534 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
     expect(r.exitCode).toBe(0);
     expect(promptText()).toContain("Secret value: ");
     expect(promptText()).not.toContain("Vault passphrase: ");
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets rotate -- the worst data-loss shape in the product.
+//
+// rotate re-encrypts EVERY entry under a new passphrase, so a partial
+// failure could leave the vault half-rewritten: some entries readable only
+// under the old passphrase, some only under the new, and no way for the
+// user to tell which. secrets-vault.rotateVault is written decrypt-ALL-
+// before-write for exactly that reason, and runSecretsRotate only reaches
+// saveVault on the all-succeeded path.
+//
+// Every abort test below asserts the vault file's BYTES are unchanged, not
+// just that the command exited non-zero -- "returned an error" and "left
+// your secrets intact" are different claims and only the second matters.
+// The bytes are read straight from disk before and after.
+// -----------------------------------------------------------------------
+
+import type { EncryptedEntry } from "../secrets-crypto.js";
+import type { VaultFile } from "../secrets-vault.js";
+import { isUnlocked } from "../secrets-vault.js";
+
+const ROT_PASS = "rotate-current-xyz";
+const ROT_NEW = "rotate-brand-new-xyz";
+
+describe("runSecrets rotate -- abort paths leave the vault byte-identical", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const promptText = (): string =>
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+
+  /** Seed a multi-entry vault under ROT_PASS. Multi-entry matters: a
+   *  one-entry vault cannot show a HALF-rotated file. */
+  async function seedMulti(): Promise<string> {
+    for (const [name, value] of [
+      ["ALPHA", "alpha-value"],
+      ["BETA", "beta-value"],
+      ["GAMMA", "gamma-value"],
+    ]) {
+      const r = await runSecrets({ action: "set", name, value, passphrase: ROT_PASS, home }, io);
+      expect(r.exitCode).toBe(0);
+    }
+    lock();
+    io.out.mockReset();
+    io.err.mockReset();
+    return readFileSync(vaultPath(home), "utf8");
+  }
+
+  /** Read one secret back with a fresh derivation. Returns undefined when
+   *  the read failed (wrong passphrase, corrupt entry, missing name). */
+  async function readBack(name: string, passphrase: string): Promise<string | undefined> {
+    lock();
+    const probe = { out: vi.fn(), err: vi.fn() };
+    const r = await runSecrets({ action: "get", name, passphrase, home, json: true }, probe);
+    if (r.exitCode !== 0) return undefined;
+    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    return line ? (JSON.parse(line).value as string) : undefined;
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    lock();
+  });
+
+  it("ONE undecryptable entry aborts the whole rotation -- vault byte-identical, siblings still readable", async () => {
+    // The headline case. BETA is corrupted so that it is still STRUCTURALLY
+    // valid (loadVault only checks iv/ciphertext/authTag are strings) but
+    // fails AES-GCM authentication. rotateVault decrypts in insertion order,
+    // so ALPHA succeeds and BETA throws -- i.e. the abort happens with
+    // plaintext already in hand, which is precisely the moment a naive
+    // implementation would have started writing.
+    await seedMulti();
+    const path = vaultPath(home);
+    const vault = JSON.parse(readFileSync(path, "utf8")) as VaultFile;
+    (vault.entries.BETA as EncryptedEntry).ciphertext = Buffer.from("tampered-ciphertext").toString("base64");
+    writeFileSync(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8");
+    const before = readFileSync(path, "utf8");
+    lock();
+
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home }, io);
+
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("rotate aborted");
+    // The message must name the entry -- it is the only way the user can
+    // find and remove the one bad record.
+    expect(errText()).toContain("BETA");
+    // THE assertion: not one byte of the vault changed.
+    expect(readFileSync(path, "utf8")).toBe(before);
+    // The stale old-passphrase key must not stay cached after the failure.
+    expect(isUnlocked()).toBe(false);
+
+    // Byte-identical is necessary but not sufficient -- prove the untouched
+    // bytes are still real ciphertext under the ORIGINAL passphrase.
+    expect(await readBack("ALPHA", ROT_PASS)).toBe("alpha-value");
+    expect(await readBack("GAMMA", ROT_PASS)).toBe("gamma-value");
+    // ...and that the new passphrase was never established.
+    expect(await readBack("ALPHA", ROT_NEW)).toBeUndefined();
+  });
+
+  it("a wrong CURRENT passphrase aborts before any decrypt -- vault byte-identical, all entries still readable", async () => {
+    const before = await seedMulti();
+
+    const r = await runSecrets(
+      { action: "rotate", passphrase: "not-the-passphrase", newPassphrase: ROT_NEW, home },
+      io,
+    );
+
+    expect(r.exitCode).toBe(1);
+    expect(errText().toLowerCase()).toMatch(/wrong passphrase|decryption failed/);
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(isUnlocked()).toBe(false);
+
+    for (const [name, value] of [
+      ["ALPHA", "alpha-value"],
+      ["BETA", "beta-value"],
+      ["GAMMA", "gamma-value"],
+    ]) {
+      expect(await readBack(name, ROT_PASS)).toBe(value);
+    }
+  });
+
+  it("--json keeps the abort machine-readable (one ok:false line on stderr) and still writes nothing", async () => {
+    const before = await seedMulti();
+
+    const r = await runSecrets(
+      { action: "rotate", passphrase: "not-the-passphrase", newPassphrase: ROT_NEW, home, json: true },
+      io,
+    );
+
+    expect(r.exitCode).toBe(1);
+    const line = io.err.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    expect(line).toBeDefined();
+    const parsed = JSON.parse(line as string);
+    expect(parsed.ok).toBe(false);
+    expect(typeof parsed.error).toBe("string");
+    // No prose leaked onto stderr alongside the JSON.
+    expect(errText()).not.toContain("yaw-mcp secrets rotate:");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("a corrupt vault fails rotate through the same named-entry envelope the sibling actions use", async () => {
+    // loadVault throws on a malformed entry; safeLoadVault has to translate
+    // that into a rotate-labelled, actionable message rather than letting
+    // the rejection escape to the dispatcher.
+    const path = vaultPath(home);
+    const salt = Buffer.alloc(16, 7).toString("base64");
+    const raw = `${JSON.stringify({ version: 1, salt, entries: { WRECKED: { iv: "x" } } }, null, 2)}\n`;
+    writeFileSync(path, raw, "utf8");
+
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home }, io);
+
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("rotate");
+    expect(errText()).toContain("WRECKED");
+    expect(readFileSync(path, "utf8")).toBe(raw);
+  });
+
+  it("refuses when no CURRENT passphrase can be obtained (non-TTY, no env) -- vault untouched", async () => {
+    const before = await seedMulti();
+    const r = await runSecrets({ action: "rotate", newPassphrase: ROT_NEW, home, io: nonTTYIo(stderr) }, io);
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Current passphrase required");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("refuses when no NEW passphrase can be obtained (non-TTY, no env) -- vault untouched", async () => {
+    // The current passphrase is correct and the vault is fully decryptable;
+    // the only thing missing is the new passphrase. Nothing may be written.
+    const before = await seedMulti();
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, home, io: nonTTYIo(stderr) }, io);
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("New passphrase required");
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE_NEW");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it('an EMPTY new passphrase ("") is treated as "none supplied", never as a key of length zero', async () => {
+    const before = await seedMulti();
+    const r = await runSecrets(
+      { action: "rotate", passphrase: ROT_PASS, newPassphrase: "", home, io: nonTTYIo(stderr) },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("New passphrase required");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("^C at the CURRENT passphrase prompt exits 130 and leaves the vault alone", async () => {
+    const before = await seedMulti();
+    const ETX = String.fromCharCode(3);
+    const stdin = new FakeTTYStdin([ETX]);
+    const r = await runSecrets(
+      {
+        action: "rotate",
+        newPassphrase: ROT_NEW,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    expect(errText().toLowerCase()).toContain("cancelled");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+  });
+
+  it("^C at the NEW passphrase prompt exits 130 -- the vault is already unlocked, and still untouched", async () => {
+    // This one gets further than any other abort: the current passphrase is
+    // verified and the old key is in hand. Cancelling here must still not
+    // write, and must not fall through to a "" new passphrase.
+    const before = await seedMulti();
+    const ETX = String.fromCharCode(3);
+    const stdin = new FakeTTYStdin(["a-fine-new-passphrase\r", ETX]);
+    const r = await runSecrets(
+      {
+        action: "rotate",
+        passphrase: ROT_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(130);
+    expect(promptText()).toContain("Confirm new passphrase: ");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    expect(await readBack("ALPHA", ROT_PASS)).toBe("alpha-value");
+  });
+
+  it("three disagreeing new-passphrase confirmations exhaust the budget and write nothing", async () => {
+    const before = await seedMulti();
+    const stdin = new FakeTTYStdin(["new-aaa\r", "new-bbb\r", "new-aaa\r", "new-bbb\r", "new-aaa\r", "new-bbb\r"]);
+    const r = await runSecrets(
+      {
+        action: "rotate",
+        passphrase: ROT_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(promptText()).toContain("did not match");
+    expect(errText()).toContain("New passphrase required");
+    expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
+    // A typo'd rotation must not have re-keyed anything.
+    expect(await readBack("ALPHA", ROT_PASS)).toBe("alpha-value");
+  });
+
+  it("an empty new-passphrase entry re-prompts, and a matching pair on the retry rotates", async () => {
+    // Covers the "Passphrase cannot be empty." arm of resolveNewPassphrase,
+    // which is distinct from the mismatch arm above.
+    await seedMulti();
+    const stdin = new FakeTTYStdin(["\r", "retry-new-passphrase\r", "retry-new-passphrase\r"]);
+    const r = await runSecrets(
+      {
+        action: "rotate",
+        passphrase: ROT_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(promptText()).toContain("Passphrase cannot be empty.");
+    expect(await readBack("ALPHA", "retry-new-passphrase")).toBe("alpha-value");
+  });
+});
+
+describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+
+  async function readBack(name: string, passphrase: string): Promise<string | undefined> {
+    lock();
+    const probe = { out: vi.fn(), err: vi.fn() };
+    const r = await runSecrets({ action: "get", name, passphrase, home, json: true }, probe);
+    if (r.exitCode !== 0) return undefined;
+    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    return line ? (JSON.parse(line).value as string) : undefined;
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    lock();
+  });
+
+  const SEEDS: Array<[string, string]> = [
+    ["ALPHA", "alpha-value"],
+    ["BETA", "beta-value"],
+    ["GAMMA", "gamma-value"],
+  ];
+
+  it("every value survives under the NEW passphrase, none reads under the old, and salt+check+ciphertexts all change", async () => {
+    for (const [name, value] of SEEDS) {
+      expect((await runSecrets({ action: "set", name, value, passphrase: ROT_PASS, home }, io)).exitCode).toBe(0);
+    }
+    lock();
+    const before = JSON.parse(readFileSync(vaultPath(home), "utf8")) as VaultFile;
+    io.out.mockReset();
+
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home }, io);
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain("Rotated 3 secrets");
+    // rotate drops the derived key, so the very next command re-prompts.
+    expect(outText()).toContain("Vault locked");
+    expect(isUnlocked()).toBe(false);
+
+    const after = JSON.parse(readFileSync(vaultPath(home), "utf8")) as VaultFile;
+    // A fresh salt is the whole point -- reusing it would leave the old
+    // derived key valid against the rewritten file.
+    expect(after.salt).not.toBe(before.salt);
+    expect(after.check).toBeDefined();
+    expect(after.check?.ciphertext).not.toBe(before.check?.ciphertext);
+    // No entry may be carried over verbatim, and none may go missing.
+    expect(Object.keys(after.entries).sort()).toEqual(["ALPHA", "BETA", "GAMMA"]);
+    for (const [name] of SEEDS) {
+      expect(after.entries[name].ciphertext).not.toBe(before.entries[name].ciphertext);
+      expect(after.entries[name].iv).not.toBe(before.entries[name].iv);
+    }
+
+    // EVERY value -- not just the first -- is readable under the new
+    // passphrase with its original plaintext intact.
+    for (const [name, value] of SEEDS) {
+      expect(await readBack(name, ROT_NEW)).toBe(value);
+    }
+    // ...and the old passphrase is dead for all of them.
+    for (const [name] of SEEDS) {
+      expect(await readBack(name, ROT_PASS)).toBeUndefined();
+    }
+  });
+
+  it("says `1 secret` (singular) for a one-entry vault", async () => {
+    await runSecrets({ action: "set", name: "ONLY", value: "v", passphrase: ROT_PASS, home }, io);
+    lock();
+    io.out.mockReset();
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home }, io);
+    expect(r.exitCode).toBe(0);
+    expect(outText()).toContain("Rotated 1 secret under a new passphrase");
+    expect(outText()).not.toContain("1 secrets");
+  });
+
+  it("--json reports the rotated count instead of prose", async () => {
+    for (const [name, value] of SEEDS) {
+      await runSecrets({ action: "set", name, value, passphrase: ROT_PASS, home }, io);
+    }
+    lock();
+    io.out.mockReset();
+    const r = await runSecrets(
+      { action: "rotate", passphrase: ROT_PASS, newPassphrase: ROT_NEW, home, json: true },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toEqual({ ok: true, rotated: true, secret_count: 3 });
+    expect(outText()).not.toContain("Vault locked");
+  });
+
+  it("takes the NEW passphrase from YAW_MCP_VAULT_PASSPHRASE_NEW, warning when it is too short", async () => {
+    // The env path is the scripted-rotation path, and it is single-shot --
+    // there is no confirm entry to catch a typo, so the length warning is
+    // the only feedback a CI rotation gets.
+    await runSecrets({ action: "set", name: "ONLY", value: "v", passphrase: ROT_PASS, home }, io);
+    lock();
+    process.env.YAW_MCP_VAULT_PASSPHRASE_NEW = "tiny";
+
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, home, io: nonTTYIo(stderr) }, io);
+    expect(r.exitCode).toBe(0);
+
+    const warned = (stderr.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+    expect(warned).toContain("the new passphrase is shorter than 12 characters");
+    // The rotation still happened -- the warning is advisory, not a block.
+    expect(await readBack("ONLY", "tiny")).toBe("v");
+  });
+});
+
+// -----------------------------------------------------------------------
+// runSecrets audit -- the render/filter arms the existing suite skips.
+//
+// The existing coverage reads the trail with --json only, so the human
+// render loop (and its injected/missing column) was never executed, and
+// --secret was never used as a filter.
+// -----------------------------------------------------------------------
+
+describe("runSecrets audit -- human render, filters, and read failure", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  let home: string;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+
+  async function seedTrail(): Promise<void> {
+    const { appendAuditEvent } = await import("../secrets-audit.js");
+    await appendAuditEvent({ server: "github", secret: "GH_TOKEN", event: "injected" }, home);
+    await appendAuditEvent({ server: "aws", secret: "AWS_KEY", event: "missing" }, home);
+    await appendAuditEvent({ server: "github", secret: "AWS_KEY", event: "injected" }, home);
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("renders one line per event with the injected/missing column, and never a value", async () => {
+    await seedTrail();
+    const r = await runSecrets({ action: "audit", home }, io);
+    expect(r.exitCode).toBe(0);
+
+    const lines = outText().trimEnd().split("\n");
+    expect(lines).toHaveLength(3);
+    // `injected` and `missing ` are padded to the same width so the server
+    // and secret columns line up; both arms of the ternary are exercised.
+    expect(lines[0]).toMatch(/^\S+ {2}injected {2}github {2}GH_TOKEN$/);
+    // "missing " carries a trailing pad space so it occupies the same
+    // column width as "injected" -- hence three spaces before the server.
+    expect(lines[1]).toMatch(/^\S+ {2}missing {3}aws {2}AWS_KEY$/);
+    expect(lines[2]).toMatch(/^\S+ {2}injected {2}github {2}AWS_KEY$/);
+    // The log records names only; nothing that could be a value.
+    expect(outText()).not.toContain("ghp_");
+  });
+
+  it("--secret filters to one secret NAME across servers", async () => {
+    await seedTrail();
+    const r = await runSecrets({ action: "audit", secretFilter: "AWS_KEY", home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(outText());
+    expect(parsed.count).toBe(2);
+    expect(parsed.events.map((e: { server: string }) => e.server)).toEqual(["aws", "github"]);
+  });
+
+  it("--secret and --server compose (AND, not OR)", async () => {
+    await seedTrail();
+    const r = await runSecrets(
+      { action: "audit", secretFilter: "AWS_KEY", serverFilter: "github", home, json: true },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(outText());
+    expect(parsed.count).toBe(1);
+    expect(parsed.events[0]).toMatchObject({ server: "github", secret: "AWS_KEY", event: "injected" });
+  });
+
+  it("a filter that matches nothing is an empty result, not an error", async () => {
+    await seedTrail();
+    const r = await runSecrets({ action: "audit", serverFilter: "nope", home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, count: 0, events: [] });
+  });
+
+  it("--json on an empty trail still emits the ok:true envelope (not the prose line)", async () => {
+    const r = await runSecrets({ action: "audit", home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, count: 0, events: [] });
+    expect(outText()).not.toContain("No secret-resolution audit");
+  });
+
+  it("surfaces a readAuditLog failure as exit 1 rather than an unhandled rejection", async () => {
+    // NOTE: today's readAuditLog swallows every I/O error internally and
+    // returns [], so this catch arm is unreachable through the real module
+    // -- it is a guard against a future readAuditLog that throws. The mock
+    // is what makes the guard testable; nothing in the arm is faked.
+    vi.resetModules();
+    vi.doMock("../secrets-audit.js", async () => {
+      const actual = await vi.importActual<typeof import("../secrets-audit.js")>("../secrets-audit.js");
+      return {
+        ...actual,
+        readAuditLog: async () => {
+          throw new Error("EACCES: permission denied, open 'secrets-audit.log'");
+        },
+      };
+    });
+    try {
+      const { runSecrets: freshRunSecrets } = await import("../secrets-cmd.js");
+
+      const plain = { out: vi.fn(), err: vi.fn() };
+      const r1 = await freshRunSecrets({ action: "audit", home }, plain);
+      expect(r1.exitCode).toBe(1);
+      expect(plain.err.mock.calls.map((c) => c[0] as string).join("")).toContain("yaw-mcp secrets audit: EACCES");
+
+      const asJson = { out: vi.fn(), err: vi.fn() };
+      const r2 = await freshRunSecrets({ action: "audit", home, json: true }, asJson);
+      expect(r2.exitCode).toBe(1);
+      const line = asJson.err.mock.calls.map((c) => c[0] as string).join("");
+      expect(JSON.parse(line)).toMatchObject({ ok: false });
+      expect(JSON.parse(line).error).toContain("EACCES");
+    } finally {
+      vi.doUnmock("../secrets-audit.js");
+      vi.resetModules();
+    }
+    // Sanity: the unmocked module the rest of the suite holds still works.
+    expect(errText()).toBe("");
   });
 });

@@ -8,6 +8,9 @@ import {
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  type PromptRoute,
+  type ResourceRoute,
+  routePromptGet,
   routeResourceRead,
 } from "../proxy.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
@@ -273,6 +276,79 @@ describe("buildToolRoutes — deferred routes", () => {
   });
 });
 
+describe("buildToolRoutes — active-vs-active collisions", () => {
+  it("warns when two LIVE upstreams flatten to the same namespaced name", () => {
+    // (ns=`gh`, tool=`actions_list`) and (ns=`gh_actions`, tool=`list`) both
+    // render `gh_actions_list`. This used to be silent, so an operator had no
+    // way to know one upstream's tool had become unreachable.
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const connections = new Map<string, UpstreamConnection>();
+      connections.set("gh", makeConnection("gh", ["actions_list"]));
+      connections.set("gh_actions", makeConnection("gh_actions", ["list"]));
+      const routes = buildToolRoutes(connections);
+      const warning = writes.find((w) => w.includes("Tool route collision"));
+      expect(warning).toBeDefined();
+      // Both sides are named so the operator knows which namespace to rename.
+      expect(warning).toContain("gh_actions_list");
+      expect(warning).toContain("gh_actions");
+      // FIRST writer wins, and it must be the SAME winner buildToolList
+      // picks. Regression guard: routes used to be last-writer-wins while
+      // buildToolList's `seen` guard is first-writer-wins, so a collision
+      // meant the model was shown `gh`'s description + inputSchema while a
+      // call dispatched to `gh_actions` -- schema and execution pointing at
+      // two different upstreams, with a later-activated server able to
+      // capture an earlier one's traffic.
+      expect(routes.get("gh_actions_list")).toEqual({ namespace: "gh", originalName: "actions_list" });
+      expect(routes.size).toBe(1);
+
+      // Pin the AGREEMENT itself, not just each side's value: whatever
+      // tools/list advertises must be what dispatch resolves to. Tag each
+      // upstream's inputSchema so the advertised entry is attributable --
+      // the two tools are otherwise indistinguishable once flattened.
+      const ghConn = connections.get("gh") as UpstreamConnection;
+      const actionsConn = connections.get("gh_actions") as UpstreamConnection;
+      ghConn.tools[0].inputSchema = { type: "object", properties: { from: { const: "gh" } } };
+      actionsConn.tools[0].inputSchema = { type: "object", properties: { from: { const: "gh_actions" } } };
+
+      const advertised = buildToolList(connections);
+      const collided = advertised.filter((t) => t.name === "gh_actions_list");
+      expect(collided).toHaveLength(1);
+      const advertisedFrom = (collided[0].inputSchema as { properties: { from: { const: string } } }).properties.from
+        .const;
+      // Same namespace on both surfaces. Fails if either flips independently.
+      expect(advertisedFrom).toBe("gh");
+      expect(buildToolRoutes(connections).get("gh_actions_list")?.namespace).toBe(advertisedFrom);
+    } finally {
+      process.stderr.write = original;
+    }
+  });
+
+  it("does NOT warn when one connection repeats a namespaced name against itself", () => {
+    // Same namespace on both sides is not an operator-fixable collision --
+    // there is no second upstream to rename -- so it must stay quiet.
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const conn = makeConnection("gh", ["list", "list_dup"]);
+      conn.tools[1].namespacedName = "gh_list";
+      buildToolRoutes(new Map([["gh", conn]]));
+      expect(writes.some((w) => w.includes("collision"))).toBe(false);
+    } finally {
+      process.stderr.write = original;
+    }
+  });
+});
+
 describe("buildResourceList / buildResourceRoutes", () => {
   it("lists resources with namespaced URIs", () => {
     const connections = new Map<string, UpstreamConnection>();
@@ -411,6 +487,86 @@ describe("routeResourceRead — builtins", () => {
   });
 });
 
+describe("routeResourceRead — upstream routing", () => {
+  // Resource reads are where an upstream payload reaches the model, so every
+  // arm here has to end in a well-formed ResourceContents rather than a throw:
+  // an exception becomes an opaque JSON-RPC failure at the client, which tells
+  // the user nothing about which server broke or why.
+  const NAMESPACED = "connect://db/db://tables";
+
+  function connectedWith(client: unknown, status: UpstreamConnection["status"] = "connected"): UpstreamConnection {
+    const conn = makeConnection("db", [], ["db://tables"]);
+    (conn as any).client = client;
+    conn.status = status;
+    return conn;
+  }
+
+  it("forwards the ORIGINAL (de-namespaced) uri upstream and returns its payload", async () => {
+    const seen: string[] = [];
+    const conn = connectedWith({
+      readResource: async ({ uri }: { uri: string }) => {
+        seen.push(uri);
+        return { contents: [{ uri: "db://tables", text: "rows", mimeType: "text/plain" }] };
+      },
+    });
+    const connections = new Map([["db", conn]]);
+    const result = await routeResourceRead(NAMESPACED, buildResourceRoutes(connections), connections);
+    // The upstream has never heard of yaw-mcp's `connect://` prefix; sending
+    // it would look like a request for a resource the server does not have.
+    expect(seen).toEqual(["db://tables"]);
+    expect(result.contents).toEqual([{ uri: "db://tables", text: "rows", mimeType: "text/plain" }]);
+  });
+
+  it("does not fuzzy-match: a near-miss uri is Unknown even with a populated route table", async () => {
+    const connections = new Map([["db", connectedWith({ readResource: async () => ({ contents: [] }) })]]);
+    const result = await routeResourceRead(`${NAMESPACED}/extra`, buildResourceRoutes(connections), connections);
+    expect(result.contents).toEqual([{ uri: `${NAMESPACED}/extra`, text: `Unknown resource: ${NAMESPACED}/extra` }]);
+  });
+
+  it("reports not-connected when the route's namespace has no connection at all", async () => {
+    // Reachable in normal operation: resourceRoutes are rebuilt on connection
+    // change, so a resources/read in flight can land after the server went
+    // away and find a route pointing at a namespace that is gone.
+    const routes = new Map<string, ResourceRoute>([[NAMESPACED, { namespace: "db", originalUri: "db://tables" }]]);
+    const result = await routeResourceRead(NAMESPACED, routes, new Map());
+    expect(result.contents).toEqual([{ uri: NAMESPACED, text: 'Server "db" is not connected.' }]);
+  });
+
+  it("reports not-connected for a connection that exists but is disconnected or errored", async () => {
+    for (const status of ["disconnected", "error"] as const) {
+      // A reader that resolves with a recognisable body: if the status guard
+      // ever stopped short-circuiting, that body would show up below.
+      const conn = connectedWith(
+        { readResource: async () => ({ contents: [{ uri: "db://tables", text: "LEAKED" }] }) },
+        status,
+      );
+      const connections = new Map([["db", conn]]);
+      const result = await routeResourceRead(NAMESPACED, buildResourceRoutes(connections), connections);
+      expect(result.contents).toEqual([{ uri: NAMESPACED, text: 'Server "db" is not connected.' }]);
+    }
+  });
+
+  it("returns an Error body (keyed to the uri the CLIENT asked for) when the upstream read rejects", async () => {
+    const conn = connectedWith({
+      readResource: async () => {
+        throw new Error("table vanished");
+      },
+    });
+    const connections = new Map([["db", conn]]);
+    const result = await routeResourceRead(NAMESPACED, buildResourceRoutes(connections), connections);
+    // Namespaced uri, not route.originalUri -- the client indexes the reply
+    // by the uri it sent.
+    expect(result.contents).toEqual([{ uri: NAMESPACED, text: "Error: table vanished" }]);
+  });
+
+  it("stringifies a non-Error rejection instead of rendering it as undefined", async () => {
+    const conn = connectedWith({ readResource: () => Promise.reject("upstream closed the pipe") });
+    const connections = new Map([["db", conn]]);
+    const result = await routeResourceRead(NAMESPACED, buildResourceRoutes(connections), connections);
+    expect(result.contents).toEqual([{ uri: NAMESPACED, text: "Error: upstream closed the pipe" }]);
+  });
+});
+
 describe("buildPromptList / buildPromptRoutes", () => {
   it("lists prompts with namespaced names", () => {
     const connections = new Map<string, UpstreamConnection>();
@@ -425,5 +581,74 @@ describe("buildPromptList / buildPromptRoutes", () => {
     connections.set("gh", makeConnection("gh", [], [], ["review_pr"]));
     const routes = buildPromptRoutes(connections);
     expect(routes.get("gh_review_pr")).toEqual({ namespace: "gh", originalName: "review_pr" });
+  });
+});
+
+describe("routePromptGet", () => {
+  // Same contract as routeResourceRead: every failure arm answers with a
+  // well-formed messages[] carrying the reason, never a throw.
+  function connectedWith(client: unknown, status: UpstreamConnection["status"] = "connected"): UpstreamConnection {
+    const conn = makeConnection("gh", [], [], ["review_pr"]);
+    (conn as any).client = client;
+    conn.status = status;
+    return conn;
+  }
+
+  it("forwards the ORIGINAL name plus the arguments and returns the upstream messages", async () => {
+    const seen: Array<{ name: string; arguments?: Record<string, string> }> = [];
+    const conn = connectedWith({
+      getPrompt: async (req: { name: string; arguments?: Record<string, string> }) => {
+        seen.push(req);
+        return { messages: [{ role: "assistant", content: { type: "text", text: "review it" } }] };
+      },
+    });
+    const connections = new Map([["gh", conn]]);
+    const result = await routePromptGet("gh_review_pr", { pr: "42" }, buildPromptRoutes(connections), connections);
+    // De-namespaced name, arguments passed straight through.
+    expect(seen).toEqual([{ name: "review_pr", arguments: { pr: "42" } }]);
+    expect(result.messages).toEqual([{ role: "assistant", content: { type: "text", text: "review it" } }]);
+  });
+
+  it("returns an Unknown prompt message for a name with no route", async () => {
+    const result = await routePromptGet("nope", undefined, new Map(), new Map());
+    expect(result.messages).toEqual([{ role: "user", content: { type: "text", text: "Unknown prompt: nope" } }]);
+  });
+
+  it("reports not-connected when the route's namespace has no connection at all", async () => {
+    const routes = new Map<string, PromptRoute>([["gh_review_pr", { namespace: "gh", originalName: "review_pr" }]]);
+    const result = await routePromptGet("gh_review_pr", undefined, routes, new Map());
+    expect(result.messages).toEqual([
+      { role: "user", content: { type: "text", text: 'Server "gh" is not connected.' } },
+    ]);
+  });
+
+  it("reports not-connected for a connection that exists but is disconnected or errored", async () => {
+    for (const status of ["disconnected", "error"] as const) {
+      const conn = connectedWith(
+        { getPrompt: async () => ({ messages: [{ role: "user", content: { type: "text", text: "LEAKED" } }] }) },
+        status,
+      );
+      const connections = new Map([["gh", conn]]);
+      const result = await routePromptGet("gh_review_pr", undefined, buildPromptRoutes(connections), connections);
+      expect(result.messages[0].content.text).toBe('Server "gh" is not connected.');
+    }
+  });
+
+  it("returns an Error message instead of throwing when the upstream getPrompt rejects", async () => {
+    const conn = connectedWith({
+      getPrompt: async () => {
+        throw new Error("prompt gone");
+      },
+    });
+    const connections = new Map([["gh", conn]]);
+    const result = await routePromptGet("gh_review_pr", undefined, buildPromptRoutes(connections), connections);
+    expect(result.messages).toEqual([{ role: "user", content: { type: "text", text: "Error: prompt gone" } }]);
+  });
+
+  it("stringifies a non-Error rejection instead of rendering it as undefined", async () => {
+    const conn = connectedWith({ getPrompt: () => Promise.reject("transport closed") });
+    const connections = new Map([["gh", conn]]);
+    const result = await routePromptGet("gh_review_pr", undefined, buildPromptRoutes(connections), connections);
+    expect(result.messages[0].content.text).toBe("Error: transport closed");
   });
 });

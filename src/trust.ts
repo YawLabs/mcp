@@ -29,6 +29,16 @@
 // This is the security boundary, so a missing / malformed / unreadable
 // store means NOTHING is trusted. That is deliberately the OPPOSITE of the
 // config loader's permissive fail-open posture (right there, wrong here).
+//
+// FAILING CLOSED IS ABOUT READS, NOT WRITES
+// Denying on an unusable store is right; DISCARDING it is not. A store we
+// could not READ (antivirus lock, a stray chmod, EIO) almost certainly still
+// holds every grant the user made, so rebuilding it from empty would revoke
+// every other project over a transient error -- security state destroyed by
+// the very code that exists to protect it. A store we could not PARSE is
+// genuinely garbage and there is nothing to preserve. readTrustStore
+// therefore reports WHICH of the two happened (`malformedKind`), both deny,
+// and only the parse case may be overwritten.
 
 import { createHash } from "node:crypto";
 import { chmod, readFile } from "node:fs/promises";
@@ -74,6 +84,46 @@ export interface TrustStore {
   malformed: boolean;
   /** Human-readable reason for `malformed`; null otherwise. */
   malformedReason: string | null;
+  /**
+   * WHY the store is unusable; null when it is healthy.
+   *
+   *   "io"    -- the file exists but could not be READ (EACCES, EPERM, EIO,
+   *              EBUSY, EISDIR...). The grants are almost certainly still on
+   *              disk and intact, so this store must never be overwritten.
+   *   "parse" -- the bytes were read fine but are not valid JSON, or the
+   *              root / `trusted` shape is wrong. Nothing recoverable is in
+   *              there, so rebuilding over it loses nothing.
+   *
+   * Both deny every lookup. The distinction only governs WRITES.
+   */
+  malformedKind: "io" | "parse" | null;
+  /** errno of the failed read when `malformedKind` is "io" (e.g. "EACCES").
+   *  Null otherwise, and null when the platform reported no code. */
+  errorCode: string | null;
+}
+
+/**
+ * Thrown when a trust-store WRITE is refused because the existing store
+ * could not be read. Rebuilding it would silently revoke every project the
+ * user approved on the strength of what is usually a transient lock, so the
+ * write does not happen and the caller has to tell the user to fix the file.
+ * A separate error type (rather than a flag on the result) so a caller that
+ * forgets to check cannot accidentally proceed.
+ */
+export class TrustStoreUnreadableError extends Error {
+  /** Absolute path of the store that could not be read. */
+  readonly storePath: string;
+  /** errno from the failed read, when the platform gave one. */
+  readonly code: string | null;
+  /** The store's `malformedReason` -- already names the path and the cause. */
+  readonly reason: string;
+  constructor(storePath: string, reason: string, code: string | null) {
+    super(`refusing to write the trust store: ${reason}`);
+    this.name = "TrustStoreUnreadableError";
+    this.storePath = storePath;
+    this.reason = reason;
+    this.code = code;
+  }
 }
 
 /** Absolute path to the trust store for a given home. */
@@ -117,8 +167,19 @@ export function isTrustBypassEnabled(env: NodeJS.ProcessEnv = process.env): bool
   return raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
 }
 
-function emptyStore(malformed = false, reason: string | null = null): TrustStore {
-  return { version: TRUST_SCHEMA_VERSION, entries: {}, malformed, malformedReason: reason };
+function emptyStore(
+  kind: "io" | "parse" | null = null,
+  reason: string | null = null,
+  errorCode: string | null = null,
+): TrustStore {
+  return {
+    version: TRUST_SCHEMA_VERSION,
+    entries: {},
+    malformed: kind !== null,
+    malformedReason: reason,
+    malformedKind: kind,
+    errorCode,
+  };
 }
 
 /**
@@ -131,6 +192,11 @@ function emptyStore(malformed = false, reason: string | null = null): TrustStore
  * JSON.parse (not parseJsonc): this file is tool-managed, never hand-edited,
  * so accepting comments would only widen what an attacker can smuggle past
  * a reviewer's eye.
+ *
+ * `malformedKind` splits the two failures the readFile / JSON.parse boundary
+ * already distinguishes: everything readFile rejects (other than ENOENT) is
+ * "io", everything after it is "parse". Both deny; only "parse" may be
+ * overwritten later. See the FAILING CLOSED IS ABOUT READS note at the top.
  *
  * Individual malformed ENTRIES are dropped (with a log line) rather than
  * poisoning the whole store -- one corrupt record must not silently revoke
@@ -146,7 +212,7 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
     if (code === "ENOENT") return emptyStore();
     const msg = err instanceof Error ? err.message : String(err);
     log("warn", "Trust store unreadable; nothing is trusted", { path, error: msg, code });
-    return emptyStore(true, `could not read ${path} (${msg})`);
+    return emptyStore("io", `could not read ${path} (${msg})`, code ?? null);
   }
   let parsed: unknown;
   try {
@@ -154,15 +220,15 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log("warn", "Trust store is not valid JSON; nothing is trusted", { path, error: msg });
-    return emptyStore(true, `${path} is not valid JSON (${msg})`);
+    return emptyStore("parse", `${path} is not valid JSON (${msg})`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return emptyStore(true, `${path} root must be a JSON object`);
+    return emptyStore("parse", `${path} root must be a JSON object`);
   }
   const obj = parsed as Record<string, unknown>;
   const rawEntries = obj.trusted;
   if (!rawEntries || typeof rawEntries !== "object" || Array.isArray(rawEntries)) {
-    return emptyStore(true, `${path} is missing a 'trusted' object`);
+    return emptyStore("parse", `${path} is missing a 'trusted' object`);
   }
   const version = typeof obj.version === "number" ? obj.version : TRUST_SCHEMA_VERSION;
   const entries: Record<string, TrustRecord> = {};
@@ -184,7 +250,7 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
       grantedAt: typeof v.grantedAt === "string" ? v.grantedAt : "",
     };
   }
-  return { version, entries, malformed: false, malformedReason: null };
+  return { version, entries, malformed: false, malformedReason: null, malformedKind: null, errorCode: null };
 }
 
 /** Result of checking one path+content pair against the store. */
@@ -245,10 +311,16 @@ async function writeTrustStore(home: string, entries: Record<string, TrustRecord
 /**
  * Record consent for `path` pinned to the hash of `contents`.
  *
- * If the on-disk store is malformed we start from an EMPTY set rather than
+ * If the store is UNPARSEABLE we start from an EMPTY set rather than
  * refusing: the file is already unusable (every lookup was denying), so the
  * alternative is a user who can never grant anything again. Callers should
  * surface `storeWasMalformed` so the user knows other grants were dropped.
+ *
+ * If the store is UNREADABLE this throws TrustStoreUnreadableError and
+ * writes nothing. An EACCES/EPERM/EIO/EBUSY at this moment says nothing
+ * about the store's contents -- the grants are still there, just behind a
+ * lock -- so replacing it would revoke every other approved project because
+ * an antivirus scanner happened to hold the file open.
  */
 export async function grantTrust(
   path: string,
@@ -257,6 +329,14 @@ export async function grantTrust(
 ): Promise<{ storePath: string; record: TrustRecord; storeWasMalformed: boolean }> {
   const home = opts.home ?? homedir();
   const store = await readTrustStore(home);
+  if (store.malformedKind === "io") {
+    throw new TrustStoreUnreadableError(
+      trustStorePath(home),
+      store.malformedReason ?? `could not read ${trustStorePath(home)}`,
+      store.errorCode,
+    );
+  }
+  // Only the "parse" case reaches here, where there is nothing to preserve.
   const entries = store.malformed ? {} : { ...store.entries };
   const record: TrustRecord = {
     path: resolve(path),

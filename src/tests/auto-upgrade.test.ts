@@ -1,5 +1,5 @@
 import { join, sep } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { detectRunningInstallPrefix, maybeAutoUpgrade } from "../auto-upgrade.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -12,7 +12,17 @@ import { detectRunningInstallPrefix, maybeAutoUpgrade } from "../auto-upgrade.js
 // ═══════════════════════════════════════════════════════════════════════
 
 // argv[1] paths that detectInstallMethod (upgrade-cmd.ts) classifies.
-const GLOBAL_NPM_PATH = "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js";
+// Built with join(), NOT a POSIX literal. detectRunningInstallPrefix matches
+// on `${sep}node_modules${sep}`, and the file-level realpathSync mock hands
+// this string straight back -- so a literal "/usr/.../node_modules/..." finds
+// a prefix on POSIX and finds NOTHING on win32. That skew made the spawn args
+// platform-dependent (bare 3-element form here, 5-element --prefix form on
+// Linux) and silently green only on Windows. join() makes both platforms
+// resolve the prefix, so the expected argv is the same everywhere.
+const GLOBAL_NPM_PREFIX = join(sep, "usr", "local");
+const GLOBAL_NPM_PATH = join(GLOBAL_NPM_PREFIX, "lib", "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+/** What maybeAutoUpgrade spawns for a global-npm install whose prefix resolves. */
+const GLOBAL_NPM_ARGS = ["install", "-g", "--prefix", GLOBAL_NPM_PREFIX, "@yawlabs/mcp@latest"];
 const NPX_PATH = "/home/u/.npm/_npx/abc123/node_modules/@yawlabs/mcp/dist/index.js";
 const LOCAL_NODE_MODULES_PATH = "/home/u/myproject/node_modules/@yawlabs/mcp/dist/index.js";
 const UNKNOWN_PATH = "/tmp/some/random/launch/path.js";
@@ -92,11 +102,7 @@ describe("maybeAutoUpgrade", () => {
           fetchLatestImpl: async () => "0.47.8",
           spawnImpl,
         });
-        expect(spawnImpl, `value=${value} should NOT opt out`).toHaveBeenCalledWith("npm", [
-          "install",
-          "-g",
-          "@yawlabs/mcp@latest",
-        ]);
+        expect(spawnImpl, `value=${value} should NOT opt out`).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS);
       } finally {
         if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
         else process.env.YAW_MCP_AUTO_UPGRADE = prev;
@@ -143,7 +149,7 @@ describe("maybeAutoUpgrade", () => {
       spawnImpl,
     });
     expect(spawnImpl).toHaveBeenCalledTimes(1);
-    expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
+    expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS);
   });
 
   it("background-upgrades stale pnpm/bun globals with their owning tool", async () => {
@@ -230,7 +236,7 @@ describe("maybeAutoUpgrade", () => {
       fetchLatestImpl: async () => "0.47.8",
       spawnImpl: (cmd, args) => calls.push([cmd, args]),
     });
-    expect(calls).toEqual([["npm", ["install", "-g", "@yawlabs/mcp@latest"]]]);
+    expect(calls).toEqual([["npm", GLOBAL_NPM_ARGS]]);
   });
 
   it("does NOT spawn for a stale bundled-app (asar.unpacked) argvPath -- distinct from generic no-spawn cases", async () => {
@@ -372,5 +378,467 @@ describe("runAutoUpgrade: --prefix injection into spawn args", () => {
 
     mockRealpathSync.mockReset();
     mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// defaultSpawn + compareWithNpmPrefix + fetchLatestVersion
+//
+// Everything above injects `spawnImpl` / `fetchLatestImpl`, so the arms
+// that only run when a real caller does NOT inject a hook were never
+// executed: the actual `spawn()` of `npm install -g` (its options, its
+// close/error handling) and the actual registry fetch. Those are the two
+// pieces that touch the user's machine at every server start, so they are
+// exercised here against a mocked `node:child_process` / `fetch`.
+//
+// Mocking node:child_process has a second benefit: without it, the
+// --prefix test above really did spawn `npm prefix -g` on the test
+// machine (compareWithNpmPrefix, unlike upgrade-cmd's defaultNpmPrefix,
+// has no `process.env.VITEST` short-circuit) as an unawaited background
+// child.
+// ═══════════════════════════════════════════════════════════════════════
+
+import type { EventEmitter } from "node:events";
+
+/** Recorder for the mocked spawn. `vi.hoisted` so the object exists before
+ *  the hoisted `vi.mock` factory below closes over it. */
+const cp = vi.hoisted(() => ({
+  calls: [] as Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }>,
+  children: [] as Array<EventEmitter & { stdout: EventEmitter }>,
+}));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const { EventEmitter: EE } = await import("node:events");
+  return {
+    ...actual,
+    spawn: (cmd: string, args: string[], opts: Record<string, unknown>) => {
+      const child = new EE() as EventEmitter & { stdout: EventEmitter };
+      child.stdout = new EE();
+      cp.calls.push({ cmd, args: [...args], opts: { ...opts } });
+      cp.children.push(child);
+      return child;
+    },
+  };
+});
+
+// The module logs its outcome rather than returning it, so the log is the
+// only observable for the close/error arms of defaultSpawn.
+vi.mock("../logger.js", () => ({ log: vi.fn() }));
+
+import { log } from "../logger.js";
+
+const mockLog = vi.mocked(log);
+
+/** A realpath with NO node_modules segment: detectRunningInstallPrefix
+ *  returns null for it on EVERY platform, so `--prefix` is omitted and the
+ *  `npm prefix -g` comparison probe never fires. Built with join/sep
+ *  because the walk in detectRunningInstallPrefix keys off `path.sep`. */
+const NO_PREFIX_REALPATH = join(sep, "home", "u", "bin", "yaw-mcp");
+/** A realpath that DOES yield a prefix on every platform. */
+const DETECTED_PREFIX = join(sep, "opt", "node");
+const PREFIXED_REALPATH = join(DETECTED_PREFIX, "lib", "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+
+const PNPM_PATH = "/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js";
+const BUN_PATH = "/home/u/.bun/install/global/node_modules/@yawlabs/mcp/dist/index.js";
+
+/** All `warn`-level log calls, in order. */
+function warnCalls(): Array<[string, string, Record<string, unknown> | undefined]> {
+  return mockLog.mock.calls.filter((c) => c[0] === "warn") as Array<
+    [string, string, Record<string, unknown> | undefined]
+  >;
+}
+
+function resetSpawnRecorder(): void {
+  cp.calls.length = 0;
+  cp.children.length = 0;
+  mockLog.mockClear();
+  mockRealpathSync.mockReset();
+  mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
+}
+
+describe("defaultSpawn -- the real background upgrade child", () => {
+  beforeEach(resetSpawnRecorder);
+  afterEach(resetSpawnRecorder);
+
+  it("spawns the whitelisted npm command with stdio ignored, NOT detached, shell only on win32", async () => {
+    // stdio:"ignore" keeps the child off the MCP stdio transport (a single
+    // stray byte on stdout corrupts the JSON-RPC stream); detached:false
+    // makes the child die with yaw-mcp instead of outliving it.
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+
+    expect(cp.calls).toHaveLength(1);
+    expect(cp.calls[0].cmd).toBe("npm");
+    expect(cp.calls[0].args).toEqual(["install", "-g", "@yawlabs/mcp@latest"]);
+    expect(cp.calls[0].opts).toMatchObject({
+      stdio: "ignore",
+      detached: false,
+      shell: process.platform === "win32",
+    });
+  });
+
+  it("logs completion (not a warning) when the child exits 0", async () => {
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+    cp.children[0].emit("close", 0);
+
+    expect(mockLog).toHaveBeenCalledWith("info", expect.stringContaining("self-upgrade complete"));
+    expect(warnCalls()).toHaveLength(0);
+  });
+
+  it("warns with the npm corrective command, the EACCES hint and the opt-out when the child exits non-zero", async () => {
+    // stdio is "ignore", so the tool's own error text is unrecoverable --
+    // the warning IS the entire diagnostic the user gets. It has to carry
+    // the command to run by hand and the way to silence the check.
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+    cp.children[0].emit("close", 243);
+
+    const warns = warnCalls();
+    expect(warns).toHaveLength(1);
+    expect(warns[0][1]).toContain("npm install -g @yawlabs/mcp@latest");
+    expect(warns[0][1]).toContain("EACCES");
+    expect(warns[0][1]).toContain("YAW_MCP_AUTO_UPGRADE=0");
+    // The exit code has to survive into the structured field -- it is the
+    // only machine-readable part of an otherwise opaque failure.
+    expect(warns[0][2]).toEqual({ code: 243 });
+  });
+
+  it("warns once on a spawn error, and the close that follows it stays SILENT", async () => {
+    // ENOENT fires BOTH "error" and "close". The error handler owns the
+    // message (it is the only one that knows what actually happened), so a
+    // regression that drops the errorFired guard shows up here as a second,
+    // misleading "exited non-zero" warning for the same failure.
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+    const child = cp.children[0];
+    child.emit("error", new Error("spawn npm ENOENT"));
+    child.emit("close", 1);
+
+    const warns = warnCalls();
+    expect(warns).toHaveLength(1);
+    expect(warns[0][1]).toContain("spawn failed");
+    expect(warns[0][2]).toEqual({ error: "spawn npm ENOENT" });
+  });
+
+  it("names pnpm (not npm) in the corrective command, and drops the sudo/EACCES hint", async () => {
+    // The EACCES hint is npm-specific -- pnpm manages its own global store,
+    // so telling a pnpm user to fix permissions on an npm prefix is wrong.
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: PNPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+
+    // Exactly one spawn: the `npm prefix -g` comparison probe is global-npm
+    // only, so a pnpm upgrade must not shell out to npm at all.
+    expect(cp.calls).toHaveLength(1);
+    expect(cp.calls[0].cmd).toBe("pnpm");
+    expect(cp.calls[0].args).toEqual(["add", "-g", "@yawlabs/mcp@latest"]);
+
+    cp.children[0].emit("close", 1);
+    const warns = warnCalls();
+    expect(warns).toHaveLength(1);
+    expect(warns[0][1]).toContain("pnpm add -g @yawlabs/mcp@latest");
+    expect(warns[0][1]).not.toContain("EACCES");
+  });
+
+  it("names bun in the corrective command, and drops the sudo/EACCES hint", async () => {
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: BUN_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+
+    expect(cp.calls).toHaveLength(1);
+    expect(cp.calls[0].cmd).toBe("bun");
+    expect(cp.calls[0].args).toEqual(["add", "-g", "@yawlabs/mcp@latest"]);
+
+    cp.children[0].emit("close", 1);
+    const warns = warnCalls();
+    expect(warns).toHaveLength(1);
+    expect(warns[0][1]).toContain("bun add -g @yawlabs/mcp@latest");
+    expect(warns[0][1]).not.toContain("EACCES");
+  });
+
+  it("never computes a --prefix for pnpm/bun -- the flag is npm-only", async () => {
+    // detectRunningInstallPrefix WOULD return a prefix for this realpath;
+    // the guard is on `method === "global-npm"`, not on the prefix being
+    // resolvable. `pnpm add -g --prefix ...` is not a real pnpm flag.
+    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: PNPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+    expect(cp.calls).toHaveLength(1);
+    expect(cp.calls[0].args).not.toContain("--prefix");
+  });
+
+  it("quotes a --prefix containing a space for the win32 shell, passes it through on POSIX", async () => {
+    // Regression guard. defaultSpawn passes `shell: true` on win32 (npm is
+    // npm.cmd and Node will not spawn a .cmd without a shell), and Node builds
+    // the cmd.exe command line by joining argv on spaces WITHOUT quoting. An
+    // unquoted prefix under a username with a space therefore reached npm as
+    // TWO tokens -- `--prefix C:\Users\Jeff` plus a stray positional -- so the
+    // install landed in the wrong tree and the running copy stayed stale: the
+    // exact silent no-op `--prefix` exists to prevent. And
+    // C:\Users\<First Last>\AppData\Roaming\npm is npm's DEFAULT Windows
+    // global prefix, so this was not an edge case.
+    const spaced = join(sep, "Users", "Jeff Smith", "AppData", "Roaming", "npm");
+    mockRealpathSync.mockReturnValue(join(spaced, "node_modules", "@yawlabs", "mcp", "dist", "index.js"));
+
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+
+    // calls[0] is the `npm prefix -g` comparison probe; calls[1] is the install.
+    const install = cp.calls[cp.calls.length - 1];
+    const onWin32 = process.platform === "win32";
+    // Quoted only where a shell actually parses it. On POSIX the arg goes
+    // through execve untouched and quoting would put literal quotes in the path.
+    const expected = onWin32 ? `"${spaced}"` : spaced;
+    expect(install.args).toEqual(["install", "-g", "--prefix", expected, "@yawlabs/mcp@latest"]);
+    expect(install.opts.shell).toBe(onWin32);
+  });
+
+  it("drops --prefix entirely when the path cannot be safely quoted on win32", async () => {
+    // A `"` or `%` cannot be quoted for cmd.exe -- a quote ends the quoted run
+    // and %VAR% expands even inside quotes. Emitting a mangled command line is
+    // worse than falling back to npm's own prefix resolution, so the flag is
+    // dropped rather than guessed at. POSIX has no such restriction.
+    const nasty = join(sep, "Users", 'we"ird%USERNAME%', "AppData", "Roaming", "npm");
+    mockRealpathSync.mockReturnValue(join(nasty, "node_modules", "@yawlabs", "mcp", "dist", "index.js"));
+
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+
+    const install = cp.calls[cp.calls.length - 1];
+    if (process.platform === "win32") {
+      expect(install.args).toEqual(["install", "-g", "@yawlabs/mcp@latest"]);
+    } else {
+      expect(install.args).toEqual(["install", "-g", "--prefix", nasty, "@yawlabs/mcp@latest"]);
+    }
+  });
+});
+
+describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    resetSpawnRecorder();
+    stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    resetSpawnRecorder();
+  });
+
+  const stderrText = (): string => (stderrSpy.mock.calls as unknown[][]).map((c) => String(c[0])).join("");
+
+  it("warns on stderr when `npm prefix -g` disagrees with the running-install prefix", async () => {
+    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      // Inject the upgrade spawn so the only child_process call recorded
+      // here is the comparison probe itself.
+      spawnImpl: vi.fn(),
+    });
+
+    expect(cp.calls).toHaveLength(1);
+    expect(cp.calls[0].cmd).toBe("npm");
+    expect(cp.calls[0].args).toEqual(["prefix", "-g"]);
+    // The probe must not inherit the parent's stdout either -- it pipes so
+    // it can read the answer, and ignores stderr.
+    expect(cp.calls[0].opts).toMatchObject({ stdio: ["ignore", "pipe", "ignore"] });
+
+    const probe = cp.children[0];
+    probe.stdout.emit("data", Buffer.from(`${join(sep, "usr", "local")}\n`));
+    probe.emit("close", 0);
+
+    expect(stderrText()).toContain("detected running prefix differs");
+    expect(stderrText()).toContain(DETECTED_PREFIX);
+    expect(stderrText()).toContain(join(sep, "usr", "local"));
+  });
+
+  it("stays quiet when the two prefixes agree", async () => {
+    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+    });
+
+    const probe = cp.children[0];
+    probe.stdout.emit("data", Buffer.from(`${DETECTED_PREFIX}\n`));
+    probe.emit("close", 0);
+
+    expect(stderrText()).not.toContain("detected running prefix differs");
+  });
+
+  it("stays quiet (and does not throw) when the probe emits no output or fails to spawn", async () => {
+    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+    });
+
+    // No stdout data at all -> npmPrefix is "" -> falsy -> no warning.
+    cp.children[0].emit("close", 1);
+    expect(stderrText()).not.toContain("detected running prefix differs");
+
+    // And an outright spawn failure resolves the probe instead of leaving
+    // an unhandled "error" event on an EventEmitter with no listener.
+    cp.calls.length = 0;
+    cp.children.length = 0;
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+    });
+    expect(() => cp.children[0].emit("error", new Error("ENOENT"))).not.toThrow();
+    expect(stderrText()).not.toContain("detected running prefix differs");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// fetchLatestVersion -- the built-in registry probe used when the caller
+// injects no fetchLatestImpl. Every failure shape must degrade to "no
+// upgrade this session", never to a spawn against a bogus version.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Minimal duck-typed stand-in for the two members fetchLatestVersion uses. */
+function fakeResponse(ok: boolean, json: () => Promise<unknown>): Response {
+  return { ok, json } as unknown as Response;
+}
+
+describe("fetchLatestVersion -- the built-in registry probe", () => {
+  beforeEach(resetSpawnRecorder);
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetSpawnRecorder();
+  });
+
+  it("requests @yawlabs/mcp/latest with an abort signal, and upgrades on a newer version", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init: { headers?: Record<string, string>; signal?: AbortSignal }) =>
+      fakeResponse(true, async () => ({ version: "0.47.8" })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://registry.npmjs.org/@yawlabs/mcp/latest");
+    expect(init.headers).toEqual({ accept: "application/json" });
+    // The 3s AbortController is what keeps a hung registry off the serve
+    // hot path; without a signal the check could stall startup indefinitely.
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
+  });
+
+  it.each([
+    ["a non-2xx response", () => fakeResponse(false, async () => ({ version: "0.47.8" }))],
+    ["a body with no version field", () => fakeResponse(true, async () => ({}))],
+    ["a body whose version is not a string", () => fakeResponse(true, async () => ({ version: 47 }))],
+    [
+      "a body that is not JSON",
+      () =>
+        fakeResponse(true, async () => {
+          throw new SyntaxError("Unexpected token < in JSON");
+        }),
+    ],
+  ])("does not spawn on %s", async (_label, make) => {
+    const fetchMock = vi.fn(async () => make());
+    vi.stubGlobal("fetch", fetchMock);
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(cp.calls).toHaveLength(0);
+  });
+
+  it("does not spawn (and does not reject) when fetch itself throws -- offline / aborted", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("getaddrinfo ENOTFOUND registry.npmjs.org");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+
+    const spawnImpl = vi.fn();
+    await expect(
+      maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH, spawnImpl }),
+    ).resolves.toBeUndefined();
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("YAW_MCP_AUTO_UPGRADE=0 makes NO network call and spawns NO child -- the opt-out is total", async () => {
+    // The three existing opt-out tests all inject both hooks, so they can
+    // only prove the injected fns went uncalled. This one leaves the real
+    // fetch + real spawn in place, which is what a pinned-version or
+    // sudo-installed user is actually opting out of.
+    const prev = process.env.YAW_MCP_AUTO_UPGRADE;
+    process.env.YAW_MCP_AUTO_UPGRADE = "0";
+    try {
+      const fetchMock = vi.fn(async () => fakeResponse(true, async () => ({ version: "9.9.9" })));
+      vi.stubGlobal("fetch", fetchMock);
+      mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+
+      await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath: GLOBAL_NPM_PATH });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(cp.calls).toHaveLength(0);
+    } finally {
+      if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
+      else process.env.YAW_MCP_AUTO_UPGRADE = prev;
+    }
+  });
+
+  it("an unbuilt dev checkout short-circuits before the registry probe", async () => {
+    // Same class as the opt-out above: the existing dev-checkout test
+    // injects fetchLatestImpl, so it cannot show that the REAL fetch is
+    // skipped for a version of "dev".
+    const fetchMock = vi.fn(async () => fakeResponse(true, async () => ({ version: "9.9.9" })));
+    vi.stubGlobal("fetch", fetchMock);
+    await maybeAutoUpgrade({ currentVersion: "dev", argvPath: GLOBAL_NPM_PATH });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(cp.calls).toHaveLength(0);
   });
 });

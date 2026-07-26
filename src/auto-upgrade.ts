@@ -49,6 +49,26 @@ declare const __VERSION__: string;
  *  prefix while the running install is rooted elsewhere produces a
  *  silent no-op upgrade: a second copy is updated but the spawned-from-
  *  client one stays stale. */
+/** Quote a single argv entry for the shell the npm spawn actually uses.
+ *
+ *  Only win32 spawns with `shell: true`, so only win32 needs quoting; on
+ *  POSIX the arg is passed through execve untouched and quoting it would
+ *  put literal quotes INTO the path. Returns null when the value cannot be
+ *  safely quoted, so the caller drops `--prefix` entirely rather than
+ *  emitting a mangled command line -- npm's own prefix resolution is a
+ *  worse-but-safe fallback, and a broken `--prefix` is not.
+ *
+ *  Narrower sibling of quoteForShell in compliance-cmd.ts; kept local so a
+ *  background upgrade path does not depend on a CLI command module. */
+export function quoteShellArgIfNeeded(arg: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (platform !== "win32") return arg;
+  // A newline or NUL terminates the command line regardless of quoting, and
+  // cmd.exe expands %VAR% and breaks on a literal " even inside quotes.
+  if (/[\r\n\0"%]/.test(arg)) return null;
+  if (!/[\s&|<>^]/.test(arg)) return arg; // nothing the shell would act on
+  return `"${arg}"`;
+}
+
 export function detectRunningInstallPrefix(argvPath: string | undefined): string | null {
   if (!argvPath) return null;
   let resolved: string;
@@ -235,7 +255,19 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // The two can drift (nvm, multiple Node versions, custom prefixes, the
   // bundled-Node Yaw Terminal ships), in which case installing into
   // npm's reported prefix is a no-op for the running copy.
-  const runningPrefix = method === "global-npm" ? detectRunningInstallPrefix(deps.argvPath ?? process.argv[1]) : null;
+  const rawPrefix = method === "global-npm" ? detectRunningInstallPrefix(deps.argvPath ?? process.argv[1]) : null;
+  // The npm spawn below runs with `shell: true` on win32 (npm is npm.cmd and
+  // Node refuses to spawn a .cmd without a shell). With a shell, argv is
+  // joined on spaces and NOT quoted -- so an unquoted prefix containing a
+  // space was split into two tokens:
+  //   passed:   C:\Users\Jeff Smith\AppData\Roaming\npm
+  //   npm saw:  --prefix C:\Users\Jeff   +   a stray positional
+  // npm then installs into the wrong tree, leaving the running copy stale --
+  // exactly the silent no-op `--prefix` exists to prevent. This is not exotic:
+  // C:\Users\<First Last>\AppData\Roaming\npm is npm's DEFAULT Windows global
+  // prefix, so any account with a space in its name hit it on every stale
+  // startup. Quote for the shell we actually invoke.
+  const runningPrefix = rawPrefix === null ? null : quoteShellArgIfNeeded(rawPrefix);
   const globalSpec =
     method === "global-npm"
       ? {

@@ -17,23 +17,25 @@
 // prewarms active servers at startup. An UNTRUSTED project file is ignored
 // completely: none of its servers load, AND it does not suppress the
 // user-global file (suppressing it would be a denial-of-service variant of
-// the same bug -- a hostile repo blanking out your real servers). The
-// user-global ~/.yaw-mcp/bundles.json is the user's own file and is NEVER
-// gated. YAW_MCP_TRUST_PROJECT=1 opts out of the check for CI/automation.
+// the same bug -- a hostile repo blanking out your real servers). That
+// covers a project file yaw-mcp cannot READ, too: unreadability is
+// attacker-controlled from inside a repo (commit `.yaw-mcp` as a regular
+// file -> ENOTDIR; commit `bundles.json` as a symlink loop -> ELOOP), so an
+// unreadable file counts as authoritative only when its path was approved
+// before -- see projectFileIsHonoured. The user-global
+// ~/.yaw-mcp/bundles.json is the user's own file and is NEVER gated.
+// YAW_MCP_TRUST_PROJECT=1 opts out of the check for CI/automation.
 //
-// When yaw-mcp starts WITH a token, the server DEFINITIONS in this file
-// are ignored -- the cloud account is the source of truth, and the
-// `servers` array sits unused on disk. When yaw-mcp starts WITHOUT a
-// token, bundles.json IS the source. If neither file exists, yaw-mcp
-// starts with an empty server list and surfaces the "no servers
-// configured" hint pointing at `yaw-mcp add <slug>` (NOT `install`,
-// which connects a CLIENT to yaw-mcp).
+// If neither file exists, yaw-mcp starts with an empty server list and
+// surfaces the "no servers configured" hint pointing at `yaw-mcp add <slug>`
+// (NOT `install`, which connects a CLIENT to yaw-mcp).
 //
-// Exception: the top-level `defaultRuntime` knob ("oam" | "node") is a
-// MACHINE-level preference, not a server definition, so it applies in
-// BOTH modes -- backend server defs don't carry `runtime`, and the
-// a shared bundles.json has no per-machine concept of "oam is installed
-// here". See default-runtime.ts for the resolution order
+// Exception to winner-takes-all: the top-level `defaultRuntime` knob
+// ("oam" | "node") is a MACHINE-level preference, not a server definition --
+// a shared bundles.json committed to a repo has no per-machine concept of
+// "oam is installed here", so a project file that does not set it falls back
+// to the user-global value instead of silently turning it off. See
+// default-runtime.ts for the resolution order
 // (YAW_MCP_DEFAULT_RUNTIME env > this file's defaultRuntime > unset).
 
 import { createHash } from "node:crypto";
@@ -48,6 +50,7 @@ import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js"
 import {
   hashTrustContent,
   isTrustBypassEnabled,
+  normalizeTrustKey,
   readTrustStore,
   TRUST_BYPASS_ENV,
   type TrustStatus,
@@ -315,6 +318,20 @@ export interface ProjectTrustProbe {
   error: string | null;
   /** Absolute path of the trust store consulted. */
   storePath: string;
+  /** Is this PATH in the trust store at all, ignoring the content hash?
+   *
+   *  Only consulted for status "unreadable": we cannot hash a file we cannot
+   *  read, so the content pin is unavailable and a path record is the only
+   *  evidence of prior consent there is. Every other status uses the
+   *  hash-checked `status` -- a path-only match must NEVER stand in for it,
+   *  or a repo could swap an approved file's contents and keep loading.
+   *  False when the store is malformed (fail closed) and when the store was
+   *  never consulted (status "none").
+   *
+   *  Optional so callers that synthesize a probe for display purposes (the
+   *  `untrustedProjectWarning` fixtures) don't have to name it; absent is
+   *  read as false. probeProjectTrust always sets it. */
+  pathTrusted?: boolean;
 }
 
 /**
@@ -335,16 +352,38 @@ export async function probeProjectTrust(
   const projectDir = await findProjectConfigDir(cwd, home).catch(() => null);
   const path = projectDir ? localBundlesPath(projectDir) : null;
   if (path === null) {
-    return { path: null, status: "none", bypassed, raw: null, sha256: null, error: null, storePath };
+    return {
+      path: null,
+      status: "none",
+      bypassed,
+      raw: null,
+      sha256: null,
+      error: null,
+      storePath,
+      pathTrusted: false,
+    };
   }
   const read = await readBundlesRawAt(path);
   if (read.kind === "absent") {
-    return { path, status: "none", bypassed, raw: null, sha256: null, error: null, storePath };
+    return { path, status: "none", bypassed, raw: null, sha256: null, error: null, storePath, pathTrusted: false };
   }
-  if (read.kind === "error") {
-    return { path, status: "unreadable", bypassed, raw: null, sha256: null, error: read.message, storePath };
-  }
+  // The store is read for the unreadable case too: an unreadable file is
+  // honoured only when its PATH was approved before (see
+  // projectFileIsHonoured), and that question needs the store.
   const store = await readTrustStore(home);
+  const pathTrusted = !store.malformed && normalizeTrustKey(path) in store.entries;
+  if (read.kind === "error") {
+    return {
+      path,
+      status: "unreadable",
+      bypassed,
+      raw: null,
+      sha256: null,
+      error: read.message,
+      storePath,
+      pathTrusted,
+    };
+  }
   return {
     path,
     status: trustStatusFor(path, read.raw, store),
@@ -353,34 +392,90 @@ export async function probeProjectTrust(
     sha256: hashTrustContent(read.raw),
     error: null,
     storePath,
+    pathTrusted,
   };
 }
 
 /**
  * The warning a blocked project bundles.json produces. Names the ignored
- * path, says what happens instead, and gives the exact command to approve
- * it -- a security gate the user cannot see their way out of just reads as
- * "my servers stopped working".
+ * path and the exact command to approve it -- a security gate the user
+ * cannot see their way out of just reads as "my servers stopped working".
+ *
+ * SHORT BY DEFAULT. This fires on EVERY yaw-mcp invocation inside an
+ * unapproved repo (`list`, `add`, the server's own startup), so the default
+ * form is one line: what was ignored, and how to approve it. Pass
+ * `{ detail: true }` for the full explanation -- `yaw-mcp doctor` does, and
+ * doctor is the surface a confused user is pointed at.
  */
-export function untrustedProjectWarning(probe: ProjectTrustProbe): string {
+export function untrustedProjectWarning(probe: ProjectTrustProbe, opts: { detail?: boolean } = {}): string {
   const path = probe.path ?? "(unknown)";
-  const fallback = "Falling back to your user-global ~/.yaw-mcp/bundles.json.";
-  const escapeHatch = `Set ${TRUST_BYPASS_ENV}=1 to skip this check (CI/automation only -- it lets any repo you run inside spawn commands as you).`;
+  const approve = "`yaw-mcp trust` to approve";
+  // Only the detailed form spells out the fallback and the escape hatch; the
+  // short form names the env var without the paragraph explaining it.
+  const detail = opts.detail === true;
+  const fallback = detail
+    ? " Falling back to your user-global ~/.yaw-mcp/bundles.json."
+    : " Using user-global instead.";
+  const escapeHatch = detail
+    ? ` Set ${TRUST_BYPASS_ENV}=1 to skip this check (CI/automation only -- it lets any repo you run inside spawn commands as you).`
+    : ` (${TRUST_BYPASS_ENV}=1 skips this check; CI only.)`;
   if (probe.status === "changed") {
-    return `${path}: project bundles.json CHANGED since you approved it -- IGNORED. The new contents could spawn commands you never reviewed. ${fallback} Re-review and re-approve with \`yaw-mcp trust\` from inside this project. ${escapeHatch}`;
+    const why = detail ? " The new contents could spawn commands you never reviewed." : "";
+    return `${path}: project bundles.json CHANGED since you approved it -- IGNORED.${why}${fallback} Re-review, then run ${approve}.${escapeHatch}`;
   }
   if (probe.status === "store-unreadable") {
-    return `${path}: project bundles.json IGNORED -- the trust store at ${probe.storePath} could not be read, so nothing is trusted (fail-closed). ${fallback} Fix or delete that file, then re-approve with \`yaw-mcp trust\` from inside this project. ${escapeHatch}`;
+    const fix = detail ? " Fix or delete that file, then re-approve from inside this project." : "";
+    return `${path}: project bundles.json IGNORED -- the trust store at ${probe.storePath} could not be read, so nothing is trusted (fail-closed).${fallback}${fix} Then run ${approve}.${escapeHatch}`;
   }
-  return `${path}: untrusted project bundles.json -- IGNORED. A project file is usually committed to the repo and can spawn arbitrary commands as you, so it has to be approved first. ${fallback} Review the servers and approve with \`yaw-mcp trust\` from inside this project. ${escapeHatch}`;
+  if (probe.status === "unreadable") {
+    // Not a consent refusal: the bytes could not be read at all, so there is
+    // nothing to hash and nothing to approve until the file is fixed. Kept
+    // distinct so the user goes and looks at the file instead of at the
+    // trust store. See projectFileIsHonoured for why this falls through.
+    const why = detail
+      ? " An unreadable project file that has never been approved is treated as absent rather than as authoritative -- otherwise a repo could blank out your servers just by committing something yaw-mcp cannot read."
+      : "";
+    return `${path}: project bundles.json could not be read (${probe.error}) and was never approved -- IGNORED.${why}${fallback} Fix the file, then run ${approve}.`;
+  }
+  const why = detail
+    ? " A project file is usually committed to the repo and can spawn arbitrary commands as you, so it has to be approved first."
+    : "";
+  return `${path}: untrusted project bundles.json -- IGNORED.${why}${fallback} Review the servers, then run ${approve}.${escapeHatch}`;
 }
 
-/** Does the loader honour this project file? True for an approved file, for
- *  the env escape hatch, and for an unreadable one (which loads nothing but
- *  still commits to the project location -- see loadLocalBundles). */
-function projectFileIsHonoured(probe: ProjectTrustProbe): boolean {
+/** Does the loader honour this project file? True for an approved file and
+ *  for the env escape hatch.
+ *
+ *  UNREADABLE IS THE SUBTLE CASE. Being honoured commits the loader to the
+ *  project location, and an unreadable file parses to nothing -- so honouring
+ *  one yields zero servers AND suppresses the user-global file. That is
+ *  exactly the denial-of-service variant the module header warns about, and
+ *  unreadability is attacker-controlled from inside a repo: committing
+ *  `.yaw-mcp` as a regular FILE makes the read fail with ENOTDIR, and
+ *  committing `bundles.json` as a symlink loop makes it fail with ELOOP.
+ *  Both survive `git clone` byte-for-byte on Linux/macOS, so any client
+ *  opened in that checkout would silently lose every server.
+ *
+ *  So an unreadable file is honoured ONLY when its PATH is already in the
+ *  trust store -- the user approved that exact file before, and "an approved
+ *  bundles.json is authoritative even when it is broken" still applies (a
+ *  chmod 000 on a file you trust must not silently swap in a different
+ *  config). A path we have never seen falls through to user-global like any
+ *  other unapproved state, with a warning. The path-only lookup is confined
+ *  to this branch: there are no bytes to hash, so the content pin cannot be
+ *  checked, and it must never substitute for the hash anywhere else.
+ *
+ *  The env escape hatch still honours it -- YAW_MCP_TRUST_PROJECT means
+ *  "treat this checkout as approved", which is a strictly larger grant than
+ *  the one being made here.
+ *
+ *  Exported for tests: the unreadable shapes that reach this branch (ENOTDIR,
+ *  ELOOP, EACCES) cannot all be produced on every platform -- Windows maps
+ *  the ENOTDIR shape to ENOENT and needs a privileged account for symlinks --
+ *  so the decision itself is unit-tested over synthesized probes. */
+export function projectFileIsHonoured(probe: ProjectTrustProbe): boolean {
   if (probe.status === "none") return false;
-  if (probe.status === "unreadable") return true;
+  if (probe.status === "unreadable") return probe.bypassed || probe.pathTrusted === true;
   return probe.bypassed || probe.status === "trusted";
 }
 
@@ -420,14 +515,18 @@ export async function loadLocalBundles(
   // Consent gate. An unapproved project file is dropped BEFORE it is parsed
   // (so it contributes no servers and no schema diagnostics) and does NOT
   // shadow the user-global file -- otherwise a hostile repo could blank out
-  // the user's real server list just by committing a bundles.json.
+  // the user's real server list just by committing a bundles.json (or by
+  // committing one yaw-mcp cannot read; see projectFileIsHonoured).
   const probe = await probeProjectTrust({ cwd, home, env: opts.env });
   const honoured = projectFileIsHonoured(probe);
   const projectPath = honoured ? probe.path : null;
   if (probe.path !== null && probe.status !== "none" && !honoured) {
-    const warning = untrustedProjectWarning(probe);
-    warnings.push(warning);
-    log("warn", "Ignoring untrusted project bundles.json", {
+    warnings.push(untrustedProjectWarning(probe));
+    // DEBUG, not warn: the same facts are already in the warning above, which
+    // every CLI entry point prints as `warning: ...`. Logging at warn too put
+    // a raw JSON envelope on stderr in front of the prose version of itself
+    // on every single command run inside an unapproved repo.
+    log("debug", "Ignoring untrusted project bundles.json", {
       path: probe.path,
       status: probe.status,
       sha256: probe.sha256,
@@ -437,7 +536,11 @@ export async function loadLocalBundles(
   // The honoured project file wins entirely. If it is present but malformed
   // (or unreadable), we commit to that location (config null, warnings
   // surfaced) instead of silently substituting the user-global config -- an
-  // APPROVED bundles.json is authoritative even when it is broken.
+  // APPROVED bundles.json is authoritative even when it is broken. Note the
+  // unreadable branch below is reachable ONLY for a previously-approved path
+  // or under the env bypass; an unknown unreadable path never gets here
+  // (projectFileIsHonoured drops it), so this cannot be used to suppress the
+  // user-global file from a fresh checkout.
   let projectResult: ReadResult = { exists: false, file: null };
   if (projectPath !== null) {
     if (probe.status === "unreadable") {

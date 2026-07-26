@@ -14,7 +14,7 @@
 // built with join() -- never a POSIX string literal -- because the SUT routes
 // through path.join, which yields backslashes on the Windows runner.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -37,6 +37,7 @@ import {
   revokeTrust,
   TRUST_BYPASS_ENV,
   TRUST_FILENAME,
+  TrustStoreUnreadableError,
   trustStatusFor,
   trustStorePath,
 } from "../trust.js";
@@ -386,6 +387,310 @@ describe("trust store grant / revoke / list round-trip", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// "could not READ it" is not "it is garbage"
+// ---------------------------------------------------------------------------
+
+/** Make the store unreadable portably: readFile on a DIRECTORY yields EISDIR
+ *  on POSIX and on Windows alike -- no chmod games, no root-vs-non-root skew. */
+function makeStoreUnreadable(home: string): void {
+  mkdirSync(trustStorePath(home), { recursive: true });
+}
+
+const RUNNING_AS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
+describe("an UNREADABLE store is denied but never discarded", () => {
+  it("readTrustStore separates an I/O failure from a parse failure, keeping the errno", async () => {
+    makeStoreUnreadable(synthHome);
+    const io = await readTrustStore(synthHome);
+    expect(io.malformed).toBe(true);
+    expect(io.malformedKind).toBe("io");
+    expect(io.errorCode).toBe("EISDIR");
+    expect(io.malformedReason).toContain(trustStorePath(synthHome));
+
+    rmSync(trustStorePath(synthHome), { recursive: true, force: true });
+    writeFileSync(trustStorePath(synthHome), "{{{");
+    const parse = await readTrustStore(synthHome);
+    expect(parse.malformed).toBe(true);
+    expect(parse.malformedKind).toBe("parse");
+    expect(parse.errorCode).toBeNull();
+  });
+
+  it("classifies a structurally-wrong (but readable) store as a parse failure", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 1 }));
+    const store = await readTrustStore(synthHome);
+    expect(store.malformedKind).toBe("parse");
+  });
+
+  it("still denies every lookup while the store is unreadable (fail closed)", async () => {
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    rmSync(trustStorePath(synthHome), { force: true });
+    makeStoreUnreadable(synthHome);
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("grantTrust REFUSES to write over a store it could not read", async () => {
+    // The old behavior rebuilt from {} here, so one antivirus lock during
+    // `yaw-mcp trust` in one repo revoked every other repo the user approved.
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    makeStoreUnreadable(synthHome);
+    await expect(grantTrust(path, readFileSync(path), { home: synthHome })).rejects.toBeInstanceOf(
+      TrustStoreUnreadableError,
+    );
+    // Nothing was written: the store is exactly as unusable as it was.
+    expect(statSync(trustStorePath(synthHome)).isDirectory()).toBe(true);
+  });
+
+  it("the refusal names the store, the errno, and the reason", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    makeStoreUnreadable(synthHome);
+    const err = await grantTrust(projectBundlesPath(synthCwd), "x", { home: synthHome }).catch((e) => e);
+    expect(err).toBeInstanceOf(TrustStoreUnreadableError);
+    expect((err as TrustStoreUnreadableError).storePath).toBe(trustStorePath(synthHome));
+    expect((err as TrustStoreUnreadableError).code).toBe("EISDIR");
+    expect((err as TrustStoreUnreadableError).reason).toContain("could not read");
+  });
+
+  it("revokeTrust likewise reports an unreadable store instead of rewriting it", async () => {
+    makeStoreUnreadable(synthHome);
+    const res = await revokeTrust(projectBundlesPath(synthCwd), { home: synthHome });
+    expect(res.removed).toBe(false);
+    expect(res.storeWasMalformed).toBe(true);
+    expect(statSync(trustStorePath(synthHome)).isDirectory()).toBe(true);
+  });
+
+  it("a genuinely UNPARSEABLE store is still rebuilt -- otherwise nothing could ever be granted again", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), "{{{");
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const granted = await grantTrust(path, readFileSync(path), { home: synthHome });
+    expect(granted.storeWasMalformed).toBe(true);
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32" || RUNNING_AS_ROOT)(
+    "the grants inside a locked store survive the refused write byte for byte",
+    async () => {
+      await writeTrustedProjectBundles(synthCwd, HOSTILE);
+      const storePath = trustStorePath(synthHome);
+      const before = readFileSync(storePath, "utf8");
+
+      chmodSync(storePath, 0o000);
+      const other = join(synthHome, "other-repo", CONFIG_DIRNAME, "bundles.json");
+      await expect(grantTrust(other, "whatever", { home: synthHome })).rejects.toBeInstanceOf(
+        TrustStoreUnreadableError,
+      );
+      chmodSync(storePath, 0o600);
+
+      expect(readFileSync(storePath, "utf8")).toBe(before);
+      const listed = await listTrusted({ home: synthHome });
+      expect(listed).toHaveLength(1);
+      expect(listed[0].path).toBe(projectBundlesPath(synthCwd));
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// ONE malformed entry is dropped; every other grant survives
+// ---------------------------------------------------------------------------
+//
+// The whole-store failures above deny EVERYTHING. A single corrupt RECORD must
+// not: silently discarding one real grant is indistinguishable from the user
+// having revoked it themselves, so they re-approve and never learn the store is
+// damaged. Every test below therefore pins BOTH directions -- the untouched
+// grant still loads end to end, AND the corrupted one reads as UNTRUSTED. The
+// second half is the one that matters: a test that only checked "no crash"
+// would pass just as happily against a store that trusted everything.
+//
+// "untrusted" and not "changed" is load-bearing too. "changed" would mean the
+// record was KEPT and merely disagreed about the hash, which is a different
+// (and much weaker) claim than the record being gone.
+
+interface TwoGrants {
+  /** Project whose record is left alone -- must still load. */
+  keepDir: string;
+  keepPath: string;
+  /** Project whose record gets corrupted -- must end up denied. */
+  dropDir: string;
+  dropPath: string;
+}
+
+const KEEP_PROJECT = {
+  version: 1,
+  servers: [{ namespace: "slack", name: "Slack", command: "uvx", args: ["mcp-server-slack"] }],
+};
+
+/** Two separately-approved projects, plus the user-global file so that a denial
+ *  shows up as the visible fallback to `github` rather than an ambiguous null. */
+async function twoGrantedProjects(): Promise<TwoGrants> {
+  writeBundles(synthHome, GLOBAL_REAL);
+  const keepDir = mkdtempSync(join(synthHome, "keep-"));
+  const dropDir = mkdtempSync(join(synthHome, "drop-"));
+  await writeTrustedProjectBundles(keepDir, KEEP_PROJECT);
+  await writeTrustedProjectBundles(dropDir, HOSTILE);
+  return { keepDir, keepPath: projectBundlesPath(keepDir), dropDir, dropPath: projectBundlesPath(dropDir) };
+}
+
+/** Overwrite ONE grant's record, leaving every other byte of the store as
+ *  `yaw-mcp trust` wrote it. Asserts the key is really present first: fixture
+ *  drift that turned this into a no-op would leave the tests below passing for
+ *  no reason at all. */
+function replaceStoreRecord(targetPath: string, record: unknown): void {
+  const storePath = trustStorePath(synthHome);
+  const raw = JSON.parse(readFileSync(storePath, "utf8")) as { version: number; trusted: Record<string, unknown> };
+  const key = normalizeTrustKey(targetPath);
+  expect(Object.keys(raw.trusted)).toContain(key);
+  raw.trusted[key] = record;
+  writeFileSync(storePath, JSON.stringify(raw));
+}
+
+/** Collect everything the logger writes to stderr while `fn` runs. */
+async function captureStderr(fn: () => Promise<unknown>): Promise<Array<{ msg?: string; key?: string }>> {
+  const chunks: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+    chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = original;
+  }
+  return chunks
+    .join("")
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as { msg?: string; key?: string });
+}
+
+/** The contract for every malformed shape. */
+async function expectOnlyKeepSurvives(g: TwoGrants): Promise<void> {
+  const store = await readTrustStore(synthHome);
+  // A bad RECORD is not a bad STORE. Flagging the whole store malformed here
+  // would fail closed on the good grant too -- correct for a garbage file,
+  // wrong for one bad line in an otherwise fine one.
+  expect(store.malformed).toBe(false);
+  expect(store.malformedKind).toBeNull();
+  // The bad key is GONE, not retained holding junk.
+  expect(Object.keys(store.entries)).toEqual([normalizeTrustKey(g.keepPath)]);
+
+  // The survivor still authorizes, all the way through the loader.
+  expect(trustStatusFor(g.keepPath, readFileSync(g.keepPath), store)).toBe("trusted");
+  expect(await isTrusted(g.keepPath, readFileSync(g.keepPath), { home: synthHome })).toBe(true);
+  const kept = await loadLocalBundles({ home: synthHome, cwd: g.keepDir, env: {} });
+  expect(kept.config?.servers.map((s) => s.namespace)).toEqual(["slack"]);
+  expect(kept.warnings).toEqual([]);
+  expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+
+  // The dropped one denies -- fail closed, and via the "never approved" path.
+  expect(trustStatusFor(g.dropPath, readFileSync(g.dropPath), store)).toBe("untrusted");
+  expect(await isTrusted(g.dropPath, readFileSync(g.dropPath), { home: synthHome })).toBe(false);
+  const denied = await loadLocalBundles({ home: synthHome, cwd: g.dropDir, env: {} });
+  expect(denied.config?.servers.map((s) => s.namespace)).toEqual(["github"]);
+  expect(denied.warnings.some((w) => w.includes("untrusted project bundles.json"))).toBe(true);
+}
+
+/** Every shape the per-entry sanitizer has to reject. `make` gets the fixture
+ *  so a shape can be built from the REAL hash of the file it points at -- the
+ *  uppercase case in particular is only meaningful if the hex digits match. */
+const MALFORMED_RECORDS: Array<{ label: string; make: (g: TwoGrants) => unknown }> = [
+  // Rejected by the "must be a plain object" guard.
+  { label: "null", make: () => null },
+  { label: "false", make: () => false },
+  { label: "a bare string", make: () => "trusted" },
+  { label: "a number", make: () => 1 },
+  {
+    label: "an array -- even one wrapping an otherwise valid record",
+    make: (g) => [{ path: g.dropPath, sha256: hashTrustContent(readFileSync(g.dropPath)) }],
+  },
+  // Rejected by the sha256 guard. A record without a usable hash can never
+  // match anything, and treating it as a wildcard is the bug this module exists
+  // to stop -- so it must not survive as an entry at all.
+  { label: "an object with no sha256 at all", make: (g) => ({ path: g.dropPath, grantedAt: "2024-01-01T00:00:00Z" }) },
+  { label: "a numeric sha256", make: (g) => ({ path: g.dropPath, sha256: 12345 }) },
+  { label: "a null sha256", make: (g) => ({ path: g.dropPath, sha256: null }) },
+  { label: "an empty-string sha256", make: (g) => ({ path: g.dropPath, sha256: "" }) },
+  {
+    label: "a 63-char sha256",
+    make: (g) => ({ path: g.dropPath, sha256: hashTrustContent(readFileSync(g.dropPath)).slice(1) }),
+  },
+  {
+    label: "a 65-char sha256",
+    make: (g) => ({ path: g.dropPath, sha256: `${hashTrustContent(readFileSync(g.dropPath))}a` }),
+  },
+  { label: "a 64-char non-hex sha256", make: (g) => ({ path: g.dropPath, sha256: "g".repeat(64) }) },
+  {
+    // The regex is /^[0-9a-f]{64}$/ -- lowercase only. Worth pinning because
+    // the comparison in trustStatusFor is exact-case too, so a store
+    // hand-edited (or written by some other tool) in uppercase must land on
+    // "untrusted" rather than looking like a legitimate grant.
+    label: "an UPPERCASE-hex sha256 of exactly the right bytes",
+    make: (g) => ({ path: g.dropPath, sha256: hashTrustContent(readFileSync(g.dropPath)).toUpperCase() }),
+  },
+];
+
+describe("a malformed ENTRY is dropped without taking the rest of the store with it", () => {
+  for (const { label, make } of MALFORMED_RECORDS) {
+    it(`drops a record that is ${label}; the other grant still loads`, async () => {
+      const g = await twoGrantedProjects();
+      replaceStoreRecord(g.dropPath, make(g));
+      await expectOnlyKeepSurvives(g);
+    });
+  }
+
+  it("drops every bad record when several are bad at once", async () => {
+    const g = await twoGrantedProjects();
+    const extra = join(synthHome, "third", CONFIG_DIRNAME, "bundles.json");
+    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+    raw.trusted[normalizeTrustKey(extra)] = { path: extra, sha256: "nope" };
+    writeFileSync(trustStorePath(synthHome), JSON.stringify(raw));
+    replaceStoreRecord(g.dropPath, null);
+    await expectOnlyKeepSurvives(g);
+  });
+
+  it("names the offending key on stderr for BOTH drop reasons", async () => {
+    // The log line is the only signal there is. Without it, a store that
+    // quietly lost a grant looks exactly like one the user revoked, and they
+    // re-approve forever without ever being told the file is damaged.
+    const g = await twoGrantedProjects();
+    const key = normalizeTrustKey(g.dropPath);
+
+    replaceStoreRecord(g.dropPath, null);
+    const shape = await captureStderr(() => readTrustStore(synthHome));
+    expect(shape.find((l) => l.msg === "Dropping malformed trust entry")?.key).toBe(key);
+
+    replaceStoreRecord(g.dropPath, { path: g.dropPath, sha256: "nope" });
+    const hash = await captureStderr(() => readTrustStore(synthHome));
+    expect(hash.find((l) => l.msg === "Dropping trust entry with a missing or malformed sha256")?.key).toBe(key);
+  });
+
+  it("KEEPS a record whose only sound field is sha256 -- the display fields are cosmetic", async () => {
+    // The counterweight to the drops above: only the hash is load-bearing, so a
+    // legacy or hand-written store must not lose a grant over a missing
+    // `path` / `grantedAt`. `path` falls back to the store key.
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    await grantTrust(path, readFileSync(path), { home: synthHome });
+    const key = normalizeTrustKey(path);
+    const sha256 = hashTrustContent(readFileSync(path));
+
+    replaceStoreRecord(path, { sha256 });
+    expect((await readTrustStore(synthHome)).entries[key]).toEqual({ path: key, sha256, grantedAt: "" });
+
+    // Present but wrong-shaped fields take the same fallback.
+    replaceStoreRecord(path, { path: "", sha256, grantedAt: 5 });
+    const store = await readTrustStore(synthHome);
+    expect(store.entries[key]).toEqual({ path: key, sha256, grantedAt: "" });
+    expect(trustStatusFor(path, readFileSync(path), store)).toBe("trusted");
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config?.servers).toHaveLength(1);
+  });
+});
+
 describe("hashing and status helpers", () => {
   it("hashes the exact bytes, not a lossy decode", () => {
     // An invalid UTF-8 byte must not collapse onto the replacement char --
@@ -409,8 +714,19 @@ describe("hashing and status helpers", () => {
   });
 
   it("trustStatusFor denies everything against a malformed store", () => {
-    const store = { version: 1, entries: {}, malformed: true, malformedReason: "x" };
+    const store = {
+      version: 1,
+      entries: {},
+      malformed: true,
+      malformedReason: "x",
+      malformedKind: null,
+      errorCode: null,
+    };
     expect(trustStatusFor("/anything", "content", store)).toBe("store-unreadable");
+    expect(trustStatusFor("/anything", "content", { ...store, malformedKind: "io" as const })).toBe("store-unreadable");
+    expect(trustStatusFor("/anything", "content", { ...store, malformedKind: "parse" as const })).toBe(
+      "store-unreadable",
+    );
   });
 
   it("isTrusted loads the store itself and ignores the env escape hatch", async () => {

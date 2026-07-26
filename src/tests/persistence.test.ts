@@ -4,7 +4,17 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LearningStore } from "../learning.js";
 import { PackDetector } from "../pack-detect.js";
-import { emptyState, loadState, STATE_SCHEMA_VERSION, saveState } from "../persistence.js";
+import {
+  emptyState,
+  isReadableStateVersion,
+  loadState,
+  STATE_SCHEMA_VERSION,
+  saveState,
+  TOOLCACHE_MAX_DESCRIPTION_CHARS,
+  TOOLCACHE_MAX_NAMESPACES,
+  TOOLCACHE_MAX_TOOLS_PER_NAMESPACE,
+  TOOLCACHE_TTL_MS,
+} from "../persistence.js";
 
 describe("persistence.loadState", () => {
   let dir: string;
@@ -139,6 +149,193 @@ describe("persistence.loadState", () => {
     const s = await loadState(file);
     expect(s.packHistory).toHaveLength(1);
     expect(s.packHistory[0].namespace).toBe("gh");
+  });
+});
+
+// Schema v2 added `toolCache`. The bump is purely additive, so a v1 file is
+// MIGRATED (learning + pack signal kept, cache starts empty) rather than
+// discarded -- an unreadable version is still dropped wholesale.
+describe("persistence state schema v1 -> v2 migration", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-state-"));
+    file = join(dir, "state.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("current schema version is 2", () => {
+    expect(STATE_SCHEMA_VERSION).toBe(2);
+  });
+
+  it("isReadableStateVersion accepts v1 and v2 only", () => {
+    expect(isReadableStateVersion(1)).toBe(true);
+    expect(isReadableStateVersion(2)).toBe(true);
+    expect(isReadableStateVersion(3)).toBe(false);
+    expect(isReadableStateVersion(0)).toBe(false);
+    expect(isReadableStateVersion("2")).toBe(false);
+    expect(isReadableStateVersion(undefined)).toBe(false);
+  });
+
+  it("keeps learning + packHistory from a v1 file and reads the cache as empty", async () => {
+    // A v1 file has no `toolCache` key at all.
+    const v1 = {
+      version: 1,
+      savedAt: 42,
+      learning: { gh: { dispatched: 4, succeeded: 3, lastUsedAt: 100 } },
+      packHistory: [{ namespace: "gh", toolName: "listPrs", at: 101 }],
+    };
+    writeFileSync(file, JSON.stringify(v1), "utf8");
+
+    const s = await loadState(file);
+    expect(s.learning.gh).toEqual({ dispatched: 4, succeeded: 3, lastUsedAt: 100 });
+    expect(s.packHistory).toHaveLength(1);
+    expect(s.toolCache).toEqual({});
+    // Normalized to the current version so the next save writes v2.
+    expect(s.version).toBe(STATE_SCHEMA_VERSION);
+  });
+
+  it("still drops a file whose version is not readable at all", async () => {
+    const future = {
+      version: STATE_SCHEMA_VERSION + 1,
+      savedAt: 0,
+      learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } },
+      packHistory: [],
+      toolCache: {},
+    };
+    writeFileSync(file, JSON.stringify(future), "utf8");
+    expect(await loadState(file)).toEqual(emptyState());
+  });
+});
+
+describe("persistence tool cache", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-state-"));
+    file = join(dir, "state.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeState(toolCache: unknown): void {
+    writeFileSync(
+      file,
+      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 0, learning: {}, packHistory: [], toolCache }),
+      "utf8",
+    );
+  }
+
+  it("round-trips a tool cache through save + load", async () => {
+    const learnedAt = Date.now();
+    await saveState(
+      {
+        learning: {},
+        packHistory: [],
+        toolCache: { gh: { tools: [{ name: "create_issue", description: "open an issue" }], learnedAt } },
+      },
+      file,
+    );
+    const loaded = await loadState(file);
+    expect(loaded.toolCache.gh).toEqual({
+      tools: [{ name: "create_issue", description: "open an issue" }],
+      learnedAt,
+    });
+  });
+
+  it("persists an empty cache when the caller omits toolCache", async () => {
+    await saveState({ learning: {}, packHistory: [] }, file);
+    expect(JSON.parse(readFileSync(file, "utf8")).toolCache).toEqual({});
+  });
+
+  it("drops malformed entries without losing the good ones", async () => {
+    const learnedAt = Date.now();
+    writeState({
+      good: { tools: [{ name: "t" }], learnedAt },
+      "": { tools: [{ name: "t" }], learnedAt },
+      notAnObject: "nope",
+      missingLearnedAt: { tools: [{ name: "t" }] },
+      negativeLearnedAt: { tools: [{ name: "t" }], learnedAt: -1 },
+      toolsNotArray: { tools: "t", learnedAt },
+      // An entry whose tools all fail validation collapses to empty and is
+      // dropped -- otherwise pre-warm would skip the server forever while
+      // never surfacing a single tool.
+      allToolsBad: { tools: [{ description: "no name" }, null, 7], learnedAt },
+      emptyTools: { tools: [], learnedAt },
+    });
+
+    const loaded = await loadState(file);
+    expect(Object.keys(loaded.toolCache)).toEqual(["good"]);
+  });
+
+  it("expires entries older than the TTL but keeps fresh and future-stamped ones", async () => {
+    const now = Date.now();
+    writeState({
+      fresh: { tools: [{ name: "t" }], learnedAt: now - 1000 },
+      stale: { tools: [{ name: "t" }], learnedAt: now - TOOLCACHE_TTL_MS - 1000 },
+      // Clock skew / hand-edited: a future stamp must not be treated as
+      // expired (now - learnedAt is negative).
+      future: { tools: [{ name: "t" }], learnedAt: now + 60_000 },
+    });
+
+    const loaded = await loadState(file);
+    expect(Object.keys(loaded.toolCache).sort()).toEqual(["fresh", "future"]);
+  });
+
+  it("caps namespaces, keeping the most recently learned", async () => {
+    const now = Date.now();
+    const oversized: Record<string, unknown> = {};
+    for (let i = 0; i < TOOLCACHE_MAX_NAMESPACES + 10; i++) {
+      // Older index => older learnedAt, so the first 10 are the evictees.
+      oversized[`ns${i}`] = { tools: [{ name: "t" }], learnedAt: now - (TOOLCACHE_MAX_NAMESPACES + 10 - i) * 1000 };
+    }
+    writeState(oversized);
+
+    const loaded = await loadState(file);
+    const kept = Object.keys(loaded.toolCache);
+    expect(kept).toHaveLength(TOOLCACHE_MAX_NAMESPACES);
+    expect(kept).toContain(`ns${TOOLCACHE_MAX_NAMESPACES + 9}`);
+    expect(kept).not.toContain("ns0");
+  });
+
+  it("caps tools per namespace and truncates long descriptions", async () => {
+    const tools = Array.from({ length: TOOLCACHE_MAX_TOOLS_PER_NAMESPACE + 5 }, (_, i) => ({
+      name: `tool${i}`,
+      description: "x".repeat(TOOLCACHE_MAX_DESCRIPTION_CHARS + 500),
+    }));
+    writeState({ gh: { tools, learnedAt: Date.now() } });
+
+    const loaded = await loadState(file);
+    expect(loaded.toolCache.gh.tools).toHaveLength(TOOLCACHE_MAX_TOOLS_PER_NAMESPACE);
+    expect(loaded.toolCache.gh.tools[0].description).toHaveLength(TOOLCACHE_MAX_DESCRIPTION_CHARS);
+  });
+
+  it("enforces the caps on WRITE, not just on read", async () => {
+    // A save must not put bytes on disk that a later load would trim -- the
+    // point of the caps is bounding the file itself.
+    const tools = Array.from({ length: TOOLCACHE_MAX_TOOLS_PER_NAMESPACE + 5 }, (_, i) => ({ name: `tool${i}` }));
+    await saveState(
+      {
+        learning: {},
+        packHistory: [],
+        toolCache: {
+          gh: { tools, learnedAt: Date.now() },
+          expired: { tools: [{ name: "t" }], learnedAt: Date.now() - TOOLCACHE_TTL_MS - 1000 },
+        },
+      },
+      file,
+    );
+
+    const onDisk = JSON.parse(readFileSync(file, "utf8"));
+    expect(onDisk.toolCache.gh.tools).toHaveLength(TOOLCACHE_MAX_TOOLS_PER_NAMESPACE);
+    expect(onDisk.toolCache.expired).toBeUndefined();
   });
 });
 

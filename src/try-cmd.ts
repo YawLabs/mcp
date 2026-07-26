@@ -17,18 +17,25 @@
 //     future fix to the wrapping logic propagates to trials for free.
 //   - Trial marker fields are versioned (`schemaVersion`) so the GC
 //     pass can refuse to delete entries it doesn't understand.
-//   - NOTHING IS SENT ANYWHERE. `try` used to POST a {slug, action, anonId}
-//     triple to /api/try/event; that endpoint died with the hosted backend
-//     and the poster is now a no-op, so no trial event leaves the machine.
-//     The anonId (a truncated SHA-256 of hostname + userInfo) is still
-//     computed and persisted for the seam's signature, but has no consumer.
-//     Removing the postEvent seam outright — it is injected by ~15 tests and
-//     by doctor's trial GC — is worth its own pass.
+//   - NOTHING IS SENT ANYWHERE AND NOTHING IS FINGERPRINTED. `try` used to
+//     POST a {slug, action, anonId} triple to /api/try/event; that endpoint
+//     died with the hosted backend and the poster is now a no-op, so no trial
+//     event leaves the machine. The anonId (a truncated SHA-256 of hostname +
+//     username) is gone with it: it is no longer computed and no longer
+//     persisted to ~/.yaw-mcp/trials/.anon.
+//   - A `.anon` file left behind by an older version is inert -- scanTrials
+//     only reads *.json, so nothing loads it -- and `try` deliberately does
+//     NOT delete it. Silently removing a file from the user's home dir as a
+//     side effect of an unrelated command is more surprising than leaving 17
+//     dead bytes; `rm ~/.yaw-mcp/trials/.anon` clears it for anyone who cares.
+//   - The postEvent seam itself STAYS -- it is injected by ~15 tests and by
+//     doctor's trial GC, so collapsing it churns more than it cleans. Its
+//     TryEventBody.anonId is now the fixed literal ANON_ID_PLACEHOLDER.
+//     Removing the seam outright is worth its own pass.
 
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
-import { homedir, hostname, userInfo } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { resolveCatalogSlug } from "./catalog.js";
@@ -62,9 +69,11 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        Required env vars not supplied here AND not in your
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
-  --base <url>         Base URL for the signup/telemetry links (default:
-                       $YAW_MCP_BASE_URL or https://yaw.sh/mcp). The catalog
-                       itself is set via $YAW_MCP_CATALOG_URL.`;
+  --base <url>         Legacy base URL kept for the trial's internal hooks
+                       (default: $YAW_MCP_BASE_URL or https://yaw.sh/mcp).
+                       No effect on a normal install: the catalog is read
+                       locally and no trial event is reported anywhere. Point
+                       the catalog somewhere else with $YAW_MCP_CATALOG_URL.`;
 
 export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
@@ -74,7 +83,12 @@ export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
 export const TRIAL_SCHEMA_VERSION = 1;
 export const TRIALS_DIRNAME = "trials";
-export const ANON_FILENAME = ".anon";
+
+/** Fixed stand-in for the retired per-machine anon id. `TryEventBody` keeps
+ *  the field so the postEvent seam's shape (and doctor's `postTryEvent`
+ *  option) don't churn, but nothing derives it from the machine any more --
+ *  every event body carries this same literal. */
+export const ANON_ID_PLACEHOLDER = "not-collected";
 
 export interface ExploreServerResponse {
   slug: string;
@@ -126,7 +140,7 @@ export interface TryCommandOptions {
   env?: NodeJS.ProcessEnv;
   /** Override for tests; defaults to the real network fetch. */
   fetchExplore?: (baseUrl: string, slug: string) => Promise<ExploreServerResponse>;
-  /** Override for tests; defaults to the real fire-and-forget POST. */
+  /** Override for tests; defaults to a no-op (see defaultPostEvent). */
   postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   out?: (s: string) => void;
   err?: (s: string) => void;
@@ -148,6 +162,9 @@ export interface TryCleanupOptions {
 export interface TryEventBody {
   slug: string;
   action: "try" | "cleanup" | "expiry-gc";
+  /** Always ANON_ID_PLACEHOLDER. The per-machine hash this used to carry was
+   *  removed along with the endpoint that consumed it; the field survives
+   *  only so the seam's shape stays stable for its injectors. */
   anonId: string;
 }
 
@@ -292,62 +309,18 @@ export function trialMarkerPath(slug: string, home: string = homedir()): string 
   return join(trialsDir(home), `${slug}.json`);
 }
 
-export function anonIdPath(home: string = homedir()): string {
-  return join(trialsDir(home), ANON_FILENAME);
-}
-
-/** Compute a stable per-machine anonymous id (first 16 hex of sha256 over
- *  hostname + username). NOT a cross-machine identity; meant to dedup
- *  "this machine tried slug X twice" in the funnel without sending
- *  anything resembling a fingerprint. */
-export function computeAnonId(): string {
-  const h = createHash("sha256");
-  h.update(hostname());
-  try {
-    h.update(userInfo().username);
-  } catch {
-    // userInfo() can throw if /etc/passwd is unavailable (containers,
-    // chroots). Fall back to whatever hostname gives us.
-  }
-  return h.digest("hex").slice(0, 16);
-}
-
-/** Read the persisted anonId, creating + persisting it on first run.
- *  Returns the 16-hex string. Best-effort writes — if the disk is RO
- *  we still return a computed id so the trial works. */
-export async function loadOrCreateAnonId(home: string = homedir()): Promise<string> {
-  const path = anonIdPath(home);
-  if (existsSync(path)) {
-    try {
-      const raw = (await readFile(path, "utf8")).trim();
-      if (/^[0-9a-f]{16}$/.test(raw)) return raw;
-    } catch {
-      // unreadable -- fall through to regenerate
-    }
-  }
-  const id = computeAnonId();
-  try {
-    await mkdir(trialsDir(home), { recursive: true });
-    await atomicWriteFile(path, `${id}\n`);
-    if (process.platform !== "win32") {
-      try {
-        await chmod(path, 0o600);
-      } catch {
-        // chmod best-effort
-      }
-    }
-  } catch {
-    // Disk RO / permission denied — non-fatal, just return the id.
-  }
-  return id;
-}
+// NOTE: `computeAnonId` / `loadOrCreateAnonId` / `anonIdPath` used to live
+// here. They hashed hostname + username into a durable id under
+// ~/.yaw-mcp/trials/.anon purely to populate TryEventBody.anonId for a poster
+// that no longer posts. Deleted rather than left dead so nothing re-adopts a
+// machine fingerprint by accident; see the .anon note in the file header.
 
 // Resolve the launch shape from the SAME static catalog the website and the
 // Yaw Terminal app read (catalog.ts), so `try <slug>` accepts the exact slug
 // set the catalog shows. (The old /api/explore/:slug endpoint was never
-// deployed -- this is the path that actually works.) `baseUrl` is retained
-// only for the signup/telemetry links; the catalog URL is overridden via
-// YAW_MCP_CATALOG_URL.
+// deployed -- this is the path that actually works.) `baseUrl` is ignored
+// here and survives only as an injection seam for tests; the catalog URL is
+// overridden via YAW_MCP_CATALOG_URL.
 async function defaultFetchExplore(_baseUrl: string, slug: string): Promise<ExploreServerResponse> {
   const resolved = await resolveCatalogSlug(slug, { catalogUrl: process.env.YAW_MCP_CATALOG_URL });
   const out: ExploreServerResponse = {
@@ -678,16 +651,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 1, written: [] };
   }
 
-  // Step 8: seed anonId + fire the telemetry event.
-  const anonId = await loadOrCreateAnonId(home);
+  // Step 8: fire the lifecycle event through the (no-op) seam.
   const postEvent = opts.postEvent ?? defaultPostEvent;
-  await postEvent(baseUrl, { slug, action: "try", anonId }).catch(() => undefined);
+  await postEvent(baseUrl, { slug, action: "try", anonId: ANON_ID_PLACEHOLDER }).catch(() => undefined);
 
-  // Step 9: nudge.
+  // Step 9: nudge. The keep-it path is local (`add` writes the server into
+  // ~/.yaw-mcp/bundles.json) -- there is no account and no signup page.
   const ttlPretty = formatTtl(ttlMs);
   print(`Trial wired: ${server.name} via yaw-mcp-try-${slug} -> ${resolved.absolute}`);
   print(`Expires in ${ttlPretty}; remove sooner with: yaw-mcp try-cleanup ${slug}`);
-  print(`Liking it? Sign up at ${baseUrl}/signup to keep ${server.name} on every machine.`);
+  print(`Liking it? Keep ${server.name} for good with: yaw-mcp add ${slug}`);
 
   // If a required key was satisfied by the ambient shell (not --env), its
   // value was copied INTO the trial entry on disk (unlike `add`, which seeds
@@ -779,10 +752,9 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 1, written: [] };
   }
 
-  // Fire-and-forget telemetry.
-  const anonId = await loadOrCreateAnonId(home);
+  // Fire the lifecycle event through the (no-op) seam.
   const postEvent = opts.postEvent ?? defaultPostEvent;
-  await postEvent(baseUrl, { slug, action: "cleanup", anonId }).catch(() => undefined);
+  await postEvent(baseUrl, { slug, action: "cleanup", anonId: ANON_ID_PLACEHOLDER }).catch(() => undefined);
 
   print(`Trial for "${slug}" cleaned up.`);
   return { exitCode: 0, written };
@@ -863,7 +835,8 @@ export async function scanTrials(opts: { home?: string; now?: () => number } = {
 }
 
 /** Sweep expired trials: peel each one out of its client config + delete
- *  the marker + fire an expiry-gc telemetry event. Best-effort — failures
+ *  the marker + fire an expiry-gc event through the postEvent seam (a no-op
+ *  unless a caller injects one). Best-effort — failures
  *  on individual entries don't abort the sweep. Returns the count cleared
  *  so doctor can report it. */
 export async function gcExpiredTrials(opts: {
@@ -884,7 +857,6 @@ export async function gcExpiredTrials(opts: {
   const scan = opts.scan ?? (await scanTrials({ home, now: opts.now }));
   if (scan.expired.length === 0) return { cleared: 0, failed: 0 };
 
-  const anonId = await loadOrCreateAnonId(home);
   let cleared = 0;
   let failed = 0;
   for (const { marker, path } of scan.expired) {
@@ -912,7 +884,9 @@ export async function gcExpiredTrials(opts: {
       // Unlink the file that was actually scanned -- deriving the path from
       // marker.slug would orphan a marker whose filename mismatches its slug.
       await unlink(path);
-      await postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId }).catch(() => undefined);
+      await postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId: ANON_ID_PLACEHOLDER }).catch(
+        () => undefined,
+      );
       cleared++;
     } catch (e) {
       log("debug", "trial gc failed", { slug: marker.slug, error: (e as Error).message });

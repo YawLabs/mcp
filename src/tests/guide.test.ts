@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { loadGuides, loadProjectGuide, loadUserGuide, renderGuide } from "../guide.js";
+import { loadGuides, loadProjectGuide, loadUserGuide, projectGuideNotice, renderGuide } from "../guide.js";
 import { CONFIG_DIRNAME, GUIDE_FILENAME } from "../paths.js";
+import { grantTrust } from "../trust.js";
 
 function writeGuide(dir: string, content: string): string {
   mkdirSync(dir, { recursive: true });
@@ -90,6 +91,75 @@ describe("loadProjectGuide", () => {
     // A project can have config.json without a guide — perfectly valid.
     mkdirSync(join(project, CONFIG_DIRNAME));
     expect(await loadProjectGuide(project, home)).toBeNull();
+  });
+});
+
+// A project YAW-MCP.md sits in the SAME `.yaw-mcp/` as the consent-gated
+// bundles.json but is not gated itself -- a project guide with no
+// bundles.json beside it is a legitimate, documented setup. What it gets
+// instead is visibility: repo-authored text reaching the model is flagged so
+// `yaw-mcp doctor` can name it.
+describe("loadProjectGuide approval flag", () => {
+  let home: string;
+  let project: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-home-"));
+    project = mkdtempSync(join(home, "proj-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function writeProjectBundles(content: unknown): string {
+    const dir = join(project, CONFIG_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    const p = join(dir, "bundles.json");
+    writeFileSync(p, JSON.stringify(content), "utf8");
+    return p;
+  }
+
+  it("flags a project guide with no bundles.json beside it (still loads)", async () => {
+    writeGuide(join(project, CONFIG_DIRNAME), "project notes");
+    const g = await loadProjectGuide(project, home, {});
+    expect(g?.content).toBe("project notes");
+    expect(g?.unapproved).toBe(true);
+    expect(projectGuideNotice(g)).toContain(g?.path as string);
+  });
+
+  it("flags a project guide whose sibling bundles.json is unapproved", async () => {
+    writeGuide(join(project, CONFIG_DIRNAME), "project notes");
+    writeProjectBundles({ version: 1, servers: [] });
+    const g = await loadProjectGuide(project, home, {});
+    expect(g?.unapproved).toBe(true);
+  });
+
+  it("does NOT flag a project guide whose sibling bundles.json is approved", async () => {
+    writeGuide(join(project, CONFIG_DIRNAME), "project notes");
+    const p = writeProjectBundles({ version: 1, servers: [] });
+    await grantTrust(p, readFileSync(p), { home });
+    const g = await loadProjectGuide(project, home, {});
+    expect(g?.unapproved).toBeUndefined();
+    expect(projectGuideNotice(g)).toBeNull();
+  });
+
+  it("does NOT flag under the YAW_MCP_TRUST_PROJECT escape hatch", async () => {
+    writeGuide(join(project, CONFIG_DIRNAME), "project notes");
+    writeProjectBundles({ version: 1, servers: [] });
+    const g = await loadProjectGuide(project, home, { YAW_MCP_TRUST_PROJECT: "1" });
+    expect(g?.unapproved).toBeUndefined();
+  });
+
+  it("never flags the user-global guide", async () => {
+    writeGuide(join(home, CONFIG_DIRNAME), "user notes");
+    const g = await loadUserGuide(home);
+    expect(g?.unapproved).toBeUndefined();
+    expect(projectGuideNotice(g)).toBeNull();
+  });
+
+  it("projectGuideNotice is null when there is no project guide", () => {
+    expect(projectGuideNotice(null)).toBeNull();
   });
 });
 

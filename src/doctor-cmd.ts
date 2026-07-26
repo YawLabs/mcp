@@ -44,6 +44,7 @@ import {
   describeServerRuntime,
   type ServerRuntimeInfo,
 } from "./default-runtime.js";
+import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import {
   CURRENT_OS,
   ENTRY_NAME,
@@ -58,7 +59,7 @@ import { parseJsonc } from "./jsonc.js";
 import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./local-bundles.js";
 import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
-import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
+import { isReadableStateVersion, loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
@@ -88,16 +89,30 @@ async function projectTrustWarning(opts: {
 }): Promise<string | null> {
   const probe = await probeProjectTrust(opts).catch(() => null);
   if (!probe || probe.path === null) return null;
-  // "none" = no project file at all; "unreadable" already surfaces through
-  // the normal bundles read path; "trusted" is the healthy case.
-  if (probe.status === "none" || probe.status === "unreadable" || probe.status === "trusted") return null;
+  // "none" = no project file at all; "trusted" is the healthy case.
+  if (probe.status === "none" || probe.status === "trusted") return null;
+  if (probe.status === "unreadable") {
+    // Not a consent problem -- the bytes cannot be read at all, so neither
+    // branch below applies. Doctor is the ONLY place this becomes visible:
+    // the loader's own warnings go to the bundles read path, which doctor
+    // does not fold into config.warnings.
+    if (probe.pathTrusted === true || probe.bypassed) {
+      // Approved-path (or bypassed) unreadable file: the loader stays
+      // committed to it, which means ZERO servers from anywhere.
+      return `${probe.path}: project bundles.json could not be read (${probe.error}). It was approved before, so yaw-mcp stays committed to that location and loads NO servers from it. Fix the file, or \`yaw-mcp trust --revoke\` it to fall back to your user-global bundles.json.`;
+    }
+    return untrustedProjectWarning(probe, { detail: true });
+  }
   if (probe.bypassed) {
     // The escape hatch is only worth flagging when it is actually loading
     // something unreviewed -- staying quiet otherwise keeps doctor from
     // nagging a CI box where the var is set but every file is approved.
     return `${probe.path}: loaded WITHOUT approval because ${TRUST_BYPASS_ENV} is set -- every command in that file spawns as you, unreviewed. Unset it and run \`yaw-mcp trust\` to review and approve the file instead.`;
   }
-  return untrustedProjectWarning(probe);
+  // Detailed form: the runtime warning is deliberately one short line (it
+  // repeats on every command), and doctor is where the user gets sent to
+  // find out what it actually means.
+  return untrustedProjectWarning(probe, { detail: true });
 }
 
 export interface DoctorOptions {
@@ -156,6 +171,11 @@ export interface DoctorJsonSnapshot {
   token: { fingerprint: null; source: null };
   apiBase: { value: null; source: null };
   loadedFiles: Array<{ scope: string; path: string; schemaVersion?: number; schemaAhead: boolean }>;
+  // Project-scoped YAW-MCP.md, or null when there isn't one. `unapproved` is
+  // true when it is served from a directory whose bundles.json is not
+  // approved -- repo-authored text reaching the model. Deliberately NOT a
+  // warning (see renderProjectGuideSection): it does not move the exit code.
+  projectGuide: { path: string; unapproved: boolean } | null;
   warnings: string[];
   // Behavior-modifier env vars, null when unset. `YAW_MCP_POLL_INTERVAL` is
   // DEPRECATED and always null -- the remote config poll loop it tuned was
@@ -306,6 +326,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     }
   }
   print("");
+
+  // Project YAW-MCP.md that reaches the model from an unapproved project dir
+  // (see guide.ts). Informational, NOT folded into config.warnings: the setup
+  // is legitimate, so it must not drive exit 2 the way the bundles gate does.
+  const projectGuide = await loadProjectGuide(cwd, home, env).catch(() => null);
+  renderProjectGuideSection({ guide: projectGuide, print });
 
   // Behavior-modifier env vars that yaw-mcp actually reads at runtime.
   // Surfaced here so support diagnostics can see at a glance whether an
@@ -498,6 +524,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
 
+  // Same project-guide probe as the text path's PROJECT GUIDE section.
+  const guide = await loadProjectGuide(cwd, home, env).catch(() => null);
+  const projectGuide: DoctorJsonSnapshot["projectGuide"] = guide
+    ? { path: guide.path, unapproved: guide.unapproved === true }
+    : null;
+
   const envVarNames = [
     "YAW_MCP_SERVER_CAP",
     "YAW_MCP_MIN_COMPLIANCE",
@@ -685,6 +717,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       ...(f.version !== undefined ? { schemaVersion: f.version } : {}),
       schemaAhead: f.version !== undefined && f.version > CURRENT_SCHEMA_VERSION,
     })),
+    projectGuide,
     warnings: config.warnings,
     env: envOverrides,
     state,
@@ -792,6 +825,20 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   print("");
 }
 
+// PROJECT GUIDE section — printed ONLY when a project-scoped YAW-MCP.md is
+// being served from a directory whose bundles.json is not approved. An
+// approved (or absent) project guide is silent, matching the
+// silence-on-empty convention of the reliability / trials sections.
+function renderProjectGuideSection(opts: { guide: GuideFile | null; print: (s?: string) => void }): void {
+  const notice = projectGuideNotice(opts.guide);
+  if (!notice) return;
+  opts.print("PROJECT GUIDE");
+  // Same `  ! ` shape as the WARNINGS section so it reads as a flag, even
+  // though it deliberately does not feed the exit code.
+  opts.print(`  ! ${notice}`);
+  opts.print("");
+}
+
 function renderStateSection(opts: {
   filePath: string;
   disabled: boolean;
@@ -864,7 +911,12 @@ async function peekStateFile(filePath: string): Promise<StatePeek> {
   }
   if (!parsed || typeof parsed !== "object") return { kind: "malformed", message: "top-level value is not an object" };
   const version = (parsed as { version?: unknown }).version;
-  if (version !== STATE_SCHEMA_VERSION) {
+  // Readable, not identical. STATE_SCHEMA_VERSION went 1 -> 2 for the
+  // additive toolCache field, and loadState MIGRATES a v1 file rather than
+  // discarding it -- so an exact-equality check here would report a healthy
+  // v1 file as "stale-version" for the one session before its first save
+  // rewrites it at v2, while learning and packHistory were loading fine.
+  if (!isReadableStateVersion(version)) {
     return { kind: "stale-version", version, expected: STATE_SCHEMA_VERSION };
   }
   return { kind: "ok" };

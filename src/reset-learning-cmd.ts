@@ -21,7 +21,7 @@ import { readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { userConfigDir } from "./paths.js";
-import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
+import { isReadableStateVersion, loadState, STATE_FILENAME } from "./persistence.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -178,7 +178,12 @@ async function peekParsedCleanly(filePath: string): Promise<boolean> {
   try {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return false;
-    return (parsed as { version?: unknown }).version === STATE_SCHEMA_VERSION;
+    // Any version loadState can READ counts as parsed-cleanly, not just the
+    // current one. STATE_SCHEMA_VERSION went 1 -> 2 for the additive
+    // toolCache field and loadState MIGRATES v1 rather than dropping it, so
+    // an exact-equality check here would report a perfectly good v1 file as
+    // unreadable for the one session before its first save rewrites it.
+    return isReadableStateVersion((parsed as { version?: unknown }).version);
   } catch {
     return false;
   }

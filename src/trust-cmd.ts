@@ -21,7 +21,7 @@
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
 import {
@@ -31,6 +31,7 @@ import {
   readTrustStore,
   revokeTrust,
   TRUST_BYPASS_ENV,
+  TrustStoreUnreadableError,
   trustStorePath,
 } from "./trust.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -46,7 +47,9 @@ export const TRUST_USAGE = `Usage: yaw-mcp trust [--yes]
   in it is a command yaw-mcp SPAWNS AS YOU at startup. yaw-mcp therefore
   ignores an unapproved one (your user-global ~/.yaw-mcp/bundles.json still
   loads) until you approve it here. Approval is pinned to the file's exact
-  contents: if the file changes, it needs approving again.
+  contents: if the file changes, it needs approving again. The pin does NOT
+  cover the code those commands run -- a script in the repo or an
+  unversioned package can change without any edit to bundles.json.
 
   Your own ~/.yaw-mcp/bundles.json is never gated by this command.
 
@@ -165,13 +168,15 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   if (probe.status === "none") {
     printErr(
       probe.path === null
-        ? `yaw-mcp trust: no .yaw-mcp/ directory found by walking up from ${cwd}. There is no project bundles.json to approve; your user-global ~/.yaw-mcp/bundles.json is always loaded.`
-        : `yaw-mcp trust: no project bundles.json at ${probe.path}. Nothing to approve.`,
+        ? `yaw-mcp trust: no .yaw-mcp/ directory found by walking up from ${displaySafe(cwd)}. There is no project bundles.json to approve; your user-global ~/.yaw-mcp/bundles.json is always loaded.`
+        : `yaw-mcp trust: no project bundles.json at ${displaySafe(probe.path)}. Nothing to approve.`,
     );
     return { exitCode: 1 };
   }
   if (probe.status === "unreadable") {
-    printErr(`yaw-mcp trust: cannot read ${probe.path} (${probe.error}). Fix the permissions, then re-run.`);
+    printErr(
+      `yaw-mcp trust: cannot read ${displaySafe(probe.path ?? "")} (${probe.error}). Fix the permissions, then re-run.`,
+    );
     return { exitCode: 1 };
   }
 
@@ -179,7 +184,7 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   const raw = probe.raw as Buffer;
 
   if (probe.status === "trusted") {
-    print(`Already approved: ${path}`);
+    print(`Already approved: ${displaySafe(path)}`);
     print(`  contents unchanged since approval (sha256 ${probe.sha256}) -- nothing to do.`);
     return { exitCode: 0 };
   }
@@ -191,17 +196,17 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   // user's real server list.
   const preview = previewBundlesContent(path, raw);
   if (!preview.ok) {
-    printErr(`yaw-mcp trust: ${path} is not a usable bundles.json, so there is nothing to review:`);
-    for (const w of preview.warnings) printErr(`  ! ${w}`);
+    printErr(`yaw-mcp trust: ${displaySafe(path)} is not a usable bundles.json, so there is nothing to review:`);
+    for (const w of preview.warnings) printErr(`  ! ${displaySafe(w)}`);
     printErr("Fix the file, then re-run `yaw-mcp trust`.");
     return { exitCode: 1 };
   }
 
   print("");
-  print(`  Project file: ${path}`);
+  print(`  Project file: ${displaySafe(path)}`);
   print(`  SHA-256:      ${probe.sha256}`);
   print(
-    `  Status:       ${probe.status === "changed" ? "CHANGED since you approved it" : probe.status === "store-unreadable" ? `trust store unreadable (${probe.storePath})` : "never approved"}`,
+    `  Status:       ${probe.status === "changed" ? "CHANGED since you approved it" : probe.status === "store-unreadable" ? `trust store unreadable (${displaySafe(probe.storePath)})` : "never approved"}`,
   );
   print("");
   if (preview.servers.length === 0) {
@@ -221,10 +226,11 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
       const envKeys = Object.keys(s.env ?? {});
       // Names only, never values -- bundles.json env can hold secrets, and
       // this output is meant to be pasted into a support thread.
-      if (envKeys.length > 0) print(`       env: ${envKeys.join(", ")}`);
+      if (envKeys.length > 0) print(`       env: ${envKeys.map(displayArg).join(", ")}`);
+      for (const gap of pinGaps(s)) print(`       ! ${gap}`);
     }
   }
-  for (const w of preview.warnings) print(`    ! ${w}`);
+  for (const w of preview.warnings) print(`    ! ${displaySafe(w)}`);
   print("");
 
   if (!opts.yes) {
@@ -250,27 +256,47 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     confirmBytes = await readFile(path);
   } catch (e) {
     printErr(
-      `yaw-mcp trust: ${path} could not be re-read before approving (${(e as Error).message}). Nothing approved.`,
+      `yaw-mcp trust: ${displaySafe(path)} could not be re-read before approving (${(e as Error).message}). Nothing approved.`,
     );
     return { exitCode: 1 };
   }
   if (hashTrustContent(confirmBytes) !== probe.sha256) {
     printErr(
-      `yaw-mcp trust: ${path} changed while you were reviewing it. Nothing approved -- re-run \`yaw-mcp trust\` to see the new contents.`,
+      `yaw-mcp trust: ${displaySafe(path)} changed while you were reviewing it. Nothing approved -- re-run \`yaw-mcp trust\` to see the new contents.`,
     );
     return { exitCode: 1 };
   }
 
-  const granted = await grantTrust(path, raw, { home, now: opts.now });
+  // A store we could not READ is refused rather than replaced -- the other
+  // projects the user approved are still in that file (see trust.ts). Only a
+  // store that would not PARSE gets rebuilt, and that is reported below.
+  let granted: Awaited<ReturnType<typeof grantTrust>>;
+  try {
+    granted = await grantTrust(path, raw, { home, now: opts.now });
+  } catch (e) {
+    if (e instanceof TrustStoreUnreadableError) {
+      printErr(
+        `yaw-mcp trust: cannot read the trust store at ${displaySafe(e.storePath)}${e.code ? ` (${e.code})` : ""} -- ${e.reason}.`,
+      );
+      printErr(
+        "Nothing was approved and the store was NOT touched: your existing approvals are still in that file. Fix its permissions (or close whatever is holding it open), then re-run `yaw-mcp trust`.",
+      );
+      return { exitCode: 1 };
+    }
+    throw e;
+  }
   if (granted.storeWasMalformed) {
     printErr(
-      `Note: the previous trust store at ${granted.storePath} was unreadable and has been replaced -- any other project you had approved must be approved again.`,
+      `Note: the previous trust store at ${displaySafe(granted.storePath)} was not valid JSON and has been replaced -- any other project you had approved must be approved again.`,
     );
   }
-  print(`Approved ${path}`);
+  print(`Approved ${displaySafe(path)}`);
   print(`  pinned to sha256 ${granted.record.sha256}`);
-  print(`  recorded in ${granted.storePath}`);
-  print("  Any later edit to the file re-requires approval.");
+  print(`  recorded in ${displaySafe(granted.storePath)}`);
+  print("  PINNED: the exact bytes of that file -- any later edit to it re-requires approval.");
+  print("  NOT PINNED: the code those commands actually run. Files inside this repo and");
+  print("  packages fetched at spawn time can change with no edit to bundles.json, and so");
+  print("  with no new prompt. Approving is trusting the repo, not just this one file.");
   print("Restart your MCP client (or yaw-mcp) to load it.");
   return { exitCode: 0 };
 }
@@ -279,10 +305,183 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
  *  whitespace or quotes are JSON-quoted so `sh -c "curl ... | sh"` reads as
  *  the single argument it really is instead of blending into the line. */
 function renderLaunch(s: UpstreamServerConfig): string {
-  if (s.type === "remote" || (!s.command && s.url)) return `HTTP ${s.url ?? "(no url)"}`;
+  if (s.type === "remote" || (!s.command && s.url)) return `HTTP ${displaySafe(s.url ?? "(no url)")}`;
   const parts = [s.command ?? "", ...(s.args ?? [])].filter((p) => p.length > 0);
   if (parts.length === 0) return "(no command)";
-  return `$ ${parts.map((p) => (/[\s"']/.test(p) ? JSON.stringify(p) : p)).join(" ")}`;
+  return `$ ${parts.map((p) => displayArg(p)).join(" ")}`;
+}
+
+// --- making the file's own strings safe to print ----------------------------
+//
+// Everything rendered above (command, args, env KEY names, url, the project
+// path, the parser's warnings) comes out of a file a hostile repo controls,
+// and it is written straight to a terminal immediately above a [y/N] prompt.
+// Control bytes there are not cosmetic:
+//
+//   ESC [8m   turns the pen invisible, so `args: ["-c<ESC>[8m", "curl ...
+//             | sh<ESC>[0m"]` renders as a bare `$ sh -c` with the payload
+//             concealed in the same colour as the background;
+//   ESC [3A ESC [J  moves the cursor up and erases -- the argv block the
+//             user was told to read is gone before the prompt paints;
+//   BS / CR   rewrite the line in place, so what is on screen is not what
+//             is in the file.
+//
+// The gate's whole value is that the user SEES the argv being authorized, so
+// anything the terminal ACTS on instead of PRINTING has to be turned into
+// visible text first.
+
+/**
+ * Everything a terminal may act on rather than print: C0 (incl. ESC, BEL,
+ * BS, CR), DEL, the C1 block (0x9b is CSI in its 8-bit form), and the bidi
+ * overrides / isolates, which can visually reorder an argv without changing
+ * a byte of it.
+ */
+const DISPLAY_CONTROL_SOURCE =
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]";
+const DISPLAY_CONTROL_RE = new RegExp(DISPLAY_CONTROL_SOURCE);
+const DISPLAY_CONTROL_RE_G = new RegExp(DISPLAY_CONTROL_SOURCE, "g");
+
+/** JSON-quote, then escape by hand what JSON.stringify leaves raw. It only
+ *  escapes code units below 0x20 (plus `"` and `\`), so DEL, the whole C1
+ *  block and the bidi controls survive a JSON.stringify untouched and would
+ *  reach the terminal intact. */
+function quoteVisible(s: string): string {
+  return JSON.stringify(s).replace(DISPLAY_CONTROL_RE_G, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/**
+ * A string that is NOT argv -- a path, a url, a parser warning. Quoted only
+ * when it carries something the terminal would act on. Whitespace alone does
+ * not trigger it: `C:\Program Files\...` is an ordinary path, and quoting it
+ * would double every backslash for no security gain.
+ */
+export function displaySafe(s: string): string {
+  return DISPLAY_CONTROL_RE.test(s) ? quoteVisible(s) : s;
+}
+
+/**
+ * One argv token or env key name. Quoted on whitespace and quote characters
+ * too, so `sh -c "curl ... | sh"` reads as the single argument it really is
+ * instead of blending into the rest of the line.
+ */
+export function displayArg(s: string): string {
+  return /[\s"']/.test(s) || DISPLAY_CONTROL_RE.test(s) ? quoteVisible(s) : s;
+}
+
+// --- what the pin does NOT cover --------------------------------------------
+//
+// The SHA-256 pins bundles.json's bytes. It does not pin what those bytes
+// POINT AT. Spawns inherit yaw-mcp's cwd, so an approved
+// `{"command":"node","args":["scripts/mcp-server.js"]}` re-executes whatever
+// that script contains TODAY -- a later commit rewriting it leaves
+// bundles.json untouched, the hash still matches, and nothing re-prompts.
+// Same for `npx -y pkg` with no version: the registry decides what runs.
+//
+// This is a heads-up line next to the entry, deliberately NOT a static
+// analyzer. It fires on the two shapes that are unambiguous and stays quiet
+// otherwise -- a false negative here costs nothing (the closing text already
+// says the pin does not cover executed code), a false positive would train
+// the user to ignore the line.
+
+/** Extensions that mean "this token is a script the interpreter will read
+ *  from disk", as opposed to a package name or a subcommand. */
+const SCRIPT_EXT_RE = /\.(?:js|mjs|cjs|ts|mts|cts|py|rb|sh|bash|zsh|pl|php|lua|jar|bat|cmd|ps1|exe)$/i;
+
+/** Tokens that resolve against the cwd -- i.e. inside the repo -- at spawn. */
+function inRepoTokens(s: UpstreamServerConfig): string[] {
+  const hits: string[] = [];
+  const isLocalish = (t: string): boolean =>
+    t.length > 0 && !/\s/.test(t) && !isAbsolute(t) && !t.includes("://") && !t.startsWith("-");
+  const command = s.command ?? "";
+  // A bare `node` resolves off PATH; `scripts/serve` or `./run.sh` does not.
+  if (isLocalish(command) && (/^\.{1,2}[\\/]/.test(command) || /[\\/]/.test(command))) hits.push(command);
+  for (const a of s.args ?? []) {
+    // An explicit ./ or ../ is unambiguous; otherwise require a script
+    // extension, so `@scope/pkg` and `owner/repo` are left alone.
+    if (isLocalish(a) && (/^\.{1,2}[\\/]/.test(a) || SCRIPT_EXT_RE.test(a))) hits.push(a);
+  }
+  return hits;
+}
+
+/** Package runners whose first non-flag operand names something fetched at
+ *  spawn time. `sub` is the subcommand that has to be present first. */
+const REGISTRY_RUNNERS: Array<{ cmd: string; sub?: string }> = [
+  { cmd: "npx" },
+  { cmd: "bunx" },
+  { cmd: "uvx" },
+  { cmd: "pnpm", sub: "dlx" },
+  { cmd: "npm", sub: "exec" },
+  { cmd: "pipx", sub: "run" },
+];
+
+/** Flags that take no value, so the token after them is still the operand.
+ *  Any OTHER flag makes us give up rather than guess which token is the
+ *  package (`npx -p a -c b` must not report `b`). */
+const VALUELESS_RUNNER_FLAGS = new Set([
+  "-y",
+  "--yes",
+  "-q",
+  "--quiet",
+  "--silent",
+  "--offline",
+  "--prefer-offline",
+  "--prefer-online",
+  "--no-install",
+  "--ignore-existing",
+]);
+
+/** The registry spec this entry would fetch, when it has no version pin. */
+function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
+  const base =
+    (s.command ?? "")
+      .split(/[\\/]/)
+      .pop()
+      ?.replace(/\.(?:exe|cmd|bat)$/i, "") ?? "";
+  const runner = REGISTRY_RUNNERS.find((r) => r.cmd === base);
+  if (!runner) return null;
+  let rest = s.args ?? [];
+  if (runner.sub) {
+    if (rest[0] !== runner.sub) return null;
+    rest = rest.slice(1);
+  }
+  let spec: string | null = null;
+  for (const a of rest) {
+    if (a.startsWith("-")) {
+      if (VALUELESS_RUNNER_FLAGS.has(a)) continue;
+      return null; // an unrecognised flag may consume the next token
+    }
+    spec = a;
+    break;
+  }
+  if (spec === null || spec.length === 0) return null;
+  // A local path / url / git ref is not a registry lookup (inRepoTokens or
+  // the closing text covers those).
+  if (spec.includes("://") || isAbsolute(spec) || /^\.{1,2}[\\/]/.test(spec)) return null;
+  // Strip the scope sigil and the scope itself, then look for a version:
+  // `@scope/pkg@1.2.3` and `pkg@1.2.3` are pinned, `pkg==1.2.3` is uv's form.
+  const body = spec.startsWith("@") ? spec.slice(1) : spec;
+  const afterScope = body.includes("/") ? body.slice(body.indexOf("/") + 1) : body;
+  if (afterScope.includes("@") || afterScope.includes("==")) return null;
+  return spec;
+}
+
+/** At most two lines naming content the SHA-256 does not cover. */
+function pinGaps(s: UpstreamServerConfig): string[] {
+  if (s.type === "remote" || (!s.command && s.url)) return [];
+  const lines: string[] = [];
+  const repo = inRepoTokens(s);
+  if (repo.length > 0) {
+    lines.push(
+      `NOT covered by the pin: ${repo.slice(0, 3).map(displayArg).join(" ")} runs from inside this repo -- a later commit rewrites it with no re-approval.`,
+    );
+  }
+  const spec = unversionedRegistrySpec(s);
+  if (spec !== null) {
+    lines.push(
+      `NOT covered by the pin: ${displayArg(spec)} has no version -- it resolves to whatever the registry serves at spawn time.`,
+    );
+  }
+  return lines;
 }
 
 // --- list -------------------------------------------------------------------
@@ -297,7 +496,13 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
 
   const store = await readTrustStore(home);
   if (store.malformed) {
-    const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- NOTHING is trusted until it is fixed or deleted`;
+    // An unreadable store still HOLDS the grants -- telling the user to
+    // delete it would throw away exactly what they are trying to inspect.
+    const fix =
+      store.malformedKind === "io"
+        ? "fix its permissions (do NOT delete it -- your approvals are still in there)"
+        : "it is fixed or deleted";
+    const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- NOTHING is trusted until ${fix}`;
     if (opts.json) {
       out(
         `${JSON.stringify({ storePath: trustStorePath(home), malformed: true, error: msg, trusted: [] }, null, 2)}\n`,
@@ -326,7 +531,13 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
   }
 
   const cols: Array<[string, (r: (typeof rows)[number]) => string]> = [
-    ["PATH", (r) => r.path],
+    // displaySafe, not the raw path: a repo directory name can legally carry
+    // ESC on POSIX, and `trust --list` is the surface a user audits to decide
+    // what to revoke -- rewriting it with cursor control defeats that. Column
+    // widths stay consistent because they are measured from this same getter.
+    // The --json branch above stays raw; its consumers want the real path and
+    // JSON.stringify handles its own quoting.
+    ["PATH", (r) => displaySafe(r.path)],
     ["APPROVED", (r) => (r.grantedAt.length > 0 ? r.grantedAt : "-")],
     ["STATUS", (r) => r.status],
   ];
@@ -374,7 +585,7 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
   } else {
     const probe = await probeProjectTrust({ cwd, home, env });
     if (probe.path === null) {
-      const msg = `no .yaw-mcp/ directory found by walking up from ${cwd}; pass an explicit path (see \`yaw-mcp trust --list\`)`;
+      const msg = `no .yaw-mcp/ directory found by walking up from ${displaySafe(cwd)}; pass an explicit path (see \`yaw-mcp trust --list\`)`;
       if (opts.json) out(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
       else printErr(`yaw-mcp trust --revoke: ${msg}`);
       return { exitCode: 1 };
@@ -396,10 +607,13 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
   // A no-op revoke exits 0: "make it not approved" is satisfied either way
   // (same posture as `yaw-mcp remove` and `try-cleanup`).
   if (!res.removed) {
-    print(`yaw-mcp trust --revoke: ${target} was not approved (nothing to do).`);
+    print(`yaw-mcp trust --revoke: ${displaySafe(target)} was not approved (nothing to do).`);
     return { exitCode: 0 };
   }
-  print(`Revoked ${target}`);
+  // displaySafe on the human path only -- the --json branch above keeps the
+  // raw target for consumers. A revoke target can come from an attacker-named
+  // repo directory just like a grant target can.
+  print(`Revoked ${displaySafe(target)}`);
   print(`  removed from ${res.storePath}`);
   print("Restart your MCP client (or yaw-mcp) to stop loading it.");
   return { exitCode: 0 };
