@@ -8,7 +8,8 @@
 //   add <slug>     resolve <slug> from the yaw.sh/mcp catalog and write it
 //                  into ~/.yaw-mcp/bundles.json
 //   remove <slug>  drop a server (by slug or namespace) from bundles.json
-//   list           show the servers yaw-mcp would load locally
+//   list           show the servers yaw-mcp would load locally, each with the
+//                  compliance grade `yaw-mcp audit` last cached for it
 //
 // `add` resolves through the same static catalog the website and the Yaw
 // Terminal app use (catalog.ts), so a slug that works as an "Add to Yaw MCP"
@@ -16,6 +17,7 @@
 
 import { homedir } from "node:os";
 import { type FetchCatalog, resolveCatalogSlug } from "./catalog.js";
+import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import {
   deriveNamespace,
   findShadowingProjectBundles,
@@ -374,7 +376,8 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
 export const LIST_USAGE = `Usage: yaw-mcp list [--json]
 
   List the MCP servers yaw-mcp loads locally from bundles.json (the
-  project-local file wins over user-global). --json for machine output.`;
+  project-local file wins over user-global), with the compliance grade
+  \`yaw-mcp audit\` last cached for each. --json for machine output.`;
 
 export interface ListCommandOptions {
   json?: boolean;
@@ -382,6 +385,8 @@ export interface ListCommandOptions {
   cwd?: string;
   out?: (s: string) => void;
   err?: (s: string) => void;
+  /** Test hook: supply a grade cache instead of reading ~/.yaw-mcp/grades.json. */
+  gradesReader?: (home?: string) => Promise<GradesCache>;
 }
 
 export function parseListArgs(
@@ -416,8 +421,23 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   // parse stdout cleanly while a human sees the diagnostic.
   for (const w of loaded.warnings) printErr(`warning: ${w}`);
 
+  // Overlay the compliance grades `yaw-mcp audit` cached in ~/.yaw-mcp/
+  // grades.json. This is the ONLY reader of that cache in local mode -- without
+  // it, `audit` would be write-only and the grade would never reach a human.
+  // bundles.json entries never carry a grade of their own (validateEntry drops
+  // unknown fields), so the cache is the sole source; the `?? s.complianceGrade`
+  // fallback keeps any future in-file grade rather than blanking it. Applied to
+  // BOTH --json and the table so the two surfaces agree. readGradesCache never
+  // throws -- a missing or garbled cache just means no overlay.
+  const gradesReader = opts.gradesReader ?? readGradesCache;
+  const grades = await gradesReader(home).catch(() => ({}) as GradesCache);
+  const graded: UpstreamServerConfig[] = servers.map((s) => {
+    const cached = grades[s.namespace];
+    return cached ? { ...s, complianceGrade: cached.grade } : s;
+  });
+
   if (opts.json) {
-    print(JSON.stringify({ path: loaded.path, servers, warnings: loaded.warnings }, null, 2));
+    print(JSON.stringify({ path: loaded.path, servers: graded, warnings: loaded.warnings }, null, 2));
     return { exitCode: 0, written: [] };
   }
 
@@ -427,11 +447,15 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
     return { exitCode: 0, written: [] };
   }
 
-  const rows = [...servers].sort((a, b) => a.namespace.localeCompare(b.namespace));
+  const rows = [...graded].sort((a, b) => a.namespace.localeCompare(b.namespace));
   const cols: Array<[string, (s: UpstreamServerConfig) => string]> = [
     ["NAMESPACE", (s) => s.namespace],
     ["NAME", (s) => s.name],
     ["STATUS", (s) => (s.isActive ? "active" : "disabled")],
+    // "-" for never-audited, matching the GRADE column this ported from.
+    // LAUNCH stays last: it's the only variable-width cell, so anything after
+    // it would be ragged.
+    ["GRADE", (s) => s.complianceGrade ?? "-"],
     ["LAUNCH", (s) => [s.command, ...(s.args ?? [])].filter(Boolean).join(" ") || s.url || ""],
   ];
   const widths = cols.map(([h, get]) => Math.max(h.length, ...rows.map((r) => get(r).length)));

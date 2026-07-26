@@ -1,51 +1,34 @@
-// `yaw-mcp servers` — lists the servers configured for this account in the
-// Yaw MCP dashboard (i.e., what `/api/connect/config` returns right
-// now). Complements `yaw-mcp doctor`, which only reads local state (config
-// files, clients, state.json). Together they give the full picture:
-//   doctor   → "what does my local machine look like?"
-//   servers  → "what does the backend think I have?"
+// `yaw-mcp servers` — DEPRECATED, always fails.
 //
-// Common uses:
-//   - Sanity-check the dashboard after editing: did my add/remove take?
-//   - Support tickets: paste `yaw-mcp servers --json` output for diagnosis.
-//   - Scripts: pick one up-front so `yaw-mcp compliance <target>` or
-//     `yaw-mcp install <client>` can feed a chosen namespace in a pipeline.
+// This used to list the servers configured for a Yaw MCP *account* (what
+// `/api/connect/config` returned). Account mode is gone — the hosted backend
+// is decommissioned and every endpoint 404s — so there is nothing left to
+// list. The command is retained for one release as a signpost rather than
+// disappearing into "unknown subcommand".
+//
+// The non-zero exit is deliberate, not an oversight. Yaw Terminal's MCP panel
+// spawns `yaw-mcp servers --json` and derives "signed in" from a CLEAN exit
+// with parseable JSON (yaw-mcp-sidecar.ts); on a non-zero exit it silently
+// falls back to local-bundles mode. Exiting 0 here would either fake an
+// account or trip the panel's "exited 0 but returned no parseable config"
+// warning. Failing is what routes it to the only mode that still exists.
+//
+// The local equivalent is `yaw-mcp list`, which reads bundles.json.
 //
 // Exit codes:
-//   0  listed successfully
-//   1  no token resolved (same signal as `yaw-mcp` with no token)
-//   2  fetch failed (network, auth rejected, non-2xx response)
-
-import { ConfigError, fetchConfig } from "./config.js";
-import { loadYawMcpConfig } from "./config-loader.js";
-import { describeDefaultRuntime, describeServerRuntime, type ServerRuntimeInfo } from "./default-runtime.js";
-import { type GradesCache, readGradesCache } from "./grades-cache.js";
-import { type OamProbe, probeOam } from "./oam-spawn.js";
-import type { ConnectConfig } from "./types.js";
+//   1  always (account mode removed)
 
 export interface ServersCommandOptions {
-  home?: string;
-  env?: NodeJS.ProcessEnv;
-  cwd?: string;
-  /** Emit JSON instead of a human-readable table. */
+  /** Accepted for back-compat; only affects whether stdout carries a JSON
+   *  error envelope. There is no server list to emit either way. */
   json?: boolean;
-  /**
-   * Case-insensitive substring filter on namespace. When set, only servers
-   * whose namespace contains this string are rendered. `yaw-mcp servers git`
-   * matches both `github` and `gitlab`. Missing ⇒ no filter (show all).
-   */
+  /** Accepted and ignored — kept so an existing script's namespace filter
+   *  gets the deprecation notice instead of a usage error. */
   filter?: string;
   /** Override for tests; defaults to process.stdout.write. */
   out?: (s: string) => void;
   /** Override for tests; defaults to process.stderr.write. */
   err?: (s: string) => void;
-  /** Test hook: skip the real backend call. */
-  fetcher?: (apiBase: string, token: string) => Promise<ConnectConfig | null>;
-  /** Test hook: supply a grade cache instead of reading ~/.yaw-mcp/grades.json. */
-  gradesReader?: (home?: string) => Promise<GradesCache>;
-  /** Test hook: replace the real `oam --version` probe (keeps the RUNTIME
-   *  column deterministic regardless of what's installed on the host). */
-  oamProbe?: () => OamProbe;
 }
 
 export interface ServersCommandResult {
@@ -59,8 +42,9 @@ export interface ParsedServersArgs {
   filter?: string;
 }
 
-// Split out so index.ts can validate `yaw-mcp servers <typo>` early and
-// emit a usage error instead of silently ignoring unknown flags.
+// Still parsed (rather than accepting anything) so `yaw-mcp servers --wat`
+// keeps reporting the typo, and `--help` keeps printing usage. index.ts
+// validates through this before dispatching.
 export function parseServersArgs(
   argv: string[],
 ): { ok: true; options: ParsedServersArgs } | { ok: false; error: string; help?: boolean } {
@@ -84,223 +68,37 @@ export function parseServersArgs(
 
 export const SERVERS_USAGE = `Usage: yaw-mcp servers [<namespace-filter>] [--json]
 
-  List the servers configured in your yaw.sh/mcp dashboard.
+  DEPRECATED -- account mode has been removed, so this command always fails.
 
-  <namespace-filter>   Case-insensitive substring filter on namespace (e.g.,
-                       \`yaw-mcp servers git\` matches github + gitlab).
-  --json               Emit machine-readable JSON instead of a table.`;
+  Run \`yaw-mcp list\` instead: it shows the MCP servers yaw-mcp actually
+  loads, from your local bundles.json.
+
+  Arguments are still accepted so existing scripts get this notice rather
+  than a usage error, but they have no effect.`;
+
+/** Single source for the message, so the stderr line and the `--json` error
+ *  envelope can never drift apart. */
+export const SERVERS_DEPRECATED_MESSAGE =
+  "yaw-mcp servers: account mode has been removed -- the hosted Yaw MCP backend is gone, so there are no account servers to list. Run `yaw-mcp list` to see the servers yaw-mcp loads from your local bundles.json.";
 
 export async function runServersCommand(opts: ServersCommandOptions = {}): Promise<ServersCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
   const lines: string[] = [];
-  const print = (s = ""): void => {
-    lines.push(s);
-    write(`${s}\n`);
-  };
-  const printErr = (s: string): void => {
-    lines.push(s);
-    writeErr(`${s}\n`);
-  };
 
-  const config = await loadYawMcpConfig({
-    cwd: opts.cwd,
-    home: opts.home,
-    env: opts.env,
-  });
+  // stderr unconditionally: a human running this interactively needs to see
+  // WHY, and a script redirecting stdout into a parser still gets the reason.
+  lines.push(SERVERS_DEPRECATED_MESSAGE);
+  writeErr(`${SERVERS_DEPRECATED_MESSAGE}\n`);
 
-  if (!config.token) {
-    printErr(
-      "yaw-mcp servers: no token resolved. Run `yaw-mcp install <client> --token mcp_pat_...` or set YAW_MCP_TOKEN.",
-    );
-    return { exitCode: 1, lines };
-  }
-
-  const fetcher = opts.fetcher ?? fetchConfig;
-
-  let backend: ConnectConfig | null;
-  try {
-    // Always pass undefined for currentVersion so we get a 200 with full
-    // body, not a 304. `yaw-mcp servers` is a user-interactive command —
-    // caching on an etag would just mean "stale output" with no way to
-    // refresh, which is surprising.
-    backend = await fetcher(config.apiBase, config.token);
-  } catch (err) {
-    const msg = err instanceof ConfigError || err instanceof Error ? err.message : String(err);
-    printErr(`yaw-mcp servers: ${msg}`);
-    return { exitCode: 2, lines };
-  }
-
-  // fetchConfig returns null on a 304 — we only expect that when a
-  // currentVersion was passed, so this branch shouldn't fire. Defensive
-  // handling: treat null the same as an empty response and fall through.
-  if (!backend) {
-    printErr("yaw-mcp servers: backend returned no data (unexpected 304).");
-    return { exitCode: 2, lines };
-  }
-
-  // Apply the namespace filter (case-insensitive substring match on
-  // namespace) to both JSON and table output so the two surfaces agree.
-  // Filter applied AFTER the fetch so a filter that matches nothing
-  // prints an explanatory "no matches" message instead of looking like
-  // the account has no servers.
-  const filterStr = opts.filter;
-  const filtered =
-    filterStr !== undefined
-      ? {
-          ...backend,
-          servers: backend.servers.filter((s) => s.namespace.toLowerCase().includes(filterStr.toLowerCase())),
-        }
-      : backend;
-
-  // Overlay locally-cached compliance grades from `yaw-mcp audit` onto each
-  // row. A freshly-audited grade in ~/.yaw-mcp/grades.json is more current
-  // than whatever the backend last computed, so it wins; servers with no
-  // cached grade keep the backend's complianceGrade (which may itself be
-  // absent). readGradesCache never throws -- a missing/garbled cache just
-  // means no overlay. This runs for BOTH json and table output so the two
-  // surfaces (and the MCP panel, which consumes `servers --json`) agree.
-  const gradesReader = opts.gradesReader ?? readGradesCache;
-  const grades = await gradesReader(opts.home).catch(() => ({}) as GradesCache);
-  const merged: ConnectConfig = {
-    ...filtered,
-    servers: filtered.servers.map((s) => {
-      const cached = grades[s.namespace];
-      return cached ? { ...s, complianceGrade: cached.grade } : s;
-    }),
-  };
-
-  // Effective-runtime verdict per server: what would this server ACTUALLY
-  // spawn on (oam vs node) and why (per-server opt-in/out, config default,
-  // oam missing/below-min, non-node command). Backend defs never carry
-  // `runtime`, so without this the oam->node fallback is invisible. Same
-  // helper doctor uses, so both surfaces agree.
-  const probe = (opts.oamProbe ?? probeOam)();
-  const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
-  // Keyed by namespace (unique per config), NOT by server object identity --
-  // the servers above flow through spread-copies (filter/grade overlay), and
-  // an identity-keyed map silently loses every lookup the moment any future
-  // step copies the objects again.
-  const runtimes = new Map<string, ServerRuntimeInfo>(
-    merged.servers.map((s) => [s.namespace, describeServerRuntime(s, dflt.runtime, probe)]),
-  );
-
+  // Under --json keep stdout parseable — a consumer piping into `jq` gets an
+  // object it can branch on instead of a parse error. The non-zero exit below
+  // is still the load-bearing signal; this is a courtesy, not a contract.
   if (opts.json) {
-    // Echo the active filter (if any) and whether it matched, so a script
-    // consuming `servers --json` can distinguish "filter matched nothing"
-    // (filter set, filterMatched=false) from "account has no servers"
-    // (filter null) -- the table branch already explains this in prose.
-    // `effectiveRuntime`/`effectiveRuntimeReason` are the computed verdicts;
-    // the configured per-server `runtime` field (when present) is preserved
-    // as-is on each server object.
-    const payload = {
-      ...merged,
-      servers: merged.servers.map((s) => {
-        const v = runtimes.get(s.namespace);
-        return { ...s, effectiveRuntime: v?.runtime ?? null, effectiveRuntimeReason: v?.reason ?? "" };
-      }),
-      filter: opts.filter ?? null,
-      filterMatched: opts.filter !== undefined ? merged.servers.length > 0 : null,
-    };
-    print(JSON.stringify(payload, null, 2));
-    return { exitCode: 0, lines };
+    const payload = JSON.stringify({ ok: false, deprecated: true, error: SERVERS_DEPRECATED_MESSAGE });
+    lines.push(payload);
+    write(`${payload}\n`);
   }
 
-  if (opts.filter !== undefined && filtered.servers.length === 0) {
-    print(`No servers match "${opts.filter}". Run \`yaw-mcp servers\` to see the full list.`);
-    return { exitCode: 0, lines };
-  }
-
-  renderTable(merged, runtimes, print);
-  return { exitCode: 0, lines };
-}
-
-/** Compact RUNTIME cell. Plain "oam"/"node" for the expected cases; the
- *  oam->node fallback cases carry a short parenthetical so the silent
- *  downgrade is visible at a glance (full reason in `servers --json`). */
-function runtimeCell(v: ServerRuntimeInfo | undefined): string {
-  if (!v || v.runtime === null) return "-";
-  switch (v.code) {
-    case "oam-not-installed":
-      return "node (no oam)";
-    case "oam-below-min":
-      return "node (oam too old)";
-    case "not-node-command":
-      return "node (not node-based)";
-    default:
-      return v.runtime;
-  }
-}
-
-function renderTable(cfg: ConnectConfig, runtimes: Map<string, ServerRuntimeInfo>, print: (s?: string) => void): void {
-  const servers = cfg.servers;
-  if (servers.length === 0) {
-    print("No servers configured yet. Visit https://yaw.sh/mcp to add one.");
-    return;
-  }
-
-  // Short config-version slug in the header — full SHA is noisy and
-  // users rarely need it. The doctor STATE section shows the file path
-  // for anyone who wants raw details.
-  const version = cfg.configVersion ? ` (config ${truncateVersion(cfg.configVersion)})` : "";
-  const active = servers.filter((s) => s.isActive).length;
-  const disabled = servers.length - active;
-  const summary =
-    disabled === 0
-      ? `${servers.length} server${servers.length === 1 ? "" : "s"}`
-      : `${servers.length} servers (${active} enabled, ${disabled} disabled)`;
-  print(`${summary}${version}`);
-  print("");
-
-  const rows = servers.map((s) => ({
-    namespace: s.namespace,
-    name: s.name,
-    type: s.type,
-    status: s.isActive ? "enabled" : "disabled",
-    runtime: runtimeCell(runtimes.get(s.namespace)),
-    grade: s.complianceGrade ?? "-",
-    tools: s.toolCache ? String(s.toolCache.length) : "?",
-  }));
-
-  const widths = {
-    namespace: Math.max("NAMESPACE".length, ...rows.map((r) => r.namespace.length)),
-    name: Math.max("NAME".length, ...rows.map((r) => r.name.length)),
-    type: Math.max("TYPE".length, ...rows.map((r) => r.type.length)),
-    status: Math.max("STATUS".length, ...rows.map((r) => r.status.length)),
-    runtime: Math.max("RUNTIME".length, ...rows.map((r) => r.runtime.length)),
-    grade: Math.max("GRADE".length, ...rows.map((r) => r.grade.length)),
-    tools: Math.max("TOOLS".length, ...rows.map((r) => r.tools.length)),
-  };
-
-  const header =
-    `  ${"NAMESPACE".padEnd(widths.namespace)}  ` +
-    `${"NAME".padEnd(widths.name)}  ` +
-    `${"TYPE".padEnd(widths.type)}  ` +
-    `${"STATUS".padEnd(widths.status)}  ` +
-    `${"RUNTIME".padEnd(widths.runtime)}  ` +
-    `${"GRADE".padEnd(widths.grade)}  ` +
-    `${"TOOLS".padStart(widths.tools)}`;
-  print(header);
-
-  // Deterministic ordering: alphabetical by namespace so re-runs stay
-  // diffable and the user can eyeball a familiar shape on each call.
-  const sorted = [...rows].sort((a, b) => a.namespace.localeCompare(b.namespace));
-  for (const r of sorted) {
-    const line =
-      `  ${r.namespace.padEnd(widths.namespace)}  ` +
-      `${r.name.padEnd(widths.name)}  ` +
-      `${r.type.padEnd(widths.type)}  ` +
-      `${r.status.padEnd(widths.status)}  ` +
-      `${r.runtime.padEnd(widths.runtime)}  ` +
-      `${r.grade.padEnd(widths.grade)}  ` +
-      `${r.tools.padStart(widths.tools)}`;
-    print(line);
-  }
-}
-
-function truncateVersion(v: string): string {
-  // Config versions are opaque strings — usually a SHA-ish hash. Trim
-  // to the first 8 chars: enough to correlate with dashboard / logs,
-  // short enough to keep the header one line on narrow terminals.
-  return v.length > 8 ? v.slice(0, 8) : v;
+  return { exitCode: 1, lines };
 }

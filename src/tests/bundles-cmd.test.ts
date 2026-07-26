@@ -5,14 +5,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CURATED_BUNDLES } from "../bundles.js";
 import { parseBundlesArgs, runBundlesCommand } from "../bundles-cmd.js";
 import { CONFIG_DIRNAME } from "../paths.js";
-import type { ConnectConfig, UpstreamServerConfig } from "../types.js";
+import type { UpstreamServerConfig } from "../types.js";
 
-function makeServer(over: Partial<UpstreamServerConfig>): UpstreamServerConfig {
+function makeServer(over: Partial<UpstreamServerConfig>): Partial<UpstreamServerConfig> {
   return {
     id: "srv-1",
     name: "Example",
     namespace: "ex",
-    type: "remote",
+    type: "local",
+    command: "npx",
     isActive: true,
     ...over,
   };
@@ -98,18 +99,11 @@ describe("runBundlesCommand — list", () => {
     expect(parsed.bundles[0]).toHaveProperty("id");
   });
 
-  it("does not hit the network or require a token", async () => {
+  it("is fully static -- reads no config file at all", async () => {
     const io = captureIO();
-    // Note: no home/env seed — if `list` tried to call loadYawMcpConfig+fetcher,
-    // it would either error or block. This test proves it's fully static.
-    const r = await runBundlesCommand({
-      action: "list",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => {
-        throw new Error("fetcher MUST NOT run during list");
-      },
-    });
+    // Note: no home/cwd seed. `list` never touches bundles.json, so it can't
+    // emit a load warning or an empty-state hint here.
+    const r = await runBundlesCommand({ action: "list", out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(io.err).toEqual([]);
   });
@@ -118,57 +112,47 @@ describe("runBundlesCommand — list", () => {
 describe("runBundlesCommand — match", () => {
   let home: string;
 
+  /** Write a user-global ~/.yaw-mcp/bundles.json with the given servers. */
+  function seedBundles(servers: Array<Partial<UpstreamServerConfig>>): void {
+    writeFileSync(
+      join(home, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({ version: 1, servers }, null, 2),
+      "utf8",
+    );
+  }
+
+  /** `cwd: home` keeps findProjectConfigDir from walking into a real project
+   *  `.yaw-mcp/` (it only considers dirs strictly UNDER home), so every case
+   *  below resolves to the user-global file we just seeded. */
+  const run = (opts: Parameters<typeof runBundlesCommand>[0] = {}) =>
+    runBundlesCommand({ home, cwd: home, action: "match", ...opts });
+
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-"));
     mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(
-      join(home, CONFIG_DIRNAME, "config.json"),
-      JSON.stringify({ version: 1, token: "mcp_pat_test" }),
-      "utf8",
-    );
   });
 
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("exits 1 when no token is resolvable", async () => {
-    rmSync(join(home, CONFIG_DIRNAME, "config.json"));
+  it("needs no token and no network -- an empty config still exits 0", async () => {
     const io = captureIO();
-    const r = await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => {
-        throw new Error("fetcher should not run");
-      },
-    });
-    expect(r.exitCode).toBe(1);
-    expect(io.err.join("")).toContain("no token resolved");
+    const r = await run({ out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.out.join("\n")).toContain("No curated bundles match");
   });
 
-  it("reports ready + partial bundles based on installed namespaces", async () => {
+  it("reports ready + partial bundles based on local namespaces", async () => {
     // github + linear + slack → pr-review ready, product-release ready,
     // devops-incident partial (missing pagerduty), support-ops partial (missing zendesk, hubspot).
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [
-        makeServer({ namespace: "github", name: "GitHub" }),
-        makeServer({ namespace: "linear", name: "Linear" }),
-        makeServer({ namespace: "slack", name: "Slack" }),
-      ],
-    };
+    seedBundles([
+      makeServer({ namespace: "github", name: "GitHub" }),
+      makeServer({ namespace: "linear", name: "Linear" }),
+      makeServer({ namespace: "slack", name: "Slack" }),
+    ]);
     const io = captureIO();
-    const r = await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
+    const r = await run({ out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     const combined = io.out.join("\n");
     expect(combined).toContain("Ready to activate");
@@ -181,22 +165,12 @@ describe("runBundlesCommand — match", () => {
 
   it("only counts enabled servers when matching", async () => {
     // github enabled; linear disabled → pr-review should NOT be ready.
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [
-        makeServer({ namespace: "github", name: "GitHub", isActive: true }),
-        makeServer({ namespace: "linear", name: "Linear", isActive: false }),
-      ],
-    };
+    seedBundles([
+      makeServer({ namespace: "github", name: "GitHub", isActive: true }),
+      makeServer({ namespace: "linear", name: "Linear", isActive: false }),
+    ]);
     const io = captureIO();
-    await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
+    await run({ out: io.push, err: io.pushErr });
     const combined = io.out.join("\n");
     expect(combined).not.toContain("Ready to activate");
     // But linear should NOT appear in "enabled servers" either. Singular
@@ -205,38 +179,17 @@ describe("runBundlesCommand — match", () => {
   });
 
   it("prints the no-match message when nothing overlaps", async () => {
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "weirdnamespace", name: "Weird" })],
-    };
+    seedBundles([makeServer({ namespace: "weirdnamespace", name: "Weird" })]);
     const io = captureIO();
-    const r = await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
+    const r = await run({ out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(io.out.join("\n")).toContain("No curated bundles match");
   });
 
   it("emits JSON with installed + ready + partial when --json is set", async () => {
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "github" }), makeServer({ namespace: "linear" })],
-    };
+    seedBundles([makeServer({ namespace: "github" }), makeServer({ namespace: "linear" })]);
     const io = captureIO();
-    const r = await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      json: true,
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
+    const r = await run({ json: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed.installed).toContain("github");
@@ -247,51 +200,56 @@ describe("runBundlesCommand — match", () => {
     expect(parsed.ready.some((b: { id: string }) => b.id === "pr-review")).toBe(true);
   });
 
-  it("exits 2 when the fetcher throws", async () => {
+  it("reads a project-local bundles.json over the user-global one", async () => {
+    seedBundles([makeServer({ namespace: "weirdnamespace", name: "Weird" })]);
+    const project = join(home, "proj");
+    mkdirSync(join(project, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(project, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [makeServer({ namespace: "github" }), makeServer({ namespace: "linear" })],
+      }),
+      "utf8",
+    );
     const io = captureIO();
     const r = await runBundlesCommand({
       home,
-      env: {},
+      cwd: project,
       action: "match",
+      json: true,
       out: io.push,
       err: io.pushErr,
-      fetcher: async () => {
-        throw new Error("network unreachable");
-      },
     });
-    expect(r.exitCode).toBe(2);
-    expect(io.err.join("")).toContain("network unreachable");
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.installed).toEqual(expect.arrayContaining(["github", "linear"]));
+    expect(parsed.installed).not.toContain("weirdnamespace");
   });
 
-  it("exits 2 on unexpected 304 (null response)", async () => {
+  it("warns on stderr (still exit 0) when bundles.json is malformed", async () => {
+    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json", "utf8");
     const io = captureIO();
-    const r = await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => null,
-    });
-    expect(r.exitCode).toBe(2);
-    expect(io.err.join("")).toContain("backend returned 304 without a conditional request");
+    const r = await run({ out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.err.join("\n")).toMatch(/invalid JSON/);
+    // Diagnostic must not leak into the stdout a --json consumer parses.
+    expect(io.out.join("\n")).not.toMatch(/invalid JSON/);
+  });
+
+  it("keeps stdout parseable under --json even when the file is malformed", async () => {
+    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json", "utf8");
+    const io = captureIO();
+    await run({ json: true, out: io.push, err: io.pushErr });
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.installed).toEqual([]);
   });
 
   it("sorts partial bundles by fewest-missing first", async () => {
     // github → devops-incident missing 2, pr-review missing 1 (linear).
-    const cfg: ConnectConfig = {
-      configVersion: "v1",
-      servers: [makeServer({ namespace: "github" })],
-    };
+    seedBundles([makeServer({ namespace: "github" })]);
     const io = captureIO();
-    await runBundlesCommand({
-      home,
-      env: {},
-      action: "match",
-      out: io.push,
-      err: io.pushErr,
-      fetcher: async () => cfg,
-    });
+    await run({ out: io.push, err: io.pushErr });
     const combined = io.out.join("\n");
     const prAt = combined.indexOf("pr-review");
     const devopsAt = combined.indexOf("devops-incident");

@@ -104,7 +104,7 @@ yaw-mcp doctor [--json]        # diagnose config, clients, learning, reliability
 ```bash
 yaw-mcp add <slug> [--env KEY=value] [--dry-run]   # add a catalog server to bundles.json
 yaw-mcp remove <slug-or-namespace>                 # drop a server
-yaw-mcp list [--json]                              # list configured servers
+yaw-mcp list [--json]                              # list configured servers with their cached compliance grade
 yaw-mcp try <slug> [--client <name>] [--ttl 1h]    # wire a one-off trial straight into your client (expires)
 yaw-mcp try-cleanup <slug>                          # remove a trial early (doctor GCs expired ones)
 ```
@@ -192,7 +192,7 @@ Python servers (`sqlite`, `time`, `sentry`, ...) launch via Astral's `uv`/`uvx`.
 
 MCP servers are third-party code you choose to run. yaw-mcp doesn't sandbox them -- that's your OS and network. What it gives you is **visibility and a gate**:
 
-- **Compliance grades (A-F)** -- the `@yawlabs/mcp-compliance` suite (88 tests) grades a server; `list` and `discover` show it inline (`github [ready] [A]`). `YAW_MCP_MIN_COMPLIANCE=B` makes `activate` refuse anything below the floor. Ungraded servers pass (don't punish unknown); audit them yourself with `yaw-mcp compliance <target>`.
+- **Compliance grades (A-F)** -- the `@yawlabs/mcp-compliance` suite (88 tests) grades a server; `yaw-mcp list` shows it in a `GRADE` column and `discover` shows it inline (`github [ready] [A]`). `YAW_MCP_MIN_COMPLIANCE=B` makes `activate` refuse anything below the floor. Ungraded servers pass (don't punish unknown); audit them yourself with `yaw-mcp compliance <target>`.
 - **Source transparency** -- `list` and `discover` show the exact `command`, `args`, and `url` each server launches with. Nothing is wrapped.
 - **Local credentials** -- vault values are encrypted at rest (scrypt + AES-256-GCM), injected at spawn, and never logged. Nothing is transmitted off the machine.
 - **Response pruning** (`YAW_MCP_PRUNE_RESPONSES`, on by default) -- redacts large file-blob content before it reaches the model, cutting the easiest cross-server prompt-injection vector.

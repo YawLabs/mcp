@@ -278,11 +278,11 @@ if (subcommand === "compliance") {
   Inspection:
     doctor                   Diagnose setup: config, token, clients, learning,
                              upgrade, flaky-namespace reliability rollup.
-    servers [<filter>]       List servers in your yaw.sh/mcp dashboard; the
-                             positional arg substring-filters by namespace.
+    servers [<filter>]       DEPRECATED -- account mode is gone; this always
+                             fails. Use \`list\` instead.
     bundles [list|match]     Browse curated multi-server bundles. \`list\` shows
                              all; \`match\` partitions against your enabled
-                             servers (ready vs. partially installed).
+                             local servers (ready vs. partially installed).
 
   Maintenance:
     upgrade                  Show (or --run) the command that bumps

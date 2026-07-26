@@ -103,7 +103,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--base", "--help"] },
   // Inspection.
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
-  { name: "servers", description: "List servers in your yaw.sh/mcp dashboard", flags: ["--json", "--help"] },
+  { name: "servers", description: "DEPRECATED -- account mode removed, use list", flags: ["--json", "--help"] },
   {
     name: "bundles",
     description: "Browse curated multi-server bundles",
