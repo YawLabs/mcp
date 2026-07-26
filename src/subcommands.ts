@@ -44,6 +44,7 @@ export const KNOWN_SUBCOMMANDS = [
   "try",
   "try-cleanup",
   "secrets",
+  "trust",
   "help",
   ...FLAG_ALIASES,
 ] as const;

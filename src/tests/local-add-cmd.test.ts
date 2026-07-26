@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CatalogServer } from "../catalog.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
 import { deriveNamespace, loadLocalBundles, removeUserBundle, upsertUserBundle } from "../local-bundles.js";
+import { CONFIG_DIRNAME } from "../paths.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -677,9 +678,22 @@ describe("runAdd env-at-rest [#3]", () => {
   });
 });
 
+/** Write a project-local bundles.json and approve it via the consent store,
+ *  so it actually shadows the user-global file. An UNAPPROVED project file is
+ *  ignored by the loader (src/trust.ts), and findShadowingProjectBundles is
+ *  trust-aware for exactly that reason -- warning about a file yaw-mcp is
+ *  ignoring would send the user off to edit the wrong thing. */
+async function writeTrustedProjectBundles(content: unknown): Promise<void> {
+  const { writeFileSync, mkdirSync, readFileSync } = await import("node:fs");
+  const { grantTrust } = await import("../trust.js");
+  mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+  const path = join(synthCwd, CONFIG_DIRNAME, "bundles.json");
+  writeFileSync(path, JSON.stringify(content));
+  await grantTrust(path, readFileSync(path), { home: synthHome });
+}
+
 describe("runRemove shadowing [#5] + removeUserBundle", () => {
-  it("warns when a project-local bundles.json shadows the removal", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
+  it("warns when an approved project-local bundles.json shadows the removal", async () => {
     // Add to user-global, then create a shadowing project file under cwd.
     await runAdd({
       slug: "fetch",
@@ -690,8 +704,7 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
       out: () => {},
       err: () => {},
     });
-    mkdirSync(join(synthCwd, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthCwd, ".yaw-mcp", "bundles.json"), JSON.stringify({ servers: [] }));
+    await writeTrustedProjectBundles({ servers: [] });
     const io = captureIO();
     const r = await runRemove({
       target: "fetch",
@@ -704,11 +717,10 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
     expect(io.errText()).toMatch(/shadows/i);
   });
 
-  it("explains the shadow on a no-op remove when a project file is in effect", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    // A project-local file exists, but the target isn't in user-global.
-    mkdirSync(join(synthCwd, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthCwd, ".yaw-mcp", "bundles.json"), JSON.stringify({ servers: [] }));
+  it("explains the shadow on a no-op remove when an approved project file is in effect", async () => {
+    // A project-local file exists and is approved, but the target isn't in
+    // user-global.
+    await writeTrustedProjectBundles({ servers: [] });
     const io = captureIO();
     const r = await runRemove({
       target: "fetch",
@@ -720,6 +732,22 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
     expect(r.exitCode).toBe(0);
     expect(io.text()).toMatch(/nothing to do/);
     expect(io.errText()).toMatch(/project-local/i);
+  });
+
+  it("stays quiet about an UNAPPROVED project file (it shadows nothing)", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(synthCwd, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ servers: [] }));
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).not.toMatch(/project-local/i);
   });
 
   it("removeUserBundle is a no-op on a missing namespace", async () => {

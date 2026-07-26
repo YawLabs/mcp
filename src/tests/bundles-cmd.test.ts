@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CURATED_BUNDLES } from "../bundles.js";
 import { parseBundlesArgs, runBundlesCommand } from "../bundles-cmd.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+import { grantTrust } from "../trust.js";
 import type { UpstreamServerConfig } from "../types.js";
 
 function makeServer(over: Partial<UpstreamServerConfig>): Partial<UpstreamServerConfig> {
@@ -114,11 +115,7 @@ describe("runBundlesCommand — match", () => {
 
   /** Write a user-global ~/.yaw-mcp/bundles.json with the given servers. */
   function seedBundles(servers: Array<Partial<UpstreamServerConfig>>): void {
-    writeFileSync(
-      join(home, CONFIG_DIRNAME, "bundles.json"),
-      JSON.stringify({ version: 1, servers }, null, 2),
-      "utf8",
-    );
+    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ version: 1, servers }, null, 2), "utf8");
   }
 
   /** `cwd: home` keeps findProjectConfigDir from walking into a real project
@@ -200,18 +197,22 @@ describe("runBundlesCommand — match", () => {
     expect(parsed.ready.some((b: { id: string }) => b.id === "pr-review")).toBe(true);
   });
 
-  it("reads a project-local bundles.json over the user-global one", async () => {
+  it("reads an APPROVED project-local bundles.json over the user-global one", async () => {
     seedBundles([makeServer({ namespace: "weirdnamespace", name: "Weird" })]);
     const project = join(home, "proj");
     mkdirSync(join(project, CONFIG_DIRNAME), { recursive: true });
+    const projectBundles = join(project, CONFIG_DIRNAME, "bundles.json");
     writeFileSync(
-      join(project, CONFIG_DIRNAME, "bundles.json"),
+      projectBundles,
       JSON.stringify({
         version: 1,
         servers: [makeServer({ namespace: "github" }), makeServer({ namespace: "linear" })],
       }),
       "utf8",
     );
+    // A project bundles.json only wins once the user has approved it via
+    // `yaw-mcp trust` -- see the consent gate in src/trust.ts.
+    await grantTrust(projectBundles, readFileSync(projectBundles), { home });
     const io = captureIO();
     const r = await runBundlesCommand({
       home,

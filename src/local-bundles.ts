@@ -9,6 +9,18 @@
 // your repo, the team gets exactly that set, no surprises from a
 // teammate's user-global file leaking in.
 //
+// SECURITY: that override only applies to a project file the user has
+// EXPLICITLY approved via `yaw-mcp trust` (see trust.ts). A project
+// bundles.json is usually committed to a repo, so without a consent gate
+// cloning a hostile repo and starting an MCP client inside it was enough to
+// spawn its argv as you -- entries default to isActive:true and the server
+// prewarms active servers at startup. An UNTRUSTED project file is ignored
+// completely: none of its servers load, AND it does not suppress the
+// user-global file (suppressing it would be a denial-of-service variant of
+// the same bug -- a hostile repo blanking out your real servers). The
+// user-global ~/.yaw-mcp/bundles.json is the user's own file and is NEVER
+// gated. YAW_MCP_TRUST_PROJECT=1 opts out of the check for CI/automation.
+//
 // When yaw-mcp starts WITH a token, the server DEFINITIONS in this file
 // are ignored -- the cloud account is the source of truth, and the
 // `servers` array sits unused on disk. When yaw-mcp starts WITHOUT a
@@ -33,6 +45,15 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
+import {
+  hashTrustContent,
+  isTrustBypassEnabled,
+  readTrustStore,
+  TRUST_BYPASS_ENV,
+  type TrustStatus,
+  trustStatusFor,
+  trustStorePath,
+} from "./trust.js";
 import type { ConnectConfig, UpstreamServerConfig } from "./types.js";
 
 /** Canonical filename for the local bundles file. */
@@ -146,6 +167,31 @@ interface ReadResult {
   file: LocalBundlesFile | null;
 }
 
+/** Raw read outcome, before any parsing. Split out from readBundlesAt so
+ *  the trust gate can hash the EXACT bytes it is about to parse: reading
+ *  once for the hash and again for the parse would open a TOCTOU window in
+ *  which a hostile repo swaps the file between the two reads and gets
+ *  unreviewed argv past an approved hash. */
+type RawRead =
+  | { kind: "ok"; raw: Buffer }
+  | { kind: "absent" }
+  | { kind: "error"; message: string; code: string | undefined };
+
+async function readBundlesRawAt(path: string): Promise<RawRead> {
+  try {
+    // Read BYTES, not utf8 text: the trust hash must cover exactly what is
+    // on disk. Decoding to a string and back is lossy for invalid UTF-8,
+    // which would let two different files produce the same hash.
+    return { kind: "ok", raw: await readFile(path) };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EISDIR") return { kind: "absent" };
+    // Any other error (EPERM, EACCES, ...) means the file likely exists but
+    // we can't read it.
+    return { kind: "error", message: err instanceof Error ? err.message : String(err), code };
+  }
+}
+
 /** Read a bundles.json from `path`. Returns:
  *   - { exists: false, file: null } when the file doesn't exist
  *   - { exists: true,  file: <parsed> } when valid
@@ -153,22 +199,25 @@ interface ReadResult {
  *     populated). Caller must NOT fall through in this case -- see
  *     loadLocalBundles. */
 async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResult> {
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "EISDIR") {
-      return { exists: false, file: null };
-    }
-    // Any other error (EPERM, EACCES, ...) means the file likely exists but
-    // we can't read it.  Return exists:true so the caller stays committed to
-    // this path instead of silently falling through to the user-global file.
-    const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`${path}: could not read file (${msg}) -- skipping`);
-    log("warn", "Could not read bundles.json", { path, error: msg, code });
+  const r = await readBundlesRawAt(path);
+  if (r.kind === "absent") return { exists: false, file: null };
+  if (r.kind === "error") {
+    // Return exists:true so the caller stays committed to this path instead
+    // of silently falling through to the user-global file.
+    warnings.push(`${path}: could not read file (${r.message}) -- skipping`);
+    log("warn", "Could not read bundles.json", { path, error: r.message, code: r.code });
     return { exists: true, file: null };
   }
+  return { exists: true, file: parseBundlesContent(path, r.raw, warnings) };
+}
+
+/** Parse already-read bundles.json bytes. Returns null (with warnings
+ *  populated) when the content is unusable. Separate from the read so the
+ *  trust gate can decide whether to parse at all -- an untrusted file must
+ *  produce ONLY the untrusted warning, not a pile of schema diagnostics
+ *  about content we are refusing to look at. */
+function parseBundlesContent(path: string, rawBytes: Buffer, warnings: string[]): LocalBundlesFile | null {
+  const raw = rawBytes.toString("utf8");
   let parsed: unknown;
   try {
     parsed = parseJsonc(raw);
@@ -176,11 +225,11 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
     const msg = err instanceof Error ? err.message : String(err);
     warnings.push(`${path}: invalid JSON (${msg}) -- file ignored`);
     log("warn", "bundles.json is not valid JSON; ignoring", { path, error: msg });
-    return { exists: true, file: null };
+    return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     warnings.push(`${path}: root must be a JSON object -- file ignored`);
-    return { exists: true, file: null };
+    return null;
   }
   const obj = parsed as Record<string, unknown>;
   const version = typeof obj.version === "number" ? obj.version : undefined;
@@ -192,7 +241,7 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
   const rawServers = obj.servers;
   if (!Array.isArray(rawServers)) {
     warnings.push(`${path}: 'servers' must be an array -- file ignored`);
-    return { exists: true, file: null };
+    return null;
   }
   // Top-level default runtime. Only "oam"/"node" are meaningful; anything
   // else is dropped with a warning (matching the per-server `runtime`
@@ -206,10 +255,30 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
       `${path}: ignoring invalid 'defaultRuntime' ${JSON.stringify(obj.defaultRuntime)} (expected "oam" or "node")`,
     );
   }
-  return {
-    exists: true,
-    file: { version, servers: rawServers as Array<Partial<UpstreamServerConfig>>, defaultRuntime },
-  };
+  return { version, servers: rawServers as Array<Partial<UpstreamServerConfig>>, defaultRuntime };
+}
+
+/** What a bundles.json would actually contribute if it loaded. Used by
+ *  `yaw-mcp trust` to show the user the exact argv they are approving --
+ *  it runs the SAME parse + validateEntry the loader runs, so the preview
+ *  cannot drift from what would really spawn. */
+export interface BundlePreview {
+  /** False when the file is unparseable / structurally wrong. */
+  ok: boolean;
+  servers: UpstreamServerConfig[];
+  warnings: string[];
+}
+
+export function previewBundlesContent(path: string, rawBytes: Buffer): BundlePreview {
+  const warnings: string[] = [];
+  const file = parseBundlesContent(path, rawBytes, warnings);
+  if (!file) return { ok: false, servers: [], warnings };
+  const servers: UpstreamServerConfig[] = [];
+  for (const entry of file.servers) {
+    const validated = validateEntry(entry, warnings);
+    if (validated) servers.push(validated);
+  }
+  return { ok: true, servers, warnings };
 }
 
 /** Deterministic content-derived configVersion. We use this in lieu of
@@ -220,6 +289,99 @@ function hashContent(servers: UpstreamServerConfig[]): string {
   const h = createHash("sha256");
   h.update(JSON.stringify(servers));
   return `local-${h.digest("hex").slice(0, 16)}`;
+}
+
+// --- Project-trust gate -----------------------------------------------------
+
+/** Everything a caller needs to know about the project bundles.json in
+ *  play, WITHOUT re-reading it. `raw` carries the exact bytes the status
+ *  was computed from so `yaw-mcp trust` can render the argv it is about to
+ *  approve and grant against the very same content. */
+export interface ProjectTrustProbe {
+  /** Absolute path of the project bundles.json, or null when no `.yaw-mcp/`
+   *  directory was found by walking up from cwd. Set even when the file
+   *  itself is absent (status "none"), so the CLI can say where it looked. */
+  path: string | null;
+  status: "none" | "unreadable" | TrustStatus;
+  /** YAW_MCP_TRUST_PROJECT is enabled -- the loader honours the project file
+   *  regardless of `status`. Kept separate from `status` so diagnostics keep
+   *  reporting the REAL trust state while the escape hatch is on. */
+  bypassed: boolean;
+  /** Exact bytes; null unless status is trusted/changed/untrusted/store-unreadable. */
+  raw: Buffer | null;
+  /** SHA-256 of `raw`; null when raw is null. */
+  sha256: string | null;
+  /** Read-error message when status === "unreadable". */
+  error: string | null;
+  /** Absolute path of the trust store consulted. */
+  storePath: string;
+}
+
+/**
+ * Locate the project bundles.json from `cwd` and classify it against the
+ * trust store. Reads the file exactly ONCE and hands the bytes back, so no
+ * caller has to re-read (and no TOCTOU window opens between the hash and
+ * the parse / the display / the grant).
+ */
+export async function probeProjectTrust(
+  opts: { cwd?: string; home?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<ProjectTrustProbe> {
+  const cwd = opts.cwd ?? process.cwd();
+  const home = opts.home ?? homedir();
+  const env = opts.env ?? process.env;
+  const bypassed = isTrustBypassEnabled(env);
+  const storePath = trustStorePath(home);
+
+  const projectDir = await findProjectConfigDir(cwd, home).catch(() => null);
+  const path = projectDir ? localBundlesPath(projectDir) : null;
+  if (path === null) {
+    return { path: null, status: "none", bypassed, raw: null, sha256: null, error: null, storePath };
+  }
+  const read = await readBundlesRawAt(path);
+  if (read.kind === "absent") {
+    return { path, status: "none", bypassed, raw: null, sha256: null, error: null, storePath };
+  }
+  if (read.kind === "error") {
+    return { path, status: "unreadable", bypassed, raw: null, sha256: null, error: read.message, storePath };
+  }
+  const store = await readTrustStore(home);
+  return {
+    path,
+    status: trustStatusFor(path, read.raw, store),
+    bypassed,
+    raw: read.raw,
+    sha256: hashTrustContent(read.raw),
+    error: null,
+    storePath,
+  };
+}
+
+/**
+ * The warning a blocked project bundles.json produces. Names the ignored
+ * path, says what happens instead, and gives the exact command to approve
+ * it -- a security gate the user cannot see their way out of just reads as
+ * "my servers stopped working".
+ */
+export function untrustedProjectWarning(probe: ProjectTrustProbe): string {
+  const path = probe.path ?? "(unknown)";
+  const fallback = "Falling back to your user-global ~/.yaw-mcp/bundles.json.";
+  const escapeHatch = `Set ${TRUST_BYPASS_ENV}=1 to skip this check (CI/automation only -- it lets any repo you run inside spawn commands as you).`;
+  if (probe.status === "changed") {
+    return `${path}: project bundles.json CHANGED since you approved it -- IGNORED. The new contents could spawn commands you never reviewed. ${fallback} Re-review and re-approve with \`yaw-mcp trust\` from inside this project. ${escapeHatch}`;
+  }
+  if (probe.status === "store-unreadable") {
+    return `${path}: project bundles.json IGNORED -- the trust store at ${probe.storePath} could not be read, so nothing is trusted (fail-closed). ${fallback} Fix or delete that file, then re-approve with \`yaw-mcp trust\` from inside this project. ${escapeHatch}`;
+  }
+  return `${path}: untrusted project bundles.json -- IGNORED. A project file is usually committed to the repo and can spawn arbitrary commands as you, so it has to be approved first. ${fallback} Review the servers and approve with \`yaw-mcp trust\` from inside this project. ${escapeHatch}`;
+}
+
+/** Does the loader honour this project file? True for an approved file, for
+ *  the env escape hatch, and for an unreadable one (which loads nothing but
+ *  still commits to the project location -- see loadLocalBundles). */
+function projectFileIsHonoured(probe: ProjectTrustProbe): boolean {
+  if (probe.status === "none") return false;
+  if (probe.status === "unreadable") return true;
+  return probe.bypassed || probe.status === "trusted";
 }
 
 export interface LoadLocalBundlesResult {
@@ -239,27 +401,54 @@ export interface LoadLocalBundlesResult {
   defaultRuntimePath?: string;
 }
 
-/** Load bundles.json from the canonical locations. Project-local
- *  (`<project>/.yaw-mcp/bundles.json`) wins over user-global
- *  (`~/.yaw-mcp/bundles.json`) -- no merge (defaultRuntime excepted; see
- *  LoadLocalBundlesResult). Returns null config when neither file exists,
- *  so the caller can render the empty-state hint. */
-export async function loadLocalBundles(opts: { cwd?: string; home?: string } = {}): Promise<LoadLocalBundlesResult> {
+/** Load bundles.json from the canonical locations. An APPROVED project-local
+ *  file (`<project>/.yaw-mcp/bundles.json`, see probeProjectTrust) wins over
+ *  user-global (`~/.yaw-mcp/bundles.json`) -- no merge (defaultRuntime
+ *  excepted; see LoadLocalBundlesResult). An unapproved project file is
+ *  ignored entirely and the user-global file loads as if it weren't there.
+ *  Returns null config when neither file exists, so the caller can render
+ *  the empty-state hint. */
+export async function loadLocalBundles(
+  opts: { cwd?: string; home?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<LoadLocalBundlesResult> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
   const warnings: string[] = [];
 
-  const projectDir = await findProjectConfigDir(cwd, home).catch(() => null);
-  const projectPath = projectDir ? localBundlesPath(projectDir) : null;
   const globalPath = localBundlesPath(join(home, CONFIG_DIRNAME));
 
-  // Project wins entirely when present. If the project file is present
-  // but malformed, we commit to that location (config null, warnings
-  // surfaced) instead of silently substituting the user-global config
-  // -- a committed bundles.json should be authoritative.
-  const projectResult = projectPath
-    ? await readBundlesAt(projectPath, warnings)
-    : ({ exists: false, file: null } as ReadResult);
+  // Consent gate. An unapproved project file is dropped BEFORE it is parsed
+  // (so it contributes no servers and no schema diagnostics) and does NOT
+  // shadow the user-global file -- otherwise a hostile repo could blank out
+  // the user's real server list just by committing a bundles.json.
+  const probe = await probeProjectTrust({ cwd, home, env: opts.env });
+  const honoured = projectFileIsHonoured(probe);
+  const projectPath = honoured ? probe.path : null;
+  if (probe.path !== null && probe.status !== "none" && !honoured) {
+    const warning = untrustedProjectWarning(probe);
+    warnings.push(warning);
+    log("warn", "Ignoring untrusted project bundles.json", {
+      path: probe.path,
+      status: probe.status,
+      sha256: probe.sha256,
+    });
+  }
+
+  // The honoured project file wins entirely. If it is present but malformed
+  // (or unreadable), we commit to that location (config null, warnings
+  // surfaced) instead of silently substituting the user-global config -- an
+  // APPROVED bundles.json is authoritative even when it is broken.
+  let projectResult: ReadResult = { exists: false, file: null };
+  if (projectPath !== null) {
+    if (probe.status === "unreadable") {
+      warnings.push(`${projectPath}: could not read file (${probe.error}) -- skipping`);
+      log("warn", "Could not read bundles.json", { path: projectPath, error: probe.error });
+      projectResult = { exists: true, file: null };
+    } else {
+      // probe.raw is non-null for every non-"none"/non-"unreadable" status.
+      projectResult = { exists: true, file: parseBundlesContent(projectPath, probe.raw as Buffer, warnings) };
+    }
+  }
 
   let file: LocalBundlesFile | null;
   let sourcePath: string | null;
@@ -532,11 +721,18 @@ async function doRemoveUserBundle(
 /**
  * Does a project-local bundles.json exist that would shadow a user-global
  * write? `add`/`remove` warn when this returns a path, since a write to
- * user-global won't load while the project file is present.
+ * user-global won't load while the project file is in effect.
+ *
+ * Trust-aware: an UNAPPROVED project file no longer shadows anything (see
+ * loadLocalBundles), so reporting it as a shadow would send the user off to
+ * edit a file that is being ignored. Only a file the loader would actually
+ * honour is returned.
  */
-export async function findShadowingProjectBundles(cwd: string, home: string = homedir()): Promise<string | null> {
-  const projectDir = await findProjectConfigDir(cwd, home).catch(() => null);
-  if (!projectDir) return null;
-  const projectPath = localBundlesPath(projectDir);
-  return existsSync(projectPath) ? projectPath : null;
+export async function findShadowingProjectBundles(
+  cwd: string,
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  const probe = await probeProjectTrust({ cwd, home, env });
+  return projectFileIsHonoured(probe) ? probe.path : null;
 }
