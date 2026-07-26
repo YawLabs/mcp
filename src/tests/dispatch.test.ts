@@ -71,7 +71,7 @@ describe("handleDispatch", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -282,7 +282,7 @@ describe("handleDiscoverWithAutoWarm", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {

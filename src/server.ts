@@ -405,10 +405,7 @@ export class ConnectServer {
   private stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STATE_SAVE_DEBOUNCE_MS = 1000;
 
-  constructor(
-    private apiUrl: string,
-    private token: string | null,
-  ) {
+  constructor() {
     this.server = new Server(
       { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
       {
@@ -424,13 +421,6 @@ export class ConnectServer {
     // is implicit -- the client advertises whether IT supports receiving
     // them, which we check via getClientCapabilities() before prompting.
     this.setupHandlers();
-  }
-
-  /** True when no token was resolved at startup. In local mode the
-   *  config source is `~/.yaw-mcp/bundles.json` rather than the
-   *  backend config endpoint. */
-  private get localMode(): boolean {
-    return this.token === null;
   }
 
   // Builtin resources served directly by yaw-mcp (not proxied from an
@@ -632,44 +622,33 @@ export class ConnectServer {
       });
     }
 
-    // Load config from bundles.json. Non-fatal errors allow startup with
-    // an empty config.
-    if (this.localMode) {
-      const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
-        log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
-        return { config: null, path: null, warnings: [] };
-      });
-      for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
-      this.config = result.config ?? { servers: [], configVersion: "" };
-      // Deduplicate by namespace -- keep first occurrence. reconcileConfig
-      // and the routing state assume one server per namespace, so a
-      // duplicate in bundles.json has to be filtered before either sees it.
-      const seenNs = new Set<string>();
-      this.config.servers = this.config.servers.filter((s) => {
-        if (seenNs.has(s.namespace)) {
-          log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
-          return false;
-        }
-        seenNs.add(s.namespace);
-        return true;
-      });
-      this.configVersion = this.config.configVersion;
-      log("info", "Local mode: loaded bundles", {
-        path: result.path,
-        serverCount: this.config.servers.length,
-      });
-      // Reconcile so the loaded servers populate the routing state.
-      await this.reconcileConfig(this.config);
-    } else {
-      // A token used to select a remote config fetch. That backend is gone,
-      // so there is nothing to load here -- start empty rather than pretend
-      // an account has servers. The token / apiBase plumbing that still
-      // routes execution down this branch is removed in a follow-up.
-      log("warn", "A token is set but the hosted backend is retired; starting with an empty config", {
-        hint: "move your servers into ~/.yaw-mcp/bundles.json (`yaw-mcp add <slug>`) and unset YAW_MCP_TOKEN",
-      });
-      this.config = { servers: [], configVersion: "" };
-    }
+    // Load config from bundles.json -- the only config source. Non-fatal
+    // errors allow startup with an empty config.
+    const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
+      log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
+      return { config: null, path: null, warnings: [] };
+    });
+    for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
+    this.config = result.config ?? { servers: [], configVersion: "" };
+    // Deduplicate by namespace -- keep first occurrence. reconcileConfig
+    // and the routing state assume one server per namespace, so a
+    // duplicate in bundles.json has to be filtered before either sees it.
+    const seenNs = new Set<string>();
+    this.config.servers = this.config.servers.filter((s) => {
+      if (seenNs.has(s.namespace)) {
+        log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
+        return false;
+      }
+      seenNs.add(s.namespace);
+      return true;
+    });
+    this.configVersion = this.config.configVersion;
+    log("info", "Loaded bundles", {
+      path: result.path,
+      serverCount: this.config.servers.length,
+    });
+    // Reconcile so the loaded servers populate the routing state.
+    await this.reconcileConfig(this.config);
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
@@ -709,7 +688,6 @@ export class ConnectServer {
     }
 
     log("info", "yaw-mcp started", {
-      apiUrl: this.apiUrl,
       servers: this.config?.servers.length ?? 0,
     });
   }

@@ -2,7 +2,7 @@ import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
-import { loadYawMcpConfig, tokenFingerprint } from "./config-loader.js";
+import { loadYawMcpConfig } from "./config-loader.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
@@ -430,12 +430,12 @@ async function runServer(): Promise<void> {
   process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
   process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
 
-  // Resolve token + apiBase via the unified loader: env > local > global
-  // for token, env > local > project > global > default for apiBase.
-  // Missing token is NOT fatal -- yaw-mcp falls through to local mode
-  // where server definitions come from ~/.yaw-mcp/bundles.json instead
-  // of the backend. Empty bundles.json + no token also fine; yaw-mcp
-  // starts with an empty server list.
+  // Load config purely for its warnings + validation side effects: the
+  // loader still rejects a non-https, non-loopback YAW_MCP_URL, and that
+  // rejection is the fatal-startup path the .catch() above reports. The
+  // resolved token / apiBase are no longer consumed -- server definitions
+  // come from ~/.yaw-mcp/bundles.json. An empty (or absent) bundles.json
+  // is fine; yaw-mcp starts with an empty server list.
   const config = await loadYawMcpConfig();
 
   // Surface non-fatal config warnings on startup so the user sees them
@@ -445,20 +445,11 @@ async function runServer(): Promise<void> {
     log("warn", "Config warning", { warning: w });
   }
 
-  if (config.token) {
-    log("info", "yaw-mcp startup (account mode)", {
-      apiBase: config.apiBase,
-      apiBaseSource: config.apiBaseSource,
-      tokenSource: config.tokenSource,
-      tokenFingerprint: tokenFingerprint(config.token),
-    });
-  } else {
-    log("info", "yaw-mcp startup (local mode)", {
-      hint: "no YAW_MCP_TOKEN set; loading servers from ~/.yaw-mcp/bundles.json (if present)",
-    });
-  }
+  log("info", "yaw-mcp startup", {
+    hint: "loading servers from ~/.yaw-mcp/bundles.json (if present)",
+  });
 
-  const server = new ConnectServer(config.apiBase, config.token);
+  const server = new ConnectServer();
 
   let shuttingDown = false;
   const shutdown = async (): Promise<void> => {

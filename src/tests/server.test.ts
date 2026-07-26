@@ -82,7 +82,7 @@ describe("ConnectServer", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2190,7 +2190,7 @@ describe("argsEqual (via reconcileConfig)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2252,7 +2252,7 @@ describe("activateOne dedup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2310,7 +2310,7 @@ describe("exec step-level split-blame attribution", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2382,7 +2382,7 @@ describe("handleToolCall route snapshot", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2421,7 +2421,7 @@ describe("guide resource + session tracking", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2550,7 +2550,7 @@ describe("prewarmDormantServers", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2655,7 +2655,7 @@ describe("auto-load on startup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2804,7 +2804,7 @@ describe("prewarm race: explicit activate during prewarm inflight", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
@@ -2897,7 +2897,7 @@ describe("reconcileConfig: detects type and connectTimeoutMs changes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    server = new ConnectServer("https://yaw.sh/mcp", "test-token");
+    server = new ConnectServer();
   });
 
   afterEach(async () => {
