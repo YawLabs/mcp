@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -133,6 +133,39 @@ describe("parseRemoveArgs (help flag)", () => {
     const r = parseRemoveArgs(["-h"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+
+  // The confirmation-skip flag. --force is `secrets remove`'s spelling, -y /
+  // --yes is `trust`'s; remove accepts all three.
+  it("accepts --force, --yes and -y as the confirmation-skip flag", () => {
+    for (const flag of ["--force", "--yes", "-y"]) {
+      const r = parseRemoveArgs(["fetch", flag]);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.options.force).toBe(true);
+        expect(r.options.target).toBe("fetch");
+      }
+    }
+  });
+
+  it("leaves force undefined when the flag is absent", () => {
+    const r = parseRemoveArgs(["fetch"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.force).toBeUndefined();
+  });
+
+  it("rejects a mistyped SHORT flag instead of treating it as the target", () => {
+    // Before -y existed only "--" prefixes were checked, so `-f` silently
+    // became the removal target. A flag typo must not name a server.
+    const r = parseRemoveArgs(["fetch", "-f"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Unknown flag: -f/);
+  });
+
+  it("documents the flag in the usage text", () => {
+    const r = parseRemoveArgs([]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--force/);
   });
 });
 
@@ -341,6 +374,7 @@ describe("runRemove", () => {
     const r = await runRemove({
       target: "fetch",
       home: synthHome,
+      force: true,
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
     });
@@ -360,7 +394,7 @@ describe("runRemove", () => {
       out: () => {},
       err: () => {},
     });
-    const r = await runRemove({ target: "fetch", home: synthHome, out: () => {}, err: () => {} });
+    const r = await runRemove({ target: "fetch", home: synthHome, force: true, out: () => {}, err: () => {} });
     expect(r.exitCode).toBe(0);
   });
 
@@ -379,6 +413,274 @@ describe("runRemove", () => {
   it("rejects an invalid target", () => {
     expect(parseRemoveArgs([]).ok).toBe(false);
     expect(parseRemoveArgs(["a", "b"]).ok).toBe(false);
+  });
+});
+
+// `remove` used to delete the entry with no confirmation, on a TTY or off it --
+// the only destructive verb in the CLI without a gate. These lock the gate's
+// two halves (confirm on a TTY, refuse off one) AND the no-op behaviour that
+// must NOT change, because a cleanup script removing an already-absent server
+// still has to exit 0 without a flag.
+describe("runRemove confirmation gate", () => {
+  const bundlesPath = (): string => join(synthHome, CONFIG_DIRNAME, "bundles.json");
+  /** Raw bytes of bundles.json. The declined paths are asserted BYTE-identical,
+   *  not merely "still loads" -- a re-serialized file that happens to hold the
+   *  same servers would still mean the command wrote when it promised not to. */
+  const bytes = (): Buffer => readFileSync(bundlesPath());
+
+  const addFetch = async (): Promise<void> => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+  };
+
+  const namespaces = async (): Promise<string[]> => {
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    return (loaded.config?.servers ?? []).map((s) => s.namespace);
+  };
+
+  it("removes on an explicit y / yes", async () => {
+    for (const answer of ["y", "Y", "yes", " YES "]) {
+      await addFetch();
+      const io = captureIO();
+      const r = await runRemove({
+        target: "fetch",
+        home: synthHome,
+        cwd: synthCwd,
+        promptAnswer: answer,
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(io.text()).toMatch(/Removed/);
+      expect(await namespaces()).not.toContain("fetch");
+    }
+  });
+
+  it("a declined prompt (and a bare Enter) leaves bundles.json BYTE-identical", async () => {
+    await addFetch();
+    // "" is the bare Enter -- the default must be NO, not yes.
+    for (const answer of ["", "n", "N", "no", "maybe", "Y E S"]) {
+      const before = bytes();
+      const io = captureIO();
+      const r = await runRemove({
+        target: "fetch",
+        home: synthHome,
+        cwd: synthCwd,
+        promptAnswer: answer,
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode).toBe(1);
+      expect(io.errText()).toMatch(/Aborted/);
+      expect(r.written).toEqual([]);
+      expect(bytes().equals(before)).toBe(true);
+    }
+    expect(await namespaces()).toContain("fetch");
+  });
+
+  it("refuses off a TTY without the flag and leaves bundles.json BYTE-identical", async () => {
+    await addFetch();
+    const before = bytes();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.errText()).toMatch(/not a TTY/);
+    // The refusal must NAME the flag to re-run with, or it is a dead end.
+    expect(io.errText()).toMatch(/--force/);
+    expect(bytes().equals(before)).toBe(true);
+    // It still SHOWED what it would have removed before refusing.
+    expect(io.text()).toMatch(/namespace: fetch/);
+  });
+
+  it("removes off a TTY WITH --force", async () => {
+    await addFetch();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Removed/);
+    expect(await namespaces()).not.toContain("fetch");
+    // --force skips the PROMPT, so it must not print the review block.
+    expect(io.text()).not.toMatch(/namespace: fetch/);
+  });
+
+  it("the preview names the namespace, the display name and the launch command", async () => {
+    await addFetch();
+    const io = captureIO();
+    await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    const shown = io.text();
+    expect(shown).toMatch(/namespace: fetch/);
+    expect(shown).toMatch(/name:\s+Fetch/);
+    // The user must see WHICH server they are dropping, not just a slug.
+    expect(shown).toContain("$ npx -y @yawlabs/fetch-mcp");
+    expect(shown).toContain(bundlesPath());
+  });
+
+  it("the preview lists env KEY names but never their values", async () => {
+    await runAdd({
+      slug: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { TAILSCALE_API_KEY: "tskey-super-secret" },
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    const io = captureIO();
+    await runRemove({
+      target: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(io.text()).toMatch(/env keys:\s+TAILSCALE_API_KEY/);
+    expect(io.text()).not.toContain("tskey-super-secret");
+  });
+
+  it("renders the url for a remote-shaped entry instead of an empty command", async () => {
+    await upsertUserBundle(
+      { namespace: "remotey", name: "Remote Thing", type: "remote", url: "https://example.test/mcp", isActive: true },
+      { home: synthHome },
+    );
+    const io = captureIO();
+    await runRemove({
+      target: "remotey",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(io.text()).toContain("HTTP https://example.test/mcp");
+  });
+
+  it("gates a removal reached by the DERIVED namespace (slug form), not just a literal match", async () => {
+    // deriveNamespace("brave-search") === "bravesearch": the second candidate.
+    // If the gate only checked the literal target, the slug form would delete
+    // with no confirmation at all.
+    await upsertUserBundle(
+      { namespace: "bravesearch", name: "Brave Search", command: "npx", args: ["-y", "pkg"], isActive: true },
+      { home: synthHome },
+    );
+    const before = bytes();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "brave-search",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.text()).toMatch(/namespace: bravesearch/);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
+  it("gates an entry validateEntry would DROP but removeUserBundle would still delete", async () => {
+    // The lookup runs on the RAW servers for exactly this case: an entry the
+    // loader rejects (no command / no url) is invisible to a validated preview,
+    // yet removeUserBundle filters by namespace string and would delete it. A
+    // validated lookup would let it through the gate unconfirmed.
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(bundlesPath(), JSON.stringify({ version: 1, servers: [{ namespace: "broken", name: "Broken" }] }));
+    const before = bytes();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "broken",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
+  // ----- what must NOT change: the no-op path stays ungated ----------------
+
+  it("still no-ops at exit 0 off a TTY when the target is absent (unchanged behaviour)", async () => {
+    await addFetch();
+    const before = bytes();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "does-not-exist",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/nothing to do/);
+    expect(io.errText()).not.toMatch(/not a TTY/);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
+  it("still no-ops at exit 0 off a TTY when there is no bundles.json at all", async () => {
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/nothing to do/);
+  });
+
+  it("still reports a malformed bundles.json as an error rather than a silent no-op", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(bundlesPath(), "{ not json");
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // An unparseable file is "uncertain", so the gate steps aside and the write
+    // path reports it -- the pre-existing exit 1 + message, not a bogus refusal.
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toMatch(/could not be parsed/);
   });
 });
 
@@ -710,6 +1012,7 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
       target: "fetch",
       home: synthHome,
       cwd: synthCwd,
+      force: true,
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
     });

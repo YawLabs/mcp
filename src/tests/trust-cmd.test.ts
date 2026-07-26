@@ -9,7 +9,7 @@
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -603,7 +603,10 @@ describe("the preview says which entries execute content the hash does not cover
   it("stays quiet for an absolute command with no repo-relative arguments", async () => {
     writeBundles(synthCwd, {
       version: 1,
-      servers: [{ namespace: "abs", name: "Abs", command: join("C:", "opt", "mcp", "serve"), args: ["--port", "7"] }],
+      // join(sep, ...) not join("C:", ...): the latter is rooted on win32 but on
+      // POSIX it is just a RELATIVE path containing slashes, which inRepoTokens
+      // correctly flags -- so the old fixture made this assertion win32-only.
+      servers: [{ namespace: "abs", name: "Abs", command: join(sep, "opt", "mcp", "serve"), args: ["--port", "7"] }],
     });
     const io = captureIO();
     await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });

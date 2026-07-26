@@ -15,16 +15,26 @@
 // Terminal app use (catalog.ts), so a slug that works as an "Add to Yaw MCP"
 // button works here too.
 
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline/promises";
 import { type FetchCatalog, resolveCatalogSlug } from "./catalog.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import {
   deriveNamespace,
   findShadowingProjectBundles,
   loadLocalBundles,
+  localBundlesPath,
   removeUserBundle,
   upsertUserBundle,
 } from "./local-bundles.js";
+import { userConfigDir } from "./paths.js";
+// The removal preview renders command / args / url / name straight out of
+// bundles.json immediately above a [y/N] prompt, so it needs the same
+// control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
+// a second hand-rolled copy of that escape logic would drift from the one
+// trust-cmd's tests actually cover.
+import { displayArg, displaySafe } from "./trust-cmd.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -270,11 +280,18 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
 
 // --- remove -----------------------------------------------------------------
 
-export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace>
+export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
 
   Remove a server from your local ~/.yaw-mcp/bundles.json. Accepts either the
   catalog slug it was added with (e.g. "brave-search") or its namespace as
-  shown by \`yaw-mcp list\` (e.g. "bravesearch"). No-op if it isn't present.`;
+  shown by \`yaw-mcp list\` (e.g. "bravesearch"). No-op if it isn't present.
+
+  Dropping an entry also drops any env value stored on it, so when there IS
+  something to remove you are shown the server -- namespace, name, and the
+  command or url it launches -- and asked to confirm. A bare Enter is NO.
+
+  --force, -y, --yes  Skip the confirmation. Required when stdin or stdout
+                      is not a TTY (there is nothing to ask on).`;
 
 // slug (dashes) or namespace (underscores) shape -- the two forms a user might
 // pass to remove.
@@ -282,10 +299,18 @@ const REMOVE_TARGET_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 export interface RemoveCommandOptions {
   target?: string;
+  /** Skip the destructive-action confirmation. Required off a TTY. */
+  force?: boolean;
   home?: string;
   cwd?: string;
   out?: (s: string) => void;
   err?: (s: string) => void;
+  /** Test hook: override the TTY verdict instead of reading process.std*. */
+  isTTY?: boolean;
+  /** Test hook: answer the confirmation without a real TTY read. */
+  promptAnswer?: string;
+  /** Test hook: replaces process.stdin/stdout for the interactive prompt. */
+  io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream };
 }
 
 export function parseRemoveArgs(
@@ -293,15 +318,158 @@ export function parseRemoveArgs(
 ): { ok: true; options: RemoveCommandOptions } | { ok: false; error: string; help?: boolean } {
   if (argv.length === 0) return { ok: false, error: REMOVE_USAGE };
   const positional: string[] = [];
+  const opts: RemoveCommandOptions = {};
   for (const a of argv) {
     if (a === "-h" || a === "--help") return { ok: false, error: REMOVE_USAGE, help: true };
-    if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${REMOVE_USAGE}` };
+    // --force is the name `secrets remove` uses; -y / --yes is the name `trust`
+    // uses. Both siblings gate a destructive write, so both spellings are
+    // accepted here rather than making the user remember which verb took which.
+    if (a === "--force" || a === "--yes" || a === "-y") {
+      opts.force = true;
+      continue;
+    }
+    // Single dash included, not just "--": now that -y is a real flag, a
+    // mistyped short flag must be reported as an unknown flag instead of
+    // becoming the removal TARGET. (No valid target starts with "-";
+    // REMOVE_TARGET_RE requires a leading alphanumeric.)
+    if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${REMOVE_USAGE}` };
     positional.push(a);
   }
   if (positional.length !== 1) {
     return { ok: false, error: `Expected exactly one slug or namespace.\n${REMOVE_USAGE}` };
   }
-  return { ok: true, options: { target: positional[0] } };
+  opts.target = positional[0];
+  return { ok: true, options: opts };
+}
+
+// --- removal confirmation ---------------------------------------------------
+//
+// `remove` was the only destructive verb in the CLI with no gate: it deleted
+// the entry on a TTY and off it alike. It now follows the idiom its siblings
+// already set -- `secrets remove` (confirm on a TTY, refuse off one without
+// --force) and `trust` (isTTY + promptAnswer test hooks, bare Enter = NO).
+//
+// The gate fires ONLY when something is actually going to be deleted. A target
+// that isn't in the file, or no file at all, stays the exit-0 "nothing to do"
+// no-op it has always been -- refusing to no-op off a TTY would break cleanup
+// scripts for no safety gain.
+
+/** Enough of the doomed entry to show the user WHAT they are dropping. A slug
+ *  alone would teach them to hit `y` without reading. */
+interface RemovalTarget {
+  namespace: string;
+  name: string;
+  /** Rendered launch line ("$ npx -y pkg" / "HTTP https://...") . */
+  launch: string;
+  /** env KEY names only -- never values; bundles.json env can hold secrets. */
+  envKeys: string[];
+}
+
+/**
+ * Which candidate namespace is really present in the user-global bundles.json,
+ * plus the fields the preview renders.
+ *
+ * `certain` distinguishes "definitely nothing to remove" (no file, or the file
+ * parsed and held no match) from "could not tell" (unreadable / malformed).
+ * Only a `certain` miss may skip the gate: an uncertain one falls through to
+ * removeUserBundle, which throws on exactly those files and surfaces the same
+ * error `remove` has always printed for them.
+ *
+ * Matching is done on the RAW parsed servers, deliberately NOT through
+ * previewBundlesContent: that runs validateEntry, which DROPS malformed
+ * entries, while removeUserBundle filters raw entries by namespace string. An
+ * entry validateEntry rejects is still one removeUserBundle deletes, so a
+ * validated lookup would let it be deleted with no confirmation at all.
+ */
+async function findRemovalTarget(
+  candidates: string[],
+  home: string,
+): Promise<{ found: RemovalTarget | null; certain: boolean }> {
+  const path = localBundlesPath(userConfigDir(home));
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (e) {
+    // No file at all: nothing to remove, and that is a certainty.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { found: null, certain: true };
+    return { found: null, certain: false };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { found: null, certain: false };
+  }
+  if (typeof parsed !== "object" || parsed === null) return { found: null, certain: false };
+  const servers = (parsed as { servers?: unknown }).servers;
+  if (!Array.isArray(servers)) return { found: null, certain: false };
+
+  for (const ns of candidates) {
+    // Same predicate as doRemoveUserBundle's filter (s?.namespace !== ns), so
+    // the preview can never disagree with what the write actually deletes.
+    const hit = servers.find((s) => (s as { namespace?: unknown } | null)?.namespace === ns) as Record<
+      string,
+      unknown
+    > | null;
+    if (!hit) continue;
+    const name = typeof hit.name === "string" && hit.name.length > 0 ? hit.name : "(unnamed)";
+    const env = typeof hit.env === "object" && hit.env !== null ? (hit.env as Record<string, unknown>) : {};
+    return { found: { namespace: ns, name, launch: renderLaunch(hit), envKeys: Object.keys(env) }, certain: true };
+  }
+  return { found: null, certain: true };
+}
+
+/** How the entry would be launched, as one reviewable line. Mirrors
+ *  trust-cmd's renderLaunch, but reads an UNVALIDATED raw entry (see
+ *  findRemovalTarget) so every field is type-checked before use. */
+function renderLaunch(entry: Record<string, unknown>): string {
+  const command = typeof entry.command === "string" ? entry.command : "";
+  const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+  const parts = [command, ...args].filter((p) => p.length > 0);
+  // Args containing whitespace or quotes are quoted, so `sh -c "curl ... | sh"`
+  // reads as the single argument it really is instead of blending into the line.
+  if (parts.length > 0) return `$ ${parts.map(displayArg).join(" ")}`;
+  const url = typeof entry.url === "string" ? entry.url : "";
+  return url.length > 0 ? `HTTP ${displaySafe(url)}` : "(no command)";
+}
+
+/** Render the doomed entry. Shared by the TTY prompt and the off-TTY refusal:
+ *  a scripted run gets to see what it WOULD have removed before being told
+ *  which flag to re-run with (same courtesy as `yaw-mcp trust`). */
+function printRemovalPreview(print: (s?: string) => void, path: string, t: RemovalTarget): void {
+  print("");
+  print(`  Remove from ${displaySafe(path)}:`);
+  print("");
+  print(`    namespace: ${t.namespace}`);
+  print(`    name:      ${displaySafe(t.name)}`);
+  print(`    launch:    ${t.launch}`);
+  if (t.envKeys.length > 0) print(`    env keys:  ${t.envKeys.map(displayArg).join(", ")}`);
+  print("");
+  print("  yaw-mcp will stop loading it. Any env value stored on the entry goes");
+  print("  with it -- re-adding the server will not bring those values back.");
+  print("");
+}
+
+/** Both ends must be a TTY: stdin to read the answer, stdout to show the
+ *  question. Mirrors trust-cmd.ts:isInteractive. */
+function isInteractive(opts: RemoveCommandOptions): boolean {
+  if (opts.isTTY !== undefined) return opts.isTTY;
+  if (opts.promptAnswer !== undefined) return true;
+  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+}
+
+/** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds, so
+ *  a bare Enter (or ^D, or a stray keystroke) leaves bundles.json untouched. */
+async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<string> {
+  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
+  const input = opts.io?.stdin ?? process.stdin;
+  const output = opts.io?.stdout ?? process.stdout;
+  const rl = createInterface({ input, output });
+  try {
+    return (await rl.question(question)).trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
 }
 
 export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandResult> {
@@ -328,6 +496,38 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // so it would mangle an underscore namespace; that's why the literal goes first.
   const derived = deriveNamespace(opts.target);
   const candidates = derived === opts.target ? [opts.target] : [opts.target, derived];
+
+  // ----- destructive-action confirmation --------------------------------
+  // Gated on there being something to delete (see findRemovalTarget): a miss
+  // or an unreadable/malformed file skips straight to the loop below, which
+  // keeps the exit-0 no-op and the existing parse-error message intact.
+  //
+  // The preview is not re-checked after the answer the way `trust` re-hashes
+  // the file it is approving. That check exists there because approval grants
+  // EXECUTION authority to content a repo controls; here the file is the
+  // user's own, the write below re-reads it anyway, and the worst case of a
+  // concurrent edit is an entry `yaw-mcp add` puts straight back.
+  if (!opts.force) {
+    const lookup = await findRemovalTarget(candidates, home);
+    if (lookup.found) {
+      printRemovalPreview(print, localBundlesPath(userConfigDir(home)), lookup.found);
+      if (!isInteractive(opts)) {
+        // Exit 2, matching `secrets remove`'s off-TTY refusal: a required flag
+        // is missing, which is this CLI's usage-error code. (A DECLINED prompt
+        // is exit 1 below -- the argv was fine, the user said no.)
+        printErr(
+          `yaw-mcp remove: refusing to remove "${lookup.found.namespace}" without a confirmation -- stdin/stdout is not a TTY.`,
+        );
+        printErr("  Re-run with --force (or -y) to remove it.");
+        return { exitCode: 2, written: [] };
+      }
+      const answer = await askYesNo(opts, `  Remove "${lookup.found.namespace}"? [y/N] `);
+      if (answer !== "y" && answer !== "yes") {
+        printErr("yaw-mcp remove: Aborted. Nothing was removed.");
+        return { exitCode: 1, written: [] };
+      }
+    }
+  }
 
   let res: Awaited<ReturnType<typeof removeUserBundle>> | null = null;
   let matched = "";

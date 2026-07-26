@@ -278,7 +278,9 @@ if (subcommand === "compliance") {
                              your local ~/.yaw-mcp/bundles.json so yaw-mcp loads
                              it. Pass required env with --env KEY=value.
     remove <slug>            Remove a server (by slug or namespace) from
-                             bundles.json.
+                             bundles.json. Shows the server and the command it
+                             launches, then confirms; --force skips the prompt
+                             (and is required when there is no TTY to ask on).
     list                     List the servers yaw-mcp loads locally.
     trust                    Approve this project's .yaw-mcp/bundles.json so
                              yaw-mcp loads it. A project file is usually

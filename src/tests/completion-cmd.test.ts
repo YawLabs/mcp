@@ -331,6 +331,14 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     expect(secrets?.flags).not.toContain("--replace");
     expect(secrets?.flags).not.toContain("--push");
   });
+
+  it("keeps the remove entry in sync with parseRemoveArgs (--force / --yes completable)", () => {
+    const remove = SUBCOMMAND_SPEC.find((s) => s.name === "remove");
+    expect(remove).toBeDefined();
+    // `remove` confirms on a TTY and REFUSES off one, so --force is the only
+    // way to script it -- a user who cannot tab it will not discover it.
+    expect(remove?.flags).toEqual(expect.arrayContaining(["--force", "--yes", "--help"]));
+  });
 });
 
 describe("runCompletion", () => {
