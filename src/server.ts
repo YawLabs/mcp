@@ -9,7 +9,6 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
@@ -37,7 +36,6 @@ import {
   formatHealthWarning,
   healthFactor,
 } from "./health-score.js";
-import { initHeartbeat, reportHeartbeat } from "./heartbeat.js";
 import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
 import { LearningStore } from "./learning.js";
@@ -66,7 +64,6 @@ import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
 import { type RankableServer, rankServers, tokenize } from "./relevance.js";
-import { initRerank, rerank } from "./rerank.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
   firstResultText,
@@ -75,7 +72,6 @@ import {
   isRewardGraderEnabled,
   isUncertainReward,
 } from "./reward-grader.js";
-import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
 import {
   bestOfNViaSampling,
   buildCandidates,
@@ -85,7 +81,6 @@ import {
 } from "./sampling-rank.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
-import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
@@ -296,14 +291,6 @@ export class ConnectServer {
   private config: ConnectConfig | null = null;
   private configVersion: string | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
-  // Captures the AI client's Implementation block once the first MCP
-  // `initialize` lands (see this.server.oninitialized). Non-null means a
-  // client is attached. The per-poll heartbeat refresh reuses these
-  // exact values so its upsert always targets the same
-  // (accountId, clientName) key the attach beacon created; re-reading
-  // getClientVersion() per poll risked a transient undefined becoming a
-  // split-brain 'unknown' row on the backend.
-  private attachedClient: { name?: string; version?: string } | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -473,10 +460,8 @@ export class ConnectServer {
   }
 
   /** True when no token was resolved at startup. In local mode the
-   *  config source is `~/.yaw-mcp/bundles.json` and all backend POSTs
-   *  (analytics, heartbeat, rerank, runtime-detect, tool-report,
-   *  /api/connect/install, /api/connect/import) are skipped or return
-   *  a clear error. */
+   *  config source is `~/.yaw-mcp/bundles.json` rather than the
+   *  backend config endpoint. */
   private get localMode(): boolean {
     return this.token === null;
   }
@@ -722,22 +707,6 @@ export class ConnectServer {
       }
     }
 
-    // Backend telemetry only when an account is attached. The init
-    // functions store apiUrl + token in module state; later report*
-    // calls short-circuit when either is empty, so skipping the inits
-    // here makes every downstream telemetry call a no-op in local mode.
-    if (!this.localMode) {
-      initAnalytics(this.apiUrl, this.token as string);
-      initToolReport(this.apiUrl, this.token as string);
-      initRerank(this.apiUrl, this.token as string);
-      initRuntimeDetect(this.apiUrl, this.token as string);
-      initHeartbeat(this.apiUrl, this.token as string);
-      // Background runtime probe -- fire-and-forget, the dashboard just
-      // ignores stale snapshots. Subsequent reports happen on each new
-      // yaw-mcp startup, which is sufficient for "what runtimes are
-      // installed" since it changes rarely.
-      reportRuntimes().catch((err: Error) => log("warn", "reportRuntimes failed", { error: err?.message }));
-    }
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
     // awaits the same in-flight promise rather than triggering a
@@ -748,24 +717,6 @@ export class ConnectServer {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
 
-    // Fire-once stage-4b beacon: the MCP SDK invokes `oninitialized`
-    // after the parent client (Claude Code, Cursor, etc.) completes
-    // the initialize handshake. We pull clientInfo from the SDK
-    // (getClientVersion returns the Implementation block from the
-    // initialize request) and POST it to /api/connect/heartbeat. Set
-    // BEFORE server.connect so the assignment can't race the first
-    // initialize on a fast client. Fire-and-forget — failure is
-    // telemetry loss, never a CLI-blocking error.
-    this.server.oninitialized = (): void => {
-      const info = this.server.getClientVersion();
-      // Capture once; the poll-loop refresh reuses these exact values so
-      // the beacon and the refresh never disagree on the upsert key.
-      this.attachedClient = { name: info?.name, version: info?.version };
-      reportHeartbeat(info?.name, info?.version).catch((err: Error) =>
-        log("warn", "reportHeartbeat failed", { error: err?.message }),
-      );
-    };
-
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
 
@@ -775,7 +726,7 @@ export class ConnectServer {
     // invisible in tools/list because getDeferredServers() filters on
     // toolCache presence. That breaks the "I toggled it on in the
     // dashboard and it disappeared" user experience. Pre-warm each one
-    // in the background: activate → reportTools persists the tool set
+    // in the background: activate → populate the in-memory toolCache
     // → disconnect so we're not holding 9 upstream processes idle.
     // Fire-and-forget so this doesn't gate transport readiness.
     this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
@@ -896,10 +847,9 @@ export class ConnectServer {
               return;
             }
             this.prewarmNamespaces.delete(server.namespace);
-            // Immediately disconnect — toolCache is already in
-            // this.toolCache and reportTools persisted it upstream,
-            // so getDeferredServers() surfaces the server without
-            // us holding the upstream process alive.
+            // Immediately disconnect — the tool list is already in
+            // this.toolCache, so getDeferredServers() surfaces the
+            // server without us holding the upstream process alive.
             const conn = this.connections.get(server.namespace);
             if (conn) {
               await disconnectFromUpstream(conn).catch(() => {});
@@ -964,7 +914,6 @@ export class ConnectServer {
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const progress = createProgressReporter(extra);
     if (name === META_TOOLS.discover.name) {
-      recordConnectEvent({ namespace: null, toolName: null, action: "discover", latencyMs: null, success: true });
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
       // calling tools. Ambiguous queries fall through to the manual list.
@@ -976,7 +925,6 @@ export class ConnectServer {
       // Per-call override of the routing effort dial (off|auto|aggressive);
       // falls back to YAW_MCP_ROUTE_EFFORT when absent. See sampling-rank.ts.
       const routeEffort = typeof args.routeEffort === "string" ? args.routeEffort : undefined;
-      recordConnectEvent({ namespace: null, toolName: null, action: "activate", latencyMs: null, success: true });
       return this.attachGuideNudge(await this.handleDispatch(intent, budget, progress, routeEffort));
     }
     if (name === META_TOOLS.activate.name) {
@@ -991,83 +939,35 @@ export class ConnectServer {
           ? (args.tools as string[])
           : undefined;
       const result = await this.handleActivate(namespaces, progress, toolsFilter);
-      const category = result.isError ? classifyError(result.content?.[0]?.text) : undefined;
-      for (const ns of namespaces) {
-        recordConnectEvent({
-          namespace: ns,
-          toolName: null,
-          action: "activate",
-          latencyMs: null,
-          success: !result.isError,
-          errorCategory: category,
-        });
-      }
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.deactivate.name) {
       const namespaces = resolveNamespaces(args);
       const result = await this.handleDeactivate(namespaces);
-      const category = result.isError ? classifyError(result.content?.[0]?.text) : undefined;
-      for (const ns of namespaces) {
-        recordConnectEvent({
-          namespace: ns,
-          toolName: null,
-          action: "deactivate",
-          latencyMs: null,
-          success: !result.isError,
-          errorCategory: category,
-        });
-      }
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.health.name) {
-      recordConnectEvent({ namespace: null, toolName: null, action: "health", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleHealth());
     }
     if (name === META_TOOLS.read_tool.name) {
       const serverArg = typeof args.server === "string" ? args.server : "";
       const toolArg = typeof args.tool === "string" ? args.tool : "";
       const result = await this.handleReadTool(serverArg, toolArg, progress);
-      recordConnectEvent({
-        namespace: serverArg || null,
-        toolName: toolArg || null,
-        action: "read_tool",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.suggest.name) {
-      recordConnectEvent({ namespace: null, toolName: null, action: "suggest", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleSuggest());
     }
     if (name === META_TOOLS.exec.name) {
       const result = await this.handleExec(args);
-      recordConnectEvent({
-        namespace: null,
-        toolName: null,
-        action: "exec",
-        latencyMs: null,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
       const action = args.action === "match" ? "match" : "list";
-      recordConnectEvent({ namespace: null, toolName: null, action: "bundles", latencyMs: null, success: true });
       return this.attachGuideNudge(this.handleBundles(action));
     }
     if (name === META_TOOLS.secrets.name) {
       const serverArg = typeof args.server === "string" ? args.server : undefined;
-      recordConnectEvent({
-        namespace: serverArg ?? null,
-        toolName: null,
-        action: "secrets",
-        latencyMs: null,
-        success: true,
-      });
       return this.attachGuideNudge(await this.handleSecretsReport(serverArg));
     }
 
@@ -1236,72 +1136,25 @@ export class ConnectServer {
         }
       }
 
-      recordConnectEvent({
-        namespace: route.namespace,
-        toolName: route.originalName,
-        action: "tool_call",
-        latencyMs,
-        success: !result.isError,
-        errorCategory: result.isError ? classifyError(result.content?.[0]?.text) : undefined,
-      });
-
       // Prune the response before it hits the LLM. Rules are
       // conservative (drop null / undefined / empty collections,
       // collapse runs of blank lines) so we trim obvious dead weight
       // without changing meaning. Disable with YAW_MCP_PRUNE_RESPONSES=0
       // if a caller needs the exact upstream bytes through.
+      //
+      // Error responses skip pruning entirely — the text IS the error
+      // message, and stripping nulls or collapsing whitespace could
+      // obscure it.
       if (!result.isError && Array.isArray(result.content)) {
         try {
           const pr = pruneContent(result.content as Content[]);
           // Only swap in the pruned body when it's actually smaller,
           // per the MIN_SAVINGS_RATIO check inside pruneContent.
           if (pr.bytesPruned < pr.bytesRaw) result.content = pr.content;
-          try {
-            const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-            recordDispatchEvent({
-              scope: "connect",
-              serverId: null,
-              toolName: route.originalName,
-              requestBytes: argsBytes,
-              responseBytesRaw: pr.bytesRaw,
-              responseBytesPruned: pr.bytesPruned,
-            });
-          } catch {
-            // JSON.stringify can throw on cyclic structures — telemetry
-            // is strictly best-effort, never fail the tool call for it.
-          }
         } catch (err: any) {
-          // Pruner should never throw, but if it does, fall back to the
-          // pre-F1 telemetry path so the dispatch event still lands.
+          // Pruner should never throw; if it does, pass the upstream
+          // content through untouched rather than failing the call.
           log("warn", "pruneContent failed", { error: err?.message });
-          try {
-            const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-            const resultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
-            recordDispatchEvent({
-              scope: "connect",
-              serverId: null,
-              toolName: route.originalName,
-              requestBytes: argsBytes,
-              responseBytesRaw: resultBytes,
-            });
-          } catch {}
-        }
-      } else {
-        // Error responses skip pruning — the text IS the error message,
-        // stripping nulls or collapsing whitespace could obscure it.
-        try {
-          const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
-          const resultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
-          recordDispatchEvent({
-            scope: "connect",
-            serverId: null,
-            toolName: route.originalName,
-            requestBytes: argsBytes,
-            responseBytesRaw: resultBytes,
-          });
-        } catch {
-          // JSON.stringify can throw on cyclic structures — telemetry
-          // is strictly best-effort, never fail the tool call for it.
         }
       }
       // Cross-session learning signal — GRADED, not binary. recordOutcome
@@ -1385,62 +1238,22 @@ export class ConnectServer {
     };
   }
 
-  // BM25 first-stage cap — wider than the budget so the semantic rerank
-  // has room to promote a server that BM25 missed on lexical grounds.
-  // 25 is comfortably under the /api/connect/rerank candidate cap (50)
-  // while leaving real reordering room.
+  // BM25 shortlist cap — wider than the budget so downstream re-sorts
+  // (health penalty, learning boost, sampling tiebreak) have room to
+  // promote a server BM25 ranked below the head of the list.
   private static readonly BM25_TOP_K = 25;
 
-  // Two-stage ranking: local BM25 to shortlist candidates, then a call
-  // to /api/connect/rerank for semantic reordering. When rerank is
-  // unavailable (no Voyage key on the backend, network hiccup, timeout,
-  // empty response), fall back silently to the BM25 order — rerank is
-  // an optimization, not a requirement.
+  // Local BM25 ranking over the profiled active servers. Shared by
+  // discover's auto-warm gate and dispatch so both pick the same winner
+  // for the same intent.
   private async twoStageRank(
     context: string,
     servers: UpstreamServerConfig[],
-  ): Promise<Array<{ namespace: string; score: number; hasRerank: boolean }>> {
+  ): Promise<Array<{ namespace: string; score: number }>> {
     const bm25Input = servers.map((s) => this.rankableFor(s));
     const bm25 = rankServers(context, bm25Input);
     if (bm25.length === 0) return [];
-
-    const shortlist = bm25.slice(0, ConnectServer.BM25_TOP_K);
-    const idByNamespace = new Map(servers.map((s) => [s.namespace, s.id]));
-    const candidateIds = shortlist
-      .map((r) => idByNamespace.get(r.namespace))
-      .filter((id): id is string => typeof id === "string" && id.length > 0);
-    if (candidateIds.length === 0) return shortlist.map((r) => ({ ...r, hasRerank: false }));
-
-    const rerankResults = await rerank(context, candidateIds);
-    if (!rerankResults) return shortlist.map((r) => ({ ...r, hasRerank: false }));
-
-    // Map id → namespace so we can reorder the BM25 shortlist by the
-    // rerank scores. Any BM25 candidate missing from rerank output
-    // (e.g., not yet embedded) falls back to its BM25 score but sorts
-    // after reranked winners.
-    const namespaceById = new Map(servers.map((s) => [s.id, s.namespace]));
-    const rerankScoreByNamespace = new Map<string, number>();
-    for (const r of rerankResults) {
-      const ns = namespaceById.get(r.id);
-      if (ns) rerankScoreByNamespace.set(ns, r.score);
-    }
-
-    const reordered: Array<{ namespace: string; score: number; hasRerank: boolean }> = [];
-    for (const item of shortlist) {
-      const s = rerankScoreByNamespace.get(item.namespace);
-      reordered.push({
-        namespace: item.namespace,
-        score: s ?? item.score,
-        hasRerank: s !== undefined,
-      });
-    }
-    reordered.sort((a, b) => {
-      // Reranked entries always sort above non-reranked (no mixing
-      // comparison between a cosine similarity and a BM25 score).
-      if (a.hasRerank !== b.hasRerank) return a.hasRerank ? -1 : 1;
-      return b.score - a.score;
-    });
-    return reordered;
+    return bm25.slice(0, ConnectServer.BM25_TOP_K);
   }
 
   // Auto-warm confidence gate — applied to discover(context) so a single
@@ -1451,15 +1264,11 @@ export class ConnectServer {
   // than a static initializer, which would latch the value at import.
   //
   // Top score must clear this floor AND the gap over the runner-up must
-  // be convincing before we auto-activate. Values are scale-dependent --
-  // BM25 scores are unbounded positive numbers, rerank cosines are in
-  // [0, 1] -- so we keep separate thresholds and pick based on whether
-  // the top entry was reranked. Tuned by intuition; revisit when we
-  // have real usage data.
+  // be convincing before we auto-activate. BM25 scores are unbounded
+  // positive numbers. Tuned by intuition; revisit when we have real
+  // usage data.
   private static readonly AUTO_ACTIVATE_MIN_SCORE_BM25 = 1.0;
   private static readonly AUTO_ACTIVATE_MARGIN_BM25 = 1.3;
-  private static readonly AUTO_ACTIVATE_MIN_SCORE_COSINE = 0.5;
-  private static readonly AUTO_ACTIVATE_MARGIN_COSINE = 1.25;
 
   // Below this installed-server count, discover() appends a one-line
   // marketplace pointer so sparse-config users see where to add more.
@@ -1480,25 +1289,18 @@ export class ConnectServer {
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) return this.handleDiscover(context);
 
-    // Use the same two-stage ranker dispatch uses so discover + dispatch
-    // pick the same winner for the same intent. BM25 shortlists locally;
-    // the backend cosines the shortlist against stored embeddings. When
-    // rerank is unavailable this silently falls back to BM25-only.
+    // Use the same ranker dispatch uses so discover + dispatch pick the
+    // same winner for the same intent.
     const ranked = await this.twoStageRank(context, activeServers);
     if (ranked.length === 0) return this.handleDiscover(context);
 
     // Only auto-warm if one candidate dominates: top score clears the
     // floor and either stands alone or beats the runner-up by the
-    // margin. Use scale-appropriate thresholds -- without this, the
-    // BM25-tuned floor (1.0) would essentially never fire when rerank
-    // is up (cosines in [0, 1]), so discover and dispatch would silently
-    // pick different winners depending on backend mode.
+    // margin.
     const top = ranked[0];
     const second = ranked[1];
-    const minScore = top?.hasRerank
-      ? ConnectServer.AUTO_ACTIVATE_MIN_SCORE_COSINE
-      : ConnectServer.AUTO_ACTIVATE_MIN_SCORE_BM25;
-    const margin = top?.hasRerank ? ConnectServer.AUTO_ACTIVATE_MARGIN_COSINE : ConnectServer.AUTO_ACTIVATE_MARGIN_BM25;
+    const minScore = ConnectServer.AUTO_ACTIVATE_MIN_SCORE_BM25;
+    const margin = ConnectServer.AUTO_ACTIVATE_MARGIN_BM25;
     const topWinsDecisively =
       top !== undefined &&
       top.score >= minScore &&
@@ -1517,9 +1319,8 @@ export class ConnectServer {
     }
 
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
-    // banner below must name the server twoStageRank picked, and the
-    // list it renders is sorted by BM25 alone (no rerank), so its head
-    // can be a different namespace entirely.
+    // banner below must name the server twoStageRank picked, which is
+    // not necessarily the head of the list the output renders.
     return this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
   }
 
@@ -1904,7 +1705,7 @@ export class ConnectServer {
 
   // Activate a single server by namespace. Shared by handleActivate,
   // handleDispatch, and handleDiscoverWithAutoWarm so error handling,
-  // retries, caching, and tool-report round-trips live in one place.
+  // retries, and caching live in one place.
   //
   // Dedup guarantee: two concurrent callers for the same namespace
   // share one in-flight activation. Without this, a tool call landing
@@ -2085,14 +1886,6 @@ export class ConnectServer {
           this.idleCallCounts.set(namespace, 0);
           const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
           this.toolCache.set(namespace, toolMeta);
-
-          // Persist the tool list so inactive servers can still be ranked
-          // on cold starts. Fire-and-forget — failure is non-fatal.
-          if (toolMeta.length > 0) {
-            reportTools(serverConfig.id, toolMeta).catch((err: Error) =>
-              log("warn", "reportTools failed", { namespace, error: err?.message }),
-            );
-          }
 
           const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
@@ -2421,35 +2214,20 @@ export class ConnectServer {
     }
 
     progress?.(`Ranking ${activeServers.length} servers…`);
-    // Two-stage: local BM25 filters to a shortlist, /api/connect/rerank
-    // semantically reorders it via Voyage. Falls back to BM25 alone when
-    // rerank is off or times out, so dispatch is robust in every mode.
     const rankedRaw = await this.twoStageRank(trimmed, activeServers);
     // Apply health-aware penalty: recent activation failures and high
     // error rates shrink the score so dispatch prefers working servers
     // when multiple match. Never boosts above raw score — all else
     // equal, prefer the one that works.
-    // hasRerank rides along so the re-sort below can keep the two score
-    // scales apart. Without it a BM25 score (unbounded positive) could
-    // leapfrog a semantic-rerank winner (cosine in [0, 1]) purely on
-    // magnitude, silently undoing the reranked-first guarantee
-    // twoStageRank establishes.
     const ranked = rankedRaw
       .map((r) => ({
         namespace: r.namespace,
-        hasRerank: r.hasRerank,
         score:
           r.score *
           healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)) *
           this.learning.boostFactor(r.namespace),
       }))
-      .sort((a, b) => {
-        // Same rule as twoStageRank: reranked entries stay ahead of
-        // non-reranked ones; the health/learning penalty only reorders
-        // WITHIN a scale group, never across.
-        if (a.hasRerank !== b.hasRerank) return a.hasRerank ? -1 : 1;
-        return b.score - a.score;
-      });
+      .sort((a, b) => b.score - a.score);
 
     if (ranked.length === 0) {
       return {
@@ -2463,7 +2241,7 @@ export class ConnectServer {
       };
     }
 
-    // Sampling tiebreak: when BM25+rerank+health rank the top-2
+    // Sampling tiebreak: when BM25+health rank the top-2
     // candidates within a close margin, ask the client LLM to choose.
     // Uses the same model the user is already running — no extra
     // provider key, no extra cost from yaw-mcp's side. Silently skips if
@@ -2811,21 +2589,6 @@ export class ConnectServer {
         await this.fetchAndApplyConfig();
       } catch (err: any) {
         log("warn", "Config poll failed", { error: err.message });
-      }
-      // Liveness refresh: while an AI client is attached, re-report the
-      // heartbeat on every poll so the dashboard's 3-minute "AI client
-      // connected" window stays satisfied. The attach beacon in
-      // oninitialized fires only once; without this refresh the badge
-      // reverts to "no AI client connected" ~3 min into every session.
-      // isRefresh=true so the backend bumps last_seen_at without
-      // inflating initialize_count. yaw-mcp is a stdio child of the AI
-      // client, so when the client closes this loop dies with it and
-      // last_seen_at goes stale on schedule -- which is the desired
-      // "client disconnected" signal.
-      if (this.attachedClient) {
-        reportHeartbeat(this.attachedClient.name, this.attachedClient.version, true).catch((err: Error) =>
-          log("warn", "reportHeartbeat refresh failed", { error: err?.message }),
-        );
       }
       this.pollTimer = setTimeout(poll, intervalMs);
       if (this.pollTimer.unref) this.pollTimer.unref();
@@ -3470,8 +3233,6 @@ export class ConnectServer {
     if (this.persistenceReady) {
       await this.flushStateSave();
     }
-
-    await shutdownAnalytics();
 
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));

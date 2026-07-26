@@ -29,7 +29,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type AnalyticsFailure, getDroppedEventsCount, getLastAnalyticsFailure } from "./analytics.js";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -59,7 +58,6 @@ import { loadLocalBundles } from "./local-bundles.js";
 import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
-import { getLastReportFailure, type ReportFailure } from "./tool-report.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
   BINARY_DOWNLOAD_URL,
@@ -113,8 +111,8 @@ export interface DoctorOptions {
 //   - UPGRADE AVAILABLE's method-aware terminal hint is text-only; the JSON
 //     `upgrade` block carries the version facts but no install-method copy.
 // Everything else (CONFIG FILES, TOKEN, API BASE, ENVIRONMENT, STATE,
-// RELIABILITY, TRIALS, BACKGROUND POSTERS, INSTALLED CLIENTS, WARNINGS,
-// DIAGNOSIS) has a structured field below.
+// RELIABILITY, TRIALS, INSTALLED CLIENTS, WARNINGS, DIAGNOSIS) has a
+// structured field below.
 export interface DoctorJsonSnapshot {
   timestamp: string;
   version: string;
@@ -157,13 +155,16 @@ export interface DoctorJsonSnapshot {
     live: Array<{ slug: string; clientName: string; clientPath: string; msUntilExpiry: number }>;
     malformed: string[];
   };
-  // Background HTTP poster failure latches (analytics, tool-report). A
-  // non-null entry is the 401/403 token-lost-write-scope signal; both null
-  // is the healthy case. Mirrors the text path's BACKGROUND POSTERS section.
-  backgroundPosters: {
-    analytics: { statusCode: number; url: string; at: string } | null;
-    toolReport: { statusCode: number; url: string; at: string } | null;
-  };
+  // DEPRECATED — both members are always `null`. The background HTTP
+  // posters (analytics, tool-report) that populated this were removed with
+  // the hosted backend. The NESTED SHAPE is retained deliberately, not
+  // flattened to a bare `null`: the latches that fed it were in-process
+  // server state and `doctor` runs as a fresh process, so this block
+  // already emitted `{"analytics": null, "toolReport": null}` in practice.
+  // Keeping the object means `doctor --json` output is byte-identical for
+  // external consumers, including anyone reading `.backgroundPosters.analytics`
+  // — flattening to `null` would throw for them. Dropped in a later release.
+  backgroundPosters: { analytics: null; toolReport: null };
   // oam runtime visibility: whether the oam binary is usable (installed AND
   // >= minVersion), the config-level default, and the per-server effective
   // runtime for locally-defined servers (bundles.json). Mirrors the text
@@ -316,14 +317,6 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // hanging around). Best-effort: any sweep failure is logged via
   // try-cmd's debug logger; doctor itself never errors out on it.
   await renderTrialsSection({ home, env, print, postEvent: opts.postTryEvent, now: opts.now });
-
-  // Background HTTP posters (analytics, tool-report) fire-and-forget by
-  // design, but a 401/403 there means the user's token has lost write
-  // scope and their analytics is silently disappearing. Latches in the
-  // poster modules capture only the most recent rejection per module;
-  // the section is rendered ONLY when at least one latch is set so
-  // healthy installs stay quiet.
-  renderBackgroundPostersSection({ print });
 
   // Probe every supported client/scope combo on the current OS. Honor
   // CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
@@ -605,23 +598,10 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     })),
   };
 
-  // Background HTTP poster failure latches — same getters the text path's
-  // renderBackgroundPostersSection reads. A non-null entry is the
-  // 401/403 token-lost-write-scope signal.
-  const analyticsFailure = getLastAnalyticsFailure();
-  const reportFailure = getLastReportFailure();
-  const backgroundPosters: DoctorJsonSnapshot["backgroundPosters"] = {
-    analytics: analyticsFailure
-      ? {
-          statusCode: analyticsFailure.statusCode,
-          url: analyticsFailure.url,
-          at: new Date(analyticsFailure.at).toISOString(),
-        }
-      : null,
-    toolReport: reportFailure
-      ? { statusCode: reportFailure.statusCode, url: reportFailure.url, at: new Date(reportFailure.at).toISOString() }
-      : null,
-  };
+  // DEPRECATED key, emitted with its original nested shape (both members
+  // null) so `doctor --json` output is unchanged for consumers during the
+  // deprecation window. See DoctorJsonSnapshot.backgroundPosters.
+  const backgroundPosters: DoctorJsonSnapshot["backgroundPosters"] = { analytics: null, toolReport: null };
 
   // Mirrors the text path's hook handling (see runDoctor): an explicit
   // registryFetch bypasses the VITEST guard, and currentVersion overrides
@@ -920,51 +900,6 @@ async function renderTrialsSection(opts: {
   }
   for (const path of scan.malformed) {
     print(`  ! malformed marker at ${path} (delete by hand)`);
-  }
-  print("");
-}
-
-// Render the BACKGROUND POSTERS section -- only when at least one
-// latch is set. The point is to be silent when everything is working;
-// a healthy install must not see this header. Reads the latches via
-// the module getters (no cross-module circular: doctor depends on
-// analytics/tool-report, never the reverse). The "no recent failure"
-// row appears only alongside a sibling that DID fail, so the user can
-// tell which poster is broken vs. which is fine.
-//
-// KNOWN LIMITATION (by design, needs an owner decision before changing):
-// the latches read here are IN-PROCESS module state, set only by the
-// long-lived MCP server process. `yaw-mcp doctor` is a fresh short-lived
-// process that never posts anything, so both getters always return null and
-// this section is effectively unreachable from the CLI. Making it real means
-// either persisting the latches cross-process (a new file under
-// ~/.yaw-mcp/, with its own staleness + concurrency rules) or deleting the
-// section (text + the --json backgroundPosters block) outright. Both are
-// product calls, not cleanups -- do not "fix" this in passing.
-function renderBackgroundPostersSection(opts: { print: (s?: string) => void }): void {
-  const { print } = opts;
-  const analyticsFailure = getLastAnalyticsFailure();
-  const reportFailure = getLastReportFailure();
-  const dropped = getDroppedEventsCount();
-  if (!analyticsFailure && !reportFailure && dropped === 0) return;
-
-  const now = Date.now();
-  // statusCode 0 is the transport-failure sentinel (see tool-report.ts:
-  // ECONNREFUSED / DNS / timeout never produce an HTTP status). Rendering it
-  // as "HTTP 0 from <url>" reads as a bizarre server response; name it for
-  // what it is so the user looks at the network, not at the endpoint.
-  const fmt = (f: AnalyticsFailure | ReportFailure): string => {
-    const what = f.statusCode === 0 ? `network error reaching ${f.url}` : `HTTP ${f.statusCode} from ${f.url}`;
-    return `${what}, ${formatRelativeAge(now - f.at)} ago`;
-  };
-
-  print("BACKGROUND POSTERS (recent failures)");
-  print(`  analytics:    ${analyticsFailure ? fmt(analyticsFailure) : "(no recent failure)"}`);
-  print(`  tool-report:  ${reportFailure ? fmt(reportFailure) : "(no recent failure)"}`);
-  if (dropped > 0) {
-    print(
-      `  dropped:      ${dropped} analytics event${dropped === 1 ? "" : "s"} dropped (buffer full or non-retryable flush)`,
-    );
   }
   print("");
 }

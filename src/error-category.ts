@@ -1,17 +1,10 @@
-// Coarse classification of failed tool calls. Sent alongside
-// `success: false` analytics events so the Yaw MCP dashboard's
-// Recent failures table can show "12 unauthorized" instead of "(no
-// message)" 12 times.
+// Coarse classification of failed tool calls, so a failure can be
+// described by category ("unauthorized") rather than by raw error text.
 //
-// We deliberately don't ship the raw error text -- third-party MCP
-// servers routinely echo args/secrets in errors (URLs with api_key=
-// query params, request bodies, Python tracebacks containing locals)
-// and we have no general scrubber. See ConnectAnalyticsEvent in
-// analytics.ts for the original rationale.
-//
-// Keep this list in sync with mcp-hosting/src/lib/connect-error-categories.ts.
-// The backend drops anything outside that allowlist on ingest, so adding
-// a new category requires bumping both repos.
+// We deliberately never surface the raw error text alongside the
+// category -- third-party MCP servers routinely echo args/secrets in
+// errors (URLs with api_key= query params, request bodies, Python
+// tracebacks containing locals) and we have no general scrubber.
 
 export const ERROR_CATEGORIES = [
   "validation_error",

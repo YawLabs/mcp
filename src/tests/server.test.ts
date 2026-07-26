@@ -32,19 +32,6 @@ vi.mock("../config.js", async (importOriginal) => {
 });
 
 import { fetchConfig } from "../config.js";
-
-// recordDispatchEvent MUST be stubbed here: server.ts calls it on every
-// proxied tool call, and a missing export would throw a TypeError that the
-// production catch-all swallows -- the telemetry would silently never fire
-// and no test would notice.
-vi.mock("../analytics.js", () => ({
-  initAnalytics: vi.fn(),
-  recordConnectEvent: vi.fn(),
-  recordDispatchEvent: vi.fn(),
-  shutdownAnalytics: vi.fn().mockResolvedValue(undefined),
-}));
-
-import { recordDispatchEvent } from "../analytics.js";
 import { buildToolList } from "../proxy.js";
 import {
   ConnectServer,
@@ -873,21 +860,6 @@ describe("ConnectServer", () => {
       expect(second).toBe("");
     });
 
-    it("nudge output is NOT sent to analytics (local-only by construction)", async () => {
-      const { recordConnectEvent } = await import("../analytics.js");
-      const priv = getPrivate(server);
-      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
-      priv.installNudge = true;
-      primeHistory(server, HEAVY("tailscale"));
-
-      priv.handleDiscover();
-      // discover is read-only telemetry-wise; the nudge path adds no
-      // analytics event carrying history data.
-      const calls = vi.mocked(recordConnectEvent).mock.calls;
-      for (const [arg] of calls) {
-        expect(JSON.stringify(arg)).not.toContain("tailscale");
-      }
-    });
   });
 
   describe("per-tool load", () => {
@@ -1763,38 +1735,6 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toBe("Issue created");
       expect(conn.health.totalCalls).toBe(1);
       expect(conn.health.totalLatencyMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it("records a dispatch telemetry event for a proxied tool call", async () => {
-      // Guards the analytics mock as much as the code: server.ts calls
-      // recordDispatchEvent inside a try/catch, so an unstubbed export
-      // (TypeError) would be swallowed and the telemetry would silently
-      // stop firing. Assert the payload shape, not just the call.
-      const priv = getPrivate(server);
-      const conn = makeConnection("gh", ["create_issue"]);
-      conn.client.callTool = vi.fn().mockResolvedValue({
-        content: [{ type: "text", text: "Issue created" }],
-      });
-      priv.connections.set("gh", conn);
-      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-      priv.rebuildRoutes();
-
-      await priv.handleToolCall("gh_create_issue", { title: "test" });
-
-      expect(vi.mocked(recordDispatchEvent)).toHaveBeenCalledTimes(1);
-      const event = vi.mocked(recordDispatchEvent).mock.calls[0][0];
-      expect(event.scope).toBe("connect");
-      // The upstream's own tool name, not the namespaced alias.
-      expect(event.toolName).toBe("create_issue");
-      expect(event.requestBytes).toBe(Buffer.byteLength(JSON.stringify({ title: "test" }), "utf8"));
-      expect(event.responseBytesRaw).toBeGreaterThan(0);
-    });
-
-    it("meta-tool calls do NOT emit a dispatch telemetry event", async () => {
-      const priv = getPrivate(server);
-      priv.config = makeConfig([]);
-      await priv.handleToolCall("mcp_connect_discover", {});
-      expect(vi.mocked(recordDispatchEvent)).not.toHaveBeenCalled();
     });
 
     it("tracks error health on failed tool calls", async () => {

@@ -2,9 +2,8 @@
 //
 // Goal: strip obviously-dead weight from upstream responses before they
 // reach the LLM, so large tool outputs cost fewer tokens without
-// changing meaning. We measure bytes before and after and ship both
-// numbers to the backend (see analytics.ts::recordDispatchEvent) so the
-// dashboard can surface a "tokens saved" figure.
+// changing meaning. We measure bytes before and after so callers can
+// tell whether pruning actually paid for itself.
 //
 // The rules are intentionally narrow — pruning is on by default, so
 // anything that risks changing semantics is left alone:

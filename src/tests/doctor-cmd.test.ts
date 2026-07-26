@@ -9,21 +9,9 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// doctor reads the tool-report failure latch through this getter. The latch
-// is in-process module state that only the long-lived server sets, so it is
-// unreachable from a fresh CLI process -- mocking the getter is the only way
-// to exercise the BACKGROUND POSTERS renderer. Defaults to the healthy
-// (null) case so every other test in this file sees today's behaviour.
-vi.mock("../tool-report.js", () => ({
-  getLastReportFailure: vi.fn(() => null),
-  initToolReport: vi.fn(),
-  reportTools: vi.fn(),
-}));
-
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
-import { getLastReportFailure } from "../tool-report.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -350,59 +338,6 @@ describe("scanShellHistoryForShadows", () => {
     const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
     expect(hits[0].cli).toBe("npm");
     expect(hits[0].count).toBe(3);
-  });
-});
-
-describe("runDoctor — BACKGROUND POSTERS section", () => {
-  const latch = vi.mocked(getLastReportFailure);
-  afterEach(() => {
-    latch.mockReturnValue(null);
-  });
-
-  it("renders statusCode 0 as a network error, never 'HTTP 0'", async () => {
-    // tool-report.ts uses statusCode 0 as the transport-failure sentinel
-    // (ECONNREFUSED / DNS / timeout produce no HTTP status).
-    latch.mockReturnValue({ statusCode: 0, url: "https://yaw.sh/mcp/api/connect/servers/srv/tools", at: Date.now() });
-    const cap = captureOut();
-    await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-      skipRegistryCheck: true,
-    });
-    const txt = cap.text();
-    expect(txt).toContain("BACKGROUND POSTERS");
-    expect(txt).toMatch(/tool-report: {2}network error reaching https:\/\/yaw\.sh/);
-    expect(txt).not.toContain("HTTP 0");
-  });
-
-  it("still renders a real status code as HTTP <code>", async () => {
-    latch.mockReturnValue({ statusCode: 401, url: "https://yaw.sh/mcp/api/connect/servers/srv/tools", at: Date.now() });
-    const cap = captureOut();
-    await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-      skipRegistryCheck: true,
-    });
-    expect(cap.text()).toMatch(/tool-report: {2}HTTP 401 from https:\/\/yaw\.sh/);
-  });
-
-  it("stays silent when no poster has failed", async () => {
-    const cap = captureOut();
-    await runDoctor({
-      cwd: synthCwd,
-      home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
-      os: "linux",
-      out: cap.out,
-      skipRegistryCheck: true,
-    });
-    expect(cap.text()).not.toContain("BACKGROUND POSTERS");
   });
 });
 
@@ -1033,8 +968,14 @@ describe("runDoctor — --json", () => {
       skipRegistryCheck: true,
     });
     const parsed = JSON.parse(r.lines[0]);
-    // Healthy install: both present, trials empty, posters null.
     expect(parsed.trials).toEqual({ cleared: 0, live: [], malformed: [] });
+    // backgroundPosters is soft-deprecated: the posters that fed it are
+    // gone, but the key AND its nested shape must survive one minor so
+    // `doctor --json` output is byte-identical for external consumers.
+    // The latches were in-process server state and doctor is a fresh
+    // process, so this already emitted both members as null in practice —
+    // flattening to a bare `null` would break `.backgroundPosters.analytics`.
+    expect(Object.hasOwn(parsed, "backgroundPosters")).toBe(true);
     expect(parsed.backgroundPosters).toEqual({ analytics: null, toolReport: null });
   });
 

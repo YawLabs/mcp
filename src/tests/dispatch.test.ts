@@ -6,8 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Exercises the new BM25-ranked routing surface:
 //   mcp_connect_dispatch(intent, budget) — rank + activate top-N
 //   mcp_connect_discover(context)        — auto-warm a decisive winner
-//
-// Also pins tool-report integration (success path calls reportTools).
 // ═══════════════════════════════════════════════════════════════════════
 
 vi.mock("undici", () => ({
@@ -34,23 +32,7 @@ vi.mock("../config.js", async (importOriginal) => {
   };
 });
 
-// recordDispatchEvent MUST be stubbed: server.ts calls it on every proxied
-// tool call, and the production catch-all would swallow the TypeError a
-// missing export throws -- the telemetry would silently stop firing.
-vi.mock("../analytics.js", () => ({
-  initAnalytics: vi.fn(),
-  recordConnectEvent: vi.fn(),
-  recordDispatchEvent: vi.fn(),
-  shutdownAnalytics: vi.fn().mockResolvedValue(undefined),
-}));
-
-vi.mock("../tool-report.js", () => ({
-  initToolReport: vi.fn(),
-  reportTools: vi.fn().mockResolvedValue(undefined),
-}));
-
 import { ConnectServer } from "../server.js";
-import { reportTools } from "../tool-report.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream } from "../upstream.js";
 
@@ -221,28 +203,6 @@ describe("handleDispatch", () => {
     const result = await priv.handleDispatch("github issue", 1);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("GITHUB_TOKEN is required");
-  });
-
-  it("fires reportTools after a successful activation", async () => {
-    const priv = getPrivate(server);
-    priv.config = {
-      configVersion: "v1",
-      servers: [
-        makeServerConfig({
-          id: "gh-id",
-          namespace: "gh",
-          name: "GitHub",
-          description: "Repos and issues",
-        }),
-      ],
-    };
-    vi.mocked(connectToUpstream).mockResolvedValue(
-      makeConnection("gh", [{ name: "create_issue", description: "Create" }]),
-    );
-    await priv.handleDispatch("github issues", 1);
-    // Fire-and-forget — awaiting the microtask queue is enough
-    await new Promise((r) => setTimeout(r, 0));
-    expect(vi.mocked(reportTools)).toHaveBeenCalledWith("gh-id", [{ name: "create_issue", description: "Create" }]);
   });
 
   it("one winner loads, one is cap-refused -- result is not an error (isError undefined)", async () => {
@@ -444,10 +404,10 @@ describe("handleDiscoverWithAutoWarm", () => {
   });
 
   it("names the namespace it actually warmed, not the head of the BM25 list", async () => {
-    // The banner used to print sorted[0] from the BM25-only ranking the
-    // list rendering uses, while the server that got activated came from
-    // twoStageRank. When rerank promotes a different namespace the two
-    // disagree and the banner names a server that was never loaded.
+    // The banner used to print sorted[0] from the ranking the list
+    // rendering uses, while the server that got activated came from
+    // twoStageRank. When the two disagree the banner named a server that
+    // was never loaded.
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -460,9 +420,11 @@ describe("handleDiscoverWithAutoWarm", () => {
       makeConnection(cfg.namespace, [{ name: "create_issue" }]),
     );
     // Force the auto-warm winner to be "bravo" regardless of BM25 order.
+    // Scores are on the BM25 scale (unbounded positive) so they clear
+    // AUTO_ACTIVATE_MIN_SCORE_BM25 / _MARGIN_BM25.
     priv.twoStageRank = async () => [
-      { namespace: "bravo", score: 0.9, hasRerank: true },
-      { namespace: "alpha", score: 0.1, hasRerank: true },
+      { namespace: "bravo", score: 9.0 },
+      { namespace: "alpha", score: 1.0 },
     ];
 
     const result = await priv.handleDiscoverWithAutoWarm("issues");
