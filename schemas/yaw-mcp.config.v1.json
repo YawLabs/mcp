@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json",
   "title": "Yaw MCP CLI configuration (.yaw-mcp/config.json)",
-  "description": "Configuration file for the @yawlabs/mcp CLI (bin `yaw-mcp`), which manages MCP servers via the Yaw MCP registry. Resolved in precedence order (most-specific to least-specific): <project>/.yaw-mcp/config.local.json  >  <project>/.yaw-mcp/config.json  >  ~/.yaw-mcp/config.json. The project `.yaw-mcp/` directory is found by walking up from the current directory, stopping just before $HOME. Environment variables YAW_MCP_TOKEN and YAW_MCP_URL override file values. JSONC (comments) is permitted.",
+  "description": "Configuration file for the @yawlabs/mcp CLI (bin `yaw-mcp`), which loads MCP servers from your local ~/.yaw-mcp/bundles.json. Resolved in precedence order (most-specific to least-specific): <project>/.yaw-mcp/config.local.json  >  <project>/.yaw-mcp/config.json  >  ~/.yaw-mcp/config.json. The project `.yaw-mcp/` directory is found by walking up from the current directory, stopping just before $HOME. JSONC (comments) is permitted.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -18,14 +18,17 @@
     },
     "token": {
       "type": "string",
-      "pattern": "^mcp_pat_[A-Za-z0-9_-]+$",
-      "description": "Personal access token for Yaw MCP. SECURITY: must NOT appear in a committed project-scope .yaw-mcp/config.json. Only valid in ~/.yaw-mcp/config.json (user-global) or .yaw-mcp/config.local.json (machine-local, gitignored). The YAW_MCP_TOKEN environment variable overrides this value."
+      "deprecated": true,
+      "description": "DEPRECATED and ignored. yaw-mcp is local-only and no longer contacts a hosted API, so nothing reads this key. Delete it from your config, and revoke the PAT at its source -- deleting it here does not deactivate it. The property is retained (and its `mcp_pat_` pattern relaxed) only because this schema sets additionalProperties:false: removing it would mark every existing user config invalid."
     },
     "apiBase": {
       "type": "string",
-      "format": "uri",
-      "pattern": "^https?://",
-      "description": "Base URL of the Yaw MCP API. Default: https://yaw.sh/mcp. The YAW_MCP_URL environment variable overrides this value."
+      "deprecated": true,
+      "description": "DEPRECATED and ignored. yaw-mcp is local-only and no longer contacts a hosted API. Delete it from your config. Retained for the same additionalProperties:false reason as `token`."
+    },
+    "installNudge": {
+      "type": "boolean",
+      "description": "Opt in to the shadow-driven install nudge in `discover`: when a recent shell command is shadowed by an MCP server you have not installed, discover suggests it. Off unless explicitly true. Resolved most-specific-scope-wins (local > project > global). The YAW_MCP_INSTALL_NUDGE=1 environment variable enables it independently."
     },
     "servers": {
       "type": "array",
@@ -43,13 +46,12 @@
   "examples": [
     {
       "version": 1,
-      "apiBase": "https://yaw.sh/mcp",
       "servers": ["github", "filesystem"],
       "blocked": ["legacy-db"]
     },
     {
       "version": 1,
-      "token": "mcp_pat_aBcDeFgHiJkLmNoP"
+      "installNudge": true
     }
   ]
 }

@@ -300,8 +300,7 @@ if (subcommand === "compliance") {
 
   Other:
     compliance <target>      Run the 88-test compliance suite against an MCP
-                             server. --publish posts the report to
-                             yaw.sh/mcp and prints the public URL.
+                             server and print the grade.
     audit <namespace>        Run the compliance suite against a stdio server
                              from your bundles.json and cache its A-F grade in
                              ~/.yaw-mcp/grades.json (shown in \`servers\` + the
@@ -397,10 +396,10 @@ if (subcommand === "compliance") {
   } else {
     // Startup failure path. runServer() registers a last-resort
     // unhandledRejection handler (see below) BEFORE its first await, so a
-    // fatal startup rejection -- e.g. loadYawMcpConfig() throwing on a
-    // non-https, non-loopback YAW_MCP_URL -- would otherwise be swallowed
-    // by that handler: logged as a JSON line, no server started, and the
-    // process exiting 0 as if all was well. Attaching a real catch here
+    // fatal startup rejection -- an unreadable config dir, a transport
+    // that fails to connect -- would otherwise be swallowed by that
+    // handler: logged as a JSON line, no server started, and the process
+    // exiting 0 as if all was well. Attaching a real catch here
     // restores the "print the error and exit 1" contract. It only covers
     // the startup promise; a genuine POST-startup rejection (an orphaned
     // upstream connect that rejects late) still lands on the handler
@@ -430,12 +429,10 @@ async function runServer(): Promise<void> {
   process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { error: String(e) }));
   process.on("uncaughtException", (e) => log("error", "uncaughtException", { error: String(e) }));
 
-  // Load config purely for its warnings + validation side effects: the
-  // loader still rejects a non-https, non-loopback YAW_MCP_URL, and that
-  // rejection is the fatal-startup path the .catch() above reports. The
-  // resolved token / apiBase are no longer consumed -- server definitions
-  // come from ~/.yaw-mcp/bundles.json. An empty (or absent) bundles.json
-  // is fine; yaw-mcp starts with an empty server list.
+  // Load config for its warnings (schema-version drift, malformed files,
+  // retired `token` / `apiBase` keys still on disk) and for the allow/deny
+  // lists. Server definitions come from ~/.yaw-mcp/bundles.json; an empty
+  // (or absent) bundles.json is fine, yaw-mcp starts with an empty list.
   const config = await loadYawMcpConfig();
 
   // Surface non-fatal config warnings on startup so the user sees them

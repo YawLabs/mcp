@@ -1,13 +1,10 @@
 // `yaw-mcp doctor` — prints a one-screen diagnostic of the user's yaw-mcp setup.
 // Goal: when a support ticket comes in ("nothing is working"), the user
 // pastes the doctor output and we can usually pinpoint the issue from
-// it alone (no token / wrong token source / wrong API base / which
-// clients have yaw-mcp wired up vs. don't / file permissions).
+// it alone (which config files loaded / which clients have yaw-mcp wired
+// up vs. don't / what the local bundles + learning state look like).
 //
 // The output is plain text so it survives Discord / Slack pasting.
-// Tokens are always fingerprinted (never raw) — see tokenFingerprint in
-// config-loader.ts for the exact masking (the visible slice varies with
-// token length; short tokens reveal fewer characters).
 //
 // Side effects: doctor is NOT purely read-only. It runs the expired-trial
 // GC pass (gcExpiredTrials, both the text and --json paths), which is a
@@ -19,11 +16,16 @@
 // and never aborts the diagnostic.
 //
 // Exit codes:
-//   0  healthy (token present, no warnings) OR local mode (no token —
-//      yaw-mcp still starts and serves ~/.yaw-mcp/bundles.json)
-//   2  warnings (e.g., schema-version mismatch, loose file permissions)
-//   (1 = fatal is reserved and currently UNREACHABLE: a missing token is
-//   treated as healthy local mode, not a fatal error, on both paths.)
+//   0  healthy — every config file parsed cleanly and raised no warnings
+//   2  warnings (e.g., schema-version mismatch, a retired `token` /
+//      `apiBase` key still sitting in a config file)
+//   (1 = fatal is reserved and currently UNREACHABLE: nothing doctor
+//   inspects is fatal — a bad config file degrades to a warning.)
+//
+// The exit-2 gate is UNCONDITIONALLY "any warning". It used to be gated on
+// `config.token !== null`, which meant a warning-producing config exited 0
+// whenever no token was configured -- i.e. always, once account mode went
+// away. Do not re-introduce a precondition here.
 
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -35,7 +37,6 @@ import {
   type LoadedConfigFile,
   loadYawMcpConfig,
   type ResolvedConfig,
-  tokenFingerprint,
 } from "./config-loader.js";
 import {
   type DefaultRuntimeInfo,
@@ -104,21 +105,25 @@ export interface DoctorOptions {
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
 // text sections so support / dashboard consumers can pick fields with jq.
-// The raw token is NEVER included — only its fingerprint.
 //
 // Sections deliberately NOT mirrored (text-only, by design):
 //   - SHADOWED CLI USAGE is carried as `shellShadows` (same data, renamed).
 //   - UPGRADE AVAILABLE's method-aware terminal hint is text-only; the JSON
 //     `upgrade` block carries the version facts but no install-method copy.
-// Everything else (CONFIG FILES, TOKEN, API BASE, ENVIRONMENT, STATE,
-// RELIABILITY, TRIALS, INSTALLED CLIENTS, WARNINGS, DIAGNOSIS) has a
-// structured field below.
+// Everything else (CONFIG FILES, ENVIRONMENT, STATE, RELIABILITY, TRIALS,
+// INSTALLED CLIENTS, WARNINGS, DIAGNOSIS) has a structured field below.
 export interface DoctorJsonSnapshot {
   timestamp: string;
   version: string;
   platform: InstallOS;
-  token: { fingerprint: string; source: string };
-  apiBase: { value: string; source: string };
+  // DEPRECATED — every member is always `null`. yaw-mcp is local-only; there
+  // is no token and no API base to report. The NESTED SHAPE is retained
+  // rather than flattened to a bare `null` for the same reason as
+  // `backgroundPosters` below: a consumer reading `.token.source` or
+  // `.apiBase.value` keeps parsing instead of throwing on a null deref.
+  // Dropped in a later release.
+  token: { fingerprint: null; source: null };
+  apiBase: { value: null; source: null };
   loadedFiles: Array<{ scope: string; path: string; schemaVersion?: number; schemaAhead: boolean }>;
   warnings: string[];
   // Behavior-modifier env vars, null when unset. `YAW_MCP_POLL_INTERVAL` is
@@ -266,21 +271,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   }
   print("");
 
-  print("TOKEN");
-  print(`  value:  ${tokenFingerprint(config.token)}`);
-  print(`  source: ${config.tokenSource}`);
-  print("");
-
-  print("API BASE");
-  print(`  value:  ${config.apiBase}`);
-  print(`  source: ${config.apiBaseSource}`);
-  print("");
-
   // Behavior-modifier env vars that yaw-mcp actually reads at runtime.
   // Surfaced here so support diagnostics can see at a glance whether an
   // override is active (e.g., "my auto-load isn't working" — doctor
-  // says AUTO_LOAD is not set). TOKEN / URL / DISABLE_PERSISTENCE have
-  // their own dedicated sections and are intentionally omitted.
+  // says AUTO_LOAD is not set). DISABLE_PERSISTENCE has its own dedicated
+  // section and is intentionally omitted.
   renderEnvSection({ env, print });
 
   // oam runtime visibility — which runtime each server would ACTUALLY get
@@ -419,29 +414,22 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   }
 
   let exitCode = 0;
-  // Warnings are emitted to stderr UNCONDITIONALLY (regardless of token
-  // state) so a pipeline that captures only stdout still sees them. The
-  // text WARNINGS section above is part of the human report (stdout); the
-  // stderr stream below is the always-on signal. Local mode exits 0,
-  // but warning lines still print here so they don't get masked by the
-  // "fully functional" diagnosis below.
+  // Warnings are emitted to stderr UNCONDITIONALLY so a pipeline that
+  // captures only stdout still sees them. The text WARNINGS section above
+  // is part of the human report (stdout); the stderr stream below is the
+  // always-on signal.
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErr(`warning: ${w}\n`);
   }
-  if (config.token === null) {
-    // No token is NOT an error: yaw-mcp runs in local mode, serving
-    // whatever is in ~/.yaw-mcp/bundles.json. runServer() (index.ts) treats
-    // a missing token as non-fatal, so doctor must agree -- reporting
-    // "cannot start" here was a false alarm that the Yaw MCP panel surfaced
-    // as a blocking ATTENTION banner.
-    print("DIAGNOSIS");
-    print("  Local mode -- fully functional, no account needed. yaw-mcp serves");
-    print("  whatever servers are configured locally in ~/.yaw-mcp/bundles.json.");
-  } else if (config.warnings.length > 0) {
+  // Any warning is exit 2. See the exit-code note at the top of this file:
+  // this gate must stay unconditional. The old form ran the warning branch
+  // only when a token was resolved, so once account mode went away a
+  // malformed config would have exited 0 with the warnings buried.
+  if (config.warnings.length > 0) {
     exitCode = 2;
     print("DIAGNOSIS");
-    print("  Token present, but warnings above need attention.");
+    print("  Warnings above need attention.");
   } else {
     print("DIAGNOSIS");
     print(
@@ -629,17 +617,15 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   let summary: string;
   // Always-on warning stream: mirrors the text path so JSON-mode pipelines
   // that capture stdout (the JSON blob) still surface config warnings on
-  // stderr, even in local mode where exit code is 0.
+  // stderr even when the exit code is 0.
   const writeErrJson = opts.err ?? ((s: string) => process.stderr.write(s));
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErrJson(`warning: ${w}\n`);
   }
-  if (config.token === null) {
-    // Local mode -- not an error (see runDoctor's text branch).
-    summary = "Local mode -- fully functional, no account needed.";
-  } else if (config.warnings.length > 0) {
+  // Unconditional warning gate, identical to the text path.
+  if (config.warnings.length > 0) {
     exitCode = 2;
-    summary = "Token present, but warnings need attention.";
+    summary = "Warnings need attention.";
   } else {
     summary = stale ? "Healthy, but an upgrade is available." : "All good. yaw-mcp should start cleanly.";
   }
@@ -648,8 +634,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     timestamp,
     version: VERSION,
     platform: os,
-    token: { fingerprint: tokenFingerprint(config.token), source: config.tokenSource },
-    apiBase: { value: config.apiBase, source: config.apiBaseSource },
+    // DEPRECATED keys, emitted with their original nested shape and null
+    // members so `doctor --json` stays parseable for consumers reading
+    // `.token.source` / `.apiBase.value`. See DoctorJsonSnapshot.
+    token: { fingerprint: null, source: null },
+    apiBase: { value: null, source: null },
     loadedFiles: config.loadedFiles.map((f) => ({
       scope: f.scope,
       path: f.path,

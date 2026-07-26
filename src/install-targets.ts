@@ -297,9 +297,6 @@ function pathFor(
 
 export interface BuildLaunchEntryOptions {
   os: InstallOS;
-  /** Optional token to embed in env. Omit to keep env empty (preferred:
-   *  token lives in ~/.yaw-mcp/config.json, not in the client config). */
-  token?: string;
   /** Optional override for the `args` binary (defaults to
    *  @yawlabs/mcp@latest -- the `@latest` tag makes `npx` re-resolve
    *  the newest version on every spawn, so a client restart is all it
@@ -312,8 +309,8 @@ export interface BuildLaunchEntryOptions {
    *  args are wrapped with `cmd /c` to dodge the same `.cmd` shim trap
    *  that bit the default yaw-mcp launcher — keep this path going through
    *  buildLaunchEntry so the wrapping logic stays in one place.
-   *  Mutually exclusive with `pkg`/`token` (those tune the default
-   *  yaw-mcp entry; with `upstream` they're ignored). */
+   *  Mutually exclusive with `pkg` (which tunes the default yaw-mcp
+   *  entry; with `upstream` it is ignored). */
   upstream?: {
     command: string;
     args: string[];
@@ -345,10 +342,11 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
     return entry;
   }
   const pkg = opts.pkg ?? "@yawlabs/mcp@latest";
-  const entry: LaunchEntry =
-    opts.os === "windows" ? { command: "cmd", args: ["/c", "npx", "-y", pkg] } : { command: "npx", args: ["-y", pkg] };
-  if (opts.token) entry.env = { YAW_MCP_TOKEN: opts.token };
-  return entry;
+  // No `env` on the default entry: yaw-mcp is local-only, so there is no
+  // token to inject. Servers come from ~/.yaw-mcp/bundles.json.
+  return opts.os === "windows"
+    ? { command: "cmd", args: ["/c", "npx", "-y", pkg] }
+    : { command: "npx", args: ["-y", pkg] };
 }
 
 /** The entry key we write into `mcpServers` (Claude Code / Desktop / Cursor)

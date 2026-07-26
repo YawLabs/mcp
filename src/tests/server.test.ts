@@ -4,16 +4,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock external dependencies before importing the module under test
-vi.mock("undici", () => ({
-  request: vi.fn().mockResolvedValue({
-    statusCode: 200,
-    body: {
-      text: vi.fn().mockResolvedValue(""),
-      json: vi.fn().mockResolvedValue({ servers: [], configVersion: "v1" }),
-    },
-  }),
-}));
-
 vi.mock("../upstream.js", async (importOriginal) => {
   const actual = (await importOriginal()) as any;
   return {

@@ -134,7 +134,7 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: [["<namespace>"]],
     flags: ["--json", "--help"],
   },
-  { name: "compliance", description: "Run the compliance suite against a server", flags: ["--publish", "--help"] },
+  { name: "compliance", description: "Run the compliance suite against a server", flags: ["--help"] },
   {
     name: "foundry",
     description: "Export the opt-in dispatch-trace corpus",

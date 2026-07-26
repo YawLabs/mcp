@@ -8,13 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //   mcp_connect_discover(context)        — auto-warm a decisive winner
 // ═══════════════════════════════════════════════════════════════════════
 
-vi.mock("undici", () => ({
-  request: vi.fn().mockResolvedValue({
-    statusCode: 200,
-    body: { text: vi.fn().mockResolvedValue(""), json: vi.fn().mockResolvedValue({}) },
-  }),
-}));
-
 vi.mock("../upstream.js", async (importOriginal) => {
   const actual = (await importOriginal()) as any;
   return {

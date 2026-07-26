@@ -375,11 +375,12 @@ describe("buildLaunchEntry", () => {
     }
   });
 
-  it("embeds YAW_MCP_TOKEN only when token is explicitly passed", () => {
-    const withToken = buildLaunchEntry({ os: "macos", token: "mcp_pat_abc" });
-    expect(withToken.env).toEqual({ YAW_MCP_TOKEN: "mcp_pat_abc" });
-    const without = buildLaunchEntry({ os: "macos" });
-    expect(without.env).toBeUndefined();
+  // yaw-mcp is local-only: the default entry carries no env at all. There is
+  // no longer a `token` option to embed YAW_MCP_TOKEN with.
+  it("never sets env on the default entry", () => {
+    for (const os of ["macos", "linux", "windows"] as const) {
+      expect(buildLaunchEntry({ os }).env).toBeUndefined();
+    }
   });
 });
 
