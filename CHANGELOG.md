@@ -2,6 +2,93 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.74.0 -- local-only: the hosted control plane is retired (BREAKING)
+
+The hosted backend is gone. Every endpoint yaw-mcp called returns 404 -- `/api/connect/config`, `/heartbeat`, `/analytics`, `/servers`, `/api/compliance/ext`, `/api/try/event`, the dashboard, and `/signup`. Rather than keep code that cannot succeed, account mode is removed outright: your servers come from `~/.yaw-mcp/bundles.json` and your credentials from the local encrypted vault. Roughly 5,800 lines deleted.
+
+Only two hosted surfaces survive, and neither needs an account: the public server catalog at `https://yaw.sh/data/mcp-catalog.json` (fetched on demand by `add` / `try`) and its browsable form at `https://yaw.sh/mcp/catalog/`.
+
+**Breaking -- removed**
+
+- `mcp_connect_install` and `mcp_connect_import` meta-tools. Both wrote to the account and already hard-errored in local mode. Add servers with `yaw-mcp add <slug>`.
+- `compliance --publish` -- posted reports to a dead endpoint. Now rejected with exit 2.
+- The 60s config poll. `bundles.json` is read once at startup, so restart the MCP client after editing it.
+- Semantic reranking. Ranking is BM25 computed locally, plus the health, learning, and sampling signals. The Voyage-backed embedding index it depended on is retired.
+- All telemetry. The analytics, heartbeat, and tool-report posters are deleted, and `try`'s event POST is a no-op that no longer computes or stores a machine fingerprint. Nothing is transmitted off your machine.
+- `yaw-mcp servers` is now a deprecation stub that prints to stderr and exits 1. It is retained for one release because Yaw Terminal's MCP panel shells out to it and reads a non-zero exit as signed-out; the compliance grade it used to show moved to a `GRADE` column in `yaw-mcp list`.
+
+**Breaking -- `yaw-mcp remove` now confirms**
+
+`remove` was the only destructive verb without a gate. On a TTY it previews the namespace, name, launch command, and env KEY names (never values), then asks -- bare Enter is no. Off a TTY it refuses with exit 2 and names `--force`.
+
+This breaks scripted use, and it breaks intermittently: a script removing an already-absent server still exits 0, so the cleanup path that worked yesterday fails the one time there was something to clean. Add `--force`. The gate exists because removal is less reversible than it looks -- env values stored on the entry go with it and `add` will not bring them back.
+
+**Deprecated for one release -- still accepted, now warns**
+
+- `--token` and `--no-yaw-mcp-config` on `yaw-mcp install`. Both are still fully parsed, so `install --all --token mcp_pat_...` keeps working and keeps exiting 0; the values are ignored.
+- The `token` and `apiBase` keys in `.yaw-mcp/config.json`. The file still loads; a warning names it and tells you to revoke the PAT at its source, since deleting the key does not deactivate it.
+- `doctor --json` keeps every key it used to emit. `token` and `apiBase` retain their nested shapes with null members and `backgroundPosters` keeps `{"analytics": null, "toolReport": null}`, rather than flattening to a bare `null` that would throw for anyone reading `.token.source`.
+
+**Security**
+
+- **Project `bundles.json` now requires explicit consent.** A project-scoped `<project>/.yaw-mcp/bundles.json` is normally committed to a repo, and every server in it is a command yaw-mcp spawns as you at startup. Cloning a hostile repo and opening an editor in it was enough to execute arbitrary argv. An unapproved file is ignored and your user-global file still loads; approve with `yaw-mcp trust`, which prints every command and arg before asking. Approval pins the file's SHA-256, so a later commit re-requires it. `--list` flags drifted entries, `--revoke` withdraws, and `YAW_MCP_TRUST_PROJECT=1` bypasses for CI. Your own `~/.yaw-mcp/bundles.json` is never gated.
+- The consent preview escapes C0, DEL, C1 (0x9b is 8-bit CSI), and bidi overrides. Without it a repo could conceal its argv with SGR 8 or erase the rendered block with cursor-up before the prompt painted, defeating the one thing the gate guarantees.
+- An unreadable project file no longer suppresses your user-global servers. A repo committing `.yaw-mcp` as a regular file (ENOTDIR) or `bundles.json` as a symlink loop (ELOOP) previously dropped every server on POSIX.
+- Dropping the `apiBase` precedence chain closes a real hole: project scope was honored for `apiBase` while refused for `token`, so a committed project config could redirect the API base and the global token would follow it to an attacker host. `url-safety.ts` is deleted with it -- nothing dials a config-supplied URL any more.
+- A transient trust-store read error (EACCES/EIO, an antivirus lock) no longer wipes every approval; I/O and parse failures are distinguished and I/O refuses to write.
+
+**Fixed**
+
+- `YAW_MCP_MIN_COMPLIANCE` was silently inert and the discover `[A]`-`[F]` badge never rendered -- `complianceGrade` lost its supplier with the backend and nothing read `grades.json`. Grades are now overlaid at startup.
+- Prewarm respawned every active server on every client start, because the tool cache lost its only writer. It is persisted at state schema v2; v1 files migrate rather than being dropped.
+- A tool-name collision between two upstreams pointed `tools/list` and dispatch at different servers -- the model saw one upstream's schema while the call executed another's, letting a later-activated server capture an earlier one's traffic. Both surfaces now agree on the first writer.
+- On Windows, an `npm --prefix` containing a space was split into two argv tokens by the `shell: true` self-upgrade spawn, so the upgrade landed in the wrong tree and the running copy stayed stale. `C:\Users\<First Last>\AppData\Roaming\npm` is npm's default global prefix, so any account with a space in its name hit this on every stale startup.
+- `doctor` lost its only exit-2 path when account mode went (both gates tested `config.token === null`), so a malformed config exited 0. The gate is unconditional now.
+
+**Added**
+
+- A root `LICENSE`: source-available, not open source. Free personal and commercial use and redistribution of unmodified copies; no right to offer it to third parties as a competing product. Contributions are accepted under DCO 1.1 sign-off -- no CLA, no copyright assignment. `package.json` previously declared `UNLICENSED` with no license file at all.
+- `yaw-mcp trust` (`--list`, `--revoke`, `--yes`, `--json`).
+- Test coverage grew from 1,809 to 1,998 tests. `ConnectServer.start()` had none and is now the only startup path.
+
+## 0.73.1 -- README rewrite and a full-pass review sweep
+
+**Docs.** The README is rewritten against `index.ts --help`, `KNOWN_SUBCOMMANDS`, and `meta-tools.ts` -- about half its former length. It drops the retired Yaw Team surface (`login`/`logout`/`sync`/`stats`, `secrets push`/`pull`, `rotate --push`), gone since 0.71.0 but still documented, and adds the previously-undocumented top-level `audit` and `mcp_connect_secrets`.
+
+**Fixed** -- 33 findings from a full-pass sweep of all source files, each adversarially re-verified before being fixed:
+
+- `YAW_MCP_MIN_COMPLIANCE` was enforced only in `handleActivate`; the floor gate moved into `runActivateOne` so dispatch, discover auto-warm, deferred activation, and autoLoad all honor it.
+- A concurrent-server-cap TOCTOU: the slot is reserved synchronously before `connectToUpstream`, so parallel activations of distinct namespaces cannot exceed the cap.
+- A non-string allow-list entry no longer collapses to `[]` (allow-all), shadowing a valid parent scope; it warns and falls through.
+- `recordSuccess` no longer fabricates a dispatch; shutdown counts an undrained backlog as dropped; sub-30% error rates are surfaced rather than silently penalizing rank.
+- A child that dies during the initial fetch window is no longer reported as connected.
+- Secret redaction sorts longest-first, so a secret that is a substring of another cannot leak a tail.
+
+Intentionally deferred: converting `index.ts`'s 39 `process.exit()` calls to `process.exitCode` (needs restructuring the top-level ESM dispatch), and `reward.ts`'s first-text-block-only grading heuristic (changes cross-session learning behavior).
+
+## 0.73.0 -- post-merge review findings and ship-ready UX blockers
+
+**Fixed**
+
+- PowerShell positional completion was entirely dead. Every slot guard read `if ($tokens.Count -eq <index+2>)`, but that switch only runs inside the `else` of `if ($tokens.Count -le 2)`, so slot 0's `-eq 2` could never be true and no client, action, or shell candidate was ever offered. Verified with `TabExpansion2` against real PowerShell 5.1. bash/zsh/fish were correct and untouched.
+- The secrets audit log recorded `injected` for secrets that were never injected. `recordResolveAudit` ran before the fail-closed missing-refs throw, so a refused spawn still logged every resolvable ref as injected -- meaning `yaw-mcp secrets audit` answered "did this server ever receive my prod token" with a false yes. Only `missing` events are recorded on that path now.
+- A fatal startup config error exited 0. The fire-and-forget `runServer()` rejection was caught by the last-resort `unhandledRejection` handler, so a bad `YAW_MCP_URL` reported failure while returning success to any supervisor. Exits 1 now.
+- An invalid secret name was rejected only after both prompts, so `secrets set "my token"` made you enter a passphrase and a secret value before saying the name was never valid. Validated in `parseSecretsArgs` now.
+- The compliance shell-fallback message named the wrong characters -- `quoteForShell` also rejects `%` on win32 and `'` on POSIX.
+- A pre-existing prompt bug in the same reader path: the value prompt rendered as `Secret value: Vault passphrase: `.
+
+**Ship-ready blockers**
+
+- `yaw-mcp --HELP` booted a silent stdio server. `suggestFlag` dropped the one alias you meant from its own candidate pool, returned `[]`, and fell through to `runServer()` -- the exact hang that branch exists to prevent. Exits 2 with a suggestion now.
+- Neither destructive secrets path confirmed. `secrets remove` deleted immediately, and `secrets set` over an existing name overwrote while printing the same message as a fresh write. Both are now gated the way a config collision already was: prompt on a TTY, refuse off one. `remove` is gated both ways since it is unrecoverable; `set` still proceeds non-interactively so rotation scripts keep working, but prints `Replaced secret "X"` and sets `replaced` in `--json`.
+
+## 0.72.0 -- unblock the release on win32-arm64
+
+**Fixed**
+
+- Pinned `@biomejs/biome` to 2.4.16. The 2.5.x native binary segfaults (exit 139) on MINGW64-ARM64 before producing any output, which blocked `npm run lint` and stalled the release script -- its tolerance paths could not engage because there was no output to match against. 2.4.16 runs cleanly.
+- `biome.json` follows the 2.4 flat schema (`rules.recommended: true` rather than `rules.preset`), plus the formatter rewrites that pin brought with it.
+
 ## 0.71.0 -- remove the Yaw Team surface (BREAKING)
 
 The Yaw Team tier is fully retired. The yaw.sh `/api/team/*` and `/api/admin/*` endpoints have been deleted, so every command that spoke to them is removed rather than left to fail at runtime.
