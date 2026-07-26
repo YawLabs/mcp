@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { posix as posixPath, win32 as winPath } from "node:path";
 
 interface ComplianceReport {
   grade: string;
@@ -96,12 +96,20 @@ export interface NpxLaunch {
  *  binary. Windows lays npm out beside node.exe; POSIX installs put it under
  *  `<prefix>/lib/node_modules`. Both shapes are probed on every platform so
  *  unusual layouts (nvm, volta, scoop, a portable unpack) still resolve. */
-function npxCliCandidates(execPath: string): string[] {
-  const binDir = dirname(execPath);
+function npxCliCandidates(execPath: string, platform: NodeJS.Platform): string[] {
+  // Use the path flavour of the TARGET platform, not the host's. resolveNpxLaunch
+  // accepts `platform` as an injectable, and until this was keyed off it the
+  // injectable was a lie: dirname("C:\nodejs\node.exe") is "." under POSIX
+  // semantics, so every candidate came out wrong, nothing matched, and the
+  // function silently fell back to the shell path. In production `platform` is
+  // always the host so behaviour is unchanged -- but the win32 branch could
+  // only ever be exercised ON win32, which is how it stayed untested on Linux.
+  const p = platform === "win32" ? winPath : posixPath;
+  const binDir = p.dirname(execPath);
   return [
-    join(binDir, "node_modules", "npm", "bin", "npx-cli.js"),
-    join(binDir, "..", "lib", "node_modules", "npm", "bin", "npx-cli.js"),
-    join(binDir, "..", "node_modules", "npm", "bin", "npx-cli.js"),
+    p.join(binDir, "node_modules", "npm", "bin", "npx-cli.js"),
+    p.join(binDir, "..", "lib", "node_modules", "npm", "bin", "npx-cli.js"),
+    p.join(binDir, "..", "node_modules", "npm", "bin", "npx-cli.js"),
   ];
 }
 
@@ -178,7 +186,7 @@ export function resolveNpxLaunch(
   const platform = opts.platform ?? process.platform;
   const fileExists = opts.exists ?? existsSync;
 
-  for (const candidate of npxCliCandidates(execPath)) {
+  for (const candidate of npxCliCandidates(execPath, platform)) {
     if (fileExists(candidate)) {
       return { command: execPath, args: [candidate, ...npxArgs], shell: false };
     }
