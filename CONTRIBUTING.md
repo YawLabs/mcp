@@ -6,8 +6,8 @@ Thanks for your interest in contributing! This guide covers the workflow for bot
 
 ```bash
 # 1. Fork this repo on GitHub, then clone your fork
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/<your-username>/mcp.git
+cd mcp
 
 # 2. Install dependencies
 npm install
@@ -66,6 +66,23 @@ Open an issue on GitHub. Include:
 - Steps to reproduce
 - Environment details (OS, Node version, etc.)
 
-## License
+## License and Contributor Sign-Off
 
-By contributing, you agree that your contributions will be licensed under the same license as this project.
+This project is source-available under the [Yaw MCP Source-Available License](LICENSE), not an open-source license. Read it before you contribute — in particular, it does not grant the right to offer this software to third parties as a competing product.
+
+Contributions are accepted under the [Developer Certificate of Origin](https://developercertificate.org/) (DCO) 1.1. It is a short statement that you wrote the patch, or otherwise have the right to submit it under this project's license. There is no CLA to sign and no copyright assignment.
+
+Certify it by adding a `Signed-off-by` line to each commit, using your real name:
+
+```
+Signed-off-by: Jane Developer <jane@example.com>
+```
+
+`git commit -s` adds this for you. Configure it once with:
+
+```bash
+git config user.name "Jane Developer"
+git config user.email "jane@example.com"
+```
+
+By signing off, you agree that Yaw Labs may distribute your contribution as part of this project under the terms of the LICENSE file, including in future versions released under different terms.

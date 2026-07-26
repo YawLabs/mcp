@@ -246,6 +246,12 @@ Common ones (run `yaw-mcp --help` for the full list):
 - Node.js 18.17+.
 - No account required for core features. A token from [yaw.sh/mcp](https://yaw.sh/mcp) unlocks dashboard-managed servers and cross-machine sync.
 
+## License
+
+Source-available, not open source. Copyright (c) 2026 Yaw Labs, all rights reserved.
+
+The source is published so you can read and audit it before running it -- `yaw-mcp` spawns processes on your machine and handles your credentials, and you should not have to take that on faith. You may use it freely, personally or commercially, and redistribute unmodified copies. You may not offer it to third parties as a competing product. See [LICENSE](./LICENSE) for the terms, and [CONTRIBUTING.md](./CONTRIBUTING.md) for the DCO sign-off contributors use.
+
 ## Links
 
 - [yaw.sh/mcp](https://yaw.sh/mcp) -- dashboard and server management
