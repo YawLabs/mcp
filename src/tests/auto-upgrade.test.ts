@@ -594,14 +594,16 @@ describe("defaultSpawn -- the real background upgrade child", () => {
     expect(cp.calls[0].args).not.toContain("--prefix");
   });
 
-  it("forwards a detected --prefix VERBATIM as one argv element, spaces and all", async () => {
-    // KNOWN ROUGH EDGE, pinned as-is rather than fixed: defaultSpawn passes
-    // `shell: true` on win32, and Node builds the cmd.exe command line by
-    // joining argv with spaces WITHOUT quoting. A Windows prefix under a
-    // username containing a space (`C:\Users\Jeff Smith\AppData\Roaming\npm`)
-    // therefore reaches npm as two tokens and the install lands somewhere
-    // else -- or fails. This test locks the CURRENT behavior (one unquoted
-    // argv element) so a future fix is a deliberate, visible change here.
+  it("quotes a --prefix containing a space for the win32 shell, passes it through on POSIX", async () => {
+    // Regression guard. defaultSpawn passes `shell: true` on win32 (npm is
+    // npm.cmd and Node will not spawn a .cmd without a shell), and Node builds
+    // the cmd.exe command line by joining argv on spaces WITHOUT quoting. An
+    // unquoted prefix under a username with a space therefore reached npm as
+    // TWO tokens -- `--prefix C:\Users\Jeff` plus a stray positional -- so the
+    // install landed in the wrong tree and the running copy stayed stale: the
+    // exact silent no-op `--prefix` exists to prevent. And
+    // C:\Users\<First Last>\AppData\Roaming\npm is npm's DEFAULT Windows
+    // global prefix, so this was not an edge case.
     const spaced = join(sep, "Users", "Jeff Smith", "AppData", "Roaming", "npm");
     mockRealpathSync.mockReturnValue(join(spaced, "node_modules", "@yawlabs", "mcp", "dist", "index.js"));
 
@@ -613,9 +615,34 @@ describe("defaultSpawn -- the real background upgrade child", () => {
 
     // calls[0] is the `npm prefix -g` comparison probe; calls[1] is the install.
     const install = cp.calls[cp.calls.length - 1];
-    expect(install.args).toEqual(["install", "-g", "--prefix", spaced, "@yawlabs/mcp@latest"]);
-    expect(install.args[3]).toContain(" ");
-    expect(install.opts.shell).toBe(process.platform === "win32");
+    const onWin32 = process.platform === "win32";
+    // Quoted only where a shell actually parses it. On POSIX the arg goes
+    // through execve untouched and quoting would put literal quotes in the path.
+    const expected = onWin32 ? `"${spaced}"` : spaced;
+    expect(install.args).toEqual(["install", "-g", "--prefix", expected, "@yawlabs/mcp@latest"]);
+    expect(install.opts.shell).toBe(onWin32);
+  });
+
+  it("drops --prefix entirely when the path cannot be safely quoted on win32", async () => {
+    // A `"` or `%` cannot be quoted for cmd.exe -- a quote ends the quoted run
+    // and %VAR% expands even inside quotes. Emitting a mangled command line is
+    // worse than falling back to npm's own prefix resolution, so the flag is
+    // dropped rather than guessed at. POSIX has no such restriction.
+    const nasty = join(sep, "Users", 'we"ird%USERNAME%', "AppData", "Roaming", "npm");
+    mockRealpathSync.mockReturnValue(join(nasty, "node_modules", "@yawlabs", "mcp", "dist", "index.js"));
+
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+    });
+
+    const install = cp.calls[cp.calls.length - 1];
+    if (process.platform === "win32") {
+      expect(install.args).toEqual(["install", "-g", "@yawlabs/mcp@latest"]);
+    } else {
+      expect(install.args).toEqual(["install", "-g", "--prefix", nasty, "@yawlabs/mcp@latest"]);
+    }
   });
 });
 
