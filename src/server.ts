@@ -28,6 +28,7 @@ import {
 } from "./exec-engine.js";
 import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js";
 import { closestNames } from "./fuzzy.js";
+import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
 import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
 import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
@@ -37,7 +38,7 @@ import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
-import { loadState, saveState } from "./persistence.js";
+import { loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
 import { createProgressReporter, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
@@ -270,7 +271,18 @@ export class ConnectServer {
   // skip logged this session — we only want the "see the mechanism in
   // action" log once per namespace, not every single idle tick.
   private adaptiveSkipLogged = new Set<string>();
+  // Tool lists learned from a live upstream handshake, keyed by namespace.
+  // Hydrated from ~/.yaw-mcp/state.json at start() and re-written there
+  // whenever a server's tools are learned, so a fresh session already knows
+  // what an inactive server offers: getDeferredServers() can surface its
+  // tools cold, and prewarmDormantServers() skips re-spawning it. Before
+  // this was persisted, every session re-spawned every active server.
   private toolCache = new Map<string, Array<{ name: string; description?: string }>>();
+  // When each namespace's toolCache entry was learned. Carried through the
+  // persistence round-trip so a hydrated entry keeps its original age and
+  // still ages out under the TTL rather than being refreshed for free on
+  // every save.
+  private toolCacheLearnedAt = new Map<string, number>();
   // Per-namespace tool filters set by mcp_connect_activate({ tools: [...] }).
   // When a namespace has an entry, only those BARE tool names surface in
   // tools/list; routing tables stay complete so mcp_connect_dispatch can
@@ -543,6 +555,73 @@ export class ConnectServer {
     return out;
   }
 
+  // Does this server's tool list already exist somewhere we trust — the
+  // toolCache shipped in bundles.json, or the one we learned in a previous
+  // session and hydrated from state.json? Gates pre-warm: a `false` here
+  // means the only way to find out what the server offers is to spawn it.
+  private hasKnownTools(server: UpstreamServerConfig): boolean {
+    if (server.toolCache && server.toolCache.length > 0) return true;
+    const cached = this.toolCache.get(server.namespace);
+    return cached !== undefined && cached.length > 0;
+  }
+
+  // Seed the in-memory tool cache from the persisted snapshot. Runs before
+  // reconcileConfig so the first tools/list of the session can already
+  // include deferred servers' tools. Entries for namespaces no longer in
+  // bundles.json are harmless — every reader iterates the CONFIGURED
+  // servers — and age out via the persistence-layer TTL.
+  private hydrateToolCache(persisted: Record<string, PersistedToolCacheEntry>): void {
+    let restored = 0;
+    for (const [namespace, entry] of Object.entries(persisted)) {
+      if (entry.tools.length === 0) continue;
+      this.toolCache.set(namespace, entry.tools);
+      this.toolCacheLearnedAt.set(namespace, entry.learnedAt);
+      restored++;
+    }
+    if (restored > 0) log("info", "Restored learned tool lists", { namespaces: restored });
+  }
+
+  // Snapshot the in-memory tool cache for persistence. The persistence layer
+  // owns the caps/TTL, so this just pairs each list with the timestamp it
+  // was learned at (falling back to now for a list learned before the
+  // timestamp map existed — belt-and-braces; runActivateOne always sets it).
+  private exportToolCache(): Record<string, PersistedToolCacheEntry> {
+    const out: Record<string, PersistedToolCacheEntry> = {};
+    for (const [namespace, tools] of this.toolCache) {
+      if (tools.length === 0) continue;
+      out[namespace] = { tools, learnedAt: this.toolCacheLearnedAt.get(namespace) ?? Date.now() };
+    }
+    return out;
+  }
+
+  // Overlay the A-F grades `yaw-mcp audit` cached in ~/.yaw-mcp/grades.json
+  // onto the loaded server list. That cache is the ONLY supplier of
+  // `complianceGrade` in local mode — validateEntry drops unknown fields, so
+  // a grade never rides along in bundles.json. Without this overlay every
+  // server is permanently ungraded, which silently disables the
+  // YAW_MCP_MIN_COMPLIANCE gate (ungraded always passes) and blanks the
+  // `[A]`-`[F]` badge in discover. Mirrors the same overlay `yaw-mcp list`
+  // applies (local-add-cmd.ts runList) so the CLI and the server agree.
+  //
+  // `home` is a parameter rather than a field so tests can point it at a
+  // synthetic ~/.yaw-mcp without running the whole of start().
+  private async hydrateComplianceGrades(home: string = homedir()): Promise<void> {
+    if (!this.config) return;
+    // readGradesCache never throws (missing/garbled cache -> {}), but the
+    // catch keeps a surprise I/O rejection from aborting startup: an
+    // unreadable grade cache must degrade to "ungraded", not to "no server".
+    const grades: GradesCache = await readGradesCache(home).catch(() => ({}));
+    if (Object.keys(grades).length === 0) return;
+    let applied = 0;
+    this.config.servers = this.config.servers.map((server) => {
+      const cached = grades[server.namespace];
+      if (!cached) return server;
+      applied++;
+      return { ...server, complianceGrade: cached.grade };
+    });
+    if (applied > 0) log("info", "Applied cached compliance grades", { graded: applied });
+  }
+
   private async notifyAllListsChanged(): Promise<void> {
     // Each send is independent — one failure shouldn't cancel the
     // others. Log so the failure is visible without throwing, since
@@ -579,6 +658,7 @@ export class ConnectServer {
           packHistoryEntries: persisted.packHistory.length,
         });
       }
+      this.hydrateToolCache(persisted.toolCache);
       this.persistenceReady = true;
     }
 
@@ -647,6 +727,9 @@ export class ConnectServer {
       path: result.path,
       serverCount: this.config.servers.length,
     });
+    // Overlay cached compliance grades BEFORE reconcile, so the routing
+    // state and every downstream grade reader see the same graded config.
+    await this.hydrateComplianceGrades();
     // Reconcile so the loaded servers populate the routing state.
     await this.reconcileConfig(this.config);
 
@@ -752,12 +835,15 @@ export class ConnectServer {
     }
   }
 
-  // Populate toolCache for any isActive-but-never-activated server so
-  // Claude's tools/list shows the full toggled set on first run.
-  // Subsequent sessions read the persisted toolCache from config and
-  // skip this path entirely, so it's a one-time cost per server.
+  // Populate toolCache for any isActive server whose tools we don't know
+  // yet, so Claude's tools/list shows the full toggled set on first run.
+  // "Don't know yet" spans BOTH sources — the toolCache in bundles.json and
+  // the one hydrated from state.json — so this is a one-time cost per
+  // server rather than a per-session `npx -y <pkg>@latest` resolve for
+  // every active server (which is what it degenerated into while the
+  // learned cache had nowhere to persist).
   private async prewarmDormantServers(): Promise<void> {
-    const dormant = this.getProfiledActiveServers().filter((s) => !s.toolCache || s.toolCache.length === 0);
+    const dormant = this.getProfiledActiveServers().filter((s) => !this.hasKnownTools(s));
     if (dormant.length === 0) return;
 
     log("info", "Pre-warming dormant servers", {
@@ -1826,6 +1912,11 @@ export class ConnectServer {
           this.idleCallCounts.set(namespace, 0);
           const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
           this.toolCache.set(namespace, toolMeta);
+          this.toolCacheLearnedAt.set(namespace, Date.now());
+          // Persist the learned list so the NEXT session skips the pre-warm
+          // spawn for this namespace. Debounced + best-effort; a failed save
+          // just means we re-learn next time.
+          this.scheduleStateSave();
 
           const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
@@ -3109,6 +3200,7 @@ export class ConnectServer {
     await saveState({
       learning: this.learning.exportSnapshot(),
       packHistory: this.packDetector.exportSnapshot(),
+      toolCache: this.exportToolCache(),
     });
   }
 }

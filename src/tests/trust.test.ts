@@ -14,7 +14,7 @@
 // built with join() -- never a POSIX string literal -- because the SUT routes
 // through path.join, which yields backslashes on the Windows runner.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -37,6 +37,7 @@ import {
   revokeTrust,
   TRUST_BYPASS_ENV,
   TRUST_FILENAME,
+  TrustStoreUnreadableError,
   trustStatusFor,
   trustStorePath,
 } from "../trust.js";
@@ -386,6 +387,113 @@ describe("trust store grant / revoke / list round-trip", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// "could not READ it" is not "it is garbage"
+// ---------------------------------------------------------------------------
+
+/** Make the store unreadable portably: readFile on a DIRECTORY yields EISDIR
+ *  on POSIX and on Windows alike -- no chmod games, no root-vs-non-root skew. */
+function makeStoreUnreadable(home: string): void {
+  mkdirSync(trustStorePath(home), { recursive: true });
+}
+
+const RUNNING_AS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
+describe("an UNREADABLE store is denied but never discarded", () => {
+  it("readTrustStore separates an I/O failure from a parse failure, keeping the errno", async () => {
+    makeStoreUnreadable(synthHome);
+    const io = await readTrustStore(synthHome);
+    expect(io.malformed).toBe(true);
+    expect(io.malformedKind).toBe("io");
+    expect(io.errorCode).toBe("EISDIR");
+    expect(io.malformedReason).toContain(trustStorePath(synthHome));
+
+    rmSync(trustStorePath(synthHome), { recursive: true, force: true });
+    writeFileSync(trustStorePath(synthHome), "{{{");
+    const parse = await readTrustStore(synthHome);
+    expect(parse.malformed).toBe(true);
+    expect(parse.malformedKind).toBe("parse");
+    expect(parse.errorCode).toBeNull();
+  });
+
+  it("classifies a structurally-wrong (but readable) store as a parse failure", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 1 }));
+    const store = await readTrustStore(synthHome);
+    expect(store.malformedKind).toBe("parse");
+  });
+
+  it("still denies every lookup while the store is unreadable (fail closed)", async () => {
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    rmSync(trustStorePath(synthHome), { force: true });
+    makeStoreUnreadable(synthHome);
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("grantTrust REFUSES to write over a store it could not read", async () => {
+    // The old behavior rebuilt from {} here, so one antivirus lock during
+    // `yaw-mcp trust` in one repo revoked every other repo the user approved.
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    makeStoreUnreadable(synthHome);
+    await expect(grantTrust(path, readFileSync(path), { home: synthHome })).rejects.toBeInstanceOf(
+      TrustStoreUnreadableError,
+    );
+    // Nothing was written: the store is exactly as unusable as it was.
+    expect(statSync(trustStorePath(synthHome)).isDirectory()).toBe(true);
+  });
+
+  it("the refusal names the store, the errno, and the reason", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    makeStoreUnreadable(synthHome);
+    const err = await grantTrust(projectBundlesPath(synthCwd), "x", { home: synthHome }).catch((e) => e);
+    expect(err).toBeInstanceOf(TrustStoreUnreadableError);
+    expect((err as TrustStoreUnreadableError).storePath).toBe(trustStorePath(synthHome));
+    expect((err as TrustStoreUnreadableError).code).toBe("EISDIR");
+    expect((err as TrustStoreUnreadableError).reason).toContain("could not read");
+  });
+
+  it("revokeTrust likewise reports an unreadable store instead of rewriting it", async () => {
+    makeStoreUnreadable(synthHome);
+    const res = await revokeTrust(projectBundlesPath(synthCwd), { home: synthHome });
+    expect(res.removed).toBe(false);
+    expect(res.storeWasMalformed).toBe(true);
+    expect(statSync(trustStorePath(synthHome)).isDirectory()).toBe(true);
+  });
+
+  it("a genuinely UNPARSEABLE store is still rebuilt -- otherwise nothing could ever be granted again", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), "{{{");
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const granted = await grantTrust(path, readFileSync(path), { home: synthHome });
+    expect(granted.storeWasMalformed).toBe(true);
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32" || RUNNING_AS_ROOT)(
+    "the grants inside a locked store survive the refused write byte for byte",
+    async () => {
+      await writeTrustedProjectBundles(synthCwd, HOSTILE);
+      const storePath = trustStorePath(synthHome);
+      const before = readFileSync(storePath, "utf8");
+
+      chmodSync(storePath, 0o000);
+      const other = join(synthHome, "other-repo", CONFIG_DIRNAME, "bundles.json");
+      await expect(grantTrust(other, "whatever", { home: synthHome })).rejects.toBeInstanceOf(
+        TrustStoreUnreadableError,
+      );
+      chmodSync(storePath, 0o600);
+
+      expect(readFileSync(storePath, "utf8")).toBe(before);
+      const listed = await listTrusted({ home: synthHome });
+      expect(listed).toHaveLength(1);
+      expect(listed[0].path).toBe(projectBundlesPath(synthCwd));
+    },
+  );
+});
+
 describe("hashing and status helpers", () => {
   it("hashes the exact bytes, not a lossy decode", () => {
     // An invalid UTF-8 byte must not collapse onto the replacement char --
@@ -409,8 +517,19 @@ describe("hashing and status helpers", () => {
   });
 
   it("trustStatusFor denies everything against a malformed store", () => {
-    const store = { version: 1, entries: {}, malformed: true, malformedReason: "x" };
+    const store = {
+      version: 1,
+      entries: {},
+      malformed: true,
+      malformedReason: "x",
+      malformedKind: null,
+      errorCode: null,
+    };
     expect(trustStatusFor("/anything", "content", store)).toBe("store-unreadable");
+    expect(trustStatusFor("/anything", "content", { ...store, malformedKind: "io" as const })).toBe("store-unreadable");
+    expect(trustStatusFor("/anything", "content", { ...store, malformedKind: "parse" as const })).toBe(
+      "store-unreadable",
+    );
   });
 
   it("isTrusted loads the store itself and ignores the env escape hatch", async () => {

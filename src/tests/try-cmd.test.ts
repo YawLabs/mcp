@@ -4,12 +4,10 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildLaunchEntry, ENTRY_NAME } from "../install-targets.js";
 import {
-  anonIdPath,
-  computeAnonId,
+  ANON_ID_PLACEHOLDER,
   type ExploreServerResponse,
   formatTtl,
   gcExpiredTrials,
-  loadOrCreateAnonId,
   parseDurationMs,
   parseTryArgs,
   parseTryCleanupArgs,
@@ -56,6 +54,13 @@ function captureIO(): {
     text: () => out.join(""),
     errText: () => err.join(""),
   };
+}
+
+/** Path of the retired per-machine anon-id file. `try` no longer has a
+ *  loader for it -- this literal exists so the tests below can assert the
+ *  fingerprint is never written back. */
+function legacyAnonPath(home: string): string {
+  return join(trialsDir(home), ".anon");
 }
 
 const SAMPLE: ExploreServerResponse = {
@@ -198,40 +203,41 @@ describe("formatTtl", () => {
   });
 });
 
-describe("computeAnonId", () => {
-  it("is a 16-char lowercase hex string", () => {
-    const id = computeAnonId();
-    expect(id).toMatch(/^[0-9a-f]{16}$/);
-  });
-
-  it("is stable on the same machine across calls", () => {
-    expect(computeAnonId()).toBe(computeAnonId());
-  });
-});
-
-describe("loadOrCreateAnonId", () => {
-  it("creates the file on first call and reuses on subsequent calls", async () => {
-    const first = await loadOrCreateAnonId(synthHome);
-    expect(first).toMatch(/^[0-9a-f]{16}$/);
-    expect(existsSync(anonIdPath(synthHome))).toBe(true);
-
-    // Mutate the file and re-load -- the file wins over a fresh compute.
-    writeFileSync(anonIdPath(synthHome), "deadbeefdeadbeef\n");
-    const second = await loadOrCreateAnonId(synthHome);
-    expect(second).toBe("deadbeefdeadbeef");
-  });
-
-  it("regenerates when the persisted value is malformed", async () => {
+describe("anon-id retirement", () => {
+  it("leaves a pre-existing .anon file alone instead of reading or rewriting it", async () => {
+    // An older version persisted a machine fingerprint here. Nothing loads it
+    // now, and `try` must neither consume it nor delete it out from under the
+    // user -- it just stops being touched.
     mkdirSync(trialsDir(synthHome), { recursive: true });
-    writeFileSync(anonIdPath(synthHome), "not-a-hex\n");
-    const id = await loadOrCreateAnonId(synthHome);
-    expect(id).toMatch(/^[0-9a-f]{16}$/);
-    expect(id).not.toBe("not-a-hex");
+    writeFileSync(legacyAnonPath(synthHome), "deadbeefdeadbeef\n");
+
+    const cap = captureIO();
+    const events: TryEventBody[] = [];
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async (_url, body) => {
+        events.push(body);
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    // Untouched on disk...
+    expect(readFileSync(legacyAnonPath(synthHome), "utf8")).toBe("deadbeefdeadbeef\n");
+    // ...and never fed into the event body.
+    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
+    expect(events[0].anonId).not.toContain("deadbeef");
   });
 });
 
 describe("runTry — happy path", () => {
-  it("writes the trial entry + marker, posts the telemetry event, prints the 3-line nudge", async () => {
+  it("writes the trial entry + marker, fires the lifecycle event, prints the 3-line nudge", async () => {
     const cap = captureIO();
     const events: TryEventBody[] = [];
     const r = await runTry({
@@ -272,20 +278,23 @@ describe("runTry — happy path", () => {
     // The canonical yaw-mcp entry is NOT created by `try`.
     expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
 
-    // anonId seeded.
-    expect(existsSync(anonIdPath(synthHome))).toBe(true);
+    // No machine fingerprint persisted -- the .anon file is never created.
+    expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
 
-    // Telemetry event fired.
+    // Lifecycle event fired through the seam, carrying the fixed placeholder
+    // rather than a per-machine id.
     expect(events).toHaveLength(1);
     expect(events[0].slug).toBe("demo");
     expect(events[0].action).toBe("try");
-    expect(events[0].anonId).toMatch(/^[0-9a-f]{16}$/);
+    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
 
-    // 3-line nudge.
+    // 3-line nudge. The keep-it CTA points at the local `add` path -- the
+    // hosted signup page it used to advertise is gone (404s).
     const text = cap.text();
     expect(text).toMatch(/Trial wired/);
     expect(text).toMatch(/Expires in 1h/);
-    expect(text).toMatch(/Sign up/);
+    expect(text).toMatch(/Liking it\? Keep Demo MCP for good with: yaw-mcp add demo/);
+    expect(text).not.toMatch(/Sign up|\/signup/);
   });
 
   it("reuses buildLaunchEntry's Windows cmd /c wrap for the trial entry", async () => {
@@ -653,6 +662,9 @@ describe("runTryCleanup", () => {
     expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
     expect(events).toHaveLength(1);
     expect(events[0].action).toBe("cleanup");
+    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
+    // Cleanup must not seed a machine fingerprint either.
+    expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
     // written must contain the client path because the entry was actually removed.
     expect(r.written).toContain(join(synthHome, ".claude.json"));
   });
@@ -790,6 +802,9 @@ describe("scanTrials + gcExpiredTrials", () => {
     expect(events).toHaveLength(1);
     expect(events[0].action).toBe("expiry-gc");
     expect(events[0].slug).toBe("old");
+    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
+    // The GC sweep no longer seeds a machine fingerprint on its way through.
+    expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
   });
 
   it("GC is a no-op when no expired trials exist", async () => {

@@ -4,6 +4,7 @@ import {
   COMPLIANCE_USAGE,
   formatLaunchFailure,
   isRenderableReport,
+  PUBLISH_REMOVED_MESSAGE,
   resolveNpxLaunch,
   runComplianceCommand,
 } from "../compliance-cmd.js";
@@ -50,11 +51,29 @@ describe("runComplianceCommand arg handling", () => {
   });
 
   // --publish was removed with the hosted backend (it POSTed to
-  // /api/compliance/ext, which 404s). It is no longer a recognized flag, so
-  // it falls through to the mcp-compliance child as a plain extra arg --
-  // this test only pins that the flag is gone from the usage text.
+  // /api/compliance/ext, which 404s).
   it("no longer advertises --publish", () => {
     expect(COMPLIANCE_USAGE).not.toContain("--publish");
+  });
+
+  it("--publish is rejected with an explanation and exit 2 (never reaches the child)", async () => {
+    // Behavior, not docs. Unhandled, --publish falls through to runTest as a
+    // stray extra arg and the user gets an opaque child-process error instead
+    // of "that flag is gone". Exit 2 is load-bearing: the child path can only
+    // ever return 0 or 1, so a 2 here proves we short-circuited before spawn.
+    const cap = captureIo();
+    const code = await runComplianceCommand(["--publish"], cap.io);
+    expect(code).toBe(2);
+    expect(cap.err()).toBe(PUBLISH_REMOVED_MESSAGE);
+    expect(cap.err()).toContain("no longer publishes compliance reports");
+    expect(cap.out()).toBe("");
+  });
+
+  it("--publish is rejected even alongside a valid target", async () => {
+    const cap = captureIo();
+    const code = await runComplianceCommand(["https://example.com/mcp", "--publish"], cap.io);
+    expect(code).toBe(2);
+    expect(cap.err()).toBe(PUBLISH_REMOVED_MESSAGE);
   });
 
   it("defaults to the real process streams when no io is injected", async () => {

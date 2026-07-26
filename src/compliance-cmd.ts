@@ -17,6 +17,13 @@ export const COMPLIANCE_USAGE =
   '    yaw-mcp compliance "npx -y @modelcontextprotocol/server-filesystem /tmp"\n' +
   "    yaw-mcp compliance https://example.com/mcp\n\n";
 
+/** Rejection text for the retired `--publish` flag. Exported so the test can
+ *  assert on the exact message rather than a substring that could drift. */
+export const PUBLISH_REMOVED_MESSAGE =
+  "\n  --publish was removed: yaw-mcp no longer publishes compliance reports.\n" +
+  "  Run `yaw-mcp compliance <target>` for a local report, or `yaw-mcp audit\n" +
+  "  <namespace>` to cache a grade for a server in your bundles.json.\n\n";
+
 /** Injectable output sinks. Every sibling subcommand (audit, doctor, ...)
  *  takes out/err hooks so tests can capture output without spying on the
  *  real process streams; compliance now matches. Defaults keep the CLI
@@ -44,6 +51,16 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
   if (argv.includes("--help") || argv.includes("-h")) {
     out(COMPLIANCE_USAGE);
     return 0;
+  }
+
+  // `--publish` used to POST the report to the hosted backend, which no longer
+  // exists. Reject it HERE rather than letting it fall through: as an
+  // unrecognized extra arg it reaches the mcp-compliance child, which fails
+  // with its own opaque child-process error instead of telling the user the
+  // flag is gone. Exit 2 -- same arg-error convention as a missing <target>.
+  if (argv.includes("--publish")) {
+    err(PUBLISH_REMOVED_MESSAGE);
+    return 2;
   }
 
   if (argv.length === 0) {

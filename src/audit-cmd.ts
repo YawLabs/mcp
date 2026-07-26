@@ -5,7 +5,7 @@
 // a one-shot report, `audit` is namespace-driven: it reads the named server's
 // spawn config (command + args + env) straight out of bundles.json, runs the
 // suite over stdio, and persists the grade to ~/.yaw-mcp/grades.json. The
-// `servers` command (and the MCP panel) then merge that cached grade into the
+// `list` command (and the MCP panel) then merge that cached grade into the
 // server's row, so a user can grade a server once and see the letter on every
 // subsequent list without re-running 80-odd tests.
 //
@@ -117,7 +117,8 @@ export const AUDIT_USAGE = `Usage: yaw-mcp audit <namespace> [--json]
 
   Run the MCP compliance suite against a server configured in your local
   bundles.json and cache its A-F grade in ~/.yaw-mcp/grades.json. The cached
-  grade then shows up in \`yaw-mcp servers\` and the Yaw Terminal MCP panel.
+  grade then shows up in the GRADE column of \`yaw-mcp list\` and the Yaw
+  Terminal MCP panel.
 
   <namespace>   The namespace of a stdio server in bundles.json (see
                 \`yaw-mcp list\`).

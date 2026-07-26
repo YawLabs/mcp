@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
   };
 });
 
+import { CONFIG_DIRNAME } from "../paths.js";
 import { buildToolList } from "../proxy.js";
 import {
   ConnectServer,
@@ -704,6 +705,164 @@ describe("ConnectServer", () => {
       // Ungraded stays clean — don't invent a placeholder that would
       // read as a grade to the model.
       expect(text).not.toMatch(/raw — Ungraded.*\[[A-F]\]/);
+    });
+  });
+
+  // The grade cache written by `yaw-mcp audit` is the ONLY supplier of
+  // `complianceGrade` in local mode: bundles.json entries never carry one
+  // (validateEntry drops unknown fields). Until start() overlaid it, every
+  // server was permanently ungraded — which made YAW_MCP_MIN_COMPLIANCE inert
+  // (ungraded always passes) and blanked the discover badge. These pin the
+  // overlay by its EFFECT on gating, not by the field being set.
+  describe("compliance grades hydrated from grades.json", () => {
+    let gradesHome: string;
+
+    function writeGrades(entries: Record<string, { grade: string; score: number; gradedAt: string }>): void {
+      mkdirSync(join(gradesHome, CONFIG_DIRNAME), { recursive: true });
+      writeFileSync(join(gradesHome, CONFIG_DIRNAME, "grades.json"), JSON.stringify(entries, null, 2), "utf8");
+    }
+
+    const GRADE_D = { grade: "D", score: 41.2, gradedAt: "2026-06-11T00:00:00.000Z" };
+
+    beforeEach(() => {
+      gradesHome = mkdtempSync(join(tmpdir(), "yaw-mcp-srv-grades-"));
+    });
+
+    afterEach(() => {
+      rmSync(gradesHome, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+    });
+
+    it("gates a cache-graded server behind YAW_MCP_MIN_COMPLIANCE", async () => {
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+      writeGrades({ bad: GRADE_D });
+      const priv = getPrivate(server);
+      // No complianceGrade in the config — exactly what bundles.json yields.
+      priv.config = makeConfig([makeServerConfig({ namespace: "bad", name: "Bad Server" })]);
+
+      await priv.hydrateComplianceGrades(gradesHome);
+
+      const result = await priv.handleActivate(["bad"]);
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain('Refused to load "bad"');
+      expect(text).toContain("grade D");
+      expect(text).toContain("YAW_MCP_MIN_COMPLIANCE=B");
+      // The gate must short-circuit before any upstream spawn.
+      expect(connectToUpstream).not.toHaveBeenCalled();
+      expect(priv.connections.has("bad")).toBe(false);
+    });
+
+    it("without the overlay the same server reads as ungraded and passes the floor", async () => {
+      // Pins WHY the bug was silent: absent the overlay, passesMinCompliance
+      // sees `undefined` and fails open. If this ever starts refusing, the
+      // fail-open-on-genuinely-ungraded policy changed and the test above is
+      // no longer proving the overlay did the work.
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+      writeGrades({ bad: GRADE_D });
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "bad", name: "Bad Server" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("bad", ["t"]));
+
+      const result = await priv.handleActivate(["bad"]);
+      expect(result.isError).toBeUndefined();
+      expect(priv.connections.has("bad")).toBe(true);
+    });
+
+    it("renders the [A]-[F] discover badge from a cached grade", async () => {
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "");
+      writeGrades({ gh: { grade: "A", score: 97.7, gradedAt: "2026-06-11T00:00:00.000Z" } });
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+      await priv.hydrateComplianceGrades(gradesHome);
+
+      expect(priv.handleDiscover().content[0].text).toMatch(/gh — GitHub.*\[A\]/);
+    });
+
+    it("leaves servers absent from the cache ungraded", async () => {
+      writeGrades({ other: GRADE_D });
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+      await priv.hydrateComplianceGrades(gradesHome);
+
+      expect(priv.config.servers[0].complianceGrade).toBeUndefined();
+    });
+
+    it("degrades to ungraded when the cache is missing or garbage", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+      // Missing file.
+      await priv.hydrateComplianceGrades(gradesHome);
+      expect(priv.config.servers[0].complianceGrade).toBeUndefined();
+
+      // Present but not JSON — must not throw and must not blank the list.
+      mkdirSync(join(gradesHome, CONFIG_DIRNAME), { recursive: true });
+      writeFileSync(join(gradesHome, CONFIG_DIRNAME, "grades.json"), "{{{ not json", "utf8");
+      await expect(priv.hydrateComplianceGrades(gradesHome)).resolves.toBeUndefined();
+      expect(priv.config.servers).toHaveLength(1);
+      expect(priv.config.servers[0].complianceGrade).toBeUndefined();
+    });
+  });
+
+  // Before the tool cache was persisted, `server.toolCache` was permanently
+  // undefined, so prewarm classified EVERY active server as dormant and
+  // re-spawned all of them (an `npx -y <pkg>@latest` resolve each) on every
+  // client start. These pin that a known tool list suppresses the spawn.
+  describe("persisted tool cache", () => {
+    it("prewarm skips a server whose tools were hydrated from state.json", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.hydrateToolCache({
+        gh: { tools: [{ name: "create_issue", description: "open an issue" }], learnedAt: Date.now() },
+      });
+
+      await priv.prewarmDormantServers();
+
+      expect(connectToUpstream).not.toHaveBeenCalled();
+    });
+
+    it("prewarm still spawns a server whose tools are unknown to both sources", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      await priv.prewarmDormantServers();
+
+      expect(connectToUpstream).toHaveBeenCalledTimes(1);
+    });
+
+    it("hydrated tools make an inactive server deferred on the first tools/list", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.hydrateToolCache({ gh: { tools: [{ name: "create_issue" }], learnedAt: 1_000 } });
+
+      const deferred = priv.getDeferredServers();
+      expect(deferred.map((s: UpstreamServerConfig) => s.namespace)).toEqual(["gh"]);
+      expect(deferred[0].toolCache).toEqual([{ name: "create_issue" }]);
+    });
+
+    it("exportToolCache preserves the hydrated learnedAt so entries still age out", () => {
+      const priv = getPrivate(server);
+      priv.hydrateToolCache({ gh: { tools: [{ name: "create_issue" }], learnedAt: 12_345 } });
+
+      expect(priv.exportToolCache()).toEqual({ gh: { tools: [{ name: "create_issue" }], learnedAt: 12_345 } });
+    });
+
+    it("a live activation refreshes the cache and stamps it with a fresh learnedAt", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.hydrateToolCache({ gh: { tools: [{ name: "stale_tool" }], learnedAt: 1_000 } });
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      const before = Date.now();
+      await priv.handleActivate(["gh"]);
+
+      const exported = priv.exportToolCache();
+      expect(exported.gh.tools.map((t: { name: string }) => t.name)).toEqual(["create_issue"]);
+      expect(exported.gh.learnedAt).toBeGreaterThanOrEqual(before);
     });
   });
 

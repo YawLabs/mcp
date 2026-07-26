@@ -196,7 +196,16 @@ describe("runServer startup failure", () => {
   // YAW_MCP_URL exported in their shell profile still gets a working server.
   it("boots normally with a would-be-unsafe YAW_MCP_URL instead of dying", async () => {
     const { code, stderr } = await runEntry({ YAW_MCP_URL: "http://evil.example.com" });
-    expect(code).not.toBe(1);
+    // 0 or null, never 1 or 2. Both healthy shapes are timing-dependent and
+    // NEITHER indicates a problem: runEntry spawns with stdin on "ignore",
+    // so the stdio transport usually sees EOF and shuts down cleanly (0),
+    // but under full-suite load it can still be running when the 15s guard
+    // SIGKILLs it (null). What actually distinguishes a healthy boot is the
+    // absence of the failure codes -- 1 is the old fatal-config abort this
+    // test guards against, 2 is an argv error. Asserting a bare `toBe(0)`
+    // here is FLAKY (observed failing in the full suite and passing solo);
+    // the `not.toBe(1)` it replaced was stable but also passed for 2.
+    expect([0, null]).toContain(code);
     // The old fatal line is gone, and nothing fell through to the
     // last-resort handler either.
     expect(stderr).not.toContain("yaw-mcp: apiBase");
