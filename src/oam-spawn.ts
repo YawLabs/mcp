@@ -109,9 +109,25 @@ export function winNormalize(p: string, platform: NodeJS.Platform = process.plat
  * `run` is injectable so the parse + gate logic is testable without a real
  * binary on PATH.
  */
+/** How long `oam --version` gets before we give up and fall back to node.
+ *  Matches the 3s budget uv-bootstrap's onPath() probe already uses. */
+export const OAM_PROBE_TIMEOUT_MS = 3_000;
+
 export function probeOam(
   run: (bin: string) => string = (bin) =>
-    execFileSync(bin, ["--version"], { stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" }),
+    // execFileSync BLOCKS the event loop, and this runs on the upstream
+    // connect path of a single-threaded broker -- without a timeout an oam
+    // binary that hangs (stuck on a network mount, a wedged FUSE path, a
+    // debugger-stopped process) takes the whole hub down with it: the client
+    // stdio transport and every in-flight upstream call stop being serviced,
+    // with no way to break out. The timeout makes the worst case a bounded
+    // 3s stall that then falls back to node, which is what an absent oam
+    // already does. The result is cached, so this is paid at most once.
+    execFileSync(bin, ["--version"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      timeout: OAM_PROBE_TIMEOUT_MS,
+    }),
 ): OamProbe {
   if (oamProbeCache !== undefined) return oamProbeCache;
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));

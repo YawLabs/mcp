@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   MIN_OAM_VERSION,
   npxCacheNodeModules,
+  OAM_PROBE_TIMEOUT_MS,
   packageName,
   parseOamVersion,
   probeOam,
@@ -255,5 +256,44 @@ describe("resolveNpmEntry", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// probeOam runs execFileSync, which blocks the event loop, on the upstream
+// connect path of a single-threaded broker. Without a timeout an oam binary
+// that never returns wedges the whole hub. These pin both halves of the
+// contract: the bound exists, and exceeding it degrades to the same
+// node fallback that an absent oam already produces.
+describe("probeOam timeout", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  it("declares a probe timeout matching the uv onPath budget", () => {
+    expect(OAM_PROBE_TIMEOUT_MS).toBe(3_000);
+  });
+
+  it("falls back to node when the probe times out", () => {
+    // execFileSync throws ETIMEDOUT when the child exceeds `timeout`; the
+    // catch must produce the same result as "oam is not installed".
+    const probe = probeOam(() => {
+      const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
+      err.code = "ETIMEDOUT";
+      throw err;
+    });
+    expect(probe.bin).toBeNull();
+    expect(probe.version).toBeNull();
+    expect(probe.belowMin).toBe(false);
+  });
+
+  it("leaves an opted-in server on its original node/npx command after a timeout", () => {
+    const probe = probeOam(() => {
+      throw new Error("spawnSync oam ETIMEDOUT");
+    });
+    const original = { command: "npx", args: ["-y", "some-mcp-server"] };
+    const rewritten = rewriteForOam(original.command, original.args, {
+      oamBin: probe.bin,
+      resolveEntry: () => "/somewhere/entry.js",
+    });
+    expect(rewritten).toEqual(original);
   });
 });
