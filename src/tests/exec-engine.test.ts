@@ -435,3 +435,43 @@ describe("exec-engine: stepBindingKey", () => {
     expect(stepBindingKey({ id: "", tool: "t" }, 1)).toBe("1");
   });
 });
+
+// JSON.parse produces "__proto__" as an OWN property, but `out[k] = v` hits
+// Object.prototype's __proto__ setter instead of creating an own key. The
+// rebuilt object then has no own "__proto__", and because JSON.stringify only
+// serializes own properties the argument is silently dropped from the
+// outgoing tools/call rather than being passed through.
+describe("resolveArgs __proto__ handling", () => {
+  it("preserves a __proto__ argument as an own property", () => {
+    const args = JSON.parse('{"__proto__": {"nested": 1}, "other": 2}');
+    expect(Object.hasOwn(args, "__proto__")).toBe(true);
+
+    const out = resolveArgs(args, {}) as Record<string, unknown>;
+
+    expect(Object.hasOwn(out, "__proto__")).toBe(true);
+    expect(out.other).toBe(2);
+    // The argument must survive serialization to the upstream server.
+    // NB: an object literal { __proto__: ... } would SET the prototype rather
+    // than create an own key -- the very trap this test is about -- so the
+    // expected value is built with JSON.parse too.
+    expect(JSON.parse(JSON.stringify(out))).toEqual(JSON.parse(`{"__proto__": {"nested": 1}, "other": 2}`));
+  });
+
+  it("does not change the rebuilt object's prototype", () => {
+    const args = JSON.parse('{"__proto__": {"polluted": true}}');
+    const out = resolveArgs(args, {}) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+  });
+
+  it("never pollutes Object.prototype", () => {
+    const args = JSON.parse('{"__proto__": {"polluted": true}}');
+    resolveArgs(args, {});
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("resolves $ref inside a __proto__-keyed argument", () => {
+    const args = JSON.parse('{"__proto__": {"from": {"$ref": "step1.value"}}}');
+    const out = resolveArgs(args, { step1: { value: "resolved" } }) as Record<string, unknown>;
+    expect(JSON.parse(JSON.stringify(out))).toEqual(JSON.parse(`{"__proto__": {"from": "resolved"}}`));
+  });
+});
