@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { rankServers, scoreRelevance } from "../relevance.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import { rankServers, relevanceCacheStats, resetRelevanceCache, scoreRelevance } from "../relevance.js";
 
 describe("scoreRelevance (single-server wrapper)", () => {
   const server = { name: "GitHub", namespace: "gh", description: "Repos, issues, pull requests" };
@@ -187,5 +187,131 @@ describe("rankServers (corpus-wide BM25)", () => {
     expect(ranked).toHaveLength(1);
     expect(ranked[0].namespace).toBe("only");
     expect(ranked[0].score).toBeGreaterThan(0);
+  });
+});
+
+// The BM25 index (per-field token counts, document frequency, IDF, average
+// field lengths) is a pure function of the corpus, but it used to be rebuilt
+// on every call. Profiling put that rebuild at ~90% of the cost of a single
+// rankServers() call, and it is paid on every discover and every dispatch.
+//
+// These tests assert the caching behaviour via build counters rather than
+// wall-clock timings, so they fail deterministically on a regression instead
+// of flaking on a loaded CI box.
+describe("ranking index cache", () => {
+  beforeEach(() => {
+    resetRelevanceCache();
+  });
+
+  const corpus = () => [
+    {
+      namespace: "gh",
+      name: "GitHub",
+      description: "Repos, issues, pull requests",
+      tools: [
+        { name: "create_issue", description: "Open a new issue" },
+        { name: "list_pull_requests", description: "List open pull requests" },
+      ],
+    },
+    {
+      namespace: "slack",
+      name: "Slack",
+      description: "Team messaging",
+      tools: [{ name: "send_message", description: "Post a message to a channel" }],
+    },
+  ];
+
+  it("builds the index once across repeated ranking of the same corpus", () => {
+    for (let i = 0; i < 25; i++) {
+      rankServers("create an issue", corpus());
+    }
+    // One build total -- not one per call -- even though every call passes a
+    // freshly constructed array (which is what ConnectServer.rankableFor does).
+    expect(relevanceCacheStats().indexBuilds).toBe(1);
+    expect(relevanceCacheStats().docBuilds).toBe(2);
+  });
+
+  it("returns identical rankings on cached and uncached calls", () => {
+    const first = rankServers("create an issue", corpus());
+    const second = rankServers("create an issue", corpus());
+    expect(second).toEqual(first);
+    expect(relevanceCacheStats().indexBuilds).toBe(1);
+  });
+
+  it("varies scoring by query while reusing one index", () => {
+    const issues = rankServers("create an issue", corpus());
+    const chat = rankServers("post a message to the channel", corpus());
+    expect(issues[0]?.namespace).toBe("gh");
+    expect(chat[0]?.namespace).toBe("slack");
+    expect(relevanceCacheStats().indexBuilds).toBe(1);
+  });
+
+  it("rebuilds when a server description changes", () => {
+    rankServers("kubernetes deploys", corpus());
+    const edited = corpus();
+    edited[1].description = "Team messaging and kubernetes deploy alerts";
+    const after = rankServers("kubernetes deploys", edited);
+    // The edit must be visible -- a stale index would still score slack at 0.
+    expect(after.map((r) => r.namespace)).toContain("slack");
+    expect(relevanceCacheStats().indexBuilds).toBe(2);
+  });
+
+  it("rebuilds when a tool is added", () => {
+    rankServers("upload attachment", corpus());
+    const edited = corpus();
+    edited[1].tools.push({ name: "upload_attachment", description: "Upload a file" });
+    const after = rankServers("upload attachment", edited);
+    expect(after.map((r) => r.namespace)).toContain("slack");
+    expect(relevanceCacheStats().indexBuilds).toBe(2);
+  });
+
+  it("reuses per-server fields for the servers that did not change", () => {
+    rankServers("create an issue", corpus());
+    expect(relevanceCacheStats().docBuilds).toBe(2);
+    const edited = corpus();
+    edited[1].description = "Team messaging, now with threads";
+    rankServers("create an issue", edited);
+    // Only the edited server is re-tokenized; gh's fields come from the cache.
+    expect(relevanceCacheStats().docBuilds).toBe(3);
+  });
+
+  it("does not collide corpora that differ only in where a field boundary falls", () => {
+    // Guards the signature separator: joining fields with a printable
+    // character would sign these two corpora identically, silently serving
+    // one the other's index. Namespace and name carry different BM25 weights,
+    // so a collision would also produce a wrong score.
+    const a = [{ namespace: "alpha beta", name: "gamma", description: "", tools: [] }];
+    const b = [{ namespace: "alpha", name: "beta gamma", description: "", tools: [] }];
+    const rankedA = rankServers("beta", a);
+    const rankedB = rankServers("beta", b);
+    expect(relevanceCacheStats().indexBuilds).toBe(2);
+    // beta sits in `namespace` (weight 2.0) for a, and in `name` (weight 3.0)
+    // for b, so the scores must differ.
+    expect(rankedA[0]?.score).not.toBe(rankedB[0]?.score);
+  });
+
+  it("bounds the index cache instead of growing without limit", () => {
+    for (let i = 0; i < 40; i++) {
+      rankServers("create an issue", [
+        { namespace: `ns${i}`, name: `Server ${i}`, description: "unique corpus", tools: [] },
+      ]);
+    }
+    // Every corpus is distinct, so every call builds -- the point is that the
+    // cache evicts rather than retaining all 40.
+    expect(relevanceCacheStats().indexBuilds).toBe(40);
+    // Re-ranking the FIRST corpus must miss (it was evicted), proving the cap.
+    rankServers("create an issue", [{ namespace: "ns0", name: "Server 0", description: "unique corpus", tools: [] }]);
+    expect(relevanceCacheStats().indexBuilds).toBe(41);
+  });
+
+  it("still saturates term frequency after the counts refactor", () => {
+    // FieldStats stores per-term counts instead of a token array; BM25's k1
+    // saturation must still apply, so 5 repeats scores below 5x a single hit.
+    const once = rankServers("widget", [{ namespace: "one", name: "One", description: "widget", tools: [] }]);
+    const many = rankServers("widget", [
+      { namespace: "one", name: "One", description: "widget widget widget widget widget", tools: [] },
+    ]);
+    expect(many[0].score).toBeGreaterThan(once[0].score);
+    expect(many[0].score).toBeLessThan(once[0].score * 5);
   });
 });
