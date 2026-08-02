@@ -32,10 +32,26 @@ const unrefed: number[] = [];
 const stdoutDestroyed: number[] = [];
 /** When true the fake child never exits -- the wedged-binary case. */
 let hangForever = false;
+/** When true the fake stdout emits an 'error' before its data -- the pipe
+ *  fault that is an uncaught exception if nothing is listening. */
+let errorOnStdout = false;
+/** When set, spawn() throws it synchronously -- the reject path that runs
+ *  before any listener or the deadline timer exists. */
+let spawnThrows: Error | null = null;
+/** When set, the child emits 'error' instead of exiting -- the ENOENT shape
+ *  every machine without oam produces. */
+let childError: (Error & { code?: string }) | null = null;
+/** stdout the fake child writes before closing. Empty models a build that
+ *  prints --version to the stderr this probe discards. */
+let stdoutChunks: string[] = ["oam 9.9.9\n"];
+/** close() args. `code` is null exactly when the child died on a signal. */
+let exitCode: number | null = 0;
+let exitSignal: string | null = null;
 
 vi.mock("node:child_process", () => ({
   spawn: (bin: string, args: string[], opts: Record<string, unknown>) => {
     spawnCalls.push({ bin, args: [...(args ?? [])], opts: { ...opts } });
+    if (spawnThrows) throw spawnThrows;
     const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void; destroy: () => void };
     stdout.setEncoding = () => {};
     const child = new EventEmitter() as EventEmitter & {
@@ -56,8 +72,17 @@ vi.mock("node:child_process", () => ({
     if (!hangForever) {
       // Emit on a later turn so the probe's listeners are attached first.
       setTimeout(() => {
-        stdout.emit("data", "oam 9.9.9\n");
-        child.emit("close", 0);
+        // Unhandled 'error' throws out of this callback, so 'close' never
+        // fires and the probe falls through to its deadline -- the assertion
+        // fails either way when the listener is missing.
+        if (errorOnStdout) stdout.emit("error", new Error("EPIPE"));
+        // An erroring child never reaches 'close' -- that is the whole shape.
+        if (childError) {
+          child.emit("error", childError);
+          return;
+        }
+        for (const chunk of stdoutChunks) stdout.emit("data", chunk);
+        child.emit("close", exitCode, exitSignal);
       }, 0);
     }
     return child;
@@ -77,6 +102,12 @@ describe("probeOam default runner", () => {
     unrefed.length = 0;
     stdoutDestroyed.length = 0;
     hangForever = false;
+    errorOnStdout = false;
+    spawnThrows = null;
+    childError = null;
+    stdoutChunks = ["oam 9.9.9\n"];
+    exitCode = 0;
+    exitSignal = null;
     resetOamBinCache();
     process.env.OAM_BIN = "/usr/local/bin/oam";
   });
@@ -164,5 +195,116 @@ describe("probeOam default runner", () => {
     expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL]);
     expect(unrefed, "child was not unref'd -- it can still hold the loop").toHaveLength(1);
     expect(stdoutDestroyed, "stdout pipe was not released").toHaveLength(1);
+  });
+
+  it("survives a pipe error on stdout rather than taking the broker down", async () => {
+    // An 'error' on a stream with nothing listening is an uncaught exception,
+    // and this file's whole premise is that the oam probe is an optimization
+    // that must never kill the process. The timeout path destroys this pipe
+    // while a wedged child may still be writing to it, so the fault is one the
+    // probe creates deliberately -- it is not a hypothetical.
+    errorOnStdout = true;
+
+    const probe = await probeOam();
+
+    // Swallowed: 'close' still settles the probe on the normal path.
+    expect(probe.version).toBe("9.9.9");
+  });
+
+  it("falls back to node the moment the child errors, without waiting out the deadline", async () => {
+    // The routine path on every machine without oam. The sibling file's ENOENT
+    // tests all inject a fake `run`, so this listener could be deleted and they
+    // would all still pass -- while each broker start stalls the full 3s on the
+    // deadline before degrading. `killed` being empty is what pins that: only
+    // the timeout path attempts a kill.
+    const enoent = new Error("spawn oam ENOENT") as Error & { code?: string };
+    enoent.code = "ENOENT";
+    childError = enoent;
+
+    const probe = await probeOam();
+
+    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(killed, "probe waited for the deadline instead of settling on 'error'").toEqual([]);
+  });
+
+  it("falls back to node when the probe exits non-zero", async () => {
+    // A broken install that fails `--version`. Same node fallback as absent.
+    stdoutChunks = [];
+    exitCode = 1;
+
+    const probe = await probeOam();
+
+    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(killed).toEqual([]);
+  });
+
+  it("falls back to node when the child is killed by a signal", async () => {
+    // `close` reports code null + a signal here (OOM killer, external kill),
+    // which is the shape the exit-code branch has to survive.
+    stdoutChunks = [];
+    exitCode = null;
+    exitSignal = "SIGKILL";
+
+    const probe = await probeOam();
+
+    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(killed).toEqual([]);
+  });
+
+  it("degrades to node when spawn itself throws before any listener exists", async () => {
+    // OAM_BIN is user-supplied and node rejects some values outright (a NUL
+    // byte, say). This is the one reject path that never reaches settle() or
+    // the deadline, so nothing else covers it.
+    spawnThrows = new TypeError("The argument 'file' must be a string without null bytes");
+
+    const probe = await probeOam();
+
+    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+  });
+
+  it("treats a clean exit with no parseable stdout as a usable oam", async () => {
+    // stderr is discarded (stdio ["ignore","pipe","ignore"]), so a build that
+    // prints --version there leaves version null -- and probeOamUncached gates
+    // on `version !== null`, so MIN_OAM_VERSION is then never applied. That is
+    // the same shape the collector's truncation fix exists to prevent, so pin
+    // the decision rather than leave it to be rediscovered.
+    stdoutChunks = [];
+
+    const probe = await probeOam();
+
+    expect(probe.version).toBeNull();
+    expect(probe.belowMin).toBe(false);
+    expect(probe.bin).toBe(winNormalize("/usr/local/bin/oam"));
+  });
+
+  it("unrefs its deadline timer so a pending probe cannot hold the process open", async () => {
+    // Promised by the doc comment on spawnVersionProbe and checked by nothing:
+    // drop the unref and a broker that starts and immediately shuts down waits
+    // out the whole deadline before exiting.
+    hangForever = true;
+    vi.useFakeTimers();
+
+    const unrefedTimers: NodeJS.Timeout[] = [];
+    const schedule = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      const handle = schedule(fn, ms) as unknown as NodeJS.Timeout;
+      handle.unref = () => {
+        unrefedTimers.push(handle);
+        return handle;
+      };
+      return handle;
+    }) as unknown as typeof globalThis.setTimeout);
+
+    try {
+      // The probe's executor -- spawn and setTimeout -- runs synchronously, so
+      // the unref has already happened by the time probeOam() returns.
+      const pending = probeOam();
+      expect(unrefedTimers, "deadline timer was not unref'd").toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
+      await pending;
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

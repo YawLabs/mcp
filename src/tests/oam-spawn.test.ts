@@ -288,7 +288,9 @@ describe("probeOam timeout", () => {
 
   it("leaves an opted-in server on its original node/npx command after a timeout", async () => {
     const probe = await probeOam(async () => {
-      throw new Error("spawnSync oam ETIMEDOUT");
+      const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
+      err.code = "ETIMEDOUT";
+      throw err;
     });
     const original = { command: "npx", args: ["-y", "some-mcp-server"] };
     const rewritten = rewriteForOam(original.command, original.args, {
@@ -354,6 +356,21 @@ describe("probeOam timeout diagnostics", () => {
     );
     expect(lines).toEqual([]);
   });
+
+  it("warns when the probe fails for any reason other than 'not installed'", async () => {
+    // A present-but-broken oam -- exits non-zero on --version, is killed by a
+    // signal, is not executable -- downgrades every opted-in server to node
+    // for the process lifetime exactly like a timeout does. Silence there
+    // leaves nothing to explain why oam quietly stopped being used.
+    const lines = await captureStderr(() =>
+      probeOam(async () => {
+        throw new Error("oam exited 1");
+      }),
+    );
+    const warn = lines.find((l) => l.msg?.includes("oam --version failed"));
+    expect(warn).toBeDefined();
+    expect(warn?.level).toBe("warn");
+  });
 });
 
 // Two hardening fixes after #92 shipped.
@@ -396,6 +413,20 @@ describe("probeOam hardening", () => {
     c.push("oam 0.");
     c.push("6.0\n");
     expect(parseOamVersion(c.result())).toBe("0.6.0");
+  });
+
+  it("stops collecting once the version is known", () => {
+    // `found` is monotonic and result() never reaches `head` once it is set,
+    // so a further chunk has nothing to do. Without the early return each one
+    // still costs a full-chunk concat plus a slice -- paid precisely by the
+    // runaway binary the cap exists to bound.
+    const c = createProbeCollector(1024);
+    c.push("oam 1.2.3\n");
+    const retained = c.retainedLength();
+
+    c.push("x".repeat(80 * 1024));
+    expect(c.retainedLength()).toBe(retained);
+    expect(parseOamVersion(c.result())).toBe("1.2.3");
   });
 
   it("keeps the first version when several appear", () => {
@@ -447,5 +478,38 @@ describe("probeOam hardening", () => {
     });
     expect(ran, "stale in-flight probe published over the reset").toBe(true);
     expect(after.version).toBe("1.2.3");
+  });
+
+  it("does not let a stale probe release the in-flight slot of the one that replaced it", async () => {
+    // The test above releases the stale probe BEFORE the replacement starts,
+    // so the ordering the generation guard actually exists for -- stale settles
+    // LAST, after a newer probe already owns the slot -- never runs. Unguarded,
+    // the stale .finally clears oamProbeInFlight and the next caller starts a
+    // second spawn against state the live probe is already resolving.
+    let releaseStale: (v: string) => void = () => {};
+    const stale = () =>
+      new Promise<string>((r) => {
+        releaseStale = r;
+      });
+    // One resolver per invocation, so a spurious second probe is counted rather
+    // than silently stealing the first one's resolver and hanging the test.
+    const freshCalls: Array<(v: string) => void> = [];
+    const fresh = () => new Promise<string>((r) => freshCalls.push(r));
+
+    const staleProbe = probeOam(stale);
+    resetOamBinCache();
+    const freshProbe = probeOam(fresh); // claims the in-flight slot
+
+    releaseStale("oam 9.9.9"); // ...and only now does the discarded probe land
+    await staleProbe;
+
+    // A caller arriving here must JOIN the live probe, not start another.
+    const joiner = probeOam(fresh);
+    for (const release of freshCalls) release("oam 1.2.3");
+    const [a, b] = await Promise.all([freshProbe, joiner]);
+
+    expect(freshCalls, "stale probe's cleanup released the live probe's slot").toHaveLength(1);
+    expect(a).toEqual(b);
+    expect(a.version).toBe("1.2.3");
   });
 });

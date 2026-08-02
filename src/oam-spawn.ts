@@ -162,8 +162,15 @@ export function createProbeCollector(max: number = OAM_PROBE_MAX_OUTPUT) {
 
   return {
     push(chunk: string): void {
+      // Once a version is in hand there is nothing left for a further chunk to
+      // do: `found` is monotonic, `carry` is read only on the not-yet-found
+      // branch, and `head` is unreachable through result(). Returning early
+      // matters for the exact case the cap exists for -- a binary that keeps
+      // spewing after printing its version otherwise costs a full-chunk concat
+      // plus a slice on every data event, with nothing retained to show for it.
+      if (found !== null) return;
       // Scan across the boundary so a version straddling two chunks is seen.
-      if (found === null) found = parseOamVersion(carry + chunk);
+      found = parseOamVersion(carry + chunk);
       carry = (carry + chunk).slice(-VERSION_CARRY);
       if (head.length >= max) return;
       head += chunk.slice(0, max - head.length); // slice, so the cap is HARD
@@ -228,11 +235,21 @@ function spawnVersionProbe(bin: string): Promise<string> {
     // why a plain prefix cap loses the version and does not actually cap.
     const collector = createProbeCollector();
     child.stdout?.setEncoding("utf8");
+    // A pipe 'error' with no listener is an uncaught exception, which would
+    // take the broker down -- precisely what the header promises this file
+    // never does. And the riskiest moment is one we create on purpose: the
+    // timeout path below destroys this pipe while a wedged child may still be
+    // writing to it. Swallow it; there is nothing to recover, and the probe
+    // still settles via 'close' or the deadline.
+    child.stdout?.on("error", () => {});
     child.stdout?.on("data", (chunk: string) => collector.push(chunk));
     // 'error' fires for ENOENT (oam not installed) -- the routine case.
     child.on("error", (err) => settle(() => reject(err)));
-    child.on("close", (code) =>
-      settle(() => (code === 0 ? resolve(collector.result()) : reject(new Error(`oam exited ${code}`)))),
+    // `code` is null when the child died on a signal, so reporting it alone
+    // yields "oam exited null" -- the one diagnostic the message carries,
+    // dropped in the case most worth diagnosing.
+    child.on("close", (code, signal) =>
+      settle(() => (code === 0 ? resolve(collector.result()) : reject(new Error(`oam exited ${code ?? signal}`)))),
     );
 
     timer = setTimeout(() => {
@@ -311,16 +328,27 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     return publish({ bin, version, belowMin: false });
   } catch (err) {
     // "oam is not installed" is the expected, silent case -- ENOENT here is
-    // routine and logging it would be noise on every node-only setup. A
-    // TIMEOUT is not routine: oam IS on disk but did not answer --version
-    // within the budget. Since the probe result is cached for the process
-    // lifetime, that single slow moment silently downgrades every opted-in
-    // server to node until restart, with nothing to explain why. Warn once,
-    // matching the belowMin path, so the degradation is diagnosable.
-    if ((err as { code?: unknown } | null)?.code === "ETIMEDOUT") {
+    // routine and logging it would be noise on every node-only setup.
+    //
+    // EVERY other failure is not routine: oam IS on disk and did not produce a
+    // usable --version. Since the probe result is cached for the process
+    // lifetime, that one moment silently downgrades every opted-in server to
+    // node until restart, with nothing to explain why. So warn once, matching
+    // the belowMin path, and let the timeout keep its own message -- it is the
+    // only failure with an actionable budget attached to it.
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === "ETIMEDOUT") {
       log("warn", "oam did not respond to --version in time; falling back to node for this process", {
         timeoutMs: OAM_PROBE_TIMEOUT_MS,
         bin,
+      });
+    } else if (code !== "ENOENT") {
+      // A non-zero exit, a signal death, an EACCES on a non-executable file,
+      // or a spawn that threw outright. All of them mean a present-but-broken
+      // oam, which is worth strictly more noise than an absent one.
+      log("warn", "oam --version failed; falling back to node for this process", {
+        bin,
+        error: err instanceof Error ? err.message : String(err),
       });
     }
     return publish({ bin: null, version: null, belowMin: false });
