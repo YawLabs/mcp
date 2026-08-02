@@ -20,7 +20,7 @@
 // There is still no auto-fallback after a healthy boot, so only opt in
 // servers verified to run on oam.
 
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -114,48 +114,106 @@ export function winNormalize(p: string, platform: NodeJS.Platform = process.plat
 export const OAM_PROBE_TIMEOUT_MS = 3_000;
 
 /**
- * SIGKILL, not the SIGTERM default, because on POSIX `timeout` alone does NOT
- * bound the call. spawnSync's timer sends `killSignal` and then keeps waiting
- * for the child to actually exit; Node does not escalate when SIGTERM was
- * delivered successfully, so a child that traps or ignores it blocks the probe
- * forever -- the exact hang the timeout is here to prevent.
+ * SIGKILL, not the SIGTERM default. The kill is best-effort either way (see
+ * below), but SIGTERM is strictly weaker: a child that traps or ignores it
+ * simply keeps running, and Node does not escalate on its own.
  *
- * Measured on Linux (node v18), `timeout: 1500`:
+ * Measured on Linux (node v18) against the old synchronous probe, timeout 1500:
  *   child traps SIGTERM,  default killSignal -> never returned (killed at 12s)
  *   child traps SIGTERM,  killSignal SIGKILL -> threw at 1508ms, ETIMEDOUT
- *   child ignores nothing, default killSignal -> threw at 1504ms  (control)
- * Windows is unaffected either way: TerminateProcess cannot be trapped.
- *
- * HONEST LIMIT: this bounds a live-but-unresponsive child, not a child stuck
- * in uninterruptible sleep (D state) on a wedged NFS/FUSE path -- no signal
- * reaches those, SIGKILL included, until the kernel completes the I/O. That
- * case still hangs, and fixing it needs an async probe that this call site
- * (synchronous, from connectToUpstreamOnce) cannot use today.
+ *   child traps nothing,  default killSignal -> threw at 1504ms  (control)
+ * Windows was unaffected either way: TerminateProcess cannot be trapped.
  */
 export const OAM_PROBE_KILL_SIGNAL = "SIGKILL";
 
-export function probeOam(
-  run: (bin: string) => string = (bin) =>
-    // execFileSync BLOCKS the event loop, and this runs on the upstream
-    // connect path of a single-threaded broker -- without a bound, an oam
-    // binary that hangs takes the whole hub down with it: the client stdio
-    // transport and every in-flight upstream call stop being serviced, with
-    // no way to break out. timeout + SIGKILL make the worst case a bounded
-    // 3s stall that then falls back to node, which is what an absent oam
-    // already does. The result is cached, so this is paid at most once.
-    // See OAM_PROBE_KILL_SIGNAL for why SIGTERM is not enough, and for the
-    // one hang shape this still does not cover.
-    execFileSync(bin, ["--version"], {
-      stdio: ["ignore", "pipe", "ignore"],
-      encoding: "utf8",
-      timeout: OAM_PROBE_TIMEOUT_MS,
-      killSignal: OAM_PROBE_KILL_SIGNAL,
-    }),
-): OamProbe {
+/**
+ * Run `oam --version` WITHOUT blocking the event loop.
+ *
+ * This was execFileSync until issue #91. A synchronous probe on the upstream
+ * connect path of a single-threaded broker means any oam binary that fails to
+ * exit freezes the whole hub -- the client stdio transport and every in-flight
+ * upstream call stop being serviced. `timeout` did not fix that: spawnSync's
+ * timer only *sends* killSignal and then keeps waiting for the child to exit,
+ * so an unkillable child hangs the call regardless. A process in
+ * uninterruptible sleep (D state) on a wedged NFS/FUSE mount takes no signal
+ * at all, SIGKILL included, until the kernel completes the I/O -- which was
+ * precisely the reported failure mode.
+ *
+ * Async is the only actual fix: the timer settles the promise and the event
+ * loop keeps turning whether or not the orphan ever dies. We still try to kill
+ * it, and `unref()` the timer so a pending probe cannot hold the process open
+ * at shutdown.
+ *
+ * Resolves to the raw stdout, or rejects with `code: "ETIMEDOUT"` on expiry --
+ * the same shape probeOam's catch already distinguishes.
+ */
+function spawnVersionProbe(bin: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn();
+    };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(bin, ["--version"], {
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: process.platform === "win32",
+      });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    let out = "";
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      out += chunk;
+    });
+    // 'error' fires for ENOENT (oam not installed) -- the routine case.
+    child.on("error", (err) => settle(() => reject(err)));
+    child.on("close", (code) => settle(() => (code === 0 ? resolve(out) : reject(new Error(`oam exited ${code}`)))));
+
+    timer = setTimeout(() => {
+      settle(() => {
+        // Best-effort. A D-state child ignores this, which is exactly why the
+        // promise is settled independently rather than waiting on the kill.
+        try {
+          child.kill(OAM_PROBE_KILL_SIGNAL);
+        } catch {
+          /* already gone */
+        }
+        const err = new Error(`oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`) as Error & { code?: string };
+        err.code = "ETIMEDOUT";
+        reject(err);
+      });
+    }, OAM_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+  });
+}
+
+/** In-flight probe, so N concurrent connects share ONE spawn rather than
+ *  racing to start their own before any of them has populated the cache. */
+let oamProbeInFlight: Promise<OamProbe> | undefined;
+
+export async function probeOam(run: (bin: string) => Promise<string> = spawnVersionProbe): Promise<OamProbe> {
+  if (oamProbeCache !== undefined) return oamProbeCache;
+  if (oamProbeInFlight !== undefined) return oamProbeInFlight;
+  oamProbeInFlight = probeOamUncached(run).finally(() => {
+    oamProbeInFlight = undefined;
+  });
+  return oamProbeInFlight;
+}
+
+async function probeOamUncached(run: (bin: string) => Promise<string>): Promise<OamProbe> {
   if (oamProbeCache !== undefined) return oamProbeCache;
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
   try {
-    const version = parseOamVersion(run(bin));
+    const version = parseOamVersion(await run(bin));
     if (version !== null && compareVersions(version, MIN_OAM_VERSION) < 0) {
       log("warn", "oam is installed but below the minimum supported version; falling back to node", {
         oamVersion: version,
@@ -188,13 +246,14 @@ export function probeOam(
  * The oam binary to spawn, or `null` if oam isn't available (not installed,
  * or installed below MIN_OAM_VERSION -- see probeOam).
  */
-export function oamBin(): string | null {
-  return probeOam().bin;
+export async function oamBin(): Promise<string | null> {
+  return (await probeOam()).bin;
 }
 
 /** Reset the cached oam-binary probe (test hook). */
 export function resetOamBinCache(): void {
   oamProbeCache = undefined;
+  oamProbeInFlight = undefined;
 }
 
 export interface OamRewriteDeps {
@@ -371,9 +430,9 @@ export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url):
  * (`config.runtime === "oam"`). A no-op for non-Node commands and a safe Node
  * fallback when oam isn't installed or the package can't be resolved on disk.
  */
-export function resolveOamSpawn(command: string, args: string[]): { command: string; args: string[] } {
+export async function resolveOamSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
   return rewriteForOam(command, args, {
-    oamBin: oamBin(),
+    oamBin: await oamBin(),
     resolveEntry: (pkg) => resolveNpmEntry(pkg),
   });
 }

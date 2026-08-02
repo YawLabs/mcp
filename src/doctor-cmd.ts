@@ -146,7 +146,7 @@ export interface DoctorOptions {
   argvPath?: string;
   /** Test hook: replace the real `oam --version` probe so the OAM RUNTIME
    *  section is deterministic regardless of what's installed on the host. */
-  oamProbe?: () => OamProbe;
+  oamProbe?: () => OamProbe | Promise<OamProbe>;
 }
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
@@ -784,9 +784,11 @@ async function collectOamRuntimeStatus(opts: {
   env: NodeJS.ProcessEnv;
   cwd: string;
   home: string;
-  probeFn: () => OamProbe;
+  // Accepts sync OR async so doctor's own test fixtures can keep passing a
+  // plain object while production passes the async probeOam (issue #91).
+  probeFn: () => OamProbe | Promise<OamProbe>;
 }): Promise<OamRuntimeStatus> {
-  const probe = opts.probeFn();
+  const probe = await opts.probeFn();
   const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
   const bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home }).catch(() => null);
   const servers = (bundles?.config?.servers ?? []).map((s) => ({

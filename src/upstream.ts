@@ -368,10 +368,13 @@ async function connectToUpstreamOnce(
     // the ORIGINAL node/npx command spawns.
     const effectiveRuntime = config.runtime ?? (await defaultRuntime());
     if (effectiveRuntime === "oam" && !disableOamRewrite && !oamDowngradedNamespaces.has(config.namespace)) {
-      const rewritten = resolveOamSpawn(resolved.command, resolved.args);
+      // Awaited since issue #91: the oam probe is async so a wedged oam binary
+      // cannot block the event loop here. The probe result is cached, so only
+      // the first connect of the process actually waits on it.
+      const rewritten = await resolveOamSpawn(resolved.command, resolved.args);
       if (rewritten.command !== resolved.command) {
         attempt.oamRewritten = true;
-        attempt.oamVersion = probeOam().version;
+        attempt.oamVersion = (await probeOam()).version;
         resolved = rewritten;
       }
     }

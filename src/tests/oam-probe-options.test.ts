@@ -1,79 +1,138 @@
-// probeOam's DEFAULT runner -- the one that actually reaches execFileSync.
+// probeOam's DEFAULT runner -- the one that actually reaches child_process.
 //
-// The sibling oam-spawn.test.ts always injects a fake `run`, which is the
-// right shape for testing the parse + version-gate logic but structurally
-// cannot observe the spawn options, since the fake never calls execFileSync.
-// That leaves the timeout and killSignal untested: delete either option and
-// every test over there still passes, while the hang they prevent comes back.
+// The sibling oam-spawn.test.ts always injects a fake `run`, which is the right
+// shape for testing the parse + version-gate logic but structurally cannot
+// observe the spawn. That left the spawn options and the timeout untested:
+// delete either and every test over there still passes, while the hang they
+// prevent comes back.
 //
 // So this file mocks node:child_process and calls probeOam() with NO argument,
 // which is what production does. Split into its own file (rather than added to
-// oam-spawn.test.ts) because the mock is module-scoped and would otherwise
-// apply to all 34 tests there -- the same reason uv-bootstrap's child_process
-// mocks live in uv-bootstrap-extract / -fixes / -network rather than one file.
+// oam-spawn.test.ts) because the mock is module-scoped -- the same reason
+// uv-bootstrap's child_process mocks live in -extract / -fixes / -network.
+//
+// Rewritten for issue #91: the probe was execFileSync + timeout, which does not
+// bound the call (spawnSync only SENDS the signal, then waits for an exit an
+// unkillable child never produces). It is now spawn + a timer, so the central
+// assertion here is no longer "the option is set" but "the event loop keeps
+// turning while a probe hangs".
 
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-interface ExecCall {
+interface SpawnCall {
   bin: string;
   args: string[];
   opts: Record<string, unknown>;
 }
 
-const execCalls: ExecCall[] = [];
+const spawnCalls: SpawnCall[] = [];
+const killed: string[] = [];
+/** When true the fake child never exits -- the wedged-binary case. */
+let hangForever = false;
 
 vi.mock("node:child_process", () => ({
-  execFileSync: (bin: string, args: string[], opts: Record<string, unknown>) => {
-    execCalls.push({ bin, args: [...(args ?? [])], opts: { ...opts } });
-    return "oam 9.9.9\n";
+  spawn: (bin: string, args: string[], opts: Record<string, unknown>) => {
+    spawnCalls.push({ bin, args: [...(args ?? [])], opts: { ...opts } });
+    const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
+    stdout.setEncoding = () => {};
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: typeof stdout;
+      kill: (sig?: string) => void;
+    };
+    child.stdout = stdout;
+    child.kill = (sig?: string) => {
+      killed.push(sig ?? "default");
+    };
+    if (!hangForever) {
+      // Emit on a later turn so the probe's listeners are attached first.
+      setTimeout(() => {
+        stdout.emit("data", "oam 9.9.9\n");
+        child.emit("close", 0);
+      }, 0);
+    }
+    return child;
   },
 }));
 
-const { OAM_PROBE_KILL_SIGNAL, OAM_PROBE_TIMEOUT_MS, probeOam, resetOamBinCache } = await import("../oam-spawn.js");
+const { OAM_PROBE_KILL_SIGNAL, OAM_PROBE_TIMEOUT_MS, probeOam, resetOamBinCache, winNormalize } = await import(
+  "../oam-spawn.js"
+);
 
-describe("probeOam default runner spawn options", () => {
+describe("probeOam default runner", () => {
   const originalOamBin = process.env.OAM_BIN;
 
   beforeEach(() => {
-    execCalls.length = 0;
+    spawnCalls.length = 0;
+    killed.length = 0;
+    hangForever = false;
     resetOamBinCache();
     process.env.OAM_BIN = "/usr/local/bin/oam";
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     resetOamBinCache();
     if (originalOamBin === undefined) delete process.env.OAM_BIN;
     else process.env.OAM_BIN = originalOamBin;
   });
 
-  it("bounds the real execFileSync call with both a timeout and a kill signal", () => {
-    probeOam(); // no injected runner -- exercises the production default
-
-    expect(execCalls).toHaveLength(1);
-    expect(execCalls[0].args).toEqual(["--version"]);
-    // The timeout alone is not a bound on POSIX: spawnSync sends killSignal
-    // and then waits for the child to exit, and Node does not escalate, so a
-    // child that traps SIGTERM hangs the probe anyway. Both must be present.
-    expect(execCalls[0].opts.timeout).toBe(OAM_PROBE_TIMEOUT_MS);
-    expect(execCalls[0].opts.killSignal).toBe(OAM_PROBE_KILL_SIGNAL);
-  });
-
-  it("keeps stderr off the broker's stdio while capturing stdout", () => {
+  it("spawns `<bin> --version` with stdout piped and stderr off the broker's stdio", async () => {
     // The broker speaks MCP over its own stdio; a probe that inherited stderr
     // could interleave oam's output into the transport.
-    probeOam();
+    const probe = await probeOam();
 
-    expect(execCalls[0].opts.stdio).toEqual(["ignore", "pipe", "ignore"]);
-    expect(execCalls[0].opts.encoding).toBe("utf8");
+    expect(spawnCalls).toHaveLength(1);
+    // Through winNormalize: OAM_BIN is backslash-converted on Windows so cmd
+    // does not read a leading "/usr" as a switch.
+    expect(spawnCalls[0].bin).toBe(winNormalize("/usr/local/bin/oam"));
+    expect(spawnCalls[0].args).toEqual(["--version"]);
+    expect(spawnCalls[0].opts.stdio).toEqual(["ignore", "pipe", "ignore"]);
+    expect(probe.version).toBe("9.9.9");
   });
 
-  it("probes once per process, not once per call", () => {
-    probeOam();
-    probeOam();
-    probeOam();
+  it("keeps the event loop responsive while a wedged binary is being probed", async () => {
+    // THE regression this file exists for. Under the old synchronous probe the
+    // call blocked the loop outright, so nothing else could run until it
+    // returned -- and with an unkillable child it never returned. Here the
+    // probe is in flight and other work must still be scheduled and completed.
+    hangForever = true;
+    vi.useFakeTimers();
 
-    // The probe blocks the event loop; the cache is what keeps that cost to a
-    // single occurrence even when many servers connect.
-    expect(execCalls).toHaveLength(1);
+    const pending = probeOam();
+    let otherWorkRan = false;
+    setTimeout(() => {
+      otherWorkRan = true;
+    }, 1);
+
+    await vi.advanceTimersByTimeAsync(2);
+    expect(otherWorkRan, "event loop was blocked by the probe").toBe(true);
+
+    // Now let the probe's own deadline expire.
+    await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
+    const probe = await pending;
+
+    // Same degraded shape as "oam is not installed" -- callers fall back to node.
+    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    // Best-effort kill still attempted, with the stronger signal.
+    expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL]);
+  });
+
+  it("probes once per process, not once per call", async () => {
+    await probeOam();
+    await probeOam();
+    await probeOam();
+
+    expect(spawnCalls).toHaveLength(1);
+  });
+
+  it("shares one spawn between callers that race before the first result lands", async () => {
+    // N servers connecting at once must not each start their own probe: the
+    // cache is only populated once the first one finishes.
+    const [a, b, c] = await Promise.all([probeOam(), probeOam(), probeOam()]);
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(a).toEqual(b);
+    expect(b).toEqual(c);
   });
 });
