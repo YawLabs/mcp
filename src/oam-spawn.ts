@@ -126,9 +126,59 @@ export const OAM_PROBE_TIMEOUT_MS = 3_000;
  */
 export const OAM_PROBE_KILL_SIGNAL = "SIGKILL";
 
-/** Cap on retained `oam --version` stdout. Replaces the 1MB maxBuffer that
- *  execFileSync applied for free before the async rewrite. */
+/** Hard cap on retained `oam --version` stdout. Replaces the 1MB maxBuffer
+ *  that execFileSync applied for free before the async rewrite. */
 export const OAM_PROBE_MAX_OUTPUT = 8 * 1024;
+
+/** Bytes of the previous chunk kept so a version split across a chunk
+ *  boundary ("0.6" | ".0") still matches. A dotted triple is ~20 chars. */
+const VERSION_CARRY = 32;
+
+/**
+ * Accumulator for probe stdout.
+ *
+ * A naive prefix cap (`if (out.length < MAX) out += chunk`) is wrong twice
+ * over, and both were shipped before this existed:
+ *
+ *   1. It is SOFT. The length check runs before the append, so one oversized
+ *      chunk lands whole -- an 80KB chunk was retained in full under the old
+ *      code. The bound was "MAX plus one chunk", not MAX.
+ *   2. It DISCARDS THE VERSION when a binary prints more than MAX of banner
+ *      first. parseOamVersion then returns null, and because the below-min
+ *      branch is guarded on `version !== null`, the MIN_OAM_VERSION gate is
+ *      skipped entirely -- yaw-mcp hosts on an oam it never version-checked.
+ *      That gate exists because old builds produce hangs that look like
+ *      server bugs, so truncation reintroduces exactly what it guards.
+ *
+ * So: scan every chunk for a version regardless of position, retain only a
+ * hard-capped head for the no-version case, and never grow past the cap.
+ * Exported for direct unit testing -- asserting the constant's value proves
+ * nothing about whether anything is actually capped.
+ */
+export function createProbeCollector(max: number = OAM_PROBE_MAX_OUTPUT) {
+  let head = "";
+  let carry = "";
+  let found: string | null = null;
+
+  return {
+    push(chunk: string): void {
+      // Scan across the boundary so a version straddling two chunks is seen.
+      if (found === null) found = parseOamVersion(carry + chunk);
+      carry = (carry + chunk).slice(-VERSION_CARRY);
+      if (head.length >= max) return;
+      head += chunk.slice(0, max - head.length); // slice, so the cap is HARD
+    },
+    /** The version if one appeared anywhere, else the capped head (which
+     *  parses to null either way, so the caller's contract is unchanged). */
+    result(): string {
+      return found ?? head;
+    },
+    /** Test hook: bytes actually retained. */
+    retainedLength(): number {
+      return head.length;
+    },
+  };
+}
 
 /**
  * Run `oam --version` WITHOUT blocking the event loop.
@@ -148,8 +198,9 @@ export const OAM_PROBE_MAX_OUTPUT = 8 * 1024;
  * it, and `unref()` the timer so a pending probe cannot hold the process open
  * at shutdown.
  *
- * Resolves to the raw stdout, or rejects with `code: "ETIMEDOUT"` on expiry --
- * the same shape probeOam's catch already distinguishes.
+ * Resolves to the version found in stdout (or the capped head when none was
+ * found -- see createProbeCollector), or rejects with `code: "ETIMEDOUT"` on
+ * expiry -- the same shape probeOam's catch already distinguishes.
  */
 function spawnVersionProbe(bin: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -173,20 +224,16 @@ function spawnVersionProbe(bin: string): Promise<string> {
       return;
     }
 
-    // Cap what we retain. execFileSync enforced a 1MB maxBuffer and errored
-    // past it; the async rewrite dropped that with nothing in its place, so a
-    // chatty (or hostile) binary could grow this string unbounded for the
-    // whole timeout window. A version string is well under 100 bytes -- read
-    // enough to parse and ignore the rest rather than erroring, since a
-    // verbose --version is not a reason to refuse to host on oam.
-    let out = "";
+    // Bounded, position-independent collection -- see createProbeCollector for
+    // why a plain prefix cap loses the version and does not actually cap.
+    const collector = createProbeCollector();
     child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      if (out.length < OAM_PROBE_MAX_OUTPUT) out += chunk;
-    });
+    child.stdout?.on("data", (chunk: string) => collector.push(chunk));
     // 'error' fires for ENOENT (oam not installed) -- the routine case.
     child.on("error", (err) => settle(() => reject(err)));
-    child.on("close", (code) => settle(() => (code === 0 ? resolve(out) : reject(new Error(`oam exited ${code}`)))));
+    child.on("close", (code) =>
+      settle(() => (code === 0 ? resolve(collector.result()) : reject(new Error(`oam exited ${code}`)))),
+    );
 
     timer = setTimeout(() => {
       settle(() => {
