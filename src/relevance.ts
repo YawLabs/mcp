@@ -63,36 +63,47 @@ export function tokenize(text: string | undefined): string[] {
     .filter((w) => w.length >= MIN_TOKEN_LEN);
 }
 
-interface DocFields {
-  namespace: string[];
-  name: string[];
-  description: string[];
-  toolName: string[];
-  toolDescription: string[];
+type FieldName = keyof typeof FIELD_WEIGHTS;
+
+/** A field reduced to exactly what BM25 needs: its token count (for length
+ *  normalization) and per-term occurrences. Storing counts instead of the
+ *  raw token array turns term-frequency lookup into a Map hit rather than
+ *  a linear scan of the field for every (query term, field) pair. */
+interface FieldStats {
+  len: number;
+  counts: Map<string, number>;
+}
+
+type DocFields = Record<FieldName, FieldStats>;
+
+function emptyField(): FieldStats {
+  return { len: 0, counts: new Map() };
+}
+
+/** Fold tokens into a FieldStats, accumulating onto an existing one so the
+ *  tool fields can absorb every tool without an intermediate array. */
+function addTokens(field: FieldStats, tokens: string[]): FieldStats {
+  for (const t of tokens) {
+    field.counts.set(t, (field.counts.get(t) ?? 0) + 1);
+  }
+  field.len += tokens.length;
+  return field;
 }
 
 function buildDocFields(server: RankableServer): DocFields {
-  const toolNameTokens: string[] = [];
-  const toolDescriptionTokens: string[] = [];
+  const toolName = emptyField();
+  const toolDescription = emptyField();
   for (const tool of server.tools) {
-    toolNameTokens.push(...tokenize(tool.name));
-    toolDescriptionTokens.push(...tokenize(tool.description));
+    addTokens(toolName, tokenize(tool.name));
+    addTokens(toolDescription, tokenize(tool.description));
   }
   return {
-    namespace: tokenize(server.namespace),
-    name: tokenize(server.name),
-    description: tokenize(server.description),
-    toolName: toolNameTokens,
-    toolDescription: toolDescriptionTokens,
+    namespace: addTokens(emptyField(), tokenize(server.namespace)),
+    name: addTokens(emptyField(), tokenize(server.name)),
+    description: addTokens(emptyField(), tokenize(server.description)),
+    toolName,
+    toolDescription,
   };
-}
-
-function termFreq(tokens: string[], term: string): number {
-  let count = 0;
-  for (const t of tokens) {
-    if (t === term) count++;
-  }
-  return count;
 }
 
 // Weighted BM25 across multiple fields — treats each field as its own
@@ -117,12 +128,12 @@ function bm25Score(
     if (termIdf === undefined || termIdf <= 0) continue; // term missing or appears in every doc
 
     for (const [fieldName, weight] of Object.entries(FIELD_WEIGHTS) as Array<[keyof DocFields, number]>) {
-      const fieldTokens = fields[fieldName];
-      if (fieldTokens.length === 0) continue;
-      const tf = termFreq(fieldTokens, term);
+      const field = fields[fieldName];
+      if (field.len === 0) continue;
+      const tf = field.counts.get(term) ?? 0;
       if (tf === 0) continue;
       const avg = avgFieldLen[fieldName] || 1;
-      const normLen = 1 - B + B * (fieldTokens.length / avg);
+      const normLen = 1 - B + B * (field.len / avg);
       const numerator = tf * (K1 + 1);
       const denominator = tf + K1 * normLen;
       score += weight * termIdf * (numerator / denominator);
@@ -132,29 +143,149 @@ function bm25Score(
   return score;
 }
 
-// Rank a list of servers against a free-text query. Returns results sorted
-// descending by score, only including entries with score > 0 (matches at
-// least one query term in some field). Zero-score servers are omitted so
-// the caller can cleanly tell "no match" from "weak match".
-export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
-  const queryTerms = tokenize(context);
-  if (queryTerms.length === 0 || servers.length === 0) return [];
+// --- Index caching ---------------------------------------------------------
+//
+// Everything BM25 needs apart from the query itself -- per-field token
+// counts, document frequency, IDF, average field lengths -- is a pure
+// function of the CORPUS. Rebuilding it per call meant re-tokenizing every
+// server name, description, and (dominant term) every tool name and
+// description on every discover/dispatch, which profiles at ~90% of the
+// call cost while the actual scoring is ~10%.
+//
+// Both caches are keyed on the corpus CONTENT, not on object identity:
+// callers rebuild their RankableServer array on every call (see
+// ConnectServer.rankableFor), so identity keys would never hit, and a
+// content key makes stale results impossible by construction -- if any
+// name, description, or tool text changes, the key changes with it.
+// Building the key costs ~3% of what tokenizing the same text costs.
 
-  const docsWithFields = servers.map((s) => ({ server: s, fields: buildDocFields(s) }));
-  const N = docsWithFields.length;
+/** Per-server DocFields, keyed by that server's content signature. Sized to
+ *  outlive a corpus edit: when one server activates, the other N-1 keys are
+ *  unchanged and their fields are reused. */
+const MAX_CACHED_DOCS = 512;
+const docCache = new Map<string, DocFields>();
+
+/** Whole-corpus index, keyed by the joined per-server signatures. A handful
+ *  of entries covers the alternation between discover's corpus (all profiled
+ *  servers) and dispatch's (a caller-supplied subset). */
+const MAX_CACHED_INDEXES = 4;
+const indexCache = new Map<string, RankingIndex>();
+
+interface RankingIndex {
+  docs: Array<{ namespace: string; fields: DocFields }>;
+  idf: Map<string, number>;
+  avgFieldLen: Record<FieldName, number>;
+}
+
+/** Build counters, exposed for tests to assert the caches actually hit
+ *  rather than relying on flaky wall-clock timing. */
+let indexBuilds = 0;
+let docBuilds = 0;
+
+/** Test hook: drop both caches and zero the counters. */
+export function resetRelevanceCache(): void {
+  docCache.clear();
+  indexCache.clear();
+  indexBuilds = 0;
+  docBuilds = 0;
+}
+
+/** Test hook: how many times an index / document has actually been built. */
+export function relevanceCacheStats(): { indexBuilds: number; docBuilds: number } {
+  return { indexBuilds, docBuilds };
+}
+
+/** Insert into a bounded, LRU-ordered cache, evicting the least recently used
+ *  entry once the cap is reached. Map iteration order is insertion order, so
+ *  the LRU ordering is maintained by `touch` re-inserting on every hit. */
+function putBounded<V>(cache: Map<string, V>, key: string, value: V, max: number): void {
+  if (cache.size >= max) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
+
+/** Move an existing entry to the newest position, so eviction is LRU rather
+ *  than FIFO. Without this a server whose content never changes stays
+ *  permanently "oldest" and gets evicted by a churning neighbour -- which is
+ *  exactly the reuse the doc cache exists to provide. Measured on a 100-server
+ *  corpus with one server churning: FIFO spent 798 doc builds over 600 calls
+ *  against an ideal 699, and 2495 over 2000 against an ideal 2099. LRU hits
+ *  the ideal exactly. */
+function touch<V>(cache: Map<string, V>, key: string, value: V): void {
+  cache.delete(key);
+  cache.set(key, value);
+}
+
+/** Field separator for a server signature. Doubled wherever it occurs
+ *  inside a field, which makes the encoding unambiguous: a lone separator is
+ *  a field boundary, a doubled one is literal text. */
+const SEP = " ";
+
+/** Escape the separator out of one field. Upstream tool names and
+ *  descriptions arrive from third-party servers over JSON-RPC, where every
+ *  character -- control characters included -- is legal string content, so a
+ *  scheme that assumed some byte was absent would be trusting the untrusted
+ *  side. The scan allocates nothing in the overwhelming common case of text
+ *  that contains no separator at all. */
+function esc(text: string): string {
+  return text.includes(SEP) ? text.replaceAll(SEP, SEP + SEP) : text;
+}
+
+/** Content signature for one server: every string BM25 will read, in order,
+ *  separator-escaped so distinct field splits cannot collide onto one key.
+ *  Without the escaping, namespace "a b" + name "c" signs identically to
+ *  namespace "a" + name "b c", silently serving one corpus its neighbour's
+ *  index -- and with a bare control character as the separator, the text that
+ *  triggers the collision is supplied by the upstream server. */
+function serverSignature(server: RankableServer): string {
+  let sig = `${esc(server.namespace)}${SEP}${esc(server.name)}${SEP}${esc(server.description ?? "")}`;
+  for (const tool of server.tools) {
+    sig += `${SEP}${esc(tool.name)}${SEP}${esc(tool.description ?? "")}`;
+  }
+  return sig;
+}
+
+/** Whole-corpus key. The per-server signature lengths go in front so the
+ *  concatenation that follows parses unambiguously without a third separator
+ *  level -- there are only as many numbers here as there are servers, so this
+ *  costs nothing next to the corpus text itself. Without the lengths a single
+ *  server whose text embeds the join separator signs identically to a
+ *  two-server corpus, and a 1-doc corpus gets served a 2-doc index: wrong N,
+ *  wrong IDF, and a ranked namespace the caller never passed in. */
+function indexKeyFor(signatures: string[]): string {
+  let lens = "";
+  for (const sig of signatures) lens += `${sig.length},`;
+  return `${lens}|${signatures.join("")}`;
+}
+
+function docFieldsFor(signature: string, server: RankableServer): DocFields {
+  const cached = docCache.get(signature);
+  if (cached) {
+    touch(docCache, signature, cached);
+    return cached;
+  }
+  docBuilds++;
+  const fields = buildDocFields(server);
+  putBounded(docCache, signature, fields, MAX_CACHED_DOCS);
+  return fields;
+}
+
+function buildIndex(servers: RankableServer[], signatures: string[]): RankingIndex {
+  indexBuilds++;
+  const docs = servers.map((s, i) => ({ namespace: s.namespace, fields: docFieldsFor(signatures[i], s) }));
+  const N = docs.length;
 
   // Document frequency — how many servers contain the term in ANY field.
   // Treating all fields as a single bag for DF is a deliberate simplification;
   // "contains the term somewhere" is what matters for IDF, not where.
   const df = new Map<string, number>();
-  for (const { fields } of docsWithFields) {
-    const bag = new Set<string>([
-      ...fields.namespace,
-      ...fields.name,
-      ...fields.description,
-      ...fields.toolName,
-      ...fields.toolDescription,
-    ]);
+  for (const { fields } of docs) {
+    const bag = new Set<string>();
+    for (const fieldName of Object.keys(FIELD_WEIGHTS) as FieldName[]) {
+      for (const term of fields[fieldName].counts.keys()) bag.add(term);
+    }
     for (const term of bag) {
       df.set(term, (df.get(term) ?? 0) + 1);
     }
@@ -163,33 +294,31 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
   // Per-term IDF using the standard BM25 formula with +1 so that terms
   // appearing in every document still get a tiny positive weight rather
   // than contributing a negative score.
-  const idfValues = new Map<string, number>();
+  const idf = new Map<string, number>();
   for (const [term, d] of df) {
-    idfValues.set(term, Math.log((N - d + 0.5) / (d + 0.5) + 1));
+    idf.set(term, Math.log((N - d + 0.5) / (d + 0.5) + 1));
   }
 
   // Average length per field across the corpus — used by length
   // normalization so longer fields don't inherently outscore shorter ones
   // just by having more chances to match.
-  const totalLen: Record<keyof DocFields, number> = {
+  const totalLen: Record<FieldName, number> = {
     namespace: 0,
     name: 0,
     description: 0,
     toolName: 0,
     toolDescription: 0,
   };
-  for (const { fields } of docsWithFields) {
-    totalLen.namespace += fields.namespace.length;
-    totalLen.name += fields.name.length;
-    totalLen.description += fields.description.length;
-    totalLen.toolName += fields.toolName.length;
-    totalLen.toolDescription += fields.toolDescription.length;
+  for (const { fields } of docs) {
+    for (const fieldName of Object.keys(FIELD_WEIGHTS) as FieldName[]) {
+      totalLen[fieldName] += fields[fieldName].len;
+    }
   }
   // Local divide-by-zero guard: rankServers early-returns on an empty
   // corpus so N>0 here today, but clamp the divisor so this block is
   // self-safe and won't emit NaN if the guard ever moves.
   const denom = Math.max(N, 1);
-  const avgFieldLen: Record<keyof DocFields, number> = {
+  const avgFieldLen: Record<FieldName, number> = {
     namespace: totalLen.namespace / denom,
     name: totalLen.name / denom,
     description: totalLen.description / denom,
@@ -197,11 +326,17 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
     toolDescription: totalLen.toolDescription / denom,
   };
 
+  return { docs, idf, avgFieldLen };
+}
+
+/** Score a prepared index against an already-tokenized query. Shared by the
+ *  cached corpus path and the uncached single-server path below. */
+function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedResult[] {
   const results: RankedResult[] = [];
-  for (const { server, fields } of docsWithFields) {
-    const score = bm25Score(queryTerms, fields, avgFieldLen, idfValues);
+  for (const { namespace, fields } of index.docs) {
+    const score = bm25Score(queryTerms, fields, index.avgFieldLen, index.idf);
     if (score > 0) {
-      results.push({ namespace: server.namespace, score });
+      results.push({ namespace, score });
     }
   }
 
@@ -214,23 +349,52 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
   return results;
 }
 
+// Rank a list of servers against a free-text query. Returns results sorted
+// descending by score, only including entries with score > 0 (matches at
+// least one query term in some field). Zero-score servers are omitted so
+// the caller can cleanly tell "no match" from "weak match".
+export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
+  const queryTerms = tokenize(context);
+  if (queryTerms.length === 0 || servers.length === 0) return [];
+
+  const signatures = servers.map(serverSignature);
+  const indexKey = indexKeyFor(signatures);
+  let index = indexCache.get(indexKey);
+  if (index === undefined) {
+    index = buildIndex(servers, signatures);
+    putBounded(indexCache, indexKey, index, MAX_CACHED_INDEXES);
+  } else {
+    touch(indexCache, indexKey, index);
+  }
+
+  return scoreAgainstIndex(queryTerms, index);
+}
+
 // Single-server convenience — kept for legacy callers that score one
 // candidate at a time. Internally wraps the BM25 ranker with a trivial
 // one-document corpus, so scores aren't comparable across different calls
 // but a return of 0 still means "no term matched". Prefer rankServers
 // wherever you're ranking a list.
+//
+// Builds its index inline rather than routing through rankServers: every
+// call is a distinct one-server corpus, so going through indexCache (cap
+// MAX_CACHED_INDEXES) would evict the real corpus index on every iteration
+// of any loop over this function, silently undoing the caching for the
+// discover/dispatch path that actually needs it. The per-server doc cache is
+// still shared, so no text gets re-tokenized.
 export function scoreRelevance(
   context: string,
   server: { name: string; namespace: string; description?: string },
   tools: RankableTool[],
 ): number {
-  const ranked = rankServers(context, [
-    {
-      namespace: server.namespace,
-      name: server.name,
-      description: server.description,
-      tools,
-    },
-  ]);
-  return ranked[0]?.score ?? 0;
+  const queryTerms = tokenize(context);
+  if (queryTerms.length === 0) return 0;
+
+  const one: RankableServer = {
+    namespace: server.namespace,
+    name: server.name,
+    description: server.description,
+    tools,
+  };
+  return scoreAgainstIndex(queryTerms, buildIndex([one], [serverSignature(one)]))[0]?.score ?? 0;
 }

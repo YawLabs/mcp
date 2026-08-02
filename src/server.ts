@@ -1403,11 +1403,14 @@ export class ConnectServer {
         activeServers.map((s) => this.rankableFor(s)),
       );
       for (const r of ranked) scores.set(r.namespace, r.score);
+      // Index by namespace once rather than re-scanning activeServers for
+      // every ranked entry (that was a linear find inside a map -- O(N^2)).
+      const byNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
+      const matched = ranked
+        .map((r) => byNamespace.get(r.namespace))
+        .filter((s): s is UpstreamServerConfig => s !== undefined);
       const rankedSet = new Set(ranked.map((r) => r.namespace));
       const rest = activeServers.filter((s) => !rankedSet.has(s.namespace));
-      const matched = ranked
-        .map((r) => activeServers.find((s) => s.namespace === r.namespace))
-        .filter((s): s is UpstreamServerConfig => s !== undefined);
       sorted = [...matched, ...rest];
     } else {
       sorted = activeServers;
