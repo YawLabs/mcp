@@ -297,3 +297,60 @@ describe("probeOam timeout", () => {
     expect(rewritten).toEqual(original);
   });
 });
+
+// A timeout is not the same event as "oam is not installed", even though both
+// land on the same node fallback. oam IS on disk and did not answer in time --
+// and because the probe result is cached for the process lifetime, that one
+// slow moment downgrades every opted-in server until restart. Without a log
+// there is nothing to tell the user why their oam-hosted servers stopped
+// using oam.
+describe("probeOam timeout diagnostics", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  /** Collect everything the logger writes to stderr while `fn` runs. */
+  function captureStderr(fn: () => unknown): Array<{ level?: string; msg?: string }> {
+    const chunks: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      fn();
+    } finally {
+      process.stderr.write = original;
+    }
+    return chunks
+      .join("")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as { level?: string; msg?: string });
+  }
+
+  it("warns when the probe times out, so the silent downgrade is diagnosable", () => {
+    const lines = captureStderr(() =>
+      probeOam(() => {
+        const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
+        err.code = "ETIMEDOUT";
+        throw err;
+      }),
+    );
+    const warn = lines.find((l) => l.msg?.includes("did not respond to --version"));
+    expect(warn).toBeDefined();
+    expect(warn?.level).toBe("warn");
+  });
+
+  it("stays silent when oam is simply not installed", () => {
+    // ENOENT is the routine node-only setup; logging it would be noise on
+    // every machine without oam.
+    const lines = captureStderr(() =>
+      probeOam(() => {
+        const err = new Error("spawnSync oam ENOENT") as Error & { code?: string };
+        err.code = "ENOENT";
+        throw err;
+      }),
+    );
+    expect(lines).toEqual([]);
+  });
+});
