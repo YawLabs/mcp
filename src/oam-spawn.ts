@@ -109,9 +109,48 @@ export function winNormalize(p: string, platform: NodeJS.Platform = process.plat
  * `run` is injectable so the parse + gate logic is testable without a real
  * binary on PATH.
  */
+/** How long `oam --version` gets before we give up and fall back to node.
+ *  Matches the 3s budget uv-bootstrap's onPath() probe already uses. */
+export const OAM_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * SIGKILL, not the SIGTERM default, because on POSIX `timeout` alone does NOT
+ * bound the call. spawnSync's timer sends `killSignal` and then keeps waiting
+ * for the child to actually exit; Node does not escalate when SIGTERM was
+ * delivered successfully, so a child that traps or ignores it blocks the probe
+ * forever -- the exact hang the timeout is here to prevent.
+ *
+ * Measured on Linux (node v18), `timeout: 1500`:
+ *   child traps SIGTERM,  default killSignal -> never returned (killed at 12s)
+ *   child traps SIGTERM,  killSignal SIGKILL -> threw at 1508ms, ETIMEDOUT
+ *   child ignores nothing, default killSignal -> threw at 1504ms  (control)
+ * Windows is unaffected either way: TerminateProcess cannot be trapped.
+ *
+ * HONEST LIMIT: this bounds a live-but-unresponsive child, not a child stuck
+ * in uninterruptible sleep (D state) on a wedged NFS/FUSE path -- no signal
+ * reaches those, SIGKILL included, until the kernel completes the I/O. That
+ * case still hangs, and fixing it needs an async probe that this call site
+ * (synchronous, from connectToUpstreamOnce) cannot use today.
+ */
+export const OAM_PROBE_KILL_SIGNAL = "SIGKILL";
+
 export function probeOam(
   run: (bin: string) => string = (bin) =>
-    execFileSync(bin, ["--version"], { stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" }),
+    // execFileSync BLOCKS the event loop, and this runs on the upstream
+    // connect path of a single-threaded broker -- without a bound, an oam
+    // binary that hangs takes the whole hub down with it: the client stdio
+    // transport and every in-flight upstream call stop being serviced, with
+    // no way to break out. timeout + SIGKILL make the worst case a bounded
+    // 3s stall that then falls back to node, which is what an absent oam
+    // already does. The result is cached, so this is paid at most once.
+    // See OAM_PROBE_KILL_SIGNAL for why SIGTERM is not enough, and for the
+    // one hang shape this still does not cover.
+    execFileSync(bin, ["--version"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      timeout: OAM_PROBE_TIMEOUT_MS,
+      killSignal: OAM_PROBE_KILL_SIGNAL,
+    }),
 ): OamProbe {
   if (oamProbeCache !== undefined) return oamProbeCache;
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
@@ -126,7 +165,20 @@ export function probeOam(
     } else {
       oamProbeCache = { bin, version, belowMin: false };
     }
-  } catch {
+  } catch (err) {
+    // "oam is not installed" is the expected, silent case -- ENOENT here is
+    // routine and logging it would be noise on every node-only setup. A
+    // TIMEOUT is not routine: oam IS on disk but did not answer --version
+    // within the budget. Since the probe result is cached for the process
+    // lifetime, that single slow moment silently downgrades every opted-in
+    // server to node until restart, with nothing to explain why. Warn once,
+    // matching the belowMin path, so the degradation is diagnosable.
+    if ((err as { code?: unknown } | null)?.code === "ETIMEDOUT") {
+      log("warn", "oam did not respond to --version in time; falling back to node for this process", {
+        timeoutMs: OAM_PROBE_TIMEOUT_MS,
+        bin,
+      });
+    }
     oamProbeCache = { bin: null, version: null, belowMin: false };
   }
   return oamProbeCache;

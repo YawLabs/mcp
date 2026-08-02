@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   MIN_OAM_VERSION,
   npxCacheNodeModules,
+  OAM_PROBE_TIMEOUT_MS,
   packageName,
   parseOamVersion,
   probeOam,
@@ -255,5 +256,101 @@ describe("resolveNpmEntry", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// probeOam runs execFileSync, which blocks the event loop, on the upstream
+// connect path of a single-threaded broker. Without a timeout an oam binary
+// that never returns wedges the whole hub. These pin both halves of the
+// contract: the bound exists, and exceeding it degrades to the same
+// node fallback that an absent oam already produces.
+describe("probeOam timeout", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  it("declares a probe timeout matching the uv onPath budget", () => {
+    expect(OAM_PROBE_TIMEOUT_MS).toBe(3_000);
+  });
+
+  it("falls back to node when the probe times out", () => {
+    // execFileSync throws ETIMEDOUT when the child exceeds `timeout`; the
+    // catch must produce the same result as "oam is not installed".
+    const probe = probeOam(() => {
+      const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
+      err.code = "ETIMEDOUT";
+      throw err;
+    });
+    expect(probe.bin).toBeNull();
+    expect(probe.version).toBeNull();
+    expect(probe.belowMin).toBe(false);
+  });
+
+  it("leaves an opted-in server on its original node/npx command after a timeout", () => {
+    const probe = probeOam(() => {
+      throw new Error("spawnSync oam ETIMEDOUT");
+    });
+    const original = { command: "npx", args: ["-y", "some-mcp-server"] };
+    const rewritten = rewriteForOam(original.command, original.args, {
+      oamBin: probe.bin,
+      resolveEntry: () => "/somewhere/entry.js",
+    });
+    expect(rewritten).toEqual(original);
+  });
+});
+
+// A timeout is not the same event as "oam is not installed", even though both
+// land on the same node fallback. oam IS on disk and did not answer in time --
+// and because the probe result is cached for the process lifetime, that one
+// slow moment downgrades every opted-in server until restart. Without a log
+// there is nothing to tell the user why their oam-hosted servers stopped
+// using oam.
+describe("probeOam timeout diagnostics", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  /** Collect everything the logger writes to stderr while `fn` runs. */
+  function captureStderr(fn: () => unknown): Array<{ level?: string; msg?: string }> {
+    const chunks: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      fn();
+    } finally {
+      process.stderr.write = original;
+    }
+    return chunks
+      .join("")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as { level?: string; msg?: string });
+  }
+
+  it("warns when the probe times out, so the silent downgrade is diagnosable", () => {
+    const lines = captureStderr(() =>
+      probeOam(() => {
+        const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
+        err.code = "ETIMEDOUT";
+        throw err;
+      }),
+    );
+    const warn = lines.find((l) => l.msg?.includes("did not respond to --version"));
+    expect(warn).toBeDefined();
+    expect(warn?.level).toBe("warn");
+  });
+
+  it("stays silent when oam is simply not installed", () => {
+    // ENOENT is the routine node-only setup; logging it would be noise on
+    // every machine without oam.
+    const lines = captureStderr(() =>
+      probeOam(() => {
+        const err = new Error("spawnSync oam ENOENT") as Error & { code?: string };
+        err.code = "ENOENT";
+        throw err;
+      }),
+    );
+    expect(lines).toEqual([]);
   });
 });
