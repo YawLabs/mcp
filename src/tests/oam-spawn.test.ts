@@ -17,45 +17,45 @@ import {
 } from "../oam-spawn.js";
 
 describe("winNormalize", () => {
-  it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
+  it("converts forward slashes to backslashes on Windows (cmd-safe)", async () => {
     expect(winNormalize("C:/Users/jeff/oam/target/release/oam.exe", "win32")).toBe(
       "C:\\Users\\jeff\\oam\\target\\release\\oam.exe",
     );
   });
-  it("leaves an already-backslash path untouched on Windows", () => {
+  it("leaves an already-backslash path untouched on Windows", async () => {
     expect(winNormalize("C:\\Users\\jeff\\oam.exe", "win32")).toBe("C:\\Users\\jeff\\oam.exe");
   });
-  it("leaves a bare binary name untouched", () => {
+  it("leaves a bare binary name untouched", async () => {
     expect(winNormalize("oam.exe", "win32")).toBe("oam.exe");
   });
-  it("is a no-op off Windows", () => {
+  it("is a no-op off Windows", async () => {
     expect(winNormalize("/usr/local/bin/oam", "linux")).toBe("/usr/local/bin/oam");
   });
 });
 
 describe("packageName", () => {
-  it("strips @latest from a scoped package", () => {
+  it("strips @latest from a scoped package", async () => {
     expect(packageName("@yawlabs/tailscale-mcp@latest")).toBe("@yawlabs/tailscale-mcp");
   });
-  it("strips a semver from an unscoped package", () => {
+  it("strips a semver from an unscoped package", async () => {
     expect(packageName("server-memory@1.2.3")).toBe("server-memory");
   });
-  it("leaves a bare scoped name untouched", () => {
+  it("leaves a bare scoped name untouched", async () => {
     expect(packageName("@yawlabs/npmjs-mcp")).toBe("@yawlabs/npmjs-mcp");
   });
-  it("leaves a bare unscoped name untouched", () => {
+  it("leaves a bare unscoped name untouched", async () => {
     expect(packageName("cowsay")).toBe("cowsay");
   });
 });
 
 describe("parseOamVersion", () => {
-  it("extracts x.y.z from the canonical `oam X.Y.Z` output", () => {
+  it("extracts x.y.z from the canonical `oam X.Y.Z` output", async () => {
     expect(parseOamVersion("oam 0.6.0\n")).toBe("0.6.0");
   });
-  it("extracts a bare x.y.z", () => {
+  it("extracts a bare x.y.z", async () => {
     expect(parseOamVersion("1.2.3")).toBe("1.2.3");
   });
-  it("returns null when no version is present", () => {
+  it("returns null when no version is present", async () => {
     expect(parseOamVersion("oam dev build")).toBeNull();
   });
 });
@@ -64,42 +64,42 @@ describe("probeOam min-version gate", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
 
-  it("reports a usable bin + version when at/above MIN_OAM_VERSION", () => {
-    const probe = probeOam(() => `oam ${MIN_OAM_VERSION}\n`);
+  it("reports a usable bin + version when at/above MIN_OAM_VERSION", async () => {
+    const probe = await probeOam(async () => `oam ${MIN_OAM_VERSION}\n`);
     expect(probe.bin).not.toBeNull();
     expect(probe.version).toBe(MIN_OAM_VERSION);
     expect(probe.belowMin).toBe(false);
   });
 
-  it("treats a below-min install as oam-absent (bin null, belowMin set)", () => {
-    const probe = probeOam(() => "oam 0.5.9\n");
+  it("treats a below-min install as oam-absent (bin null, belowMin set)", async () => {
+    const probe = await probeOam(async () => "oam 0.5.9\n");
     expect(probe.bin).toBeNull();
     expect(probe.version).toBe("0.5.9");
     expect(probe.belowMin).toBe(true);
   });
 
-  it("treats a failed probe as not installed", () => {
-    const probe = probeOam(() => {
+  it("treats a failed probe as not installed", async () => {
+    const probe = await probeOam(async () => {
       throw new Error("ENOENT");
     });
     expect(probe).toEqual({ bin: null, version: null, belowMin: false });
   });
 
-  it("treats an unparseable version as usable (a working --version proves oam exists)", () => {
-    const probe = probeOam(() => "oam dev build\n");
+  it("treats an unparseable version as usable (a working --version proves oam exists)", async () => {
+    const probe = await probeOam(async () => "oam dev build\n");
     expect(probe.bin).not.toBeNull();
     expect(probe.version).toBeNull();
     expect(probe.belowMin).toBe(false);
   });
 
-  it("caches the probe result (the runner is only consulted once)", () => {
+  it("caches the probe result (the runner is only consulted once)", async () => {
     let calls = 0;
-    const run = () => {
+    const run = async () => {
       calls++;
       return "oam 9.9.9";
     };
-    probeOam(run);
-    probeOam(run);
+    await probeOam(run);
+    await probeOam(run);
     expect(calls).toBe(1);
   });
 });
@@ -107,56 +107,56 @@ describe("probeOam min-version gate", () => {
 describe("rewriteForOam", () => {
   const oam = { oamBin: "oam", resolveEntry: (p: string) => `/pkgs/${p}/dist/index.js` };
 
-  it("rewrites `npx -y <pkg>@latest` to `oam run <resolved entry>`", () => {
+  it("rewrites `npx -y <pkg>@latest` to `oam run <resolved entry>`", async () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/npmjs-mcp@latest"], oam)).toEqual({
       command: "oam",
       args: ["run", "/pkgs/@yawlabs/npmjs-mcp/dist/index.js"],
     });
   });
 
-  it("rewrites `node <entry>` to `oam run <entry>`", () => {
+  it("rewrites `node <entry>` to `oam run <entry>`", async () => {
     expect(rewriteForOam("node", ["/srv/index.js"], oam)).toEqual({
       command: "oam",
       args: ["run", "/srv/index.js"],
     });
   });
 
-  it("forwards extra args after `--`", () => {
+  it("forwards extra args after `--`", async () => {
     expect(rewriteForOam("node", ["/srv/index.js", "--port", "1"], oam)).toEqual({
       command: "oam",
       args: ["run", "/srv/index.js", "--", "--port", "1"],
     });
   });
 
-  it("stays on node when the first arg is a node flag, not the entry", () => {
+  it("stays on node when the first arg is a node flag, not the entry", async () => {
     expect(rewriteForOam("node", ["--enable-source-maps", "/srv/index.js"], oam)).toEqual({
       command: "node",
       args: ["--enable-source-maps", "/srv/index.js"],
     });
   });
 
-  it("leaves docker untouched (not Node-based)", () => {
+  it("leaves docker untouched (not Node-based)", async () => {
     expect(rewriteForOam("docker", ["run", "-i", "img"], oam)).toEqual({
       command: "docker",
       args: ["run", "-i", "img"],
     });
   });
 
-  it("leaves uv untouched (handled by resolveUvSpawn)", () => {
+  it("leaves uv untouched (handled by resolveUvSpawn)", async () => {
     expect(rewriteForOam("uv", ["tool", "run", "x"], oam)).toEqual({
       command: "uv",
       args: ["tool", "run", "x"],
     });
   });
 
-  it("falls back to the original command when oam is unavailable", () => {
+  it("falls back to the original command when oam is unavailable", async () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/npmjs-mcp"], { oamBin: null, resolveEntry: () => "/x" })).toEqual({
       command: "npx",
       args: ["-y", "@yawlabs/npmjs-mcp"],
     });
   });
 
-  it("falls back to npx when the package can't be resolved on disk", () => {
+  it("falls back to npx when the package can't be resolved on disk", async () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/not-installed"], { oamBin: "oam", resolveEntry: () => null })).toEqual(
       { command: "npx", args: ["-y", "@yawlabs/not-installed"] },
     );
@@ -164,7 +164,7 @@ describe("rewriteForOam", () => {
 });
 
 describe("npxCacheNodeModules", () => {
-  it("derives sibling npx-cache node_modules from a path under _npx", () => {
+  it("derives sibling npx-cache node_modules from a path under _npx", async () => {
     const root = mkdtempSync(join(tmpdir(), "npxcache-"));
     const npx = join(root, "_npx");
     // The broker itself is fetched into cache "aaa"; "bbb" is a sibling
@@ -181,11 +181,11 @@ describe("npxCacheNodeModules", () => {
     }
   });
 
-  it("returns [] for a path not under an npx cache", () => {
+  it("returns [] for a path not under an npx cache", async () => {
     expect(npxCacheNodeModules(pathToFileURL(join(tmpdir(), "plain", "index.js")).href)).toEqual([]);
   });
 
-  it("returns [] for a non-file URL", () => {
+  it("returns [] for a non-file URL", async () => {
     expect(npxCacheNodeModules("not-a-url")).toEqual([]);
   });
 });
@@ -208,7 +208,7 @@ describe("resolveNpmEntry", () => {
     return dir;
   }
 
-  it("resolves a sidecar's BIN, not its ESM-only exports library entry", () => {
+  it("resolves a sidecar's BIN, not its ESM-only exports library entry", async () => {
     const { npx, brokerUrl, cleanup } = fixture();
     // Real-world shape: bin is the CLI (dist/index.js); exports is ESM-only
     // (import/types, no require/default) so require.resolve throws -- the bug.
@@ -226,7 +226,7 @@ describe("resolveNpmEntry", () => {
     }
   });
 
-  it("falls back to the first bin when none is keyed by the unscoped name", () => {
+  it("falls back to the first bin when none is keyed by the unscoped name", async () => {
     const { npx, brokerUrl, cleanup } = fixture();
     const dir = writePkg(npx, "@modelcontextprotocol/server-memory", {
       name: "@modelcontextprotocol/server-memory",
@@ -239,7 +239,7 @@ describe("resolveNpmEntry", () => {
     }
   });
 
-  it("falls back to main when there is no bin", () => {
+  it("falls back to main when there is no bin", async () => {
     const { npx, brokerUrl, cleanup } = fixture();
     const dir = writePkg(npx, "libonly", { name: "libonly", main: "lib/main.js" });
     try {
@@ -249,7 +249,7 @@ describe("resolveNpmEntry", () => {
     }
   });
 
-  it("returns null when the package is in no cache", () => {
+  it("returns null when the package is in no cache", async () => {
     const { brokerUrl, cleanup } = fixture();
     try {
       expect(resolveNpmEntry("@yawlabs/nonexistent-mcp", brokerUrl)).toBeNull();
@@ -268,14 +268,14 @@ describe("probeOam timeout", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
 
-  it("declares a probe timeout matching the uv onPath budget", () => {
+  it("declares a probe timeout matching the uv onPath budget", async () => {
     expect(OAM_PROBE_TIMEOUT_MS).toBe(3_000);
   });
 
-  it("falls back to node when the probe times out", () => {
+  it("falls back to node when the probe times out", async () => {
     // execFileSync throws ETIMEDOUT when the child exceeds `timeout`; the
     // catch must produce the same result as "oam is not installed".
-    const probe = probeOam(() => {
+    const probe = await probeOam(async () => {
       const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
       err.code = "ETIMEDOUT";
       throw err;
@@ -285,8 +285,8 @@ describe("probeOam timeout", () => {
     expect(probe.belowMin).toBe(false);
   });
 
-  it("leaves an opted-in server on its original node/npx command after a timeout", () => {
-    const probe = probeOam(() => {
+  it("leaves an opted-in server on its original node/npx command after a timeout", async () => {
+    const probe = await probeOam(async () => {
       throw new Error("spawnSync oam ETIMEDOUT");
     });
     const original = { command: "npx", args: ["-y", "some-mcp-server"] };
@@ -309,7 +309,7 @@ describe("probeOam timeout diagnostics", () => {
   afterEach(() => resetOamBinCache());
 
   /** Collect everything the logger writes to stderr while `fn` runs. */
-  function captureStderr(fn: () => unknown): Array<{ level?: string; msg?: string }> {
+  async function captureStderr(fn: () => unknown): Promise<Array<{ level?: string; msg?: string }>> {
     const chunks: string[] = [];
     const original = process.stderr.write.bind(process.stderr);
     (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
@@ -317,7 +317,7 @@ describe("probeOam timeout diagnostics", () => {
       return true;
     };
     try {
-      fn();
+      await fn();
     } finally {
       process.stderr.write = original;
     }
@@ -328,9 +328,9 @@ describe("probeOam timeout diagnostics", () => {
       .map((l) => JSON.parse(l) as { level?: string; msg?: string });
   }
 
-  it("warns when the probe times out, so the silent downgrade is diagnosable", () => {
-    const lines = captureStderr(() =>
-      probeOam(() => {
+  it("warns when the probe times out, so the silent downgrade is diagnosable", async () => {
+    const lines = await captureStderr(() =>
+      probeOam(async () => {
         const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
         err.code = "ETIMEDOUT";
         throw err;
@@ -341,11 +341,11 @@ describe("probeOam timeout diagnostics", () => {
     expect(warn?.level).toBe("warn");
   });
 
-  it("stays silent when oam is simply not installed", () => {
+  it("stays silent when oam is simply not installed", async () => {
     // ENOENT is the routine node-only setup; logging it would be noise on
     // every machine without oam.
-    const lines = captureStderr(() =>
-      probeOam(() => {
+    const lines = await captureStderr(() =>
+      probeOam(async () => {
         const err = new Error("spawnSync oam ENOENT") as Error & { code?: string };
         err.code = "ENOENT";
         throw err;

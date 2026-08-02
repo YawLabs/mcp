@@ -614,7 +614,7 @@ describe("connectToUpstream oam runtime wiring", () => {
   });
 
   it("applies resolveOamSpawn to the spawn command when runtime is 'oam'", async () => {
-    vi.mocked(resolveOamSpawn).mockReturnValue({
+    vi.mocked(resolveOamSpawn).mockResolvedValue({
       command: "/usr/bin/oam",
       args: ["run", "/cache/fetch/dist/index.js"],
     });
@@ -685,7 +685,7 @@ describe("connectToUpstream config-level default runtime", () => {
 
   it("applies the oam rewrite when the default is 'oam' and runtime is unset", async () => {
     vi.mocked(defaultRuntime).mockResolvedValue("oam");
-    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
     const config = makeLocalConfig({ command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
     try {
       await connectToUpstream(config);
@@ -745,7 +745,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
   });
 
   it("respawns once on the ORIGINAL command and succeeds when node boots", async () => {
-    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
     let connects = 0;
     _sdkBehavior.clientConnect = () => {
       connects++;
@@ -764,7 +764,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
   });
 
   it("downgrades exactly once: a second failure propagates (no retry ladder)", async () => {
-    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
     const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
 
     await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
@@ -780,7 +780,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
   it("does NOT respawn when resolveOamSpawn already fell back internally (command unchanged)", async () => {
     // oam absent / package unresolvable: resolveOamSpawn returns the command
     // untouched, so a boot failure is a NODE failure -- no downgrade retry.
-    vi.mocked(resolveOamSpawn).mockImplementation((command: string, args: string[]) => ({ command, args }));
+    vi.mocked(resolveOamSpawn).mockImplementation(async (command: string, args: string[]) => ({ command, args }));
     const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
     await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
     expect(_sdkBehavior.stdioConstructions).toHaveLength(1);
@@ -793,7 +793,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     // identically on node, so the wrapper must rethrow without a respawn.
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
-    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
     const config = makeLocalConfig({
       runtime: "oam",
       command: "npx",
@@ -809,7 +809,7 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     // Callers (activation retry, auto-reconnect) call connectToUpstream
     // repeatedly; without the namespace memo they'd re-pay the oam boot
     // failure on every outer attempt.
-    vi.mocked(resolveOamSpawn).mockReturnValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
     const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
 
     // First call: oam attempt fails, downgrade attempt fails too.
