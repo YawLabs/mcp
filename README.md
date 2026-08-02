@@ -222,7 +222,7 @@ Common ones (run `yaw-mcp --help` for the full list):
 
 ## Requirements
 
-- Node.js 18.17+.
+- Node.js 20+.
 - No account. Everything runs locally.
 
 ## License

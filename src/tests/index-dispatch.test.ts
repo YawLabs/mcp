@@ -167,7 +167,7 @@ describe("runServer startup failure", () => {
       bundle: true,
       platform: "node",
       format: "esm",
-      target: "node18",
+      target: "node20",
       // Prefer each dep's ESM build, and hand bundled CJS a real require:
       // both keep the self-contained bundle runnable outside the repo.
       mainFields: ["module", "main"],
