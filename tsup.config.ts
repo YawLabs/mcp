@@ -8,7 +8,10 @@ export default defineConfig({
   format: ['esm'],
   dts: false,
   clean: true,
-  target: 'node18',
+  // Matches package.json engines. Raised from node18 once a direct prod
+  // dependency (@yawlabs/mcp-compliance) began requiring node>=20 -- the
+  // package could not actually run on 18 while still claiming to.
+  target: 'node20',
   banner: { js: '#!/usr/bin/env node' },
   define: { '__VERSION__': JSON.stringify(version) },
 });

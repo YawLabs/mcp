@@ -46,7 +46,7 @@
     "vitest": "^4.1.9"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=20"
   },
   "keywords": [
     "mcp",

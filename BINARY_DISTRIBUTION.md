@@ -15,7 +15,7 @@ Or, for a one-off run without installing:
 npx -y @yawlabs/mcp --version
 ```
 
-This works on Linux (x64 + arm64), macOS (x64 + arm64), and Windows (x64 + arm64). Node 18.3 or newer is required (the `engines` field in `package.json` enforces this; `npx -y` will pull a recent Node automatically if you're on an older one).
+This works on Linux (x64 + arm64), macOS (x64 + arm64), and Windows (x64 + arm64). Node 20 or newer is required (the `engines` field in `package.json` enforces this; `npx -y` will pull a recent Node automatically if you're on an older one).
 
 ## What happened to the single-binary download
 
