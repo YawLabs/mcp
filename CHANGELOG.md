@@ -23,6 +23,12 @@ Only two hosted surfaces survive, and neither needs an account: the public serve
 
 This breaks scripted use, and it breaks intermittently: a script removing an already-absent server still exits 0, so the cleanup path that worked yesterday fails the one time there was something to clean. Add `--force`. The gate exists because removal is less reversible than it looks -- env values stored on the entry go with it and `add` will not bring them back.
 
+**Breaking -- Node 20 is the floor**
+
+`engines` moves from `>=18.17` to `>=20`, and the build target moves from `node18` to `node20` to match. This is a correction, not a new requirement: `@yawlabs/mcp-compliance` is a direct production dependency and already required `node>=20`, so the package could not actually run on Node 18 while still advertising that it could. Node 18 is also past end of life.
+
+The practical change is where it fails. `npm install` on Node 18 now refuses with `EBADENGINE` instead of installing a tree that breaks at runtime. `npx -y @yawlabs/mcp` is unaffected -- it pulls a recent Node on its own.
+
 **Deprecated for one release -- still accepted, now warns**
 
 - `--token` and `--no-yaw-mcp-config` on `yaw-mcp install`. Both are still fully parsed, so `install --all --token mcp_pat_...` keeps working and keeps exiting 0; the values are ignored.
