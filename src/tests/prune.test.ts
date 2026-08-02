@@ -215,3 +215,40 @@ describe("pruneContent", () => {
     expect(parsed.meta).toBe("ok");
   });
 });
+
+// Same footgun as resolveArgs in exec-engine.ts: JSON.parse yields
+// "__proto__" as an OWN property, but rebuilding the tree with `out[k] = v`
+// hits Object.prototype's setter instead of creating an own key, so the
+// field an upstream server actually returned disappears from the pruned
+// result handed back to the model.
+describe("pruneJson __proto__ handling", () => {
+  const originalEnv = process.env.YAW_MCP_PRUNE_RESPONSES;
+  beforeEach(() => {
+    delete process.env.YAW_MCP_PRUNE_RESPONSES;
+  });
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.YAW_MCP_PRUNE_RESPONSES;
+    else process.env.YAW_MCP_PRUNE_RESPONSES = originalEnv;
+  });
+
+  it("keeps a __proto__ key that survives pruning", () => {
+    // Padding nulls make the prune clear MIN_SAVINGS_RATIO so the result is
+    // actually applied rather than falling back to the original content.
+    const source = JSON.parse('{"__proto__": {"nested": "data"}, "keep": "value"}');
+    for (let i = 0; i < 40; i++) source[`empty${i}`] = null;
+    const result = pruneContent([{ type: "text", text: JSON.stringify(source) }]);
+    const out = JSON.parse((result.content[0] as { text: string }).text);
+
+    expect(result.bytesPruned).toBeLessThan(result.bytesRaw);
+    expect(Object.hasOwn(out, "__proto__")).toBe(true);
+    expect(out.keep).toBe("value");
+    expect(JSON.parse(JSON.stringify(out))).toEqual(JSON.parse('{"__proto__": {"nested": "data"}, "keep": "value"}'));
+  });
+
+  it("never pollutes Object.prototype while pruning", () => {
+    const source = JSON.parse('{"__proto__": {"polluted": true}, "keep": "value"}');
+    for (let i = 0; i < 40; i++) source[`empty${i}`] = null;
+    pruneContent([{ type: "text", text: JSON.stringify(source) }]);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+});

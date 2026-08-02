@@ -217,3 +217,33 @@ describe("writeGrade -- concurrent writes (serialization)", () => {
     expect(disk["new-b"]).toEqual(newB);
   });
 });
+
+// ---------------------------------------------------------------------------
+// readGradesCache -- a "__proto__" namespace
+// ---------------------------------------------------------------------------
+
+// Rebuilding the cache with plain assignment onto a fresh {} drops a
+// "__proto__" key (assignment hits Object.prototype's inherited setter) and,
+// because the value is an object, leaves the cache inheriting that entry's
+// fields. See src/json-key.ts.
+describe("readGradesCache -- a __proto__ namespace", () => {
+  it("keeps it as an own property without touching the prototype", async () => {
+    // Raw JSON text, not an object literal: `{ __proto__: ... }` in source
+    // SETS the prototype rather than creating an own key -- the very bug
+    // under test -- so a literal fixture would be empty and pass for the
+    // wrong reason.
+    writeGradesFile(
+      synthHome,
+      `{"__proto__":{"grade":"A","score":97.7,"gradedAt":"2026-06-11T00:00:00.000Z"},"ctxlint":${JSON.stringify(VALID_ENTRY)}}`,
+    );
+
+    const cache = await readGradesCache(synthHome);
+
+    expect(Object.hasOwn(cache, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(cache)).toBe(Object.prototype);
+    expect(cache.ctxlint).toEqual(VALID_ENTRY);
+    // Without the fix the cache inherits the entry's fields, so a namespace
+    // named "grade" resolves to a string instead of undefined.
+    expect(cache.grade).toBeUndefined();
+  });
+});

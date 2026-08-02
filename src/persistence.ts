@@ -25,6 +25,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 
@@ -190,7 +191,10 @@ function sanitizeLearning(input: unknown): Record<string, PersistedLearningUsage
     // succeeded cannot exceed dispatched — clamp rather than reject so we
     // salvage otherwise-valid entries from corrupted/hand-edited state files.
     const succeeded = Math.min(u.succeeded, u.dispatched);
-    out[k] = { dispatched: u.dispatched, succeeded, lastUsedAt: u.lastUsedAt };
+    // setJsonKey, not out[k]: k comes from a parsed (and per the comment
+    // above, possibly hand-edited) state file, and plain assignment to
+    // "__proto__" would drop the entry AND repoint `out`'s prototype at it.
+    setJsonKey(out, k, { dispatched: u.dispatched, succeeded, lastUsedAt: u.lastUsedAt });
   }
   return out;
 }

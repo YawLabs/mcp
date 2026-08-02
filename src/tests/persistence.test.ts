@@ -476,3 +476,43 @@ describe("PackDetector snapshot round-trip", () => {
     expect(d.getHistory()[0].namespace).toBe("gh");
   });
 });
+
+// sanitizeLearning rebuilds the map with plain assignment onto a fresh {},
+// which drops a "__proto__" namespace (assignment hits Object.prototype's
+// inherited setter) and leaves the map inheriting that entry's fields. Its
+// own doc comment scopes it to salvaging corrupted/hand-edited state files,
+// which is exactly where such a key comes from. See src/json-key.ts.
+describe("persistence.loadState -- a __proto__ learning key", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-state-proto-"));
+    file = join(dir, "state.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps it as an own property without touching the prototype", async () => {
+    // Raw JSON text, not an object literal: `{ __proto__: ... }` in source
+    // SETS the prototype rather than creating an own key -- the very bug
+    // under test -- so a literal fixture would be empty and pass for the
+    // wrong reason.
+    writeFileSync(
+      file,
+      `{"version":${STATE_SCHEMA_VERSION},"savedAt":0,"learning":{"__proto__":{"dispatched":4,"succeeded":3,"lastUsedAt":100},"gh":{"dispatched":1,"succeeded":1,"lastUsedAt":1}}}`,
+    );
+
+    const s = await loadState(file);
+
+    expect(Object.hasOwn(s.learning, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(s.learning)).toBe(Object.prototype);
+    expect(s.learning.gh).toEqual({ dispatched: 1, succeeded: 1, lastUsedAt: 1 });
+    expect(Object.keys(s.learning).sort()).toEqual(["__proto__", "gh"]);
+    // Without the fix `learning` inherits the entry's fields, so a namespace
+    // named "dispatched" resolves to a number instead of undefined.
+    expect(s.learning.dispatched).toBeUndefined();
+  });
+});

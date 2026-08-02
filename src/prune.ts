@@ -118,7 +118,16 @@ function pruneJson(value: unknown): unknown {
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       const pv = pruneJson(v);
       if (pv !== undefined) {
-        out[k] = pv;
+        // See resolveArgs in exec-engine.ts: plain assignment to
+        // "__proto__" hits the inherited setter instead of creating an own
+        // key, so the field would be dropped from the pruned result an
+        // upstream server actually returned. defineProperty keeps it a
+        // plain data property.
+        if (k === "__proto__") {
+          Object.defineProperty(out, k, { value: pv, writable: true, enumerable: true, configurable: true });
+        } else {
+          out[k] = pv;
+        }
         kept++;
       }
     }

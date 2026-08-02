@@ -838,3 +838,34 @@ describe("findShadowingProjectBundles is trust-aware", () => {
     );
   });
 });
+
+// A "__proto__" key in the store file is dropped when the loader rebuilds
+// `entries` with plain assignment onto a fresh {} -- assignment hits
+// Object.prototype's inherited __proto__ setter instead of creating an own
+// key. Because the assigned value is an object, `entries` also ends up with
+// that record as its prototype. See src/json-key.ts.
+describe("a __proto__ store key survives the rebuild", () => {
+  const SHA = "a".repeat(64);
+
+  it("keeps it as an own property without touching the prototype", async () => {
+    // Raw JSON text, not an object literal: `{ __proto__: ... }` in source
+    // SETS the prototype rather than creating an own key -- the very bug
+    // under test -- so a literal fixture would be empty and the test would
+    // pass for the wrong reason.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      trustStorePath(synthHome),
+      `{"version":1,"trusted":{"__proto__":{"path":"/p","sha256":"${SHA}","grantedAt":"2026-01-01T00:00:00.000Z"}}}`,
+    );
+
+    const store = await readTrustStore(synthHome);
+
+    expect(store.malformed).toBe(false);
+    expect(Object.hasOwn(store.entries, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(store.entries)).toBe(Object.prototype);
+    expect(Object.keys(store.entries)).toEqual(["__proto__"]);
+    // Without the fix `entries` inherits the record's own fields, so a lookup
+    // for a key named "sha256" resolves to a string instead of undefined.
+    expect(store.entries.sha256).toBeUndefined();
+  });
+});

@@ -189,7 +189,22 @@ export function resolveArgs(args: unknown, bindings: Record<string, unknown>): u
   if (args !== null && typeof args === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(args as Record<string, unknown>)) {
-      out[k] = resolveArgs(v, bindings);
+      const resolved = resolveArgs(v, bindings);
+      // `out[k] = v` is wrong for k === "__proto__". JSON.parse produces
+      // __proto__ as an OWN property, but plain assignment hits
+      // Object.prototype's __proto__ setter instead of creating an own key,
+      // so the key vanishes from the rebuilt object -- and since
+      // JSON.stringify only serializes own properties, the argument is
+      // silently dropped from the outgoing tools/call. (This is not
+      // prototype pollution: only `out`'s own prototype is affected, never
+      // Object.prototype.) defineProperty stores it as the plain data
+      // property the input actually had. Branching keeps the common path
+      // on plain assignment.
+      if (k === "__proto__") {
+        Object.defineProperty(out, k, { value: resolved, writable: true, enumerable: true, configurable: true });
+      } else {
+        out[k] = resolved;
+      }
     }
     return out;
   }
