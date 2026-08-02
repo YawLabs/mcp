@@ -304,6 +304,79 @@ describe("ranking index cache", () => {
     expect(relevanceCacheStats().indexBuilds).toBe(41);
   });
 
+  it("evicts least-recently-used, so a churning server cannot flush its stable neighbours", () => {
+    // FIFO eviction would let one server whose content changes every call
+    // push out the neighbours that never change -- exactly the reuse the doc
+    // cache exists to provide, since a stable entry is inserted once and then
+    // stays permanently "oldest". Measured before the fix on a 100-server
+    // corpus: 798 doc builds over 600 calls against an ideal of 699.
+    const STABLE = 20;
+    const CALLS = 600; // STABLE + CALLS must exceed MAX_CACHED_DOCS (512)
+    const withChurn = (v: number) => [
+      ...Array.from({ length: STABLE }, (_, i) => ({
+        namespace: `stable${i}`,
+        name: `Stable ${i}`,
+        description: `unchanging server ${i}`,
+        tools: [{ name: `tool_${i}`, description: `does thing ${i}` }],
+      })),
+      { namespace: "churn", name: "Churn", description: `version ${v}`, tools: [] },
+    ];
+    for (let v = 0; v < CALLS; v++) rankServers("thing", withChurn(v));
+    // One build per stable server plus the churner, then one per new version:
+    // the stable 20 are re-tokenized zero times.
+    expect(relevanceCacheStats().docBuilds).toBe(STABLE + 1 + (CALLS - 1));
+  });
+
+  it("does not let scoreRelevance evict the cached corpus index", () => {
+    rankServers("create an issue", corpus());
+    expect(relevanceCacheStats().indexBuilds).toBe(1);
+    // Each scoreRelevance call is its own distinct one-server corpus. Routing
+    // those through the shared index cache (cap 4) would evict the corpus
+    // index above on every iteration, silently undoing the caching for the
+    // discover/dispatch path that needs it.
+    for (let i = 0; i < 12; i++) {
+      scoreRelevance("issue tracker", { name: `Server ${i}`, namespace: `ns${i}` }, []);
+    }
+    const beforeReRank = relevanceCacheStats().indexBuilds;
+    rankServers("create an issue", corpus());
+    expect(relevanceCacheStats().indexBuilds).toBe(beforeReRank);
+  });
+
+  it("cannot be made to collide by control characters inside a field", () => {
+    // Tool names and descriptions come from third-party upstream servers over
+    // JSON-RPC, where NUL and SOH are legal string content -- so any
+    // "this character cannot occur" assumption in a delimiter scheme is
+    // supplied by the untrusted side. Length-prefixing removes the assumption.
+    const embedded = [{ namespace: "ns", name: "Name", description: "alpha beta ", tools: [] }];
+    const split = [{ namespace: "ns", name: "Name", description: "alpha", tools: [{ name: "beta", description: "" }] }];
+    const a = rankServers("beta", embedded);
+    const b = rankServers("beta", split);
+    expect(relevanceCacheStats().indexBuilds).toBe(2);
+    // "beta" lands in `description` (weight 1.5) for one and `toolName`
+    // (weight 2.0) for the other, so a collision would also misscore.
+    expect(a[0]?.score).not.toBe(b[0]?.score);
+  });
+
+  it("cannot be made to collide across the server boundary of the index key", () => {
+    const two = [
+      { namespace: "alpha", name: "Alpha", description: "widget", tools: [] },
+      { namespace: "bravo", name: "Bravo", description: "widget", tools: [] },
+    ];
+    // Under a separator-joined index key this single server signs identically
+    // to the two-server corpus above, so it would be served a 2-doc index --
+    // wrong N, wrong IDF, and a ranked namespace the caller never passed in.
+    const forged = [
+      {
+        namespace: "alpha",
+        name: "Alpha",
+        description: "widgetbravo Bravo widget",
+        tools: [],
+      },
+    ];
+    rankServers("widget", two);
+    expect(rankServers("widget", forged).map((r) => r.namespace)).toEqual(["alpha"]);
+  });
+
   it("still saturates term frequency after the counts refactor", () => {
     // FieldStats stores per-term counts instead of a token array; BM25's k1
     // saturation must still apply, so 5 repeats scores below 5x a single hit.
