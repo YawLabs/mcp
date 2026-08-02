@@ -221,7 +221,7 @@ function touch<V>(cache: Map<string, V>, key: string, value: V): void {
 /** Field separator for a server signature. Doubled wherever it occurs
  *  inside a field, which makes the encoding unambiguous: a lone separator is
  *  a field boundary, a doubled one is literal text. */
-const SEP = " ";
+const SEP = "\u0000";
 
 /** Escape the separator out of one field. Upstream tool names and
  *  descriptions arrive from third-party servers over JSON-RPC, where every

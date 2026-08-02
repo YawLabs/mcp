@@ -220,7 +220,7 @@ function unionBlocked(files: LoadedConfigFile[]): string[] | undefined {
 const migrationOnce = new Map<string, Promise<void>>();
 
 function migrateLegacyConfigPathsOnce(cwd: string, home: string): Promise<void> {
-  const key = `${cwd} ${home}`;
+  const key = `${cwd}\u0000${home}`;
   let pending = migrationOnce.get(key);
   if (pending === undefined) {
     // Fail-open (matches the migrator's own contract): a rejection is

@@ -347,7 +347,7 @@ describe("ranking index cache", () => {
     // JSON-RPC, where NUL and SOH are legal string content -- so any
     // "this character cannot occur" assumption in a delimiter scheme is
     // supplied by the untrusted side. Length-prefixing removes the assumption.
-    const embedded = [{ namespace: "ns", name: "Name", description: "alpha beta ", tools: [] }];
+    const embedded = [{ namespace: "ns", name: "Name", description: "alpha\u0000beta\u0000", tools: [] }];
     const split = [{ namespace: "ns", name: "Name", description: "alpha", tools: [{ name: "beta", description: "" }] }];
     const a = rankServers("beta", embedded);
     const b = rankServers("beta", split);
@@ -369,7 +369,7 @@ describe("ranking index cache", () => {
       {
         namespace: "alpha",
         name: "Alpha",
-        description: "widgetbravo Bravo widget",
+        description: "widget\u0001bravo\u0000Bravo\u0000widget",
         tools: [],
       },
     ];
