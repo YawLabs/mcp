@@ -19,6 +19,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { setJsonKey } from "./json-key.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
@@ -95,7 +96,10 @@ export async function readGradesCache(home: string = homedir()): Promise<GradesC
   const out: GradesCache = {};
   for (const [ns, entry] of Object.entries(parsed as Record<string, unknown>)) {
     const validated = validateEntry(entry);
-    if (validated) out[ns] = validated;
+    // setJsonKey, not out[ns]: ns comes straight from the parsed cache file,
+    // and plain assignment to "__proto__" would drop the grade AND repoint
+    // `out`'s prototype at it.
+    if (validated) setJsonKey(out, ns, validated);
   }
   return out;
 }

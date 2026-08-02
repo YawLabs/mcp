@@ -45,6 +45,7 @@ import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 
@@ -244,11 +245,14 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
       log("warn", "Dropping trust entry with a missing or malformed sha256", { path, key });
       continue;
     }
-    entries[key] = {
+    // setJsonKey, not entries[key]: key comes straight from the parsed trust
+    // file, and plain assignment to "__proto__" would silently drop the
+    // record AND repoint `entries`' prototype at it.
+    setJsonKey(entries, key, {
       path: typeof v.path === "string" && v.path.length > 0 ? v.path : key,
       sha256: v.sha256,
       grantedAt: typeof v.grantedAt === "string" ? v.grantedAt : "",
-    };
+    });
   }
   return { version, entries, malformed: false, malformedReason: null, malformedKind: null, errorCode: null };
 }
