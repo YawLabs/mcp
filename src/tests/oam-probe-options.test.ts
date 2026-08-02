@@ -28,21 +28,30 @@ interface SpawnCall {
 
 const spawnCalls: SpawnCall[] = [];
 const killed: string[] = [];
+const unrefed: number[] = [];
+const stdoutDestroyed: number[] = [];
 /** When true the fake child never exits -- the wedged-binary case. */
 let hangForever = false;
 
 vi.mock("node:child_process", () => ({
   spawn: (bin: string, args: string[], opts: Record<string, unknown>) => {
     spawnCalls.push({ bin, args: [...(args ?? [])], opts: { ...opts } });
-    const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
+    const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void; destroy: () => void };
     stdout.setEncoding = () => {};
     const child = new EventEmitter() as EventEmitter & {
       stdout: typeof stdout;
       kill: (sig?: string) => void;
+      unref: () => void;
     };
     child.stdout = stdout;
     child.kill = (sig?: string) => {
       killed.push(sig ?? "default");
+    };
+    child.unref = () => {
+      unrefed.push(1);
+    };
+    stdout.destroy = () => {
+      stdoutDestroyed.push(1);
     };
     if (!hangForever) {
       // Emit on a later turn so the probe's listeners are attached first.
@@ -65,6 +74,8 @@ describe("probeOam default runner", () => {
   beforeEach(() => {
     spawnCalls.length = 0;
     killed.length = 0;
+    unrefed.length = 0;
+    stdoutDestroyed.length = 0;
     hangForever = false;
     resetOamBinCache();
     process.env.OAM_BIN = "/usr/local/bin/oam";
@@ -134,5 +145,24 @@ describe("probeOam default runner", () => {
     expect(spawnCalls).toHaveLength(1);
     expect(a).toEqual(b);
     expect(b).toEqual(c);
+  });
+
+  it("detaches the child on timeout so a survivor cannot hold the process open", async () => {
+    // Killing is best-effort; DETACHING is what makes the shutdown safe. A
+    // live child with a piped stdout keeps the PARENT's event loop alive --
+    // verified out-of-band: a parent with an unkilled child and nothing else
+    // pending was still running after 6s. So in the exact case this probe
+    // exists for (a kill that does not take effect), settling the promise
+    // unblocks the connect path but the broker could then never exit.
+    hangForever = true;
+    vi.useFakeTimers();
+
+    const pending = probeOam();
+    await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
+    await pending;
+
+    expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL]);
+    expect(unrefed, "child was not unref'd -- it can still hold the loop").toHaveLength(1);
+    expect(stdoutDestroyed, "stdout pipe was not released").toHaveLength(1);
   });
 });

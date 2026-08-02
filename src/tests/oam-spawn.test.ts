@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  createProbeCollector,
   MIN_OAM_VERSION,
   npxCacheNodeModules,
   OAM_PROBE_TIMEOUT_MS,
@@ -352,5 +353,99 @@ describe("probeOam timeout diagnostics", () => {
       }),
     );
     expect(lines).toEqual([]);
+  });
+});
+
+// Two hardening fixes after #92 shipped.
+describe("probeOam hardening", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  // These assert the COLLECTOR's behaviour. The previous version of this test
+  // only asserted that OAM_PROBE_MAX_OUTPUT sat in a plausible range, which
+  // passes with the capping logic deleted outright -- it proved nothing.
+
+  it("caps retained output hard, even against a single oversized chunk", () => {
+    // The first implementation checked the length BEFORE appending, so one
+    // big chunk landed whole: an 80KB chunk was retained in full.
+    const c = createProbeCollector(1024);
+    c.push("x".repeat(80 * 1024));
+    expect(c.retainedLength()).toBe(1024);
+
+    c.push("y".repeat(80 * 1024));
+    expect(c.retainedLength()).toBe(1024);
+  });
+
+  it("still finds a version that arrives after the cap", () => {
+    // The real damage of a naive prefix cap: the version is discarded, so
+    // parseOamVersion returns null, so the `version !== null` guard skips the
+    // MIN_OAM_VERSION check -- hosting on an oam that was never version-gated.
+    const c = createProbeCollector(64);
+    c.push("banner ".repeat(200)); // well past the cap, no version in it
+    c.push("oam 0.9.1\n");
+    expect(parseOamVersion(c.result())).toBe("0.9.1");
+  });
+
+  it("finds a version split across a chunk boundary, past the cap", () => {
+    // The cap must be already full, otherwise the head buffer happens to
+    // contain both halves and the test passes without the carry doing any
+    // work -- which is exactly how the first version of this test passed
+    // with the carry deleted.
+    const c = createProbeCollector(16);
+    c.push("banner ".repeat(50)); // head is now full of text with no version
+    c.push("oam 0.");
+    c.push("6.0\n");
+    expect(parseOamVersion(c.result())).toBe("0.6.0");
+  });
+
+  it("keeps the first version when several appear", () => {
+    const c = createProbeCollector();
+    c.push("oam 1.2.3\n");
+    c.push("plugin 9.9.9\n");
+    expect(parseOamVersion(c.result())).toBe("1.2.3");
+  });
+
+  it("returns capped text (which parses to null) when no version appears", () => {
+    const c = createProbeCollector(32);
+    c.push("no version here at all, and quite a lot of it".repeat(10));
+    expect(c.retainedLength()).toBe(32);
+    expect(parseOamVersion(c.result())).toBeNull();
+  });
+
+  it("a below-min version past the cap still trips the gate end to end", async () => {
+    // The consequence chain, exercised through probeOam rather than the
+    // collector: a chatty binary must not smuggle an old oam past the gate.
+    const probe = await probeOam(async () => {
+      const c = createProbeCollector(64);
+      c.push("banner ".repeat(200));
+      c.push(`oam 0.0.1\n`);
+      return c.result();
+    });
+    expect(probe.belowMin).toBe(true);
+    expect(probe.bin).toBeNull();
+  });
+
+  it("does not let a probe that was in flight during a reset publish its result", async () => {
+    // Otherwise the reset is silently undone by a probe the caller believes
+    // it discarded -- one test's probe populating the next test's cache.
+    let release: (v: string) => void = () => {};
+    const slow = () =>
+      new Promise<string>((r) => {
+        release = r;
+      });
+
+    const inflight = probeOam(slow);
+    resetOamBinCache(); // caller discards that probe
+    release("oam 9.9.9"); // ...which only now lands
+    await inflight;
+
+    // A fresh probe must actually run rather than reading the discarded result.
+    let ran = false;
+    const after = await probeOam(async () => {
+      ran = true;
+      return "oam 1.2.3";
+    });
+    expect(ran, "stale in-flight probe published over the reset").toBe(true);
+    expect(after.version).toBe("1.2.3");
   });
 });
