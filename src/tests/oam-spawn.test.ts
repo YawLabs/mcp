@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   MIN_OAM_VERSION,
   npxCacheNodeModules,
+  OAM_PROBE_MAX_OUTPUT,
   OAM_PROBE_TIMEOUT_MS,
   packageName,
   parseOamVersion,
@@ -352,5 +353,43 @@ describe("probeOam timeout diagnostics", () => {
       }),
     );
     expect(lines).toEqual([]);
+  });
+});
+
+// Two hardening fixes after #92 shipped.
+describe("probeOam hardening", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  it("declares a bound on retained probe output", () => {
+    // execFileSync applied a 1MB maxBuffer for free; the async rewrite
+    // dropped it, so a chatty binary could grow the buffer for the whole
+    // timeout window. A version string is under 100 bytes.
+    expect(OAM_PROBE_MAX_OUTPUT).toBeGreaterThan(0);
+    expect(OAM_PROBE_MAX_OUTPUT).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  it("does not let a probe that was in flight during a reset publish its result", async () => {
+    // Otherwise the reset is silently undone by a probe the caller believes
+    // it discarded -- one test's probe populating the next test's cache.
+    let release: (v: string) => void = () => {};
+    const slow = () =>
+      new Promise<string>((r) => {
+        release = r;
+      });
+
+    const inflight = probeOam(slow);
+    resetOamBinCache(); // caller discards that probe
+    release("oam 9.9.9"); // ...which only now lands
+    await inflight;
+
+    // A fresh probe must actually run rather than reading the discarded result.
+    let ran = false;
+    const after = await probeOam(async () => {
+      ran = true;
+      return "oam 1.2.3";
+    });
+    expect(ran, "stale in-flight probe published over the reset").toBe(true);
+    expect(after.version).toBe("1.2.3");
   });
 });

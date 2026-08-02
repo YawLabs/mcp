@@ -126,6 +126,10 @@ export const OAM_PROBE_TIMEOUT_MS = 3_000;
  */
 export const OAM_PROBE_KILL_SIGNAL = "SIGKILL";
 
+/** Cap on retained `oam --version` stdout. Replaces the 1MB maxBuffer that
+ *  execFileSync applied for free before the async rewrite. */
+export const OAM_PROBE_MAX_OUTPUT = 8 * 1024;
+
 /**
  * Run `oam --version` WITHOUT blocking the event loop.
  *
@@ -169,10 +173,16 @@ function spawnVersionProbe(bin: string): Promise<string> {
       return;
     }
 
+    // Cap what we retain. execFileSync enforced a 1MB maxBuffer and errored
+    // past it; the async rewrite dropped that with nothing in its place, so a
+    // chatty (or hostile) binary could grow this string unbounded for the
+    // whole timeout window. A version string is well under 100 bytes -- read
+    // enough to parse and ignore the rest rather than erroring, since a
+    // verbose --version is not a reason to refuse to host on oam.
     let out = "";
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
-      out += chunk;
+      if (out.length < OAM_PROBE_MAX_OUTPUT) out += chunk;
     });
     // 'error' fires for ENOENT (oam not installed) -- the routine case.
     child.on("error", (err) => settle(() => reject(err)));
@@ -184,6 +194,21 @@ function spawnVersionProbe(bin: string): Promise<string> {
         // promise is settled independently rather than waiting on the kill.
         try {
           child.kill(OAM_PROBE_KILL_SIGNAL);
+        } catch {
+          /* already gone */
+        }
+        // DETACH, do not merely kill. A live child with a piped stdout keeps
+        // the PARENT's event loop alive -- verified: a parent with an unkilled
+        // child and nothing else pending was still running after 6s. So when
+        // the kill above does not take effect (the D-state case this whole
+        // probe exists for, or a grandchild inheriting the pipe), settling the
+        // promise unblocks the connect path but the broker can then never
+        // exit. Trading a connect-path hang for a shutdown hang is not a fix.
+        // unref drops the child from the loop's handle count; destroying stdout
+        // releases the pipe the grandchild case would otherwise hold open.
+        try {
+          child.stdout?.destroy();
+          child.unref();
         } catch {
           /* already gone */
         }
@@ -200,18 +225,33 @@ function spawnVersionProbe(bin: string): Promise<string> {
  *  racing to start their own before any of them has populated the cache. */
 let oamProbeInFlight: Promise<OamProbe> | undefined;
 
+/** Bumped by resetOamBinCache. A probe that was already in flight when the
+ *  reset landed must NOT write its result afterwards -- otherwise the reset is
+ *  silently undone by a probe the caller believes it discarded, and one test's
+ *  probe can populate the cache for the next. */
+let oamProbeGeneration = 0;
+
 export async function probeOam(run: (bin: string) => Promise<string> = spawnVersionProbe): Promise<OamProbe> {
   if (oamProbeCache !== undefined) return oamProbeCache;
   if (oamProbeInFlight !== undefined) return oamProbeInFlight;
-  oamProbeInFlight = probeOamUncached(run).finally(() => {
-    oamProbeInFlight = undefined;
+  const generation = oamProbeGeneration;
+  oamProbeInFlight = probeOamUncached(run, generation).finally(() => {
+    if (generation === oamProbeGeneration) oamProbeInFlight = undefined;
   });
   return oamProbeInFlight;
 }
 
-async function probeOamUncached(run: (bin: string) => Promise<string>): Promise<OamProbe> {
+async function probeOamUncached(run: (bin: string) => Promise<string>, generation: number): Promise<OamProbe> {
   if (oamProbeCache !== undefined) return oamProbeCache;
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
+  /** Publish only if no reset landed while we were awaiting the spawn. The
+   *  result is still RETURNED to this call's own caller either way -- it is
+   *  correct for the state it observed; it just must not become the cache a
+   *  post-reset caller reads. */
+  const publish = (probe: OamProbe): OamProbe => {
+    if (generation === oamProbeGeneration) oamProbeCache = probe;
+    return probe;
+  };
   try {
     const version = parseOamVersion(await run(bin));
     if (version !== null && compareVersions(version, MIN_OAM_VERSION) < 0) {
@@ -219,10 +259,9 @@ async function probeOamUncached(run: (bin: string) => Promise<string>): Promise<
         oamVersion: version,
         minVersion: MIN_OAM_VERSION,
       });
-      oamProbeCache = { bin: null, version, belowMin: true };
-    } else {
-      oamProbeCache = { bin, version, belowMin: false };
+      return publish({ bin: null, version, belowMin: true });
     }
+    return publish({ bin, version, belowMin: false });
   } catch (err) {
     // "oam is not installed" is the expected, silent case -- ENOENT here is
     // routine and logging it would be noise on every node-only setup. A
@@ -237,9 +276,8 @@ async function probeOamUncached(run: (bin: string) => Promise<string>): Promise<
         bin,
       });
     }
-    oamProbeCache = { bin: null, version: null, belowMin: false };
+    return publish({ bin: null, version: null, belowMin: false });
   }
-  return oamProbeCache;
 }
 
 /**
@@ -250,10 +288,12 @@ export async function oamBin(): Promise<string | null> {
   return (await probeOam()).bin;
 }
 
-/** Reset the cached oam-binary probe (test hook). */
+/** Reset the cached oam-binary probe (test hook). Bumps the generation so a
+ *  probe still in flight cannot publish its result afterwards. */
 export function resetOamBinCache(): void {
   oamProbeCache = undefined;
   oamProbeInFlight = undefined;
+  oamProbeGeneration++;
 }
 
 export interface OamRewriteDeps {
