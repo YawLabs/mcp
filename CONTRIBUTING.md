@@ -68,7 +68,7 @@ Open an issue on GitHub. Include:
 
 ## License and Contributor Sign-Off
 
-This project is source-available under the [Elastic License 2.0](LICENSE) (SPDX `Elastic-2.0`), not an open-source license. Read it before you contribute — in particular, it does not grant the right to provide this software to third parties as a hosted or managed service.
+This project is source-available under [PolyForm Shield 1.0.0](LICENSE.md), not an open-source license. Read it before you contribute — in particular, it does not grant the right to use this software to offer a product that competes with it.
 
 Contributions are accepted under the [Developer Certificate of Origin](https://developercertificate.org/) (DCO) 1.1. It is a short statement that you wrote the patch, or otherwise have the right to submit it under this project's license. There is no CLA to sign and no copyright assignment.
 
