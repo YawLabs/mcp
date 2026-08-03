@@ -227,9 +227,9 @@ Common ones (run `yaw-mcp --help` for the full list):
 
 ## License
 
-Source-available, not open source. Copyright (c) 2026 Yaw Labs, all rights reserved.
+[Elastic License 2.0](./LICENSE) (SPDX `Elastic-2.0`). Source-available, not open source. Copyright (c) 2026 Yaw Labs.
 
-The source is published so you can read and audit it before running it -- `yaw-mcp` spawns processes on your machine and handles your credentials, and you should not have to take that on faith. You may use it freely, personally or commercially, and redistribute unmodified copies. You may not offer it to third parties as a competing product. See [LICENSE](./LICENSE) for the terms, and [CONTRIBUTING.md](./CONTRIBUTING.md) for the DCO sign-off contributors use.
+The source is published so you can read and audit it before running it -- `yaw-mcp` spawns processes on your machine and handles your credentials, and you should not have to take that on faith. You may use it freely, personally or commercially, modify it for your own use, and redistribute it, provided you pass these terms along and mark any copies you changed. You may not offer it to third parties as a hosted or managed service. See [LICENSE](./LICENSE) for the terms, and [CONTRIBUTING.md](./CONTRIBUTING.md) for the DCO sign-off contributors use.
 
 ## Links
 

@@ -2,6 +2,16 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## Unreleased -- Elastic License 2.0
+
+The bespoke Yaw MCP Source-Available License is replaced by the [Elastic License 2.0](./LICENSE), and `package.json` declares the SPDX identifier `Elastic-2.0` instead of `SEE LICENSE IN LICENSE`.
+
+The intent is unchanged: the source is published so you can read and audit it before running it, use is free personally and commercially with no limit on users or machines, and you may modify it for your own use and redistribute it. What changes is that the terms are now machine-readable. A bespoke license has no SPDX identifier, so license scanners (FOSSA, Snyk, Black Duck, Renovate policy) classify it as `unknown` -- and at many companies `unknown` is an automatic block that never reaches a human reviewer. For a package whose whole pitch is "read it before you run it," being silently rejected by a scanner is the wrong way to lose.
+
+One deliberate narrowing: ELv2 prohibits providing the software to third parties as a hosted or managed service, where the previous license prohibited any Competing Product. Someone shipping a rival on-prem MCP orchestrator built on this code was caught by the old text and is not clearly caught by ELv2. That is the cost of a standard license.
+
+ELv2's license-key clause is inert here, since yaw-mcp has no license key functionality.
+
 ## 0.74.0 -- local-only: the hosted control plane is retired (BREAKING)
 
 The hosted backend is gone. Every endpoint yaw-mcp called returns 404 -- `/api/connect/config`, `/heartbeat`, `/analytics`, `/servers`, `/api/compliance/ext`, `/api/try/event`, the dashboard, and `/signup`. Rather than keep code that cannot succeed, account mode is removed outright: your servers come from `~/.yaw-mcp/bundles.json` and your credentials from the local encrypted vault. Roughly 5,800 lines deleted.
