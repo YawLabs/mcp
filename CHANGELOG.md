@@ -2,6 +2,12 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## Unreleased -- `LICENSE` renamed to `LICENSE.md`
+
+The license file is renamed from `LICENSE` to `LICENSE.md` and `package.json` now declares `SEE LICENSE IN LICENSE.md` rather than the doubled-up `SEE LICENSE IN LICENSE`. `SEE LICENSE IN <filename>` is npm's own syntax for a license with no SPDX identifier, so the repetition was just the filename having no extension.
+
+Cosmetic only. The license text, its terms, and the licensor are unchanged.
+
 ## 0.74.0 -- local-only: the hosted control plane is retired (BREAKING)
 
 The hosted backend is gone. Every endpoint yaw-mcp called returns 404 -- `/api/connect/config`, `/heartbeat`, `/analytics`, `/servers`, `/api/compliance/ext`, `/api/try/event`, the dashboard, and `/signup`. Rather than keep code that cannot succeed, account mode is removed outright: your servers come from `~/.yaw-mcp/bundles.json` and your credentials from the local encrypted vault. Roughly 5,800 lines deleted.
