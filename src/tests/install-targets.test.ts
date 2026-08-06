@@ -388,6 +388,20 @@ describe("buildLaunchEntry", () => {
     }
   });
 
+  it("ignores oam when pkg pins a version, rather than emitting a name-only pin", () => {
+    // npx honours a pinned spec on every spawn; an oamEntry is a resolved path
+    // the caller looked up for its own package. Combining them would name one
+    // version and run whatever is on disk, so the pin wins and oam is skipped.
+    const e = buildLaunchEntry({
+      os: "linux",
+      pkg: "@yawlabs/mcp@0.73.0",
+      oamBin: "/usr/local/bin/oam",
+      oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
+    });
+    expect(e.command).toBe("npx");
+    expect(e.args).toEqual(["-y", "@yawlabs/mcp@0.73.0"]);
+  });
+
   it("keeps the npx entry when either half is missing", () => {
     // oam absent -> npx. This is the guarantee that the feature can only ever
     // be an upgrade: it never replaces a working launcher with a broken one.

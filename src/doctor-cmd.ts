@@ -30,7 +30,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -260,6 +260,14 @@ export interface ClientProbeResult {
   legacyEntryName: string | null;
   malformed: boolean;
   unavailable: boolean;
+  /** An absolute launch `command` in the entry that no longer exists on disk,
+   *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
+   *  PATH-resolved and cannot be verified cheaply. This catches the failure
+   *  mode an absolute entry introduces: `install` can write a path (an oam
+   *  binary, a global node_modules entry), and if that later moves or is
+   *  uninstalled the client cannot start the broker AT ALL, where the npx
+   *  entry would simply have kept working. */
+  launchCommandMissing: string | null;
 }
 
 export interface DoctorResult {
@@ -1027,6 +1035,9 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.hasMcpEntry && c.hasLegacyEntry) {
     return `OK — has "${ENTRY_NAME}" entry; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
   }
+  if (c.launchCommandMissing) {
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\``;
+  }
   if (c.hasMcpEntry) return `OK — has "${ENTRY_NAME}" entry`;
   if (c.hasLegacyEntry) {
     return `legacy "${c.legacyEntryName}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
@@ -1054,7 +1065,13 @@ interface ProbeSlot {
   read: { path: string; containerPath: string[] } | null;
 }
 
-const MALFORMED = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true } as const;
+const MALFORMED = {
+  hasMcpEntry: false,
+  hasLegacyEntry: false,
+  legacyEntryName: null,
+  malformed: true,
+  launchCommandMissing: null,
+} as const;
 
 /** Enumerate every (client, scope) combo for the current OS and resolve its
  *  config path. Shared by the sync and async probe variants so the client
@@ -1070,6 +1087,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           path: "(n/a)",
           exists: false,
           hasMcpEntry: false,
+          launchCommandMissing: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1106,6 +1124,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           path: resolved.absolute,
           exists,
           hasMcpEntry: false,
+          launchCommandMissing: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1149,28 +1168,68 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
 function classifyProbeContent(
   raw: string,
   containerPath: string[],
-): { hasMcpEntry: boolean; hasLegacyEntry: boolean; legacyEntryName: string | null; malformed: boolean } {
+  exists: (p: string) => boolean = existsSync,
+): {
+  hasMcpEntry: boolean;
+  hasLegacyEntry: boolean;
+  legacyEntryName: string | null;
+  malformed: boolean;
+  launchCommandMissing: string | null;
+} {
   if (raw.trim().length === 0) {
-    return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: false };
+    return {
+      hasMcpEntry: false,
+      hasLegacyEntry: false,
+      legacyEntryName: null,
+      malformed: false,
+      launchCommandMissing: null,
+    };
   }
   try {
     const parsed = parseJsonc(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
+      return {
+        hasMcpEntry: false,
+        hasLegacyEntry: false,
+        legacyEntryName: null,
+        malformed: true,
+        launchCommandMissing: null,
+      };
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
     if (!container) {
-      return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: false };
+      return {
+        hasMcpEntry: false,
+        hasLegacyEntry: false,
+        legacyEntryName: null,
+        malformed: false,
+        launchCommandMissing: null,
+      };
     }
     const legacyEntryName = findLegacyEntry(container);
+    const entry = container[ENTRY_NAME];
+    let launchCommandMissing: string | null = null;
+    if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+      const command = (entry as { command?: unknown }).command;
+      if (typeof command === "string" && isAbsolute(command) && !exists(command)) {
+        launchCommandMissing = command;
+      }
+    }
     return {
       hasMcpEntry: ENTRY_NAME in container,
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
+      launchCommandMissing,
     };
   } catch {
-    return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
+    return {
+      hasMcpEntry: false,
+      hasLegacyEntry: false,
+      legacyEntryName: null,
+      malformed: true,
+      launchCommandMissing: null,
+    };
   }
 }
 

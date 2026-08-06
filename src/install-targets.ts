@@ -311,6 +311,11 @@ export interface BuildLaunchEntryOptions {
    *  buildLaunchEntry so the wrapping logic stays in one place.
    *  Mutually exclusive with `pkg` (which tunes the default yaw-mcp
    *  entry; with `upstream` it is ignored). */
+  upstream?: {
+    command: string;
+    args: string[];
+    env?: Record<string, string>;
+  };
   /** Host the broker ITSELF on oam rather than node. Both must be set, and
    *  both are resolved by the caller: `oamBin` from the version-gated probe,
    *  `oamEntry` from resolveStableNpmEntry (durable installs only -- never
@@ -318,15 +323,14 @@ export interface BuildLaunchEntryOptions {
    *  null keeps the npx entry, so this can only ever be an upgrade on a
    *  machine that has oam; it never removes a working launcher.
    *
+   *  Ignored when `pkg` is set: `oamEntry` is resolved by the caller for a
+   *  specific package, so honouring a `pkg` override here would emit an entry
+   *  pinned in name only, pointing at whatever version happens to be on disk.
+   *
    *  Note this is a DIFFERENT axis from `runtime: "oam"` in bundles.json:
    *  that hosts the sidecars the broker spawns, this hosts the broker. */
   oamBin?: string | null;
   oamEntry?: string | null;
-  upstream?: {
-    command: string;
-    args: string[];
-    env?: Record<string, string>;
-  };
 }
 
 /** The MCP client `mcpServers["yaw-mcp"]` entry — what `install` writes. */
@@ -357,7 +361,13 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   // wrap on Windows: that exists because `npx` is a `.cmd` shim the client
   // cannot spawn directly, and oam is a real executable. `--no-check` keeps
   // the TypeScript checker off a long-lived stdio server.
-  if (opts.oamBin && opts.oamEntry) {
+  //
+  // `opts.pkg` disables this path. `pkg` exists to pin a spec ("@yawlabs/
+  // mcp@0.73.0"), and npx honours that on every spawn -- but oamEntry is a
+  // resolved path the caller looked up for its OWN package, so combining them
+  // would emit an entry that names one version and runs whatever is on disk.
+  // Silently ignoring a pin is worse than not taking the oam path.
+  if (opts.oamBin && opts.oamEntry && !opts.pkg) {
     return { command: opts.oamBin, args: ["run", "--no-check", opts.oamEntry] };
   }
   // No `env` on the default entry: yaw-mcp is local-only, so there is no

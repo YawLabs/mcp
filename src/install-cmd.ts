@@ -225,8 +225,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const oamProbeResult = await probeOam();
   const oamEntry = oamProbeResult.bin ? resolveStableNpmEntry("@yawlabs/mcp") : null;
   const newEntry = buildLaunchEntry({ os, oamBin: oamProbeResult.bin, oamEntry });
+  // "will run on", not "runs on": nothing has been written yet, and the write
+  // can still fail below. Reporting a runtime the user does not have would be
+  // worse than saying nothing.
   if (oamProbeResult.bin && oamEntry) {
-    log(`Runtime: oam ${oamProbeResult.version ?? ""}`.trimEnd());
+    log(`Runtime: will run on oam ${oamProbeResult.version ?? ""}`.trimEnd());
   } else if (oamProbeResult.bin) {
     // oam is present and usable, but yaw-mcp itself resolves only to the npx
     // cache -- a path a config file must not persist. Say so: "I installed oam
@@ -294,7 +297,23 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     log(`Overwriting existing "${ENTRY_NAME}" entry.`);
   }
 
-  const merged = mergeClientConfig(existing, containerPath, newEntry);
+  // Carry over an existing entry's `env`. The merge replaces our entry
+  // wholesale, and the default entry sets no env at all -- so re-running
+  // install silently dropped anything the user had put there. OAM_BIN is the
+  // live example: it pins which oam hosts the sidecars, and losing it moves
+  // them to a different runtime with no diagnostic. Only fills a gap; an
+  // entry that brings its own env (the upstream/try shape) is untouched.
+  const previousEntry = readEntryAt(existing, containerPath, ENTRY_NAME);
+  const previousEnv = previousEntry?.env;
+  const entryToWrite =
+    newEntry.env === undefined && previousEnv && Object.keys(previousEnv).length > 0
+      ? { ...newEntry, env: previousEnv }
+      : newEntry;
+  if (entryToWrite !== newEntry) {
+    log(`Kept existing env on the ${ENTRY_NAME} entry: ${Object.keys(previousEnv ?? {}).join(", ")}`);
+  }
+
+  const merged = mergeClientConfig(existing, containerPath, entryToWrite);
   const clientJson = `${JSON.stringify(merged, null, 2)}\n`;
 
   const home = opts.home ?? homedir();
@@ -506,6 +525,25 @@ export function readNested(root: Record<string, unknown>, containerPath: string[
  *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp entry);
  *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
  *  next to a real yaw-mcp install without colliding. */
+/** Read the existing launch entry at `containerPath`, or null when the path or
+ *  the entry is absent. Mirrors mergeClientConfig's walk so the two agree on
+ *  where the entry lives. */
+export function readEntryAt(
+  existing: Record<string, unknown>,
+  containerPath: string[],
+  entryName: string = ENTRY_NAME,
+): { command?: string; args?: string[]; env?: Record<string, string> } | null {
+  let node: unknown = existing;
+  for (const key of containerPath) {
+    if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
+    node = (node as Record<string, unknown>)[key];
+  }
+  if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
+  const entry = (node as Record<string, unknown>)[entryName];
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+  return entry as { command?: string; args?: string[]; env?: Record<string, string> };
+}
+
 export function mergeClientConfig(
   existing: Record<string, unknown>,
   containerPath: string[],

@@ -97,6 +97,39 @@ describe("runDoctor — output content", () => {
 });
 
 describe("runDoctor — client detection", () => {
+  // An entry whose command is an absolute path can rot: install may write one
+  // (an oam binary, a global node_modules entry), and if it is later moved or
+  // uninstalled the client cannot start yaw-mcp AT ALL -- where the npx entry
+  // would have kept working. Doctor has to name that, not report OK.
+  it("flags an absolute launch command that no longer exists", async () => {
+    const gone = join(synthHome, "definitely", "not", "here", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchCommandMissing).toBe(gone);
+    expect(cap.text()).toContain("launch command does not exist");
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+  });
+
+  it("does not flag a PATH-resolved command it cannot verify", async () => {
+    // "npx"/"cmd" are resolved via PATH at spawn time; treating an unfound
+    // bare name as broken would flag every healthy default install.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(
+      r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing,
+    ).toBeNull();
+    expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
+  });
+
   it("reports Claude Code as configured when a yaw-mcp entry exists in ~/.claude.json", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
