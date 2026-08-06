@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
+import { MIN_OAM_VERSION } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 
 let synthHome: string;
@@ -96,6 +97,70 @@ describe("runDoctor — output content", () => {
 });
 
 describe("runDoctor — client detection", () => {
+  // An entry whose command is an absolute path can rot: install may write one
+  // (an oam binary, a global node_modules entry), and if it is later moved or
+  // uninstalled the client cannot start yaw-mcp AT ALL -- where the npx entry
+  // would have kept working. Doctor has to name that, not report OK.
+  it("marks a client whose entry launches the broker on oam", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    // The question this answers is "did my install actually put yaw-mcp on
+    // oam?" -- unanswerable from the running process, since `yaw-mcp doctor`
+    // in a shell is on node regardless of what the entry says.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchRuntime).toBe(
+      "oam",
+    );
+    expect(cap.text()).toContain("runs on oam");
+  });
+
+  it("does not mark an npx entry as running on oam", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchRuntime).toBe(
+      "node",
+    );
+    expect(cap.text()).not.toContain("runs on oam");
+  });
+
+  it("flags an absolute launch command that no longer exists", async () => {
+    const gone = join(synthHome, "definitely", "not", "here", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchCommandMissing).toBe(gone);
+    expect(cap.text()).toContain("launch command does not exist");
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+  });
+
+  it("does not flag a PATH-resolved command it cannot verify", async () => {
+    // "npx"/"cmd" are resolved via PATH at spawn time; treating an unfound
+    // bare name as broken would flag every healthy default install.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(
+      r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing,
+    ).toBeNull();
+    expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
+  });
+
   it("reports Claude Code as configured when a yaw-mcp entry exists in ~/.claude.json", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
@@ -1131,7 +1196,7 @@ describe("runDoctor — OAM RUNTIME section", () => {
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOld });
     const txt = cap.text();
     expect(txt).toContain("v0.5.0");
-    expect(txt).toContain("below min 0.6.0");
+    expect(txt).toContain(`below min ${MIN_OAM_VERSION}`);
     expect(txt).toContain("servers run on node");
   });
 
@@ -1197,7 +1262,7 @@ describe("runDoctor — OAM RUNTIME section", () => {
       binary: null,
       version: "0.5.0",
       belowMin: true,
-      minVersion: "0.6.0",
+      minVersion: MIN_OAM_VERSION,
       defaultRuntime: null,
       defaultRuntimeSource: null,
     });

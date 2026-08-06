@@ -375,6 +375,60 @@ describe("buildLaunchEntry", () => {
     }
   });
 
+  // Hosting the BROKER on oam (distinct from bundles.json `runtime: "oam"`,
+  // which hosts the sidecars it spawns).
+  it("hosts the broker on oam when both the binary and a durable entry resolve", () => {
+    for (const os of ["windows", "macos", "linux"] as const) {
+      const e = buildLaunchEntry({ os, oamBin: "/usr/local/bin/oam", oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" });
+      expect(e.command).toBe("/usr/local/bin/oam");
+      // No cmd /c even on Windows: that wrap exists for npx's .cmd shim, and
+      // oam is a real executable the client can spawn directly.
+      expect(e.args).toEqual(["run", "--no-check", "/opt/nm/@yawlabs/mcp/dist/index.js"]);
+      expect(e.env).toBeUndefined();
+    }
+  });
+
+  it("prefers upstream over oam when both are supplied", () => {
+    // Precedence here is positional -- `upstream` returns before the oam
+    // branch is reached. `yaw-mcp try` always passes upstream, so a
+    // reordering would silently route trial entries through oam and point
+    // them at the BROKER's binary instead of the upstream's launcher.
+    const e = buildLaunchEntry({
+      os: "linux",
+      upstream: { command: "uvx", args: ["some-server"] },
+      oamBin: "/usr/local/bin/oam",
+      oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
+    });
+    expect(e.command).toBe("uvx");
+    expect(e.args).toEqual(["some-server"]);
+  });
+
+  it("ignores oam when pkg pins a version, rather than emitting a name-only pin", () => {
+    // npx honours a pinned spec on every spawn; an oamEntry is a resolved path
+    // the caller looked up for its own package. Combining them would name one
+    // version and run whatever is on disk, so the pin wins and oam is skipped.
+    const e = buildLaunchEntry({
+      os: "linux",
+      pkg: "@yawlabs/mcp@0.73.0",
+      oamBin: "/usr/local/bin/oam",
+      oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
+    });
+    expect(e.command).toBe("npx");
+    expect(e.args).toEqual(["-y", "@yawlabs/mcp@0.73.0"]);
+  });
+
+  it("keeps the npx entry when either half is missing", () => {
+    // oam absent -> npx. This is the guarantee that the feature can only ever
+    // be an upgrade: it never replaces a working launcher with a broken one.
+    const noBin = buildLaunchEntry({ os: "linux", oamBin: null, oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" });
+    expect(noBin.command).toBe("npx");
+    // oam present but yaw-mcp only in the npx cache -> npx, because a config
+    // file must not persist a path under ~/.npm/_npx that can be evicted.
+    const noEntry = buildLaunchEntry({ os: "linux", oamBin: "/usr/local/bin/oam", oamEntry: null });
+    expect(noEntry.command).toBe("npx");
+    expect(noEntry.args).toEqual(["-y", "@yawlabs/mcp@latest"]);
+  });
+
   // yaw-mcp is local-only: the default entry carries no env at all. There is
   // no longer a `token` option to embed YAW_MCP_TOKEN with.
   it("never sets env on the default entry", () => {

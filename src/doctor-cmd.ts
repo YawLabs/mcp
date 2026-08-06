@@ -30,7 +30,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -57,7 +57,7 @@ import {
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./local-bundles.js";
-import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
+import { isOamLaunch, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { isReadableStateVersion, loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
@@ -260,6 +260,21 @@ export interface ClientProbeResult {
   legacyEntryName: string | null;
   malformed: boolean;
   unavailable: boolean;
+  /** An absolute launch `command` in the entry that no longer exists on disk,
+   *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
+   *  PATH-resolved and cannot be verified cheaply. This catches the failure
+   *  mode an absolute entry introduces: `install` can write a path (an oam
+   *  binary, a global node_modules entry), and if that later moves or is
+   *  uninstalled the client cannot start the broker AT ALL, where the npx
+   *  entry would simply have kept working. */
+  launchCommandMissing: string | null;
+  /** What the WRITTEN entry will launch the broker on: "oam" when its command
+   *  is an oam binary, "node" for the npx/node/cmd shapes, null when there is
+   *  no entry. Derived from the config, not from this process -- `yaw-mcp
+   *  doctor` in a shell runs on node even when the configured entry uses oam,
+   *  so the running process cannot answer "did my install put the broker on
+   *  oam?". The config can. */
+  launchRuntime: "oam" | "node" | null;
 }
 
 export interface DoctorResult {
@@ -809,6 +824,17 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   } else {
     print(`  binary:  ${probe.bin} (v${probe.version ?? "unknown"}, min ${MIN_OAM_VERSION})`);
   }
+  // What THIS process runs on. Meaningful when doctor is called as a tool
+  // through the broker (same process), and explicitly labelled so it is not
+  // mistaken for what a client's configured entry will launch -- `yaw-mcp
+  // doctor` typed into a shell runs on node no matter what the entry says.
+  // The per-client "(runs on oam)" marker in CLIENTS answers that one.
+  // Guarded, not just cast: process.versions is another runtime's surface, and
+  // an unexpected shape would otherwise render "[object Object]" into the one
+  // line whose whole job is to be trustworthy.
+  const rawOamVersion = (process.versions as Record<string, unknown>).oam;
+  const runningOam = typeof rawOamVersion === "string" && rawOamVersion.length > 0 ? rawOamVersion : null;
+  print(`  this process: ${runningOam ? `oam ${runningOam}` : `node ${process.version}`}`);
   // Name the exact source: the connect path resolves project-local bundles
   // from the BROKER's cwd, doctor from the shell's cwd — printing the file
   // path makes a divergence between the two spottable.
@@ -1027,7 +1053,12 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.hasMcpEntry && c.hasLegacyEntry) {
     return `OK — has "${ENTRY_NAME}" entry; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
   }
-  if (c.hasMcpEntry) return `OK — has "${ENTRY_NAME}" entry`;
+  if (c.launchCommandMissing) {
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\``;
+  }
+  if (c.hasMcpEntry) {
+    return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
+  }
   if (c.hasLegacyEntry) {
     return `legacy "${c.legacyEntryName}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
   }
@@ -1054,7 +1085,14 @@ interface ProbeSlot {
   read: { path: string; containerPath: string[] } | null;
 }
 
-const MALFORMED = { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true } as const;
+const MALFORMED = {
+  hasMcpEntry: false,
+  hasLegacyEntry: false,
+  legacyEntryName: null,
+  malformed: true,
+  launchCommandMissing: null,
+  launchRuntime: null,
+} as const;
 
 /** Enumerate every (client, scope) combo for the current OS and resolve its
  *  config path. Shared by the sync and async probe variants so the client
@@ -1070,6 +1108,8 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           path: "(n/a)",
           exists: false,
           hasMcpEntry: false,
+          launchCommandMissing: null,
+          launchRuntime: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1106,6 +1146,8 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           path: resolved.absolute,
           exists,
           hasMcpEntry: false,
+          launchCommandMissing: null,
+          launchRuntime: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1149,28 +1191,77 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
 function classifyProbeContent(
   raw: string,
   containerPath: string[],
-): { hasMcpEntry: boolean; hasLegacyEntry: boolean; legacyEntryName: string | null; malformed: boolean } {
+  exists: (p: string) => boolean = existsSync,
+): {
+  hasMcpEntry: boolean;
+  hasLegacyEntry: boolean;
+  legacyEntryName: string | null;
+  malformed: boolean;
+  launchCommandMissing: string | null;
+  launchRuntime: "oam" | "node" | null;
+} {
   if (raw.trim().length === 0) {
-    return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: false };
+    return {
+      hasMcpEntry: false,
+      hasLegacyEntry: false,
+      legacyEntryName: null,
+      malformed: false,
+      launchCommandMissing: null,
+      launchRuntime: null,
+    };
   }
   try {
     const parsed = parseJsonc(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
+      return {
+        hasMcpEntry: false,
+        hasLegacyEntry: false,
+        legacyEntryName: null,
+        malformed: true,
+        launchCommandMissing: null,
+        launchRuntime: null,
+      };
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
     if (!container) {
-      return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: false };
+      return {
+        hasMcpEntry: false,
+        hasLegacyEntry: false,
+        legacyEntryName: null,
+        malformed: false,
+        launchCommandMissing: null,
+        launchRuntime: null,
+      };
     }
     const legacyEntryName = findLegacyEntry(container);
+    const entry = container[ENTRY_NAME];
+    let launchCommandMissing: string | null = null;
+    let launchRuntime: "oam" | "node" | null = null;
+    if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+      const command = (entry as { command?: unknown }).command;
+      if (typeof command === "string") {
+        if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
+        const entryArgs = (entry as { args?: unknown }).args;
+        launchRuntime = isOamLaunch(command, Array.isArray(entryArgs) ? (entryArgs as string[]) : []) ? "oam" : "node";
+      }
+    }
     return {
       hasMcpEntry: ENTRY_NAME in container,
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
+      launchCommandMissing,
+      launchRuntime,
     };
   } catch {
-    return { hasMcpEntry: false, hasLegacyEntry: false, legacyEntryName: null, malformed: true };
+    return {
+      hasMcpEntry: false,
+      hasLegacyEntry: false,
+      legacyEntryName: null,
+      malformed: true,
+      launchCommandMissing: null,
+      launchRuntime: null,
+    };
   }
 }
 

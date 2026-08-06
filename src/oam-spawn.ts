@@ -45,8 +45,21 @@ export function packageName(spec: string): string {
  * extra-fd stdio + npx-bin-resolution fixes MCP sidecars rely on; hosting on
  * them produces hangs that LOOK like server bugs. Below-min is treated the
  * same as oam-absent: the spawn falls back to node/npx (one warn log).
+ *
+ * Raised 0.6.0 -> 0.8.1: everything below 0.8.1 carries three defects in the
+ * request-body and socket paths this workload sits directly on top of. The
+ * worst is that an unlistened error on a request stream was fatal, so a client
+ * hanging up mid-upload killed the process -- for a broker, that is every
+ * hosted server dying at once. Alongside it the aggregate body budget was
+ * charged on no platform, and socket writes never signalled backpressure, so a
+ * slow consumer buffered without bound. A version gate exists precisely so a
+ * runtime that fails this way is not silently hosted.
  */
-export const MIN_OAM_VERSION = "0.6.0";
+export const MIN_OAM_VERSION = "0.8.1";
+
+/** One "oam is missing" warning per process, not one per opted-in server.
+ *  Cleared by resetOamBinCache so tests do not leak it across cases. */
+let warnedOamMissing = false;
 
 /** Result of probing the oam binary (`oam --version`). */
 export interface OamProbe {
@@ -366,6 +379,7 @@ export async function oamBin(): Promise<string | null> {
 /** Reset the cached oam-binary probe (test hook). Bumps the generation so a
  *  probe still in flight cannot publish its result afterwards. */
 export function resetOamBinCache(): void {
+  warnedOamMissing = false;
   oamProbeCache = undefined;
   oamProbeInFlight = undefined;
   oamProbeGeneration++;
@@ -541,13 +555,117 @@ export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url):
 }
 
 /**
+ * Resolve a package entry ONLY from a durable install -- a real global or
+ * project `node_modules`, never the npx cache.
+ *
+ * Writing a launch entry into a client's config is a different problem from
+ * spawning a sidecar right now, so it needs a different resolver:
+ *
+ *   * An npx-cache path is fine to spawn (it exists this instant) but wrong to
+ *     PERSIST. `~/.npm/_npx/<hash>` is a cache; `npm cache clean` or an
+ *     eviction turns the client's MCP entry into a path that isn't there, and
+ *     a broker that fails to launch at all is strictly worse than one running
+ *     on node.
+ *   * A durable path also keeps updates working. `npm update -g` rewrites the
+ *     global install IN PLACE, so a pinned path still picks up new versions.
+ *     That matters because the npx entry it replaces carries `@latest`, which
+ *     re-resolves on every spawn -- pointing at a cache path keyed by content
+ *     hash would silently freeze the broker at one version forever.
+ *
+ * Returning null means "stay on npx", and it is the common answer: when
+ * yaw-mcp is itself launched via `npx -y`, its own module lives in the cache,
+ * so there is nothing durable to point at.
+ */
+export function resolveStableNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
+  const npxMarker = `${sep}_npx${sep}`;
+  for (const nodeModules of ownNodeModules(fromUrl)) {
+    if (nodeModules.includes(npxMarker)) continue;
+    const entry = packageEntry(join(nodeModules, ...pkg.split("/")), pkg);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+/**
  * Resolve a server's launch to run on oam when it has opted in
  * (`config.runtime === "oam"`). A no-op for non-Node commands and a safe Node
  * fallback when oam isn't installed or the package can't be resolved on disk.
  */
 export async function resolveOamSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
+  const probe = await probeOam();
+  // Reaching here means a server ASKED for oam. Absence is silent inside the
+  // probe on purpose -- warning there would fire on every node-only install,
+  // which is noise -- but at this point the user opted in and is getting node
+  // anyway, which from the outside is indistinguishable from oam working.
+  // belowMin already warns in the probe with its own actionable numbers, so
+  // this covers only genuine absence, and only once per process.
+  if (probe.bin === null && !probe.belowMin && !warnedOamMissing) {
+    warnedOamMissing = true;
+    log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {
+      install: "curl -fsSL https://oamjs.org/install.sh | sh",
+      installWindows: "irm https://oamjs.org/install.ps1 | iex",
+      overrideWith: "OAM_BIN",
+    });
+  }
   return rewriteForOam(command, args, {
-    oamBin: await oamBin(),
+    oamBin: probe.bin,
     resolveEntry: (pkg) => resolveNpmEntry(pkg),
   });
+}
+
+/** True when a launch command names an oam binary -- bare "oam"/"oam.exe" or
+ *  any path ending in one. Splits on BOTH separators: Windows is the platform
+ *  that writes a backslash path here (`C:\...\oam.exe`), so a "/"-only split
+ *  would fail to recognise oam on the very platform the entry came from.
+ *  Not a PATH lookup -- this classifies what the config ASKS for, and a bare
+ *  name resolves at spawn time. */
+export function isOamCommand(command: string): boolean {
+  const base = command.split(/[\\/]/).pop() ?? command;
+  return /^oam(\.exe)?$/i.test(base);
+}
+
+/**
+ * Whether a launch entry runs the broker on oam, including through a shell
+ * wrapper.
+ *
+ * `install` never writes the wrapped shape -- the `cmd /c` wrap exists for
+ * npx's `.cmd` shim and oam is a real executable -- but a hand-edited config
+ * reasonably might, and reporting "node" for an entry that plainly launches
+ * oam is worse than not reporting at all.
+ */
+export function isOamLaunch(command: string, args: readonly string[] = []): boolean {
+  if (isOamCommand(command)) return true;
+  const base = command.split(/[\\/]/).pop() ?? command;
+
+  // cmd and POSIX shells package their payload DIFFERENTLY, and treating them
+  // alike is why the first version of this recognised neither real shape.
+  if (/^cmd(\.exe)?$/i.test(base)) {
+    // cmd takes the command as separate argv entries. Skip its own switches:
+    // `/d /s /c` is the everyday shape (npm emits it), not just `/c`. The
+    // pattern is deliberately "slash + ONE letter" so a POSIX path argument
+    // like /usr/local/bin/oam is never mistaken for a switch.
+    const first = args.find((a) => !/^\/[a-z]$/i.test(a));
+    return first !== undefined && isOamCommand(first);
+  }
+
+  if (/^(sh|bash|zsh|dash)$/i.test(base)) {
+    // A POSIX shell takes the WHOLE command as one string after -c
+    // ("oam run /path/index.js"), so the payload has to be tokenised. Reading
+    // it as a bare command name is what made this return false for every
+    // realistic `sh -c` entry.
+    const dashC = args.indexOf("-c");
+    const payload = dashC >= 0 ? args[dashC + 1] : args[0];
+    if (payload === undefined) return false;
+    // Strip quotes that do not hide a space. Tokenising on whitespace cannot
+    // recover a quoted path that CONTAINS one, and a display marker does not
+    // justify a shell parser -- such an entry reports "node". Under-reporting
+    // is the safe direction: it never claims oam for something that is not.
+    const firstToken = payload
+      .trim()
+      .split(/\s+/)[0]
+      ?.replace(/^["']|["']$/g, "");
+    return firstToken !== undefined && firstToken.length > 0 && isOamCommand(firstToken);
+  }
+
+  return false;
 }

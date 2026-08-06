@@ -2,9 +2,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createProbeCollector,
+  isOamCommand,
+  isOamLaunch,
   MIN_OAM_VERSION,
   npxCacheNodeModules,
   OAM_PROBE_TIMEOUT_MS,
@@ -13,6 +15,8 @@ import {
   probeOam,
   resetOamBinCache,
   resolveNpmEntry,
+  resolveOamSpawn,
+  resolveStableNpmEntry,
   rewriteForOam,
   winNormalize,
 } from "../oam-spawn.js";
@@ -70,6 +74,23 @@ describe("probeOam min-version gate", () => {
     expect(probe.bin).not.toBeNull();
     expect(probe.version).toBe(MIN_OAM_VERSION);
     expect(probe.belowMin).toBe(false);
+  });
+
+  it("rejects the version one patch below the floor", async () => {
+    // MIN_OAM_VERSION now ends in a non-zero patch (0.8.1), so patch-level
+    // comparison decides the boundary for the first time -- a comparator that
+    // only weighed major.minor would pass every other test here while hosting
+    // on a runtime with the fatal request-stream bug the floor exists to
+    // exclude. Derived from the constant so it tracks future bumps.
+    const [maj, min, patch] = MIN_OAM_VERSION.split(".").map(Number);
+    if (patch === 0) return; // boundary below is a different minor; nothing to assert
+    const justBelow = `${maj}.${min}.${patch - 1}`;
+    const probe = await probeOam(
+      async () => `oam ${justBelow}
+`,
+    );
+    expect(probe.belowMin).toBe(true);
+    expect(probe.bin).toBeNull();
   });
 
   it("treats a below-min install as oam-absent (bin null, belowMin set)", async () => {
@@ -188,6 +209,64 @@ describe("npxCacheNodeModules", () => {
 
   it("returns [] for a non-file URL", async () => {
     expect(npxCacheNodeModules("not-a-url")).toEqual([]);
+  });
+});
+
+describe("resolveStableNpmEntry", () => {
+  // The whole point: what may be SPAWNED now is not what may be PERSISTED into
+  // a client's config. An npx-cache path exists this instant and is gone after
+  // `npm cache clean`, which would leave the client pointing at nothing.
+  it("refuses an npx-cache install even though resolveNpmEntry accepts it", () => {
+    const root = mkdtempSync(join(tmpdir(), "stable-"));
+    const dir = join(root, "_npx", "aaa", "node_modules", "@yawlabs", "mcp");
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/mcp", bin: { "yaw-mcp": "./dist/index.js" } }),
+    );
+    writeFileSync(join(dir, "dist", "index.js"), "");
+    const fromUrl = pathToFileURL(join(dir, "dist", "index.js")).href;
+    try {
+      // Same package, same path, opposite answers -- that IS the distinction.
+      expect(resolveNpmEntry("@yawlabs/mcp", fromUrl)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null when the package is absent entirely", () => {
+    // Distinct condition from present-but-in-the-npx-cache. Both currently
+    // mean "stay on npx", so conflating them is invisible today -- and would
+    // stop being invisible the moment either grows its own message.
+    const root = mkdtempSync(join(tmpdir(), "stable-"));
+    const dir = join(root, "lib", "node_modules", "@yawlabs", "other-pkg");
+    mkdirSync(dir, { recursive: true });
+    const fromUrl = pathToFileURL(join(dir, "index.js")).href;
+    try {
+      expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a durable global/project node_modules", () => {
+    const root = mkdtempSync(join(tmpdir(), "stable-"));
+    const dir = join(root, "lib", "node_modules", "@yawlabs", "mcp");
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/mcp", bin: { "yaw-mcp": "./dist/index.js" } }),
+    );
+    writeFileSync(join(dir, "dist", "index.js"), "");
+    const fromUrl = pathToFileURL(join(dir, "dist", "index.js")).href;
+    try {
+      // `npm update -g` rewrites this path in place, so pinning it still picks
+      // up new versions -- which is what makes replacing `@latest` acceptable.
+      expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -511,5 +590,119 @@ describe("probeOam hardening", () => {
     expect(freshCalls, "stale probe's cleanup released the live probe's slot").toHaveLength(1);
     expect(a).toEqual(b);
     expect(a.version).toBe("1.2.3");
+  });
+});
+
+describe("resolveOamSpawn — missing-oam warning", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => {
+    resetOamBinCache();
+    vi.restoreAllMocks();
+  });
+
+  /** Prime the probe cache as "oam absent" so this does not depend on whether
+   *  the machine running the tests has oam. */
+  async function primeAbsent(): Promise<void> {
+    await probeOam(async () => {
+      const e: NodeJS.ErrnoException = new Error("spawn oam ENOENT");
+      e.code = "ENOENT";
+      throw e;
+    });
+  }
+
+  it("warns once per process, not once per opted-in server", async () => {
+    await primeAbsent();
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    // A broker hosting a dozen opted-in servers must not print this a dozen
+    // times on every boot.
+    await resolveOamSpawn("node", ["a.js"]);
+    await resolveOamSpawn("node", ["b.js"]);
+    await resolveOamSpawn("node", ["c.js"]);
+    const warnings = lines.filter((l) => l.includes("opted in to oam but oam is not installed"));
+    expect(warnings).toHaveLength(1);
+    // and it carries the install command -- the whole point of warning
+    expect(warnings[0]).toContain("oamjs.org/install.sh");
+  });
+
+  it("stays silent when oam is present", async () => {
+    await probeOam(async () => "oam 99.0.0");
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await resolveOamSpawn("node", ["a.js"]);
+    expect(lines.filter((l) => l.includes("oam is not installed"))).toHaveLength(0);
+  });
+
+  it("stays silent for a below-min install, which warns in the probe instead", async () => {
+    // Two warnings for one condition would be noise; belowMin already reports
+    // both versions, which is strictly more actionable.
+    await probeOam(async () => "oam 0.0.1");
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await resolveOamSpawn("node", ["a.js"]);
+    expect(lines.filter((l) => l.includes("opted in to oam but oam is not installed"))).toHaveLength(0);
+  });
+});
+
+describe("isOamCommand / isOamLaunch", () => {
+  it("recognises an oam command with either path separator", () => {
+    expect(isOamCommand("oam")).toBe(true);
+    expect(isOamCommand("oam.exe")).toBe(true);
+    expect(isOamCommand("/usr/local/bin/oam")).toBe(true);
+    // Windows writes this shape, and a "/"-only split silently missed it.
+    expect(isOamCommand(String.raw`C:\Users\jeff\oam.exe`)).toBe(true);
+    expect(isOamCommand("npx")).toBe(false);
+    expect(isOamCommand("cmd")).toBe(false);
+    expect(isOamCommand("/usr/bin/node")).toBe(false);
+    // Not a substring match: a different binary that merely contains "oam".
+    expect(isOamCommand("/usr/bin/foam")).toBe(false);
+  });
+
+  // These assert the shapes a CONFIG FILE actually contains. An earlier
+  // version asserted `sh -c` with a single-token payload and `cmd` with a bare
+  // `/c` -- neither occurs in practice, so the suite went green while every
+  // realistic wrapped entry returned false.
+  it("sees through a cmd wrapper, including its everyday switch set", () => {
+    expect(isOamLaunch("cmd", ["/c", "oam", "run", "x.js"])).toBe(true);
+    expect(isOamLaunch("cmd.exe", ["/C", String.raw`C:\bin\oam.exe`, "run"])).toBe(true);
+    // `/d /s /c` is what npm and most wrappers emit -- the common case, and
+    // the one the first version missed by matching only an exact "/c".
+    expect(isOamLaunch("cmd", ["/d", "/s", "/c", "oam", "run", "x.js"])).toBe(true);
+    expect(isOamLaunch("cmd", ["/d", "/s", "/c", "npx", "-y", "@yawlabs/mcp@latest"])).toBe(false);
+  });
+
+  it("sees through a POSIX shell wrapper, whose payload is ONE string", () => {
+    // `sh -c` does not receive separate argv entries -- this is the shape that
+    // silently failed before.
+    expect(isOamLaunch("sh", ["-c", "oam run /path/index.js"])).toBe(true);
+    expect(isOamLaunch("bash", ["-c", "/usr/local/bin/oam run x.js"])).toBe(true);
+    expect(isOamLaunch("sh", ["-c", "npx -y @yawlabs/mcp@latest"])).toBe(false);
+    // Quoting is tolerated only when it does not hide a space: tokenising on
+    // whitespace cannot recover `'/opt/my oam/oam'`, and a display marker is
+    // not worth a shell parser. Under-reporting (says node) is the safe way
+    // to be wrong here -- it never claims oam for something that is not.
+    expect(isOamLaunch("sh", ["-c", `"oam" run x.js`])).toBe(true);
+    expect(isOamLaunch("sh", ["-c", `'/opt/my oam/oam' run x.js`])).toBe(false);
+    expect(isOamLaunch("sh", ["-c", "   "])).toBe(false);
+    expect(isOamLaunch("sh", ["-c"])).toBe(false);
+  });
+
+  it("judges a non-shell command on itself, never on its arguments", () => {
+    // Otherwise `node --require oam ...` would read as oam-hosted.
+    expect(isOamLaunch("node", ["oam"])).toBe(false);
+    expect(isOamLaunch("npx", ["oam"])).toBe(false);
+    expect(isOamLaunch("oam", [])).toBe(true);
+    expect(isOamLaunch("npx", [])).toBe(false);
+    // A POSIX path argument must never be read as a cmd switch.
+    expect(isOamLaunch("cmd", ["/c", "/usr/local/bin/oam"])).toBe(true);
   });
 });
