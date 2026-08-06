@@ -68,7 +68,7 @@ Open an issue on GitHub. Include:
 
 ## License and Contributor Sign-Off
 
-This project is source-available under the [Yaw MCP Source-Available License](LICENSE), not an open-source license. Read it before you contribute — in particular, it does not grant the right to offer this software to third parties as a competing product.
+This project is source-available under the [Yaw MCP Source-Available License](LICENSE.md), not an open-source license. Read it before you contribute — in particular, it does not grant the right to offer this software to third parties as a competing product.
 
 Contributions are accepted under the [Developer Certificate of Origin](https://developercertificate.org/) (DCO) 1.1. It is a short statement that you wrote the patch, or otherwise have the right to submit it under this project's license. There is no CLA to sign and no copyright assignment.
 
@@ -85,4 +85,4 @@ git config user.name "Jane Developer"
 git config user.email "jane@example.com"
 ```
 
-By signing off, you agree that Yaw Labs may distribute your contribution as part of this project under the terms of the LICENSE file, including in future versions released under different terms.
+By signing off, you agree that Yaw Labs may distribute your contribution as part of this project under the terms of the LICENSE.md file, including in future versions released under different terms.
