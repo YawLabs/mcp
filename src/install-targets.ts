@@ -311,6 +311,17 @@ export interface BuildLaunchEntryOptions {
    *  buildLaunchEntry so the wrapping logic stays in one place.
    *  Mutually exclusive with `pkg` (which tunes the default yaw-mcp
    *  entry; with `upstream` it is ignored). */
+  /** Host the broker ITSELF on oam rather than node. Both must be set, and
+   *  both are resolved by the caller: `oamBin` from the version-gated probe,
+   *  `oamEntry` from resolveStableNpmEntry (durable installs only -- never
+   *  the npx cache, which a config file must not point at). Either being
+   *  null keeps the npx entry, so this can only ever be an upgrade on a
+   *  machine that has oam; it never removes a working launcher.
+   *
+   *  Note this is a DIFFERENT axis from `runtime: "oam"` in bundles.json:
+   *  that hosts the sidecars the broker spawns, this hosts the broker. */
+  oamBin?: string | null;
+  oamEntry?: string | null;
   upstream?: {
     command: string;
     args: string[];
@@ -342,6 +353,13 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
     return entry;
   }
   const pkg = opts.pkg ?? "@yawlabs/mcp@latest";
+  // Host the broker on oam when the caller resolved both halves. No `cmd /c`
+  // wrap on Windows: that exists because `npx` is a `.cmd` shim the client
+  // cannot spawn directly, and oam is a real executable. `--no-check` keeps
+  // the TypeScript checker off a long-lived stdio server.
+  if (opts.oamBin && opts.oamEntry) {
+    return { command: opts.oamBin, args: ["run", "--no-check", opts.oamEntry] };
+  }
   // No `env` on the default entry: yaw-mcp is local-only, so there is no
   // token to inject. Servers come from ~/.yaw-mcp/bundles.json.
   return opts.os === "windows"

@@ -13,6 +13,7 @@ import {
   probeOam,
   resetOamBinCache,
   resolveNpmEntry,
+  resolveStableNpmEntry,
   rewriteForOam,
   winNormalize,
 } from "../oam-spawn.js";
@@ -188,6 +189,49 @@ describe("npxCacheNodeModules", () => {
 
   it("returns [] for a non-file URL", async () => {
     expect(npxCacheNodeModules("not-a-url")).toEqual([]);
+  });
+});
+
+describe("resolveStableNpmEntry", () => {
+  // The whole point: what may be SPAWNED now is not what may be PERSISTED into
+  // a client's config. An npx-cache path exists this instant and is gone after
+  // `npm cache clean`, which would leave the client pointing at nothing.
+  it("refuses an npx-cache install even though resolveNpmEntry accepts it", () => {
+    const root = mkdtempSync(join(tmpdir(), "stable-"));
+    const dir = join(root, "_npx", "aaa", "node_modules", "@yawlabs", "mcp");
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/mcp", bin: { "yaw-mcp": "./dist/index.js" } }),
+    );
+    writeFileSync(join(dir, "dist", "index.js"), "");
+    const fromUrl = pathToFileURL(join(dir, "dist", "index.js")).href;
+    try {
+      // Same package, same path, opposite answers -- that IS the distinction.
+      expect(resolveNpmEntry("@yawlabs/mcp", fromUrl)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a durable global/project node_modules", () => {
+    const root = mkdtempSync(join(tmpdir(), "stable-"));
+    const dir = join(root, "lib", "node_modules", "@yawlabs", "mcp");
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/mcp", bin: { "yaw-mcp": "./dist/index.js" } }),
+    );
+    writeFileSync(join(dir, "dist", "index.js"), "");
+    const fromUrl = pathToFileURL(join(dir, "dist", "index.js")).href;
+    try {
+      // `npm update -g` rewrites this path in place, so pinning it still picks
+      // up new versions -- which is what makes replacing `@latest` acceptable.
+      expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -44,6 +44,7 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
+import { probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -217,7 +218,21 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   log(`File:   ${resolved.absolute}`);
 
   // Read + merge existing client config.
-  const newEntry = buildLaunchEntry({ os });
+  //
+  // Host the broker itself on oam when this machine can do it durably: a
+  // version-gated oam AND a non-npx-cache install to point at. Either missing
+  // keeps the npx entry unchanged -- the normal case, not an error.
+  const oamProbeResult = await probeOam();
+  const oamEntry = oamProbeResult.bin ? resolveStableNpmEntry("@yawlabs/mcp") : null;
+  const newEntry = buildLaunchEntry({ os, oamBin: oamProbeResult.bin, oamEntry });
+  if (oamProbeResult.bin && oamEntry) {
+    log(`Runtime: oam ${oamProbeResult.version ?? ""}`.trimEnd());
+  } else if (oamProbeResult.bin) {
+    // oam is present and usable, but yaw-mcp itself resolves only to the npx
+    // cache -- a path a config file must not persist. Say so: "I installed oam
+    // and it still runs on node" is otherwise unexplainable from the outside.
+    log("Runtime: node (oam found, but yaw-mcp is not durably installed -- `npm i -g @yawlabs/mcp` to host it on oam)");
+  }
   const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
   let existingHasEntry = false;

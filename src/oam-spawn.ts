@@ -555,6 +555,38 @@ export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url):
 }
 
 /**
+ * Resolve a package entry ONLY from a durable install -- a real global or
+ * project `node_modules`, never the npx cache.
+ *
+ * Writing a launch entry into a client's config is a different problem from
+ * spawning a sidecar right now, so it needs a different resolver:
+ *
+ *   * An npx-cache path is fine to spawn (it exists this instant) but wrong to
+ *     PERSIST. `~/.npm/_npx/<hash>` is a cache; `npm cache clean` or an
+ *     eviction turns the client's MCP entry into a path that isn't there, and
+ *     a broker that fails to launch at all is strictly worse than one running
+ *     on node.
+ *   * A durable path also keeps updates working. `npm update -g` rewrites the
+ *     global install IN PLACE, so a pinned path still picks up new versions.
+ *     That matters because the npx entry it replaces carries `@latest`, which
+ *     re-resolves on every spawn -- pointing at a cache path keyed by content
+ *     hash would silently freeze the broker at one version forever.
+ *
+ * Returning null means "stay on npx", and it is the common answer: when
+ * yaw-mcp is itself launched via `npx -y`, its own module lives in the cache,
+ * so there is nothing durable to point at.
+ */
+export function resolveStableNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
+  const npxMarker = `${sep}_npx${sep}`;
+  for (const nodeModules of ownNodeModules(fromUrl)) {
+    if (nodeModules.includes(npxMarker)) continue;
+    const entry = packageEntry(join(nodeModules, ...pkg.split("/")), pkg);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+/**
  * Resolve a server's launch to run on oam when it has opted in
  * (`config.runtime === "oam"`). A no-op for non-Node commands and a safe Node
  * fallback when oam isn't installed or the package can't be resolved on disk.
