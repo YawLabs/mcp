@@ -9,7 +9,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
+import { formatRelativeAge, isOamCommand, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
@@ -101,6 +101,50 @@ describe("runDoctor — client detection", () => {
   // (an oam binary, a global node_modules entry), and if it is later moved or
   // uninstalled the client cannot start yaw-mcp AT ALL -- where the npx entry
   // would have kept working. Doctor has to name that, not report OK.
+  it("marks a client whose entry launches the broker on oam", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    // The question this answers is "did my install actually put yaw-mcp on
+    // oam?" -- unanswerable from the running process, since `yaw-mcp doctor`
+    // in a shell is on node regardless of what the entry says.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchRuntime).toBe(
+      "oam",
+    );
+    expect(cap.text()).toContain("runs on oam");
+  });
+
+  it("recognises an oam command with either path separator", () => {
+    expect(isOamCommand("oam")).toBe(true);
+    expect(isOamCommand("oam.exe")).toBe(true);
+    expect(isOamCommand("/usr/local/bin/oam")).toBe(true);
+    // Windows writes this shape, and a "/"-only split silently missed it.
+    expect(isOamCommand(String.raw`C:\Users\jeff\oam.exe`)).toBe(true);
+    expect(isOamCommand("npx")).toBe(false);
+    expect(isOamCommand("cmd")).toBe(false);
+    expect(isOamCommand("/usr/bin/node")).toBe(false);
+    // Not a substring match: a different binary that merely contains "oam".
+    expect(isOamCommand("/usr/bin/foam")).toBe(false);
+  });
+
+  it("does not mark an npx entry as running on oam", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchRuntime).toBe(
+      "node",
+    );
+    expect(cap.text()).not.toContain("runs on oam");
+  });
+
   it("flags an absolute launch command that no longer exists", async () => {
     const gone = join(synthHome, "definitely", "not", "here", "oam");
     writeFileSync(

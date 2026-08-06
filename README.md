@@ -88,6 +88,29 @@ The JSON shape (top-level `mcpServers`, except VS Code uses `servers` in `.vscod
 
 On **Windows**, use `"command": "cmd", "args": ["/c", "npx", "-y", "@yawlabs/mcp@latest"]`.
 
+### Running yaw-mcp on oam
+
+yaw-mcp can host itself on [oam](https://oamjs.org), a Rust+V8 JavaScript runtime built for this shape of workload — short-lived, mostly-idle MCP processes.
+
+`yaw-mcp install` writes the oam entry for you when two things are true:
+
+- **oam is installed**, at least v0.8.1 — `curl -fsSL https://oamjs.org/install.sh | sh`, or `irm https://oamjs.org/install.ps1 | iex` on Windows. Older builds are refused rather than silently used: they predate fixes this workload sits on, including one where a client disconnecting mid-upload killed the process.
+- **yaw-mcp is durably installed** — `npm i -g @yawlabs/mcp`, or a project `node_modules`. A path in the npx cache is deliberately not used: that directory is evictable, and an entry pointing into it breaks the moment npm cleans it.
+
+Neither is required, and nothing breaks without them — the npx entry is written as before, and install tells you which one you got. Afterwards `yaw-mcp doctor` marks a client whose entry launches the broker on oam with `(runs on oam)`, and its OAM RUNTIME section reports the binary, version, and minimum.
+
+The entry it writes:
+
+```json
+{
+  "mcpServers": {
+    "mcp": { "command": "/path/to/oam", "args": ["run", "--no-check", "/path/to/@yawlabs/mcp/dist/index.js"] }
+  }
+}
+```
+
+Two consequences worth knowing. It pins a path, so it does not re-resolve `@latest` on every spawn the way the npx entry does — `npm update -g` still picks up new versions, because it rewrites that path in place. And this is a **different setting** from `runtime: "oam"` in `bundles.json`, which hosts the *sidecars* yaw-mcp spawns; the two are independent.
+
 ## CLI
 
 `yaw-mcp` with no subcommand runs as the MCP server, serving the servers in your `~/.yaw-mcp/bundles.json`. Most read-only subcommands accept `--json`. Run `yaw-mcp <cmd> --help` for per-command flags.

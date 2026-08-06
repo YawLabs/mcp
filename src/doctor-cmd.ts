@@ -268,6 +268,24 @@ export interface ClientProbeResult {
    *  uninstalled the client cannot start the broker AT ALL, where the npx
    *  entry would simply have kept working. */
   launchCommandMissing: string | null;
+  /** What the WRITTEN entry will launch the broker on: "oam" when its command
+   *  is an oam binary, "node" for the npx/node/cmd shapes, null when there is
+   *  no entry. Derived from the config, not from this process -- `yaw-mcp
+   *  doctor` in a shell runs on node even when the configured entry uses oam,
+   *  so the running process cannot answer "did my install put the broker on
+   *  oam?". The config can. */
+  launchRuntime: "oam" | "node" | null;
+}
+
+/** True when a launch command names an oam binary -- bare "oam"/"oam.exe" or
+ *  any path ending in one. Not a PATH lookup: this classifies what the config
+ *  ASKS for, which is the question, and a bare name resolves at spawn time. */
+export function isOamCommand(command: string): boolean {
+  // BOTH separators. Windows is the platform that writes a backslash path
+  // here (`C:\...\oam.exe`), so splitting on "/" alone would fail to
+  // recognise oam on the very platform the entry came from.
+  const base = command.split(/[\\/]/).pop() ?? command;
+  return /^oam(\.exe)?$/i.test(base);
 }
 
 export interface DoctorResult {
@@ -817,6 +835,12 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   } else {
     print(`  binary:  ${probe.bin} (v${probe.version ?? "unknown"}, min ${MIN_OAM_VERSION})`);
   }
+  // What THIS process runs on. Meaningful when doctor is called as a tool
+  // through the broker (same process), and explicitly labelled so it is not
+  // mistaken for what a client's configured entry will launch -- `yaw-mcp
+  // doctor` typed into a shell runs on node no matter what the entry says.
+  // The per-client "(runs on oam)" marker in CLIENTS answers that one.
+  print(`  this process: ${isOamCommand(process.execPath) ? "oam" : `node ${process.version}`}`);
   // Name the exact source: the connect path resolves project-local bundles
   // from the BROKER's cwd, doctor from the shell's cwd — printing the file
   // path makes a divergence between the two spottable.
@@ -1038,7 +1062,9 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.launchCommandMissing) {
     return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\``;
   }
-  if (c.hasMcpEntry) return `OK — has "${ENTRY_NAME}" entry`;
+  if (c.hasMcpEntry) {
+    return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
+  }
   if (c.hasLegacyEntry) {
     return `legacy "${c.legacyEntryName}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
   }
@@ -1071,6 +1097,7 @@ const MALFORMED = {
   legacyEntryName: null,
   malformed: true,
   launchCommandMissing: null,
+  launchRuntime: null,
 } as const;
 
 /** Enumerate every (client, scope) combo for the current OS and resolve its
@@ -1088,6 +1115,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           exists: false,
           hasMcpEntry: false,
           launchCommandMissing: null,
+          launchRuntime: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1125,6 +1153,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           exists,
           hasMcpEntry: false,
           launchCommandMissing: null,
+          launchRuntime: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1175,6 +1204,7 @@ function classifyProbeContent(
   legacyEntryName: string | null;
   malformed: boolean;
   launchCommandMissing: string | null;
+  launchRuntime: "oam" | "node" | null;
 } {
   if (raw.trim().length === 0) {
     return {
@@ -1183,6 +1213,7 @@ function classifyProbeContent(
       legacyEntryName: null,
       malformed: false,
       launchCommandMissing: null,
+      launchRuntime: null,
     };
   }
   try {
@@ -1194,6 +1225,7 @@ function classifyProbeContent(
         legacyEntryName: null,
         malformed: true,
         launchCommandMissing: null,
+        launchRuntime: null,
       };
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
@@ -1204,15 +1236,18 @@ function classifyProbeContent(
         legacyEntryName: null,
         malformed: false,
         launchCommandMissing: null,
+        launchRuntime: null,
       };
     }
     const legacyEntryName = findLegacyEntry(container);
     const entry = container[ENTRY_NAME];
     let launchCommandMissing: string | null = null;
+    let launchRuntime: "oam" | "node" | null = null;
     if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
       const command = (entry as { command?: unknown }).command;
-      if (typeof command === "string" && isAbsolute(command) && !exists(command)) {
-        launchCommandMissing = command;
+      if (typeof command === "string") {
+        if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
+        launchRuntime = isOamCommand(command) ? "oam" : "node";
       }
     }
     return {
@@ -1221,6 +1256,7 @@ function classifyProbeContent(
       legacyEntryName,
       malformed: false,
       launchCommandMissing,
+      launchRuntime,
     };
   } catch {
     return {
@@ -1229,6 +1265,7 @@ function classifyProbeContent(
       legacyEntryName: null,
       malformed: true,
       launchCommandMissing: null,
+      launchRuntime: null,
     };
   }
 }
