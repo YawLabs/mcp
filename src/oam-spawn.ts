@@ -636,8 +636,36 @@ export function isOamCommand(command: string): boolean {
 export function isOamLaunch(command: string, args: readonly string[] = []): boolean {
   if (isOamCommand(command)) return true;
   const base = command.split(/[\\/]/).pop() ?? command;
-  if (!/^(cmd|cmd\.exe|sh|bash)$/i.test(base)) return false;
-  // Skip the shell's own switch; the next positional is the real command.
-  const first = args.find((a) => !/^(\/c|-c)$/i.test(a));
-  return first !== undefined && isOamCommand(first);
+
+  // cmd and POSIX shells package their payload DIFFERENTLY, and treating them
+  // alike is why the first version of this recognised neither real shape.
+  if (/^cmd(\.exe)?$/i.test(base)) {
+    // cmd takes the command as separate argv entries. Skip its own switches:
+    // `/d /s /c` is the everyday shape (npm emits it), not just `/c`. The
+    // pattern is deliberately "slash + ONE letter" so a POSIX path argument
+    // like /usr/local/bin/oam is never mistaken for a switch.
+    const first = args.find((a) => !/^\/[a-z]$/i.test(a));
+    return first !== undefined && isOamCommand(first);
+  }
+
+  if (/^(sh|bash|zsh|dash)$/i.test(base)) {
+    // A POSIX shell takes the WHOLE command as one string after -c
+    // ("oam run /path/index.js"), so the payload has to be tokenised. Reading
+    // it as a bare command name is what made this return false for every
+    // realistic `sh -c` entry.
+    const dashC = args.indexOf("-c");
+    const payload = dashC >= 0 ? args[dashC + 1] : args[0];
+    if (payload === undefined) return false;
+    // Strip quotes that do not hide a space. Tokenising on whitespace cannot
+    // recover a quoted path that CONTAINS one, and a display marker does not
+    // justify a shell parser -- such an entry reports "node". Under-reporting
+    // is the safe direction: it never claims oam for something that is not.
+    const firstToken = payload
+      .trim()
+      .split(/\s+/)[0]
+      ?.replace(/^["']|["']$/g, "");
+    return firstToken !== undefined && firstToken.length > 0 && isOamCommand(firstToken);
+  }
+
+  return false;
 }

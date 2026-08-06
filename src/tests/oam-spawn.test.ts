@@ -667,18 +667,42 @@ describe("isOamCommand / isOamLaunch", () => {
     expect(isOamCommand("/usr/bin/foam")).toBe(false);
   });
 
-  it("sees through a shell wrapper that install never writes but a human might", () => {
-    // Reporting "node" for an entry that plainly launches oam is worse than
-    // not reporting at all.
+  // These assert the shapes a CONFIG FILE actually contains. An earlier
+  // version asserted `sh -c` with a single-token payload and `cmd` with a bare
+  // `/c` -- neither occurs in practice, so the suite went green while every
+  // realistic wrapped entry returned false.
+  it("sees through a cmd wrapper, including its everyday switch set", () => {
     expect(isOamLaunch("cmd", ["/c", "oam", "run", "x.js"])).toBe(true);
     expect(isOamLaunch("cmd.exe", ["/C", String.raw`C:\bin\oam.exe`, "run"])).toBe(true);
-    expect(isOamLaunch("sh", ["-c", "/usr/local/bin/oam"])).toBe(true);
-    // The wrapped command still has to BE oam.
-    expect(isOamLaunch("cmd", ["/c", "npx", "-y", "@yawlabs/mcp@latest"])).toBe(false);
-    // A non-shell command is judged on itself, never on its args -- otherwise
-    // `node --require oam ...` would read as oam-hosted.
+    // `/d /s /c` is what npm and most wrappers emit -- the common case, and
+    // the one the first version missed by matching only an exact "/c".
+    expect(isOamLaunch("cmd", ["/d", "/s", "/c", "oam", "run", "x.js"])).toBe(true);
+    expect(isOamLaunch("cmd", ["/d", "/s", "/c", "npx", "-y", "@yawlabs/mcp@latest"])).toBe(false);
+  });
+
+  it("sees through a POSIX shell wrapper, whose payload is ONE string", () => {
+    // `sh -c` does not receive separate argv entries -- this is the shape that
+    // silently failed before.
+    expect(isOamLaunch("sh", ["-c", "oam run /path/index.js"])).toBe(true);
+    expect(isOamLaunch("bash", ["-c", "/usr/local/bin/oam run x.js"])).toBe(true);
+    expect(isOamLaunch("sh", ["-c", "npx -y @yawlabs/mcp@latest"])).toBe(false);
+    // Quoting is tolerated only when it does not hide a space: tokenising on
+    // whitespace cannot recover `'/opt/my oam/oam'`, and a display marker is
+    // not worth a shell parser. Under-reporting (says node) is the safe way
+    // to be wrong here -- it never claims oam for something that is not.
+    expect(isOamLaunch("sh", ["-c", `"oam" run x.js`])).toBe(true);
+    expect(isOamLaunch("sh", ["-c", `'/opt/my oam/oam' run x.js`])).toBe(false);
+    expect(isOamLaunch("sh", ["-c", "   "])).toBe(false);
+    expect(isOamLaunch("sh", ["-c"])).toBe(false);
+  });
+
+  it("judges a non-shell command on itself, never on its arguments", () => {
+    // Otherwise `node --require oam ...` would read as oam-hosted.
     expect(isOamLaunch("node", ["oam"])).toBe(false);
+    expect(isOamLaunch("npx", ["oam"])).toBe(false);
     expect(isOamLaunch("oam", [])).toBe(true);
     expect(isOamLaunch("npx", [])).toBe(false);
+    // A POSIX path argument must never be read as a cmd switch.
+    expect(isOamLaunch("cmd", ["/c", "/usr/local/bin/oam"])).toBe(true);
   });
 });

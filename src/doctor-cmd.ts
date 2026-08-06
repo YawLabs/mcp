@@ -829,7 +829,11 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   // mistaken for what a client's configured entry will launch -- `yaw-mcp
   // doctor` typed into a shell runs on node no matter what the entry says.
   // The per-client "(runs on oam)" marker in CLIENTS answers that one.
-  const runningOam = (process.versions as Record<string, string | undefined>).oam;
+  // Guarded, not just cast: process.versions is another runtime's surface, and
+  // an unexpected shape would otherwise render "[object Object]" into the one
+  // line whose whole job is to be trustworthy.
+  const rawOamVersion = (process.versions as Record<string, unknown>).oam;
+  const runningOam = typeof rawOamVersion === "string" && rawOamVersion.length > 0 ? rawOamVersion : null;
   print(`  this process: ${runningOam ? `oam ${runningOam}` : `node ${process.version}`}`);
   // Name the exact source: the connect path resolves project-local bundles
   // from the BROKER's cwd, doctor from the shell's cwd — printing the file
