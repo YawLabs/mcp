@@ -9,6 +9,7 @@ import {
   mergePermissionsAllow,
   NO_CONFIG_FLAG_DEPRECATION,
   parseInstallArgs,
+  readEntryAt,
   runInstall,
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
@@ -265,6 +266,13 @@ describe("mergePermissionsAllow", () => {
   });
 });
 
+/** Deterministic oam seams. `runInstall` probes the real machine by default,
+ *  so a maintainer with oam + a global @yawlabs/mcp would get an oam entry
+ *  where CI gets npx -- these pin the world each test means to assert. */
+const OAM_ABSENT = async () => ({ bin: null, version: null, belowMin: false });
+const OAM_PRESENT = async () => ({ bin: "/usr/local/bin/oam", version: "0.8.1", belowMin: false });
+const OAM_ENTRY = "/opt/nm/@yawlabs/mcp/dist/index.js";
+
 describe("runInstall — settings.json merge edge cases (claude-code)", () => {
   it("preserves existing settings.json content when patching", async () => {
     const settingsDir = join(synthHome, ".claude");
@@ -404,6 +412,7 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     // Two files touched: ~/.claude.json (mcpServers) and ~/.claude/settings.json
@@ -592,6 +601,7 @@ describe("runInstall — Windows uses cmd /c", () => {
       os: "windows",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -1140,5 +1150,84 @@ describe("install usage", () => {
     expect(INSTALL_USAGE).toContain("--token");
     expect(INSTALL_USAGE).toContain("--no-yaw-mcp-config");
     expect(INSTALL_USAGE).toMatch(/local-only/);
+  });
+});
+
+describe("runInstall — oam launch entry", () => {
+  it("writes an oam entry when oam and a durable install both resolve", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_PRESENT,
+      resolveOamEntry: () => OAM_ENTRY,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("/usr/local/bin/oam");
+    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["run", "--no-check", OAM_ENTRY]);
+  });
+
+  it("stays on npx when oam is present but nothing durable resolves", async () => {
+    // The common shape: launched via `npx -y`, so yaw-mcp lives only in the
+    // npx cache and there is no path safe to persist.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      home: synthHome,
+      io: cap.io,
+      os: "linux",
+      oamProbe: OAM_PRESENT,
+      resolveOamEntry: () => null,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+    expect(r.messages.join(" ")).toContain("not durably installed");
+  });
+
+  it("keeps an existing entry's env across a reinstall", async () => {
+    // OAM_BIN pins WHICH oam hosts the sidecars. The merge replaces our entry
+    // wholesale and the default entry carries no env, so without this the
+    // setting silently vanished and the sidecars moved runtime.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "old"], env: { OAM_BIN: "/custom/oam" } } },
+      }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      home: synthHome,
+      io: cap.io,
+      os: "linux",
+      force: true,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/custom/oam" });
+    // and the command was still refreshed -- preservation must not freeze the entry
+    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcp@latest"]);
+  });
+});
+
+describe("readEntryAt", () => {
+  it("returns the entry, or null for every shape that is not one", () => {
+    const cfg = { mcpServers: { [ENTRY_NAME]: { command: "npx", env: { A: "1" } } } };
+    expect(readEntryAt(cfg, ["mcpServers"], ENTRY_NAME)?.env).toEqual({ A: "1" });
+    // Absent container, absent entry, and non-object shapes must all be null
+    // rather than throw: these come from a user-editable config file.
+    expect(readEntryAt({}, ["mcpServers"], ENTRY_NAME)).toBeNull();
+    expect(readEntryAt({ mcpServers: {} }, ["mcpServers"], ENTRY_NAME)).toBeNull();
+    expect(readEntryAt({ mcpServers: [] }, ["mcpServers"], ENTRY_NAME)).toBeNull();
+    expect(readEntryAt({ mcpServers: "nope" }, ["mcpServers"], ENTRY_NAME)).toBeNull();
+    expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: "nope" } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
+    expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: [] } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
   });
 });

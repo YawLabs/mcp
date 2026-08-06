@@ -44,7 +44,7 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
-import { probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
+import { type OamProbe, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -62,6 +62,13 @@ export interface InstallCommandOptions {
   skip?: boolean;
   /** Print the changes that would be made and exit without writing. */
   dryRun?: boolean;
+  /** Test seams for the oam launch-entry decision, mirroring runDoctor's
+   *  `oamProbe`. Without these the entry written depends on whether the
+   *  MACHINE running the tests happens to have oam plus a durable
+   *  @yawlabs/mcp install -- so the npx-entry assertions would pass on CI and
+   *  fail on a maintainer's box, which is the worst way for a test to fail. */
+  oamProbe?: () => OamProbe | Promise<OamProbe>;
+  resolveOamEntry?: (pkg: string) => string | null;
   /** DEPRECATED and ignored. Existed only to suppress the (now removed)
    *  ~/.yaw-mcp/config.json token write; install no longer touches that
    *  file at all. Still accepted, with a stderr warning. */
@@ -222,8 +229,9 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // Host the broker itself on oam when this machine can do it durably: a
   // version-gated oam AND a non-npx-cache install to point at. Either missing
   // keeps the npx entry unchanged -- the normal case, not an error.
-  const oamProbeResult = await probeOam();
-  const oamEntry = oamProbeResult.bin ? resolveStableNpmEntry("@yawlabs/mcp") : null;
+  const oamProbeResult = await (opts.oamProbe ?? probeOam)();
+  const resolveEntry = opts.resolveOamEntry ?? resolveStableNpmEntry;
+  const oamEntry = oamProbeResult.bin ? resolveEntry("@yawlabs/mcp") : null;
   const newEntry = buildLaunchEntry({ os, oamBin: oamProbeResult.bin, oamEntry });
   // "will run on", not "runs on": nothing has been written yet, and the write
   // can still fail below. Reporting a runtime the user does not have would be

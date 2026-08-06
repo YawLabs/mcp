@@ -388,6 +388,21 @@ describe("buildLaunchEntry", () => {
     }
   });
 
+  it("prefers upstream over oam when both are supplied", () => {
+    // Precedence here is positional -- `upstream` returns before the oam
+    // branch is reached. `yaw-mcp try` always passes upstream, so a
+    // reordering would silently route trial entries through oam and point
+    // them at the BROKER's binary instead of the upstream's launcher.
+    const e = buildLaunchEntry({
+      os: "linux",
+      upstream: { command: "uvx", args: ["some-server"] },
+      oamBin: "/usr/local/bin/oam",
+      oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
+    });
+    expect(e.command).toBe("uvx");
+    expect(e.args).toEqual(["some-server"]);
+  });
+
   it("ignores oam when pkg pins a version, rather than emitting a name-only pin", () => {
     // npx honours a pinned spec on every spawn; an oamEntry is a resolved path
     // the caller looked up for its own package. Combining them would name one
