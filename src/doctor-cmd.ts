@@ -57,7 +57,7 @@ import {
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./local-bundles.js";
-import { MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
+import { isOamLaunch, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { isReadableStateVersion, loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
@@ -275,17 +275,6 @@ export interface ClientProbeResult {
    *  so the running process cannot answer "did my install put the broker on
    *  oam?". The config can. */
   launchRuntime: "oam" | "node" | null;
-}
-
-/** True when a launch command names an oam binary -- bare "oam"/"oam.exe" or
- *  any path ending in one. Not a PATH lookup: this classifies what the config
- *  ASKS for, which is the question, and a bare name resolves at spawn time. */
-export function isOamCommand(command: string): boolean {
-  // BOTH separators. Windows is the platform that writes a backslash path
-  // here (`C:\...\oam.exe`), so splitting on "/" alone would fail to
-  // recognise oam on the very platform the entry came from.
-  const base = command.split(/[\\/]/).pop() ?? command;
-  return /^oam(\.exe)?$/i.test(base);
 }
 
 export interface DoctorResult {
@@ -840,7 +829,8 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   // mistaken for what a client's configured entry will launch -- `yaw-mcp
   // doctor` typed into a shell runs on node no matter what the entry says.
   // The per-client "(runs on oam)" marker in CLIENTS answers that one.
-  print(`  this process: ${isOamCommand(process.execPath) ? "oam" : `node ${process.version}`}`);
+  const runningOam = (process.versions as Record<string, string | undefined>).oam;
+  print(`  this process: ${runningOam ? `oam ${runningOam}` : `node ${process.version}`}`);
   // Name the exact source: the connect path resolves project-local bundles
   // from the BROKER's cwd, doctor from the shell's cwd — printing the file
   // path makes a divergence between the two spottable.
@@ -1247,7 +1237,8 @@ function classifyProbeContent(
       const command = (entry as { command?: unknown }).command;
       if (typeof command === "string") {
         if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
-        launchRuntime = isOamCommand(command) ? "oam" : "node";
+        const entryArgs = (entry as { args?: unknown }).args;
+        launchRuntime = isOamLaunch(command, Array.isArray(entryArgs) ? (entryArgs as string[]) : []) ? "oam" : "node";
       }
     }
     return {

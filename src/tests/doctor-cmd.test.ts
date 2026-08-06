@@ -9,7 +9,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { formatRelativeAge, isOamCommand, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
+import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
@@ -117,19 +117,6 @@ describe("runDoctor — client detection", () => {
       "oam",
     );
     expect(cap.text()).toContain("runs on oam");
-  });
-
-  it("recognises an oam command with either path separator", () => {
-    expect(isOamCommand("oam")).toBe(true);
-    expect(isOamCommand("oam.exe")).toBe(true);
-    expect(isOamCommand("/usr/local/bin/oam")).toBe(true);
-    // Windows writes this shape, and a "/"-only split silently missed it.
-    expect(isOamCommand(String.raw`C:\Users\jeff\oam.exe`)).toBe(true);
-    expect(isOamCommand("npx")).toBe(false);
-    expect(isOamCommand("cmd")).toBe(false);
-    expect(isOamCommand("/usr/bin/node")).toBe(false);
-    // Not a substring match: a different binary that merely contains "oam".
-    expect(isOamCommand("/usr/bin/foam")).toBe(false);
   });
 
   it("does not mark an npx entry as running on oam", async () => {

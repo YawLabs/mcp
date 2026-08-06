@@ -612,3 +612,32 @@ export async function resolveOamSpawn(command: string, args: string[]): Promise<
     resolveEntry: (pkg) => resolveNpmEntry(pkg),
   });
 }
+
+/** True when a launch command names an oam binary -- bare "oam"/"oam.exe" or
+ *  any path ending in one. Splits on BOTH separators: Windows is the platform
+ *  that writes a backslash path here (`C:\...\oam.exe`), so a "/"-only split
+ *  would fail to recognise oam on the very platform the entry came from.
+ *  Not a PATH lookup -- this classifies what the config ASKS for, and a bare
+ *  name resolves at spawn time. */
+export function isOamCommand(command: string): boolean {
+  const base = command.split(/[\\/]/).pop() ?? command;
+  return /^oam(\.exe)?$/i.test(base);
+}
+
+/**
+ * Whether a launch entry runs the broker on oam, including through a shell
+ * wrapper.
+ *
+ * `install` never writes the wrapped shape -- the `cmd /c` wrap exists for
+ * npx's `.cmd` shim and oam is a real executable -- but a hand-edited config
+ * reasonably might, and reporting "node" for an entry that plainly launches
+ * oam is worse than not reporting at all.
+ */
+export function isOamLaunch(command: string, args: readonly string[] = []): boolean {
+  if (isOamCommand(command)) return true;
+  const base = command.split(/[\\/]/).pop() ?? command;
+  if (!/^(cmd|cmd\.exe|sh|bash)$/i.test(base)) return false;
+  // Skip the shell's own switch; the next positional is the real command.
+  const first = args.find((a) => !/^(\/c|-c)$/i.test(a));
+  return first !== undefined && isOamCommand(first);
+}

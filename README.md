@@ -94,7 +94,7 @@ yaw-mcp can host itself on [oam](https://oamjs.org), a Rust+V8 JavaScript runtim
 
 `yaw-mcp install` writes the oam entry for you when two things are true:
 
-- **oam is installed**, at least v0.8.1 — `curl -fsSL https://oamjs.org/install.sh | sh`, or `irm https://oamjs.org/install.ps1 | iex` on Windows. Older builds are refused rather than silently used: they predate fixes this workload sits on, including one where a client disconnecting mid-upload killed the process.
+- **oam is installed** — `curl -fsSL https://oamjs.org/install.sh | sh`, or `irm https://oamjs.org/install.ps1 | iex` on Windows. Those install the current release, which always satisfies the minimum. An older build is refused rather than silently used: versions below the floor predate fixes this workload sits on, including one where a client disconnecting mid-upload killed the process. `yaw-mcp doctor` prints the exact minimum under OAM RUNTIME.
 - **yaw-mcp is durably installed** — `npm i -g @yawlabs/mcp`, or a project `node_modules`. A path in the npx cache is deliberately not used: that directory is evictable, and an entry pointing into it breaks the moment npm cleans it.
 
 Neither is required, and nothing breaks without them — the npx entry is written as before, and install tells you which one you got. Afterwards `yaw-mcp doctor` marks a client whose entry launches the broker on oam with `(runs on oam)`, and its OAM RUNTIME section reports the binary, version, and minimum.

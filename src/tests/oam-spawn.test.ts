@@ -5,6 +5,8 @@ import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createProbeCollector,
+  isOamCommand,
+  isOamLaunch,
   MIN_OAM_VERSION,
   npxCacheNodeModules,
   OAM_PROBE_TIMEOUT_MS,
@@ -648,5 +650,35 @@ describe("resolveOamSpawn — missing-oam warning", () => {
     });
     await resolveOamSpawn("node", ["a.js"]);
     expect(lines.filter((l) => l.includes("opted in to oam but oam is not installed"))).toHaveLength(0);
+  });
+});
+
+describe("isOamCommand / isOamLaunch", () => {
+  it("recognises an oam command with either path separator", () => {
+    expect(isOamCommand("oam")).toBe(true);
+    expect(isOamCommand("oam.exe")).toBe(true);
+    expect(isOamCommand("/usr/local/bin/oam")).toBe(true);
+    // Windows writes this shape, and a "/"-only split silently missed it.
+    expect(isOamCommand(String.raw`C:\Users\jeff\oam.exe`)).toBe(true);
+    expect(isOamCommand("npx")).toBe(false);
+    expect(isOamCommand("cmd")).toBe(false);
+    expect(isOamCommand("/usr/bin/node")).toBe(false);
+    // Not a substring match: a different binary that merely contains "oam".
+    expect(isOamCommand("/usr/bin/foam")).toBe(false);
+  });
+
+  it("sees through a shell wrapper that install never writes but a human might", () => {
+    // Reporting "node" for an entry that plainly launches oam is worse than
+    // not reporting at all.
+    expect(isOamLaunch("cmd", ["/c", "oam", "run", "x.js"])).toBe(true);
+    expect(isOamLaunch("cmd.exe", ["/C", String.raw`C:\bin\oam.exe`, "run"])).toBe(true);
+    expect(isOamLaunch("sh", ["-c", "/usr/local/bin/oam"])).toBe(true);
+    // The wrapped command still has to BE oam.
+    expect(isOamLaunch("cmd", ["/c", "npx", "-y", "@yawlabs/mcp@latest"])).toBe(false);
+    // A non-shell command is judged on itself, never on its args -- otherwise
+    // `node --require oam ...` would read as oam-hosted.
+    expect(isOamLaunch("node", ["oam"])).toBe(false);
+    expect(isOamLaunch("oam", [])).toBe(true);
+    expect(isOamLaunch("npx", [])).toBe(false);
   });
 });
