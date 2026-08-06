@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
+import { MIN_OAM_VERSION } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 
 let synthHome: string;
@@ -1131,7 +1132,7 @@ describe("runDoctor — OAM RUNTIME section", () => {
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOld });
     const txt = cap.text();
     expect(txt).toContain("v0.5.0");
-    expect(txt).toContain("below min 0.6.0");
+    expect(txt).toContain(`below min ${MIN_OAM_VERSION}`);
     expect(txt).toContain("servers run on node");
   });
 
@@ -1197,7 +1198,7 @@ describe("runDoctor — OAM RUNTIME section", () => {
       binary: null,
       version: "0.5.0",
       belowMin: true,
-      minVersion: "0.6.0",
+      minVersion: MIN_OAM_VERSION,
       defaultRuntime: null,
       defaultRuntimeSource: null,
     });

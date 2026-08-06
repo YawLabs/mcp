@@ -45,8 +45,21 @@ export function packageName(spec: string): string {
  * extra-fd stdio + npx-bin-resolution fixes MCP sidecars rely on; hosting on
  * them produces hangs that LOOK like server bugs. Below-min is treated the
  * same as oam-absent: the spawn falls back to node/npx (one warn log).
+ *
+ * Raised 0.6.0 -> 0.8.1: everything below 0.8.1 carries three defects in the
+ * request-body and socket paths this workload sits directly on top of. The
+ * worst is that an unlistened error on a request stream was fatal, so a client
+ * hanging up mid-upload killed the process -- for a broker, that is every
+ * hosted server dying at once. Alongside it the aggregate body budget was
+ * charged on no platform, and socket writes never signalled backpressure, so a
+ * slow consumer buffered without bound. A version gate exists precisely so a
+ * runtime that fails this way is not silently hosted.
  */
-export const MIN_OAM_VERSION = "0.6.0";
+export const MIN_OAM_VERSION = "0.8.1";
+
+/** One "oam is missing" warning per process, not one per opted-in server.
+ *  Cleared by resetOamBinCache so tests do not leak it across cases. */
+let warnedOamMissing = false;
 
 /** Result of probing the oam binary (`oam --version`). */
 export interface OamProbe {
@@ -366,6 +379,7 @@ export async function oamBin(): Promise<string | null> {
 /** Reset the cached oam-binary probe (test hook). Bumps the generation so a
  *  probe still in flight cannot publish its result afterwards. */
 export function resetOamBinCache(): void {
+  warnedOamMissing = false;
   oamProbeCache = undefined;
   oamProbeInFlight = undefined;
   oamProbeGeneration++;
@@ -546,8 +560,23 @@ export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url):
  * fallback when oam isn't installed or the package can't be resolved on disk.
  */
 export async function resolveOamSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
+  const probe = await probeOam();
+  // Reaching here means a server ASKED for oam. Absence is silent inside the
+  // probe on purpose -- warning there would fire on every node-only install,
+  // which is noise -- but at this point the user opted in and is getting node
+  // anyway, which from the outside is indistinguishable from oam working.
+  // belowMin already warns in the probe with its own actionable numbers, so
+  // this covers only genuine absence, and only once per process.
+  if (probe.bin === null && !probe.belowMin && !warnedOamMissing) {
+    warnedOamMissing = true;
+    log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {
+      install: "curl -fsSL https://oamjs.org/install.sh | sh",
+      installWindows: "irm https://oamjs.org/install.ps1 | iex",
+      overrideWith: "OAM_BIN",
+    });
+  }
   return rewriteForOam(command, args, {
-    oamBin: await oamBin(),
+    oamBin: probe.bin,
     resolveEntry: (pkg) => resolveNpmEntry(pkg),
   });
 }
