@@ -2,7 +2,29 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased -- `LICENSE` renamed to `LICENSE.md`
+## Unreleased -- oam becomes the default sidecar runtime
+
+**Changed -- oam hosts the sidecars by default**
+
+When oam is installed and meets the minimum version, yaw-mcp now hosts the MCP servers it spawns on it without any configuration. Previously this required `runtime: "oam"` on each server or a top-level `defaultRuntime` in `bundles.json`.
+
+Nothing is required and nothing changes for a machine without oam: those servers run on node/npx exactly as before, and no warning is printed, because nothing was asked for. The escape hatches are unchanged and still win -- `runtime: "node"` on a server, `"defaultRuntime": "node"` for the whole machine, or `YAW_MCP_DEFAULT_RUNTIME=node` for one process. Only Node-based launches are rewritten; `docker`, `uvx`, and native commands are untouched.
+
+**Fixed -- the oam runtime never actually reached the sidecars on a global install**
+
+An opted-in sidecar silently ran on npx instead of oam whenever yaw-mcp itself was installed globally. Resolving an `npx -y <pkg>` server to an on-disk entry requires finding npm's `_npx` cache, and that lookup was derived from the broker's own module path -- so it only found anything when the broker had *itself* been launched through npx. A global install has no `_npx` segment in its path and therefore found nothing.
+
+The result was the feature quietly doing nothing on the most common shape, made worse by `install` recommending `npm i -g @yawlabs/mcp` in order to host on oam. `doctor` reported those servers as "oam" the whole time, because it reports the policy decision rather than the spawn. The cache is now located from npm's own configuration, independent of how the broker was started, so all three shapes -- global, project, npx -- resolve. The only trace of this was a `debug`-level log line.
+
+**Fixed -- an arbitrary cached version could be run instead of the newest**
+
+The npx cache is keyed by content hash, so a machine that has run a server for months holds every version it ever fetched. Resolution took the first directory-listing hit, which is hash order, so a server configured as `@latest` could be started from a months-old build with nothing logged. The highest version present now wins, and a durable `npm i` install still takes precedence over any cached copy.
+
+**Changed -- minimum oam version is 0.8.1**
+
+Raised from 0.6.0. Builds below 0.8.1 carry three defects in the request-body and socket paths this workload sits on -- most seriously, an unlistened error on a request stream was fatal, which for a broker means every hosted server dying at once. A below-minimum oam is refused rather than silently used, and `install` now says so when oam is missing.
+
+**Changed -- `LICENSE` renamed to `LICENSE.md`**
 
 The license file is renamed from `LICENSE` to `LICENSE.md` and `package.json` now declares `SEE LICENSE IN LICENSE.md` rather than the doubled-up `SEE LICENSE IN LICENSE`. `SEE LICENSE IN <filename>` is npm's own syntax for a license with no SPDX identifier, so the repetition was just the filename having no extension.
 

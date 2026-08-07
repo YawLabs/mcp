@@ -1,7 +1,8 @@
-// Host an opted-in MCP sidecar on the oam runtime (https://oam.sh) instead of
+// Host an MCP sidecar on the oam runtime (https://oamjs.org) instead of
 // node/npx. This is the spawn-rewrite half of "run Yaw's MCP sidecars on oam":
-// connectToUpstream() applies it after resolveUvSpawn (upstream.ts) for servers
-// whose config sets `runtime: "oam"`.
+// connectToUpstream() applies it after resolveUvSpawn (upstream.ts) for every
+// server that has not opted out -- oam is the default when it is installed and
+// meets MIN_OAM_VERSION (see default-runtime.ts for the resolution order).
 //
 // It is deliberately conservative -- a pure optimization, never a correctness
 // dependency. It rewrites only Node-based launches and falls back to the
@@ -22,7 +23,8 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { isAbsolute, join, sep } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./logger.js";
 
@@ -482,6 +484,115 @@ export function npxCacheNodeModules(fromUrl: string = import.meta.url): string[]
   }
 }
 
+/** The `cache=` setting in an npmrc, or null when the file is absent or does
+ *  not set one. npmrc is `key=value` per line with `;`/`#` comments. */
+function npmrcCache(file: string): string | null {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*cache\s*=\s*(.+?)\s*$/.exec(line);
+    if (m && !/^\s*[;#]/.test(line)) return m[1].replace(/^["']|["']$/g, "");
+  }
+  return null;
+}
+
+// Memoized: the answer cannot change within a process, and this sits behind
+// the connect path.
+let npmCacheDirCache: string | null | undefined;
+
+/**
+ * npm's cache directory -- the parent of `_npx`, where `npx -y <pkg>` puts the
+ * package it fetched.
+ *
+ * Resolved WITHOUT shelling out to `npm config get cache`: that is ~half a
+ * second of process spawn on a path that runs while an MCP client waits for
+ * its tools. Instead this walks npm's own precedence order over the npmrc
+ * files, which are plain text and cheap to read.
+ *
+ * The builtin npmrc is the one that matters in practice and the easy one to
+ * forget: version managers (scoop, nvm, volta, asdf) relocate the cache there,
+ * NOT in the user's `~/.npmrc`, so a resolver that checks only the user file
+ * and the platform default misses the cache entirely on a managed install. It
+ * lives beside npm itself in the global `node_modules`, which is exactly what
+ * ownNodeModules() already computes -- `process.execPath` is no good for this,
+ * because a shimmed install (scoop's `current` junction) points somewhere the
+ * global tree is not.
+ *
+ * Returns null when nothing resolves, which just means "no npx cache to
+ * search" -- callers fall back to node/npx as always.
+ */
+export function npmCacheDir(fromUrl: string = import.meta.url): string | null {
+  if (npmCacheDirCache !== undefined) return npmCacheDirCache;
+  npmCacheDirCache = resolveNpmCacheDir(fromUrl);
+  return npmCacheDirCache;
+}
+
+/** Reset the memoized npm cache dir (test hook). */
+export function resetNpmCacheDir(): void {
+  npmCacheDirCache = undefined;
+}
+
+function resolveNpmCacheDir(fromUrl: string): string | null {
+  // npm's precedence, highest first.
+  const fromEnv = process.env.npm_config_cache;
+  if (fromEnv) return fromEnv;
+
+  const candidates = [join(homedir(), ".npmrc")];
+  for (const nodeModules of ownNodeModules(fromUrl)) {
+    // <prefix>/etc/npmrc (global) then <globalroot>/npm/npmrc (builtin).
+    candidates.push(join(dirname(nodeModules), "etc", "npmrc"), join(nodeModules, "npm", "npmrc"));
+  }
+  // npm as it sits beside the running node itself. This is what covers a
+  // broker that is NOT globally installed -- a repo checkout or a project
+  // `node_modules` has no npm inside it, so the loop above finds nothing.
+  const nodeDir = dirname(process.execPath);
+  candidates.push(
+    join(nodeDir, "node_modules", "npm", "npmrc"), // Windows layout
+    join(nodeDir, "..", "lib", "node_modules", "npm", "npmrc"), // POSIX layout
+  );
+  for (const file of candidates) {
+    const cache = npmrcCache(file);
+    if (cache) return cache;
+  }
+
+  // npm's compiled-in default, used when no npmrc overrides it.
+  const fallback =
+    process.platform === "win32"
+      ? process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "npm-cache")
+      : join(homedir(), ".npm");
+  return fallback && existsSync(fallback) ? fallback : null;
+}
+
+/**
+ * Every `_npx/<hash>/node_modules` under npm's cache directory.
+ *
+ * The sibling npxCacheNodeModules() finds these too, but ONLY when the broker
+ * itself was launched through npx, because it derives the cache root from the
+ * broker's own module path. A globally installed broker has no `_npx` segment
+ * in its path, so it saw nothing -- and `npm i -g @yawlabs/mcp` is precisely
+ * what `install` recommends in order to host on oam. The result was that the
+ * oam runtime silently did nothing for every `npx -y <pkg>` sidecar on the
+ * most common install shape, while doctor still reported them as "oam".
+ *
+ * Locating the cache independently of the broker's own path is what closes
+ * that gap.
+ */
+export function npmCacheNpxNodeModules(cacheDir: string | null): string[] {
+  if (!cacheDir) return [];
+  const npxRoot = join(cacheDir, "_npx");
+  try {
+    return readdirSync(npxRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => join(npxRoot, e.name, "node_modules"));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * The `node_modules` that contains the broker itself, derived from the LAST
  * `node_modules` segment of a module path. Lets the broker's own dependencies
@@ -537,21 +648,65 @@ function packageEntry(pkgDir: string, pkg: string): string | null {
 
 /**
  * Resolve a package name to an on-disk RUNNABLE entry, or `null`. Searches the
- * broker's own node_modules then every npx cache: an `npx -y <pkg>` server
- * lives in a sibling `_npx/<hash>/node_modules` that the broker's own resolver
- * can't see, so without this an opted-in npx server silently falls back to
- * Node. Resolves the package's BIN (read straight from package.json) rather
- * than require.resolve's library "." export. `null` keeps the npx/node command.
+ * broker's own node_modules first, then every npx cache -- an `npx -y <pkg>`
+ * server lives in a `_npx/<hash>/node_modules` the broker's own resolver can't
+ * see, so without this an opted-in npx server silently falls back to Node.
+ * Among cached copies the HIGHEST version wins. Resolves the package's BIN
+ * (read straight from package.json) rather than require.resolve's library "."
+ * export. `null` keeps the npx/node command.
  *
- * `fromUrl` is injectable for testing; it defaults to this module's own URL.
+ * `fromUrl` and `npmCache` are injectable for testing; they default to this
+ * module's own URL and the resolved npm cache. Tests should pass `npmCache`
+ * explicitly (a temp dir, or null) so they never read the host's real cache.
  */
-export function resolveNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
+export function resolveNpmEntry(
+  pkg: string,
+  fromUrl: string = import.meta.url,
+  npmCache: string | null = npmCacheDir(fromUrl),
+): string | null {
   const parts = pkg.split("/"); // "@scope/name" -> ["@scope", "name"]
-  for (const nodeModules of [...ownNodeModules(fromUrl), ...npxCacheNodeModules(fromUrl)]) {
+
+  // A durable install is authoritative: it is a deliberate `npm i`, it is the
+  // single copy, and it is what npx itself would prefer. Take it outright.
+  for (const nodeModules of ownNodeModules(fromUrl)) {
     const entry = packageEntry(join(nodeModules, ...parts), pkg);
     if (entry) return entry;
   }
-  return null;
+
+  // The npx cache is keyed by content hash, not by package, so a machine that
+  // has run a server for months holds every version it ever fetched -- 15
+  // copies of one sidecar is real, observed. Iteration order is the hash
+  // order, i.e. arbitrary, so taking the first hit silently pinned whatever
+  // the directory listing happened to surface: a config that says `@latest`
+  // ran a months-old build with no warning anywhere. Pick the highest version
+  // instead, which is the closest on-disk answer to what `@latest` asked for.
+  const roots = new Set([...npxCacheNodeModules(fromUrl), ...npmCacheNpxNodeModules(npmCache)]);
+  let best: string | null = null;
+  let bestVersion: string | null = null;
+  for (const nodeModules of roots) {
+    const dir = join(nodeModules, ...parts);
+    const entry = packageEntry(dir, pkg);
+    if (!entry) continue;
+    const version = packageVersion(dir);
+    // An unversioned candidate only wins when nothing else has been found:
+    // compareVersions returns 0 for unparseable input, so it can never
+    // displace a real version.
+    if (best === null || (version !== null && (bestVersion === null || compareVersions(version, bestVersion) > 0))) {
+      best = entry;
+      bestVersion = version;
+    }
+  }
+  return best;
+}
+
+/** A package's declared version, for choosing between cached copies. */
+function packageVersion(pkgDir: string): string | null {
+  try {
+    const v = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")).version;
+    return typeof v === "string" ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -591,15 +746,20 @@ export function resolveStableNpmEntry(pkg: string, fromUrl: string = import.meta
  * (`config.runtime === "oam"`). A no-op for non-Node commands and a safe Node
  * fallback when oam isn't installed or the package can't be resolved on disk.
  */
-export async function resolveOamSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
+export async function resolveOamSpawn(
+  command: string,
+  args: string[],
+  optedIn = true,
+): Promise<{ command: string; args: string[] }> {
   const probe = await probeOam();
-  // Reaching here means a server ASKED for oam. Absence is silent inside the
-  // probe on purpose -- warning there would fire on every node-only install,
-  // which is noise -- but at this point the user opted in and is getting node
-  // anyway, which from the outside is indistinguishable from oam working.
-  // belowMin already warns in the probe with its own actionable numbers, so
-  // this covers only genuine absence, and only once per process.
-  if (probe.bin === null && !probe.belowMin && !warnedOamMissing) {
+  // Absence is silent inside the probe on purpose -- warning there would fire
+  // on every node-only install, which is noise -- but when the user EXPLICITLY
+  // opted in and is getting node anyway, that is indistinguishable from oam
+  // working, so say it once. `optedIn` is false when oam is merely the default
+  // (nothing configured); an absent oam is then the expected state, not a
+  // misconfiguration, and must stay quiet. belowMin already warns in the probe
+  // with its own actionable numbers, so this covers only genuine absence.
+  if (optedIn && probe.bin === null && !probe.belowMin && !warnedOamMissing) {
     warnedOamMissing = true;
     log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {
       install: "curl -fsSL https://oamjs.org/install.sh | sh",

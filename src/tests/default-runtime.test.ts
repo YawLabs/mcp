@@ -113,8 +113,24 @@ describe("describeServerRuntime", () => {
     expect(v).toMatchObject({ runtime: "node", code: "per-server-node" });
   });
 
-  it("no opt-in anywhere -> node by default", () => {
+  it("no opt-in anywhere -> oam, because an available oam is now the default", () => {
+    // The flip: "unset" used to mean node. It now means oam-when-available, so
+    // a machine with oam installed gets it without configuring anything.
     const v = describeServerRuntime(local(), null, oamOk);
+    expect(v).toMatchObject({ runtime: "oam", code: "default-oam" });
+  });
+
+  it("no opt-in anywhere and no oam -> node, silently", () => {
+    // The other half of the flip, and the common case: nothing configured and
+    // no oam installed must still be plain node.
+    const v = describeServerRuntime(local(), null, oamMissing);
+    expect(v).toMatchObject({ runtime: "node", code: "oam-not-installed" });
+  });
+
+  it('config default "node" opts the whole machine out', () => {
+    // With unset meaning oam, an explicit "node" is the only way to turn the
+    // default off config-wide -- so it has to actually work.
+    const v = describeServerRuntime(local(), "node", oamOk);
     expect(v).toMatchObject({ runtime: "node", code: "default-node" });
   });
 

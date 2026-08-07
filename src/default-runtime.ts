@@ -8,7 +8,13 @@
 //     1. per-server `config.runtime` ("node" stays an escape hatch)
 //     2. YAW_MCP_DEFAULT_RUNTIME env var
 //     3. bundles.json top-level `defaultRuntime`
-//     4. unset -> node/npx (today's behavior)
+//     4. unset -> oam when it is installed and >= MIN_OAM_VERSION, else node
+//
+// Step 4 is the "auto" default. It is not an opt-in: nothing is configured, so
+// nothing should be SAID when oam is absent -- that is the overwhelmingly
+// common case and a warning there is pure noise. Callers distinguish the two
+// by whether steps 1-3 produced an answer (see `optedIn` on resolveOamSpawn);
+// only an explicit opt-in that fails to reach oam is worth a warning.
 //
 // Applied in connectToUpstream (upstream.ts), NOT at config-load time, so it
 // covers account mode too: backend server defs never carry `runtime`, and the
@@ -132,11 +138,18 @@ export function describeServerRuntime(
   if (server.runtime === "node") {
     return { runtime: "node", code: "per-server-node", reason: 'per-server runtime:"node"' };
   }
-  const wantsOam = server.runtime === "oam" || (server.runtime === undefined && configDefault === "oam");
+  // `null` (nothing configured) now means oam-when-available, so only an
+  // explicit "node" default keeps a server off oam.
+  const wantsOam = server.runtime === "oam" || (server.runtime === undefined && configDefault !== "node");
   if (!wantsOam) {
-    return { runtime: "node", code: "default-node", reason: "default (no oam opt-in)" };
+    return { runtime: "node", code: "default-node", reason: 'config default runtime:"node"' };
   }
-  const via = server.runtime === "oam" ? 'per-server runtime:"oam"' : 'default runtime "oam"';
+  const via =
+    server.runtime === "oam"
+      ? 'per-server runtime:"oam"'
+      : configDefault === "oam"
+        ? 'default runtime "oam"'
+        : "oam is the default when installed";
   if (server.command !== "node" && server.command !== "npx") {
     return { runtime: "node", code: "not-node-command", reason: `${via}, but command is not node/npx` };
   }

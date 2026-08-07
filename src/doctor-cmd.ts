@@ -771,7 +771,7 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
     { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
     { name: "YAW_MCP_AUTO_ACTIVATE", defaultHint: "default on" },
     { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
-    { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "per-server opt-in only" },
+    { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
   ];
   const widest = vars.reduce((m, v) => Math.max(m, v.name.length), 0);
   print("ENVIRONMENT (behavior overrides)");
@@ -841,7 +841,7 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   const dfltLabel =
     dflt.runtime !== null
       ? `${dflt.runtime} (${dflt.source === "env" ? "env YAW_MCP_DEFAULT_RUNTIME" : `bundles.json defaultRuntime @ ${dflt.path}`})`
-      : '(not set — per-server runtime:"oam" opt-in only)';
+      : `(not set — oam when installed, currently ${probe.bin !== null ? "oam" : "node"})`;
   print(`  default runtime: ${dfltLabel}`);
   if (servers.length > 0) {
     print("  servers (local bundles.json):");
