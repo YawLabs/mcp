@@ -244,6 +244,72 @@ describe("runSidecarsInstall", () => {
 
     expect(res.exitCode).toBe(0);
     expect(npmRan, "npm was spawned with nothing to install").toBe(false);
+    // The docker case: the config is fine and the servers still run, so say
+    // which commands this command covers rather than implying something is
+    // wrong.
+    expect(res.lines.join("\n")).toContain("only npx servers are installed here");
+  });
+
+  it("tells a user with no config at all to add a server first", async () => {
+    // Distinct from the case above: with no bundles.json anywhere, "no
+    // npx-launched servers in bundles.json" describes a file that does not
+    // exist, and leaves a first-time user with no next step.
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {} });
+
+    const text = res.lines.join("\n");
+    expect(res.exitCode).toBe(0);
+    expect(text).toContain("No servers configured yet");
+    expect(text).toContain("yaw-mcp add");
+    expect(text, "must not describe a bundles.json that does not exist").not.toContain("in bundles.json");
+  });
+
+  it("leads with the skips when every npx server is a git or path target", async () => {
+    // Reporting "no npx-launched servers" would flatly contradict the config
+    // the user is looking at, which reads as a bug rather than an explanation.
+    writeBundles([
+      {
+        id: "1",
+        name: "G",
+        namespace: "gitsrv",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "github:owner/repo"],
+      },
+    ]);
+
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {} });
+
+    const text = res.lines.join("\n");
+    expect(res.exitCode).toBe(0);
+    expect(text).toContain("git or path target");
+    expect(text).toContain("gitsrv");
+  });
+
+  it("distinguishes the three empty states in --json", async () => {
+    // A scripted caller should be able to tell "you have no config" from "your
+    // config has nothing installable" without parsing prose.
+    const capture = async (servers: unknown[] | null) => {
+      if (servers !== null) writeBundles(servers);
+      let out = "";
+      await runSidecarsInstall({
+        home,
+        cwd: home,
+        json: true,
+        out: (s) => {
+          out += s;
+        },
+        runNpm: async () => 0,
+      });
+      return JSON.parse(out);
+    };
+    const base = { id: "1", name: "N", namespace: "n", type: "local", transport: "stdio" };
+
+    expect((await capture(null)).reason).toBe("no-config");
+    expect((await capture([{ ...base, command: "docker", args: ["run", "x"] }])).reason).toBe("no-npx-servers");
+    expect((await capture([{ ...base, command: "npx", args: ["-y", "github:o/r"] }])).reason).toBe(
+      "only-non-registry-specs",
+    );
   });
 
   it("writes the manifest and runs npm in the managed directory", async () => {
