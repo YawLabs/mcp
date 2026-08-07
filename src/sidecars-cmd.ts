@@ -59,6 +59,11 @@ export interface SidecarSpec {
   spec: string;
   /** Namespaces that launch this package -- one package can back several. */
   namespaces: string[];
+  /** Other specs configured for this same package, when they disagree with
+   *  `spec`. A flat node_modules holds ONE version, so the others cannot be
+   *  honoured -- they are carried here so the command can say so instead of
+   *  dropping them silently. Empty in the ordinary case. */
+  conflicting: string[];
 }
 
 /**
@@ -68,6 +73,12 @@ export interface SidecarSpec {
  * file, and docker/uvx/native commands are not npm packages at all. An npx
  * launch carrying flags yaw-mcp does not parse is skipped for the same reason
  * rewriteForOam skips it: the first positional is not reliably the package.
+ *
+ * When the same package is configured twice at DIFFERENT versions, the first
+ * spec wins and the rest are recorded in `conflicting`. One flat node_modules
+ * cannot hold two versions of a package, so a loser is unavoidable -- but a
+ * server configured `pkg@1.0.0` that silently starts on `@latest` is a lie the
+ * caller should get to see, so the runner prints it.
  */
 export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>>): SidecarSpec[] {
   const byPkg = new Map<string, SidecarSpec>();
@@ -81,9 +92,12 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
     const existing = byPkg.get(pkg);
     if (existing) {
       if (s.namespace && !existing.namespaces.includes(s.namespace)) existing.namespaces.push(s.namespace);
+      // Only a DIFFERENT spec is a conflict; the same package pinned the same
+      // way by two servers is the common case and says nothing.
+      if (spec !== existing.spec && !existing.conflicting.includes(spec)) existing.conflicting.push(spec);
       continue;
     }
-    byPkg.set(pkg, { pkg, spec, namespaces: s.namespace ? [s.namespace] : [] });
+    byPkg.set(pkg, { pkg, spec, namespaces: s.namespace ? [s.namespace] : [], conflicting: [] });
   }
   return [...byPkg.values()];
 }
@@ -142,7 +156,37 @@ export interface SidecarsInstallResult {
   lines: string[];
 }
 
-/** Spawn npm, inheriting stdio so the user sees progress on a long install. */
+/** Every key the `--json` document carries, on every path. */
+interface SidecarsJson {
+  /** The managed directory. Present even when nothing was installed, so a
+   *  consumer never has to branch on its absence to learn where it looks. */
+  root: string;
+  installed: Array<{ pkg: string; version: string | null; namespaces: string[] }>;
+  /** Why nothing was installed, else null. */
+  reason: string | null;
+  /** What went wrong, else null. */
+  error: string | null;
+  /** Packages configured at two different versions; the winner is the version
+   *  reported in `installed`. Empty in the ordinary case. */
+  conflicts: Array<{ pkg: string; used: string; ignored: string[] }>;
+}
+
+/**
+ * Emit the `--json` document.
+ *
+ * One shape on EVERY path. The three exit paths previously emitted three
+ * different objects -- `{root, installed}`, `{installed, reason}`, and
+ * `{installed, error}` -- so a caller could not read `root` without first
+ * working out which path it had hit, and had to probe for keys to tell
+ * success from failure. Defaulting every field here means the document has
+ * the same keys whether the install worked, found nothing, or failed.
+ */
+function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
+  const doc: SidecarsJson = { root, installed: [], reason: null, error: null, conflicts: [], ...over };
+  return `${JSON.stringify(doc, null, 2)}\n`;
+}
+
+/** Spawn npm so the user sees progress on a long install. */
 function defaultRunNpm(args: string[], cwd: string): Promise<number> {
   return new Promise((resolve) => {
     // npm on Windows is a .cmd shim, and since the CVE-2024-27980 fix Node
@@ -154,7 +198,15 @@ function defaultRunNpm(args: string[], cwd: string): Promise<number> {
     const isWindows = process.platform === "win32";
     const child = spawn(isWindows ? "npm.cmd" : "npm", args, {
       cwd,
-      stdio: ["ignore", "inherit", "inherit"],
+      // npm's own progress ("added 220 packages in 12s") goes to its STDOUT,
+      // and inheriting that put it ahead of the JSON document under --json --
+      // enough to make `yaw-mcp sidecars install --json | jq` fail outright.
+      // Routing the child's stdout to fd 2 keeps the progress visible while
+      // leaving OUR stdout carrying only the result, which is what a caller
+      // parses. Unconditional rather than --json-only: progress belongs on
+      // stderr in both modes, and a mode-dependent stdio is a second shape to
+      // get wrong.
+      stdio: ["ignore", 2, "inherit"],
       shell: isWindows,
     });
     child.on("error", () => resolve(-1));
@@ -209,19 +261,31 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
 
   const bundles = await loadLocalBundles({ cwd: opts.cwd, home });
   const specs = collectSidecarSpecs(bundles.config?.servers ?? []);
+  const root = sidecarsRoot(home);
+  const conflicts = specs
+    .filter((s) => s.conflicting.length > 0)
+    .map((s) => ({ pkg: s.pkg, used: s.spec, ignored: s.conflicting }));
 
   if (specs.length === 0) {
     print("No npx-launched servers in bundles.json -- nothing to install.");
-    if (opts.json) write(`${JSON.stringify({ installed: [], reason: "no-npx-servers" }, null, 2)}\n`);
+    if (opts.json) write(jsonDocument(root, { reason: "no-npx-servers" }));
     return { exitCode: 0, installed: [], lines };
   }
 
-  const root = sidecarsRoot(home);
   mkdirSync(root, { recursive: true });
   await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
 
   print(`Installing ${specs.length} server package(s) into ${root}`);
   for (const s of specs) print(`  ${s.spec}${s.namespaces.length ? `  (${s.namespaces.join(", ")})` : ""}`);
+  // A flat tree holds one version per package, so a second spec for the same
+  // package cannot be honoured. Say which one won rather than letting a server
+  // pinned to an exact version quietly start on something else.
+  if (conflicts.length > 0) {
+    print();
+    for (const c of conflicts) {
+      print(`  note: ${c.pkg} is also configured as ${c.ignored.join(", ")}; installing ${c.used}`);
+    }
+  }
   print();
 
   const runNpm = opts.runNpm ?? defaultRunNpm;
@@ -230,7 +294,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
   if (code !== 0) {
     print(`npm install failed (exit ${code}). Servers keep resolving from the npx cache.`);
-    if (opts.json) write(`${JSON.stringify({ installed: [], error: `npm exited ${code}` }, null, 2)}\n`);
+    if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts }));
     return { exitCode: 1, installed: [], lines };
   }
 
@@ -250,13 +314,14 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   print();
   print("These versions are now fixed. Re-run this command to move them forward.");
 
-  if (opts.json) write(`${JSON.stringify({ root, installed }, null, 2)}\n`);
+  if (opts.json) write(jsonDocument(root, { installed, conflicts }));
   // Exit non-zero when nothing at all resolved -- a scripted caller should be
   // able to tell "installed" from "npm succeeded but the tree is empty".
   return { exitCode: missing.length === installed.length ? 1 : 0, installed, lines };
 }
 
-/** True when a managed install exists (doctor reports it). */
+/** True when a managed install exists. Lets a caller skip the per-package
+ *  reads entirely when the tree was never created. */
 export function hasManagedSidecars(home: string = homedir()): boolean {
   return existsSync(sidecarsNodeModules(home));
 }

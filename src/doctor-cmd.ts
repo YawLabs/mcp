@@ -60,7 +60,7 @@ import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./
 import { isOamLaunch, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { isReadableStateVersion, loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
-import { collectSidecarSpecs, installedVersion, sidecarsRoot } from "./sidecars-cmd.js";
+import { collectSidecarSpecs, hasManagedSidecars, installedVersion, sidecarsRoot } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
@@ -818,9 +818,14 @@ async function collectOamRuntimeStatus(opts: {
   // for -- that is the number an oam-hosted server will run, and the one thing
   // the config file itself cannot tell you.
   const specs = collectSidecarSpecs(bundles?.config?.servers ?? []);
+  // Skip the per-package reads entirely when the tree was never created --
+  // `sidecars install` is opt-in, so "never run" is the common case, and each
+  // package would otherwise cost a stat + read + JSON.parse that can only come
+  // back null.
+  const anyManaged = hasManagedSidecars(opts.home);
   const managed = {
     root: sidecarsRoot(opts.home),
-    packages: specs.map((s) => ({ pkg: s.pkg, version: installedVersion(s.pkg, opts.home) })),
+    packages: specs.map((s) => ({ pkg: s.pkg, version: anyManaged ? installedVersion(s.pkg, opts.home) : null })),
   };
   return { probe, dflt, servers, managed };
 }

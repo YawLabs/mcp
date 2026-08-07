@@ -50,6 +50,23 @@ describe("collectSidecarSpecs", () => {
 
     expect(specs).toHaveLength(1);
     expect(specs[0].namespaces).toEqual(["pg1", "pg2"]);
+    // Same spec twice is not a conflict -- that would put a note on the most
+    // ordinary configuration there is.
+    expect(specs[0].conflicting).toEqual([]);
+  });
+
+  it("records the losing spec when one package is configured at two versions", () => {
+    // A flat node_modules holds ONE version, so a loser is unavoidable. What
+    // is avoidable is a server pinned to an exact version silently starting on
+    // something else, so the discarded spec has to survive to be reported.
+    const specs = collectSidecarSpecs([
+      local({ namespace: "a", command: "npx", args: ["-y", "@yawlabs/postgres-mcp@1.0.0"] }),
+      local({ namespace: "b", command: "npx", args: ["-y", "@yawlabs/postgres-mcp@latest"] }),
+    ]);
+
+    expect(specs).toHaveLength(1);
+    expect(specs[0].spec).toBe("@yawlabs/postgres-mcp@1.0.0");
+    expect(specs[0].conflicting).toEqual(["@yawlabs/postgres-mcp@latest"]);
   });
 
   it("skips an npx launch whose first positional is a flag", () => {
@@ -205,5 +222,63 @@ describe("runSidecarsInstall", () => {
 
     expect(res.exitCode).toBe(1);
     expect(res.installed[0].version).toBeNull();
+  });
+
+  it("emits the same --json keys on every path", async () => {
+    // The three exit paths used to emit three different objects, so a consumer
+    // could not read `root` without first working out which path it hit. Pin
+    // the shape: same keys whether the install worked, found nothing, or
+    // failed.
+    const KEYS = ["root", "installed", "reason", "error", "conflicts"].sort();
+    const npxServer = {
+      id: "1",
+      name: "F",
+      namespace: "fetch",
+      type: "local",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@yawlabs/fetch-mcp@latest"],
+    };
+    const capture = async (servers: unknown[], npmExit: number) => {
+      writeBundles(servers);
+      let out = "";
+      await runSidecarsInstall({
+        home,
+        cwd: home,
+        json: true,
+        out: (s) => {
+          out += s;
+        },
+        runNpm: async () => npmExit,
+      });
+      return JSON.parse(out);
+    };
+
+    // nothing to do / npm failed / npm succeeded but the tree is empty
+    const empty = await capture([{ ...npxServer, command: "docker", args: ["run", "x"] }], 0);
+    const failed = await capture([npxServer], 1);
+    const ok = await capture([npxServer], 0);
+
+    for (const doc of [empty, failed, ok]) {
+      expect(Object.keys(doc).sort()).toEqual(KEYS);
+      expect(typeof doc.root).toBe("string");
+    }
+    expect(empty.reason).toBe("no-npx-servers");
+    expect(failed.error).toContain("npm exited 1");
+    expect(ok.error).toBeNull();
+  });
+
+  it("reports which spec won when a package is configured at two versions", async () => {
+    const base = { type: "local", transport: "stdio", command: "npx" };
+    writeBundles([
+      { ...base, id: "1", name: "A", namespace: "a", args: ["-y", "@yawlabs/postgres-mcp@1.0.0"] },
+      { ...base, id: "2", name: "B", namespace: "b", args: ["-y", "@yawlabs/postgres-mcp@latest"] },
+    ]);
+
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {} });
+
+    const text = res.lines.join("\n");
+    expect(text).toContain("@yawlabs/postgres-mcp@latest");
+    expect(text).toContain("installing @yawlabs/postgres-mcp@1.0.0");
   });
 });
