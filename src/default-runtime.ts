@@ -85,7 +85,11 @@ export async function describeDefaultRuntime(
  *
  * `cwd`/`home` default to the real process values (production passes
  * nothing); they exist so the bundles path is testable without depending on
- * the machine the suite runs on.
+ * the machine the suite runs on. They seed the ONE-TIME read only: the cache
+ * below is a single unkeyed slot, so a later call passing different values
+ * gets the first call's answer rather than its own. Production resolves one
+ * cwd for the process, so this is a test-ergonomics parameter, NOT a
+ * per-call override -- key the cache before treating it as one.
  */
 export async function defaultRuntime(opts: { cwd?: string; home?: string } = {}): Promise<RuntimeChoice | null> {
   const raw = process.env.YAW_MCP_DEFAULT_RUNTIME;

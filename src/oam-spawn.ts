@@ -469,6 +469,13 @@ export function rewriteForOam(
   return { command, args };
 }
 
+/** The path fragment that marks an npm `_npx` cache directory. Derived once:
+ *  npxCacheNodeModules locates the cache with it and both resolvers CLASSIFY
+ *  on it (cache copies are fine to spawn but wrong to persist, and they take
+ *  different refresh advice), so three local copies of the same magic
+ *  fragment is exactly how those three decisions drift apart. */
+const NPX_CACHE_MARKER = `${sep}_npx${sep}`;
+
 /**
  * The `node_modules` directories of every npx install cache, derived from a
  * module path that lives under `_npx/<hash>/...`. When the broker is itself
@@ -486,10 +493,9 @@ export function npxCacheNodeModules(fromUrl: string = import.meta.url): string[]
   } catch {
     return [];
   }
-  const marker = `${sep}_npx${sep}`;
-  const idx = here.indexOf(marker);
+  const idx = here.indexOf(NPX_CACHE_MARKER);
   if (idx === -1) return [];
-  const npxRoot = here.slice(0, idx + marker.length - sep.length); // ".../_npx"
+  const npxRoot = here.slice(0, idx + NPX_CACHE_MARKER.length - sep.length); // ".../_npx"
   try {
     return readdirSync(npxRoot, { withFileTypes: true })
       .filter((e) => e.isDirectory())
@@ -710,7 +716,6 @@ export function resolveNpmEntry(
   // is the only one the user asked yaw-mcp to maintain, so when it and some
   // ambient node_modules both have the package, the managed answer is the one
   // they can actually move forward by re-running the command.
-  const npxMarker = `${sep}_npx${sep}`;
   const durable: Array<{ nodeModules: string; source: PinSource }> = [
     ...(managedRoot ? [{ nodeModules: managedRoot, source: "managed" as const }] : []),
     // The broker's OWN node_modules sits UNDER _npx whenever yaw-mcp was
@@ -720,18 +725,17 @@ export function resolveNpmEntry(
     // resolveStableNpmEntry draws the same distinction for the same reason.
     ...ownNodeModules(fromUrl).map((nodeModules) => ({
       nodeModules,
-      source: (nodeModules.includes(npxMarker) ? "npx-cache" : "durable") as PinSource,
+      source: (nodeModules.includes(NPX_CACHE_MARKER) ? "npx-cache" : "durable") as PinSource,
     })),
   ];
   for (const { nodeModules, source } of durable) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
     if (hit) {
-      // Reported here too, not just for cache hits: a durable copy pins just
-      // as hard as a cached one -- `oam run <entry>` cannot re-resolve
-      // "@latest" wherever the entry came from. Leaving these silent meant
-      // the notice never fired for the managed tree, i.e. for the exact
-      // install path `sidecars install` exists to promote.
-      notePinnedSidecar(pkg, hit.version, source);
+      // Every source is reported here, but not at the same level: an ambient
+      // durable copy pins as hard as a cache copy and is just as invisible
+      // otherwise, so both go to info -- while the managed tree is a pin the
+      // user deliberately chose, so it goes to debug. See notePinnedSidecar.
+      notePinnedSidecar(pkg, hit.version, source, nodeModules);
       return hit.entry;
     }
   }
@@ -745,6 +749,7 @@ export function resolveNpmEntry(
   // instead, which is the closest on-disk answer to what `@latest` asked for.
   const roots = new Set([...npxCacheNodeModules(fromUrl), ...npmCacheNpxNodeModules(npmCache)]);
   let best: PackageHit | null = null;
+  let bestRoot: string | null = null;
   for (const nodeModules of roots) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
     if (!hit) continue;
@@ -756,9 +761,10 @@ export function resolveNpmEntry(
       (hit.version !== null && (best.version === null || compareVersions(hit.version, best.version) > 0))
     ) {
       best = hit;
+      bestRoot = nodeModules;
     }
   }
-  if (best !== null) notePinnedSidecar(pkg, best.version, "npx-cache");
+  if (best !== null && bestRoot !== null) notePinnedSidecar(pkg, best.version, "npx-cache", bestRoot);
   return best?.entry ?? null;
 }
 
@@ -767,9 +773,13 @@ export function resolveNpmEntry(
  *  wrong one is worse than naming none. */
 type PinSource = "managed" | "durable" | "npx-cache";
 
-/** How to refresh a pinned copy, per source. `npm install <pkg>@latest` is
- *  scoped to whichever tree the entry was found in, which is what a durable
- *  install (global or project) responds to. */
+/** How to refresh a pinned copy, per source.
+ *
+ *  None of these can be fully scoped from here: a durable tree may be global
+ *  (the command needs `-g`) or project-local (it needs to run in that
+ *  project), and this cannot tell which. So the command names WHAT to run and
+ *  the notice's `from` field names WHERE -- printing a bare `npm install`
+ *  with no directory is advice that silently updates the wrong tree. */
 const REFRESH_COMMAND: Record<PinSource, (pkg: string) => string> = {
   managed: () => "yaw-mcp sidecars install",
   durable: (pkg) => `npm install ${pkg}@latest`,
@@ -805,7 +815,7 @@ export function resetPinnedSidecarLog(): void {
  * other two sources are genuinely invisible otherwise, which is the whole
  * reason this notice exists.
  */
-function notePinnedSidecar(pkg: string, version: string | null, source: PinSource): void {
+function notePinnedSidecar(pkg: string, version: string | null, source: PinSource, from: string): void {
   if (pinnedReported.has(pkg)) return;
   pinnedReported.add(pkg);
   log(
@@ -815,6 +825,11 @@ function notePinnedSidecar(pkg: string, version: string | null, source: PinSourc
       package: pkg,
       version: version ?? "unknown",
       source,
+      // The node_modules the entry was actually resolved out of. refreshWith
+      // cannot name it -- a durable tree may be global or project-local, and
+      // the command differs -- so this is what makes the advice actionable
+      // rather than something to run in whatever cwd the user happens to be.
+      from,
       refreshWith: REFRESH_COMMAND[source](pkg),
     },
   );
@@ -843,9 +858,8 @@ function notePinnedSidecar(pkg: string, version: string | null, source: PinSourc
  * so there is nothing durable to point at.
  */
 export function resolveStableNpmEntry(pkg: string, fromUrl: string = import.meta.url): string | null {
-  const npxMarker = `${sep}_npx${sep}`;
   for (const nodeModules of ownNodeModules(fromUrl)) {
-    if (nodeModules.includes(npxMarker)) continue;
+    if (nodeModules.includes(NPX_CACHE_MARKER)) continue;
     const hit = packageEntry(join(nodeModules, ...pkg.split("/")), pkg);
     if (hit) return hit.entry;
   }

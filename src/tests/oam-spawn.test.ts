@@ -546,14 +546,17 @@ describe("resolveNpmEntry", () => {
   // and each is refreshed by a different command, so naming the wrong one is
   // worse than saying nothing.
 
-  /** Pinned-sidecar notices the logger put on stderr while `fn` ran. Debug
-   *  lines never reach stderr at the default LOG_LEVEL, so an empty result
-   *  means "said nothing at info". */
-  function captureNotices(fn: () => void): string[] {
+  /** Pinned-sidecar notices the logger put on stderr while `fn` ran, PARSED.
+   *  Parsed rather than substring-matched because the envelope is JSON, so a
+   *  Windows path arrives backslash-escaped and no raw `toContain(dir)` would
+   *  ever match on the platform most likely to have one. Debug lines never
+   *  reach stderr at the default LOG_LEVEL, so an empty result means "said
+   *  nothing at info". */
+  function captureNotices(fn: () => void): Array<Record<string, unknown>> {
     resetPinnedSidecarLog();
-    const lines: string[] = [];
+    const chunks: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
+      chunks.push(String(chunk));
       return true;
     });
     try {
@@ -561,7 +564,12 @@ describe("resolveNpmEntry", () => {
     } finally {
       spy.mockRestore();
     }
-    return lines.filter((l) => l.includes("will not self-update"));
+    return chunks
+      .join("")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((e) => String(e.msg ?? "").includes("will not self-update"));
   }
 
   function writeResolvablePkg(nodeModules: string, version: string): void {
@@ -597,8 +605,13 @@ describe("resolveNpmEntry", () => {
     try {
       const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
       expect(note, "a durable hit reported no pin at all").toBeDefined();
-      expect(note).toContain("npm install @yawlabs/fetch-mcp@latest");
-      expect(note).toContain("0.1.0");
+      expect(note.source).toBe("durable");
+      expect(note.refreshWith).toBe("npm install @yawlabs/fetch-mcp@latest");
+      expect(note.version).toBe("0.1.0");
+      // The command alone is not actionable: a durable tree may be global
+      // (needs -g) or project-local, so without the directory the user would
+      // run it in whatever cwd they happen to be in and update nothing.
+      expect(note.from, "no directory, so the refresh command has nowhere to run").toBe(nm);
     } finally {
       cleanup();
     }
@@ -610,12 +623,14 @@ describe("resolveNpmEntry", () => {
     // an edge case. Classifying that as durable advertised `npm install`,
     // which cannot refresh a content-hashed cache directory.
     const { npx, brokerUrl, cleanup } = fixture();
-    writeResolvablePkg(join(npx, "aaa", "node_modules"), "0.2.0");
+    const cacheNodeModules = join(npx, "aaa", "node_modules");
+    writeResolvablePkg(cacheNodeModules, "0.2.0");
     try {
       const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
       expect(note).toBeDefined();
-      expect(note).toContain("npx -y @yawlabs/fetch-mcp@latest");
-      expect(note, "cache path advertised the durable refresh command").not.toContain("npm install");
+      expect(note.source, "the broker's own _npx node_modules was called durable").toBe("npx-cache");
+      expect(note.refreshWith).toBe("npx -y @yawlabs/fetch-mcp@latest --help");
+      expect(note.from).toBe(cacheNodeModules);
     } finally {
       cleanup();
     }
