@@ -77,7 +77,7 @@ describe("probeOam min-version gate", () => {
   });
 
   it("rejects the version one patch below the floor", async () => {
-    // MIN_OAM_VERSION now ends in a non-zero patch (0.8.1), so patch-level
+    // MIN_OAM_VERSION now ends in a non-zero patch, so patch-level
     // comparison decides the boundary for the first time -- a comparator that
     // only weighed major.minor would pass every other test here while hosting
     // on a runtime with the fatal request-stream bug the floor exists to
