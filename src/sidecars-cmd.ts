@@ -52,6 +52,30 @@ import type { UpstreamServerConfig } from "./types.js";
 
 export { SIDECARS_DIRNAME, sidecarsNodeModules, sidecarsRoot } from "./paths.js";
 
+/**
+ * Whether a launch spec names a plain REGISTRY package, the only kind that can
+ * go in the generated manifest.
+ *
+ * npx also accepts git and path specs -- `npx -y github:owner/repo`,
+ * `npx -y ./local-server`, `file:../x` -- and `packageName` passes those
+ * through whole, because there is no `@version` separator to cut at. Used as a
+ * dependency KEY that produces `{"github:owner/repo": "latest"}`, which npm
+ * rejects as an invalid name. npm then fails the WHOLE install, so one
+ * unusually-configured server would stop every other package from installing.
+ *
+ * A git or path spec is legitimate configuration, so this is a skip rather
+ * than an error: those servers keep resolving through npx exactly as before,
+ * and the command says which ones it passed over. Resolving them properly
+ * would mean fetching the target just to learn the name it declares, which is
+ * more than this command should do.
+ */
+export function isRegistrySpec(spec: string): boolean {
+  // A protocol (github:, file:, git+ssh:, http:) or a filesystem path.
+  if (spec.includes(":") || /^[./~\\]/.test(spec)) return false;
+  // @scope/name, or a bare name. npm forbids a leading "." or "_".
+  return /^(@[^/@\s]+\/)?[^./_@\s][^/@\s]*$/.test(packageName(spec));
+}
+
 export interface SidecarSpec {
   /** Bare package name, e.g. "@yawlabs/fetch-mcp". */
   pkg: string;
@@ -87,6 +111,10 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
     const positional = (s.args ?? []).filter((a) => a !== "-y" && a !== "--yes");
     const spec = positional[0];
     if (spec === undefined || spec.startsWith("-")) continue;
+    // A git or path spec cannot be a dependency key; including it would make
+    // npm reject the manifest and fail the install for every other package
+    // too. See isRegistrySpec.
+    if (!isRegistrySpec(spec)) continue;
     const pkg = packageName(spec);
     if (!pkg) continue;
     const existing = byPkg.get(pkg);
@@ -100,6 +128,25 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
     byPkg.set(pkg, { pkg, spec, namespaces: s.namespace ? [s.namespace] : [], conflicting: [] });
   }
   return [...byPkg.values()];
+}
+
+/**
+ * npx servers whose spec is a git or path target rather than a registry
+ * package, paired with the namespace that configured them. Reported so the
+ * skip is visible -- a server missing from the install list with no
+ * explanation reads as a bug.
+ */
+export function collectNonRegistrySpecs(
+  servers: Array<Partial<UpstreamServerConfig>>,
+): Array<{ namespace: string; spec: string }> {
+  const out: Array<{ namespace: string; spec: string }> = [];
+  for (const s of servers) {
+    if (s.type !== "local" || s.command !== "npx") continue;
+    const spec = (s.args ?? []).filter((a) => a !== "-y" && a !== "--yes")[0];
+    if (spec === undefined || spec.startsWith("-") || isRegistrySpec(spec)) continue;
+    out.push({ namespace: s.namespace ?? "(unnamed)", spec });
+  }
+  return out;
 }
 
 /**
@@ -169,6 +216,9 @@ interface SidecarsJson {
   /** Packages configured at two different versions; the winner is the version
    *  reported in `installed`. Empty in the ordinary case. */
   conflicts: Array<{ pkg: string; used: string; ignored: string[] }>;
+  /** npx servers passed over because their spec is a git or path target, not
+   *  a registry package. They keep resolving through npx. */
+  skipped: Array<{ namespace: string; spec: string }>;
 }
 
 /**
@@ -182,7 +232,15 @@ interface SidecarsJson {
  * the same keys whether the install worked, found nothing, or failed.
  */
 function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
-  const doc: SidecarsJson = { root, installed: [], reason: null, error: null, conflicts: [], ...over };
+  const doc: SidecarsJson = {
+    root,
+    installed: [],
+    reason: null,
+    error: null,
+    conflicts: [],
+    skipped: [],
+    ...over,
+  };
   return `${JSON.stringify(doc, null, 2)}\n`;
 }
 
@@ -225,8 +283,9 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--json]
   install a server stays pinned at whatever was last fetched. Re-run this to
   move them forward.
 
-  Only npx-launched servers are installed. docker, uvx, and native commands
-  are left alone, as are node launches that already name a file.`;
+  Only npx-launched servers naming a registry package are installed. docker,
+  uvx, and native commands are left alone, as are node launches that already
+  name a file and npx launches pointing at a git or path target.`;
 
 export function parseSidecarsArgs(
   argv: string[],
@@ -260,15 +319,29 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   };
 
   const bundles = await loadLocalBundles({ cwd: opts.cwd, home });
-  const specs = collectSidecarSpecs(bundles.config?.servers ?? []);
+  const servers = bundles.config?.servers ?? [];
+  const specs = collectSidecarSpecs(servers);
+  const skipped = collectNonRegistrySpecs(servers);
   const root = sidecarsRoot(home);
   const conflicts = specs
     .filter((s) => s.conflicting.length > 0)
     .map((s) => ({ pkg: s.pkg, used: s.spec, ignored: s.conflicting }));
 
+  // Printed on every path INCLUDING the nothing-to-do one: a config whose only
+  // npx servers are git targets would otherwise report "nothing to install"
+  // and leave the reason to be guessed at.
+  const printSkipped = () => {
+    if (skipped.length === 0) return;
+    print();
+    for (const k of skipped) {
+      print(`  note: ${k.namespace} launches ${k.spec}, not a registry package; it keeps using npx`);
+    }
+  };
+
   if (specs.length === 0) {
     print("No npx-launched servers in bundles.json -- nothing to install.");
-    if (opts.json) write(jsonDocument(root, { reason: "no-npx-servers" }));
+    printSkipped();
+    if (opts.json) write(jsonDocument(root, { reason: "no-npx-servers", skipped }));
     return { exitCode: 0, installed: [], lines };
   }
 
@@ -277,6 +350,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
 
   print(`Installing ${specs.length} server package(s) into ${root}`);
   for (const s of specs) print(`  ${s.spec}${s.namespaces.length ? `  (${s.namespaces.join(", ")})` : ""}`);
+  printSkipped();
   // A flat tree holds one version per package, so a second spec for the same
   // package cannot be honoured. Say which one won rather than letting a server
   // pinned to an exact version quietly start on something else.
@@ -294,7 +368,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
   if (code !== 0) {
     print(`npm install failed (exit ${code}). Servers keep resolving from the npx cache.`);
-    if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts }));
+    if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts, skipped }));
     return { exitCode: 1, installed: [], lines };
   }
 
@@ -314,7 +388,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   print();
   print("These versions are now fixed. Re-run this command to move them forward.");
 
-  if (opts.json) write(jsonDocument(root, { installed, conflicts }));
+  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped }));
   // Exit non-zero when nothing at all resolved -- a scripted caller should be
   // able to tell "installed" from "npm succeeded but the tree is empty".
   return { exitCode: missing.length === installed.length ? 1 : 0, installed, lines };

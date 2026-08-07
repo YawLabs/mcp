@@ -10,7 +10,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  collectNonRegistrySpecs,
   collectSidecarSpecs,
+  installedVersion,
+  isRegistrySpec,
   parseSidecarsArgs,
   runSidecarsInstall,
   sidecarsManifest,
@@ -99,6 +102,98 @@ describe("sidecarsManifest", () => {
 
     expect(json.dependencies).toEqual({ "@scope/name": "1.2.3" });
     expect(json.private).toBe(true);
+  });
+
+  it("is byte-identical regardless of the order servers appear in", () => {
+    // The sort is what keeps a re-run from rewriting package.json and churning
+    // the lockfile -- npm sees no change and no-ops. Without it, reordering
+    // bundles.json would silently produce a different file every time.
+    const a = collectSidecarSpecs([
+      local({ command: "npx", args: ["-y", "z-mcp@1.0.0"] }),
+      local({ command: "npx", args: ["-y", "a-mcp@2.0.0"] }),
+    ]);
+    const b = collectSidecarSpecs([
+      local({ command: "npx", args: ["-y", "a-mcp@2.0.0"] }),
+      local({ command: "npx", args: ["-y", "z-mcp@1.0.0"] }),
+    ]);
+
+    expect(sidecarsManifest(a)).toBe(sidecarsManifest(b));
+  });
+});
+
+describe("isRegistrySpec", () => {
+  it("accepts the registry forms and rejects git/path targets", () => {
+    // npx takes git and path specs too, and packageName passes those through
+    // whole (no `@version` to cut at). As a dependency KEY that yields
+    // {"github:owner/repo": "latest"}, which npm rejects -- failing the whole
+    // install, so ONE oddly-configured server would block every other package.
+    for (const ok of ["@yawlabs/fetch-mcp@latest", "@scope/n@1.2.3", "plain", "some-mcp@next"]) {
+      expect(isRegistrySpec(ok), ok).toBe(true);
+    }
+    for (const bad of ["github:owner/repo", "./local-server", "file:../x", "git+ssh://h/r.git", "/abs/path"]) {
+      expect(isRegistrySpec(bad), bad).toBe(false);
+    }
+  });
+
+  it("keeps a git-spec server out of the manifest entirely", () => {
+    const specs = collectSidecarSpecs([
+      local({ namespace: "gitsrv", command: "npx", args: ["-y", "github:owner/repo"] }),
+      local({ namespace: "fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }),
+    ]);
+
+    expect(specs.map((s) => s.pkg)).toEqual(["@yawlabs/fetch-mcp"]);
+    expect(JSON.parse(sidecarsManifest(specs)).dependencies).toEqual({ "@yawlabs/fetch-mcp": "latest" });
+  });
+
+  it("reports the skipped server rather than dropping it silently", () => {
+    // A server missing from the install list with no explanation reads as a
+    // bug in the command.
+    const skipped = collectNonRegistrySpecs([
+      local({ namespace: "gitsrv", command: "npx", args: ["-y", "github:owner/repo"] }),
+      local({ namespace: "fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }),
+    ]);
+
+    expect(skipped).toEqual([{ namespace: "gitsrv", spec: "github:owner/repo" }]);
+  });
+});
+
+describe("installedVersion", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "instver-"));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  const writePkg = (json: unknown) => {
+    const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify(json));
+  };
+
+  it("returns null for a package.json carrying no version", () => {
+    // Doctor renders null identically to "not installed", so a present-but-odd
+    // package reads as absent and sends the user to re-run an install that
+    // will not change anything. Pin the shape so that stays a deliberate
+    // choice rather than an accident of the `typeof` check.
+    writePkg({ name: "@yawlabs/fetch-mcp" });
+
+    expect(installedVersion("@yawlabs/fetch-mcp", home)).toBeNull();
+  });
+
+  it("returns null for an unparseable package.json rather than throwing", () => {
+    // A half-written file (an install killed midway) must not take down the
+    // command that is trying to report on it.
+    const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), "{ not json");
+
+    expect(installedVersion("@yawlabs/fetch-mcp", home)).toBeNull();
+  });
+
+  it("reads the version when one is present", () => {
+    writePkg({ name: "@yawlabs/fetch-mcp", version: "0.3.6" });
+
+    expect(installedVersion("@yawlabs/fetch-mcp", home)).toBe("0.3.6");
   });
 });
 
@@ -229,7 +324,7 @@ describe("runSidecarsInstall", () => {
     // could not read `root` without first working out which path it hit. Pin
     // the shape: same keys whether the install worked, found nothing, or
     // failed.
-    const KEYS = ["root", "installed", "reason", "error", "conflicts"].sort();
+    const KEYS = ["root", "installed", "reason", "error", "conflicts", "skipped"].sort();
     const npxServer = {
       id: "1",
       name: "F",

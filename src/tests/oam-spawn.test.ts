@@ -495,6 +495,39 @@ describe("resolveNpmEntry", () => {
     }
   });
 
+  it("falls through to the cache when the managed copy has no bin or main", async () => {
+    // An exports-only package (no `bin`, no `main`) has no runnable entry to
+    // point oam at, so the managed copy cannot be used even though the install
+    // succeeded. Falling through to a cached copy that DOES declare one beats
+    // failing, but it means `sidecars install` can report a package as
+    // installed while the spawn still comes from the cache -- pin that so the
+    // asymmetry is a decision rather than a surprise.
+    const { root, npx, cleanup } = fixture();
+    const managed = join(root, "managed", "node_modules");
+    const managedPkg = join(managed, "@yawlabs", "fetch-mcp");
+    mkdirSync(managedPkg, { recursive: true });
+    writeFileSync(
+      join(managedPkg, "package.json"),
+      JSON.stringify({
+        name: "@yawlabs/fetch-mcp",
+        version: "9.9.9",
+        exports: { ".": { import: "./dist/lib.js" } },
+      }),
+    );
+    const cached = join(npx, "aaa0", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(cached, { recursive: true });
+    writeFileSync(
+      join(cached, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+    const brokerUrl = pathToFileURL(join(root, "global", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed)).toBe(join(cached, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
   it("prefers a durable install over any cached copy, even a newer one", async () => {
     // A real `npm i` is a deliberate choice and the single copy; the cache is
     // incidental. Version order must not override that.
