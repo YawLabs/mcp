@@ -12,6 +12,7 @@ import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
+import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseTrustArgs, runTrust } from "./trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
@@ -145,6 +146,17 @@ if (subcommand === "compliance") {
     process.exit(2);
   }
   dispatch("servers", runServersCommand(parsed.options));
+} else if (subcommand === "sidecars") {
+  const parsed = parseSidecarsArgs(process.argv.slice(3));
+  if (!parsed.ok) {
+    if ((parsed as { help?: boolean }).help) {
+      process.stdout.write(`${parsed.error}\n`);
+      process.exit(0);
+    }
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
+  dispatch("sidecars", runSidecarsInstall(parsed.options));
 } else if (subcommand === "bundles") {
   const parsed = parseBundlesArgs(process.argv.slice(3));
   if (!parsed.ok) {

@@ -117,7 +117,19 @@ When oam is installed and meets the minimum, yaw-mcp hosts the MCP servers it sp
 
 Only Node-based launches are rewritten. A server whose command is `docker`, `uvx`, or a native binary is left alone, as is an npx package that cannot be found on disk.
 
-**One tradeoff worth knowing.** `npx -y <pkg>@latest` re-resolves that tag on every spawn, so those servers update themselves. `oam run <entry>` cannot — oam has no fetch-on-demand, so it runs the copy already on disk, and because npx then stops running for that server, the copy stops being refreshed. The version pins itself until something fetches a newer one. yaw-mcp logs the resolved version once per package at startup so this is visible rather than silent, and picks the newest copy present. To refresh a pinned sidecar, run it through npx once (`npx -y <pkg>@latest --help`) or install it durably; to keep npx's self-updating behavior for a given server, set `runtime: "node"` on it.
+**One tradeoff worth knowing.** `npx -y <pkg>@latest` re-resolves that tag on every spawn, so those servers update themselves. `oam run <entry>` cannot — oam has no fetch-on-demand, so it runs the copy already on disk, and because npx then stops running for that server, the copy stops being refreshed. The version pins itself until something fetches a newer one. yaw-mcp logs the resolved version once per package at startup so this is visible rather than silent, and picks the newest copy present.
+
+### Installing the servers durably
+
+```
+yaw-mcp sidecars install
+```
+
+Installs the npx-launched servers from your `bundles.json` into `~/.yaw-mcp/sidecars`, and yaw-mcp resolves from there in preference to npm's npx cache. That gives one copy per package at a version that is written down, instead of whichever of the several copies in the cache happened to be newest — and re-running the command is how you move them forward.
+
+It is not automatic and nothing requires it. Acquiring packages means network and minutes, and the connect path is what an MCP client blocks on while waiting for its tools; a first connect that silently turned into an npm install would be the wrong trade. Without it, resolution falls back to the npx cache exactly as before.
+
+`yaw-mcp doctor` prints the installed version of each configured package under OAM RUNTIME, so a pinned or missing one is visible. To keep npx's self-updating behavior for a particular server instead, set `runtime: "node"` on it.
 
 To override, in `~/.yaw-mcp/bundles.json`:
 

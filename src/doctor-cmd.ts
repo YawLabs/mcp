@@ -60,6 +60,7 @@ import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./
 import { isOamLaunch, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
 import { isReadableStateVersion, loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
+import { collectSidecarSpecs, installedVersion, sidecarsRoot } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
@@ -793,6 +794,9 @@ interface OamRuntimeStatus {
   probe: OamProbe;
   dflt: DefaultRuntimeInfo;
   servers: Array<{ namespace: string; info: ServerRuntimeInfo }>;
+  /** The managed install (`yaw-mcp sidecars install`): where it is, and the
+   *  version of each package in it. Empty when it has never been run. */
+  managed: { root: string; packages: Array<{ pkg: string; version: string | null }> };
 }
 
 async function collectOamRuntimeStatus(opts: {
@@ -810,7 +814,15 @@ async function collectOamRuntimeStatus(opts: {
     namespace: s.namespace,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));
-  return { probe, dflt, servers };
+  // Report the version actually installed for each package the config asks
+  // for -- that is the number an oam-hosted server will run, and the one thing
+  // the config file itself cannot tell you.
+  const specs = collectSidecarSpecs(bundles?.config?.servers ?? []);
+  const managed = {
+    root: sidecarsRoot(opts.home),
+    packages: specs.map((s) => ({ pkg: s.pkg, version: installedVersion(s.pkg, opts.home) })),
+  };
+  return { probe, dflt, servers, managed };
 }
 
 function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: string) => void }): void {
@@ -853,6 +865,20 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
     const widest = servers.reduce((m, s) => Math.max(m, s.namespace.length), 0);
     for (const s of servers) {
       print(`    ${s.namespace.padEnd(widest)}  ${(s.info.runtime ?? "-").padEnd(4)}  ${s.info.reason}`);
+    }
+  }
+  // Which VERSION each sidecar will run. An oam-hosted server runs a copy from
+  // disk and cannot re-resolve "@latest" the way npx did, so the version is a
+  // fact about this machine that nothing else reports.
+  const { managed } = status;
+  if (managed.packages.length > 0) {
+    const anyInstalled = managed.packages.some((p) => p.version !== null);
+    print(`  managed install: ${anyInstalled ? managed.root : "none — run `yaw-mcp sidecars install`"}`);
+    if (anyInstalled) {
+      const widest = managed.packages.reduce((m, p) => Math.max(m, p.pkg.length), 0);
+      for (const p of managed.packages) {
+        print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not installed — resolves from the npx cache"}`);
+      }
     }
   }
   print("");

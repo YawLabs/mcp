@@ -104,6 +104,15 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     flags: ["--force", "--yes", "--help"],
   },
   { name: "list", description: "List the servers yaw-mcp loads locally", flags: ["--json", "--help"] },
+  // Positional is the literal subcommand, not a placeholder -- `install` is
+  // the only verb, and requiring it keeps room for later ones (list, prune)
+  // without a bare `yaw-mcp sidecars` having ever meant something else.
+  {
+    name: "sidecars",
+    description: "Install configured MCP servers into a managed directory",
+    positional: [["install"]],
+    flags: ["--json", "--help"],
+  },
   // Consent gate for a project-local .yaw-mcp/bundles.json. Flags mirror
   // parseTrustArgs in src/trust-cmd.ts -- keep them in sync.
   {

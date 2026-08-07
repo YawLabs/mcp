@@ -16,6 +16,16 @@ An opted-in sidecar silently ran on npx instead of oam whenever yaw-mcp itself w
 
 The result was the feature quietly doing nothing on the most common shape, made worse by `install` recommending `npm i -g @yawlabs/mcp` in order to host on oam. `doctor` reported those servers as "oam" the whole time, because it reports the policy decision rather than the spawn. The cache is now located from npm's own configuration, independent of how the broker was started, so all three shapes -- global, project, npx -- resolve. The only trace of this was a `debug`-level log line.
 
+**Added -- `yaw-mcp sidecars install`**
+
+Installs the npx-launched servers from `bundles.json` into `~/.yaw-mcp/sidecars`, and resolution prefers that tree over npm's npx cache. One copy per package at a version that is written down, and re-running the command is how it moves forward.
+
+This is the answer to the pinning note below. The npx cache is keyed by content hash, so it accumulates every version ever fetched and names none of them current; a managed install replaces that with a single deliberate answer. `yaw-mcp doctor` prints the installed version of each configured package.
+
+Deliberately not automatic: acquiring packages means network and minutes, and the connect path is what an MCP client blocks on while waiting for its tools. Nothing requires it -- without it, resolution falls back to the npx cache exactly as before.
+
+(npm does the installing, not `oam install`, which is frozen-lockfile only and so cannot acquire `@latest` into an empty directory.)
+
 **Changed -- an oam-hosted sidecar no longer self-updates, and now says so**
 
 `npx -y <pkg>@latest` re-resolves the tag on every spawn; `oam run <entry>` cannot, because oam has no fetch-on-demand. Once oam is the default, npx stops running for those servers, so the on-disk copy that supplied the entry also stops being refreshed and the version pins itself indefinitely.
