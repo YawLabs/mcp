@@ -1244,6 +1244,44 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toMatch(/plain\s+oam\s+oam is the default when installed/);
   });
 
+  it("points at `sidecars install` when the managed tree was never created", async () => {
+    // The empty state is the one most users see, and it is the line that tells
+    // them the command exists at all.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"] }],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+
+    expect(cap.text()).toContain("managed install: none");
+    expect(cap.text()).toContain("yaw-mcp sidecars install");
+  });
+
+  it("lists the installed version of each configured package when the tree exists", async () => {
+    // The version an oam-hosted sidecar will actually run is a fact about this
+    // machine that nothing else reports -- bundles.json only says "@latest".
+    writeLocalBundles({
+      version: 1,
+      servers: [
+        { namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] },
+        { namespace: "gone", name: "Gone", command: "npx", args: ["-y", "@yawlabs/not-installed@latest"] },
+      ],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+
+    expect(txt).toMatch(/@yawlabs\/fetch-mcp\s+0\.3\.6/);
+    // A configured package with nothing installed must say so rather than be
+    // omitted -- omission reads as "fine".
+    expect(txt).toMatch(/@yawlabs\/not-installed\s+not installed/);
+  });
+
   it("emits the oamRuntime block on the --json path (mirror of the text section)", async () => {
     writeLocalBundles({
       version: 1,
