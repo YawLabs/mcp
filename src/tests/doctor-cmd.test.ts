@@ -1238,7 +1238,10 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toContain("servers (local bundles.json):");
     expect(txt).toMatch(/fetch\s+oam\s+per-server runtime:"oam"/);
     expect(txt).toMatch(/dockerized\s+node\s+.*not node\/npx/);
-    expect(txt).toMatch(/plain\s+node\s+default \(no oam opt-in\)/);
+    // "plain" configures no runtime at all, and with a usable oam probe that
+    // now resolves to oam -- the reason names the default rather than an
+    // opt-in, so the two are still distinguishable in the output.
+    expect(txt).toMatch(/plain\s+oam\s+oam is the default when installed/);
   });
 
   it("emits the oamRuntime block on the --json path (mirror of the text section)", async () => {

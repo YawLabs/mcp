@@ -366,12 +366,17 @@ async function connectToUpstreamOnce(
     // pure optimization. disableOamRewrite is the boot-probe downgrade path:
     // the wrapper re-runs this function once with the rewrite suppressed so
     // the ORIGINAL node/npx command spawns.
-    const effectiveRuntime = config.runtime ?? (await defaultRuntime());
+    // `optedIn` is the difference between "the user asked for oam" and "oam is
+    // simply the default now". Both spawn on oam when it is available, but only
+    // the former warrants a warning when it isn't -- see default-runtime.ts.
+    const configured = config.runtime ?? (await defaultRuntime());
+    const optedIn = configured !== null;
+    const effectiveRuntime = configured ?? "oam";
     if (effectiveRuntime === "oam" && !disableOamRewrite && !oamDowngradedNamespaces.has(config.namespace)) {
       // Awaited since issue #91: the oam probe is async so a wedged oam binary
       // cannot block the event loop here. The probe result is cached, so only
       // the first connect of the process actually waits on it.
-      const rewritten = await resolveOamSpawn(resolved.command, resolved.args);
+      const rewritten = await resolveOamSpawn(resolved.command, resolved.args, optedIn);
       if (rewritten.command !== resolved.command) {
         attempt.oamRewritten = true;
         attempt.oamVersion = (await probeOam()).version;

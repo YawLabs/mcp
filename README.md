@@ -109,7 +109,28 @@ The entry it writes:
 }
 ```
 
-Two consequences worth knowing. It pins a path, so it does not re-resolve `@latest` on every spawn the way the npx entry does — `npm update -g` still picks up new versions, because it rewrites that path in place. And this is a **different setting** from `runtime: "oam"` in `bundles.json`, which hosts the *sidecars* yaw-mcp spawns; the two are independent.
+Two consequences worth knowing. It pins a path, so it does not re-resolve `@latest` on every spawn the way the npx entry does — `npm update -g` still picks up new versions, because it rewrites that path in place. And this setting is about the **broker itself**; which runtime the *sidecars* get is decided separately, below.
+
+### Which runtime the sidecars get
+
+When oam is installed and meets the minimum, yaw-mcp hosts the MCP servers it spawns on it. Nothing needs configuring — install oam and the sidecars move over. Without oam they run on node/npx exactly as before, and no warning is printed, because nothing was asked for.
+
+Only Node-based launches are rewritten. A server whose command is `docker`, `uvx`, or a native binary is left alone, as is an npx package that cannot be found on disk.
+
+To override, in `~/.yaw-mcp/bundles.json`:
+
+```json
+{
+  "defaultRuntime": "node",
+  "servers": [{ "namespace": "postgres", "runtime": "oam" }]
+}
+```
+
+- `runtime` on a server wins over everything, and `"node"` is the per-server escape hatch.
+- `defaultRuntime` at the top level sets the machine-wide default; `"node"` opts the whole machine out.
+- `YAW_MCP_DEFAULT_RUNTIME=node|oam` overrides `defaultRuntime` for one process.
+
+`yaw-mcp doctor` prints the resolved runtime for every configured server, with the reason — including the cases where oam was wanted but not used, so a silent fallback is visible rather than guessed at.
 
 ## CLI
 

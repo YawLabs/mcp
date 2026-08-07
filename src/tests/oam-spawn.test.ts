@@ -274,12 +274,19 @@ describe("resolveNpmEntry", () => {
   // Build a temp npx cache: the broker in cache "aaa", a sidecar in sibling
   // "bbb". `brokerUrl` is a module path under "aaa" so the resolver derives the
   // sibling caches from it.
-  function fixture(): { npx: string; brokerUrl: string; cleanup: () => void } {
+  //
+  // Every call below passes an EXPLICIT npmCache (null, or the fixture's own
+  // cache root). Letting it default would resolve the host's real npm cache,
+  // where these very package names are present in several versions -- the
+  // assertions would then pass or fail based on what the developer happens to
+  // have npx'd, which is exactly the machine-dependence the injectable
+  // parameter exists to prevent.
+  function fixture(): { root: string; npx: string; brokerUrl: string; cleanup: () => void } {
     const root = mkdtempSync(join(tmpdir(), "resolve-"));
     const npx = join(root, "_npx");
     mkdirSync(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist"), { recursive: true });
     const brokerUrl = pathToFileURL(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
-    return { npx, brokerUrl, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+    return { root, npx, brokerUrl, cleanup: () => rmSync(root, { recursive: true, force: true }) };
   }
   function writePkg(npx: string, pkg: string, json: Record<string, unknown>): string {
     const dir = join(npx, "bbb", "node_modules", ...pkg.split("/"));
@@ -300,7 +307,7 @@ describe("resolveNpmEntry", () => {
       exports: { ".": { import: "./dist/server.js", types: "./dist/server.d.ts" } },
     });
     try {
-      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null)).toBe(join(dir, "dist", "index.js"));
     } finally {
       cleanup();
     }
@@ -313,7 +320,9 @@ describe("resolveNpmEntry", () => {
       bin: { "mcp-server-memory": "dist/index.js" }, // bin key != unscoped name
     });
     try {
-      expect(resolveNpmEntry("@modelcontextprotocol/server-memory", brokerUrl)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveNpmEntry("@modelcontextprotocol/server-memory", brokerUrl, null)).toBe(
+        join(dir, "dist", "index.js"),
+      );
     } finally {
       cleanup();
     }
@@ -323,7 +332,7 @@ describe("resolveNpmEntry", () => {
     const { npx, brokerUrl, cleanup } = fixture();
     const dir = writePkg(npx, "libonly", { name: "libonly", main: "lib/main.js" });
     try {
-      expect(resolveNpmEntry("libonly", brokerUrl)).toBe(join(dir, "lib", "main.js"));
+      expect(resolveNpmEntry("libonly", brokerUrl, null)).toBe(join(dir, "lib", "main.js"));
     } finally {
       cleanup();
     }
@@ -332,7 +341,84 @@ describe("resolveNpmEntry", () => {
   it("returns null when the package is in no cache", async () => {
     const { brokerUrl, cleanup } = fixture();
     try {
-      expect(resolveNpmEntry("@yawlabs/nonexistent-mcp", brokerUrl)).toBeNull();
+      expect(resolveNpmEntry("@yawlabs/nonexistent-mcp", brokerUrl, null)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("finds an npx-cached sidecar when the broker is NOT itself under _npx", async () => {
+    // The globally-installed shape, and the one that was broken: a broker at
+    // <globalroot>/@yawlabs/mcp has no "_npx" segment in its path, so the
+    // path-derived cache search returned nothing and EVERY `npx -y <pkg>`
+    // sidecar silently stayed on npx -- while doctor reported it as "oam".
+    // Passing the cache root explicitly is what makes the lookup independent
+    // of how the broker itself was launched.
+    const { root, npx, cleanup } = fixture();
+    const globalUrl = pathToFileURL(join(root, "global", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
+    const dir = writePkg(npx, "@yawlabs/fetch-mcp", {
+      name: "@yawlabs/fetch-mcp",
+      bin: { "fetch-mcp": "./dist/index.js" },
+    });
+    try {
+      // Without the cache root it cannot be found at all...
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", globalUrl, null)).toBeNull();
+      // ...and with it, the same global broker reaches the same sidecar.
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", globalUrl, root)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("picks the highest version when the npx cache holds several copies", async () => {
+    // The cache is keyed by content hash, so a machine that has run a server
+    // for months keeps every version it ever fetched (15 copies of one sidecar
+    // is real). Iteration order is hash order, so "first hit" silently pinned
+    // an arbitrary build -- a config saying `@latest` running months-old code
+    // with nothing logged anywhere.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const mk = (hash: string, version: string) => {
+      const dir = join(npx, hash, "node_modules", "@yawlabs", "fetch-mcp");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "package.json"),
+        JSON.stringify({ name: "@yawlabs/fetch-mcp", version, bin: { "fetch-mcp": "./dist/index.js" } }),
+      );
+      return dir;
+    };
+    // The newest copy is deliberately placed so it sorts LAST. Directory order
+    // is what the old code followed, so an oldest-first layout is the only one
+    // that actually fails when "first hit wins" comes back.
+    mk("aaa0", "0.1.0");
+    mk("mmm5", "0.3.3");
+    const newest = mk("zzz9", "0.3.6");
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root)).toBe(join(newest, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("prefers a durable install over any cached copy, even a newer one", async () => {
+    // A real `npm i` is a deliberate choice and the single copy; the cache is
+    // incidental. Version order must not override that.
+    const { root, npx, cleanup } = fixture();
+    const home = join(root, "global", "node_modules");
+    const durable = join(home, "@yawlabs", "fetch-mcp");
+    mkdirSync(durable, { recursive: true });
+    writeFileSync(
+      join(durable, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+    const brokerUrl = pathToFileURL(join(home, "@yawlabs", "mcp", "dist", "index.js")).href;
+    const cachedDir = join(npx, "aaa0", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(cachedDir, { recursive: true });
+    writeFileSync(
+      join(cachedDir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "9.9.9", bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root)).toBe(join(durable, "dist", "index.js"));
     } finally {
       cleanup();
     }

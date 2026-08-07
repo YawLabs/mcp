@@ -631,22 +631,24 @@ describe("connectToUpstream oam runtime wiring", () => {
     // The gate fired with the (uv-resolved) command/args, exactly once -- the
     // boot-probe downgrade retry deliberately skips the rewrite ...
     expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledOnce();
-    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"], true);
     // ... and the REWRITTEN command/args are what actually get spawned first.
     expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/usr/bin/oam");
     expect(_sdkBehavior.stdioConstructions[0]?.args).toEqual(["run", "/cache/fetch/dist/index.js"]);
   });
 
-  it("does NOT touch the spawn command when runtime is unset", async () => {
+  it("still routes through oam when runtime is unset, but marked as not opted in", async () => {
+    // Unset now means oam-when-available, so the rewrite IS attempted. The
+    // third argument is what keeps that quiet: `false` says nothing was
+    // configured, so an absent oam must not warn -- otherwise every node-only
+    // install starts logging about a runtime its owner never asked for.
     const config = makeLocalConfig({ command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] });
     try {
       await connectToUpstream(config);
     } catch {
-      /* connect rejects; assert the original command was spawned */
+      /* connect rejects; assertions below */
     }
-    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
-    expect(_sdkBehavior.lastStdioArgs?.command).toBe("npx");
-    expect(_sdkBehavior.lastStdioArgs?.args).toEqual(["-y", "@yawlabs/fetch-mcp@latest"]);
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"], false);
   });
 
   it("does NOT touch the spawn command when runtime is 'node'", async () => {
@@ -692,7 +694,7 @@ describe("connectToUpstream config-level default runtime", () => {
     } catch {
       /* connect rejects; assertions below */
     }
-    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"]);
+    expect(vi.mocked(resolveOamSpawn)).toHaveBeenCalledWith("npx", ["-y", "@yawlabs/fetch-mcp@latest"], true);
     expect(_sdkBehavior.stdioConstructions[0]?.command).toBe("/usr/bin/oam");
   });
 
