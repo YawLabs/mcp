@@ -52,6 +52,37 @@ function dispatch(cmd: string, p: Promise<{ exitCode: number } | number>): void 
   });
 }
 
+/** Parse result shape shared by every subcommand parser below. `help` is
+ *  absent on the parsers that have no --help of their own. */
+type ParseResult<T> = { ok: true; options: T } | { ok: false; error: string; help?: boolean };
+
+/**
+ * The parse-then-dispatch tail every `{ok}`-shaped subcommand shares: a
+ * --help parse prints usage to stdout and exits 0, a real argv error goes to
+ * stderr and exits 2, and anything else hands the options to the runner.
+ *
+ * Sets process.exitCode instead of calling process.exit(), for the SAME
+ * reason dispatch() above and the top-level --help branch below do: a
+ * synchronous exit force-flushes the event loop and can TRUNCATE a buffered
+ * usage body when stdout is a slow pipe (`yaw-mcp install --help | less`).
+ * This was open-coded in 13 branches, every one of which called
+ * process.exit() right after the write -- the hazard the rest of the file
+ * takes care to avoid. Returning lets Node drain the write and exit on its
+ * own with the requested code.
+ */
+function run<T>(
+  cmd: string,
+  parsed: ParseResult<T>,
+  runner: (options: T) => Promise<{ exitCode: number } | number>,
+): void {
+  if (!parsed.ok) {
+    (parsed.help ? process.stdout : process.stderr).write(`${parsed.error}\n`);
+    process.exitCode = parsed.help ? 0 : 2;
+    return;
+  }
+  dispatch(cmd, runner(parsed.options));
+}
+
 // Subcommand dispatcher. `yaw-mcp` with no args (or with flags only) runs as
 // the MCP server that talks to Yaw MCP. Known subcommands branch off
 // before the YAW_MCP_TOKEN check so local-only commands like `compliance`,
@@ -61,45 +92,31 @@ const subcommand = process.argv[2];
 if (subcommand === "compliance") {
   dispatch("compliance", runComplianceCommand(process.argv.slice(3)));
 } else if (subcommand === "audit") {
-  const parsed = parseAuditArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("audit", runAudit(parsed.options));
+  run("audit", parseAuditArgs(process.argv.slice(3)), runAudit);
 } else if (subcommand === "foundry") {
+  // foundry's parser signals --help by returning USAGE as the error rather
+  // than by setting a `help` flag; normalize it onto the shared tail.
   const parsed = parseFoundryArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    // --help prints the usage to stdout and exits 0; real errors go to stderr.
-    const isHelp = parsed.error === FOUNDRY_USAGE;
-    (isHelp ? process.stdout : process.stderr).write(`${parsed.error}\n`);
-    process.exit(isHelp ? 0 : 2);
-  }
-  dispatch("foundry", runFoundryExport(parsed.options));
+  run("foundry", parsed.ok ? parsed : { ...parsed, help: parsed.error === FOUNDRY_USAGE }, runFoundryExport);
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
   // --help is now a successful parse with helpRequested=true (parser
   // returns { ok: true, options: { helpRequested: true } }); print USAGE
   // and exit 0. Real argv errors still come back as ok:false -> stderr + 2.
   if (parsed.ok && parsed.options.helpRequested) {
+    // Help is a SUCCESSFUL parse here, so it cannot ride the shared tail --
+    // but INSTALL_USAGE is multi-KB, so it still must not process.exit().
     process.stdout.write(`${INSTALL_USAGE}\n`);
-    process.exit(0);
+    process.exitCode = 0;
+  } else {
+    // Read CLAUDE_CONFIG_DIR here (not inside runInstall) so tests stay
+    // hermetic — they call runInstall directly and never inherit env state.
+    const claudeConfigDir =
+      process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
+        ? process.env.CLAUDE_CONFIG_DIR
+        : undefined;
+    run("install", parsed, (options) => runInstall({ ...options, claudeConfigDir }));
   }
-  if (!parsed.ok) {
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  // Read CLAUDE_CONFIG_DIR here (not inside runInstall) so tests stay
-  // hermetic — they call runInstall directly and never inherit env state.
-  const claudeConfigDir =
-    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-      ? process.env.CLAUDE_CONFIG_DIR
-      : undefined;
-  dispatch("install", runInstall({ ...parsed.options, claudeConfigDir }));
 } else if (subcommand === "doctor") {
   const doctorArgs = process.argv.slice(3);
   const doctorJson = doctorArgs.includes("--json");
@@ -116,157 +133,49 @@ if (subcommand === "compliance") {
     process.stdout.write(
       "Usage: yaw-mcp doctor [--json]\n\n  Print a diagnostic of your yaw-mcp setup.\n\n  --json  Emit machine-readable JSON instead of text.\n",
     );
-    process.exit(0);
-  }
-  if (doctorUnknowns.length > 0) {
+    process.exitCode = 0;
+  } else if (doctorUnknowns.length > 0) {
     const quoted = doctorUnknowns.map((a) => `"${a}"`).join(", ");
     process.stderr.write(`yaw-mcp doctor: unknown argument${doctorUnknowns.length > 1 ? "s" : ""} ${quoted}\n`);
-    process.exit(2);
+    process.exitCode = 2;
+  } else {
+    dispatch("doctor", runDoctor({ json: doctorJson }));
   }
-  dispatch("doctor", runDoctor({ json: doctorJson }));
 } else if (subcommand === "reset-learning") {
   const parsed = parseResetLearningArgs(process.argv.slice(3));
   if (parsed.kind === "help") {
     process.stdout.write(`${RESET_LEARNING_USAGE}\n`);
-    process.exit(0);
-  }
-  if (parsed.kind === "error") {
+    process.exitCode = 0;
+  } else if (parsed.kind === "error") {
     process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
+    process.exitCode = 2;
+  } else {
+    dispatch("reset-learning", runResetLearning());
   }
-  dispatch("reset-learning", runResetLearning());
 } else if (subcommand === "servers") {
-  const parsed = parseServersArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("servers", runServersCommand(parsed.options));
+  run("servers", parseServersArgs(process.argv.slice(3)), runServersCommand);
 } else if (subcommand === "sidecars") {
-  const parsed = parseSidecarsArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("sidecars", runSidecarsInstall(parsed.options));
+  run("sidecars", parseSidecarsArgs(process.argv.slice(3)), runSidecarsInstall);
 } else if (subcommand === "bundles") {
-  const parsed = parseBundlesArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("bundles", runBundlesCommand(parsed.options));
+  run("bundles", parseBundlesArgs(process.argv.slice(3)), runBundlesCommand);
 } else if (subcommand === "completion") {
-  const parsed = parseCompletionArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("completion", runCompletion(parsed.options));
+  run("completion", parseCompletionArgs(process.argv.slice(3)), runCompletion);
 } else if (subcommand === "upgrade") {
-  const parsed = parseUpgradeArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("upgrade", runUpgrade(parsed.options));
+  run("upgrade", parseUpgradeArgs(process.argv.slice(3)), runUpgrade);
 } else if (subcommand === "try") {
-  const parsed = parseTryArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("try", runTry(parsed.options));
+  run("try", parseTryArgs(process.argv.slice(3)), runTry);
 } else if (subcommand === "try-cleanup") {
-  const parsed = parseTryCleanupArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("try-cleanup", runTryCleanup(parsed.options));
+  run("try-cleanup", parseTryCleanupArgs(process.argv.slice(3)), runTryCleanup);
 } else if (subcommand === "add") {
-  const parsed = parseAddArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("add", runAdd(parsed.options));
+  run("add", parseAddArgs(process.argv.slice(3)), runAdd);
 } else if (subcommand === "remove") {
-  const parsed = parseRemoveArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("remove", runRemove(parsed.options));
+  run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
 } else if (subcommand === "list") {
-  const parsed = parseListArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("list", runList(parsed.options));
+  run("list", parseListArgs(process.argv.slice(3)), runList);
 } else if (subcommand === "secrets") {
-  const parsed = parseSecretsArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("secrets", runSecrets(parsed.options));
+  run("secrets", parseSecretsArgs(process.argv.slice(3)), runSecrets);
 } else if (subcommand === "trust") {
-  const parsed = parseTrustArgs(process.argv.slice(3));
-  if (!parsed.ok) {
-    if ((parsed as { help?: boolean }).help) {
-      process.stdout.write(`${parsed.error}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`${parsed.error}\n`);
-    process.exit(2);
-  }
-  dispatch("trust", runTrust(parsed.options));
+  run("trust", parseTrustArgs(process.argv.slice(3)), runTrust);
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
   yaw-mcp — one install, every MCP server, managed from one place.
@@ -372,7 +281,8 @@ if (subcommand === "compliance") {
                                server \`runtime\` use this; per-server
                                \`"runtime": "node"\` opts out. Same knob as
                                bundles.json top-level \`defaultRuntime\`
-                               (env wins). Unset = node (today's default).
+                               (env wins). Unset = oam when it is installed
+                               and meets the minimum version, else node.
     YAW_MCP_TRUST_PROJECT         Set to \`1\` to skip the consent check on a
                                project-local .yaw-mcp/bundles.json and load
                                it unconditionally. FOR CI/AUTOMATION ONLY --
@@ -425,7 +335,7 @@ if (subcommand === "compliance") {
       ? ` Did you mean: ${suggestions.join(", ")}?`
       : " Run `yaw-mcp --help` for the list of subcommands.";
   process.stderr.write(`yaw-mcp: unknown subcommand "${subcommand}".${hint}\n`);
-  process.exit(2);
+  process.exitCode = 2;
 } else {
   // Long-form leading-dash near-miss of a known flag alias (e.g.
   // `--versionn`, `--hepl`). Without this it would fall through to
@@ -438,7 +348,7 @@ if (subcommand === "compliance") {
   const flagSuggestions = subcommand ? suggestFlag(subcommand) : [];
   if (flagSuggestions.length > 0) {
     process.stderr.write(`yaw-mcp: unknown flag "${subcommand}". Did you mean: ${flagSuggestions.join(", ")}?\n`);
-    process.exit(2);
+    process.exitCode = 2;
   } else {
     // Startup failure path. runServer() registers a last-resort
     // unhandledRejection handler (see below) BEFORE its first await, so a

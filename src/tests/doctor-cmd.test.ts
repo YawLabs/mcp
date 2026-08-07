@@ -1282,6 +1282,44 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toMatch(/@yawlabs\/not-installed\s+not installed/);
   });
 
+  it("mirrors the managed-install block into --json, not just the text report", async () => {
+    // collectOamRuntimeStatus already pays for these reads on BOTH paths;
+    // emitting them only on the text path made the shared-collector claim
+    // false and hid the one machine-level fact (which version an oam-hosted
+    // sidecar actually runs) from every --json consumer.
+    writeLocalBundles({
+      version: 1,
+      servers: [
+        { namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] },
+        { namespace: "gone", name: "Gone", command: "npx", args: ["-y", "@yawlabs/not-installed@latest"] },
+      ],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamOk,
+    });
+
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime.managed.root).toBe(join(synthHome, ".yaw-mcp", "sidecars"));
+    // A configured package with nothing installed reports null rather than
+    // being omitted -- omission reads as "fine", same rule as the text path.
+    expect(parsed.oamRuntime.managed.packages).toEqual([
+      { pkg: "@yawlabs/fetch-mcp", version: "0.3.6" },
+      { pkg: "@yawlabs/not-installed", version: null },
+    ]);
+  });
+
   it("emits the oamRuntime block on the --json path (mirror of the text section)", async () => {
     writeLocalBundles({
       version: 1,

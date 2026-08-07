@@ -82,8 +82,12 @@ export async function describeDefaultRuntime(
  * (cheap, and lets a respawned broker pick up a change); the bundles.json
  * top-level `defaultRuntime` is read once and cached -- this sits on the
  * upstream connect path.
+ *
+ * `cwd`/`home` default to the real process values (production passes
+ * nothing); they exist so the bundles path is testable without depending on
+ * the machine the suite runs on.
  */
-export async function defaultRuntime(): Promise<RuntimeChoice | null> {
+export async function defaultRuntime(opts: { cwd?: string; home?: string } = {}): Promise<RuntimeChoice | null> {
   const raw = process.env.YAW_MCP_DEFAULT_RUNTIME;
   if (raw === "oam" || raw === "node") return raw;
   if (raw !== undefined && raw !== "" && !warnedInvalidEnv) {
@@ -91,8 +95,22 @@ export async function defaultRuntime(): Promise<RuntimeChoice | null> {
     log("warn", 'Ignoring invalid YAW_MCP_DEFAULT_RUNTIME (expected "oam" or "node")', { value: raw });
   }
   if (bundlesDefaultCache === undefined) {
-    const bundles = await loadLocalBundles({ cwd: process.cwd() }).catch(() => ({ defaultRuntime: undefined }));
-    bundlesDefaultCache = bundles.defaultRuntime ?? null;
+    const bundles = await loadLocalBundles({ cwd: opts.cwd ?? process.cwd(), home: opts.home }).catch(() => null);
+    // A bundles.json that EXISTS but yielded no config (unreadable, or JSON
+    // that will not parse) is a degraded read, not an answer -- and it is
+    // indistinguishable from "nothing configured" once it reaches the cache.
+    // That matters now that unset means oam-when-installed: caching it would
+    // silently INVERT an explicit `defaultRuntime: "node"` for the rest of
+    // the process. Return the fallback for this call and let the next connect
+    // re-read instead.
+    //
+    // Only the degraded-AND-empty pair is left uncached. The healthy shapes
+    // all still cache on the first call, including "no bundles.json anywhere"
+    // (path null), so the connect path does not re-read per spawn.
+    const degraded = bundles === null || (bundles.config === null && bundles.path !== null);
+    const resolved = bundles?.defaultRuntime ?? null;
+    if (degraded && resolved === null) return null;
+    bundlesDefaultCache = resolved;
   }
   return bundlesDefaultCache;
 }

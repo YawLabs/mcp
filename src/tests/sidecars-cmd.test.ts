@@ -400,7 +400,7 @@ describe("runSidecarsInstall", () => {
       command: "npx",
       args: ["-y", "@yawlabs/fetch-mcp@latest"],
     };
-    const capture = async (servers: unknown[], npmExit: number) => {
+    const capture = async (servers: unknown[], npmExit: number, onNpm?: () => void) => {
       writeBundles(servers);
       let out = "";
       await runSidecarsInstall({
@@ -410,23 +410,40 @@ describe("runSidecarsInstall", () => {
         out: (s) => {
           out += s;
         },
-        runNpm: async () => npmExit,
+        runNpm: async () => {
+          onNpm?.();
+          return npmExit;
+        },
       });
       return JSON.parse(out);
     };
+    // Stand in for what npm would have produced, so one capture is a REAL
+    // success. Without it every "ok" case here was actually the tree-is-empty
+    // path, which is how `error: null` on an exit-1 result stayed pinned.
+    const landPackage = () => {
+      const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    };
 
-    // nothing to do / npm failed / npm succeeded but the tree is empty
+    // nothing to do / npm failed / npm exited 0 but nothing landed / installed
     const empty = await capture([{ ...npxServer, command: "docker", args: ["run", "x"] }], 0);
     const failed = await capture([npxServer], 1);
-    const ok = await capture([npxServer], 0);
+    const emptyTree = await capture([npxServer], 0);
+    const ok = await capture([npxServer], 0, landPackage);
 
-    for (const doc of [empty, failed, ok]) {
+    for (const doc of [empty, failed, emptyTree, ok]) {
       expect(Object.keys(doc).sort()).toEqual(KEYS);
       expect(typeof doc.root).toBe("string");
     }
     expect(empty.reason).toBe("no-npx-servers");
     expect(failed.error).toContain("npm exited 1");
+    // Exit 1, so `error` has to say so -- a consumer branching on `error`
+    // would otherwise read a tree that resolved nothing as a clean install.
+    expect(emptyTree.error).toContain("no requested package resolved");
+    // Only a genuine install reports no error.
     expect(ok.error).toBeNull();
+    expect(ok.installed[0].version).toBe("0.3.6");
   });
 
   it("reports which spec won when a package is configured at two versions", async () => {

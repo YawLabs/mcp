@@ -409,10 +409,16 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   print();
   print("These versions are now fixed. Re-run this command to move them forward.");
 
-  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped }));
-  // Exit non-zero when nothing at all resolved -- a scripted caller should be
-  // able to tell "installed" from "npm succeeded but the tree is empty".
-  return { exitCode: missing.length === installed.length ? 1 : 0, installed, lines };
+  // npm exited 0 but not one requested package resolved in the tree. A
+  // scripted caller has to be able to tell that from a real install, so it
+  // exits non-zero AND fills in `error` -- the field this document exists to
+  // make the single success/failure discriminator. Reporting exit 1 with
+  // `error: null` meant a consumer branching on `error` read it as clean.
+  const nothingLanded = missing.length === installed.length;
+  const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
+
+  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped, error }));
+  return { exitCode: nothingLanded ? 1 : 0, installed, lines };
 }
 
 /** True when a managed install exists. Lets a caller skip the per-package

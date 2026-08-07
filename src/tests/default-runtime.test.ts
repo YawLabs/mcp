@@ -90,6 +90,33 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     process.env.YAW_MCP_DEFAULT_RUNTIME = "node";
     expect(await defaultRuntime()).toBe("node");
   });
+
+  it("does not cache a bundles.json that exists but will not parse", async () => {
+    // The cache holds for the process lifetime, and `null` now means
+    // oam-when-installed -- so caching a failed read as "nothing configured"
+    // would silently INVERT an explicit `defaultRuntime: "node"` until the
+    // broker restarts. A degraded read has to stay retryable.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const file = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+    writeFileSync(file, "{ not json at all");
+
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    // Same process, file now readable: the next call must SEE it rather than
+    // serve the null it just returned.
+    writeFileSync(file, JSON.stringify({ version: 1, servers: [], defaultRuntime: "node" }));
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+  });
+
+  it("still caches the healthy no-bundles.json case", async () => {
+    // Only degraded-AND-empty is exempt. "Nothing configured anywhere" is the
+    // common shape and sits on the connect path, so it must not re-read per
+    // spawn -- pin that the exemption did not swallow the cache whole.
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+  });
 });
 
 describe("describeServerRuntime", () => {

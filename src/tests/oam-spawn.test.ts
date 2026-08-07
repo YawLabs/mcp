@@ -16,6 +16,7 @@ import {
   probeOam,
   resetNpmCacheDir,
   resetOamBinCache,
+  resetPinnedSidecarLog,
   resolveNpmEntry,
   resolveOamSpawn,
   resolveStableNpmEntry,
@@ -177,6 +178,17 @@ describe("rewriteForOam", () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/npmjs-mcp"], { oamBin: null, resolveEntry: () => "/x" })).toEqual({
       command: "npx",
       args: ["-y", "@yawlabs/npmjs-mcp"],
+    });
+  });
+
+  it("keeps a server's own --yes, stripping only the flags npx itself consumes", async () => {
+    // The filter used to run over the WHOLE arg list, so a `--yes` meant for
+    // the SERVER was eaten -- the oam launch and the npx fallback then handed
+    // the child different argv, which is the one thing a rewrite billed as
+    // "a pure optimization, never a correctness dependency" must never do.
+    expect(rewriteForOam("npx", ["-y", "some-mcp", "--yes", "--port", "1"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/pkgs/some-mcp/dist/index.js", "--", "--yes", "--port", "1"],
     });
   });
 
@@ -526,6 +538,41 @@ describe("resolveNpmEntry", () => {
     } finally {
       cleanup();
     }
+  });
+
+  it("reports a managed-tree pin with the command that actually moves it forward", () => {
+    // The notice exists because an oam-hosted sidecar cannot re-resolve
+    // "@latest" the way npx did. It used to fire ONLY for npx-cache hits, so
+    // it was silent for the managed tree -- i.e. for the exact install path
+    // `sidecars install` exists to promote. And the cache's `npx -y ...@latest`
+    // advice would be the wrong command to print there anyway.
+    const { root, brokerUrl, cleanup } = fixture();
+    const managed = join(root, "managed", "node_modules");
+    const managedPkg = join(managed, "@yawlabs", "fetch-mcp");
+    mkdirSync(managedPkg, { recursive: true });
+    writeFileSync(
+      join(managedPkg, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.0", bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+    resetPinnedSidecarLog();
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed);
+    } finally {
+      spy.mockRestore();
+      cleanup();
+    }
+
+    const note = lines.find((l) => l.includes("will not self-update"));
+    expect(note, "a managed-tree hit reported no pin at all").toBeDefined();
+    expect(note).toContain("yaw-mcp sidecars install");
+    expect(note).toContain("0.3.0");
+    // Never the npx-cache advice, which cannot refresh the managed tree.
+    expect(note).not.toContain("npx -y");
   });
 
   it("prefers a durable install over any cached copy, even a newer one", async () => {

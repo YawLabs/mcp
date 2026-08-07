@@ -59,7 +59,7 @@ export function packageName(spec: string): string {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.8.2";
+export const MIN_OAM_VERSION = "0.8.3";
 
 /** One "oam is missing" warning per process, not one per opted-in server.
  *  Cleared by resetOamBinCache so tests do not leak it across cases. */
@@ -438,8 +438,15 @@ export function rewriteForOam(
     // npx's arg parser here is not worth it -- but say WHY at debug level:
     // from the outside, an opted-in server quietly running on node is
     // indistinguishable from oam being absent.
-    const positional = args.filter((a) => a !== "-y" && a !== "--yes");
-    const [spec, ...rest] = positional;
+    //
+    // -y/--yes are skipped only where npx ITSELF consumes them: before the
+    // spec. Everything after the spec belongs to the SERVER, so `rest` is
+    // sliced from the original argv rather than from a filtered copy.
+    // Filtering the whole list also ate a server's own trailing `--yes`, so
+    // the oam launch and the npx fallback handed the child different
+    // arguments -- the one thing this rewrite promises never to do.
+    const specIdx = args.findIndex((a) => a !== "-y" && a !== "--yes");
+    const spec = specIdx === -1 ? undefined : args[specIdx];
     if (!spec) return { command, args };
     if (spec.startsWith("-")) {
       log("debug", "npx launch carries flags yaw-mcp does not parse; staying on npx instead of oam", {
@@ -456,7 +463,7 @@ export function rewriteForOam(
       log("debug", "npx package has no on-disk entry; staying on npx instead of oam", { package: pkg });
       return { command, args };
     }
-    return toOam(entry, rest);
+    return toOam(entry, args.slice(specIdx + 1));
   }
 
   return { command, args };
@@ -703,9 +710,21 @@ export function resolveNpmEntry(
   // is the only one the user asked yaw-mcp to maintain, so when it and some
   // ambient node_modules both have the package, the managed answer is the one
   // they can actually move forward by re-running the command.
-  for (const nodeModules of [...(managedRoot ? [managedRoot] : []), ...ownNodeModules(fromUrl)]) {
+  const durable: Array<{ nodeModules: string; source: PinSource }> = [
+    ...(managedRoot ? [{ nodeModules: managedRoot, source: "managed" as const }] : []),
+    ...ownNodeModules(fromUrl).map((nodeModules) => ({ nodeModules, source: "durable" as const })),
+  ];
+  for (const { nodeModules, source } of durable) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
-    if (hit) return hit.entry;
+    if (hit) {
+      // Reported here too, not just for cache hits: a durable copy pins just
+      // as hard as a cached one -- `oam run <entry>` cannot re-resolve
+      // "@latest" wherever the entry came from. Leaving these silent meant
+      // the notice never fired for the managed tree, i.e. for the exact
+      // install path `sidecars install` exists to promote.
+      notePinnedSidecar(pkg, hit.version, source);
+      return hit.entry;
+    }
   }
 
   // The npx cache is keyed by content hash, not by package, so a machine that
@@ -730,9 +749,23 @@ export function resolveNpmEntry(
       best = hit;
     }
   }
-  if (best !== null) notePinnedSidecar(pkg, best.version);
+  if (best !== null) notePinnedSidecar(pkg, best.version, "npx-cache");
   return best?.entry ?? null;
 }
+
+/** Where a resolved entry came from. Governs the command that actually moves
+ *  that copy forward -- the three are genuinely different, and naming the
+ *  wrong one is worse than naming none. */
+type PinSource = "managed" | "durable" | "npx-cache";
+
+/** How to refresh a pinned copy, per source. `npm install <pkg>@latest` is
+ *  scoped to whichever tree the entry was found in, which is what a durable
+ *  install (global or project) responds to. */
+const REFRESH_COMMAND: Record<PinSource, (pkg: string) => string> = {
+  managed: () => "yaw-mcp sidecars install",
+  durable: (pkg) => `npm install ${pkg}@latest`,
+  "npx-cache": (pkg) => `npx -y ${pkg}@latest --help`,
+};
 
 /** Packages already reported as pinned -- one line each, not one per connect. */
 const pinnedReported = new Set<string>();
@@ -756,13 +789,14 @@ export function resetPinnedSidecarLog(): void {
  * Logged at info, not debug: a debug-level line is exactly how the resolver's
  * failure to find these packages at all went unnoticed.
  */
-function notePinnedSidecar(pkg: string, version: string | null): void {
+function notePinnedSidecar(pkg: string, version: string | null, source: PinSource): void {
   if (pinnedReported.has(pkg)) return;
   pinnedReported.add(pkg);
   log("info", "hosting sidecar on oam from an on-disk copy; it will not self-update the way npx does", {
     package: pkg,
     version: version ?? "unknown",
-    refreshWith: `npx -y ${pkg}@latest --help`,
+    source,
+    refreshWith: REFRESH_COMMAND[source](pkg),
   });
 }
 

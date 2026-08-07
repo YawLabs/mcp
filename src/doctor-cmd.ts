@@ -241,6 +241,14 @@ export interface DoctorJsonSnapshot {
     defaultRuntimeSource: "env" | "bundles" | null;
     defaultRuntimePath: string | null;
     servers: Array<{ namespace: string; runtime: "oam" | "node" | null; reason: string }>;
+    /** The managed install (`yaw-mcp sidecars install`): where it lives, and
+     *  the version of each configured package in it. A null version means the
+     *  package is not in the managed tree, so that server resolves from the
+     *  npx cache instead. This is the version an oam-hosted sidecar will
+     *  ACTUALLY run -- bundles.json only says "@latest" and oam cannot
+     *  re-resolve it, so nothing else reports this. `packages` is empty when
+     *  no npx-launched server is configured. */
+    managed: { root: string; packages: Array<{ pkg: string; version: string | null }> };
   };
   upgrade: { current: string; latest: string | null; stale: boolean };
   diagnosis: { exitCode: number; summary: string };
@@ -682,6 +690,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
       runtime: s.info.runtime,
       reason: s.info.reason,
     })),
+    // Mirrored, not dropped. collectOamRuntimeStatus already pays for these
+    // reads on both paths, and the text renderer has always printed them --
+    // emitting only on the text path made the shared-collector claim above
+    // false and hid the one machine-level fact from every --json consumer.
+    managed: oamStatus.managed,
   };
 
   // DEPRECATED key, emitted with its original nested shape (both members
