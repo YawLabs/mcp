@@ -319,6 +319,12 @@ if (subcommand === "compliance") {
   Maintenance:
     upgrade                  Show (or --run) the command that bumps
                              @yawlabs/mcp to the latest version.
+    sidecars install         Install your servers into ~/.yaw-mcp/sidecars so
+                             they run from one known version. Worth doing when
+                             servers run on oam: it runs the copy already on
+                             disk and cannot re-resolve \`@latest\` the way npx
+                             did. Re-run to move them forward; \`doctor\` shows
+                             the version each one is on.
     reset-learning           Clear cross-session learning history
                              (~/.yaw-mcp/state.json).
     completion <shell>       Print a shell completion script for bash, zsh,

@@ -339,8 +339,29 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   };
 
   if (specs.length === 0) {
+    // Three different empty states, and telling a first-time user with no
+    // config at all that their bundles.json has no npx servers describes a
+    // file that does not exist. `config` is null exactly when neither the
+    // user-global nor an approved project file was found, so the cases are
+    // distinguishable -- and each wants a different next step.
+    if (bundles.config === null) {
+      print("No servers configured yet -- nothing to install.");
+      print("Add one with `yaw-mcp add <slug>`, then run this again.");
+      printSkipped();
+      if (opts.json) write(jsonDocument(root, { reason: "no-config", skipped }));
+      return { exitCode: 0, installed: [], lines };
+    }
+    if (skipped.length > 0) {
+      // Every npx server was a git or path target. Saying "no npx-launched
+      // servers" here would flatly contradict the config the user is looking
+      // at, so lead with the skips instead of appending them as a footnote.
+      print("Nothing to install -- every npx server points at a git or path target.");
+      printSkipped();
+      if (opts.json) write(jsonDocument(root, { reason: "only-non-registry-specs", skipped }));
+      return { exitCode: 0, installed: [], lines };
+    }
     print("No npx-launched servers in bundles.json -- nothing to install.");
-    printSkipped();
+    print("docker, uvx, and native commands run as configured; only npx servers are installed here.");
     if (opts.json) write(jsonDocument(root, { reason: "no-npx-servers", skipped }));
     return { exitCode: 0, installed: [], lines };
   }

@@ -26,6 +26,12 @@ Deliberately not automatic: acquiring packages means network and minutes, and th
 
 npm does the installing, not `oam install`: that is frozen-lockfile only, so it cannot acquire `@latest` into an empty directory; its `--precompile` has nothing to do for packages that ship compiled JavaScript, which every MCP server does; and running it over an npm-installed tree skips lifecycle scripts unless the package is trusted, which would quietly cost puppeteer its browser download.
 
+Only npx servers naming a registry package are installed. An npx launch pointing at a git or path target -- `npx -y github:owner/repo`, `npx -y ./local-server` -- is skipped and named in the output, and keeps using npx. Those specs carry no `@version` separator to cut at, so they would otherwise have become dependency *keys* (`{"github:owner/repo": "latest"}`), which npm rejects -- failing the install for every other package too. Resolving them properly would mean fetching the target just to learn the name it declares, which is more than this command should do.
+
+Two servers pinning one package at different versions is reported rather than silently resolved: a flat `node_modules` holds a single version, so the command names the one it installed instead of letting the loser start on something it did not ask for.
+
+`--json` emits the same keys on every path -- `root`, `installed`, `reason`, `error`, `conflicts`, `skipped` -- so a caller can read the result without first determining which path it took. `reason` distinguishes the empty states: `no-config` (nothing configured yet), `no-npx-servers` (a docker/uvx-only config), and `only-non-registry-specs`.
+
 **Changed -- an oam-hosted sidecar no longer self-updates, and now says so**
 
 `npx -y <pkg>@latest` re-resolves the tag on every spawn; `oam run <entry>` cannot, because oam has no fetch-on-demand. Once oam is the default, npx stops running for those servers, so the on-disk copy that supplied the entry also stops being refreshed and the version pins itself indefinitely.

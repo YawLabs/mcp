@@ -129,7 +129,11 @@ Installs the npx-launched servers from your `bundles.json` into `~/.yaw-mcp/side
 
 It is not automatic and nothing requires it. Acquiring packages means network and minutes, and the connect path is what an MCP client blocks on while waiting for its tools; a first connect that silently turned into an npm install would be the wrong trade. Without it, resolution falls back to the npx cache exactly as before.
 
+Only npx servers naming a **registry package** are installed. An npx launch pointing at a git or path target — `npx -y github:owner/repo`, `npx -y ./local-server` — is skipped and named in the output; those keep using npx, since resolving them would mean fetching the target just to learn the name it declares. Two servers pinning the same package at different versions is also reported: one flat `node_modules` holds a single version, so the command tells you which one it installed rather than letting the loser start on something it did not ask for.
+
 `yaw-mcp doctor` prints the installed version of each configured package under OAM RUNTIME, so a pinned or missing one is visible. To keep npx's self-updating behavior for a particular server instead, set `runtime: "node"` on it.
+
+`--json` emits the same keys on every run — `root`, `installed`, `reason`, `error`, `conflicts`, `skipped` — so a script can read the result without first working out which path it took.
 
 To override, in `~/.yaw-mcp/bundles.json`:
 
