@@ -24,7 +24,7 @@ This is the answer to the pinning note below. The npx cache is keyed by content 
 
 Deliberately not automatic: acquiring packages means network and minutes, and the connect path is what an MCP client blocks on while waiting for its tools. Nothing requires it -- without it, resolution falls back to the npx cache exactly as before.
 
-(npm does the installing, not `oam install`, which is frozen-lockfile only and so cannot acquire `@latest` into an empty directory.)
+npm does the installing, not `oam install`: that is frozen-lockfile only, so it cannot acquire `@latest` into an empty directory; its `--precompile` has nothing to do for packages that ship compiled JavaScript, which every MCP server does; and running it over an npm-installed tree skips lifecycle scripts unless the package is trusted, which would quietly cost puppeteer its browser download.
 
 **Changed -- an oam-hosted sidecar no longer self-updates, and now says so**
 
