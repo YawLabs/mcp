@@ -230,7 +230,7 @@ describe("resolveStableNpmEntry", () => {
     const fromUrl = pathToFileURL(join(dir, "dist", "index.js")).href;
     try {
       // Same package, same path, opposite answers -- that IS the distinction.
-      expect(resolveNpmEntry("@yawlabs/mcp", fromUrl)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveNpmEntry("@yawlabs/mcp", fromUrl, null, null)).toBe(join(dir, "dist", "index.js"));
       expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -376,7 +376,7 @@ describe("resolveNpmEntry", () => {
       exports: { ".": { import: "./dist/server.js", types: "./dist/server.d.ts" } },
     });
     try {
-      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null)).toBe(join(dir, "dist", "index.js"));
     } finally {
       cleanup();
     }
@@ -389,7 +389,7 @@ describe("resolveNpmEntry", () => {
       bin: { "mcp-server-memory": "dist/index.js" }, // bin key != unscoped name
     });
     try {
-      expect(resolveNpmEntry("@modelcontextprotocol/server-memory", brokerUrl, null)).toBe(
+      expect(resolveNpmEntry("@modelcontextprotocol/server-memory", brokerUrl, null, null)).toBe(
         join(dir, "dist", "index.js"),
       );
     } finally {
@@ -401,7 +401,7 @@ describe("resolveNpmEntry", () => {
     const { npx, brokerUrl, cleanup } = fixture();
     const dir = writePkg(npx, "libonly", { name: "libonly", main: "lib/main.js" });
     try {
-      expect(resolveNpmEntry("libonly", brokerUrl, null)).toBe(join(dir, "lib", "main.js"));
+      expect(resolveNpmEntry("libonly", brokerUrl, null, null)).toBe(join(dir, "lib", "main.js"));
     } finally {
       cleanup();
     }
@@ -410,7 +410,7 @@ describe("resolveNpmEntry", () => {
   it("returns null when the package is in no cache", async () => {
     const { brokerUrl, cleanup } = fixture();
     try {
-      expect(resolveNpmEntry("@yawlabs/nonexistent-mcp", brokerUrl, null)).toBeNull();
+      expect(resolveNpmEntry("@yawlabs/nonexistent-mcp", brokerUrl, null, null)).toBeNull();
     } finally {
       cleanup();
     }
@@ -431,9 +431,9 @@ describe("resolveNpmEntry", () => {
     });
     try {
       // Without the cache root it cannot be found at all...
-      expect(resolveNpmEntry("@yawlabs/fetch-mcp", globalUrl, null)).toBeNull();
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", globalUrl, null, null)).toBeNull();
       // ...and with it, the same global broker reaches the same sidecar.
-      expect(resolveNpmEntry("@yawlabs/fetch-mcp", globalUrl, root)).toBe(join(dir, "dist", "index.js"));
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", globalUrl, root, null)).toBe(join(dir, "dist", "index.js"));
     } finally {
       cleanup();
     }
@@ -462,7 +462,34 @@ describe("resolveNpmEntry", () => {
     mk("mmm5", "0.3.3");
     const newest = mk("zzz9", "0.3.6");
     try {
-      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root)).toBe(join(newest, "dist", "index.js"));
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(join(newest, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("prefers the managed sidecar tree over a newer cached copy", async () => {
+    // `yaw-mcp sidecars install` maintains this tree, and re-running that
+    // command is how a version moves forward. A newer cache copy winning
+    // would make the managed version unreachable and the command pointless.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const managed = join(root, "managed", "node_modules");
+    const managedPkg = join(managed, "@yawlabs", "fetch-mcp");
+    mkdirSync(managedPkg, { recursive: true });
+    writeFileSync(
+      join(managedPkg, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.0", bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+    const cached = join(npx, "aaa0", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(cached, { recursive: true });
+    writeFileSync(
+      join(cached, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "9.9.9", bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed)).toBe(
+        join(managedPkg, "dist", "index.js"),
+      );
     } finally {
       cleanup();
     }
@@ -487,7 +514,7 @@ describe("resolveNpmEntry", () => {
       JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "9.9.9", bin: { "fetch-mcp": "./dist/index.js" } }),
     );
     try {
-      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root)).toBe(join(durable, "dist", "index.js"));
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(join(durable, "dist", "index.js"));
     } finally {
       cleanup();
     }

@@ -25,6 +25,26 @@ export function cacheDir(): string {
 // or blow away atomically.
 export const CONFIG_DIRNAME = ".yaw-mcp";
 
+/** Subdirectory of the config dir holding the sidecar install that
+ *  `yaw-mcp sidecars install` manages. */
+export const SIDECARS_DIRNAME = "sidecars";
+
+/** Where `yaw-mcp sidecars install` installs MCP server packages. */
+export function sidecarsRoot(home: string = homedir()): string {
+  return path.join(userConfigDir(home), SIDECARS_DIRNAME);
+}
+
+/**
+ * The `node_modules` of the managed sidecar install.
+ *
+ * Lives here rather than beside the command that writes it because
+ * oam-spawn's resolver reads it, and oam-spawn is imported BY that command --
+ * putting the path there would be an import cycle.
+ */
+export function sidecarsNodeModules(home: string = homedir()): string {
+  return path.join(sidecarsRoot(home), "node_modules");
+}
+
 // User-global yaw-mcp config dir: `~/.yaw-mcp/`. Always this; no XDG
 // variation -- config is small, human-edited, and lives next to shell
 // dotfiles like `.gitconfig` rather than under a cache root.

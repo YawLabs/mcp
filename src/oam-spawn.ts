@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./logger.js";
+import { sidecarsNodeModules } from "./paths.js";
 
 /**
  * Strip an npm version/tag suffix from a package spec:
@@ -682,20 +683,27 @@ function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
  * (read straight from package.json) rather than require.resolve's library "."
  * export. `null` keeps the npx/node command.
  *
- * `fromUrl` and `npmCache` are injectable for testing; they default to this
- * module's own URL and the resolved npm cache. Tests should pass `npmCache`
- * explicitly (a temp dir, or null) so they never read the host's real cache.
+ * `fromUrl`, `npmCache`, and `managedRoot` are injectable for testing; they
+ * default to this module's own URL, the resolved npm cache, and the managed
+ * sidecar tree. Tests should pass `npmCache` and `managedRoot` explicitly (a
+ * temp dir, or null) so they never read the host's real cache or home dir.
  */
 export function resolveNpmEntry(
   pkg: string,
   fromUrl: string = import.meta.url,
   npmCache: string | null = npmCacheDir(fromUrl),
+  managedRoot: string | null = sidecarsNodeModules(),
 ): string | null {
   const parts = pkg.split("/"); // "@scope/name" -> ["@scope", "name"]
 
   // A durable install is authoritative: it is a deliberate `npm i`, it is the
   // single copy, and it is what npx itself would prefer. Take it outright.
-  for (const nodeModules of ownNodeModules(fromUrl)) {
+  //
+  // The managed tree (`yaw-mcp sidecars install`) comes first among these: it
+  // is the only one the user asked yaw-mcp to maintain, so when it and some
+  // ambient node_modules both have the package, the managed answer is the one
+  // they can actually move forward by re-running the command.
+  for (const nodeModules of [...(managedRoot ? [managedRoot] : []), ...ownNodeModules(fromUrl)]) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
     if (hit) return hit.entry;
   }

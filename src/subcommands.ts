@@ -38,6 +38,7 @@ export const KNOWN_SUBCOMMANDS = [
   "doctor",
   "reset-learning",
   "servers",
+  "sidecars",
   "bundles",
   "completion",
   "upgrade",
