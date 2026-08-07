@@ -14,6 +14,7 @@ import {
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
+import { MIN_OAM_VERSION } from "../oam-spawn.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -270,7 +271,10 @@ describe("mergePermissionsAllow", () => {
  *  so a maintainer with oam + a global @yawlabs/mcp would get an oam entry
  *  where CI gets npx -- these pin the world each test means to assert. */
 const OAM_ABSENT = async () => ({ bin: null, version: null, belowMin: false });
-const OAM_PRESENT = async () => ({ bin: "/usr/local/bin/oam", version: "0.8.1", belowMin: false });
+// Derived from the constant, not pinned: MIN_OAM_VERSION tracks the latest oam
+// release and so moves every release. A hardcoded version here would silently
+// become a below-min build that the fixture still claims is usable.
+const OAM_PRESENT = async () => ({ bin: "/usr/local/bin/oam", version: MIN_OAM_VERSION, belowMin: false });
 const OAM_ENTRY = "/opt/nm/@yawlabs/mcp/dist/index.js";
 
 describe("runInstall — settings.json merge edge cases (claude-code)", () => {

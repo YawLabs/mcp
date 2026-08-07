@@ -43,21 +43,22 @@ export function packageName(spec: string): string {
 }
 
 /**
- * Minimum oam version yaw-mcp will host sidecars on. Older builds predate the
- * extra-fd stdio + npx-bin-resolution fixes MCP sidecars rely on; hosting on
- * them produces hangs that LOOK like server bugs. Below-min is treated the
- * same as oam-absent: the spawn falls back to node/npx (one warn log).
+ * Minimum oam version yaw-mcp will host sidecars on.
  *
- * Raised 0.6.0 -> 0.8.1: everything below 0.8.1 carries three defects in the
- * request-body and socket paths this workload sits directly on top of. The
- * worst is that an unlistened error on a request stream was fatal, so a client
- * hanging up mid-upload killed the process -- for a broker, that is every
- * hosted server dying at once. Alongside it the aggregate body budget was
- * charged on no platform, and socket writes never signalled backpressure, so a
- * slow consumer buffered without bound. A version gate exists precisely so a
- * runtime that fails this way is not silently hosted.
+ * POLICY: this tracks the LATEST oam release. Bump it with every oam release,
+ * not only when a release happens to fix something this code noticed. oam is
+ * pre-1.0 and moves fast, the install channel (oamjs.org) only ever hands out
+ * the current release, and hosting sidecars on a runtime older than that means
+ * debugging against a build nobody else is running. There is no support
+ * commitment for older builds, so there is no reason to admit them.
+ *
+ * Below-min is treated the same as oam-absent: the spawn falls back to
+ * node/npx with one warn log naming both versions. That is a safe outcome --
+ * the user gets node, which is what they had before oam existed -- so an
+ * aggressive floor costs nothing but a fallback, while a lax one silently
+ * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.8.1";
+export const MIN_OAM_VERSION = "0.8.2";
 
 /** One "oam is missing" warning per process, not one per opted-in server.
  *  Cleared by resetOamBinCache so tests do not leak it across cases. */

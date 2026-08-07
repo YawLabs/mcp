@@ -20,9 +20,11 @@ The result was the feature quietly doing nothing on the most common shape, made 
 
 The npx cache is keyed by content hash, so a machine that has run a server for months holds every version it ever fetched. Resolution took the first directory-listing hit, which is hash order, so a server configured as `@latest` could be started from a months-old build with nothing logged. The highest version present now wins, and a durable `npm i` install still takes precedence over any cached copy.
 
-**Changed -- minimum oam version is 0.8.1**
+**Changed -- minimum oam version is 0.8.2, and now tracks the latest oam release**
 
-Raised from 0.6.0. Builds below 0.8.1 carry three defects in the request-body and socket paths this workload sits on -- most seriously, an unlistened error on a request stream was fatal, which for a broker means every hosted server dying at once. A below-minimum oam is refused rather than silently used, and `install` now says so when oam is missing.
+Raised from 0.6.0. The floor is no longer set by whichever release happened to fix something yaw-mcp noticed; it tracks the current oam release and moves with every one. oam is pre-1.0 and moves fast, and oamjs.org only ever installs the current release, so hosting sidecars on anything older means running a build nobody else is.
+
+A below-minimum oam is refused rather than silently used -- the servers run on node instead, which is where they were before oam existed, with one warning naming both versions. `install` now says so when oam is missing.
 
 **Changed -- `LICENSE` renamed to `LICENSE.md`**
 
