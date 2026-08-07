@@ -710,9 +710,18 @@ export function resolveNpmEntry(
   // is the only one the user asked yaw-mcp to maintain, so when it and some
   // ambient node_modules both have the package, the managed answer is the one
   // they can actually move forward by re-running the command.
+  const npxMarker = `${sep}_npx${sep}`;
   const durable: Array<{ nodeModules: string; source: PinSource }> = [
     ...(managedRoot ? [{ nodeModules: managedRoot, source: "managed" as const }] : []),
-    ...ownNodeModules(fromUrl).map((nodeModules) => ({ nodeModules, source: "durable" as const })),
+    // The broker's OWN node_modules sits UNDER _npx whenever yaw-mcp was
+    // itself launched via `npx -y @yawlabs/mcp` -- the common install shape,
+    // not an edge case. Calling that "durable" would advertise `npm install
+    // <pkg>@latest`, which cannot refresh a content-hashed cache directory.
+    // resolveStableNpmEntry draws the same distinction for the same reason.
+    ...ownNodeModules(fromUrl).map((nodeModules) => ({
+      nodeModules,
+      source: (nodeModules.includes(npxMarker) ? "npx-cache" : "durable") as PinSource,
+    })),
   ];
   for (const { nodeModules, source } of durable) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
@@ -788,16 +797,27 @@ export function resetPinnedSidecarLog(): void {
  *
  * Logged at info, not debug: a debug-level line is exactly how the resolver's
  * failure to find these packages at all went unnoticed.
+ *
+ * EXCEPT for the managed tree, which is the one source the user explicitly
+ * chose: they ran `sidecars install`, that command printed the versions on
+ * its way out, and doctor reports them on demand. Repeating it per package on
+ * every boot restates a decision they already made, so it drops to debug. The
+ * other two sources are genuinely invisible otherwise, which is the whole
+ * reason this notice exists.
  */
 function notePinnedSidecar(pkg: string, version: string | null, source: PinSource): void {
   if (pinnedReported.has(pkg)) return;
   pinnedReported.add(pkg);
-  log("info", "hosting sidecar on oam from an on-disk copy; it will not self-update the way npx does", {
-    package: pkg,
-    version: version ?? "unknown",
-    source,
-    refreshWith: REFRESH_COMMAND[source](pkg),
-  });
+  log(
+    source === "managed" ? "debug" : "info",
+    "hosting sidecar on oam from an on-disk copy; it will not self-update the way npx does",
+    {
+      package: pkg,
+      version: version ?? "unknown",
+      source,
+      refreshWith: REFRESH_COMMAND[source](pkg),
+    },
+  );
 }
 
 /**

@@ -540,20 +540,16 @@ describe("resolveNpmEntry", () => {
     }
   });
 
-  it("reports a managed-tree pin with the command that actually moves it forward", () => {
-    // The notice exists because an oam-hosted sidecar cannot re-resolve
-    // "@latest" the way npx did. It used to fire ONLY for npx-cache hits, so
-    // it was silent for the managed tree -- i.e. for the exact install path
-    // `sidecars install` exists to promote. And the cache's `npx -y ...@latest`
-    // advice would be the wrong command to print there anyway.
-    const { root, brokerUrl, cleanup } = fixture();
-    const managed = join(root, "managed", "node_modules");
-    const managedPkg = join(managed, "@yawlabs", "fetch-mcp");
-    mkdirSync(managedPkg, { recursive: true });
-    writeFileSync(
-      join(managedPkg, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.0", bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+  // The pinned-sidecar notice, per SOURCE. The three sources want different
+  // things: the managed tree is a decision the user already made, while an
+  // ambient durable copy and a cache copy are invisible without this line --
+  // and each is refreshed by a different command, so naming the wrong one is
+  // worse than saying nothing.
+
+  /** Pinned-sidecar notices the logger put on stderr while `fn` ran. Debug
+   *  lines never reach stderr at the default LOG_LEVEL, so an empty result
+   *  means "said nothing at info". */
+  function captureNotices(fn: () => void): string[] {
     resetPinnedSidecarLog();
     const lines: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
@@ -561,18 +557,68 @@ describe("resolveNpmEntry", () => {
       return true;
     });
     try {
-      resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed);
+      fn();
     } finally {
       spy.mockRestore();
+    }
+    return lines.filter((l) => l.includes("will not self-update"));
+  }
+
+  function writeResolvablePkg(nodeModules: string, version: string): void {
+    const dir = join(nodeModules, "@yawlabs", "fetch-mcp");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version, bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+  }
+
+  it("stays quiet about a managed-tree pin, which the user opted into", () => {
+    // `sidecars install` prints these versions on its way out and doctor
+    // reports them on demand, so an info line per package on every boot only
+    // restates a decision the user already made.
+    const { root, brokerUrl, cleanup } = fixture();
+    const managed = join(root, "managed", "node_modules");
+    writeResolvablePkg(managed, "0.3.0");
+    try {
+      expect(captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed))).toEqual([]);
+    } finally {
       cleanup();
     }
+  });
 
-    const note = lines.find((l) => l.includes("will not self-update"));
-    expect(note, "a managed-tree hit reported no pin at all").toBeDefined();
-    expect(note).toContain("yaw-mcp sidecars install");
-    expect(note).toContain("0.3.0");
-    // Never the npx-cache advice, which cannot refresh the managed tree.
-    expect(note).not.toContain("npx -y");
+  it("reports a durable install with the command that refreshes it", () => {
+    // An ambient global/project node_modules is not something the user aimed
+    // at yaw-mcp, so the pin genuinely is invisible without this.
+    const { root, cleanup } = fixture();
+    const nm = join(root, "global", "node_modules");
+    writeResolvablePkg(nm, "0.1.0");
+    const brokerUrl = pathToFileURL(join(nm, "@yawlabs", "mcp", "dist", "index.js")).href;
+    try {
+      const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
+      expect(note, "a durable hit reported no pin at all").toBeDefined();
+      expect(note).toContain("npm install @yawlabs/fetch-mcp@latest");
+      expect(note).toContain("0.1.0");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("calls the broker's OWN node_modules a cache when it sits under _npx", () => {
+    // `npx -y @yawlabs/mcp` puts the broker itself inside the npx cache, so
+    // ownNodeModules hands back a CACHE path -- the common install shape, not
+    // an edge case. Classifying that as durable advertised `npm install`,
+    // which cannot refresh a content-hashed cache directory.
+    const { npx, brokerUrl, cleanup } = fixture();
+    writeResolvablePkg(join(npx, "aaa", "node_modules"), "0.2.0");
+    try {
+      const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
+      expect(note).toBeDefined();
+      expect(note).toContain("npx -y @yawlabs/fetch-mcp@latest");
+      expect(note, "cache path advertised the durable refresh command").not.toContain("npm install");
+    } finally {
+      cleanup();
+    }
   });
 
   it("prefers a durable install over any cached copy, even a newer one", async () => {
