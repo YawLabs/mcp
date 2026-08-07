@@ -338,6 +338,9 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       log("warn", "oam is installed but below the minimum supported version; falling back to node", {
         oamVersion: version,
         minVersion: MIN_OAM_VERSION,
+        // The floor tracks the latest release, so below-min always means out
+        // of date, and oam updates itself in place.
+        updateWith: "oam self-update",
       });
       return publish({ bin: null, version, belowMin: true });
     }
@@ -386,6 +389,9 @@ export function resetOamBinCache(): void {
   oamProbeCache = undefined;
   oamProbeInFlight = undefined;
   oamProbeGeneration++;
+  // Cleared here too so the once-per-package pinned notice does not leak
+  // across cases in tests that already reset the probe.
+  pinnedReported.clear();
 }
 
 export interface OamRewriteDeps {
@@ -501,9 +507,12 @@ function npmrcCache(file: string): string | null {
   return null;
 }
 
-// Memoized: the answer cannot change within a process, and this sits behind
-// the connect path.
-let npmCacheDirCache: string | null | undefined;
+// Memoized PER fromUrl: the answer cannot change within a process, and this
+// sits behind the connect path. Keyed rather than a single slot because the
+// result genuinely depends on the argument -- a single slot would make the
+// first caller's fromUrl decide the answer for every later one, which is a
+// parameter that silently stops mattering.
+const npmCacheDirCache = new Map<string, string | null>();
 
 /**
  * npm's cache directory -- the parent of `_npx`, where `npx -y <pkg>` puts the
@@ -527,14 +536,16 @@ let npmCacheDirCache: string | null | undefined;
  * search" -- callers fall back to node/npx as always.
  */
 export function npmCacheDir(fromUrl: string = import.meta.url): string | null {
-  if (npmCacheDirCache !== undefined) return npmCacheDirCache;
-  npmCacheDirCache = resolveNpmCacheDir(fromUrl);
-  return npmCacheDirCache;
+  const cached = npmCacheDirCache.get(fromUrl);
+  if (cached !== undefined) return cached;
+  const resolved = resolveNpmCacheDir(fromUrl);
+  npmCacheDirCache.set(fromUrl, resolved);
+  return resolved;
 }
 
-/** Reset the memoized npm cache dir (test hook). */
+/** Reset the memoized npm cache dirs (test hook). */
 export function resetNpmCacheDir(): void {
-  npmCacheDirCache = undefined;
+  npmCacheDirCache.clear();
 }
 
 function resolveNpmCacheDir(fromUrl: string): string | null {
@@ -623,11 +634,23 @@ export function ownNodeModules(fromUrl: string = import.meta.url): string[] {
  * exports.=dist/server.js) AND throws ERR_PACKAGE_PATH_NOT_EXPORTED on an
  * ESM-only `exports` with no `require`/`default` condition. Reading
  * package.json directly sidesteps the package's own `exports` gating entirely.
+ *
+ * Returns the declared `version` alongside the entry. Choosing between cached
+ * copies needs it, and this function has already parsed the file the version
+ * lives in -- reading it a second time would mean two reads and two JSON
+ * parses per candidate, across every npx cache directory (well over a hundred
+ * on a machine that has used npx for a while) on the connect path.
  */
-function packageEntry(pkgDir: string, pkg: string): string | null {
+interface PackageHit {
+  entry: string;
+  /** null when the package declares no usable `version` string. */
+  version: string | null;
+}
+
+function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
   const pjPath = join(pkgDir, "package.json");
   if (!existsSync(pjPath)) return null;
-  let j: { bin?: string | Record<string, string>; main?: string; name?: string };
+  let j: { bin?: string | Record<string, string>; main?: string; name?: string; version?: unknown };
   try {
     j = JSON.parse(readFileSync(pjPath, "utf8"));
   } catch {
@@ -644,7 +667,10 @@ function packageEntry(pkgDir: string, pkg: string): string | null {
   }
   if (!rel && typeof j.main === "string") rel = j.main;
   if (!rel) return null;
-  return isAbsolute(rel) ? rel : join(pkgDir, rel);
+  return {
+    entry: isAbsolute(rel) ? rel : join(pkgDir, rel),
+    version: typeof j.version === "string" ? j.version : null,
+  };
 }
 
 /**
@@ -670,8 +696,8 @@ export function resolveNpmEntry(
   // A durable install is authoritative: it is a deliberate `npm i`, it is the
   // single copy, and it is what npx itself would prefer. Take it outright.
   for (const nodeModules of ownNodeModules(fromUrl)) {
-    const entry = packageEntry(join(nodeModules, ...parts), pkg);
-    if (entry) return entry;
+    const hit = packageEntry(join(nodeModules, ...parts), pkg);
+    if (hit) return hit.entry;
   }
 
   // The npx cache is keyed by content hash, not by package, so a machine that
@@ -682,32 +708,54 @@ export function resolveNpmEntry(
   // ran a months-old build with no warning anywhere. Pick the highest version
   // instead, which is the closest on-disk answer to what `@latest` asked for.
   const roots = new Set([...npxCacheNodeModules(fromUrl), ...npmCacheNpxNodeModules(npmCache)]);
-  let best: string | null = null;
-  let bestVersion: string | null = null;
+  let best: PackageHit | null = null;
   for (const nodeModules of roots) {
-    const dir = join(nodeModules, ...parts);
-    const entry = packageEntry(dir, pkg);
-    if (!entry) continue;
-    const version = packageVersion(dir);
+    const hit = packageEntry(join(nodeModules, ...parts), pkg);
+    if (!hit) continue;
     // An unversioned candidate only wins when nothing else has been found:
     // compareVersions returns 0 for unparseable input, so it can never
     // displace a real version.
-    if (best === null || (version !== null && (bestVersion === null || compareVersions(version, bestVersion) > 0))) {
-      best = entry;
-      bestVersion = version;
+    if (
+      best === null ||
+      (hit.version !== null && (best.version === null || compareVersions(hit.version, best.version) > 0))
+    ) {
+      best = hit;
     }
   }
-  return best;
+  if (best !== null) notePinnedSidecar(pkg, best.version);
+  return best?.entry ?? null;
 }
 
-/** A package's declared version, for choosing between cached copies. */
-function packageVersion(pkgDir: string): string | null {
-  try {
-    const v = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")).version;
-    return typeof v === "string" ? v : null;
-  } catch {
-    return null;
-  }
+/** Packages already reported as pinned -- one line each, not one per connect. */
+const pinnedReported = new Set<string>();
+
+/** Reset the pinned-sidecar log dedupe (test hook). */
+export function resetPinnedSidecarLog(): void {
+  pinnedReported.clear();
+}
+
+/**
+ * Say, once per package, that a sidecar is running from an on-disk copy rather
+ * than through npx.
+ *
+ * This is the one user-visible consequence of hosting on oam that is otherwise
+ * invisible. `npx -y <pkg>@latest` re-resolves the tag on every spawn, so those
+ * servers used to update themselves; `oam run <entry>` cannot, because oam has
+ * no fetch-on-demand. Worse, once oam is the default, npx stops running for
+ * these servers at all, so the cache that supplied the entry also stops being
+ * refreshed -- the version pins itself indefinitely.
+ *
+ * Logged at info, not debug: a debug-level line is exactly how the resolver's
+ * failure to find these packages at all went unnoticed.
+ */
+function notePinnedSidecar(pkg: string, version: string | null): void {
+  if (pinnedReported.has(pkg)) return;
+  pinnedReported.add(pkg);
+  log("info", "hosting sidecar on oam from an on-disk copy; it will not self-update the way npx does", {
+    package: pkg,
+    version: version ?? "unknown",
+    refreshWith: `npx -y ${pkg}@latest --help`,
+  });
 }
 
 /**
@@ -736,16 +784,21 @@ export function resolveStableNpmEntry(pkg: string, fromUrl: string = import.meta
   const npxMarker = `${sep}_npx${sep}`;
   for (const nodeModules of ownNodeModules(fromUrl)) {
     if (nodeModules.includes(npxMarker)) continue;
-    const entry = packageEntry(join(nodeModules, ...pkg.split("/")), pkg);
-    if (entry) return entry;
+    const hit = packageEntry(join(nodeModules, ...pkg.split("/")), pkg);
+    if (hit) return hit.entry;
   }
   return null;
 }
 
 /**
- * Resolve a server's launch to run on oam when it has opted in
- * (`config.runtime === "oam"`). A no-op for non-Node commands and a safe Node
- * fallback when oam isn't installed or the package can't be resolved on disk.
+ * Resolve a server's launch to run on oam unless it has opted OUT -- oam is
+ * the default whenever it is installed and meets MIN_OAM_VERSION. A no-op for
+ * non-Node commands and a safe Node fallback when oam isn't installed or the
+ * package can't be resolved on disk.
+ *
+ * `optedIn` says whether oam was actually ASKED for (per-server `runtime` or a
+ * config default) as opposed to merely being the default; it only governs
+ * whether an absent oam is worth a warning.
  */
 export async function resolveOamSpawn(
   command: string,
