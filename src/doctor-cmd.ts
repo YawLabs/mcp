@@ -819,6 +819,11 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
   print("OAM RUNTIME");
   if (probe.belowMin) {
     print(`  binary:  installed (v${probe.version}) — below min ${MIN_OAM_VERSION}; IGNORED, servers run on node`);
+    // The floor tracks the latest oam release, so "below min" is always
+    // "out of date" rather than "wrong build" -- and oam updates itself in
+    // place. Naming the one command that fixes it beats re-running an
+    // installer that has to be looked up.
+    print("           fix: oam self-update");
   } else if (probe.bin === null) {
     print("  binary:  not installed — node/npx spawns are used directly");
   } else {

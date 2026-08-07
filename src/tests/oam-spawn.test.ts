@@ -8,11 +8,13 @@ import {
   isOamCommand,
   isOamLaunch,
   MIN_OAM_VERSION,
+  npmCacheDir,
   npxCacheNodeModules,
   OAM_PROBE_TIMEOUT_MS,
   packageName,
   parseOamVersion,
   probeOam,
+  resetNpmCacheDir,
   resetOamBinCache,
   resolveNpmEntry,
   resolveOamSpawn,
@@ -266,6 +268,73 @@ describe("resolveStableNpmEntry", () => {
       expect(resolveStableNpmEntry("@yawlabs/mcp", fromUrl)).toBe(join(dir, "dist", "index.js"));
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("npmCacheDir", () => {
+  // npm injects npm_config_* into scripts it runs, and that value takes
+  // precedence over every npmrc -- so it has to be cleared or these assertions
+  // measure the runner instead of the resolver.
+  const savedEnv = process.env.npm_config_cache;
+  beforeEach(() => {
+    delete process.env.npm_config_cache;
+    resetNpmCacheDir();
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.npm_config_cache;
+    else process.env.npm_config_cache = savedEnv;
+    resetNpmCacheDir();
+  });
+
+  /** A broker at <root>/node_modules/@yawlabs/mcp/dist/index.js whose sibling
+   *  npm carries a builtin npmrc pointing at `cache`. */
+  function brokerWithNpmrc(cache: string): { url: string; cleanup: () => void } {
+    const root = mkdtempSync(join(tmpdir(), "npmcache-"));
+    const nm = join(root, "node_modules");
+    mkdirSync(join(nm, "@yawlabs", "mcp", "dist"), { recursive: true });
+    mkdirSync(join(nm, "npm"), { recursive: true });
+    writeFileSync(join(nm, "npm", "npmrc"), `prefix=${root}\ncache=${cache}\n`);
+    return {
+      url: pathToFileURL(join(nm, "@yawlabs", "mcp", "dist", "index.js")).href,
+      cleanup: () => rmSync(root, { recursive: true, force: true }),
+    };
+  }
+
+  it("reads the cache out of npm's builtin npmrc", () => {
+    // The case that matters: version managers (scoop, nvm, volta) relocate the
+    // cache in the BUILTIN npmrc beside npm, not in the user's ~/.npmrc.
+    const a = brokerWithNpmrc(join(tmpdir(), "cache-A"));
+    try {
+      expect(npmCacheDir(a.url)).toBe(join(tmpdir(), "cache-A"));
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("memoizes per fromUrl, so a second caller does not inherit the first's answer", () => {
+    // A single memo slot would return cache-A here for BOTH brokers -- the
+    // parameter would silently stop mattering after the first call.
+    const a = brokerWithNpmrc(join(tmpdir(), "cache-A"));
+    const b = brokerWithNpmrc(join(tmpdir(), "cache-B"));
+    try {
+      expect(npmCacheDir(a.url)).toBe(join(tmpdir(), "cache-A"));
+      expect(npmCacheDir(b.url)).toBe(join(tmpdir(), "cache-B"));
+      expect(npmCacheDir(a.url)).toBe(join(tmpdir(), "cache-A")); // still cached
+    } finally {
+      a.cleanup();
+      b.cleanup();
+    }
+  });
+
+  it("lets npm_config_cache win over any npmrc", () => {
+    const a = brokerWithNpmrc(join(tmpdir(), "cache-A"));
+    process.env.npm_config_cache = join(tmpdir(), "cache-ENV");
+    resetNpmCacheDir();
+    try {
+      expect(npmCacheDir(a.url)).toBe(join(tmpdir(), "cache-ENV"));
+    } finally {
+      a.cleanup();
     }
   });
 });

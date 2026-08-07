@@ -117,6 +117,8 @@ When oam is installed and meets the minimum, yaw-mcp hosts the MCP servers it sp
 
 Only Node-based launches are rewritten. A server whose command is `docker`, `uvx`, or a native binary is left alone, as is an npx package that cannot be found on disk.
 
+**One tradeoff worth knowing.** `npx -y <pkg>@latest` re-resolves that tag on every spawn, so those servers update themselves. `oam run <entry>` cannot — oam has no fetch-on-demand, so it runs the copy already on disk, and because npx then stops running for that server, the copy stops being refreshed. The version pins itself until something fetches a newer one. yaw-mcp logs the resolved version once per package at startup so this is visible rather than silent, and picks the newest copy present. To refresh a pinned sidecar, run it through npx once (`npx -y <pkg>@latest --help`) or install it durably; to keep npx's self-updating behavior for a given server, set `runtime: "node"` on it.
+
 To override, in `~/.yaw-mcp/bundles.json`:
 
 ```json
