@@ -21,10 +21,24 @@
 // trade. Nothing breaks without running it; resolution falls back to the cache
 // exactly as before.
 //
-// Why npm and not `oam install`: oam's installer is frozen-lockfile only ("the
-// default and only mode for MVP"), so it reproduces an existing lockfile and
-// cannot acquire `@latest` into an empty directory. npm creates the lockfile;
-// `oam install --precompile` becomes useful against it afterwards.
+// Why npm and not `oam install`, which sounds like the obvious tool here:
+//
+//   * It is frozen-lockfile only ("the default and only mode for MVP"), so it
+//     reproduces an existing lockfile and cannot acquire `@latest` into an
+//     empty directory. Something has to create the lockfile first.
+//   * Its `--precompile` buys nothing for this workload. It pre-compiles
+//     TypeScript found in installed packages, and MCP servers ship compiled
+//     JavaScript to npm -- measured across every sidecar in the default
+//     bundle, the count of runnable .ts files is zero and the precompile
+//     cache comes back empty.
+//   * Running it OVER an npm-installed tree is worse than useless: it skips
+//     lifecycle scripts unless the package is trusted (`oam trust add`), so a
+//     server that needs a postinstall -- puppeteer downloading a browser --
+//     silently loses it and fails at spawn rather than at install.
+//
+// So npm does the install, and this file does not chain `oam install` after
+// it. That is a deliberate decision with the measurement behind it, not an
+// oversight to be tidied up later.
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
