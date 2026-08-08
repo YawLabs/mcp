@@ -1,7 +1,7 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BUNDLES_FILENAME,
   loadLocalBundles,
@@ -17,6 +17,35 @@ import { CONFIG_DIRNAME } from "../paths.js";
 // SATISFIED, so the project-precedence cases keep testing precedence.
 import { grantTrust } from "../trust.js";
 
+// The unreadable-project-file shapes this module discriminates (EACCES,
+// ENOTDIR, ELOOP) are all attacker-controlled ERRNOS, and the code's job is to
+// tell them apart from ENOENT/EISDIR -- not to produce them. Staging them on
+// disk needs POSIX (Windows reports the `.yaw-mcp`-is-a-file shape as ENOENT,
+// has no chmod 000, and needs a privileged account for symlinks), so the errno
+// is injected at the readFile boundary instead and the discrimination is
+// asserted everywhere. Reads of every other path pass straight through.
+const { readFileErrors } = vi.hoisted(() => ({ readFileErrors: new Map<string, string>() }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const readFile = ((target: unknown, ...rest: unknown[]) => {
+    const code = typeof target === "string" ? readFileErrors.get(target) : undefined;
+    if (code !== undefined) {
+      const err: NodeJS.ErrnoException = new Error(`${code}: injected read failure, open '${String(target)}'`);
+      err.code = code;
+      return Promise.reject(err);
+    }
+    return (actual.readFile as (...a: unknown[]) => unknown)(target, ...rest);
+  }) as unknown as typeof actual.readFile;
+  return { ...actual, readFile };
+});
+
+/** Make every read of `path` fail with `code`, the way a hostile repo shape
+ *  (or a lock) makes it fail for real. */
+function failReadsOf(path: string, code: string): void {
+  readFileErrors.set(path, code);
+}
+
 let synthHome: string;
 let synthCwd: string;
 
@@ -30,6 +59,8 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
+  readFileErrors.clear();
+  vi.restoreAllMocks();
 });
 
 function writeBundles(dir: string, content: unknown) {
@@ -403,37 +434,28 @@ describe("loadLocalBundles", () => {
 
 // Fix 1: readBundlesAt -- ENOENT/EISDIR -> exists:false; other errors -> exists:true
 describe("readBundlesAt error discrimination (fix 1)", () => {
-  it.skipIf(process.platform === "win32")(
-    "EPERM/EACCES on an APPROVED project file does NOT fall through to user-global",
-    async () => {
-      // Write a valid user-global so a fallthrough would succeed.
-      writeBundles(synthHome, {
-        version: 1,
-        servers: [{ namespace: "global", name: "Global", command: "npx" }],
-      });
-      // Write a valid project file, APPROVE it, then revoke all permissions.
-      // Approval is what makes the location authoritative: a `chmod 000` on a
-      // file the user vetted must not silently swap in a different config.
-      await writeTrustedProjectBundles(synthCwd, {
-        version: 1,
-        servers: [{ namespace: "project", name: "Project", command: "npx" }],
-      });
-      const path = projectBundlesPath(synthCwd);
-      chmodSync(path, 0o000);
-      try {
-        const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-        // exists:true committed to project path -- config is null (unreadable),
-        // but the global file must NOT have been loaded.
-        expect(r.config).toBeNull();
-        expect(r.config?.servers?.some((s) => s.namespace === "global")).toBeFalsy();
-        // A warning must be present for the unreadable file.
-        expect(r.warnings.some((w) => w.includes("could not read"))).toBe(true);
-      } finally {
-        // Restore perms so afterEach rmSync can clean up.
-        chmodSync(path, 0o644);
-      }
-    },
-  );
+  it("EPERM/EACCES on an APPROVED project file does NOT fall through to user-global", async () => {
+    // Write a valid user-global so a fallthrough would succeed.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "global", name: "Global", command: "npx" }],
+    });
+    // Write a valid project file, APPROVE it, then make it unreadable.
+    // Approval is what makes the location authoritative: losing read access to
+    // a file the user vetted must not silently swap in a different config.
+    await writeTrustedProjectBundles(synthCwd, {
+      version: 1,
+      servers: [{ namespace: "project", name: "Project", command: "npx" }],
+    });
+    failReadsOf(projectBundlesPath(synthCwd), "EACCES");
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    // exists:true committed to project path -- config is null (unreadable),
+    // but the global file must NOT have been loaded.
+    expect(r.config).toBeNull();
+    expect(r.config?.servers?.some((s) => s.namespace === "global")).toBeFalsy();
+    // A warning must be present for the unreadable file.
+    expect(r.warnings.some((w) => w.includes("could not read"))).toBe(true);
+  });
 
   it("ENOENT (no file) still returns exists:false and falls through to global", async () => {
     writeBundles(synthHome, {
@@ -473,9 +495,14 @@ describe("an UNAPPROVED unreadable project file cannot blank out user-global", (
     expect(r.path).toBe(localBundlesPath(join(synthHome, CONFIG_DIRNAME)));
   });
 
-  it.skipIf(process.platform === "win32")("ENOTDIR warns that the project file was ignored", async () => {
+  // ENOTDIR is what `.yaw-mcp` committed as a regular FILE yields on POSIX
+  // (Windows collapses that shape to ENOENT, which is a different branch), so
+  // the errno is injected on an otherwise ordinary project file. What is under
+  // test is the message the loader builds for a read it could not complete.
+  it("ENOTDIR warns that the project file was ignored", async () => {
     writeBundles(synthHome, GLOBAL);
-    commitYawMcpAsFile(synthCwd);
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "project", name: "Project", command: "npx" }] });
+    failReadsOf(projectBundlesPath(synthCwd), "ENOTDIR");
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
     const warning = r.warnings.find((w) => w.includes("could not be read"));
     expect(warning).toBeDefined();
@@ -483,28 +510,23 @@ describe("an UNAPPROVED unreadable project file cannot blank out user-global", (
     expect(warning).toContain("yaw-mcp trust");
   });
 
-  it.skipIf(process.platform === "win32")("EACCES (chmod 000) falls through to user-global", async () => {
+  it("EACCES (no read permission) falls through to user-global", async () => {
     writeBundles(synthHome, GLOBAL);
     writeBundles(synthCwd, { version: 1, servers: [{ namespace: "project", name: "Project", command: "npx" }] });
-    const path = projectBundlesPath(synthCwd);
-    chmodSync(path, 0o000);
-    try {
-      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
-      expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
-      expect(r.warnings.some((w) => w.includes("could not be read"))).toBe(true);
-    } finally {
-      chmodSync(path, 0o644);
-    }
+    failReadsOf(projectBundlesPath(synthCwd), "EACCES");
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
+    expect(r.warnings.some((w) => w.includes("could not be read"))).toBe(true);
   });
 
-  // Symlinks need a privileged account (or developer mode) on Windows, so
-  // this shape is POSIX-only -- which is also where it survives git clone.
-  it.skipIf(process.platform === "win32")("ELOOP (two-symlink loop) falls through to user-global", async () => {
+  // The shape behind this errno -- bundles.json committed as a two-symlink
+  // loop -- needs a privileged account to stage on Windows, but the errno it
+  // raises is just another "not ENOENT/EISDIR" the reader must not mistake for
+  // an absent file.
+  it("ELOOP (a symlink loop) falls through to user-global", async () => {
     writeBundles(synthHome, GLOBAL);
-    const cfg = join(synthCwd, CONFIG_DIRNAME);
-    mkdirSync(cfg, { recursive: true });
-    symlinkSync("bundles.alt.json", join(cfg, BUNDLES_FILENAME));
-    symlinkSync(BUNDLES_FILENAME, join(cfg, "bundles.alt.json"));
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "project", name: "Project", command: "npx" }] });
+    failReadsOf(projectBundlesPath(synthCwd), "ELOOP");
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
     expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
     expect(r.warnings.some((w) => w.includes("could not be read"))).toBe(true);
@@ -622,25 +644,21 @@ describe("readRawUserBundles error message branching (fix 9)", () => {
     ).rejects.toThrow(/could not be parsed.*fix the JSON/i);
   });
 
-  it.skipIf(process.platform === "win32")(
-    "throws a permissions-error message when bundles.json is unreadable",
-    async () => {
-      mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-      const bundlesFile = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
-      writeFileSync(bundlesFile, JSON.stringify({ version: 1, servers: [] }));
-      chmodSync(bundlesFile, 0o000);
-      try {
-        await expect(
-          upsertUserBundle(
-            { namespace: "test", name: "Test", command: "npx", args: [], isActive: true },
-            { home: synthHome },
-          ),
-        ).rejects.toThrow(/could not be read.*check file permissions/i);
-      } finally {
-        chmodSync(bundlesFile, 0o644);
-      }
-    },
-  );
+  it("throws a permissions-error message when bundles.json is unreadable", async () => {
+    // The branch is a decision about the WARNING TEXT (read error -> "fix the
+    // permissions"; parse error -> "fix the JSON"), so the read failure is
+    // injected rather than staged with a POSIX-only chmod 000.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const bundlesFile = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+    writeFileSync(bundlesFile, JSON.stringify({ version: 1, servers: [] }));
+    failReadsOf(bundlesFile, "EACCES");
+    await expect(
+      upsertUserBundle(
+        { namespace: "test", name: "Test", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+    ).rejects.toThrow(/could not be read.*check file permissions/i);
+  });
 });
 
 // The write path (add/remove) must round-trip the top-level defaultRuntime --
@@ -786,28 +804,44 @@ describe("upsertUserBundle / removeUserBundle serializer (fix 2)", () => {
 // The serializer tests above reach the create-fresh-dir path via upsert but
 // never stat the dir's mode -- these assert the 0o700 birth directly.
 describe("write path births ~/.yaw-mcp/ owner-only (0o700)", () => {
-  // POSIX-only: Windows chmod is a no-op and mode bits aren't meaningful there.
-  it.skipIf(process.platform === "win32")("upsertUserBundle births a fresh .yaw-mcp/ at 0o700", async () => {
+  // Asserted through the dirMode the write path REQUESTS, not through
+  // stat().mode on the finished directory: POSIX mode bits are not meaningful
+  // on Windows (chmod is a near no-op there and stat reports a synthetic
+  // 0o666), so the on-disk form pinned nothing on the only machine that runs
+  // this suite. atomic-write.test.ts covers that request reaching mkdir(2).
+  const userBundlesPath = (): string => localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+
+  it("upsertUserBundle asks for dirMode 0o700 when it births a fresh .yaw-mcp/", async () => {
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
     // synthHome has no .yaw-mcp/ yet (nothing pre-created it this test), so
     // doUpsertUserBundle -> atomicWriteFile creates it fresh at dirMode 0o700.
+    expect(existsSync(join(synthHome, CONFIG_DIRNAME))).toBe(false);
     await upsertUserBundle(
       { namespace: "github", name: "GitHub", command: "npx", args: [], isActive: true },
       { home: synthHome },
     );
-    expect(statSync(join(synthHome, CONFIG_DIRNAME)).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(synthHome, CONFIG_DIRNAME))).toBe(true);
+    const call = spy.mock.calls.find((c) => c[0] === userBundlesPath());
+    expect(call, "the user bundles file was never written").toBeDefined();
+    expect(call?.[4]).toBe(0o700);
   });
 
   // doRemoveUserBundle early-returns (removed:false) when the file is absent,
   // so it can only reach its own atomicWriteFile once the dir already exists.
-  // Seed via upsert (which births the dir at 0o700), then exercise the remove
-  // write path and confirm it keeps the parent owner-only.
-  it.skipIf(process.platform === "win32")("removeUserBundle's write path keeps .yaw-mcp/ at 0o700", async () => {
+  // Seed via upsert, then exercise the remove write path and confirm it asks
+  // for the same owner-only parent rather than dropping the dirMode.
+  it("removeUserBundle's write path asks for dirMode 0o700 too", async () => {
     await upsertUserBundle(
       { namespace: "gone", name: "Gone", command: "npx", args: [], isActive: true },
       { home: synthHome },
     );
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
     const res = await removeUserBundle("gone", { home: synthHome });
     expect(res.removed).toBe(true);
-    expect(statSync(join(synthHome, CONFIG_DIRNAME)).mode & 0o777).toBe(0o700);
+    const call = spy.mock.calls.find((c) => c[0] === userBundlesPath());
+    expect(call, "the user bundles file was never rewritten").toBeDefined();
+    expect(call?.[4]).toBe(0o700);
   });
 });

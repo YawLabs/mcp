@@ -146,6 +146,61 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
   });
 
+  // A BARE oam command is the shape older installs wrote, and the absolute-path
+  // check above cannot see it. It resolves against the CLIENT's PATH, which a
+  // GUI-launched client does not inherit from the shell, so the broker never
+  // starts. install no longer writes it but nothing rewrites existing configs,
+  // which makes doctor the only surface that can report it.
+  it("flags a bare oam launch command as unresolvable for a GUI-launched client", async () => {
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "oam", args: ["run", "--no-check", entryFile] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamNotAbsolute).toBe("oam");
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).toContain("resolves against the client's PATH");
+    // Must NOT read as OK -- an entry that cannot launch is not a healthy one.
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+  });
+
+  it("flags an oam entry file that no longer exists", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const gone = join(synthHome, "gone", "broker.js");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", gone] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamEntryMissing).toBe(gone);
+    expect(cap.text()).toContain("oam cannot fetch it on demand");
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+  });
+
+  it("reports a fully resolvable oam entry as OK", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", entryFile] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamNotAbsolute).toBeNull();
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).toContain("runs on oam");
+  });
+
   it("names the missing launch command even when a legacy entry is also present", async () => {
     // Both problems at once used to hit the combined-legacy branch FIRST, so
     // doctor printed `OK ... legacy "mcp.hosting" entry also present - remove
@@ -776,6 +831,46 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const txt = cap.text();
     expect(txt).toContain("UPGRADE AVAILABLE");
     expect(txt).toContain("yaw-mcp upgrade --run");
+  });
+
+  // The registryFetch hook is now the `override` seam of upgrade-cmd's shared
+  // fetchLatestVersion rather than a doctor-local wrapper. These two pin the
+  // behaviour doctor needs from that seam, so a future change to the shared
+  // probe cannot quietly take it away.
+  it("a registryFetch that REJECTS leaves doctor healthy with no upgrade banner", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => {
+        throw new Error("ENOTFOUND registry.npmjs.org");
+      },
+    });
+    // A freshness check that depends on an external service must never move the
+    // exit code or abort the other ~20 local checks.
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toContain("UPGRADE AVAILABLE");
+  });
+
+  it("a registryFetch returning null is treated as 'unknown', not as 'up to date'", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => null,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toContain("UPGRADE AVAILABLE");
   });
 
   it("dev-checkout / unknown argvPath shows the plan command (not 'upgrade --run')", async () => {

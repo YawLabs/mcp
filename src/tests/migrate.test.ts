@@ -81,34 +81,66 @@ describe("migrateLegacyConfigPaths", () => {
     await expect(stat(join(userConfigDir(home), "config.json"))).rejects.toThrow();
   });
 
-  // 4. POSIX-only: skips when legacy file is owned by a different uid.
-  it.skipIf(process.platform === "win32")(
-    "skips migration when legacy file is owned by a different uid (POSIX)",
-    async () => {
-      writeLegacy(home, LEGACY_GLOBAL_FILENAME);
-      const legacyPath = join(home, LEGACY_GLOBAL_FILENAME);
-      const targetPath = join(userConfigDir(home), "config.json");
+  // 4. The owner check itself: a legacy file whose uid is not ours is left
+  //    alone rather than hoisted into ~/.yaw-mcp/, where the loader trusts it.
+  //
+  //    migrateFile gates this on `process.platform !== "win32"` (Windows has
+  //    no geteuid and a different ACL model) and reads process.platform at CALL
+  //    time, so the decision is reachable from any runner: report a POSIX
+  //    platform, then hand it a geteuid that disagrees with the file's stat().
+  //    Both halves are stubs of things the OS supplies, not of the code under
+  //    test -- what runs is the real comparison and the real skip.
+  it("skips migration when the legacy file is owned by a different uid", async () => {
+    writeLegacy(home, LEGACY_GLOBAL_FILENAME);
+    const legacyPath = join(home, LEGACY_GLOBAL_FILENAME);
+    const targetPath = join(userConfigDir(home), "config.json");
 
-      // Make geteuid report a uid that differs from the file's actual uid.
-      // stat().uid on the real file will be process.geteuid() by default,
-      // so we stub geteuid to return a different value.
-      const realStat = await stat(legacyPath);
-      const foreignUid = realStat.uid + 999;
-      const origGeteuid = (process as { geteuid?: () => number }).geteuid;
-      (process as { geteuid?: () => number }).geteuid = () => foreignUid;
+    // stat().uid on the real file is the current user's (0 where the platform
+    // does not report one), so a geteuid that differs is a foreign owner.
+    const realStat = await stat(legacyPath);
+    const foreignUid = realStat.uid + 999;
+    const origGeteuid = (process as { geteuid?: () => number }).geteuid;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    (process as { geteuid?: () => number }).geteuid = () => foreignUid;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
 
-      try {
-        await migrateLegacyConfigPaths({ cwd, home });
-      } finally {
-        (process as { geteuid?: () => number }).geteuid = origGeteuid;
-      }
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      (process as { geteuid?: () => number }).geteuid = origGeteuid;
+      if (origPlatform) Object.defineProperty(process, "platform", origPlatform);
+    }
 
-      // Migration must have been skipped: target does not exist.
-      await expect(stat(targetPath)).rejects.toThrow();
-      // Legacy file must still be in place.
-      await expect(stat(legacyPath)).resolves.toBeDefined();
-    },
-  );
+    // Migration must have been skipped: target does not exist.
+    await expect(stat(targetPath)).rejects.toThrow();
+    // Legacy file must still be in place.
+    await expect(stat(legacyPath)).resolves.toBeDefined();
+  });
+
+  // The other half of the same branch: a MATCHING uid must still migrate.
+  // Without this, "skipped" above would pass just as happily against a
+  // migrator that had stopped migrating anything at all.
+  it("still migrates when the legacy file's uid IS ours", async () => {
+    writeLegacy(home, LEGACY_GLOBAL_FILENAME);
+    const legacyPath = join(home, LEGACY_GLOBAL_FILENAME);
+    const targetPath = join(userConfigDir(home), "config.json");
+
+    const realStat = await stat(legacyPath);
+    const origGeteuid = (process as { geteuid?: () => number }).geteuid;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    (process as { geteuid?: () => number }).geteuid = () => realStat.uid;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      (process as { geteuid?: () => number }).geteuid = origGeteuid;
+      if (origPlatform) Object.defineProperty(process, "platform", origPlatform);
+    }
+
+    await expect(stat(targetPath)).resolves.toBeDefined();
+    await expect(stat(legacyPath)).rejects.toThrow();
+  });
 });
 
 describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {

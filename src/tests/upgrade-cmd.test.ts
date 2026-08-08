@@ -1,12 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
+  fetchLatestVersion,
   type InstallMethod,
   localInstallRoot,
   npmGlobalPrefix,
   parseUpgradeArgs,
+  REGISTRY_FETCH_TIMEOUT_MS,
   refineInstallMethod,
   runUpgrade,
 } from "../upgrade-cmd.js";
@@ -284,6 +286,111 @@ describe("npmGlobalPrefix", () => {
     // prefix inject their own probe (opts.npmPrefix / deps.npmPrefixImpl).
     expect(process.env.VITEST).toBeTruthy();
     expect(await npmGlobalPrefix()).toBeNull();
+  });
+});
+
+// The ONE registry probe for the package. `upgrade`, auto-upgrade at serve
+// startup and `doctor` all call this; it used to exist three times over, and the
+// copies had drifted on exactly the two axes covered here -- the abort budget
+// and whether a stand-in could be injected. Both are now parameters, so these
+// tests are what keep a caller with a real difference in requirement from
+// forking the URL and the failure semantics along with it.
+describe("fetchLatestVersion -- the shared registry probe", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /** A fetch that never resolves on its own -- it settles only when the
+   *  AbortController fires, which is what a real fetch does on abort. Captures
+   *  the signal so a test can assert WHEN the abort landed, not just that it
+   *  eventually did. */
+  function hangingFetch(): { mock: ReturnType<typeof vi.fn>; signal: () => AbortSignal | undefined } {
+    let seen: AbortSignal | undefined;
+    const mock = vi.fn(
+      (_url: string, init: { signal?: AbortSignal }) =>
+        new Promise<Response>((_resolve, reject) => {
+          seen = init.signal;
+          init.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted.")));
+        }),
+    );
+    return { mock, signal: () => seen };
+  }
+
+  it("uses the override instead of the network, and never touches fetch", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchLatestVersion({ override: async () => "1.2.3" })).toBe("1.2.3");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("absorbs a throwing override to null -- an injected probe cannot fail its caller", async () => {
+    // doctor's registryFetch hook lands here. A hook that rejects must degrade
+    // the freshness line to "unknown", exactly like an offline registry does,
+    // rather than take down the whole diagnostic.
+    const thrower = async (): Promise<string | null> => {
+      throw new Error("hook blew up");
+    };
+    await expect(fetchLatestVersion({ override: thrower })).resolves.toBeNull();
+  });
+
+  it("aborts at the caller's timeout when one is given, not at the default", async () => {
+    vi.useFakeTimers();
+    const { mock, signal } = hangingFetch();
+    vi.stubGlobal("fetch", mock);
+
+    const pending = fetchLatestVersion({ timeoutMs: 2000 });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(signal()?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal()?.aborted).toBe(true);
+    // An aborted fetch is a failure like any other: null, never a throw.
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it("falls back to the 3s default budget when the caller names none", async () => {
+    // Pins the asymmetry doctor depends on: doctor passes 2000 (see
+    // DOCTOR_REGISTRY_TIMEOUT_MS) precisely because the shared default is
+    // longer. If these two ever collapse to one number, this test and the
+    // 2000ms one above stop disagreeing and the requirement is silently gone.
+    expect(REGISTRY_FETCH_TIMEOUT_MS).toBe(3000);
+    vi.useFakeTimers();
+    const { mock, signal } = hangingFetch();
+    vi.stubGlobal("fetch", mock);
+
+    const pending = fetchLatestVersion();
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(signal()?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal()?.aborted).toBe(true);
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it("returns null for a non-2xx response and for a body with no string version", async () => {
+    const responses = [
+      { ok: false, json: async () => ({ version: "9.9.9" }) },
+      { ok: true, json: async () => ({}) },
+      { ok: true, json: async () => ({ version: 47 }) },
+    ];
+    for (const res of responses) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => res as unknown as Response),
+      );
+      expect(await fetchLatestVersion()).toBeNull();
+    }
+  });
+
+  it("requests @yawlabs/mcp/latest with a JSON accept header and an abort signal", async () => {
+    const fetchMock = vi.fn(
+      async () => ({ ok: true, json: async () => ({ version: "0.47.8" }) }) as unknown as Response,
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchLatestVersion()).toBe("0.47.8");
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { headers: unknown; signal: unknown }];
+    expect(url).toBe("https://registry.npmjs.org/@yawlabs/mcp/latest");
+    expect(init.headers).toEqual({ accept: "application/json" });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 });
 

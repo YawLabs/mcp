@@ -65,6 +65,8 @@ import {
   untrustedProjectWarning,
 } from "./local-bundles.js";
 import {
+  compareVersions,
+  isOamCommand,
   isOamLaunch,
   MIN_OAM_VERSION,
   nodeLaunchKind,
@@ -88,6 +90,7 @@ import {
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
+  fetchLatestVersion,
   refineInstallMethod,
 } from "./upgrade-cmd.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
@@ -334,6 +337,17 @@ export interface ClientProbeResult {
    *  so the running process cannot answer "did my install put the broker on
    *  oam?". The config can. */
   launchRuntime: "oam" | "node" | null;
+  /** A BARE oam launch command in the entry (`"command": "oam"`), or null.
+   *  Distinct from launchCommandMissing, which only inspects ABSOLUTE paths and
+   *  therefore cannot see this one. `install` used to write it; a bare name
+   *  resolves against the client's PATH, which a GUI-launched client does not
+   *  inherit from the shell, so the broker fails to start with no fallback.
+   *  Existing configs still carry it, so doctor reports it. */
+  launchOamNotAbsolute: string | null;
+  /** The absolute `oam run` entry path in the entry that no longer exists, or
+   *  null. oam has no fetch-on-demand, so unlike the npx shape a stale entry
+   *  here cannot be recovered at launch. */
+  launchOamEntryMissing: string | null;
 }
 
 export interface DoctorResult {
@@ -500,7 +514,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // Freshness check: is this binary behind the npm registry? Skip in
   // source ("dev") mode and absorb any network error silently — a
   // stale-version warning that depends on an external service must not
-  // block the diagnostic. Times out after 2s to keep doctor snappy.
+  // block the diagnostic. Times out after DOCTOR_REGISTRY_TIMEOUT_MS to keep
+  // doctor snappy -- see that constant for why doctor's budget is shorter than
+  // upgrade's.
   // Auto-skipped under vitest (check process.env directly since tests
   // pass a stripped `env: {}`).
   // skipRegistryCheck=true or VITEST env both suppress the real registry
@@ -512,7 +528,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // would never be visible via opts.env; reading process.env directly is
   // what lets the auto-skip fire under vitest. Kept intentional.
   const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
-  const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
+  const latest = skipCheck
+    ? null
+    : await fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch });
   const effectiveVersion = opts.currentVersion ?? VERSION;
   const staleHint = latest && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0 ? latest : null;
   if (staleHint) {
@@ -770,7 +788,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // documented on the text path's skipCheck above (opts.env is stripped
   // to `{}` under vitest, so VITEST is only visible via process.env).
   const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
-  const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
+  const latest = skipCheck
+    ? null
+    : await fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch });
   const effectiveVersion = opts.currentVersion ?? VERSION;
   const stale = latest !== null && effectiveVersion !== "dev" && compareSemver(effectiveVersion, latest) < 0;
 
@@ -890,13 +910,19 @@ async function collectOamRuntimeStatus(opts: {
   probeFn: () => OamProbe | Promise<OamProbe>;
 }): Promise<OamRuntimeStatus> {
   const probe = await opts.probeFn();
-  const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
   // `env` is threaded through so the loader's trust gate sees the SAME
   // environment doctor's own probeProjectTrust does. Without it the loader read
   // process.env while doctor read opts.env, and the two could disagree about
   // whether the project file is honoured -- which would print a bypass warning
   // and an "IGNORED" warning about the same file in the same report.
   const bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home, env: opts.env }).catch(() => null);
+  // Hand describeDefaultRuntime the load we just did instead of letting it do
+  // its own -- it reads the SAME file. Two reads was not merely wasteful: the
+  // loader warns on a bundles.json it cannot parse, so a malformed file logged
+  // "bundles.json is not valid JSON" TWICE per doctor run. Passing null when the
+  // load failed is the same answer it would have reached itself (its own catch
+  // collapses a failed load to null), so the resolution is unchanged.
+  const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home, bundles });
   const servers = (bundles?.config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
     command: s.command,
@@ -1222,6 +1248,15 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
       : "";
     return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
   }
+  // Both oam-specific states below are "the entry looks fine and will not
+  // start", so they rank with launchCommandMissing rather than with the OK
+  // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
+  if (c.launchOamEntryMissing) {
+    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} — oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\``;
+  }
+  if (c.launchOamNotAbsolute) {
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command — it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN`;
+  }
   if (c.hasMcpEntry && c.hasLegacyEntry) {
     return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
   }
@@ -1261,6 +1296,8 @@ const MALFORMED = {
   malformed: true,
   launchCommandMissing: null,
   launchRuntime: null,
+  launchOamNotAbsolute: null,
+  launchOamEntryMissing: null,
 } as const;
 
 /** Enumerate every (client, scope) combo for the current OS and resolve its
@@ -1279,6 +1316,8 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           hasMcpEntry: false,
           launchCommandMissing: null,
           launchRuntime: null,
+          launchOamNotAbsolute: null,
+          launchOamEntryMissing: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1317,6 +1356,8 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           hasMcpEntry: false,
           launchCommandMissing: null,
           launchRuntime: null,
+          launchOamNotAbsolute: null,
+          launchOamEntryMissing: null,
           hasLegacyEntry: false,
           legacyEntryName: null,
           malformed: false,
@@ -1368,6 +1409,8 @@ function classifyProbeContent(
   malformed: boolean;
   launchCommandMissing: string | null;
   launchRuntime: "oam" | "node" | null;
+  launchOamNotAbsolute: string | null;
+  launchOamEntryMissing: string | null;
 } {
   if (raw.trim().length === 0) {
     return {
@@ -1377,6 +1420,8 @@ function classifyProbeContent(
       malformed: false,
       launchCommandMissing: null,
       launchRuntime: null,
+      launchOamNotAbsolute: null,
+      launchOamEntryMissing: null,
     };
   }
   try {
@@ -1389,6 +1434,8 @@ function classifyProbeContent(
         malformed: true,
         launchCommandMissing: null,
         launchRuntime: null,
+        launchOamNotAbsolute: null,
+        launchOamEntryMissing: null,
       };
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
@@ -1400,18 +1447,42 @@ function classifyProbeContent(
         malformed: false,
         launchCommandMissing: null,
         launchRuntime: null,
+        launchOamNotAbsolute: null,
+        launchOamEntryMissing: null,
       };
     }
     const legacyEntryName = findLegacyEntry(container);
     const entry = container[ENTRY_NAME];
     let launchCommandMissing: string | null = null;
     let launchRuntime: "oam" | "node" | null = null;
+    let launchOamNotAbsolute: string | null = null;
+    let launchOamEntryMissing: string | null = null;
     if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
       const command = (entry as { command?: unknown }).command;
       if (typeof command === "string") {
         if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
         const entryArgs = (entry as { args?: unknown }).args;
-        launchRuntime = isOamLaunch(command, Array.isArray(entryArgs) ? (entryArgs as string[]) : []) ? "oam" : "node";
+        const args = Array.isArray(entryArgs) ? (entryArgs as string[]) : [];
+        launchRuntime = isOamLaunch(command, args) ? "oam" : "node";
+        // A BARE oam command is the one shape the absolute-path check above
+        // cannot see, and it is the shape older installs actually wrote. It
+        // resolves against the CLIENT's PATH, not the shell's, so a
+        // GUI-launched client (Claude Desktop from the Dock, Cursor from
+        // Explorer) never finds an oam that lives in ~/.oam/bin -- the broker
+        // fails to start with no fallback. `install` no longer writes this,
+        // but nothing rewrites the configs that already carry it, so doctor is
+        // the only thing that can surface it.
+        if (isOamCommand(command) && !isAbsolute(command)) launchOamNotAbsolute = command;
+        // `oam run [--no-check] <entry>`: the entry is the first arg that is
+        // not the subcommand or a flag. Unlike npx, oam cannot fetch a missing
+        // entry on demand, so a stale path here is a hard launch failure rather
+        // than a slow start.
+        if (launchRuntime === "oam") {
+          const entryPath = args.find((a, i) => i > 0 && !a.startsWith("-"));
+          if (entryPath !== undefined && isAbsolute(entryPath) && !exists(entryPath)) {
+            launchOamEntryMissing = entryPath;
+          }
+        }
       }
     }
     return {
@@ -1421,6 +1492,8 @@ function classifyProbeContent(
       malformed: false,
       launchCommandMissing,
       launchRuntime,
+      launchOamNotAbsolute,
+      launchOamEntryMissing,
     };
   } catch {
     return {
@@ -1430,6 +1503,8 @@ function classifyProbeContent(
       malformed: true,
       launchCommandMissing: null,
       launchRuntime: null,
+      launchOamNotAbsolute: null,
+      launchOamEntryMissing: null,
     };
   }
 }
@@ -1454,35 +1529,25 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
   return out;
 }
 
-// Hit the public npm registry for the latest `@yawlabs/mcp` version.
-// Intentionally thin: on ANY error (offline, timeout, rate-limited,
-// corp proxy) we return null and doctor just skips the upgrade section.
-// This function is NEVER awaited on a hot path — it only runs in doctor,
-// which is user-interactive.
-async function fetchLatestVersion(override?: () => Promise<string | null>): Promise<string | null> {
-  if (override) {
-    try {
-      return await override();
-    } catch {
-      return null;
-    }
-  }
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 2000);
-  try {
-    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcp/latest", {
-      signal: ac.signal,
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return typeof body.version === "string" ? body.version : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
+// Doctor's abort budget for the freshness probe, deliberately SHORTER than
+// upgrade-cmd's 3000ms default.
+//
+// The asymmetry is the requirement, not an oversight. `upgrade` exists to answer
+// "is there a newer version"; it has nothing at all to print until the registry
+// replies, so waiting longer is strictly better there. Doctor's freshness line
+// is one of ~20 checks, and every other one is local and instant -- a firewalled
+// or black-holed registry that stalls the whole report is a worse outcome than
+// an UPGRADE AVAILABLE banner that stays silent for one run. Doctor must not
+// hang.
+//
+// The cost of the shorter budget, stated plainly: on a registry slow enough to
+// answer between 2s and 3s, doctor reports nothing while `upgrade` would have
+// reported an available upgrade. That is the intended trade, and it is why this
+// is a parameter of the shared probe rather than a second implementation --
+// upgrade-cmd's `fetchLatestVersion` owns the URL, the response validation and
+// the failure-to-null semantics for all three callers, and only the number
+// differs here.
+const DOCTOR_REGISTRY_TIMEOUT_MS = 2000;
 
 export interface ShadowHit {
   cli: string;
@@ -1644,22 +1709,23 @@ function extractLeadingBinary(command: string): string | null {
   return slash === -1 ? first : first.slice(slash + 1);
 }
 
-// Tiny semver compare — full semver is overkill; we only need to
-// recognize "a is older than b" for dotted numeric x.y.z tags. Anything
-// unparseable returns 0 (treated as equal) so a weird version string
-// can't accidentally show a false "upgrade available" banner.
+// Version compare, delegated to oam-spawn's `compareVersions` -- the canonical
+// implementation for the package.
+//
+// This used to be a local triple-only copy, and the duplication was not
+// harmless: it read "0.8.3-rc.1" as EQUAL to a 0.8.3 floor, so doctor could
+// report that a prerelease met a MIN_OAM_VERSION floor that oam-spawn (which
+// implements real prerelease precedence) ranks it BELOW. doctor printing one
+// verdict while the spawn path acts on another is the failure this whole
+// section exists to prevent, so the two must share one comparator.
+//
+// `compareVersions` is anchored and does NOT accept a leading "v"; the old copy
+// did. That tolerance is preserved here rather than dropped, because these
+// inputs include a version read from a package.json that a git-tag-shaped build
+// can write as "v1.2.3", and silently returning 0 for it would suppress the
+// upgrade banner instead of showing a wrong one. Unparseable still compares
+// equal, so a weird version string cannot invent a false "upgrade available".
 export function compareSemver(a: string, b: string): number {
-  const parse = (s: string): [number, number, number] | null => {
-    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(s);
-    if (!m) return null;
-    return [Number(m[1]), Number(m[2]), Number(m[3])];
-  };
-  const pa = parse(a);
-  const pb = parse(b);
-  if (!pa || !pb) return 0;
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] < pb[i]) return -1;
-    if (pa[i] > pb[i]) return 1;
-  }
-  return 0;
+  const strip = (s: string) => (s.startsWith("v") ? s.slice(1) : s);
+  return compareVersions(strip(a), strip(b));
 }

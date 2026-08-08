@@ -481,6 +481,31 @@ describe("yaw-mcp trust --list", () => {
     expect(io.errText()).toContain("trust store unusable");
   });
 
+  it("escapes a control character in a stored path instead of letting it redraw the audit", async () => {
+    // --list is the surface a user reads to decide what to REVOKE, so a repo
+    // that got itself approved under an ESC-bearing directory name must not be
+    // able to erase its own row on the way out. Unlike the grant-preview case
+    // (skipped on win32 above, where the hostile name has to be a real
+    // directory), the path here arrives as DATA -- a display field in the store
+    // -- so the same wiring is assertable on every platform.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const hostile = join(synthHome, `repo${ESC}[2J`, CONFIG_DIRNAME, "bundles.json");
+    writeFileSync(
+      trustStorePath(synthHome),
+      JSON.stringify({
+        version: 1,
+        trusted: { [hostile]: { path: hostile, sha256: "a".repeat(64), grantedAt: "2026-01-01T00:00:00.000Z" } },
+      }),
+    );
+    const io = captureIO();
+    const r = await runTrust({ mode: "list", home: synthHome, cwd: synthCwd, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.text() + io.errText()).not.toContain(ESC);
+    expect(io.text()).toContain("\\u001b");
+    // The row is still there to be read -- escaping must not drop the entry.
+    expect(io.text()).toContain("missing (file not found)");
+  });
+
   it("sends a newer-schema store to an upgrade, not to a delete", async () => {
     // The parse case above may be deleted; this one holds real grants an
     // older binary simply cannot read, so "delete it" would be destructive.
@@ -635,6 +660,16 @@ describe("the consent preview cannot be redrawn by the file it is previewing", (
     expect(printed).toContain("GITHUB_TOKEN");
   });
 
+  // IRREDUCIBLY POSIX -- and it is the FIXTURE, not the assertion, that cannot
+  // be reproduced: the Win32 filesystem rejects every character below 0x20 in a
+  // path component, so a directory literally NAMED with an ESC cannot exist
+  // here, and `probeProjectTrust` only ever reports a path it walked up to on
+  // disk (there is no seam to hand the grant flow a synthetic one). Faking it
+  // by asserting displaySafe() in isolation would test less than this does --
+  // that the grant preview actually ROUTES the probed path through it -- so the
+  // skip stands. The same wiring on a surface where a hostile path arrives as
+  // DATA rather than as a real directory is covered platform-independently by
+  // the `--list` case below.
   it.skipIf(process.platform === "win32")("escapes a control character in the project path line", async () => {
     // A repo directory name may legally contain ESC on POSIX, and the path
     // is printed on the line above the argv block.

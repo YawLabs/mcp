@@ -6,6 +6,7 @@ import {
   defaultRuntime,
   describeDefaultRuntime,
   describeServerRuntime,
+  oamFailureLabel,
   resetDefaultRuntimeCache,
 } from "../default-runtime.js";
 import { localBundlesPath } from "../local-bundles.js";
@@ -84,6 +85,52 @@ describe("describeDefaultRuntime", () => {
   it("returns null/null when nothing is configured", async () => {
     const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome });
     expect(r).toEqual({ runtime: null, source: null, path: null });
+  });
+
+  // The `bundles` seam exists so a caller that ALREADY read bundles.json (doctor
+  // reads it for its server list) does not read it a second time -- the second
+  // read re-emits every read-time warning, so a malformed file logged
+  // "bundles.json is not valid JSON" twice per doctor run. These pin that the
+  // passed-in load is the one that decides, and that no fallback read happens.
+  describe("the pre-loaded `bundles` seam", () => {
+    it("answers from the handed-in load instead of reading the file", async () => {
+      // The on-disk file says "node" and the handed-in load says "oam". If the
+      // seam were ignored (or used only as a hint) this would come back "node".
+      writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+      const r = await describeDefaultRuntime({
+        env: {},
+        cwd: synthCwd,
+        home: synthHome,
+        bundles: { defaultRuntime: "oam", defaultRuntimePath: "/somewhere/bundles.json" },
+      });
+      expect(r).toEqual({ runtime: "oam", source: "bundles", path: "/somewhere/bundles.json" });
+    });
+
+    it("treats an explicit null (the caller's load FAILED) as 'nothing configured', with no retry read", async () => {
+      // Same answer its own `.catch(() => null)` would have reached, which is
+      // what makes handing the failure over safe. Crucially it must not fall
+      // back to loading the file itself -- that is the double-warning bug.
+      writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+      const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome, bundles: null });
+      expect(r).toEqual({ runtime: null, source: null, path: null });
+    });
+
+    it("still loads the file itself when the seam is omitted (sidecars-cmd's shape)", async () => {
+      writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+      const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome });
+      expect(r.runtime).toBe("oam");
+      expect(r.source).toBe("bundles");
+    });
+
+    it("the env var still outranks a handed-in bundles load", async () => {
+      const r = await describeDefaultRuntime({
+        env: { YAW_MCP_DEFAULT_RUNTIME: "node" },
+        cwd: synthCwd,
+        home: synthHome,
+        bundles: { defaultRuntime: "oam", defaultRuntimePath: "/somewhere/bundles.json" },
+      });
+      expect(r).toEqual({ runtime: "node", source: "env", path: null });
+    });
   });
 });
 
@@ -255,6 +302,58 @@ describe("describeServerRuntime", () => {
     const v = describeServerRuntime(local({ command: "docker", runtime: "oam" }), null, oamOk);
     expect(v).toMatchObject({ runtime: "node", code: "not-node-command" });
     expect(v.reason).toContain("not node/npx");
+  });
+
+  it("an installed-but-broken oam is 'oam-unusable', never 'oam is not installed'", () => {
+    // probeOam publishes bin:null for BOTH an absent oam and one that is present
+    // but wedged; only `failure` separates them. Reporting the second as "not
+    // installed" sends a user who HAS oam -- often with OAM_BIN aimed straight at
+    // it -- off to install it again, while the real cause never surfaces.
+    for (const failure of ["timeout", "exit", "spawn"] as const) {
+      const probe: OamProbe = {
+        bin: null,
+        binPath: null,
+        version: null,
+        belowMin: false,
+        failure,
+        failureDetail: "boom",
+      };
+      const v = describeServerRuntime(local({ runtime: "oam" }), null, probe);
+      expect(v, failure).toMatchObject({ runtime: "node", code: "oam-unusable" });
+      expect(v.reason).toContain("installed and unusable");
+      expect(v.reason).not.toContain("oam is not installed");
+      // One voice across surfaces: doctor's OAM RUNTIME line prints this same
+      // helper directly, so the per-server reason must quote it verbatim rather
+      // than word the same failure a second way.
+      expect(v.reason).toContain(oamFailureLabel(failure));
+    }
+  });
+
+  it("below-min outranks unusable, because only it carries actionable numbers", () => {
+    // probeOam sets failure:null on the below-min path, so this pins the ORDER
+    // of the two gates rather than a shape probeOam emits today: a probe with
+    // both flags set must still report the version and the floor.
+    const probe: OamProbe = {
+      bin: null,
+      binPath: null,
+      version: "0.5.0",
+      belowMin: true,
+      failure: "exit",
+      failureDetail: "exit 1",
+    };
+    const v = describeServerRuntime(local({ runtime: "oam" }), null, probe);
+    expect(v.code).toBe("oam-below-min");
+    expect(v.reason).toContain("0.5.0");
+    expect(v.reason).toContain(MIN_OAM_VERSION);
+  });
+
+  it("oamFailureLabel gives each probe failure its own wording", () => {
+    expect(oamFailureLabel("timeout")).toContain("did not answer in time");
+    expect(oamFailureLabel("exit")).toContain("exited non-zero");
+    expect(oamFailureLabel("spawn")).toContain("could not be executed");
+    // Distinct per shape is the whole point: one shared string would send every
+    // failure mode to the same (mostly wrong) fix.
+    expect(new Set((["timeout", "exit", "spawn"] as const).map(oamFailureLabel)).size).toBe(3);
   });
 
   // The gates below are the ones doctor used to report as "oam": the launch

@@ -74,7 +74,7 @@ function readEnvChoice(env: NodeJS.ProcessEnv): RuntimeChoice | null {
   return null;
 }
 
-/** Where a resolved default came from -- surfaced by doctor. */
+/** Where a resolved default came from -- surfaced by the reporting commands. */
 export interface DefaultRuntimeInfo {
   runtime: RuntimeChoice | null;
   source: "env" | "bundles" | null;
@@ -88,16 +88,19 @@ export interface DefaultRuntimeInfo {
 
 /**
  * Resolve the config-level default runtime WITHOUT caching, reporting where
- * it came from. Used by doctor (interactive, wants fresh state and
- * provenance). The env var wins over bundles.json; an invalid env value is
- * ignored with a warn (once per process, shared with defaultRuntime below).
+ * it came from. Used by the interactive reporting commands, which want fresh
+ * state and provenance rather than the connect path's cache: `doctor` (OAM
+ * RUNTIME section) and `sidecars install` (its unhosted note). The env var wins
+ * over bundles.json; an invalid env value is ignored with a warn (once per
+ * process, shared with defaultRuntime below).
  *
  * `bundles` is an ALREADY-LOADED loadLocalBundles result, for a caller that
  * needs the same file for something else. Passing it is not an optimization
  * detail -- doctor reads bundles.json for its server list too, and without
  * this it read the file TWICE per run, which was observable: every read-time
  * diagnostic ("bundles.json is not valid JSON; ignoring") was logged twice for
- * one invocation. Omit it and the file is loaded here.
+ * one invocation. Omit it and the file is loaded here (what sidecars-cmd does,
+ * having no bundles read of its own to share).
  *
  * `env` is threaded into that load so the loader's project-trust gate sees the
  * same environment the caller's own probe does -- otherwise this resolver could
@@ -171,6 +174,9 @@ export async function defaultRuntime(opts: { cwd?: string; home?: string } = {})
  * binary, and describeServerRuntime below folds it into a per-server `reason`.
  * A second copy is how "installed but UNUSABLE" in one line and "not
  * installed" in the next line of the same report happens.
+ *
+ * `sidecars install` reaches the same wording through describeServerRuntime's
+ * `reason`, so all three surfaces stay in one voice.
  */
 export function oamFailureLabel(failure: OamProbeFailure): string {
   if (failure === "timeout") return "`oam --version` did not answer in time";
@@ -179,8 +185,9 @@ export function oamFailureLabel(failure: OamProbeFailure): string {
 }
 
 /** Machine-readable "why" for a per-server runtime verdict. Everything from
- *  "not-node-command" down is a silent-fallback case doctor exists to make
- *  visible: the config asks for oam and the spawn quietly hands back node.
+ *  "not-node-command" down is a silent-fallback case the reporting commands
+ *  exist to make visible: the config asks for oam and the spawn quietly hands
+ *  back node.
  *
  *  The six launch-shape codes each mirror ONE `return { command, args }` in
  *  rewriteForOam (oam-spawn.ts), in that function's own order. That 1:1 mapping
@@ -203,7 +210,10 @@ export type ServerRuntimeCode =
   | "oam-unusable"
   | "oam-below-min";
 
-/** Per-server effective-runtime verdict for doctor. */
+/** Per-server effective-runtime verdict. Two commands render it: `doctor` (the
+ *  per-server lines of its OAM RUNTIME section) and `sidecars install` (which
+ *  reuses `reason` verbatim for its unhosted note, so the two cannot describe
+ *  the same machine differently). */
 export interface ServerRuntimeInfo {
   /** What the server would actually get: "oam", "node", or null for remote
    *  servers (no local spawn to host). */

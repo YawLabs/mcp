@@ -431,17 +431,50 @@ function compareSemverLocal(a: string, b: string): number {
   return 0;
 }
 
+/** Abort budget for the registry probe when a caller names none. Three seconds
+ *  is `upgrade`'s own number: reaching the registry IS that command's job, so it
+ *  has nothing to print until this answers and can afford to wait. */
+export const REGISTRY_FETCH_TIMEOUT_MS = 3000;
+
+export interface FetchLatestVersionOptions {
+  /** Abort budget in ms. Defaults to REGISTRY_FETCH_TIMEOUT_MS.
+   *
+   *  Per-caller on purpose, and not a tuning detail: `doctor` deliberately runs
+   *  a SHORTER budget than `upgrade` (see DOCTOR_REGISTRY_TIMEOUT_MS in
+   *  doctor-cmd.ts). A diagnostic that hangs behind a black-holed registry is a
+   *  worse failure than one that prints the freshness check as unknown and moves
+   *  on to the twenty other things it checks; `upgrade` has no report at all
+   *  until this resolves. Forcing both onto one number is what made the second
+   *  copy of this function look justified. */
+  timeoutMs?: number;
+  /** Stand-in for the request itself -- doctor's `registryFetch` hook and the
+   *  unit tests behind it. Short-circuits the fetch entirely, and a throw is
+   *  absorbed to null so an injected probe can fail its caller no harder than
+   *  the real one can. */
+  override?: () => Promise<string | null>;
+}
+
 /** Ask the registry for the newest published version, or null on any failure
- *  (non-2xx, malformed body, offline, or a >3s stall via the AbortController).
+ *  (non-2xx, malformed body, offline, or a stall past `timeoutMs` via the
+ *  AbortController).
  *
- *  Exported because auto-upgrade needs the identical probe at serve startup and
- *  used to keep a byte-identical copy: two copies meant a change to the URL, the
- *  timeout or the response validation landed in one of them only, and that
- *  divergence has already happened once (doctor-cmd's third copy runs a 2000ms
- *  timeout where this one runs 3000ms). */
-export async function fetchLatestVersion(): Promise<string | null> {
+ *  THE registry probe for the package: `upgrade`, auto-upgrade at serve startup,
+ *  and `doctor` all land here. It previously existed three times over and the
+ *  copies had already drifted on the two axes that actually differ between
+ *  callers -- the timeout budget and whether a stand-in can be injected. Both
+ *  are parameters now, so a caller with a real difference in requirement gets it
+ *  without forking the URL, the response validation, or the failure semantics
+ *  along with it. */
+export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): Promise<string | null> {
+  if (opts.override) {
+    try {
+      return await opts.override();
+    } catch {
+      return null;
+    }
+  }
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 3000);
+  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? REGISTRY_FETCH_TIMEOUT_MS);
   try {
     const res = await fetch("https://registry.npmjs.org/@yawlabs/mcp/latest", {
       signal: ac.signal,

@@ -1,28 +1,72 @@
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import type { Stats } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { atomicWriteFile } from "../atomic-write.js";
+
+// The permission behaviour below is asserted through the ARGUMENTS this module
+// hands node:fs, not through stat().mode on the finished file. The mode it
+// passes is the decision atomicWriteFile makes; whether the OS then honours
+// those bits is the OS's business, and Windows does not honour them at all
+// (stat reports a synthetic 0o666/0o444). Asserting the bits on disk therefore
+// pinned nothing on the only platform this suite runs on. Every fs call is a
+// PASSTHROUGH spy, so the real-fs tests in this file behave exactly as before.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    writeFile: vi.fn(actual.writeFile),
+    mkdir: vi.fn(actual.mkdir),
+    chmod: vi.fn(actual.chmod),
+    stat: vi.fn(actual.stat),
+  };
+});
+
+import { chmod, mkdir, stat, writeFile } from "node:fs/promises";
+
+/**
+ * Run `fn` with process.platform reporting a POSIX value.
+ *
+ * Mode preservation and dirMode are both explicitly skipped on win32 inside
+ * atomic-write.ts, and it reads process.platform at CALL time -- so the POSIX
+ * DECISIONS are reachable from any runner even though the POSIX filesystem
+ * SEMANTICS are not.
+ */
+async function asPosix<T>(fn: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+  try {
+    return await fn();
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+  }
+}
 
 describe("atomicWriteFile", () => {
   let dir: string;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     dir = mkdtempSync(join(tmpdir(), "yaw-mcp-atomic-"));
   });
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
   });
+
+  /** The options the tmp write for `target` was born with. atomicWriteFile
+   *  writes a sibling `${target}.tmp-<pid>-<ms>-<n>` and renames it over the
+   *  target, so the birth mode is that call's third argument. */
+  function birthOptions(target: string): { encoding?: string; mode?: number } | undefined {
+    const call = vi.mocked(writeFile).mock.calls.find((c) => String(c[0]).startsWith(`${target}.tmp-`));
+    return call?.[2] as { encoding?: string; mode?: number } | undefined;
+  }
+
+  /** Every path chmod was called on, in order. */
+  function chmoddedPaths(): string[] {
+    return vi.mocked(chmod).mock.calls.map((c) => String(c[0]));
+  }
 
   it("writes contents to a fresh path", async () => {
     const file = join(dir, "fresh.json");
@@ -43,41 +87,50 @@ describe("atomicWriteFile", () => {
     expect(readFileSync(file, "utf8")).toBe('{"new":true}');
   });
 
-  // POSIX-only: Windows ignores the creation mode and reports 0o666.
-  it.skipIf(process.platform === "win32")("honors the mode option so the file is born owner-only (0600)", async () => {
+  it("honors the mode option so the file is born owner-only (0600)", async () => {
     const file = join(dir, "secret.json");
     await atomicWriteFile(file, '{"token":"x"}', "utf8", 0o600);
     expect(readFileSync(file, "utf8")).toBe('{"token":"x"}');
-    // Mask to the permission bits; umask may only clear bits, never add, so
-    // 0o600 stays 0o600 under any normal umask.
-    expect(statSync(file).mode & 0o777).toBe(0o600);
+    // The mode reaches creat(2) itself: the tmp file is BORN owner-only rather
+    // than chmodded after the fact, so there is no window where the secret
+    // sits at the umask default. (umask may only clear bits, never add.)
+    expect(birthOptions(file)).toEqual({ encoding: "utf8", mode: 0o600 });
   });
 
-  // POSIX-only: Windows ignores the creation mode and reports 0o666.
-  it.skipIf(process.platform === "win32")(
-    "carries an existing target's mode onto the replacement inode when no mode is passed",
-    async () => {
-      // rename() publishes a NEW inode, so without preservation the surviving
-      // file is born at the umask default (~0644) and every overwrite silently
-      // widens a config the user (or an earlier secret-bearing write) tightened
-      // to owner-only. ~/.claude.json holds OAuth tokens and inline MCP env.
-      const file = join(dir, "tightened.json");
-      writeFileSync(file, '{"token":"x"}', { encoding: "utf8", mode: 0o600 });
+  it("carries an existing target's mode onto the replacement inode when no mode is passed", async () => {
+    // rename() publishes a NEW inode, so without preservation the surviving
+    // file is born at the umask default (~0644) and every overwrite silently
+    // widens a config the user (or an earlier secret-bearing write) tightened
+    // to owner-only. ~/.claude.json holds OAuth tokens and inline MCP env.
+    const file = join(dir, "tightened.json");
+    writeFileSync(file, '{"token":"x"}', "utf8");
+    await asPosix(async () => {
+      // What the target's mode IS comes from stat; what the helper DOES with
+      // it is the behaviour under test, so the stat is the injection point.
+      vi.mocked(stat).mockResolvedValueOnce({ mode: 0o100600 } as unknown as Stats);
       await atomicWriteFile(file, '{"token":"y"}');
-      expect(readFileSync(file, "utf8")).toBe('{"token":"y"}');
-      expect(statSync(file).mode & 0o777).toBe(0o600);
-    },
-  );
+    });
+    expect(readFileSync(file, "utf8")).toBe('{"token":"y"}');
+    expect(birthOptions(file)).toEqual({ encoding: "utf8", mode: 0o600 });
+    // And pinned back with chmod on the TMP file (before the rename), because
+    // writeFile's mode is umask-masked -- a preserved 0o664 would otherwise
+    // land at 0o644 under a 0o022 umask.
+    expect(chmoddedPaths().filter((p) => p.startsWith(`${file}.tmp-`))).toHaveLength(1);
+    expect(vi.mocked(chmod).mock.calls[0]?.[1]).toBe(0o600);
+  });
 
-  // POSIX-only for the same reason as above.
-  it.skipIf(process.platform === "win32")("an explicit mode still wins over the target's existing mode", async () => {
+  it("an explicit mode still wins over the target's existing mode", async () => {
     // Preservation must not block a caller that TIGHTENS on purpose: `yaw-mcp
     // try` passes 0o600 precisely because the write it is doing is what puts a
-    // plaintext credential in the file.
+    // plaintext credential in the file. An explicit mode short-circuits the
+    // preservation branch outright -- the target's mode is never even read,
+    // so it cannot win and there is no chmod pinning the looser bits back.
     const file = join(dir, "was-open.json");
-    writeFileSync(file, "{}", { encoding: "utf8", mode: 0o644 });
-    await atomicWriteFile(file, '{"token":"x"}', "utf8", 0o600);
-    expect(statSync(file).mode & 0o777).toBe(0o600);
+    writeFileSync(file, "{}", "utf8");
+    await asPosix(() => atomicWriteFile(file, '{"token":"x"}', "utf8", 0o600));
+    expect(birthOptions(file)).toEqual({ encoding: "utf8", mode: 0o600 });
+    expect(stat).not.toHaveBeenCalled();
+    expect(chmoddedPaths()).toEqual([]);
   });
 
   it("gives concurrent same-path writes distinct tmp files instead of one shared one", async () => {
@@ -108,18 +161,22 @@ describe("atomicWriteFile", () => {
     expect(siblings).toEqual(["clean.json"]);
   });
 
-  // POSIX-only: Windows chmod is a no-op; the mode bits are not meaningful there.
-  it.skipIf(process.platform === "win32")(
-    "with dirMode creates parent directories with the specified mode on POSIX",
-    async () => {
-      const file = join(dir, "secret-dir", "deeper", "vault.json");
-      await atomicWriteFile(file, '{"s":1}', "utf8", undefined, 0o700);
-      expect(readFileSync(file, "utf8")).toBe('{"s":1}');
-      // Both newly-created parent directories should have mode 0o700.
-      expect(statSync(join(dir, "secret-dir")).mode & 0o777).toBe(0o700);
-      expect(statSync(join(dir, "secret-dir", "deeper")).mode & 0o777).toBe(0o700);
-    },
-  );
+  it("with dirMode births every parent directory it creates at that mode", async () => {
+    const file = join(dir, "secret-dir", "deeper", "vault.json");
+    await asPosix(() => atomicWriteFile(file, '{"s":1}', "utf8", undefined, 0o700));
+    expect(readFileSync(file, "utf8")).toBe('{"s":1}');
+    // mkdir(2) itself carries the mode, so neither new parent ever exists at
+    // the umask default (0o755) -- there is no listable window.
+    const leaf = resolve(join(dir, "secret-dir", "deeper"));
+    expect(vi.mocked(mkdir).mock.calls).toContainEqual([leaf, { recursive: true, mode: 0o700 }]);
+    // Both directories this call CREATED are then chmodded (that only
+    // normalizes mkdir's umask masking)...
+    expect(chmoddedPaths()).toEqual([resolve(join(dir, "secret-dir")), leaf]);
+    expect(vi.mocked(chmod).mock.calls.map((c) => c[1])).toEqual([0o700, 0o700]);
+    // ...and the PRE-EXISTING parent is left alone: this must not tighten the
+    // user's $HOME just because a vault was written under it.
+    expect(chmoddedPaths()).not.toContain(resolve(dir));
+  });
 
   it("leaves the original file untouched and rethrows when the parent path is a regular file", async () => {
     // Mechanism: mkdir(parent, {recursive:true}) THROWS EEXIST when
