@@ -219,6 +219,60 @@ describe("parseSecretsArgs", () => {
     expect(parseSecretsArgs(["get", "my token"]).ok).toBe(true);
     expect(parseSecretsArgs(["remove", "my token"]).ok).toBe(true);
   });
+
+  // A stray positional used to be SWALLOWED for every action that takes no
+  // <name>: `secrets audit GH_TOKEN` exited 0 having printed the ENTIRE
+  // trail, so an operator asking "where did GH_TOKEN go" read other
+  // secrets' injection events as if they were GH_TOKEN's.
+  it("rejects a positional on audit and names the flag that really filters", () => {
+    const r = parseSecretsArgs(["audit", "GH_TOKEN"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/unexpected argument "GH_TOKEN"/);
+      expect(r.error).toMatch(/--secret GH_TOKEN/);
+      expect((r as { help?: boolean }).help).toBeUndefined();
+    }
+  });
+
+  it("rejects a positional on list / lock / rotate", () => {
+    for (const action of ["list", "lock", "rotate"]) {
+      const r = parseSecretsArgs([action, "GH_TOKEN"]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toMatch(/takes no <name>/);
+    }
+  });
+
+  // The usage text marks these "(set only)" / "(audit only)"; the parser
+  // used to accept them anywhere and silently drop them.
+  it("rejects --value / --stdin on an action other than set", () => {
+    expect(parseSecretsArgs(["get", "gh", "--stdin"]).ok).toBe(false);
+    const r = parseSecretsArgs(["remove", "gh", "--value", "x"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--value applies to `set` only/);
+  });
+
+  it("rejects the audit-only filters on a non-audit action", () => {
+    const r = parseSecretsArgs(["list", "--secret", "gh"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--secret applies to `audit` only/);
+    expect(parseSecretsArgs(["get", "gh", "--server", "github"]).ok).toBe(false);
+  });
+
+  // `lock` clears a module-scoped cache in ITS OWN one-shot process. No code
+  // path lets it reach the cached key inside a running hub, so the usage
+  // text must not tell an operator it revokes anything there.
+  it("the lock usage does not claim it reaches a running yaw-mcp server", () => {
+    expect(SECRETS_USAGE).toMatch(/CANNOT reach a yaw-mcp\s+server that is already running/);
+    expect(SECRETS_USAGE).not.toMatch(/it matters for a long-running yaw-mcp server/);
+  });
+
+  // Shell history is a 0600 file only the user reads; argv is world-readable
+  // via ps / procfs for the whole run, which is the bigger exposure.
+  it("the --value usage names the argv/ps exposure, not just shell history", () => {
+    expect(SECRETS_USAGE).toMatch(/argv/);
+    expect(SECRETS_USAGE).toMatch(/ps \/ \/proc/);
+    expect(SECRETS_USAGE).toMatch(/For scripting use --stdin/);
+  });
 });
 
 // The push / pull test suites were removed 2026-07-21 with the Yaw Team
@@ -559,6 +613,83 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
     // The env var supplied the passphrase -- no prompt of either kind.
     expect(promptText()).not.toContain("Confirm passphrase: ");
     expect(promptText()).not.toContain("Vault passphrase: ");
+  });
+});
+
+// -----------------------------------------------------------------------
+// Short-passphrase warning -- on EVERY path, not just the env var.
+//
+// The warning used to fire only for YAW_MCP_VAULT_PASSPHRASE, so the
+// interactive creation prompt -- the one place a human actually CHOOSES the
+// vault passphrase -- was the single path with no feedback at all. A vault
+// created under "abc" is trivially brute-forced offline against the stolen
+// file, which is precisely the threat model the vault exists for.
+// -----------------------------------------------------------------------
+
+describe("runSecrets -- short-passphrase warning covers the TTY paths", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  const warned = (): string =>
+    (stderr.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+  const ttyIo = (
+    stdin: FakeTTYStdin,
+  ): { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream; stderr: NodeJS.WritableStream } => ({
+    stdin: stdin as unknown as NodeJS.ReadableStream,
+    stdout,
+    stderr,
+  });
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    lock();
+  });
+
+  it("warns when the confirm-twice CREATION prompt accepts a short passphrase", async () => {
+    const stdin = new FakeTTYStdin(["abc\r", "abc\r"]);
+    const r = await runSecrets({ action: "set", name: "github", value: "ghp_abc", home, io: ttyIo(stdin) }, io);
+    expect(r.exitCode).toBe(0);
+    expect(warned()).toContain("shorter than 12 characters");
+    // Advisory, never a block -- the vault really was created under "abc".
+    lock();
+    expect((await runSecrets({ action: "get", name: "github", passphrase: "abc", home }, io)).exitCode).toBe(0);
+  });
+
+  it("stays quiet when the creation prompt accepts a long passphrase", async () => {
+    const stdin = new FakeTTYStdin(["a-properly-long-passphrase\r", "a-properly-long-passphrase\r"]);
+    const r = await runSecrets({ action: "set", name: "github", value: "ghp_abc", home, io: ttyIo(stdin) }, io);
+    expect(r.exitCode).toBe(0);
+    expect(warned()).not.toContain("shorter than");
+  });
+
+  it("warns on the TTY UNLOCK prompt too, and points at rotate as the fix", async () => {
+    // Seed the vault off-TTY so only the READ below exercises the prompt.
+    expect(
+      (await runSecrets({ action: "set", name: "github", value: "ghp_abc", passphrase: "abc", home }, io)).exitCode,
+    ).toBe(0);
+    lock();
+    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+
+    const stdin = new FakeTTYStdin(["abc\r"]);
+    const r = await runSecrets({ action: "get", name: "github", home, io: ttyIo(stdin) }, io);
+    expect(r.exitCode).toBe(0);
+    expect(warned()).toContain("shorter than 12 characters");
+    // The passphrase is already the vault's, so retyping it is not the fix.
+    expect(warned()).toContain("yaw-mcp secrets rotate");
   });
 });
 
@@ -1500,6 +1631,37 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
     expect(errText()).toContain("rotate");
     expect(errText()).toContain("WRECKED");
     expect(readFileSync(path, "utf8")).toBe(raw);
+  });
+
+  it("a damaged check marker is reported as a corrupt token with the vault path, NOT a wrong passphrase", async () => {
+    // A structurally-valid but undecryptable `check` survives loadVault
+    // (which only type-checks the three string fields). Condemning the
+    // PASSPHRASE on that made every secrets command fail forever on a vault
+    // whose entries were all intact, with nothing naming the real culprit.
+    const before = await seedMulti();
+    const path = vaultPath(home);
+    const onDisk = JSON.parse(before) as VaultFile;
+    onDisk.check = {
+      ...(onDisk.check as EncryptedEntry),
+      ciphertext: Buffer.from("tampered-check-marker").toString("base64"),
+    };
+    writeFileSync(path, `${JSON.stringify(onDisk, null, 2)}\n`, "utf8");
+    lock();
+
+    const r = await runSecrets({ action: "get", name: "ALPHA", passphrase: ROT_PASS, home }, io);
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain('verification token ("check") is corrupt');
+    // The vault module cannot name the file, so the CLI attaches the path.
+    expect(errText()).toContain(path);
+    expect(errText().toLowerCase()).not.toContain("wrong passphrase");
+
+    // A genuinely wrong passphrase against the same damaged vault still
+    // reads as a wrong passphrase -- the two cases stay distinguishable.
+    lock();
+    io.err.mockReset();
+    const bad = await runSecrets({ action: "get", name: "ALPHA", passphrase: "not-the-passphrase", home }, io);
+    expect(bad.exitCode).toBe(1);
+    expect(errText().toLowerCase()).toContain("wrong passphrase");
   });
 
   it("refuses when no CURRENT passphrase can be obtained (non-TTY, no env) -- vault untouched", async () => {

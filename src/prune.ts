@@ -15,6 +15,11 @@
 //     ("error": "" meaning success, "deleted": false, etc.).
 //   * Text-mode: strip trailing whitespace per line and collapse runs
 //     of 3+ blank lines into 2. No content is removed, just formatting.
+//   * JSON mode is SKIPPED entirely when re-serializing would change a
+//     number. Pruning round-trips through JSON.parse + JSON.stringify, so
+//     an int64 id like 12345678901234567890 (ordinary in SQL and REST MCP
+//     servers) would reach the model as 12345678901234567000. Losing a
+//     couple of percent of savings beats handing the model a wrong id.
 //   * If pruning doesn't save at least MIN_SAVINGS_RATIO of the total
 //     serialized bytes across the entire content array, we return the
 //     original untouched — the re-serialization cost isn't worth a
@@ -71,13 +76,84 @@ function pruneText(text: string): string {
   if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && text.length < 2_000_000) {
     try {
       const parsed = JSON.parse(text);
-      const cleaned = pruneJson(parsed);
-      if (cleaned !== undefined) return JSON.stringify(cleaned);
+      // Only re-serialize when every number survives the round-trip. A
+      // response carrying one oversized id keeps its original bytes rather
+      // than reaching the model with that id silently rewritten.
+      if (jsonNumbersAreFaithful(text)) {
+        const cleaned = pruneJson(parsed);
+        if (cleaned !== undefined) return JSON.stringify(cleaned);
+      }
     } catch {
       // Not JSON — fall through to text-mode cleanup.
     }
   }
   return pruneWhitespace(text);
+}
+
+// --- number fidelity --------------------------------------------------
+//
+// JSON numbers are IEEE-754 doubles once parsed, so JSON.parse +
+// JSON.stringify is not a round-trip for every literal a server can send:
+//
+//   12345678901234567890  ->  12345678901234567000   (int64 row id)
+//   9007199254740993      ->  9007199254740992       (2^53 + 1)
+//   1e400                 ->  null                   (overflow to Infinity)
+//   1e-400                ->  0                      (underflow)
+//
+// Pruning is on by default and these shapes are ordinary in SQL / REST MCP
+// servers, so the module's "anything that risks changing semantics is left
+// alone" contract has to cover them too. When any literal is unfaithful we
+// skip JSON mode for the whole document and fall back to whitespace-only
+// cleanup, which cannot alter a value.
+//
+// Integers -- the shape that actually breaks -- get an exact test, so a
+// 16-digit id a double holds precisely still prunes. Fractional forms get a
+// conservative digit bound instead.
+
+/** Significant mantissa digits a double round-trips (a double's shortest
+ *  representation never needs more than 17). */
+const MAX_FAITHFUL_MANTISSA_DIGITS = 17;
+
+/** A JSON string literal, escapes included. Blanked before scanning for
+ *  numbers so digits INSIDE a string can't trigger a false bail. */
+const JSON_STRING_RE = /"(?:[^"\\]|\\.)*"/g;
+
+/** A JSON number literal. Only ever run over string-blanked text. */
+const JSON_NUMBER_RE = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+
+/** Does every number in `text` survive JSON.parse + JSON.stringify with its
+ *  value intact? Callers only ask after JSON.parse succeeded, so blanking
+ *  string literals is enough to make every remaining digit run a number. */
+function jsonNumbersAreFaithful(text: string): boolean {
+  const outsideStrings = text.replace(JSON_STRING_RE, '""');
+  for (const m of outsideStrings.matchAll(JSON_NUMBER_RE)) {
+    if (!numberLiteralIsFaithful(m[0])) return false;
+  }
+  return true;
+}
+
+function numberLiteralIsFaithful(literal: string): boolean {
+  const n = Number(literal);
+  // 1e400 parses to Infinity, which JSON.stringify emits as `null`.
+  if (!Number.isFinite(n)) return false;
+  // Plain integers are the shape that actually breaks, so they get an EXACT
+  // test: the re-serialized text must be the literal, byte for byte. That
+  // keeps every id a double holds precisely (9007199254740991 is 16 digits
+  // and fine), rejects the ones it does not (12345678901234567890, 2^53+1),
+  // and also rejects the ones that merely reshape (1000000000000000000000
+  // comes back as 1e+21 -- same value, but not an id the user can grep for).
+  if (/^-?\d+$/.test(literal)) return String(n) === literal;
+  // Fractional / exponent forms: the double IS the value every JSON parser
+  // sees, and JSON.stringify emits the shortest text that round-trips to
+  // that same double, so re-serializing only reformats (1.0 -> 1, 19.90 ->
+  // 19.9). What can still lose information is underflow to zero, and a
+  // mantissa carrying more precision than a double holds
+  // (0.1000000000000000000001 collapses to 0.1) -- guard those two.
+  const mantissa = literal.replace(/^-/, "").split(/[eE]/)[0];
+  const digits = mantissa.replace(".", "").replace(/^0+/, "");
+  // 1e-400 underflows to 0 -- the digits are gone, not merely rounded.
+  if (n === 0) return !/[1-9]/.test(digits);
+  return digits.replace(/0+$/, "").length <= MAX_FAITHFUL_MANTISSA_DIGITS;
 }
 
 function pruneWhitespace(text: string): string {

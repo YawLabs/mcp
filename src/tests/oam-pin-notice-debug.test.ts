@@ -48,11 +48,15 @@ describe("pinned-sidecar notice at debug level", () => {
   it("names `yaw-mcp sidecars install` for a managed-tree pin", () => {
     const managed = join(root, "managed", "node_modules");
     const dir = join(managed, "@yawlabs", "fetch-mcp");
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(join(dir, "dist"), { recursive: true });
     writeFileSync(
       join(dir, "package.json"),
       JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.0", bin: { "fetch-mcp": "./dist/index.js" } }),
     );
+    // The bin must EXIST: packageEntry existsSync's the entry it resolves, so a
+    // manifest-only fixture resolves to null and the notice never fires at all
+    // -- which would make this test pass its "defined" assertion never.
+    writeFileSync(join(dir, "dist", "index.js"), "");
     // A broker OUTSIDE any npx cache, so the managed entry is the only hit.
     const brokerUrl = pathToFileURL(join(root, "global", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
 

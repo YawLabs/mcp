@@ -102,12 +102,40 @@ export async function defaultFetchCatalog(url: string = DEFAULT_CATALOG_URL): Pr
     if (!res.ok) {
       throw new Error(`the Yaw MCP catalog at ${url} returned HTTP ${res.status}.`);
     }
-    body = await res.json();
+    // A 200 whose body isn't JSON is the captive-portal / corporate-proxy
+    // shape: the request "succeeded" and returned an HTML login page. Left
+    // unwrapped, the raw SyntaxError reaches the user as `yaw-mcp add:
+    // Unexpected token '<', "<!DOCTYPE "... is not valid JSON` -- naming
+    // neither the catalog nor the URL that produced it. Wrap it here so every
+    // failure mode of this function carries the same "catalog at <url>" prefix
+    // its docstring promises. An abort that lands while the BODY is streaming
+    // also rejects here; rethrow that untouched so the outer catch keeps
+    // reporting it as the timeout it is.
+    try {
+      body = await res.json();
+    } catch (parseErr) {
+      if (parseErr instanceof Error && parseErr.name === "AbortError") throw parseErr;
+      const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      throw new Error(`the Yaw MCP catalog at ${url} did not return valid JSON (${msg}).`);
+    }
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error(`timed out fetching the Yaw MCP catalog at ${url}.`);
     }
-    throw err instanceof Error ? err : new Error(String(err));
+    // Anything thrown ABOVE already carries the "catalog at <url>" prefix, so
+    // rethrow those untouched -- the url test is what tells them apart.
+    if (err instanceof Error && err.message.includes(url)) throw err;
+    // Everything else is a TRANSPORT failure raised by fetch itself: offline,
+    // DNS, connection refused, TLS, a proxy that drops the connection. undici
+    // reports every one of them as a bare `TypeError: fetch failed`, which
+    // names neither the catalog nor the URL -- so `yaw-mcp add <slug>` on a
+    // laptop with no network printed exactly "yaw-mcp add: fetch failed".
+    // That is the most common failure this function has, and it was the one
+    // mode the wrapping above did not cover. The real reason lives on
+    // `cause` (ECONNREFUSED, ENOTFOUND, ...); surface it.
+    const cause = err instanceof Error && err.cause instanceof Error ? err.cause.message : null;
+    const detail = cause ?? (err instanceof Error ? err.message : String(err));
+    throw new Error(`could not reach the Yaw MCP catalog at ${url} (${detail}). Check your network, then retry.`);
   } finally {
     clearTimeout(timer);
   }

@@ -11,6 +11,9 @@
 //   * the command isn't Node-based (uv/uvx/docker/python/...) -> unchanged
 //   * an npx package can't be resolved on disk                -> npx (Node)
 //     (oam run needs a real entry; it can't reproduce npx's fetch-on-demand)
+//   * the npx spec is a git/path spec, not a registry package -> npx (Node)
+//   * the npx spec constrains the version and no on-disk copy -> npx (Node)
+//     satisfies it (npx honours the pin; `oam run <entry>` cannot)
 //
 // Compat note: opt in the pure-JS/SDK tier (npmjs/fetch/lemonsqueezy) and the
 // pure-JS DB drivers (postgres via `pg`, redis via `ioredis`) first. Servers
@@ -43,6 +46,124 @@ export function packageName(spec: string): string {
   return at === -1 ? spec : spec.slice(0, at);
 }
 
+/** The `@suffix` of a package spec ("pkg@1.2.3" -> "1.2.3"), or null when the
+ *  spec carries none. The mirror of packageName, cutting at the same "@". */
+function specSuffix(spec: string): string | null {
+  const start = spec.startsWith("@") ? 1 : 0;
+  const at = spec.indexOf("@", start);
+  return at === -1 ? null : spec.slice(at + 1);
+}
+
+/** A single exact version, anchored -- `1.2.3`, `1.2.3-rc.1`, `1.2.3+build`.
+ *  Deliberately NOT tolerant of a leading "v": npm accepts `pkg@v1.2.3`, but
+ *  the version a package.json DECLARES never carries one, so treating it as
+ *  exact would mean normalising before comparing. It falls into "range" below,
+ *  which stays on npx -- the safe answer for a spec we can't verify. */
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/**
+ * What an npx spec's version suffix asks for. Three answers, because the
+ * rewrite can honour only one of them:
+ *
+ *   "any"   -- no suffix, or a dist-tag (`@latest`, `@next`, `@beta`). npx
+ *              would re-resolve the tag against the registry; the newest copy
+ *              on disk is the closest available answer, and notePinnedSidecar
+ *              reports which one won. This is the everyday case.
+ *   "exact" -- one version. The resolved copy must DECLARE it, or the rewrite
+ *              stays on npx: `oam run <entry>` runs whatever is at that path,
+ *              so a version-agnostic lookup would silently host a different
+ *              build than the config asked for. buildLaunchEntry refuses the
+ *              oam path for the broker's own pinned spec for the same reason
+ *              (install-targets.ts) -- silently ignoring a pin is worse than
+ *              not taking the oam path.
+ *   "range" -- a range or partial (`^1.2.3`, `~1.2`, `1.x`, `>=2 <3`, `*`).
+ *              Satisfiable by more than one version, so honouring it means a
+ *              semver range parser this module has no dependency on. Treated
+ *              like an unsatisfiable pin (stay on npx) rather than like a tag,
+ *              because `^1.2.3` resolving to an on-disk 0.9.0 is the exact
+ *              major-version jump the exact case exists to prevent.
+ */
+type SpecConstraint = { kind: "any" } | { kind: "exact"; version: string } | { kind: "range"; raw: string };
+
+export function specConstraint(spec: string): SpecConstraint {
+  const suffix = specSuffix(spec);
+  if (suffix === null || suffix === "") return { kind: "any" };
+  if (EXACT_VERSION.test(suffix)) return { kind: "exact", version: suffix };
+  // A dist-tag is a name, not a version: npm forbids a tag that parses as
+  // semver, so anything opening with a digit or a range operator is a version
+  // expression and anything else ("latest", "next", "canary") is a tag.
+  const versionish = /^[v=<>^~*\d]/.test(suffix) || suffix.includes("||");
+  return versionish ? { kind: "range", raw: suffix } : { kind: "any" };
+}
+
+/**
+ * Whether a launch spec names a plain REGISTRY package -- the only kind whose
+ * name can be used as an on-disk lookup key.
+ *
+ * npx also accepts git and path specs (`npx -y github:owner/repo`, `npx -y
+ * ./local-server`, `file:../x`), and packageName passes those through whole
+ * because there is no `@version` separator to cut at. Handing one to
+ * resolveNpmEntry is worse than useless: it splits on "/" and path.joins the
+ * parts, so `./local-server` is looked up as a TOP-LEVEL package named
+ * `local-server` (join collapses the "."), and on a machine whose managed tree
+ * happens to hold a published package by that name the server is rewritten to
+ * run a different program than the directory the user pointed at.
+ *
+ * A git or path spec is legitimate configuration, so callers skip rather than
+ * error: those servers keep resolving through npx exactly as before.
+ *
+ * NOTE: sidecars-cmd.ts carries a copy of this predicate, which it needs for a
+ * different reason (a git/path spec cannot be a dependency KEY in a generated
+ * manifest). A follow-up dedupes that copy against this one; the direction is
+ * sidecars-cmd -> oam-spawn, since sidecars-cmd already imports packageName
+ * from here.
+ */
+export function isRegistrySpec(spec: string): boolean {
+  // A protocol (github:, file:, git+ssh:, http:) or a filesystem path.
+  if (spec.includes(":") || /^[./~\\]/.test(spec)) return false;
+  // @scope/name, or a bare name. npm forbids a leading "." or "_".
+  return /^(@[^/@\s]+\/)?[^./_@\s][^/@\s]*$/.test(packageName(spec));
+}
+
+/**
+ * Index of the argv element an `npx` launch treats as the package spec: the
+ * FIRST argument npx does not consume itself. -1 when there is none.
+ *
+ * Only `-y`/`--yes` are recognized as npx's own, and only ahead of the spec --
+ * everything after it belongs to the SERVER. That distinction is why this is a
+ * head-scan and not a whole-list filter: filtering the whole list also ate a
+ * server's own trailing `--yes`, so the oam launch and the npx fallback handed
+ * the child different arguments (the 0.74.2 bug). The two shapes agree on WHICH
+ * element is the spec -- the first survivor of a filter is the first non-flag
+ * element -- so the copies drifted apart silently rather than loudly.
+ *
+ * Shared because three callers must answer this identically: rewriteForOam
+ * (which also needs the index, to slice the server's own args off the tail) and
+ * both collectors in sidecars-cmd.ts, which PARTITION the same server set into
+ * "installed" and "skipped". A one-sided edit there drops a server from both
+ * reports with nothing to say why.
+ */
+export function npxSpecIndex(args: readonly string[]): number {
+  return args.findIndex((a) => a !== "-y" && a !== "--yes");
+}
+
+/**
+ * The package spec of an `npx` launch, or null when there is none or the first
+ * unconsumed argument is a flag yaw-mcp does not parse (`--package`, `-p`,
+ * `--node-options`, ...). A flag landing here would otherwise be treated as the
+ * package name.
+ *
+ * rewriteForOam does not use this -- it needs the index for the tail slice, and
+ * it logs the offending flag at debug -- but it applies the same two rules
+ * through npxSpecIndex.
+ */
+export function npxSpec(args: readonly string[]): string | null {
+  const idx = npxSpecIndex(args);
+  if (idx === -1) return null;
+  const spec = args[idx];
+  return spec.startsWith("-") ? null : spec;
+}
+
 /**
  * Minimum oam version yaw-mcp will host sidecars on.
  *
@@ -59,58 +180,228 @@ export function packageName(spec: string): string {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.8.3";
+export const MIN_OAM_VERSION = "0.9.0";
 
 /** One "oam is missing" warning per process, not one per opted-in server.
  *  Cleared by resetOamBinCache so tests do not leak it across cases. */
 let warnedOamMissing = false;
+
+/** Why the probe produced no usable binary even though oam was present on
+ *  disk. `null` is BOTH "oam is usable" and "oam is absent" -- absence is the
+ *  routine case and is already conveyed by `bin === null` with no failure.
+ *    "timeout" -- `oam --version` outlived OAM_PROBE_TIMEOUT_MS
+ *    "exit"    -- it ran and exited non-zero (or died on a signal)
+ *    "spawn"   -- it could not be executed at all (EACCES, a non-executable
+ *                 file, or an injected `run` that rejected without a code) */
+export type OamProbeFailure = "timeout" | "exit" | "spawn";
 
 /** Result of probing the oam binary (`oam --version`). */
 export interface OamProbe {
   /** The spawnable oam binary -- null when oam is not installed OR its
    *  version is below MIN_OAM_VERSION (both mean "fall back to node"). */
   bin: string | null;
+  /**
+   * The same binary as an ABSOLUTE path, or null when it could not be located.
+   *
+   * `bin` is what to SPAWN -- a bare name is correct there, because this
+   * process already resolved it against its own PATH by successfully running
+   * it. `binPath` is what to PERSIST into someone else's config, which is a
+   * different question for the same reason resolveNpmEntry and
+   * resolveStableNpmEntry are two functions: a GUI-launched MCP client does
+   * not inherit the shell PATH that made the bare name work here, so a bare
+   * `oam` written into its config is an ENOENT with no fallback. Null means
+   * "do not persist an oam launch" -- see install-targets.ts.
+   */
+  binPath: string | null;
   /** Version reported by `oam --version` (e.g. "0.6.0"), or null when oam
    *  is not installed or the output was unparseable. */
   version: string | null;
   /** True when oam IS installed but below MIN_OAM_VERSION (bin is null). */
   belowMin: boolean;
+  /** Set when oam was present but unusable, so callers can tell a BROKEN oam
+   *  from an ABSENT one -- both carry bin=null, and reporting the former as
+   *  "not installed" sends the user looking for an install they already have. */
+  failure: OamProbeFailure | null;
+  /** The underlying error message behind `failure`, for diagnostics. Null
+   *  whenever `failure` is null. */
+  failureDetail: string | null;
 }
 
 let oamProbeCache: OamProbe | undefined;
 
-/** Extract the first x.y.z version from `oam --version` output ("oam 0.6.0"). */
+/**
+ * Extract the first version from `oam --version` output ("oam 0.6.0").
+ *
+ * The PRERELEASE suffix is part of the match, and that is the whole point: an
+ * `x.y.z`-only capture read "oam 0.8.3-rc.1" as "0.8.3", which went wrong
+ * twice at once. The rc compared EQUAL to a 0.8.3 floor and was hosted, and
+ * every place that prints probe.version -- doctor's runtime line, upstream's
+ * `oamVersion` log field -- named a release the machine does not have, so a bug
+ * found on the rc would be reported against the release. Build metadata is
+ * captured for the same reporting reason; comparison ignores it, per semver.
+ */
 export function parseOamVersion(out: string): string | null {
-  const m = /(\d+\.\d+\.\d+)/.exec(out);
-  return m ? m[1] : null;
+  const m = /\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?/.exec(out);
+  return m ? m[0] : null;
 }
 
-/** Dotted-numeric x.y.z compare: negative when a < b, 0 when equal/unparseable.
- *  Local copy (doctor-cmd.ts has compareSemver, but importing it here would
- *  create an upstream -> oam-spawn -> doctor-cmd dependency chain). */
-function compareVersions(a: string, b: string): number {
-  const parse = (s: string): [number, number, number] | null => {
-    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(s);
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-  };
-  const pa = parse(a);
-  const pb = parse(b);
-  if (!pa || !pb) return 0;
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+/** A parsed version: the release triple plus prerelease identifiers. Build
+ *  metadata is dropped on purpose -- semver says it carries no precedence. */
+interface Semver {
+  release: [number, number, number];
+  /** Empty for a release; ["rc", 1] for "-rc.1". Numeric identifiers are kept
+   *  as numbers because they compare numerically ("9" < "10", not "10" < "9"). */
+  pre: Array<string | number>;
+}
+
+/** Parse a LEADING x.y.z[-pre][+build], or null when the string does not open
+ *  with one. Anchored: this reads a version it was handed, it does not search
+ *  for one in free text -- that is parseOamVersion's job. */
+function parseSemver(s: string): Semver | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-.]+))?/.exec(s);
+  if (!m) return null;
+  const pre = m[4] === undefined ? [] : m[4].split(".").map((id) => (/^\d+$/.test(id) ? Number(id) : id));
+  return { release: [Number(m[1]), Number(m[2]), Number(m[3])], pre };
+}
+
+/** Prerelease precedence, semver rules 11.3-11.4. Split out because it is the
+ *  half that is easy to get wrong: a release outranks every prerelease of the
+ *  same triple, numeric identifiers rank BELOW alphanumeric ones, and a
+ *  shorter identifier list loses when every shared identifier is equal. */
+function comparePre(a: Array<string | number>, b: Array<string | number>): number {
+  if (a.length === 0 || b.length === 0) {
+    if (a.length === b.length) return 0;
+    return a.length === 0 ? 1 : -1;
   }
-  return 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x === y) continue;
+    if (typeof x === "number" && typeof y === "number") return x < y ? -1 : 1;
+    if (typeof x === "number") return -1;
+    if (typeof y === "number") return 1;
+    return x < y ? -1 : 1;
+  }
+  if (a.length === b.length) return 0;
+  return a.length < b.length ? -1 : 1;
+}
+
+function compareSemver(a: Semver, b: Semver): number {
+  for (let i = 0; i < 3; i++) {
+    if (a.release[i] !== b.release[i]) return a.release[i] < b.release[i] ? -1 : 1;
+  }
+  return comparePre(a.pre, b.pre);
+}
+
+/** Semver compare on two version STRINGS: negative when a < b, positive when
+ *  a > b, 0 when equal or when either side does not parse.
+ *
+ *  Canonical for the whole package, and it lives HERE rather than in
+ *  doctor-cmd (which used to keep a triple-only copy of the same idea) because
+ *  the dependency direction only works one way: upstream -> oam-spawn is on the
+ *  connect path, and importing doctor-cmd from here would drag the whole
+ *  diagnostic command into it. doctor-cmd already imports this module, so it
+ *  takes this one -- and the divergence that made the duplicate worth removing
+ *  was real: the triple-only parse read "0.8.3-rc.1" as EQUAL to a 0.8.3 floor,
+ *  so doctor would have said a prerelease met a floor this file ranks it below.
+ *
+ *  Anchored, per parseSemver: a leading "v" does not parse. Callers whose input
+ *  can carry one (a git-tag-shaped version) normalise before calling. */
+export function compareVersions(a: string, b: string): number {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return 0;
+  return compareSemver(pa, pb);
+}
+
+/** Whether an on-disk copy's DECLARED version satisfies an exact pin.
+ *
+ *  Compared as semver when both parse, so a spec pinning `1.2.3` accepts a copy
+ *  declaring `1.2.3+build` (build metadata carries no precedence). Falls back to
+ *  string equality so a package whose version field is not semver at all can
+ *  still match a spec that names it verbatim. A copy that declares NO version
+ *  never satisfies a pin: it cannot be shown to be the requested build, and the
+ *  point of the check is that "probably right" is what it replaces. */
+function satisfiesExactPin(declared: string | null, want: string): boolean {
+  if (declared === null) return false;
+  const d = parseSemver(declared);
+  const w = parseSemver(want);
+  if (d && w) return compareSemver(d, w) === 0;
+  return declared === want;
 }
 
 /**
- * Convert forward slashes to backslashes on Windows. The MCP SDK spawns stdio
- * servers with `shell: true` (-> cmd.exe), which mis-parses a forward-slash
- * command path ("C:/Users/.../oam.exe" makes cmd read "/Users" as a switch).
- * A backslash path (or a bare "oam.exe" on PATH) spawns correctly. No-op off
- * Windows. `platform` is injectable so the behaviour is testable cross-OS.
+ * Convert forward slashes to backslashes on Windows, because a forward-slash
+ * command path mis-parses in cmd.exe ("C:/Users/.../oam.exe" makes cmd read
+ * "/Users" as a switch). A backslash path (or a bare "oam.exe" on PATH) is
+ * safe everywhere. No-op off Windows. `platform` is injectable so the
+ * behaviour is testable cross-OS.
+ *
+ * The consumer that needs this is the PERSIST path, not the broker's own spawn.
+ * `install` writes the resolved binary into a third-party MCP client's config
+ * (install-cmd.ts -> buildLaunchEntry), and that client launches it however it
+ * likes -- through cmd.exe in the shapes that already require the `cmd /c` wrap
+ * for npx's `.cmd` shim. A backslash path survives all of them.
+ *
+ * It is NOT because of the MCP SDK: @modelcontextprotocol/sdk spawns stdio
+ * servers with `shell: false` (dist/esm/client/stdio.js), so the broker's own
+ * children go straight to CreateProcess and a forward-slash path spawns fine.
+ * An earlier version of this comment claimed `shell: true`, which sent anyone
+ * debugging a Windows spawn to cmd.exe quoting rules that were never involved.
  */
 export function winNormalize(p: string, platform: NodeJS.Platform = process.platform): string {
   return platform === "win32" ? p.replace(/\//g, "\\") : p;
+}
+
+/**
+ * Locate a binary as an ABSOLUTE path, the way the OS loader would: an already
+ * absolute path is accepted if it exists, and a bare name is searched across
+ * PATH (times PATHEXT on Windows, where a bare `oam` is spawnable but the file
+ * on disk is `oam.exe`).
+ *
+ * Deliberately NOT a `which`/`where` subprocess: this runs on the install path
+ * and, via probeOam, on the connect path, where the async-probe rewrite above
+ * exists precisely to keep child processes off it. Reading directory entries is
+ * cheap and cannot hang the way a spawn can.
+ *
+ * `env` and `platform` are injectable so the search is testable cross-OS.
+ */
+export function resolveBinAbsolute(
+  bin: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if (isAbsolute(bin)) return existsSync(bin) ? winNormalize(bin, platform) : null;
+  // Windows env vars are case-insensitive but process.env is not, and a
+  // sanitized child env can carry either spelling.
+  const pathVar = env.PATH ?? env.Path ?? env.path ?? "";
+  if (!pathVar) return null;
+  // An empty PATH entry means "cwd" to the shell; skip it rather than resolve
+  // a config-bound absolute path against whatever directory we happen to be in.
+  const dirs = pathVar.split(platform === "win32" ? ";" : ":").filter(Boolean);
+  // "" first, so a name that already carries its extension is found as written.
+  const exts = platform === "win32" ? ["", ...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)] : [""];
+  for (const dir of dirs) {
+    // Windows PATH entries are commonly quoted; the quotes are shell syntax,
+    // not part of the directory name.
+    const clean = dir.replace(/^"|"$/g, "");
+    for (const ext of exts) {
+      const candidate = join(clean, bin + ext);
+      if (existsSync(candidate)) return winNormalize(candidate, platform);
+    }
+  }
+  return null;
+}
+
+/** Classify a probe rejection so callers can distinguish a BROKEN oam from an
+ *  absent one. An injected `run` that rejects without a recognizable code is
+ *  reported as "spawn" -- the conservative answer, since the one thing it
+ *  definitely was not is a clean run. */
+function classifyProbeFailure(err: unknown): OamProbeFailure {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === "ETIMEDOUT") return "timeout";
+  if (code === "EOAMEXIT") return "exit";
+  return "spawn";
 }
 
 /**
@@ -266,7 +557,17 @@ function spawnVersionProbe(bin: string): Promise<string> {
     // yields "oam exited null" -- the one diagnostic the message carries,
     // dropped in the case most worth diagnosing.
     child.on("close", (code, signal) =>
-      settle(() => (code === 0 ? resolve(collector.result()) : reject(new Error(`oam exited ${code ?? signal}`)))),
+      settle(() => {
+        if (code === 0) {
+          resolve(collector.result());
+          return;
+        }
+        // Tagged so probeOam can classify this as "ran and failed" rather than
+        // "could not be run" -- the two send the user to different fixes.
+        const err = new Error(`oam exited ${code ?? signal}`) as Error & { code?: string };
+        err.code = "EOAMEXIT";
+        reject(err);
+      }),
     );
 
     timer = setTimeout(() => {
@@ -337,15 +638,36 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     const version = parseOamVersion(await run(bin));
     if (version !== null && compareVersions(version, MIN_OAM_VERSION) < 0) {
       log("warn", "oam is installed but below the minimum supported version; falling back to node", {
+        // The full token, prerelease suffix included: a build reporting
+        // "0.8.3-rc.1" against a 0.8.3 floor lands here deliberately (semver
+        // ranks a prerelease below its release), and naming it as "0.8.3" would
+        // make this line look like a comparator bug.
         oamVersion: version,
         minVersion: MIN_OAM_VERSION,
         // The floor tracks the latest release, so below-min always means out
         // of date, and oam updates itself in place.
         updateWith: "oam self-update",
+        // ...but updating alone changes nothing here. oamProbeCache is written
+        // once per process and only ever cleared by a test hook, so every
+        // opted-in server keeps landing on node until the broker restarts --
+        // and an MCP broker under a desktop client lives for days. Without this
+        // the user runs the update, sees no further log line, and reads a
+        // working fix as a fix that did not work. The timeout and generic
+        // failure warns say "for this process" for the same reason.
+        thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
       });
-      return publish({ bin: null, version, belowMin: true });
+      return publish({ bin: null, binPath: null, version, belowMin: true, failure: null, failureDetail: null });
     }
-    return publish({ bin, version, belowMin: false });
+    return publish({
+      bin,
+      // Resolved once, alongside the probe that proved the name spawns, so the
+      // install path never has to re-derive it (or spawn `where`/`which`).
+      binPath: resolveBinAbsolute(bin),
+      version,
+      belowMin: false,
+      failure: null,
+      failureDetail: null,
+    });
   } catch (err) {
     // "oam is not installed" is the expected, silent case -- ENOENT here is
     // routine and logging it would be noise on every node-only setup.
@@ -371,17 +693,29 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         error: err instanceof Error ? err.message : String(err),
       });
     }
-    return publish({ bin: null, version: null, belowMin: false });
+    // ENOENT is absence, not a failure -- see OamProbeFailure. Everything else
+    // is a present-but-unusable oam, which doctor must not report as "not
+    // installed".
+    return publish({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: code === "ENOENT" ? null : classifyProbeFailure(err),
+      failureDetail: code === "ENOENT" ? null : err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
-/**
- * The oam binary to spawn, or `null` if oam isn't available (not installed,
- * or installed below MIN_OAM_VERSION -- see probeOam).
- */
-export async function oamBin(): Promise<string | null> {
-  return (await probeOam()).bin;
-}
+// There used to be an `oamBin()` convenience here -- `(await probeOam()).bin`.
+// It had no callers, and it was the one API shape in this module that ERASED
+// the below-min distinction the rest of it carefully preserves: probeOam
+// returns `belowMin`, and both consumers branch on it (doctor-cmd's runtime
+// line, default-runtime's "oam-below-min" verdict) to say "oam is out of date"
+// rather than "oam is not installed". A future caller reaching for the
+// convenient one-liner would have silently lost that, so it is gone rather
+// than kept as an attractive nuisance -- `(await probeOam()).bin` is the same
+// length and does not throw the distinction away invisibly.
 
 /** Reset the cached oam-binary probe (test hook). Bumps the generation so a
  *  probe still in flight cannot publish its result afterwards. */
@@ -398,8 +732,40 @@ export function resetOamBinCache(): void {
 export interface OamRewriteDeps {
   /** The oam binary, or null when oam is unavailable (-> Node fallback). */
   oamBin: string | null;
-  /** Resolve a package name to an on-disk entry, or null if unresolvable. */
-  resolveEntry: (pkg: string) => string | null;
+  /** Resolve a package name to an on-disk entry, or null if unresolvable.
+   *  `wantVersion` is the exact version the spec pinned, or null when it named
+   *  a tag or nothing -- the resolver must return null rather than a copy that
+   *  declares something else, because `oam run <entry>` has no way to honour a
+   *  pin the path does not already satisfy. */
+  resolveEntry: (pkg: string, wantVersion: string | null) => string | null;
+}
+
+/** Trailing Windows executable extension. A config's `command` may carry one
+ *  (`node.exe`, `npx.cmd` -- npm ships both shims), and it says nothing about
+ *  what the program IS. */
+const WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/;
+
+/**
+ * Which Node launcher a command names, or null for anything else.
+ *
+ * Matched on the BASENAME, with any Windows executable extension removed, so
+ * every real shape of the same launcher is recognised: `node`, `node.exe`,
+ * `/usr/local/bin/node`, `C:\Program Files\nodejs\node.exe`, an nvm/volta shim,
+ * `npx.cmd`. Exact string equality against "node"/"npx" -- which is what this
+ * replaced -- silently opted those launches out of the oam runtime, and an
+ * absolute interpreter path is an ordinary MCP config shape, not an edge case.
+ * README's "only non-Node launches are left alone" is only true with this.
+ *
+ * Exported because doctor answers the same question independently
+ * (default-runtime.ts, the `not-node-command` verdict) and the two MUST agree:
+ * a spawn that hosts on oam while doctor reports node is a worse failure than
+ * either behaviour on its own.
+ */
+export function nodeLaunchKind(command: string): "node" | "npx" | null {
+  const base = (command.split(/[\\/]/).pop() ?? command).replace(WIN_EXE_EXT, "").toLowerCase();
+  if (base === "node") return "node";
+  if (base === "npx") return "npx";
+  return null;
 }
 
 /**
@@ -421,7 +787,9 @@ export function rewriteForOam(
     args: rest.length > 0 ? ["run", entry, "--", ...rest] : ["run", entry],
   });
 
-  if (command === "node") {
+  const kind = nodeLaunchKind(command);
+
+  if (kind === "node") {
     const [entry, ...rest] = args;
     if (!entry) return { command, args };
     // A leading-dash arg is a node flag (--enable-source-maps, --inspect, ...),
@@ -431,7 +799,7 @@ export function rewriteForOam(
     return toOam(entry, rest);
   }
 
-  if (command === "npx") {
+  if (kind === "npx") {
     // Only -y/--yes are recognized, so any OTHER npx flag (--package, -p,
     // --node-options, ...) lands in `spec` and would be treated as the
     // package name. Staying on npx is the safe answer -- reimplementing
@@ -444,8 +812,10 @@ export function rewriteForOam(
     // sliced from the original argv rather than from a filtered copy.
     // Filtering the whole list also ate a server's own trailing `--yes`, so
     // the oam launch and the npx fallback handed the child different
-    // arguments -- the one thing this rewrite promises never to do.
-    const specIdx = args.findIndex((a) => a !== "-y" && a !== "--yes");
+    // arguments -- the one thing this rewrite promises never to do. The scan
+    // itself lives in npxSpecIndex so sidecars-cmd's two collectors cannot
+    // drift from it.
+    const specIdx = npxSpecIndex(args);
     const spec = specIdx === -1 ? undefined : args[specIdx];
     if (!spec) return { command, args };
     if (spec.startsWith("-")) {
@@ -455,12 +825,46 @@ export function rewriteForOam(
       });
       return { command, args };
     }
+    // A git or path spec (`github:owner/repo`, `./local-server`) is not a
+    // package NAME, and resolveNpmEntry would look it up as one -- path.join
+    // collapses the "." so `./local-server` becomes a top-level `local-server`,
+    // i.e. a different program than the directory the config points at. See
+    // isRegistrySpec.
+    if (!isRegistrySpec(spec)) {
+      log("debug", "npx spec is a git/path target, not a registry package; staying on npx instead of oam", { spec });
+      return { command, args };
+    }
     const pkg = packageName(spec);
-    const entry = deps.resolveEntry(pkg);
+    // What the spec asks for version-wise. `oam run <entry>` runs whatever sits
+    // at that path, so anything the resolver cannot prove has to keep npx --
+    // npx re-resolves the spec against the registry and therefore honours it.
+    const constraint = specConstraint(spec);
+    if (constraint.kind === "range") {
+      log("debug", "npx spec constrains the version with a range yaw-mcp cannot evaluate; staying on npx", {
+        package: pkg,
+        range: constraint.raw,
+      });
+      return { command, args };
+    }
+    const wantVersion = constraint.kind === "exact" ? constraint.version : null;
+    const entry = deps.resolveEntry(pkg, wantVersion);
     if (!entry) {
       // oam run needs a real on-disk entry; it can't reproduce npx's
       // fetch-on-demand. Keep npx.
-      log("debug", "npx package has no on-disk entry; staying on npx instead of oam", { package: pkg });
+      //
+      // Two different reasons land here and they send the reader to different
+      // places, so they get different lines: nothing on disk at all (install it,
+      // or leave it -- npx will fetch it) versus nothing on disk AT THE PINNED
+      // VERSION, where npx is not a fallback but the only thing that can honour
+      // the pin at all.
+      if (wantVersion !== null) {
+        log("debug", "no on-disk copy declares the pinned version; staying on npx so the pin is honoured", {
+          package: pkg,
+          version: wantVersion,
+        });
+      } else {
+        log("debug", "npx package has no on-disk entry; staying on npx instead of oam", { package: pkg });
+      }
       return { command, args };
     }
     return toOam(entry, args.slice(specIdx + 1));
@@ -505,8 +909,71 @@ export function npxCacheNodeModules(fromUrl: string = import.meta.url): string[]
   }
 }
 
+/**
+ * An npmrc value, decoded the way npm's own ini parser decodes one.
+ *
+ * Worth doing properly because the two shapes a hand-written npmrc actually
+ * contains are the two a naive `(.+?)\s*$` capture gets wrong, and both produce
+ * a cache directory that does not exist -- after which readdirSync throws, the
+ * npx-cache search finds nothing, and every npx sidecar quietly stays on npx,
+ * indistinguishable from "no sidecars installed":
+ *
+ *   * An INLINE comment. `cache=/tmp/x ; scratch dir` is `/tmp/x` to npm; the
+ *     naive capture takes the comment with it. (A comment on its own LINE was
+ *     already handled -- by the `^\s*cache` anchor, which cannot match one --
+ *     so the explicit `^\s*[;#]` guard that used to sit here was unreachable
+ *     code guarding against the one case that could not occur.)
+ *   * Quoting. A quoted value is unquoted, and a `\;` inside an unquoted one is
+ *     a literal semicolon rather than the start of a comment.
+ *
+ * The backslash handling is the subtle part and it is why this mirrors ini
+ * rather than simplifying: an escape that does NOT precede `\`, `;` or `#` is
+ * kept WITH its backslash, which is the only reason a Windows
+ * `cache=C:\Users\me\npm-cache` survives at all. A generic unescape would eat
+ * every separator and hand back `C:Usersmenpm-cache`.
+ */
+function npmrcValue(raw: string): string {
+  const v = raw.trim();
+  const quoted = v.length > 1 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")));
+  if (quoted) {
+    if (v.startsWith('"')) {
+      try {
+        return JSON.parse(v) as string;
+      } catch {
+        // Not valid JSON -- a Windows path is the everyday case ("C:\Users\me"
+        // has invalid JSON escapes). Take it literally, quotes removed.
+        return v.slice(1, -1);
+      }
+    }
+    return v.slice(1, -1);
+  }
+  let out = "";
+  let esc = false;
+  for (const c of v) {
+    if (esc) {
+      out += ";#\\".includes(c) ? c : `\\${c}`;
+      esc = false;
+      continue;
+    }
+    if (c === ";" || c === "#") break; // start of an inline comment
+    if (c === "\\") {
+      esc = true;
+      continue;
+    }
+    out += c;
+  }
+  if (esc) out += "\\"; // a trailing lone backslash is itself
+  return out.trim();
+}
+
 /** The `cache=` setting in an npmrc, or null when the file is absent or does
- *  not set one. npmrc is `key=value` per line with `;`/`#` comments. */
+ *  not set one. npmrc is `key=value` per line with `;`/`#` comments.
+ *
+ *  `~/` is expanded, because npm expands it for path-typed config fields
+ *  (@npmcli/config's parse-field) and `cache=~/.npm-cache` is a natural thing
+ *  to write. Only the `~/` form, which is the only one npm itself expands -- a
+ *  bare `~` or a Windows `~\` is left alone rather than resolved to something
+ *  npm would not have resolved. */
 function npmrcCache(file: string): string | null {
   let text: string;
   try {
@@ -515,8 +982,13 @@ function npmrcCache(file: string): string | null {
     return null;
   }
   for (const line of text.split(/\r?\n/)) {
-    const m = /^\s*cache\s*=\s*(.+?)\s*$/.exec(line);
-    if (m && !/^\s*[;#]/.test(line)) return m[1].replace(/^["']|["']$/g, "");
+    // The anchor is what excludes a whole-line comment: `;cache=/x` does not
+    // match `^\s*cache`.
+    const m = /^\s*cache\s*=(.*)$/.exec(line);
+    if (!m) continue;
+    const value = npmrcValue(m[1]);
+    if (!value) continue;
+    return value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
   }
   return null;
 }
@@ -569,8 +1041,31 @@ function resolveNpmCacheDir(fromUrl: string): string | null {
 
   const candidates = [join(homedir(), ".npmrc")];
   for (const nodeModules of ownNodeModules(fromUrl)) {
-    // <prefix>/etc/npmrc (global) then <globalroot>/npm/npmrc (builtin).
-    candidates.push(join(dirname(nodeModules), "etc", "npmrc"), join(nodeModules, "npm", "npmrc"));
+    // The GLOBAL npmrc is `<prefix>/etc/npmrc`, and how far the prefix sits
+    // above the global root DIFFERS BY PLATFORM: Windows installs globals into
+    // `<prefix>\node_modules` (prefix is one level up, so dirname IS the
+    // prefix), POSIX into `<prefix>/lib/node_modules` (prefix is two levels
+    // up). Only the one-level form used to be pushed, so on mac/Linux this
+    // candidate was `$PREFIX/lib/etc/npmrc` -- a path npm never writes. A
+    // `cache=` set in the real global npmrc was therefore never read, the
+    // resolver fell through to the compiled-in default, and npmCacheNpxNodeModules
+    // then scanned an `_npx` npm no longer writes to: every `npx -y <pkg>`
+    // sidecar silently stayed on npx. Push BOTH shapes -- the one that does not
+    // match the running layout simply does not exist, so the extra candidate
+    // costs one failed read.
+    //
+    // NOT covered: npm's PROJECT config, which outranks the user file. npm
+    // reads `.npmrc` at the localPrefix (the nearest ancestor with a
+    // package.json / node_modules), not at the cwd, and approximating that walk
+    // with `<cwd>/.npmrc` would read a file npm itself would ignore whenever the
+    // broker is launched from a subdirectory. A missed project `cache=` costs a
+    // fallback to npx; a wrongly-read one hosts sidecars out of a cache npm is
+    // not filling, so the omission is the safe side of that trade.
+    candidates.push(
+      join(dirname(nodeModules), "etc", "npmrc"), // <prefix>/node_modules      (Windows)
+      join(dirname(dirname(nodeModules)), "etc", "npmrc"), // <prefix>/lib/node_modules  (POSIX)
+      join(nodeModules, "npm", "npmrc"), // builtin, beside npm itself
+    );
   }
   // npm as it sits beside the running node itself. This is what covers a
   // broker that is NOT globally installed -- a repo checkout or a project
@@ -681,8 +1176,21 @@ function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
   }
   if (!rel && typeof j.main === "string") rel = j.main;
   if (!rel) return null;
+  const entry = isAbsolute(rel) ? rel : join(pkgDir, rel);
+  // A DECLARED entry is not an entry on disk. package.json is the manifest, not
+  // the file listing: a `files` field that omits the bin, a partially pruned
+  // cache directory, or an interrupted install all leave a package.json whose
+  // `bin` points at nothing. Without this check the module header's "an npx
+  // package can't be resolved on disk -> npx" and rewriteForOam's "oam run
+  // needs a real entry" were both promises this function did not keep, and the
+  // cost of breaking them is a guaranteed-failing spawn: `oam run <missing>`
+  // exits 1 immediately (error[OAM-RT0002]), the boot fails on transport close,
+  // and upstream burns its one-shot node respawn -- where staying on npx was
+  // free. One existsSync per candidate, on a path this function has already
+  // built, is the cheapest possible way to keep the promise.
+  if (!existsSync(entry)) return null;
   return {
-    entry: isAbsolute(rel) ? rel : join(pkgDir, rel),
+    entry,
     version: typeof j.version === "string" ? j.version : null,
   };
 }
@@ -696,6 +1204,14 @@ function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
  * (read straight from package.json) rather than require.resolve's library "."
  * export. `null` keeps the npx/node command.
  *
+ * `wantVersion` is the exact version an `npx -y <pkg>@1.2.3` spec pinned. When
+ * set, a copy is a candidate ONLY if it declares that version -- including the
+ * durable trees, which are otherwise authoritative: a deliberate `npm i` is
+ * still the wrong build if the config asked for a different one, and falling
+ * through to a cache copy that DOES declare it honours the pin where taking the
+ * managed copy would quietly break it. Returning null then keeps npx, which is
+ * the only thing that can actually fetch the pinned version.
+ *
  * `fromUrl`, `npmCache`, and `managedRoot` are injectable for testing; they
  * default to this module's own URL, the resolved npm cache, and the managed
  * sidecar tree. Tests should pass `npmCache` and `managedRoot` explicitly (a
@@ -706,6 +1222,7 @@ export function resolveNpmEntry(
   fromUrl: string = import.meta.url,
   npmCache: string | null = npmCacheDir(fromUrl),
   managedRoot: string | null = sidecarsNodeModules(),
+  wantVersion: string | null = null,
 ): string | null {
   const parts = pkg.split("/"); // "@scope/name" -> ["@scope", "name"]
 
@@ -730,14 +1247,17 @@ export function resolveNpmEntry(
   ];
   for (const { nodeModules, source } of durable) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
-    if (hit) {
-      // Every source is reported here, but not at the same level: an ambient
-      // durable copy pins as hard as a cache copy and is just as invisible
-      // otherwise, so both go to info -- while the managed tree is a pin the
-      // user deliberately chose, so it goes to debug. See notePinnedSidecar.
-      notePinnedSidecar(pkg, hit.version, source, nodeModules);
-      return hit.entry;
-    }
+    if (!hit) continue;
+    // A pin outranks "authoritative": this tree is the right PLACE but the
+    // wrong BUILD, so keep looking rather than host a version the config
+    // explicitly did not ask for.
+    if (wantVersion !== null && !satisfiesExactPin(hit.version, wantVersion)) continue;
+    // Every source is reported here, but not at the same level: an ambient
+    // durable copy pins as hard as a cache copy and is just as invisible
+    // otherwise, so both go to info -- while the managed tree is a pin the
+    // user deliberately chose, so it goes to debug. See notePinnedSidecar.
+    notePinnedSidecar(pkg, hit.version, source, nodeModules);
+    return hit.entry;
   }
 
   // The npx cache is keyed by content hash, not by package, so a machine that
@@ -750,18 +1270,32 @@ export function resolveNpmEntry(
   const roots = new Set([...npxCacheNodeModules(fromUrl), ...npmCacheNpxNodeModules(npmCache)]);
   let best: PackageHit | null = null;
   let bestRoot: string | null = null;
+  // The PARSED version of `best`, or null when it has none / declares one that
+  // is not semver. Kept beside `best` rather than re-derived from
+  // best.version because comparing through compareVersions cannot express the
+  // difference: it returns 0 both for "equal" and for "one of these does not
+  // parse", so a non-null-but-unparseable incumbent could never be displaced.
+  // That is not the symmetric rule the old comment here claimed -- it made the
+  // FIRST such copy win outright and left the highest-version pick, the entire
+  // reason this loop exists, decided by directory-hash order instead.
+  let bestParsed: Semver | null = null;
   for (const nodeModules of roots) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
     if (!hit) continue;
-    // An unversioned candidate only wins when nothing else has been found:
-    // compareVersions returns 0 for unparseable input, so it can never
-    // displace a real version.
-    if (
-      best === null ||
-      (hit.version !== null && (best.version === null || compareVersions(hit.version, best.version) > 0))
-    ) {
+    if (wantVersion !== null && !satisfiesExactPin(hit.version, wantVersion)) continue;
+    const parsed = hit.version === null ? null : parseSemver(hit.version);
+    // Take it when nothing has been found yet, or when this candidate has a
+    // real version and the incumbent's is missing/unparseable, or when both
+    // parse and this one is higher. A GENUINE tie -- the same version in two
+    // cache dirs, or "1.2.3" against "1.2.3+build" -- keeps the incumbent, i.e.
+    // directory order decides; that is fine, because the copies are the same
+    // release. Prerelease precedence is part of the compare, so "0.4.0" beats
+    // "0.4.0-rc.1" rather than tying with it.
+    const wins = best === null || (parsed !== null && (bestParsed === null || compareSemver(parsed, bestParsed) > 0));
+    if (wins) {
       best = hit;
       bestRoot = nodeModules;
+      bestParsed = parsed;
     }
   }
   if (best !== null && bestRoot !== null) notePinnedSidecar(pkg, best.version, "npx-cache", bestRoot);
@@ -899,7 +1433,10 @@ export async function resolveOamSpawn(
   }
   return rewriteForOam(command, args, {
     oamBin: probe.bin,
-    resolveEntry: (pkg) => resolveNpmEntry(pkg),
+    // The three injectables (fromUrl, npmCache, managedRoot) keep their
+    // production defaults -- explicit `undefined` rather than a reorder,
+    // because they are positional and every test call site passes them.
+    resolveEntry: (pkg, wantVersion) => resolveNpmEntry(pkg, undefined, undefined, undefined, wantVersion),
   });
 }
 

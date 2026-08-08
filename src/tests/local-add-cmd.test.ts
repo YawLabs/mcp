@@ -359,6 +359,176 @@ describe("runAdd", () => {
   });
 });
 
+// A re-add rebuilds the entry from the catalog, so it used to overwrite the
+// slot wholesale -- silently dropping a persisted --env secret, an explicit
+// `"isActive": false`, a per-server runtime override and any hand-added field,
+// all under an "Updated ..." success line. upsertUserBundle now folds the new
+// entry ONTO the stored one (mergeServerEntry).
+describe("runAdd re-add preserves user state", () => {
+  const rawFile = async (): Promise<Record<string, unknown>> => {
+    const { readFileSync } = await import("node:fs");
+    return JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8"));
+  };
+  const rawServers = async (): Promise<Array<Record<string, unknown>>> =>
+    (await rawFile()).servers as Array<Record<string, unknown>>;
+
+  it("keeps a stored --env value when a later add supplies none", async () => {
+    const base = { home: synthHome, cwd: synthCwd, fetchCatalog, out: () => {}, err: () => {} };
+    await runAdd({ ...base, slug: "tailscale", env: {}, envOverrides: { TAILSCALE_API_KEY: "tskey-stored" } });
+    // Second add (e.g. to pick up a catalog command change) with the key only
+    // in the SHELL: the required-env gate passes off the ambient value, and the
+    // rebuilt entry seeds the key "". That must not blank the stored secret.
+    const io = captureIO();
+    const r = await runAdd({
+      ...base,
+      slug: "tailscale",
+      env: { TAILSCALE_API_KEY: "tskey-ambient" },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "tailscale");
+    expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-stored");
+    // The ambient value is still never copied to disk.
+    expect(JSON.stringify(await rawFile())).not.toContain("tskey-ambient");
+    // ...and the "read from your shell env and NOT persisted" note must not
+    // fire when a value IS persisted -- it would be plainly false.
+    expect(io.errText()).not.toMatch(/NOT persisted/);
+  });
+
+  it("still lets an explicit --env overwrite the stored value", async () => {
+    const base = { home: synthHome, cwd: synthCwd, env: {}, fetchCatalog, out: () => {}, err: () => {} };
+    await runAdd({ ...base, slug: "tailscale", envOverrides: { TAILSCALE_API_KEY: "tskey-old" } });
+    await runAdd({ ...base, slug: "tailscale", envOverrides: { TAILSCALE_API_KEY: "tskey-new" } });
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers[0].env?.TAILSCALE_API_KEY).toBe("tskey-new");
+  });
+
+  it("keeps isActive:false, a runtime override, connectTimeoutMs and unknown fields", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          {
+            id: "local-fetch",
+            namespace: "fetch",
+            name: "Fetch",
+            type: "local",
+            transport: "stdio",
+            command: "npx",
+            args: ["-y", "@yawlabs/fetch-mcp@0.1.0"],
+            isActive: false,
+            runtime: "oam",
+            connectTimeoutMs: 60000,
+            myOwnNote: "keep me",
+          },
+        ],
+      }),
+    );
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    const [entry] = await rawServers();
+    // What the user set survives...
+    expect(entry.isActive).toBe(false);
+    expect(entry.runtime).toBe("oam");
+    expect(entry.connectTimeoutMs).toBe(60000);
+    expect(entry.myOwnNote).toBe("keep me");
+    // ...while what the re-add is FOR is refreshed from the catalog.
+    expect(entry.args).toEqual(["-y", "@yawlabs/fetch-mcp"]);
+  });
+
+  it("says the entry stays disabled instead of telling the user to restart", async () => {
+    // Preserving isActive:false (above) makes the usual "Restart your MCP
+    // client to pick it up" line actively wrong: a disabled entry never
+    // loads, so the user restarts, sees nothing, and has no reason to
+    // suspect the file. There is no `enable` verb, so the note must name the
+    // edit that turns it on.
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          { id: "local-fetch", namespace: "fetch", name: "Fetch", type: "local", command: "npx", isActive: false },
+        ],
+      }),
+    );
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/stays disabled and will NOT load/);
+    expect(io.text()).not.toMatch(/Restart your MCP client/);
+  });
+
+  it("still tells the user to restart when the entry is enabled", async () => {
+    // Counterweight: the note above must not swallow the normal line, or
+    // every ordinary add loses its only next-step instruction.
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Restart your MCP client/);
+    expect(io.text()).not.toMatch(/stays disabled/);
+  });
+
+  it("still writes isActive:true on a FRESH add", async () => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    expect((await rawServers())[0].isActive).toBe(true);
+  });
+
+  it("--json reports the entry as written, not the pre-merge input", async () => {
+    const base = { home: synthHome, cwd: synthCwd, fetchCatalog, out: () => {}, err: () => {} };
+    await runAdd({ ...base, slug: "tailscale", env: {}, envOverrides: { TAILSCALE_API_KEY: "tskey-stored" } });
+    const io = captureIO();
+    await runAdd({
+      ...base,
+      slug: "tailscale",
+      env: { TAILSCALE_API_KEY: "tskey-ambient" },
+      json: true,
+      out: (s) => io.out.push(s),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.replaced).toBe(true);
+    expect(parsed.entry.env.TAILSCALE_API_KEY).toBe("tskey-stored");
+  });
+});
+
 describe("runRemove", () => {
   it("removes an added server by slug", async () => {
     await runAdd({
@@ -627,6 +797,71 @@ describe("runRemove confirmation gate", () => {
       err: (s) => io.err.push(s),
     });
     expect(r.exitCode).toBe(2);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
+  // The gate parses with parseJsonc -- the SAME parser the write path uses.
+  // Under a stricter JSON.parse a single hand-added `//` line made the lookup
+  // return "nothing to remove" while removeUserBundle parsed the file fine and
+  // deleted the entry (and its stored secret) with no preview, no refusal and
+  // no prompt. Comments + trailing commas are expected input here: the module
+  // header documents that the READER accepts them.
+  const JSONC_BUNDLES = `{
+  // prod token lives in 1Password
+  "version": 1,
+  "servers": [
+    {
+      "namespace": "tailscale",
+      "name": "Tailscale",
+      "command": "npx",
+      "args": ["-y", "@yawlabs/tailscale-mcp"],
+      "env": { "TAILSCALE_API_KEY": "tskey-super-secret" },
+    },
+  ],
+}
+`;
+
+  const writeJsoncBundles = async (): Promise<void> => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(bundlesPath(), JSONC_BUNDLES);
+  };
+
+  it("gates a JSONC bundles.json off a TTY instead of deleting it unconfirmed", async () => {
+    await writeJsoncBundles();
+    const before = bytes();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.errText()).toMatch(/not a TTY/);
+    expect(io.text()).toMatch(/namespace: tailscale/);
+    // The preview renders from the JSONC file, keys only -- never the value.
+    expect(io.text()).toMatch(/env keys:\s+TAILSCALE_API_KEY/);
+    expect(io.text()).not.toContain("tskey-super-secret");
+    expect(bytes().equals(before)).toBe(true);
+  });
+
+  it("prompts on a JSONC bundles.json, and a decline leaves it BYTE-identical", async () => {
+    await writeJsoncBundles();
+    const before = bytes();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toMatch(/Aborted/);
     expect(bytes().equals(before)).toBe(true);
   });
 

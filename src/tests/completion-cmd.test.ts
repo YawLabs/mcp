@@ -129,11 +129,38 @@ describe("renderScript — zsh", () => {
   it("lists every subcommand as a _values candidate with a non-blank description", () => {
     const s = renderScript("zsh");
     for (const spec of SUBCOMMAND_SPEC) {
-      // Each entry renders as 'name:description' -- description must be present
-      // (regression guard for the old hardcoded-map gap that blanked new cmds).
-      expect(s).toContain(`'${spec.name}:${spec.description}'`);
+      // Each entry renders as 'name[description]' -- `_values` takes specs in
+      // `_arguments` form minus the option name, so the description belongs in
+      // BRACKETS. The old 'name:description' form is `_describe` syntax: zsh
+      // parses everything after the ':' as an argument spec and the candidate
+      // shows up with no description at all.
+      expect(s).toContain(`'${spec.name}[${spec.description}]'`);
       expect(spec.description.length).toBeGreaterThan(0);
+      // A '[' / ']' / '(' / ')' inside a description would close the bracket
+      // early or open an action group, silently mangling the candidate.
+      expect(spec.description).not.toMatch(/[[\]()]/);
     }
+    // The colon form must be gone entirely -- no spec may render as 'name:...'.
+    expect(s).not.toMatch(/'[a-z-]+:[^']*'/);
+  });
+
+  it("continues the _values invocation on every spec line but the last", () => {
+    // REGRESSION: the spec lines used to be joined on a bare newline, so only
+    // the FIRST of the 19 continued the `_values` call. The other 18 were
+    // emitted as standalone zsh simple commands whose command word was the
+    // quoted string -- a user pressing TAB after `yaw-mcp ` got `install` as
+    // the sole candidate plus 18 `command not found: add[...]` errors.
+    const s = renderScript("zsh");
+    const block = s.match(/_values 'yaw-mcp subcommand' \\\n([\s\S]*?)\n {6};;/);
+    expect(block, "no _values block in the generated zsh script").not.toBeNull();
+    const specLines = (block as RegExpMatchArray)[1].split("\n");
+    expect(specLines).toHaveLength(SUBCOMMAND_SPEC.length);
+    for (const line of specLines.slice(0, -1)) {
+      expect(line, `spec line does not continue _values: ${line}`).toMatch(/' \\$/);
+    }
+    // Only the final spec line terminates the command.
+    expect(specLines[specLines.length - 1]).toMatch(/'\s*$/);
+    expect(specLines[specLines.length - 1]).not.toMatch(/\\$/);
   });
 
   it("offers positional alternatives at the same _arguments slot", () => {
@@ -330,6 +357,14 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     // The Yaw Team surface's sync flags stay gone.
     expect(secrets?.flags).not.toContain("--replace");
     expect(secrets?.flags).not.toContain("--push");
+  });
+
+  it("offers --help on every subcommand that carries flags", () => {
+    // `install` was the lone flag-carrying entry without --help even though
+    // parseInstallArgs accepts it (install-cmd.ts returns helpRequested), so
+    // `yaw-mcp install --<TAB>` was the only one that hid it.
+    const missing = SUBCOMMAND_SPEC.filter((s) => s.flags.length > 0 && !s.flags.includes("--help")).map((s) => s.name);
+    expect(missing).toEqual([]);
   });
 
   it("keeps the remove entry in sync with parseRemoveArgs (--force / --yes completable)", () => {

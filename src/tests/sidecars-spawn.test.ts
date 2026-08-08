@@ -89,7 +89,23 @@ describe("sidecars install default npm runner", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  const run = () => runSidecarsInstall({ home, cwd: home, out: () => {} });
+  // The oam probe spawns too, and it would go through the same mock and land in
+  // spawnCalls -- so it is stubbed out here, leaving the npm spawns this file
+  // exists to observe. Its own options live in oam-probe-options.test.ts.
+  const run = () =>
+    runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      oamProbe: async () => ({
+        bin: null,
+        binPath: null,
+        version: null,
+        belowMin: false,
+        failure: null,
+        failureDetail: null,
+      }),
+    });
 
   it("keeps npm's own output off stdout so --json stays parseable", async () => {
     // THE regression this file exists for. npm writes its progress ("added 220
@@ -100,7 +116,9 @@ describe("sidecars install default npm runner", () => {
 
     await run();
 
-    expect(spawnCalls).toHaveLength(1);
+    // Two steps: `install` acquires, `update` is the only one that can move an
+    // already-locked @latest forward on a re-run.
+    expect(spawnCalls).toHaveLength(2);
     const stdio = spawnCalls[0].opts.stdio as unknown[];
     expect(stdio[1], "npm stdout must not reach the caller's stdout").toBe(2);
     // stdin closed (nothing to answer with), stderr inherited (progress).
@@ -138,9 +156,32 @@ describe("sidecars install default npm runner", () => {
 
     await run();
 
-    expect(spawnCalls[0].opts.cwd).toBe(sidecarsRoot(home));
-    expect(spawnCalls[0].args).toEqual(["install", "--no-audit", "--no-fund"]);
-    expect(spawnCalls[0].args.join(" ")).not.toContain(home);
+    expect(spawnCalls.map((c) => c.args)).toEqual([
+      ["install", "--no-audit", "--no-fund"],
+      ["update", "--no-audit", "--no-fund"],
+    ]);
+    // Holds for BOTH steps: the shell concession above is only safe while every
+    // argument is a fixed literal.
+    for (const call of spawnCalls) {
+      expect(call.opts.cwd).toBe(sidecarsRoot(home));
+      expect(call.args.join(" ")).not.toContain(home);
+    }
+  });
+
+  it("reports failure when spawn throws synchronously instead of emitting 'error'", async () => {
+    // spawn does not always defer its failure to an 'error' event -- an option
+    // the platform rejects (the EINVAL that made the Windows shell necessary)
+    // or a cwd that vanished throws right out of the call. defaultRunNpm builds
+    // the child inside the Promise executor, so an uncaught throw there rejects
+    // runSidecarsInstall and the CLI prints a raw Node message (index.ts)
+    // instead of the degradation the ENOENT case above pins.
+    setPlatform("linux");
+    spawnThrows = new Error("spawn EINVAL");
+
+    const res = await run();
+
+    expect(res.exitCode).toBe(1);
+    expect(res.lines.join("\n")).toContain("npx cache");
   });
 
   it("reports failure when npm cannot be spawned at all", async () => {

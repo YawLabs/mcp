@@ -584,6 +584,83 @@ describe("buildPromptList / buildPromptRoutes", () => {
   });
 });
 
+describe("buildPromptList / buildPromptRoutes — cross-namespace name collisions", () => {
+  // Prompts flatten exactly like tools: `${namespace}_${prompt}`, so
+  // (ns=`gh`, prompt=`review_pr`) and (ns=`gh_review`, prompt=`pr`) both
+  // render `gh_review_pr`. Underscore-bearing namespaces are real in this
+  // product (e.g. `mcp_hosting`), so this is reachable, not theoretical.
+  function collidingConnections(): Map<string, UpstreamConnection> {
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", [], [], ["review_pr"]));
+    connections.set("gh_review", makeConnection("gh_review", [], [], ["pr"]));
+    return connections;
+  }
+
+  it("emits ONE entry when two active namespaces flatten to the same prompt name", () => {
+    const prompts = buildPromptList(collidingConnections());
+    expect(prompts.filter((p) => p.name === "gh_review_pr")).toHaveLength(1);
+    expect(prompts).toHaveLength(1);
+  });
+
+  it("warns and keeps the FIRST upstream, and both surfaces agree on it", () => {
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const connections = collidingConnections();
+      const routes = buildPromptRoutes(connections);
+      const warning = writes.find((w) => w.includes("Prompt route collision"));
+      // Silent before: an operator had no way to know one upstream's prompt
+      // had become unreachable. Both sides are named so they know which
+      // namespace to rename.
+      expect(warning).toBeDefined();
+      expect(warning).toContain("gh_review_pr");
+      expect(warning).toContain("gh_review");
+
+      // FIRST writer wins, matching buildPromptList's `seen` guard. Routes
+      // used to be last-writer-wins, so a collision meant the client picked
+      // the prompt it saw from `gh` and prompts/get executed `gh_review`'s --
+      // and a later-activated server could capture an earlier one's traffic.
+      expect(routes.get("gh_review_pr")).toEqual({ namespace: "gh", originalName: "review_pr" });
+      expect(routes.size).toBe(1);
+
+      // Pin the AGREEMENT itself, not just each side's value. Tag each
+      // upstream's description so the advertised entry is attributable --
+      // the two prompts are otherwise indistinguishable once flattened.
+      (connections.get("gh") as UpstreamConnection).prompts[0].description = "from gh";
+      (connections.get("gh_review") as UpstreamConnection).prompts[0].description = "from gh_review";
+
+      const advertised = buildPromptList(connections).filter((p) => p.name === "gh_review_pr");
+      expect(advertised).toHaveLength(1);
+      expect(advertised[0].description).toBe("from gh");
+      expect(buildPromptRoutes(connections).get("gh_review_pr")?.namespace).toBe("gh");
+    } finally {
+      process.stderr.write = original;
+    }
+  });
+
+  it("does NOT warn when one connection repeats a namespaced prompt name against itself", () => {
+    // No second upstream to rename, so there is nothing an operator could fix.
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      const conn = makeConnection("gh", [], [], ["review_pr", "review_pr_dup"]);
+      conn.prompts[1].namespacedName = "gh_review_pr";
+      buildPromptRoutes(new Map([["gh", conn]]));
+      expect(writes.some((w) => w.includes("collision"))).toBe(false);
+    } finally {
+      process.stderr.write = original;
+    }
+  });
+});
+
 describe("routePromptGet", () => {
   // Same contract as routeResourceRead: every failure arm answers with a
   // well-formed messages[] carrying the reason, never a throw.

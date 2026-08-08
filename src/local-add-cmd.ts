@@ -20,6 +20,10 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { type FetchCatalog, resolveCatalogSlug } from "./catalog.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
+// The removal gate must see the same files the WRITE path can modify, so it
+// parses with the loader's JSONC parser (comments + trailing commas) rather
+// than a stricter JSON.parse. See findRemovalTarget.
+import { parseJsonc } from "./jsonc.js";
 import {
   deriveNamespace,
   findShadowingProjectBundles,
@@ -204,14 +208,6 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     entryEnv[k] = trimmed;
   }
 
-  // Required keys that passed the gate ONLY because the value was present in the
-  // ambient shell env (not --env). The persisted entry seeds these EMPTY, so the
-  // server depends on that shell var still being set wherever yaw-mcp launches.
-  const overrides = opts.envOverrides ?? {};
-  const ambientOnlyRequired = server.requiredEnvKeys.filter(
-    (k) => (!overrides[k] || overrides[k] === "") && env[k] != null && env[k] !== "",
-  );
-
   const entry: Partial<UpstreamServerConfig> = {
     id: `local-${namespace}`,
     name: server.name,
@@ -246,16 +242,42 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     return { exitCode: 1, written: [] };
   }
 
+  // Report the entry AS WRITTEN, not the one built above: an update folds onto
+  // whatever was already on disk (env values, an explicit isActive:false, a
+  // per-server runtime override -- see mergeServerEntry), so the pre-merge
+  // object would describe a file that doesn't exist.
+  const written = res.entry;
+
   if (opts.json) {
-    print(JSON.stringify({ ok: true, namespace, path: res.path, replaced: res.replaced, entry }, null, 2));
+    print(JSON.stringify({ ok: true, namespace, path: res.path, replaced: res.replaced, entry: written }, null, 2));
   } else {
     print(`${res.replaced ? "Updated" : "Added"} ${server.name} (namespace "${namespace}") in ${res.path}`);
-    print("Restart your MCP client (or yaw-mcp) to pick it up.");
+    // A re-add folds onto a stored `"isActive": false` instead of silently
+    // re-enabling it (mergeServerEntry rule 3). That is deliberate, but it
+    // makes the usual "restart to pick it up" line WRONG: a disabled entry
+    // never loads, so the user restarts, sees nothing, and has no reason to
+    // suspect the file. There is no `enable` verb to point at, so name the
+    // edit that actually turns it on.
+    if (written.isActive === false) {
+      print(
+        `Note: this entry is "isActive": false in ${res.path}, so it stays disabled and will NOT load. Set it to true there to enable it.`,
+      );
+    } else {
+      print("Restart your MCP client (or yaw-mcp) to pick it up.");
+    }
   }
 
-  // If a required key was satisfied only by the ambient shell (not --env), its
-  // value is NOT persisted -- the entry seeds it empty. Warn on stderr (so it
-  // survives --json) that the server depends on that var at launch time.
+  // Required keys that passed the gate but landed on disk EMPTY: the value came
+  // from the ambient shell (not --env) and was deliberately not persisted, so
+  // the server depends on that shell var still being set wherever yaw-mcp
+  // launches. Computed from the WRITTEN entry rather than from the flags, so a
+  // re-add over an entry that already carries a stored value stays quiet
+  // instead of claiming nothing was persisted. Warned on stderr so it survives
+  // --json.
+  const writtenEnv = (written.env ?? {}) as Record<string, string>;
+  const ambientOnlyRequired = server.requiredEnvKeys.filter(
+    (k) => (writtenEnv[k] ?? "").trim() === "" && (env[k] ?? "").trim() !== "",
+  );
   if (ambientOnlyRequired.length > 0) {
     printErr(
       `Note: ${ambientOnlyRequired.join(", ")} ${
@@ -367,13 +389,26 @@ interface RemovalTarget {
 
 /**
  * Which candidate namespace is really present in the user-global bundles.json,
- * plus the fields the preview renders.
+ * plus the fields the preview renders. Null when there is nothing to confirm:
+ * no file, no match, or a file this lookup could not read or parse.
  *
- * `certain` distinguishes "definitely nothing to remove" (no file, or the file
- * parsed and held no match) from "could not tell" (unreadable / malformed).
- * Only a `certain` miss may skip the gate: an uncertain one falls through to
- * removeUserBundle, which throws on exactly those files and surfaces the same
- * error `remove` has always printed for them.
+ * PARSE WITH THE WRITE PATH'S PARSER. parseJsonc is what readBundlesAt (and so
+ * removeUserBundle) uses, and it accepts `//` comments and trailing commas.
+ * Gating on the stricter JSON.parse instead meant a bundles.json carrying one
+ * hand-added `// prod token lives in 1Password` line looked malformed HERE
+ * while the write path parsed and deleted from it happily -- so the preview,
+ * the off-TTY refusal AND the [y/N] prompt were all skipped on exactly the
+ * hand-edited files most likely to hold a stored secret. The two parsers must
+ * see the same set of files or the gate does not cover the write.
+ *
+ * A null return skips the gate, which is safe because the two shapes behind it
+ * end differently in runRemove: a genuine miss stays the exit-0 "nothing to do"
+ * no-op it has always been, while an unreadable / malformed file reaches
+ * removeUserBundle, whose readRawUserBundles THROWS rather than clobber a file
+ * it could not parse -- surfacing the same error `remove` has always printed
+ * instead of a bogus "nothing to remove". There is deliberately no
+ * found/uncertain distinction in the return value: nothing ever consumed it,
+ * and a flag no caller reads documents an invariant nothing enforces.
  *
  * Matching is done on the RAW parsed servers, deliberately NOT through
  * previewBundlesContent: that runs validateEntry, which DROPS malformed
@@ -381,28 +416,23 @@ interface RemovalTarget {
  * entry validateEntry rejects is still one removeUserBundle deletes, so a
  * validated lookup would let it be deleted with no confirmation at all.
  */
-async function findRemovalTarget(
-  candidates: string[],
-  home: string,
-): Promise<{ found: RemovalTarget | null; certain: boolean }> {
+async function findRemovalTarget(candidates: string[], home: string): Promise<RemovalTarget | null> {
   const path = localBundlesPath(userConfigDir(home));
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
-  } catch (e) {
-    // No file at all: nothing to remove, and that is a certainty.
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { found: null, certain: true };
-    return { found: null, certain: false };
+  } catch {
+    return null;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJsonc(raw);
   } catch {
-    return { found: null, certain: false };
+    return null;
   }
-  if (typeof parsed !== "object" || parsed === null) return { found: null, certain: false };
+  if (typeof parsed !== "object" || parsed === null) return null;
   const servers = (parsed as { servers?: unknown }).servers;
-  if (!Array.isArray(servers)) return { found: null, certain: false };
+  if (!Array.isArray(servers)) return null;
 
   for (const ns of candidates) {
     // Same predicate as doRemoveUserBundle's filter (s?.namespace !== ns), so
@@ -414,9 +444,9 @@ async function findRemovalTarget(
     if (!hit) continue;
     const name = typeof hit.name === "string" && hit.name.length > 0 ? hit.name : "(unnamed)";
     const env = typeof hit.env === "object" && hit.env !== null ? (hit.env as Record<string, unknown>) : {};
-    return { found: { namespace: ns, name, launch: renderLaunch(hit), envKeys: Object.keys(env) }, certain: true };
+    return { namespace: ns, name, launch: renderLaunch(hit), envKeys: Object.keys(env) };
   }
-  return { found: null, certain: true };
+  return null;
 }
 
 /** How the entry would be launched, as one reviewable line. Mirrors
@@ -508,20 +538,20 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // user's own, the write below re-reads it anyway, and the worst case of a
   // concurrent edit is an entry `yaw-mcp add` puts straight back.
   if (!opts.force) {
-    const lookup = await findRemovalTarget(candidates, home);
-    if (lookup.found) {
-      printRemovalPreview(print, localBundlesPath(userConfigDir(home)), lookup.found);
+    const doomed = await findRemovalTarget(candidates, home);
+    if (doomed) {
+      printRemovalPreview(print, localBundlesPath(userConfigDir(home)), doomed);
       if (!isInteractive(opts)) {
         // Exit 2, matching `secrets remove`'s off-TTY refusal: a required flag
         // is missing, which is this CLI's usage-error code. (A DECLINED prompt
         // is exit 1 below -- the argv was fine, the user said no.)
         printErr(
-          `yaw-mcp remove: refusing to remove "${lookup.found.namespace}" without a confirmation -- stdin/stdout is not a TTY.`,
+          `yaw-mcp remove: refusing to remove "${doomed.namespace}" without a confirmation -- stdin/stdout is not a TTY.`,
         );
         printErr("  Re-run with --force (or -y) to remove it.");
         return { exitCode: 2, written: [] };
       }
-      const answer = await askYesNo(opts, `  Remove "${lookup.found.namespace}"? [y/N] `);
+      const answer = await askYesNo(opts, `  Remove "${doomed.namespace}"? [y/N] `);
       if (answer !== "y" && answer !== "yes") {
         printErr("yaw-mcp remove: Aborted. Nothing was removed.");
         return { exitCode: 1, written: [] };

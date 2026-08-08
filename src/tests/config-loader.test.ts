@@ -189,6 +189,31 @@ describe("loadYawMcpConfig — fail-open on bad files", () => {
     expect(r.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
   });
 
+  it("warns when a config file exists but cannot be READ (not just when it won't parse)", async () => {
+    // A config.json that is really a DIRECTORY reads as EISDIR on every
+    // platform -- the portable stand-in for the field case (a root-owned
+    // 0600 ~/.yaw-mcp/config.json left by a sudo-run install or a restored
+    // backup, which reads EACCES). Swallowing it made the allow/deny lists
+    // silently vanish -- isAllowed then falls through to allow-all -- with
+    // `doctor --json` reporting an empty warnings array, while the far
+    // milder invalid-JSON case above did warn.
+    const cfgPath = join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME);
+    mkdirSync(cfgPath, { recursive: true });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.loadedFiles).toEqual([]);
+    expect(r.servers).toBeUndefined();
+    const w = r.warnings.find((x) => x.includes("unreadable"));
+    expect(w).toBeDefined();
+    expect(w).toContain(cfgPath);
+  });
+
+  it("stays silent for a merely absent file", async () => {
+    // ENOENT is the normal case for every scope a user hasn't configured;
+    // warning on it would make `doctor` noisy for everyone.
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings).toEqual([]);
+  });
+
   it("non-object root is ignored with a warning", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify(["not", "an", "object"]));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });

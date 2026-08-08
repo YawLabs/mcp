@@ -17,6 +17,7 @@ import {
   saveVault,
   setSecret,
   unlock,
+  VAULT_CHECK_CORRUPT_ERROR,
   VAULT_CHECK_PLAINTEXT,
   type VaultFile,
   vaultPath,
@@ -274,6 +275,54 @@ describe("secrets-vault: set/get/list/remove", () => {
     expect(loaded?.check).toBeDefined();
     // Wrong passphrase against the loaded vault is rejected via check.
     await expect(unlock(loaded as VaultFile, "wrongpass")).rejects.toThrow(/wrong passphrase/i);
+  });
+
+  it("a damaged check marker is reported as a corrupt token, not a wrong passphrase", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    lock();
+    // Flip the check ciphertext but keep the blob STRUCTURALLY valid (three
+    // strings) -- exactly what survives loadVault. The entries are intact.
+    const damaged: VaultFile = {
+      ...vault,
+      check: {
+        ...(vault.check as EncryptedEntry),
+        ciphertext: Buffer.from("tampered-check-marker").toString("base64"),
+      },
+    };
+    // The right passphrase must NOT be condemned: an entry decrypts, so the
+    // marker is the damaged thing and the error has to say so.
+    await expect(unlock(damaged, "hunter2")).rejects.toThrow(VAULT_CHECK_CORRUPT_ERROR);
+    lock();
+    // A genuinely wrong passphrase against the same vault is still a wrong
+    // passphrase -- nothing at all decrypts.
+    await expect(unlock(damaged, "hunter3")).rejects.toThrow(/wrong passphrase/i);
+  });
+
+  it("a legacy vault whose FIRST entry is corrupt still unlocks on a later good one", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "aaa-first", "v1");
+    vault = setSecret(vault, key, "zzz-second", "v2");
+    lock();
+    // No check (pre-check vault) AND the first entry is undecryptable. A
+    // first-entry-only canary condemned the correct passphrase here.
+    const legacy: VaultFile = {
+      version: vault.version,
+      salt: vault.salt,
+      entries: {
+        "aaa-first": {
+          ...vault.entries["aaa-first"],
+          ciphertext: Buffer.from("tampered").toString("base64"),
+        },
+        "zzz-second": vault.entries["zzz-second"],
+      },
+    };
+    await expect(unlock(legacy, "hunter2")).resolves.toBeInstanceOf(Buffer);
+    lock();
+    // Only an ALL-fail is a wrong passphrase.
+    await expect(unlock(legacy, "hunter3")).rejects.toThrow(/wrong passphrase/i);
   });
 
   it("vaultPath places secrets.json under ~/.yaw-mcp/", () => {

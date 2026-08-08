@@ -172,6 +172,57 @@ describe("runAudit", () => {
     expect(io.err.join("\n")).toContain("yaw-mcp compliance https://example.com/mcp");
   });
 
+  // A cache-write failure used to throw straight out of runAudit: the grade
+  // the suite just spent minutes computing was never printed, and index.ts's
+  // dispatch catch exited 1 -- the code this command documents as "no server
+  // with that namespace". A read-only $HOME is the real-world shape; a
+  // DIRECTORY where grades.json belongs reproduces it on every platform
+  // (readGradesCache degrades to {}, then the rename onto it throws).
+  function wedgeGradesCache(root: string): void {
+    mkdirSync(join(root, CONFIG_DIRNAME, "grades.json"), { recursive: true });
+    writeFileSync(join(root, CONFIG_DIRNAME, "grades.json", "occupied"), "x");
+  }
+
+  it("exit 3 when grades.json cannot be written -- the grade is still printed", async () => {
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: [] }]);
+    wedgeGradesCache(home);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 97.5 }),
+    });
+    // 3, not 1 (namespace not found) and not 2 (nothing was graded).
+    expect(r.exitCode).toBe(3);
+    expect(io.out.join("\n")).toContain("Grade: A");
+    expect(io.out.join("\n")).not.toContain("Cached to");
+    expect(io.err.join("\n")).toContain("could not write");
+  });
+
+  it("keeps --json stdout parseable when the cache write fails", async () => {
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: [] }]);
+    wedgeGradesCache(home);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "B", score: 80 }),
+    });
+    expect(r.exitCode).toBe(3);
+    // The Yaw MCP panel parses this stdout: it must stay pure JSON, keep the
+    // `cache` key (null, not absent), and carry the grade.
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed).toMatchObject({ namespace: "ctxlint", grade: "B", score: 80, cache: null });
+    expect(typeof parsed.cacheError).toBe("string");
+  });
+
   it("exit 2 when the suite throws", async () => {
     home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: [] }]);
     const io = captureIO();

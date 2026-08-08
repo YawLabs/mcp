@@ -300,7 +300,17 @@ export interface BuildLaunchEntryOptions {
   /** Optional override for the `args` binary (defaults to
    *  @yawlabs/mcp@latest -- the `@latest` tag makes `npx` re-resolve
    *  the newest version on every spawn, so a client restart is all it
-   *  takes to pick up a new release). */
+   *  takes to pick up a new release).
+   *
+   *  RESERVED SEAM WITH NO LIVE CALLER. Nothing in src/ passes `pkg`:
+   *  install-cmd sends {os, oamBinPath, oamEntry}, try-cmd sends {os, upstream},
+   *  and `parseInstallArgs` has no `--pkg` flag -- the `@latest` default is what
+   *  every caller wants. So the precedence rule documented under `oamBinPath`
+   *  (a `pkg` pin beats the oam path) is reached only from
+   *  install-targets.test.ts, and combinations of `pkg` with the rest of the
+   *  install flow -- notably install-cmd's `previousEnv` carry-over -- have no
+   *  coverage at all. Anyone wiring a `--pkg` flag should write those tests
+   *  first rather than assume the documented interactions are exercised. */
   pkg?: string;
   /** Optional upstream-shape override: when set, the entry is built for
    *  an arbitrary upstream MCP server (used by `yaw-mcp try` to wire a
@@ -317,19 +327,39 @@ export interface BuildLaunchEntryOptions {
     env?: Record<string, string>;
   };
   /** Host the broker ITSELF on oam rather than node. Both must be set, and
-   *  both are resolved by the caller: `oamBin` from the version-gated probe,
-   *  `oamEntry` from resolveStableNpmEntry (durable installs only -- never
-   *  the npx cache, which a config file must not point at). Either being
-   *  null keeps the npx entry, so this can only ever be an upgrade on a
-   *  machine that has oam; it never removes a working launcher.
+   *  both are resolved by the caller: `oamBinPath` from the version-gated
+   *  probe's `binPath`, `oamEntry` from resolveStableNpmEntry (durable installs
+   *  only -- never the npx cache, which a config file must not point at).
+   *  Either being null keeps the npx entry.
+   *
+   *  `binPath`, NOT the probe's `bin`. The two differ for the same reason
+   *  resolveNpmEntry and resolveStableNpmEntry do: `bin` is what THIS process
+   *  can spawn (`OAM_BIN` or a bare `oam`, already resolved against the shell
+   *  PATH by having run it), while this value gets PERSISTED into a config file
+   *  some other process reads. oam installs to `$HOME/.oam/bin` and only nudges
+   *  the shell profile, so a GUI-launched client (Claude Desktop, Cursor from
+   *  Finder/Explorer) inherits no such PATH -- a bare `oam` there is an ENOENT
+   *  with no fallback, and doctor cannot even see it (it flags a missing command
+   *  only when isAbsolute(command)). A non-absolute value is therefore IGNORED
+   *  here, not just filtered by the caller, so the invariant is enforced at the
+   *  boundary instead of by convention.
    *
    *  Ignored when `pkg` is set: `oamEntry` is resolved by the caller for a
    *  specific package, so honouring a `pkg` override here would emit an entry
    *  pinned in name only, pointing at whatever version happens to be on disk.
    *
+   *  Scope of the safety claim: taking this path is an upgrade AT WRITE TIME.
+   *  It cannot replace a launcher that works right now -- but the entry is
+   *  baked, never re-resolved, and the client spawns `oam run --no-check <path>`
+   *  verbatim, so none of the sidecar protections apply later (no
+   *  MIN_OAM_VERSION gate, no ENOENT-to-npx retry, no boot-failure downgrade).
+   *  A subsequent `npm rm -g @yawlabs/mcp` or oam uninstall breaks every client,
+   *  and doctor reports a clean bill of health because it never checks the entry
+   *  path in `args`.
+   *
    *  Note this is a DIFFERENT axis from `runtime: "oam"` in bundles.json:
    *  that hosts the sidecars the broker spawns, this hosts the broker. */
-  oamBin?: string | null;
+  oamBinPath?: string | null;
   oamEntry?: string | null;
 }
 
@@ -367,14 +397,61 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   // resolved path the caller looked up for its OWN package, so combining them
   // would emit an entry that names one version and runs whatever is on disk.
   // Silently ignoring a pin is worse than not taking the oam path.
-  if (opts.oamBin && opts.oamEntry && !opts.pkg) {
-    return { command: opts.oamBin, args: ["run", "--no-check", opts.oamEntry] };
+  //
+  // isAbsolute is a hard gate, not an assertion about the caller: a bare `oam`
+  // written into a client config resolves against the CLIENT's PATH, which a
+  // GUI-launched app does not inherit from the shell that installed oam. Bare
+  // names stay on npx -- see oamBinPath above.
+  if (opts.oamBinPath && isAbsolute(opts.oamBinPath) && opts.oamEntry && !opts.pkg) {
+    return { command: opts.oamBinPath, args: ["run", "--no-check", opts.oamEntry] };
   }
   // No `env` on the default entry: yaw-mcp is local-only, so there is no
   // token to inject. Servers come from ~/.yaw-mcp/bundles.json.
   return opts.os === "windows"
     ? { command: "cmd", args: ["/c", "npx", "-y", pkg] }
     : { command: "npx", args: ["-y", pkg] };
+}
+
+/**
+ * Does `entryPath` live in the node_modules of the tree `cwd` sits in?
+ *
+ * resolveStableNpmEntry calls any non-`_npx` node_modules hit "durable", which
+ * includes a project's own `node_modules` -- and install persists that path into
+ * a MACHINE-GLOBAL config (~/.claude.json, claude_desktop_config.json). A
+ * project tree is much less durable than a global one: `rm -rf node_modules`,
+ * `npm prune`, or renaming the checkout invalidates it, and the "npm update -g
+ * rewrites that path in place" reasoning that justifies persisting a resolved
+ * path at all only covers the global case. So the write is allowed but the user
+ * is told, which needs this predicate to distinguish the two shapes.
+ *
+ * The test is "is cwd inside the tree that owns this node_modules", not a
+ * global-prefix pattern match: prefix layouts differ per installer (nvm, fnm,
+ * volta, homebrew, %APPDATA%\npm) and a missed layout would warn on a perfectly
+ * good global install. It is also precisely the reachable case -- the entry is
+ * resolved from the RUNNING broker's own module URL, so a project hit means
+ * yaw-mcp was launched from that project's node_modules, which is where the
+ * user is.
+ *
+ * Pure string work on both separators, and case-insensitive: Windows paths
+ * compare case-insensitively (including drive-letter case, which differs
+ * between `process.cwd()` and a resolved module path), and a POSIX tree whose
+ * only difference is case would at worst earn one extra note.
+ */
+export function isProjectLocalEntry(entryPath: string, cwd: string): boolean {
+  const norm = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const entry = norm(entryPath);
+  const here = norm(cwd);
+  // OUTERMOST node_modules, so a transitively-nested copy is still attributed
+  // to the tree the user owns and would delete. Anchoring on the innermost one
+  // instead would put the root under node_modules, where cwd never sits.
+  const idx = entry.indexOf("/node_modules/");
+  if (idx <= 0) return false;
+  const root = entry.slice(0, idx);
+  // Only this direction. The mirror test ("is the tree inside cwd") looks
+  // tempting but misfires on every global install whose prefix happens to live
+  // under HOME -- ~/.nvm/versions/node/<v>/lib/node_modules is inside cwd for
+  // anyone running install from their home directory.
+  return here === root || here.startsWith(`${root}/`);
 }
 
 /** The entry key we write into `mcpServers` (Claude Code / Desktop / Cursor)

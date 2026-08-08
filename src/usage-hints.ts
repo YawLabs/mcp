@@ -3,10 +3,12 @@ import type { DetectedPack } from "./pack-detect.js";
 
 // Inline usage hints for discover() output. Two signals:
 //
-//   1. Success count from LearningStore — "you called a tool on this
+//   1. Success credit from LearningStore — "you called a tool on this
 //      server N times and it worked." Populated on the proxy path in
-//      handleToolCall: every routed tool call where the upstream
-//      replied without isError. Activation alone doesn't contribute.
+//      handleToolCall through recordOutcome, which banks a GRADED reward
+//      in [0,1] per routed call rather than a binary answered/errored
+//      flag, so the displayed count is a rounded sum (see formatUsageHint).
+//      Activation alone doesn't contribute.
 //
 //   2. Co-activation peers from PackDetector — "when you loaded X
 //      you usually had Y loaded too." Populated by successful proxied
@@ -23,18 +25,15 @@ import type { DetectedPack } from "./pack-detect.js";
 const MAX_PEERS = 3;
 const MIN_SUCCESS_TO_SHOW = 1;
 
-// Thresholds for the dormant-reliability hint. Exported so
-// handleHealth and `yaw-mcp doctor` can share the same "what counts as
-// flaky" definition — otherwise the various views would disagree about
-// which namespaces qualify and the LLM / operator ends up confused.
-//
-// These are ALIASES of the learning-store constants, not copies: the
-// reliability hint must describe exactly the population LearningStore's
-// penalty branch depresses, so the numbers are imported rather than
-// mirrored-by-comment. Change them in learning.ts and both surfaces move
-// together.
-export const RELIABILITY_MIN_OBSERVATIONS = LEARNING_MIN_OBSERVATIONS;
-export const RELIABILITY_THRESHOLD = PENALTY_RATE_THRESHOLD;
+// The dormant-reliability thresholds below are LEARNING_MIN_OBSERVATIONS
+// and PENALTY_RATE_THRESHOLD, used directly rather than re-exported under
+// reliability-flavoured names. handleHealth and `yaw-mcp doctor` share the
+// "what counts as flaky" definition by calling selectFlakyNamespaces /
+// formatReliabilityWarning, not by importing a threshold -- so a local
+// alias bought nothing and only added a second name for one number.
+// Reading the learning-store constants here (rather than mirroring them)
+// is what keeps the hint describing exactly the population the routing
+// penalty depresses; change them in learning.ts and both surfaces move.
 
 // Flatten detected packs into a per-namespace peer list. Each pack is
 // a set of 2-3 namespaces that co-occurred in ≥2 bursts; the map
@@ -97,9 +96,9 @@ export function formatUsageHint(usage: NamespaceUsage | undefined, coUsedWith: s
 // for suppressing this when the server is currently loaded (the live
 // health warning takes precedence there — see formatHealthWarning).
 export function formatReliabilityWarning(usage: NamespaceUsage | undefined): string | null {
-  if (!usage || usage.dispatched < RELIABILITY_MIN_OBSERVATIONS) return null;
+  if (!usage || usage.dispatched < LEARNING_MIN_OBSERVATIONS) return null;
   const rate = usage.succeeded / usage.dispatched;
-  if (rate >= RELIABILITY_THRESHOLD) return null;
+  if (rate >= PENALTY_RATE_THRESHOLD) return null;
   const pct = Math.round(rate * 100);
   return `reliability: ${pct}% success across ${usage.dispatched} past calls`;
 }
@@ -119,8 +118,8 @@ export function selectFlakyNamespaces(entries: Iterable<FlakyNamespaceEntry>, li
   if (limit <= 0) return [];
   return Array.from(entries)
     .filter(({ usage }) => {
-      if (usage.dispatched < RELIABILITY_MIN_OBSERVATIONS) return false;
-      return usage.succeeded / usage.dispatched < RELIABILITY_THRESHOLD;
+      if (usage.dispatched < LEARNING_MIN_OBSERVATIONS) return false;
+      return usage.succeeded / usage.dispatched < PENALTY_RATE_THRESHOLD;
     })
     .sort((a, b) => {
       const aRate = a.usage.succeeded / a.usage.dispatched;

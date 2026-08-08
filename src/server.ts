@@ -38,7 +38,7 @@ import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
-import { loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
+import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
 import { createProgressReporter, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
@@ -83,17 +83,10 @@ import { ensureUv } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
 
-// Opt-out for cross-session persistence. Set YAW_MCP_DISABLE_PERSISTENCE=1
-// (or "true") to keep learning + pack-history scoped to the current
-// process — nothing is loaded at start, nothing is written on shutdown.
-// Intended for users running yaw-mcp in ephemeral/shared environments
-// (CI runners, containers, on-call relief boxes) where a stale state
-// file would lie about recent usage patterns.
-export function isPersistenceDisabled(): boolean {
-  const raw = process.env.YAW_MCP_DISABLE_PERSISTENCE;
-  if (raw === undefined || raw === "") return false;
-  return raw === "1" || raw.toLowerCase() === "true";
-}
+// The YAW_MCP_DISABLE_PERSISTENCE opt-out lives in persistence.ts (the module
+// it disables) and is imported above. This file used to define its own copy;
+// the shared one reads process.env by default, which is exactly what the call
+// site below wants.
 
 // Current minimum compliance filter, parsed from YAW_MCP_MIN_COMPLIANCE.
 // Re-read on every call so tests can stub the env between cases. Null
@@ -128,6 +121,29 @@ export function isAutoLoadEnabled(): boolean {
   const raw = process.env.YAW_MCP_AUTO_LOAD;
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
+}
+
+// Baseline number of non-matching tool calls a namespace tolerates before
+// the idle reaper unloads it. adaptiveThreshold() (idle-ttl.ts) stacks a
+// per-namespace bonus on top of this and clamps the result to [5, 50].
+export const DEFAULT_IDLE_CALL_THRESHOLD = 10;
+
+// Live idle-threshold baseline. YAW_MCP_IDLE_THRESHOLD is the current
+// name; MCP_CONNECT_IDLE_THRESHOLD is the pre-rename spelling and stays
+// honored as a fallback so existing setups keep working. Re-read on every
+// call (same discipline as resolveMinCompliance / isAutoActivateEnabled)
+// rather than latched in a static initializer, so a mid-session env change
+// — or a test stubbing the env between cases — takes effect immediately.
+// A non-numeric or <1 value falls back to the default instead of
+// silently disabling the reaper.
+export function resolveIdleThreshold(): number {
+  // An empty value counts as unset for BOTH names, so `YAW_MCP_IDLE_THRESHOLD=`
+  // falls through to the legacy spelling rather than swallowing it.
+  const current = process.env.YAW_MCP_IDLE_THRESHOLD;
+  const raw = current !== undefined && current !== "" ? current : process.env.MCP_CONNECT_IDLE_THRESHOLD;
+  if (!raw) return DEFAULT_IDLE_CALL_THRESHOLD;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 1 ? n : DEFAULT_IDLE_CALL_THRESHOLD;
 }
 
 // Auto-warm gate for discover(context): when one candidate clearly wins,
@@ -355,6 +371,17 @@ export class ConnectServer {
   // YAW_MCP_SERVER_CAP. Distinct from activationInflight (which dedupes
   // repeat activations of the SAME namespace) — this bounds the TOTAL count.
   private pendingActivations = new Set<string>();
+  // Per-namespace count of tool calls currently awaiting an upstream
+  // response. Incremented immediately before routeToolCall and decremented
+  // in a finally, so it is accurate across concurrent calls. Read by
+  // trackUsageAndAutoDeactivate: the idle reaper runs on OTHER calls'
+  // completions, so without this a long call to B can be killed mid-flight
+  // by a burst of short calls to A (and then booked as B's failure).
+  private inflightCalls = new Map<string, number>();
+  // Latched by shutdown() before it drains anything. activateOne refuses
+  // while set, so a connection can't be registered into this.connections
+  // after the teardown snapshot and leak a live child process.
+  private shuttingDown = false;
   // Usage learning — nudges dispatch toward namespaces that have been
   // genuinely useful. Counts persist across yaw-mcp restarts via state.json
   // (see persistence.ts). YAW_MCP_DISABLE_PERSISTENCE=1 makes it session
@@ -388,18 +415,10 @@ export class ConnectServer {
   } | null = null;
   private static readonly DISCOVER_CACHE_TTL_MS = 3000;
 
-  // Baseline idle-call threshold. A namespace with NO recent activity
-  // gets deactivated after this many non-matching tool calls; bursty
-  // namespaces get proportionally more patience via adaptiveThreshold()
-  // (see idle-ttl.ts). The env var MCP_CONNECT_IDLE_THRESHOLD overrides
-  // the baseline — it does NOT disable the adaptive cap, which is a
-  // safety valve clamping the final threshold to [5, 50].
-  private static readonly IDLE_CALL_THRESHOLD = (() => {
-    const env = process.env.MCP_CONNECT_IDLE_THRESHOLD;
-    if (!env) return 10;
-    const n = Number.parseInt(env, 10);
-    return Number.isFinite(n) && n >= 1 ? n : 10;
-  })();
+  // Baseline idle-call threshold lives in resolveIdleThreshold() (module
+  // scope, re-read per call) rather than in a static initializer here: a
+  // static latches the env at import, which is exactly the pattern the
+  // isAutoActivateEnabled comment above calls out as the one to avoid.
 
   // Concurrent-load ceiling. See server-cap.ts — checked in
   // runActivateOne before a new upstream is spawned so we refuse at
@@ -508,8 +527,7 @@ export class ConnectServer {
 
   private readonly onUpstreamListChanged = (ns: string) => {
     log("info", "Upstream list changed, rebuilding routes", { namespace: ns });
-    this.rebuildRoutes();
-    this.notifyAllListsChanged().catch((err: Error) => {
+    this.refreshRoutesAndNotify().catch((err: Error) => {
       // Logged rather than silenced — a failure here means the client
       // won't know tools/resources/prompts just changed, which cascades
       // into confusing "unknown tool" errors on the next call. Worth
@@ -525,6 +543,19 @@ export class ConnectServer {
     this.toolRoutes = buildToolRoutes(this.connections, this.getDeferredServers());
     this.resourceRoutes = buildResourceRoutes(this.connections);
     this.promptRoutes = buildPromptRoutes(this.connections);
+  }
+
+  // The obligatory pair after ANY change to the connected set: rebuild the
+  // routing tables, then tell the client its lists moved. Every activation
+  // and deactivation site funnels through here because doing only half of
+  // it is the bug that keeps recurring — a namespace lands in
+  // this.connections while toolRoutes still holds its `deferred` entry, so
+  // the next tools/call takes the deferred branch, finds the server already
+  // connected (isChanged:false), and returns the misleading "no longer
+  // available after loading X" error with no way for the model to recover.
+  private async refreshRoutesAndNotify(): Promise<void> {
+    this.rebuildRoutes();
+    await this.notifyAllListsChanged();
   }
 
   // Active servers, narrowed by the project profile if one is loaded.
@@ -814,6 +845,16 @@ export class ConnectServer {
       }
     }
 
+    // Same obligation prewarm has: the namespaces we just activated are in
+    // this.connections but toolRoutes still carries whatever start() built
+    // (deferred entries, or nothing at all for a server with no toolCache).
+    // Without this the first call on an auto-loaded tool takes the deferred
+    // branch, sees the server already connected, and dead-ends on
+    // "no longer available" — for a server that loaded fine seconds ago.
+    if (loaded.length > 0) {
+      await this.refreshRoutesAndNotify();
+    }
+
     log("info", "Auto-loaded recurring pack", {
       loaded,
       refusedCount: refused.length,
@@ -879,8 +920,17 @@ export class ConnectServer {
             const conn = this.connections.get(server.namespace);
             if (conn) {
               await disconnectFromUpstream(conn).catch(() => {});
-              this.connections.delete(server.namespace);
-              this.idleCallCounts.delete(server.namespace);
+              // Re-read the map after the await and only drop the entry when
+              // it is still OUR connection. disconnectFromUpstream marks the
+              // old connection "disconnected" synchronously, so an explicit
+              // activate that starts during the close sees a dead connection,
+              // spawns a fresh child, and re-registers under the same key.
+              // An unconditional delete here would orphan that child: live,
+              // unreferenced, and invisible to shutdown().
+              if (this.connections.get(server.namespace) === conn) {
+                this.connections.delete(server.namespace);
+                this.idleCallCounts.delete(server.namespace);
+              }
             }
             anyPopulated = true;
           } catch (err) {
@@ -894,8 +944,7 @@ export class ConnectServer {
     }
 
     if (anyPopulated) {
-      this.rebuildRoutes();
-      await this.notifyAllListsChanged();
+      await this.refreshRoutesAndNotify();
     }
   }
 
@@ -1031,10 +1080,14 @@ export class ConnectServer {
           isError: true,
         };
       }
-      if (activation.isChanged) {
-        this.rebuildRoutes();
-        await this.notifyAllListsChanged();
-      }
+      // Rebuild unconditionally on a successful activation, NOT only when
+      // isChanged. We got here holding a `deferred` route, so toolRoutes is
+      // stale by construction; isChanged is false whenever the namespace was
+      // already connected (auto-warmed by discover, loaded by dispatch, or
+      // activated concurrently), and gating on it left the deferred entry in
+      // place — which then fails the re-snapshot below with the misleading
+      // "no longer available" error that no retry can clear.
+      await this.refreshRoutesAndNotify();
       // Re-snapshot against fresh routes. If the upstream no longer
       // exposes a tool by this name (cache was stale), fall through to
       // the routes.get(name) miss path below with a clear message.
@@ -1090,8 +1143,7 @@ export class ConnectServer {
                 this.onUpstreamListChanged,
               );
               this.connections.set(ns, newConn);
-              this.rebuildRoutes();
-              await this.notifyAllListsChanged();
+              await this.refreshRoutesAndNotify();
               log("info", "Auto-reconnected to upstream", { namespace: ns });
               reconnected = true;
               // rebuildRoutes() replaced this.toolRoutes; re-snapshot so the
@@ -1145,10 +1197,30 @@ export class ConnectServer {
     // Capture connection ref before the await to avoid race with config reconciliation
     const connForHealth = route ? this.connections.get(route.namespace) : undefined;
 
+    // Mark the namespace busy for the duration of the upstream call. The
+    // idle reaper (trackUsageAndAutoDeactivate) runs on OTHER calls'
+    // completions, and this namespace's idle counter is only reset AFTER
+    // this call returns — so without the marker a burst of short calls to A
+    // can tip a slow, still-in-flight B over its threshold, close B's
+    // transport, reject the user's pending call, and book the rejection as
+    // B's own 0.0 reward.
+    const callNamespace = route?.namespace;
+    if (callNamespace !== undefined) {
+      this.inflightCalls.set(callNamespace, (this.inflightCalls.get(callNamespace) ?? 0) + 1);
+    }
     const startMs = Date.now();
     // Route against the snapshot, not this.toolRoutes, so a rebuild
     // between the initial lookup and this call can't misdirect us.
-    const result = await routeToolCall(name, args, routes, this.connections);
+    let result: { content: Array<{ type: string; text: string }>; isError?: boolean };
+    try {
+      result = await routeToolCall(name, args, routes, this.connections);
+    } finally {
+      if (callNamespace !== undefined) {
+        const remaining = (this.inflightCalls.get(callNamespace) ?? 1) - 1;
+        if (remaining > 0) this.inflightCalls.set(callNamespace, remaining);
+        else this.inflightCalls.delete(callNamespace);
+      }
+    }
     const latencyMs = Date.now() - startMs;
 
     if (route) {
@@ -1195,6 +1267,10 @@ export class ConnectServer {
         const reward = computeOutcomeReward(result);
         this.learning.recordOutcome(route.namespace, reward);
         this.scheduleStateSave();
+        // The learning counters feed discover's `usage:` / `reliability:`
+        // lines, which the cache key doesn't cover — drop the memo so the
+        // next discover reflects the call that just happened.
+        this.invalidateDiscoverCache();
         // Optional LLM grader (opt-in, YAW_MCP_REWARD_GRADER): on the uncertain
         // heuristic bands only, ask the client LLM whether the call actually
         // accomplished the goal and revise the credit in the BACKGROUND. The
@@ -1341,6 +1417,11 @@ export class ConnectServer {
     progress?.(`Auto-warming top candidate "${top.namespace}"`);
     const result = await this.activateOne(top.namespace, progress);
     if (result.ok) {
+      // The namespace is connected now, so its `deferred` route (built from
+      // the persisted toolCache) is stale. Every other activation site
+      // rebuilds + notifies; skipping it here wedged the very next
+      // tools/call on this server behind a "no longer available" error.
+      await this.refreshRoutesAndNotify();
       log("info", "Auto-warmed top-ranked server on discover", { namespace: top.namespace, score: top.score });
     }
 
@@ -1348,6 +1429,17 @@ export class ConnectServer {
     // banner below must name the server twoStageRank picked, which is
     // not necessarily the head of the list the output renders.
     return this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
+  }
+
+  // Drop the memoized discover body. The cache key only covers
+  // (configVersion, context, warmedNamespace, connected set), so state that
+  // discover RENDERS but the key does not see -- activation failures
+  // (formatHealthWarning) and learning counters (usage:/reliability: lines)
+  // -- has to invalidate explicitly. Without this the exact case the cache
+  // was built for ("discover, failed activate, discover again") replays the
+  // pre-failure text and the model retries the dead server.
+  private invalidateDiscoverCache(): void {
+    this.discoverCache = null;
   }
 
   private discoverCacheKey(context: string | undefined, warmedNamespace: string | null): string {
@@ -1758,6 +1850,17 @@ export class ConnectServer {
     progress?: ProgressReporter,
     fromPrewarm = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
+    // Refuse once shutdown() has latched. Anything spawned from here would
+    // land in this.connections after the teardown snapshot and outlive the
+    // process's own bookkeeping — a live child nothing will ever close.
+    if (this.shuttingDown) {
+      return Promise.resolve({
+        ok: false,
+        isChanged: false,
+        message: `"${namespace}" was not loaded — yaw-mcp is shutting down.`,
+      });
+    }
+
     // An explicit (non-prewarm) activation claims the namespace: prewarm
     // must not tear down a connection the user asked for.
     if (!fromPrewarm) {
@@ -1834,12 +1937,12 @@ export class ConnectServer {
     }
 
     // Compliance floor gate. Refuse to spawn an upstream whose reported
-    // grade is below YAW_MCP_MIN_COMPLIANCE. Enforced here (not only in
-    // handleActivate) so EVERY activation path — dispatch, discover auto-
+    // grade is below YAW_MCP_MIN_COMPLIANCE. This is the ONLY copy of the
+    // gate, so EVERY activation path — activate, dispatch, discover auto-
     // warm, deferred lazy-activation, autoLoadRecurringPack — honors the
-    // floor before connectToUpstream. Ungraded servers pass (see
-    // passesMinCompliance). handleActivate keeps its own early check for
-    // the multi-namespace refusal message, but this is the real gate.
+    // floor before connectToUpstream with one refusal string and one
+    // precedence order (not-installed, then disabled, then profile, then
+    // compliance). Ungraded servers pass (see passesMinCompliance).
     const minCompliance = resolveMinCompliance();
     if (minCompliance !== null && !passesMinCompliance(serverConfig.complianceGrade, minCompliance)) {
       return {
@@ -1965,6 +2068,10 @@ export class ConnectServer {
         at: Date.now(),
         message: lastError instanceof Error ? lastError.message : String(lastError),
       });
+      // discover renders this failure as a `warn: last activation failed ...`
+      // line, but the failure touches nothing in the discover cache key, so
+      // a re-discover inside the 3s TTL would hand back the pre-failure text.
+      this.invalidateDiscoverCache();
 
       // Prefer the ActivationError's message (includes stderr tail + category
       // hint) over the raw SDK error. Falls back cleanly for transport errors.
@@ -2083,7 +2190,17 @@ export class ConnectServer {
     //   - tools not provided (or multi-server activate) → clear the
     //     filter for each touched namespace so re-activating without
     //     `tools` always exposes the full set.
+    //
+    // A filter SET this way is rolled back below when the activation it was
+    // meant for fails: leaving it behind means a later successful load of
+    // the same namespace (via dispatch, or a deferred first call — neither
+    // touches toolFilters) silently advertises only the tools the FAILED
+    // call asked for. The clear-filter branch needs no rollback: it widens
+    // the surface back to the documented default.
     let filtersChanged = false;
+    // Set when this call INSTALLED a filter, so a failed activation can put
+    // the previous state back. `prev: undefined` means "there was none".
+    let installedFilter: { namespace: string; prev: Set<string> | undefined } | null = null;
     if (toolsFilter && namespaces.length === 1) {
       const ns = namespaces[0];
       // Dedup + drop empty strings. If the resulting set is empty we
@@ -2104,6 +2221,7 @@ export class ConnectServer {
         if (!same) {
           this.toolFilters.set(ns, names);
           filtersChanged = true;
+          installedFilter = { namespace: ns, prev };
         }
       }
     } else {
@@ -2117,29 +2235,19 @@ export class ConnectServer {
     let anyError = false;
     let anyCapped = false;
 
-    // Compliance gate. When YAW_MCP_MIN_COMPLIANCE is set, refuse to
-    // activate any server whose reported grade is below the floor.
-    // Ungraded servers always pass — see passesMinCompliance. Parsed
-    // once per handleActivate call so a mid-session env change takes
-    // effect on the next activation, not after a restart.
-    const minCompliance = resolveMinCompliance();
-
+    // NB: no compliance pre-check here. The YAW_MCP_MIN_COMPLIANCE floor is
+    // enforced once, inside runActivateOne, so every activation path shares
+    // one gate and one refusal string. The duplicate that used to live here
+    // produced identical text for the common case but silently REORDERED
+    // precedence for a server failing two gates: a below-grade server that
+    // is also disabled or profile-blocked reported the compliance reason to
+    // `activate` and the disabled/blocked reason to `dispatch`. Refusals are
+    // still errors (not cap-style budgeting) because a failed activateOne
+    // returns ok:false with capped unset, which sets anyError below.
     const total = namespaces.length;
     let i = 0;
     for (const namespace of namespaces) {
       i += 1;
-      if (minCompliance !== null) {
-        const cfg = this.config?.servers.find((s) => s.namespace === namespace);
-        if (cfg && !passesMinCompliance(cfg.complianceGrade, minCompliance)) {
-          const message = `Refused to load "${namespace}": ${complianceRefusalReason(cfg.complianceGrade, minCompliance)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
-          results.push(message);
-          // Deliberately an error even when OTHER namespaces load fine
-          // (unlike cap refusals below): a compliance floor is a hard
-          // policy gate the caller must act on, not expected budgeting.
-          anyError = true;
-          continue;
-        }
-      }
       progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);
@@ -2150,6 +2258,17 @@ export class ConnectServer {
       if (!r.ok) {
         if (r.capped) anyCapped = true;
         else anyError = true;
+        // Roll back a filter we installed for a namespace that never came
+        // up. Otherwise the entry outlives this call and narrows the tool
+        // surface of a LATER, successful activation nobody filtered — and
+        // for a namespace that isn't installed at all it is permanent.
+        if (installedFilter && installedFilter.namespace === namespace) {
+          if (installedFilter.prev) this.toolFilters.set(namespace, installedFilter.prev);
+          else this.toolFilters.delete(namespace);
+          installedFilter = null;
+          // The surface never actually moved, so don't announce that it did.
+          filtersChanged = false;
+        }
       }
     }
     // NB: no trailing "Done" progress notification here. MCP clients
@@ -2162,8 +2281,7 @@ export class ConnectServer {
     // the tail-end progress would be redundant anyway.
 
     if (anyChanged) {
-      this.rebuildRoutes();
-      await this.notifyAllListsChanged();
+      await this.refreshRoutesAndNotify();
     } else if (filtersChanged) {
       // Filter changed on an already-connected server — routes are
       // unchanged (dispatch still reaches hidden tools) but the
@@ -2196,6 +2314,7 @@ export class ConnectServer {
       if (graded === null || graded === heuristic) return;
       this.learning.adjustSucceeded(namespace, graded - heuristic);
       this.scheduleStateSave();
+      this.invalidateDiscoverCache();
     } catch {
       // Refinement is best-effort; it must never surface to the caller.
     }
@@ -2376,8 +2495,7 @@ export class ConnectServer {
     // the client-side race this avoids.
 
     if (anyChanged) {
-      this.rebuildRoutes();
-      await this.notifyAllListsChanged();
+      await this.refreshRoutesAndNotify();
     }
 
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
@@ -2417,8 +2535,7 @@ export class ConnectServer {
     }
 
     if (anyChanged) {
-      this.rebuildRoutes();
-      await this.notifyAllListsChanged();
+      await this.refreshRoutesAndNotify();
     }
 
     return {
@@ -2447,23 +2564,37 @@ export class ConnectServer {
 
     // Auto-deactivate servers that have been idle too long, using an
     // adaptive per-namespace threshold so bursty upstreams get more
-    // patience. The baseline is the static IDLE_CALL_THRESHOLD (env
-    // var-overridable); the adaptive function adds a bonus based on
-    // that namespace's recent activity.
+    // patience. The baseline comes from resolveIdleThreshold() (env
+    // var-overridable, re-read per call); the adaptive function adds a
+    // bonus based on that namespace's recent activity.
+    const baseline = resolveIdleThreshold();
     const toDeactivate: string[] = [];
     for (const [ns, idleCount] of this.idleCallCounts) {
       if (!this.connections.has(ns)) continue;
-      const threshold = adaptiveThreshold(ns, this.recentToolCalls, ConnectServer.IDLE_CALL_THRESHOLD);
+      const threshold = adaptiveThreshold(ns, this.recentToolCalls, baseline);
       if (idleCount >= threshold) {
+        // Never reap a namespace with a tool call still in flight: the
+        // close would reject the user's own pending callTool, which the
+        // proxy turns into an isError result and handleToolCall then books
+        // as a 0.0 reward against a server WE killed. Leaving it connected
+        // costs one more idle tick — it is re-evaluated on the next
+        // completion, by which point the call has drained.
+        if ((this.inflightCalls.get(ns) ?? 0) > 0) {
+          log("info", "Skipping idle deactivation — tool call in flight", {
+            namespace: ns,
+            idleCalls: idleCount,
+          });
+          continue;
+        }
         toDeactivate.push(ns);
-      } else if (idleCount >= ConnectServer.IDLE_CALL_THRESHOLD && !this.adaptiveSkipLogged.has(ns)) {
-        // We would have deactivated under the static threshold but the
+      } else if (idleCount >= baseline && !this.adaptiveSkipLogged.has(ns)) {
+        // We would have deactivated under the baseline threshold but the
         // adaptive bonus is keeping this ns alive. Log once per ns so
         // users can see the mechanism doing its job, then stay quiet.
         log("info", "Adaptive idle patience keeping bursty upstream alive", {
           namespace: ns,
           idleCalls: idleCount,
-          baseline: ConnectServer.IDLE_CALL_THRESHOLD,
+          baseline,
           adaptiveThreshold: threshold,
         });
         this.adaptiveSkipLogged.add(ns);
@@ -2483,8 +2614,7 @@ export class ConnectServer {
     }
 
     if (toDeactivate.length > 0) {
-      this.rebuildRoutes();
-      await this.notifyAllListsChanged();
+      await this.refreshRoutesAndNotify();
     }
   }
 
@@ -2537,8 +2667,7 @@ export class ConnectServer {
     }
 
     if (changed) {
-      this.rebuildRoutes();
-      await this.notifyAllListsChanged();
+      await this.refreshRoutesAndNotify();
     }
   }
 
@@ -2571,6 +2700,37 @@ export class ConnectServer {
           {
             type: "text",
             text: `"${serverArg}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover to list available servers.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Policy gates, in the same order and with the same wording
+    // runActivateOne uses. The transient path below still SPAWNS the
+    // server's configured command with its resolved env (vault secrets
+    // included) — "we disconnect afterwards" does not make executing a
+    // deny-listed or below-floor server acceptable, and every other
+    // surface (discover, dispatch, secrets, bundles, prewarm) narrows by
+    // the profile before it reaches a server.
+    if (!profileAllows(this.profile, serverArg)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `"${serverArg}" is not allowed by the project profile at ${this.profile?.path}.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    const minCompliance = resolveMinCompliance();
+    if (minCompliance !== null && !passesMinCompliance(serverConfig.complianceGrade, minCompliance)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Refused to load "${serverArg}": ${complianceRefusalReason(serverConfig.complianceGrade, minCompliance)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`,
           },
         ],
         isError: true,
@@ -2756,7 +2916,7 @@ export class ConnectServer {
         const avgLatency = h.totalCalls > 0 ? Math.round(h.totalLatencyMs / h.totalCalls) : 0;
         const errorRate = h.totalCalls > 0 ? Math.round((h.errorCount / h.totalCalls) * 100) : 0;
         const idleCount = this.idleCallCounts.get(namespace) ?? 0;
-        const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, ConnectServer.IDLE_CALL_THRESHOLD);
+        const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, resolveIdleThreshold());
         const toolNames = conn.tools.map((t) => t.name).join(", ");
 
         lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
@@ -3164,6 +3324,10 @@ export class ConnectServer {
   async shutdown(): Promise<void> {
     log("info", "Shutting down yaw-mcp");
 
+    // Latch FIRST: activateOne refuses from here on, so nothing new can be
+    // registered into this.connections behind the teardown below.
+    this.shuttingDown = true;
+
     // Flush any pending state save before we stop accepting writes.
     // Cancels the debounce timer so no stale snapshot writes after.
     if (this.stateSaveTimer) {
@@ -3174,10 +3338,26 @@ export class ConnectServer {
       await this.flushStateSave();
     }
 
+    // Drain activations that were already past the gate when we latched.
+    // start()'s fire-and-forget prewarm can have several children mid-
+    // handshake; each one registers its connection on resolve. Snapshotting
+    // this.connections without waiting would miss them entirely, leaving
+    // live child processes nobody ever disconnects (the parent exiting is
+    // what masks this in production, not any cleanup we do).
+    if (this.activationInflight.size > 0) {
+      log("info", "Waiting for in-flight activations before teardown", { count: this.activationInflight.size });
+      await Promise.allSettled([...this.activationInflight.values()]);
+    }
+
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));
     await Promise.allSettled(disconnects);
     this.connections.clear();
+    // Drop session-elicited credentials, as the field's contract promises.
+    // Plaintext values the user typed must not survive a shutdown into an
+    // embedded/test host that reuses the instance.
+    this.elicitedEnv.clear();
+    this.inflightCalls.clear();
 
     await this.server.close();
 

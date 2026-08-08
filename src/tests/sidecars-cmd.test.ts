@@ -9,11 +9,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { isRegistrySpec, type OamProbe } from "../oam-spawn.js";
 import {
   collectNonRegistrySpecs,
   collectSidecarSpecs,
   installedVersion,
-  isRegistrySpec,
   parseSidecarsArgs,
   runSidecarsInstall,
   sidecarsManifest,
@@ -21,6 +21,21 @@ import {
   sidecarsRoot,
 } from "../sidecars-cmd.js";
 import type { UpstreamServerConfig } from "../types.js";
+
+/** A stand-in oam probe. Injected so the "will anything READ this tree" note
+ *  does not depend on whether the machine running the suite has oam -- and so
+ *  no unit test here spawns the real `oam --version` that probeOam defaults to. */
+const probeWith = (bin: string | null): OamProbe => ({
+  bin,
+  binPath: bin,
+  version: bin === null ? null : "9.9.9",
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
+
+/** The common case: no oam on this machine. */
+const noOam = async () => probeWith(null);
 
 const local = (over: Partial<UpstreamServerConfig>): Partial<UpstreamServerConfig> => ({
   type: "local",
@@ -121,6 +136,12 @@ describe("sidecarsManifest", () => {
   });
 });
 
+// The predicate itself lives in oam-spawn.ts and is imported, not copied --
+// see the note above collectSidecarSpecs in sidecars-cmd.ts. oam-spawn.test.ts
+// pins the same function for the LOOKUP-KEY contract; this block pins the
+// MANIFEST-KEY contract that sidecars-cmd depends on, which is a separate
+// promise about the same code and is what the two tests below are actually
+// about. Both matter: one function now answers both questions.
 describe("isRegistrySpec", () => {
   it("accepts the registry forms and rejects git/path targets", () => {
     // npx takes git and path specs too, and packageName passes those through
@@ -263,6 +284,55 @@ describe("runSidecarsInstall", () => {
     expect(text, "must not describe a bundles.json that does not exist").not.toContain("in bundles.json");
   });
 
+  it("reports a bundles.json it cannot parse as broken, not as an empty machine", async () => {
+    // loadLocalBundles returns config=null for BOTH "no file anywhere" and
+    // "a file that is there and unusable" (invalid JSON, a non-array `servers`,
+    // an EACCES read), telling them apart by leaving `path` set. Collapsing the
+    // two told the user to add a server to a file whose actual problem is that
+    // it cannot be parsed, and handed a scripted caller `reason: "no-config",
+    // error: null` -- a broken machine read as a fresh one, in the document
+    // whose whole job is to be the success/failure discriminator.
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), "{ not json");
+    const warnings: string[] = [];
+    let out = "";
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      err: (s) => warnings.push(s),
+      runNpm: async () => 0,
+    });
+
+    const doc = JSON.parse(out);
+    expect(res.exitCode, "nothing was installed and the cause is a defect to fix").toBe(1);
+    expect(doc.reason).toBe("unreadable-config");
+    expect(doc.error, "a consumer branching on `error` must not read this as clean").toContain("invalid JSON");
+    // The loader's own diagnostic is what names the defect; every sibling
+    // command prints it and this one used to drop it on the floor.
+    expect(warnings.join("\n")).toContain("invalid JSON");
+    // Same keys as every other path, so the document stays uniform.
+    expect(Object.keys(doc).sort()).toEqual(
+      ["root", "installed", "reason", "error", "updateError", "conflicts", "skipped"].sort(),
+    );
+  });
+
+  it("does not offer `yaw-mcp add` when the config exists but is broken", async () => {
+    // The text-mode half: "No servers configured yet" describes a machine with
+    // no bundles.json, which is precisely what this one is not.
+    writeFileSync(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers: "not-an-array" }));
+
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {}, err: () => {} });
+
+    const text = res.lines.join("\n");
+    expect(res.exitCode).toBe(1);
+    expect(text).toContain("Could not read");
+    expect(text).not.toContain("No servers configured yet");
+  });
+
   it("leads with the skips when every npx server is a git or path target", async () => {
     // Reporting "no npx-launched servers" would flatly contradict the config
     // the user is looking at, which reads as a bug rather than an explanation.
@@ -326,21 +396,142 @@ describe("runSidecarsInstall", () => {
     ]);
     // Stand in for what npm would have produced, so the version read-back has
     // something to find.
-    const runNpm = async (args: string[], cwd: string) => {
-      expect(args[0]).toBe("install");
-      expect(cwd).toBe(sidecarsRoot(home));
+    const cwds: string[] = [];
+    const runNpm = async (_args: string[], cwd: string) => {
+      cwds.push(cwd);
       const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
       return 0;
     };
 
-    const res = await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {} });
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {}, oamProbe: noOam });
 
     expect(res.exitCode).toBe(0);
     expect(res.installed).toEqual([{ pkg: "@yawlabs/fetch-mcp", version: "0.3.6", namespaces: ["fetch"] }]);
+    // Every npm step runs in the managed directory, never in the caller's cwd.
+    expect(new Set(cwds)).toEqual(new Set([sidecarsRoot(home)]));
     const manifest = JSON.parse(readFileSync(join(sidecarsRoot(home), "package.json"), "utf8"));
     expect(manifest.dependencies).toEqual({ "@yawlabs/fetch-mcp": "latest" });
+  });
+
+  it("runs `npm update` after `npm install` so a re-run moves a @latest server forward", async () => {
+    // THE reason this command exists. `npm install` cannot re-resolve a
+    // dist-tag against an existing tree: with a lockfile present, arborist's
+    // dep-valid treats a `tag` spec as satisfied by any node that already has a
+    // `resolved` URL, so the locked version stays and npm prints "up to date".
+    // Measured against real npm -- install left the old version, update moved
+    // it. Without the second step "Re-run this command to move them forward"
+    // is a promise the command cannot keep, and a @latest sidecar pins itself
+    // permanently the first time it is installed.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+
+    await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      oamProbe: noOam,
+      runNpm: async (args, cwd) => {
+        calls.push({ args, cwd });
+        return 0;
+      },
+    });
+
+    expect(calls.map((c) => c.args)).toEqual([
+      ["install", "--no-audit", "--no-fund"],
+      ["update", "--no-audit", "--no-fund"],
+    ]);
+    // Fixed literals only, in both steps -- the Windows shell in defaultRunNpm
+    // is safe ONLY while no user-controlled string reaches these args.
+    for (const c of calls) {
+      expect(c.cwd).toBe(sidecarsRoot(home));
+      expect(c.args.join(" ")).not.toContain(home);
+    }
+  });
+
+  it("does not run the refresh step when the install itself failed", async () => {
+    // Nothing to move forward, and npm has already printed why it failed --
+    // a second command on a broken tree only adds noise.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    const verbs: string[] = [];
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      runNpm: async (args) => {
+        verbs.push(args[0]);
+        return 1;
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(verbs).toEqual(["install"]);
+  });
+
+  it("keeps a failed refresh non-fatal but reports it in --json", async () => {
+    // The install succeeded, so the packages ARE on disk and usable -- exiting
+    // non-zero would make a scripted caller discard a good tree. What the
+    // caller does need to know is that the versions may not have moved, which
+    // is why `updateError` is separate from `error`.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    let out = "";
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      oamProbe: noOam,
+      runNpm: async (args) => {
+        if (args[0] === "install") {
+          const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+          return 0;
+        }
+        return 7;
+      },
+    });
+
+    const doc = JSON.parse(out);
+    expect(res.exitCode, "a usable tree is not a failure").toBe(0);
+    expect(doc.error, "the install itself worked").toBeNull();
+    expect(doc.updateError).toContain("npm update exited 7");
+    expect(doc.installed[0].version).toBe("0.3.6");
   });
 
   it("fails when npm fails, and says resolution falls back rather than breaking", async () => {
@@ -379,7 +570,7 @@ describe("runSidecarsInstall", () => {
       },
     ]);
 
-    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {} });
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {}, oamProbe: noOam });
 
     expect(res.exitCode).toBe(1);
     expect(res.installed[0].version).toBeNull();
@@ -403,7 +594,7 @@ describe("runSidecarsInstall", () => {
       return 0;
     };
 
-    const res = await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {} });
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {}, oamProbe: noOam });
 
     expect(res.exitCode, "a partial install is not a failure").toBe(0);
     expect(res.installed.map((i) => i.version)).toEqual(["0.3.6", null]);
@@ -415,7 +606,7 @@ describe("runSidecarsInstall", () => {
     // could not read `root` without first working out which path it hit. Pin
     // the shape: same keys whether the install worked, found nothing, or
     // failed.
-    const KEYS = ["root", "installed", "reason", "error", "conflicts", "skipped"].sort();
+    const KEYS = ["root", "installed", "reason", "error", "updateError", "conflicts", "skipped"].sort();
     const npxServer = {
       id: "1",
       name: "F",
@@ -435,6 +626,7 @@ describe("runSidecarsInstall", () => {
         out: (s) => {
           out += s;
         },
+        oamProbe: noOam,
         runNpm: async () => {
           onNpm?.();
           return npmExit;
@@ -471,6 +663,97 @@ describe("runSidecarsInstall", () => {
     expect(ok.installed[0].version).toBe("0.3.6");
   });
 
+  it("says so when nothing will read the tree it just filled", async () => {
+    // collectSidecarSpecs filters on `command === "npx"` and nothing else, but
+    // the managed tree is read ONLY by resolveNpmEntry on the oam rewrite path.
+    // A server pinned to the node runtime spawns through npx and never looks
+    // there, so "These versions are now fixed" on its own tells the user their
+    // servers are pinned when nothing has changed. `runtime: "node"` is checked
+    // before any probe, so this case is deterministic on any machine -- and the
+    // probe below is deliberately a WORKING oam, to show the note is about
+    // configuration, not about oam being missing.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+        runtime: "node",
+      },
+    ]);
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      runNpm: async () => 0,
+      oamProbe: async () => probeWith("oam"),
+    });
+
+    const text = res.lines.join("\n");
+    expect(text).toContain("Nothing reads these copies yet");
+    // The reason comes from describeServerRuntime, so this note and doctor's
+    // runtime section cannot drift apart.
+    expect(text).toContain('per-server runtime:"node"');
+    expect(text).toContain("the managed copies are read only");
+  });
+
+  it("stays quiet about the runtime when oam will host the servers", async () => {
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+        runtime: "oam",
+      },
+    ]);
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      runNpm: async () => 0,
+      oamProbe: async () => probeWith("oam"),
+    });
+
+    expect(res.lines.join("\n")).not.toContain("Nothing reads these copies");
+  });
+
+  it("says so when oam is not installed at all", async () => {
+    // The other half of the same blind spot: nothing about the config is wrong,
+    // the machine just has no oam, so every spawn still goes through npx. Only
+    // the headline is asserted -- the exact reason string also depends on
+    // YAW_MCP_DEFAULT_RUNTIME, which belongs to whoever runs the suite.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      runNpm: async () => 0,
+      oamProbe: async () => probeWith(null),
+    });
+
+    expect(res.lines.join("\n")).toContain("Nothing reads these copies yet");
+  });
+
   it("reports which spec won when a package is configured at two versions", async () => {
     const base = { type: "local", transport: "stdio", command: "npx" };
     writeBundles([
@@ -478,7 +761,7 @@ describe("runSidecarsInstall", () => {
       { ...base, id: "2", name: "B", namespace: "b", args: ["-y", "@yawlabs/postgres-mcp@latest"] },
     ]);
 
-    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {} });
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm: async () => 0, out: () => {}, oamProbe: noOam });
 
     const text = res.lines.join("\n");
     expect(text).toContain("@yawlabs/postgres-mcp@latest");

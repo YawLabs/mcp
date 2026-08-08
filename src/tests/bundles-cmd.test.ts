@@ -170,9 +170,12 @@ describe("runBundlesCommand — match", () => {
     await run({ out: io.push, err: io.pushErr });
     const combined = io.out.join("\n");
     expect(combined).not.toContain("Ready to activate");
-    // But linear should NOT appear in "enabled servers" either. Singular
-    // "server" -- the header pluralizes on the enabled count.
-    expect(combined).toContain("1 enabled server: github");
+    // But linear should NOT appear in the header count either. Singular
+    // "server" -- the header pluralizes on the count. ("available", not
+    // "enabled": the count is enabled MINUS anything the config.json profile
+    // excludes, and calling an excluded-but-enabled server "enabled" while
+    // leaving it out of the list reads as a matcher bug.)
+    expect(combined).toContain("1 available server: github");
   });
 
   it("prints the no-match message when nothing overlaps", async () => {
@@ -244,6 +247,72 @@ describe("runBundlesCommand — match", () => {
     await run({ json: true, out: io.push, err: io.pushErr });
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed.installed).toEqual([]);
+  });
+
+  // The config.json allow/deny profile is what actually gates activation
+  // (server.ts refuses `mcp_connect_activate` on a blocked namespace), so a
+  // match that ignored it printed bundles as "Ready to activate" with an
+  // activate snippet the server hard-refuses.
+  describe("config.json allow/deny profile", () => {
+    /** Write a user-global ~/.yaw-mcp/config.json. */
+    function seedConfig(config: Record<string, unknown>): void {
+      writeFileSync(join(home, CONFIG_DIRNAME, "config.json"), JSON.stringify(config), "utf8");
+    }
+
+    const seedThree = (): void =>
+      seedBundles([
+        makeServer({ namespace: "github", name: "GitHub" }),
+        makeServer({ namespace: "linear", name: "Linear" }),
+        makeServer({ namespace: "slack", name: "Slack" }),
+      ]);
+
+    it("drops a denied namespace from the match and reports it as excluded", async () => {
+      seedThree();
+      seedConfig({ blocked: ["slack"] });
+      const io = captureIO();
+      const r = await run({ json: true, out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(io.out.join("\n"));
+      expect(parsed.installed).toEqual(expect.arrayContaining(["github", "linear"]));
+      expect(parsed.installed).not.toContain("slack");
+      expect(parsed.excluded).toEqual(["slack"]);
+      // product-release is github+linear+slack: it must NOT be ready now.
+      expect(parsed.ready.some((b: { id: string }) => b.id === "product-release")).toBe(false);
+      expect(parsed.partial.some((p: { bundle: { id: string } }) => p.bundle.id === "product-release")).toBe(true);
+      // pr-review (github+linear) is untouched by the deny-list.
+      expect(parsed.ready.some((b: { id: string }) => b.id === "pr-review")).toBe(true);
+    });
+
+    it("names the excluded namespace in the text output", async () => {
+      seedThree();
+      seedConfig({ blocked: ["slack"] });
+      const io = captureIO();
+      await run({ out: io.push, err: io.pushErr });
+      const combined = io.out.join("\n");
+      expect(combined).toContain("2 available servers: github, linear");
+      expect(combined).toMatch(/Excluded by your config\.json allow\/deny profile: slack/);
+      expect(combined).toContain("missing: slack");
+    });
+
+    it("honours an allow-list, not just the deny-list", async () => {
+      seedThree();
+      seedConfig({ servers: ["github", "linear"] });
+      const io = captureIO();
+      const r = await run({ json: true, out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(io.out.join("\n"));
+      expect(parsed.installed).toEqual(expect.arrayContaining(["github", "linear"]));
+      expect(parsed.excluded).toEqual(["slack"]);
+    });
+
+    it("stays quiet (no excluded line) when no profile is configured", async () => {
+      seedThree();
+      const io = captureIO();
+      const r = await run({ out: io.push, err: io.pushErr });
+      expect(r.exitCode).toBe(0);
+      expect(io.out.join("\n")).not.toMatch(/Excluded by your config\.json/);
+      expect(io.out.join("\n")).toContain("3 available servers");
+    });
   });
 
   it("sorts partial bundles by fewest-missing first", async () => {

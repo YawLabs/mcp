@@ -3,11 +3,16 @@
 // per-OS file paths.
 //
 // The client's config file (e.g., ~/.claude.json for Claude Code user
-// scope) is the only file this touches: the "yaw-mcp" launch entry is
-// merged in, preserving any other `mcpServers` / `servers` keys the user
-// already has, plus every sibling along the container key path (Claude
-// Code local scope nests under projects[<absDir>].mcpServers). Claude Code
-// additionally gets a `permissions.allow` patch in its settings.json.
+// scope) is the only file this touches: the yaw-mcp launch entry (written
+// under the key `mcp` -- ENTRY_NAME) is merged in, preserving any other
+// `mcpServers` / `servers` keys the user already has, plus every sibling
+// along the container key path (Claude Code local scope nests under
+// projects[<absDir>].mcpServers). Claude Code additionally gets a
+// `permissions.allow` patch in its settings.json.
+//
+// The key is `mcp`, NOT `yaw-mcp`: that spelling is a LEGACY_ENTRY_NAME now,
+// detected only to nudge the user into deleting it. Anything keying off this
+// file's behaviour (a migration, an external doctor check) must read `mcp`.
 //
 // ~/.yaw-mcp/config.json is NO LONGER written. It existed to carry the
 // account token across clients, and yaw-mcp is local-only now — servers
@@ -17,7 +22,7 @@
 //
 // Failure semantics:
 //   - Existing client file with malformed JSON  → refuse, point at the file.
-//   - Existing `yaw-mcp` entry                  → prompt (TTY) or refuse
+//   - Existing `mcp` entry                      → prompt (TTY) or refuse
 //                                                  with --force/--skip flag.
 //   - --dry-run                                  → print the would-be diff
 //                                                  and exit 0 without writing.
@@ -40,11 +45,13 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  isProjectLocalEntry,
+  LEGACY_ENTRY_NAMES,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "./install-targets.js";
-import { parseJsonc } from "./jsonc.js";
-import { type OamProbe, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
+import { editJsoncEntry, parseJsonc } from "./jsonc.js";
+import { MIN_OAM_VERSION, type OamProbe, type OamProbeFailure, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -120,7 +127,13 @@ const USAGE =
   "                       [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                       [--force | --skip] [--dry-run]\n" +
   "       yaw-mcp install --list  (detect clients; no writes)\n" +
-  "       yaw-mcp install --all   (install into every detected client)\n" +
+  // "every client available on this OS", NOT "every detected client":
+  // runInstallAll plans from `availableOn` (the OSes a client ships on), not
+  // from a probe of what is actually installed here, so `--all` creates a
+  // config for clients the user may not have. That is deliberate (it
+  // pre-provisions), and --list is the detecting one -- the help text just
+  // has to stop promising detection.
+  "       yaw-mcp install --all   (install into every client available on this OS)\n" +
   "\n" +
   "  Deprecated (accepted, ignored, warns): --token <mcp_pat_…>, --no-yaw-mcp-config.\n" +
   "  yaw-mcp is local-only -- it stores no token and never writes ~/.yaw-mcp/config.json.\n" +
@@ -137,6 +150,15 @@ export const TOKEN_FLAG_DEPRECATION =
 export const NO_CONFIG_FLAG_DEPRECATION =
   "yaw-mcp install: --no-yaw-mcp-config is deprecated and ignored -- install no longer writes " +
   "~/.yaw-mcp/config.json at all, so there is nothing to suppress.";
+
+/** How a broken-but-present oam is described in the Runtime line. The probe
+ *  distinguishes these from absence precisely so the user is not sent looking
+ *  for an install they already have. */
+const OAM_FAILURE_PHRASE: Record<OamProbeFailure, string> = {
+  timeout: "`oam --version` did not answer in time",
+  exit: "`oam --version` exited non-zero",
+  spawn: "`oam --version` could not be executed",
+};
 
 export async function runInstall(opts: InstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
@@ -164,8 +186,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
-  if (opts.listOnly) return runInstallList(opts, log);
-  if (opts.all) return runInstallAll(opts, log, err);
+  // Both sub-commands write into the SAME `messages` array this call already
+  // accumulates (log/err push into it), so the returned InstallResult carries
+  // the full printed trail -- including the deprecation notices emitted above
+  // the dispatch, which a second, locally-built array silently dropped.
+  if (opts.listOnly) return runInstallList(opts, log, messages);
+  if (opts.all) return runInstallAll(opts, log, err, messages);
 
   if (opts.force && opts.skip) {
     err("yaw-mcp install: --force and --skip are mutually exclusive");
@@ -205,7 +231,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
-  const projectDir = scopeSpec.requiresProjectDir ? resolve(opts.projectDir ?? process.cwd()) : undefined;
+  // `opts.cwd` is the documented cwd override and runInstallList honors it, so
+  // the write path must too: without it a caller that redirects cwd (a test,
+  // an embedder) still resolves project scope against the REAL process.cwd()
+  // and writes .vscode/mcp.json into whatever directory the runner happens to
+  // be in. It also kept `--list` and `install --scope project` reporting two
+  // different directories.
+  const projectDir = scopeSpec.requiresProjectDir ? resolve(opts.projectDir ?? opts.cwd ?? process.cwd()) : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
   try {
     resolved = resolveInstallPath({
@@ -227,27 +259,83 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // Read + merge existing client config.
   //
   // Host the broker itself on oam when this machine can do it durably: a
-  // version-gated oam AND a non-npx-cache install to point at. Either missing
-  // keeps the npx entry unchanged -- the normal case, not an error.
+  // version-gated oam, resolvable to an ABSOLUTE path, AND a non-npx-cache
+  // install to point at. Any one missing keeps the npx entry unchanged -- the
+  // normal case, not an error.
   const oamProbeResult = await (opts.oamProbe ?? probeOam)();
   const resolveEntry = opts.resolveOamEntry ?? resolveStableNpmEntry;
-  const oamEntry = oamProbeResult.bin ? resolveEntry("@yawlabs/mcp") : null;
-  const newEntry = buildLaunchEntry({ os, oamBin: oamProbeResult.bin, oamEntry });
+  // `binPath`, not `bin`. `bin` is what THIS process spawns, and without
+  // OAM_BIN it is a bare "oam" that only resolves because a shell PATH made it
+  // work here; the entry below is read by a GUI-launched client that inherits
+  // no such PATH. `binPath` is the same binary as an absolute path, or null
+  // when it could not be located -- "oam works here but there is no portable
+  // path to write", which stays on npx exactly like oam-absent does.
+  const oamBinPath = oamProbeResult.binPath;
+  const oamEntry = oamBinPath ? resolveEntry("@yawlabs/mcp") : null;
+  const newEntry = buildLaunchEntry({ os, oamBinPath, oamEntry });
+  // Every fallback gets a reason. The npx entry is the right outcome in all of
+  // them, but "I installed oam and it still runs on node" is unexplainable from
+  // the outside, and a silent below-min / broken / unresolvable oam is
+  // indistinguishable from a machine that has none.
+  //
   // "will run on", not "runs on": nothing has been written yet, and the write
   // can still fail below. Reporting a runtime the user does not have would be
   // worse than saying nothing.
-  if (oamProbeResult.bin && oamEntry) {
-    log(`Runtime: will run on oam ${oamProbeResult.version ?? ""}`.trimEnd());
-  } else if (oamProbeResult.bin) {
+  const oamVersion = oamProbeResult.version ? ` ${oamProbeResult.version}` : "";
+  if (oamBinPath && oamEntry) {
+    log(`Runtime: will run on oam${oamVersion}`);
+    // The resolved entry is durable but not necessarily GLOBAL: a project
+    // node_modules qualifies, and this config is machine-global, so an
+    // `rm -rf node_modules` weeks from now kills the broker in every project
+    // with nothing pointing back at the cause.
+    if (isProjectLocalEntry(oamEntry, opts.cwd ?? process.cwd())) {
+      log(
+        `Note: that path is a project-local install (${oamEntry}). Removing this checkout's node_modules ` +
+          `(\`rm -rf node_modules\`, \`npm prune\`, a rename) breaks the entry in ${resolved.absolute}. ` +
+          "`npm i -g @yawlabs/mcp` and re-run install for a machine-durable path.",
+      );
+    }
+  } else if (oamBinPath) {
     // oam is present and usable, but yaw-mcp itself resolves only to the npx
-    // cache -- a path a config file must not persist. Say so: "I installed oam
-    // and it still runs on node" is otherwise unexplainable from the outside.
+    // cache -- a path a config file must not persist.
     log("Runtime: node (oam found, but yaw-mcp is not durably installed -- `npm i -g @yawlabs/mcp` to host it on oam)");
+  } else if (oamProbeResult.bin) {
+    // Usable here, not persistable: `oam` runs in this shell but was not found
+    // on PATH as a file, so the only value available to write is a bare name
+    // the client would resolve against its own PATH.
+    log(
+      `Runtime: node (oam${oamVersion} runs here, but its absolute path could not be resolved -- a client config ` +
+        `must not carry a bare \`${oamProbeResult.bin}\`, which a GUI-launched client cannot find. Set OAM_BIN to ` +
+        "oam's full path and re-run install to host yaw-mcp on it.)",
+    );
+  } else if (oamProbeResult.belowMin) {
+    log(
+      `Runtime: node (oam${oamVersion} is below the ${MIN_OAM_VERSION} minimum -- upgrade oam and re-run install ` +
+        "to host yaw-mcp on it)",
+    );
+  } else if (oamProbeResult.failure) {
+    log(
+      `Runtime: node (oam is installed but unusable: ${OAM_FAILURE_PHRASE[oamProbeResult.failure]}` +
+        `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
+        "re-run install to host yaw-mcp on it.)",
+    );
   }
   const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
+  // RAW bytes of a pre-existing, non-empty, object-shaped client config. Kept
+  // so the write below can go through the comment-preserving `editJsoncEntry`
+  // instead of JSON.parse + JSON.stringify, which silently deletes every `//`
+  // and `/* */` in the user's file. `.vscode/mcp.json` is documented JSONC and
+  // its `inputs` array is routinely commented; ~/.claude.json carries user
+  // comments too. `yaw-mcp try` already writes these same files this way --
+  // install was the one path that still flattened them.
+  let rawClient: string | null = null;
   let existingHasEntry = false;
   let legacyEntry: string | null = null;
+  // EVERY legacy entry key still in the container, not just the first one
+  // findLegacyEntry reports -- the settings.json patch needs the full set to
+  // decide which legacy allow-patterns are still load-bearing.
+  let legacyEntriesPresent: string[] = [];
   if (existsSync(resolved.absolute)) {
     let raw: string;
     try {
@@ -266,6 +354,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           return { written: [], wouldWrite: [], messages, exitCode: 1 };
         }
         existing = parsed as Record<string, unknown>;
+        rawClient = raw;
       } catch (e) {
         err(
           `yaw-mcp install: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite. Fix the file or rename it and re-run.`,
@@ -278,6 +367,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       const c = container as Record<string, unknown>;
       existingHasEntry = ENTRY_NAME in c;
       legacyEntry = findLegacyEntry(c);
+      legacyEntriesPresent = LEGACY_ENTRY_NAMES.filter((n) => n in c);
     }
   }
 
@@ -302,7 +392,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       err("Aborted.");
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
-    log(`Overwriting existing "${ENTRY_NAME}" entry.`);
+    // Conditional tense under --dry-run: the decision above maps dryRun onto
+    // "overwrite" so this collision path is exercised, but the run returns
+    // before any write. Present tense here told a user scanning the transcript
+    // that their preview had already mutated the file.
+    log(
+      opts.dryRun ? `Would overwrite existing "${ENTRY_NAME}" entry.` : `Overwriting existing "${ENTRY_NAME}" entry.`,
+    );
   }
 
   // Carry over an existing entry's `env`. The merge replaces our entry
@@ -321,8 +417,29 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     log(`Kept existing env on the ${ENTRY_NAME} entry: ${Object.keys(previousEnv ?? {}).join(", ")}`);
   }
 
-  const merged = mergeClientConfig(existing, containerPath, entryToWrite);
-  const clientJson = `${JSON.stringify(merged, null, 2)}\n`;
+  // Two write paths, mirroring try-cmd:
+  //   - file pre-exists with object content -> splice the entry into the
+  //     ORIGINAL bytes via jsonc-parser, so comments, key order and the
+  //     user's indentation all survive;
+  //   - file missing or empty -> nothing to preserve, so build the object and
+  //     render it (this path also materializes a missing container chain).
+  let clientJson: string;
+  if (rawClient !== null) {
+    try {
+      const next = editJsoncEntry(rawClient, containerPath, ENTRY_NAME, entryToWrite);
+      // Keep the file's own trailing-newline convention: editJsoncEntry
+      // returns the user's bytes verbatim outside the edited span.
+      clientJson = next.endsWith("\n") ? next : `${next}\n`;
+    } catch (e) {
+      err(
+        `yaw-mcp install: failed to splice the "${ENTRY_NAME}" entry into ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`,
+      );
+      return { written: [], wouldWrite: [], messages, exitCode: 1 };
+    }
+  } else {
+    const merged = mergeClientConfig(existing, containerPath, entryToWrite);
+    clientJson = `${JSON.stringify(merged, null, 2)}\n`;
+  }
 
   const home = opts.home ?? homedir();
 
@@ -339,6 +456,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           projectDir,
           os,
           claudeConfigDir: opts.claudeConfigDir,
+          // Legacy allow-patterns are only dead wildcards when the server they
+          // grant is gone. install deliberately LEAVES a legacy mcpServers
+          // entry in place (it only warns), so stripping that entry's pattern
+          // in the same run revokes a still-running server's grant and Claude
+          // Code re-prompts on every one of its tool calls.
+          retainAllowPatterns: legacyEntriesPresent.map(legacyAllowPatternFor),
         })
       : null;
 
@@ -420,6 +543,9 @@ async function prepareClaudeCodeSettingsPatch(opts: {
   projectDir: string | undefined;
   os: InstallOS;
   claudeConfigDir: string | undefined;
+  /** Legacy allow-patterns to leave in place because the entry they grant is
+   *  still wired in the client config. */
+  retainAllowPatterns?: string[];
 }): Promise<{
   path: string;
   nextJson: string;
@@ -436,6 +562,10 @@ async function prepareClaudeCodeSettingsPatch(opts: {
   if (!path) return null;
 
   let existing: Record<string, unknown> = {};
+  // Raw bytes of the pre-existing settings.json, for the same reason install
+  // keeps the client config's: settings.json is JSONC and hand-maintained,
+  // and a JSON.stringify rewrite drops every comment in it.
+  let rawSettings: string | null = null;
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, "utf8");
@@ -443,6 +573,7 @@ async function prepareClaudeCodeSettingsPatch(opts: {
         const parsed = parseJsonc(raw);
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
           existing = parsed as Record<string, unknown>;
+          rawSettings = raw;
         } else {
           // Not an object — leave alone, but flag it so the caller can warn
           // (otherwise the settings.json is silently never patched).
@@ -456,25 +587,57 @@ async function prepareClaudeCodeSettingsPatch(opts: {
     }
   }
 
-  const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+  const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN], opts.retainAllowPatterns);
   // If nothing changed, signal no-op to the caller.
   const before = JSON.stringify(existing);
   const after = JSON.stringify(merged);
   if (before === after) return { path, nextJson: "", changed: false };
+  if (rawSettings !== null) {
+    // Only `permissions.allow` changes, so edit exactly that node in the
+    // original bytes. Everything else -- hooks, model, comments, formatting --
+    // is left untouched rather than re-serialized.
+    const nextAllow = (merged.permissions as { allow: string[] }).allow;
+    try {
+      const next = editJsoncEntry(rawSettings, ["permissions"], "allow", nextAllow);
+      return { path, nextJson: next.endsWith("\n") ? next : `${next}\n`, changed: true };
+    } catch (e) {
+      // jsonc-parser could not locate/splice the node (e.g. `permissions` is
+      // an array). Surface it the same way an unparseable file is surfaced
+      // rather than silently falling back to a comment-destroying rewrite.
+      return { path, nextJson: "", changed: false, malformed: true, malformedReason: (e as Error).message };
+    }
+  }
   return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true };
+}
+
+/** Claude Code derives a server's tool-name prefix from its entry key by
+ *  replacing every non-alphanumeric char with `_` (see CLAUDE_CODE_ALLOW_PATTERN
+ *  in install-targets.ts), so `yaw-mcp` grants `mcp__yaw_mcp__*` and
+ *  `mcp.hosting` grants `mcp__mcp_hosting__*`. Derived rather than tabulated so
+ *  a new LEGACY_ENTRY_NAMES member cannot silently miss its pattern. */
+function legacyAllowPatternFor(entryName: string): string {
+  return `mcp__${entryName.replace(/[^A-Za-z0-9]/g, "_")}__*`;
 }
 
 /** Allow-patterns earlier installers wrote into Claude Code's
  *  `permissions.allow` (the dead mcp.hosting brand and the interim yaw-mcp
  *  key). Stripped on upgrade so dead wildcards don't accumulate forever —
- *  no live tool name can match them now that ENTRY_NAME is "mcp". */
+ *  no live tool name can match them ONCE THE ENTRY THAT SERVED THEM IS GONE.
+ *  A pattern whose legacy mcpServers entry is still wired is NOT dead, so the
+ *  caller passes it via `retain` (see legacyAllowPatternFor). */
 const LEGACY_CLAUDE_CODE_ALLOW_PATTERNS = ["mcp__mcp_hosting__*", "mcp__yaw_mcp__*"];
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every
  *  other key. Deduplicates by string equality so repeated installs don't
  *  grow the list. Also drops any pre-rename legacy patterns first so
- *  upgraded installs don't keep a dead wildcard around. Exported for tests. */
-export function mergePermissionsAllow(existing: Record<string, unknown>, patterns: string[]): Record<string, unknown> {
+ *  upgraded installs don't keep a dead wildcard around -- except the ones in
+ *  `retain`, whose legacy server entry the caller found still present.
+ *  Exported for tests. */
+export function mergePermissionsAllow(
+  existing: Record<string, unknown>,
+  patterns: string[],
+  retain: string[] = [],
+): Record<string, unknown> {
   const out: Record<string, unknown> = { ...existing };
   const prev = out.permissions;
   const perms: Record<string, unknown> =
@@ -482,7 +645,8 @@ export function mergePermissionsAllow(existing: Record<string, unknown>, pattern
   const prevAllow = perms.allow;
   const allow: string[] = Array.isArray(prevAllow)
     ? (prevAllow as unknown[]).filter(
-        (x): x is string => typeof x === "string" && !LEGACY_CLAUDE_CODE_ALLOW_PATTERNS.includes(x),
+        (x): x is string =>
+          typeof x === "string" && (retain.includes(x) || !LEGACY_CLAUDE_CODE_ALLOW_PATTERNS.includes(x)),
       )
     : [];
   for (const p of patterns) {
@@ -722,16 +886,15 @@ export function parseInstallArgs(argv: string[]):
  *  OS and whether yaw-mcp is already wired up. Read-only: never
  *  touches a file, never hits the network, works without a token. The
  *  exit code is always 0; this is diagnostic, not gating. */
-async function runInstallList(opts: InstallCommandOptions, log: (s: string) => void): Promise<InstallResult> {
-  // Capture every log() emission so the returned InstallResult carries
-  // the same diagnostic trail tests / programmatic callers see from the
-  // main install path. Without this, --list silently drops everything
-  // the caller may want to assert against.
-  const messages: string[] = [];
-  const capture = (s: string): void => {
-    messages.push(s);
-    log(s);
-  };
+async function runInstallList(
+  opts: InstallCommandOptions,
+  log: (s: string) => void,
+  messages: string[],
+): Promise<InstallResult> {
+  // `log` already appends to `messages` (it is runInstall's closure), so the
+  // returned trail is exactly what was printed -- deprecation warnings from
+  // before the dispatch included. An earlier local array here captured only
+  // the rows below and dropped everything else.
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
   const os = opts.os ?? CURRENT_OS;
@@ -746,8 +909,8 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
 
   const installed = probes.filter((p) => p.hasMcpEntry).length;
   const available = probes.filter((p) => !p.unavailable).length;
-  capture(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
-  capture("");
+  log(`${installed}/${available} client scopes have yaw-mcp configured on ${os}.`);
+  log("");
 
   const widths = {
     client: Math.max("CLIENT".length, ...rows.map((r) => r.client.length)),
@@ -760,18 +923,18 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
     `${"SCOPE".padEnd(widths.scope)}  ` +
     `${"PATH".padEnd(widths.path)}  ` +
     `${"STATUS".padEnd(widths.status)}`;
-  capture(header);
+  log(header);
   for (const r of rows) {
-    capture(
+    log(
       `  ${r.client.padEnd(widths.client)}  ` +
         `${r.scope.padEnd(widths.scope)}  ` +
         `${r.path.padEnd(widths.path)}  ` +
         `${r.status.padEnd(widths.status)}`,
     );
   }
-  capture("");
-  capture("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
-  capture("Install into every available client (user scope where supported): `yaw-mcp install --all`");
+  log("");
+  log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
+  log("Install into every available client (user scope where supported): `yaw-mcp install --all`");
   return { written: [], wouldWrite: [], messages, exitCode: 0 };
 }
 
@@ -803,12 +966,15 @@ async function runInstallAll(
   opts: InstallCommandOptions,
   log: (s: string) => void,
   err: (s: string) => void,
+  messages: string[],
 ): Promise<InstallResult> {
   const os = opts.os ?? CURRENT_OS;
   const targets = INSTALL_TARGETS.filter((t) => t.availableOn.includes(os));
   if (targets.length === 0) {
     err(`yaw-mcp install --all: no installable clients on ${os}.`);
-    return { written: [], wouldWrite: [], messages: [], exitCode: 1 };
+    // `messages`, not [] -- the err() above (and any deprecation warning
+    // before the dispatch) belongs in the returned trail.
+    return { written: [], wouldWrite: [], messages, exitCode: 1 };
   }
 
   // Pick one scope per client: user where supported, else the first
@@ -846,7 +1012,6 @@ async function runInstallAll(
 
   const aggregateWritten: string[] = [];
   const aggregateWouldWrite: string[] = [];
-  const aggregateMessages: string[] = [];
   let failed = 0;
   let succeeded = 0;
   // Collision-without-flag refusals (non-TTY, no --force/--skip) all carry
@@ -893,7 +1058,9 @@ async function runInstallAll(
     if (sawCollision) collisionClients.push(plan.clientId);
     aggregateWritten.push(...result.written);
     aggregateWouldWrite.push(...result.wouldWrite);
-    aggregateMessages.push(...result.messages);
+    // Splice each sub-install's trail in right where it printed, between this
+    // client's header and the blank line that closes it.
+    messages.push(...result.messages);
     if (result.exitCode === 0) succeeded += 1;
     else failed += 1;
     log("");
@@ -911,7 +1078,7 @@ async function runInstallAll(
     return {
       written: aggregateWritten,
       wouldWrite: aggregateWouldWrite,
-      messages: aggregateMessages,
+      messages,
       exitCode: 0,
     };
   }
@@ -919,7 +1086,7 @@ async function runInstallAll(
   return {
     written: aggregateWritten,
     wouldWrite: aggregateWouldWrite,
-    messages: aggregateMessages,
+    messages,
     exitCode: 1,
   };
 }

@@ -1,64 +1,132 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { rankServers, relevanceCacheStats, resetRelevanceCache, scoreRelevance } from "../relevance.js";
+import { rankServers, relevanceCacheStats, resetRelevanceCache } from "../relevance.js";
 
-describe("scoreRelevance (single-server wrapper)", () => {
+// Single-server score. A `scoreRelevance` export used to do exactly this,
+// documented as being "kept for legacy callers" that never existed outside
+// these tests; ranking a one-element array is the same computation, so the
+// wrapper lives here now instead of in the production module.
+function score1(
+  context: string,
+  server: { name: string; namespace: string; description?: string },
+  tools: Array<{ name: string; description?: string }> = [],
+): number {
+  return rankServers(context, [{ ...server, tools }])[0]?.score ?? 0;
+}
+
+describe("single-server scoring", () => {
   const server = { name: "GitHub", namespace: "gh", description: "Repos, issues, pull requests" };
 
   it("returns 0 for empty context", () => {
-    expect(scoreRelevance("", server, [])).toBe(0);
+    expect(score1("", server)).toBe(0);
   });
 
-  it("returns 0 for context with only short words", () => {
-    expect(scoreRelevance("go do it", server, [])).toBe(0);
+  it("returns 0 for short query words that match nothing in the corpus", () => {
+    expect(score1("go do it", server)).toBe(0);
   });
 
   it("scores server name matches", () => {
-    const score = scoreRelevance("use github", server, []);
+    const score = score1("use github", server);
     expect(score).toBeGreaterThan(0);
   });
 
   it("scores namespace matches on multi-char namespaces", () => {
     const slackServer = { name: "Slack", namespace: "slack", description: "Team chat" };
-    const score = scoreRelevance("check slack messages", slackServer, []);
+    const score = score1("check slack messages", slackServer);
     expect(score).toBeGreaterThan(0);
+  });
+
+  it("scores namespace matches on short namespaces too", () => {
+    // The 3-char prose floor used to delete `gh` from the index entirely, so
+    // the namespace field -- the second-heaviest weight -- was permanently
+    // empty for this server and naming it in the intent contributed nothing.
+    const nameless = { name: "Untitled", namespace: "gh", description: "Repos" };
+    expect(score1("gh", nameless)).toBeGreaterThan(0);
   });
 
   it("matches snake_case tool names from space-separated query", () => {
     const tools = [{ name: "create_issue", description: "Create a new issue" }];
-    const score = scoreRelevance("create issue on github", server, tools);
+    const score = score1("create issue on github", server, tools);
     expect(score).toBeGreaterThan(0);
   });
 
   it("scores tool description matches", () => {
     const tools = [{ name: "run_query", description: "Execute a database query" }];
-    const score = scoreRelevance(
-      "database query needed",
-      { name: "DB", namespace: "db", description: "SQL access" },
-      tools,
-    );
+    const score = score1("database query needed", { name: "DB", namespace: "db", description: "SQL access" }, tools);
     expect(score).toBeGreaterThan(0);
   });
 
   it("deduplicates query terms so repeats don't inflate score", () => {
-    const singleScore = scoreRelevance("github tools", server, []);
-    const repeatedScore = scoreRelevance("github github github tools", server, []);
+    const singleScore = score1("github tools", server);
+    const repeatedScore = score1("github github github tools", server);
     expect(repeatedScore).toBe(singleScore);
   });
 
   it("is case-insensitive", () => {
-    const lower = scoreRelevance("github", server, []);
-    const upper = scoreRelevance("GITHUB", server, []);
+    const lower = score1("github", server);
+    const upper = score1("GITHUB", server);
     expect(lower).toBe(upper);
   });
 
   it("returns 0 when no words match", () => {
-    const score = scoreRelevance("completely unrelated query", server, []);
+    const score = score1("completely unrelated query", server);
     expect(score).toBe(0);
   });
 
   it("strips punctuation from query tokens", () => {
-    const score = scoreRelevance("use (github)!", server, []);
+    const score = score1("use (github)!", server);
     expect(score).toBeGreaterThan(0);
+  });
+});
+
+// The prose token floor (3 chars) is right for descriptions and wrong for
+// identifiers: a server may legitimately be called `pg`, `gh`, or `db`
+// (NAMESPACE_RE in local-bundles.ts allows one character), and tool names
+// routinely embed `s3` / `ec2`. Applying the prose floor to those fields
+// dropped them from the index without a trace.
+describe("short identifiers below the prose token floor", () => {
+  const corpus = [
+    {
+      namespace: "pg",
+      name: "Postgres",
+      description: "SQL access",
+      tools: [{ name: "run_query", description: "Execute a statement" }],
+    },
+    {
+      namespace: "slack",
+      name: "Slack",
+      description: "Team chat",
+      tools: [{ name: "send_message", description: "Post a message" }],
+    },
+  ];
+
+  it("ranks a 2-char namespace named in the intent", () => {
+    // Previously "pg" was dropped from the query AND from the index, so this
+    // returned nothing and dispatch answered "No installed server matches".
+    expect(rankServers("use pg", corpus).map((r) => r.namespace)).toEqual(["pg"]);
+  });
+
+  it("lets a short namespace contribute alongside prose terms", () => {
+    expect(rankServers("get the pg schema", corpus).map((r) => r.namespace)).toContain("pg");
+  });
+
+  it("keeps short fragments inside tool names searchable", () => {
+    const withAws = [
+      {
+        namespace: "aws",
+        name: "AWS",
+        description: "Amazon Web Services",
+        tools: [{ name: "s3_list_buckets", description: "List buckets" }],
+      },
+      ...corpus,
+    ];
+    expect(rankServers("list s3 buckets", withAws)[0]?.namespace).toBe("aws");
+  });
+
+  it("still ignores short query words absent from the corpus", () => {
+    // Widening the query floor must not start matching noise against prose:
+    // descriptions keep the 3-char floor, and a term with no corpus
+    // occurrence has no IDF entry at all, so it is skipped outright.
+    expect(rankServers("of a to", corpus)).toEqual([]);
   });
 });
 
@@ -325,21 +393,6 @@ describe("ranking index cache", () => {
     // One build per stable server plus the churner, then one per new version:
     // the stable 20 are re-tokenized zero times.
     expect(relevanceCacheStats().docBuilds).toBe(STABLE + 1 + (CALLS - 1));
-  });
-
-  it("does not let scoreRelevance evict the cached corpus index", () => {
-    rankServers("create an issue", corpus());
-    expect(relevanceCacheStats().indexBuilds).toBe(1);
-    // Each scoreRelevance call is its own distinct one-server corpus. Routing
-    // those through the shared index cache (cap 4) would evict the corpus
-    // index above on every iteration, silently undoing the caching for the
-    // discover/dispatch path that needs it.
-    for (let i = 0; i < 12; i++) {
-      scoreRelevance("issue tracker", { name: `Server ${i}`, namespace: `ns${i}` }, []);
-    }
-    const beforeReRank = relevanceCacheStats().indexBuilds;
-    rankServers("create an issue", corpus());
-    expect(relevanceCacheStats().indexBuilds).toBe(beforeReRank);
   });
 
   it("cannot be made to collide by control characters inside a field", () => {

@@ -123,6 +123,21 @@ describe("findProjectConfigDir", () => {
     expect(await findProjectConfigDir(sub, home)).toBeNull();
   });
 
+  it("descends into a directory whose NAME starts with '..'", async () => {
+    // Regression: the walk-up bounded itself with `relative(home, dir)`
+    // .startsWith(".."), which also matches a real directory named
+    // `..config` (relative path "..config/app"). isUnderHome returned false
+    // on the very first iteration, so no `.yaw-mcp/` anywhere below such a
+    // directory was ever found. Only a literal ".." segment escapes $HOME.
+    const project = join(home, "..config", "app");
+    mkdirSync(project, { recursive: true });
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    const startFrom = join(project, "src");
+    mkdirSync(startFrom);
+    expect(await findProjectConfigDir(startFrom, home)).toBe(cfgDir);
+  });
+
   it("prefers the nearest .yaw-mcp/ when multiple exist on the path", async () => {
     mkdirSync(join(root, CONFIG_DIRNAME));
     const innerProject = join(root, "apps", "web");

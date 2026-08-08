@@ -18,12 +18,24 @@
 // stream through to the caller unchanged.
 //
 // Exit codes:
-//   0  already on the latest version, OR there is nothing to run (npx /
-//      bundled-app)
+//   0  already on the latest version, there is nothing to run (npx /
+//      bundled-app), OR the registry was unreachable (see OFFLINE below)
 //   1  upgrade available but --run was not passed (human-interactive mode)
 //   2  usage error (unknown flag), OR --run on an install method that
 //      can't be auto-upgraded (binary / dev-checkout / unknown)
 //   3  --run attempted the upgrade and the child process failed
+//
+// OFFLINE — a scripting hazard of the same class as the 1→2 trap below.
+// When the registry can't be reached, staleness is UNKNOWN, and EVERY
+// method — including a stale global-npm — exits 0 after printing
+// "couldn't reach the npm registry (offline? firewall?)". So exit 0 means
+// "nothing to do OR never checked", not "up to date": a CI step shaped
+// like `yaw-mcp upgrade || yaw-mcp upgrade --run` behind a firewall
+// records "up to date" forever while the install never moves. A script
+// that must tell the two apart has to read the --json snapshot, where
+// `latest: null` is the offline marker (`stale` is false there because
+// staleness cannot be computed, not because the install is current).
+// Pinned by the offline tests in src/tests/upgrade-cmd.test.ts.
 //
 // SCRIPTING TRAP — the 1→2 transition for NON-RUNNABLE methods (binary,
 // dev-checkout, unknown): for these, plain `upgrade` on a stale install
@@ -73,6 +85,17 @@ export interface UpgradeCommandOptions {
   npmPrefix?: () => Promise<string | null>;
   /** Test hook: force single-executable (SEA binary) detection. */
   isSea?: () => boolean;
+  /** Test hook: replace the `oam --version` probe behind the oam-floor note. */
+  oamProbe?: () => OamFloorProbe | Promise<OamFloorProbe>;
+}
+
+/** The two fields the oam-floor note reads out of an `oam --version` probe.
+ *  Declared structurally (rather than reusing oam-spawn's OamProbe) so
+ *  upgrade-cmd keeps oam-spawn out of its static import graph -- see
+ *  oamFloorLines for why that matters on the serve startup path. */
+export interface OamFloorProbe {
+  version: string | null;
+  belowMin: boolean;
 }
 
 export interface UpgradeCommandResult {
@@ -90,6 +113,36 @@ export type InstallMethod =
   | "dev-checkout"
   | "binary"
   | "unknown";
+
+/** POSIX-style global prefixes keep globals at `<prefix>/lib/node_modules`.
+ *  These alternatives each anchor on a prefix shape that really is a Node
+ *  install root: a bare `/lib/node_modules/@yawlabs/mcp/` marker also matched a
+ *  workspace package directory literally named `lib`
+ *  (`<repo>/packages/lib/node_modules/@yawlabs/mcp/...`), which then drove
+ *  auto-upgrade's `npm install -g --prefix <repo>/packages` — writing a global
+ *  tree plus bin shims into the user's repo and overwriting the
+ *  workspace-pinned version.
+ *
+ *  Anchoring deliberately trades a false POSITIVE (unrecoverable: a `-g`
+ *  install into a project tree) for a false NEGATIVE (recoverable: the install
+ *  is classified `local-node-modules`, refineInstallMethod's `npm prefix -g`
+ *  probe reclassifies it for the CLI, and maybeAutoUpgrade merely logs the
+ *  manual path instead of spawning). An exotic prefix that isn't listed here
+ *  therefore degrades safely — do NOT widen this back to a bare
+ *  `/lib/node_modules/`.
+ *    /usr/lib, /usr/local/lib   distro packages and `make install` defaults
+ *    /opt/<tool>/lib            homebrew (/opt/homebrew), /opt/node, /opt/nodejs
+ *  The optional drive prefix keeps a normalized `C:/usr/local/lib/...`
+ *  (MSYS/Cygwin) matching the same shape. */
+const POSIX_GLOBAL_LIB_PREFIX = /^(?:[A-Za-z]:)?(?:\/usr(?:\/local)?|\/opt\/[^/]+)\/lib\/node_modules\/@yawlabs\/mcp\//;
+
+/** Version-manager and rootless-user Node roots, which also keep globals at
+ *  `<root>/lib/node_modules` but sit at an arbitrary depth under the manager's
+ *  own directory (`~/.nvm/versions/node/v22.11.0/lib/node_modules/...`). Same
+ *  anchoring rationale as POSIX_GLOBAL_LIB_PREFIX: the manager segment is what
+ *  distinguishes a Node root from a project directory named `lib`. */
+const MANAGED_NODE_LIB_PREFIX =
+  /\/(?:\.local|\.nvm|\.fnm|fnm|\.asdf|\.volta|\.nodenv|\.nvs|n)\/(?:[^/]+\/)*lib\/node_modules\/@yawlabs\/mcp\//;
 
 export interface UpgradePlan {
   current: string;
@@ -156,7 +209,10 @@ export function detectInstallMethod(argvPath: string | undefined): InstallMethod
   // global vs local from argv alone, use the npm prefix marker on
   // common platforms and a `\\npm\\node_modules\\` Windows marker.
   if (/\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
-  if (/\/lib\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
+  // `<prefix>/lib/node_modules` — anchored on real Node-root shapes; see the
+  // two regex definitions above for why a bare `/lib/` marker was unsafe.
+  if (POSIX_GLOBAL_LIB_PREFIX.test(normalized)) return "global-npm";
+  if (MANAGED_NODE_LIB_PREFIX.test(normalized)) return "global-npm";
   if (/\/AppData\/Roaming\/npm\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "global-npm";
   // Windows npm prefixes that live in a `bin` dir (scoop's nodejs persist
   // dir, custom prefixes): globals land at <prefix>/node_modules with
@@ -196,9 +252,15 @@ export function localInstallRoot(argvPath: string | undefined): string | null {
 }
 
 /** Ask npm where its global prefix actually is. Returns null when npm
- *  isn't reachable or doesn't answer within 3s — refinement is then
- *  skipped and the path-marker classification stands. */
-async function defaultNpmPrefix(): Promise<string | null> {
+ *  isn't reachable, exits non-zero, or doesn't answer within 3s — refinement
+ *  is then skipped and the path-marker classification stands.
+ *
+ *  Exported because auto-upgrade's multi-prefix warning needs the same probe:
+ *  it used to keep its own copy with no timer, no kill, no exit-code check and
+ *  no VITEST guard, so a hung `npm prefix -g` left an unresolved promise and a
+ *  live child handle for the broker's lifetime. One helper, one timeout, one
+ *  test short-circuit. */
+export async function npmGlobalPrefix(): Promise<string | null> {
   // Auto-skip under vitest (mirrors doctor-cmd's registry probe) so unit
   // tests never spawn a real npm; tests exercising refinement inject
   // their own probe via opts.npmPrefix.
@@ -251,7 +313,7 @@ function comparablePath(p: string): string {
 export async function refineInstallMethod(
   method: InstallMethod,
   argvPath: string | undefined,
-  npmPrefix: () => Promise<string | null> = defaultNpmPrefix,
+  npmPrefix: () => Promise<string | null> = npmGlobalPrefix,
 ): Promise<InstallMethod> {
   if (method !== "local-node-modules" && method !== "unknown") return method;
   if (!argvPath) return method;
@@ -369,9 +431,50 @@ function compareSemverLocal(a: string, b: string): number {
   return 0;
 }
 
-async function defaultFetchLatest(): Promise<string | null> {
+/** Abort budget for the registry probe when a caller names none. Three seconds
+ *  is `upgrade`'s own number: reaching the registry IS that command's job, so it
+ *  has nothing to print until this answers and can afford to wait. */
+export const REGISTRY_FETCH_TIMEOUT_MS = 3000;
+
+export interface FetchLatestVersionOptions {
+  /** Abort budget in ms. Defaults to REGISTRY_FETCH_TIMEOUT_MS.
+   *
+   *  Per-caller on purpose, and not a tuning detail: `doctor` deliberately runs
+   *  a SHORTER budget than `upgrade` (see DOCTOR_REGISTRY_TIMEOUT_MS in
+   *  doctor-cmd.ts). A diagnostic that hangs behind a black-holed registry is a
+   *  worse failure than one that prints the freshness check as unknown and moves
+   *  on to the twenty other things it checks; `upgrade` has no report at all
+   *  until this resolves. Forcing both onto one number is what made the second
+   *  copy of this function look justified. */
+  timeoutMs?: number;
+  /** Stand-in for the request itself -- doctor's `registryFetch` hook and the
+   *  unit tests behind it. Short-circuits the fetch entirely, and a throw is
+   *  absorbed to null so an injected probe can fail its caller no harder than
+   *  the real one can. */
+  override?: () => Promise<string | null>;
+}
+
+/** Ask the registry for the newest published version, or null on any failure
+ *  (non-2xx, malformed body, offline, or a stall past `timeoutMs` via the
+ *  AbortController).
+ *
+ *  THE registry probe for the package: `upgrade`, auto-upgrade at serve startup,
+ *  and `doctor` all land here. It previously existed three times over and the
+ *  copies had already drifted on the two axes that actually differ between
+ *  callers -- the timeout budget and whether a stand-in can be injected. Both
+ *  are parameters now, so a caller with a real difference in requirement gets it
+ *  without forking the URL, the response validation, or the failure semantics
+ *  along with it. */
+export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): Promise<string | null> {
+  if (opts.override) {
+    try {
+      return await opts.override();
+    } catch {
+      return null;
+    }
+  }
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 3000);
+  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? REGISTRY_FETCH_TIMEOUT_MS);
   try {
     const res = await fetch("https://registry.npmjs.org/@yawlabs/mcp/latest", {
       signal: ac.signal,
@@ -384,6 +487,43 @@ async function defaultFetchLatest(): Promise<string | null> {
     return null;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** Advisory lines for the case where the oam runtime is installed but BELOW the
+ *  floor yaw-mcp hosts sidecars on. Empty when oam is absent (node is the
+ *  baseline, nothing to say), current, or unprobeable.
+ *
+ *  Why `upgrade` of all commands: MIN_OAM_VERSION tracks the LATEST oam release
+ *  and moves with every one, so the very act of upgrading yaw-mcp can raise the
+ *  floor past the user's oam and silently drop every sidecar from oam to
+ *  node/npx. That state is otherwise surfaced only as one warn line on the
+ *  broker's stderr (which MCP clients hide) and in `yaw-mcp doctor` — while
+ *  `upgrade`, the command a user runs precisely to "get current", printed
+ *  "nothing to do".
+ *
+ *  The oam-spawn import is dynamic on purpose: upgrade-cmd sits on the serve
+ *  startup path (auto-upgrade.ts imports it), and this probe only matters in the
+ *  prose CLI path. The try/catch makes the note strictly advisory — a probe that
+ *  throws must never fail `upgrade`. */
+async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise<string[]> {
+  // Auto-skip under vitest when no probe was injected (mirrors npmGlobalPrefix):
+  // an un-injected unit test must never spawn a real `oam --version`, whose
+  // answer varies per machine.
+  if (!probe && process.env.VITEST) return [];
+  try {
+    const { MIN_OAM_VERSION, probeOam } = await import("./oam-spawn.js");
+    const oam: OamFloorProbe = probe ? await probe() : await probeOam();
+    if (!oam.belowMin) return [];
+    return [
+      "",
+      `oam:     v${oam.version ?? "unknown"} is installed but below the v${MIN_OAM_VERSION} floor yaw-mcp`,
+      "         requires, so MCP sidecars run on node instead of oam. Update it:",
+      "",
+      "  oam self-update",
+    ];
+  } catch {
+    return [];
   }
 }
 
@@ -428,7 +568,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     writeErr(`${s}\n`);
   };
 
-  const fetcher = opts.fetchLatest ?? defaultFetchLatest;
+  const fetcher = opts.fetchLatest ?? fetchLatestVersion;
   const current = opts.currentVersion ?? readCurrentVersion();
   const argvPath = opts.argvPath ?? process.argv[1];
   // A standalone SEA binary has no package manager and no script path in
@@ -474,6 +614,9 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   print(`Current: ${current}`);
   print(`Latest:  ${latest}`);
   print(`Install: ${method}`);
+  // Printed for both the stale and up-to-date paths: "nothing to do" about
+  // yaw-mcp itself is exactly when a below-floor oam would otherwise go unsaid.
+  for (const line of await oamFloorLines(opts.oamProbe)) print(line);
 
   if (!plan.stale) {
     print("");

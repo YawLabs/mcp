@@ -10,6 +10,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -305,6 +306,107 @@ describe("yaw-mcp trust (grant)", () => {
     expect(io.text()).toContain("no servers");
     expect(io.text()).toContain("take precedence");
   });
+
+  it("explains a newer-schema trust store instead of blaming permissions", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const storePath = trustStorePath(synthHome);
+    writeFileSync(storePath, JSON.stringify({ version: 99, trusted: {} }, null, 2));
+    const io = captureIO();
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toContain("written by a newer yaw-mcp");
+    expect(io.errText()).toContain("npm i -g @yawlabs/mcp@latest");
+    // The io-flavoured remedy would send the user to chmod a file that is
+    // perfectly readable.
+    expect(io.errText()).not.toContain("Fix its permissions");
+    // And the newer store is still on disk, unstamped.
+    expect((JSON.parse(readFileSync(storePath, "utf8")) as { version: number }).version).toBe(99);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The count the user is attesting to has to be AT the decision point
+// ---------------------------------------------------------------------------
+//
+// The entry list is unbounded -- a repo can commit thousands of valid entries
+// -- and at the [y/N] prompt the viewport holds only the last screenful, so an
+// entry near the top scrolls away with nothing visible saying there was more.
+// Same reason the file neutralizes ESC[3A/ESC[J: what the user authorizes has
+// to be legible where they authorize it.
+
+describe("the consent preview states how many servers it is asking about", () => {
+  /** Drive the real readline prompt so the QUESTION text is observable
+   *  (promptAnswer short-circuits askYesNo before it writes anything). */
+  async function askedQuestion(cwd: string): Promise<string> {
+    const stdin = new PassThrough();
+    stdin.write("n\n"); // decline -- we only care about the question text
+    const stdout = new PassThrough();
+    const seen: string[] = [];
+    stdout.on("data", (c: Buffer | string) => seen.push(String(c)));
+    await runTrust({
+      home: synthHome,
+      cwd,
+      env: {},
+      isTTY: true,
+      io: { stdin, stdout },
+      out: () => {},
+      err: () => {},
+    });
+    return seen.join("");
+  }
+
+  it("prints the count in the header block, above the list", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(io.text()).toContain("Servers:      2");
+    // Header, not a footer: it lands before the first entry.
+    expect(io.text().indexOf("Servers:")).toBeLessThan(io.text().indexOf("pwn"));
+  });
+
+  it("repeats the count in the question itself", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    expect(await askedQuestion(synthCwd)).toContain("Read all 2 commands above. Approve this file?");
+  });
+
+  it("stays grammatical for a single server", async () => {
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "solo", name: "Solo", command: "node", args: [] }] });
+    const q = await askedQuestion(synthCwd);
+    expect(q).toContain("Read the 1 command above. Approve this file?");
+    expect(q).not.toContain("1 commands");
+  });
+
+  it("does not claim there are commands to read when the file defines none", async () => {
+    writeBundles(synthCwd, { version: 1, servers: [] });
+    const io = captureIO();
+    await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      promptAnswer: "n",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(io.text()).toContain("Servers:      0");
+    expect(await askedQuestion(synthCwd)).toContain("It defines no servers.");
+  });
+
+  it("still reports the true count when the list is far longer than a screen", async () => {
+    const many = Array.from({ length: 400 }, (_, i) => ({
+      namespace: `s${i}`,
+      name: `S${i}`,
+      command: "node",
+      args: [`server-${i}.js`],
+    }));
+    writeBundles(synthCwd, { version: 1, servers: many });
+    const io = captureIO();
+    // Decline: granting here would make the second pass report "Already
+    // approved" and never render the preview at all.
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, promptAnswer: "n", out: io.push, err: io.pushErr });
+    expect(io.text()).toContain("Servers:      400");
+    expect(await askedQuestion(synthCwd)).toContain("Read all 400 commands above.");
+  });
 });
 
 describe("yaw-mcp trust --list", () => {
@@ -377,6 +479,44 @@ describe("yaw-mcp trust --list", () => {
     const r = await runTrust({ mode: "list", home: synthHome, cwd: synthCwd, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(1);
     expect(io.errText()).toContain("trust store unusable");
+  });
+
+  it("escapes a control character in a stored path instead of letting it redraw the audit", async () => {
+    // --list is the surface a user reads to decide what to REVOKE, so a repo
+    // that got itself approved under an ESC-bearing directory name must not be
+    // able to erase its own row on the way out. Unlike the grant-preview case
+    // (skipped on win32 above, where the hostile name has to be a real
+    // directory), the path here arrives as DATA -- a display field in the store
+    // -- so the same wiring is assertable on every platform.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const hostile = join(synthHome, `repo${ESC}[2J`, CONFIG_DIRNAME, "bundles.json");
+    writeFileSync(
+      trustStorePath(synthHome),
+      JSON.stringify({
+        version: 1,
+        trusted: { [hostile]: { path: hostile, sha256: "a".repeat(64), grantedAt: "2026-01-01T00:00:00.000Z" } },
+      }),
+    );
+    const io = captureIO();
+    const r = await runTrust({ mode: "list", home: synthHome, cwd: synthCwd, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.text() + io.errText()).not.toContain(ESC);
+    expect(io.text()).toContain("\\u001b");
+    // The row is still there to be read -- escaping must not drop the entry.
+    expect(io.text()).toContain("missing (file not found)");
+  });
+
+  it("sends a newer-schema store to an upgrade, not to a delete", async () => {
+    // The parse case above may be deleted; this one holds real grants an
+    // older binary simply cannot read, so "delete it" would be destructive.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 99, trusted: {} }, null, 2));
+    const io = captureIO();
+    const r = await runTrust({ mode: "list", home: synthHome, cwd: synthCwd, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toContain("written by a newer yaw-mcp");
+    expect(io.errText()).toContain("npm i -g @yawlabs/mcp@latest");
+    expect(io.errText()).toContain("do NOT delete it");
   });
 });
 
@@ -520,6 +660,16 @@ describe("the consent preview cannot be redrawn by the file it is previewing", (
     expect(printed).toContain("GITHUB_TOKEN");
   });
 
+  // IRREDUCIBLY POSIX -- and it is the FIXTURE, not the assertion, that cannot
+  // be reproduced: the Win32 filesystem rejects every character below 0x20 in a
+  // path component, so a directory literally NAMED with an ESC cannot exist
+  // here, and `probeProjectTrust` only ever reports a path it walked up to on
+  // disk (there is no seam to hand the grant flow a synthetic one). Faking it
+  // by asserting displaySafe() in isolation would test less than this does --
+  // that the grant preview actually ROUTES the probed path through it -- so the
+  // skip stands. The same wiring on a surface where a hostile path arrives as
+  // DATA rather than as a real directory is covered platform-independently by
+  // the `--list` case below.
   it.skipIf(process.platform === "win32")("escapes a control character in the project path line", async () => {
     // A repo directory name may legally contain ESC on POSIX, and the path
     // is printed on the line above the argv block.

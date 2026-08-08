@@ -2,12 +2,32 @@
 // onto the target -- fs.rename is atomic on the same filesystem on POSIX
 // and on modern Windows Node, so a process killed mid-write (SIGINT,
 // OOM, antivirus) leaves the original target intact instead of a half-
-// written file. The pid+timestamp suffix avoids tmp name collisions
-// across concurrent processes; in-process serialization is the caller's
-// concern (see persistence.ts:saveState for an example).
+// written file. The pid+timestamp+counter suffix makes the tmp name unique
+// across concurrent processes AND within this one; in-process serialization
+// of the LOGICAL read-modify-write is still the caller's concern (see
+// persistence.ts:saveState) -- unique tmp names stop the writes from
+// tearing each other, they don't stop a last-writer-wins overwrite.
+//
+// PERMISSIONS: rename() publishes a brand-new inode, so the surviving
+// file's mode comes from the tmp file, never from the file being replaced.
+// Left alone that silently resets a user-tightened target to the umask
+// default (typically 0644) on every overwrite. This helper therefore
+// carries an EXISTING target's mode forward when the caller passes no
+// explicit `mode` -- a write never loosens perms it did not set. Pass
+// `mode` explicitly when the CONTENT decides the mode (e.g. 0o600 because
+// this write is what puts a secret in the file).
 
 import { chmod, mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+// Bumped per call so two concurrent atomicWriteFile calls to the same path in
+// the same process never share a tmp path. pid+ms alone is NOT unique there
+// (same pid, same millisecond): writeFile opens with 'w', so an interleaved
+// A.truncate -> B.truncate -> A.rename publishes a torn or zero-byte target
+// and the loser's rename throws ENOENT/EPERM -- the exact failure this
+// primitive exists to prevent. appendAuditEvent -> trimToTailCap
+// (secrets-audit.ts) reaches this with no serializer, once per secret.
+let tmpSeq = 0;
 
 export async function atomicWriteFile(
   filePath: string,
@@ -19,6 +39,10 @@ export async function atomicWriteFile(
   // window between rename and a post-hoc chmod. The bits are masked by the
   // process umask like any creat(2); callers that need an exact mode should
   // still chmod afterward as belt-and-suspenders.
+  //
+  // Omit it to PRESERVE an existing target's mode (see the header note).
+  // Omitting is the right default when this write does not change what the
+  // file is worth protecting; pass a mode only when the content does.
   mode?: number,
   // Optional mode for the parent-directory chain. Pass 0o700 for secret-
   // bearing paths (vault, team-session cookie) so newly-created parent
@@ -39,10 +63,36 @@ export async function atomicWriteFile(
   // different fs than where the tmp would be written -- that would surface
   // as an EXDEV throw rather than an atomic swap. (If a real cross-device
   // need ever arises, fall back to writeFile-in-place, losing atomicity.)
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${++tmpSeq}`;
   await mkdirpWithMode(dir, dirMode);
+  // No explicit mode: carry the target's own perms onto the replacement inode
+  // so an overwrite cannot widen a file the user (or an earlier secret-bearing
+  // write) tightened. Nothing to preserve when the target does not exist yet --
+  // that stays at the umask default, as before. Skipped on Windows, where the
+  // POSIX bits are not meaningful and stat reports a synthetic 0o666/0o444.
+  let preserved: number | undefined;
+  if (mode === undefined && process.platform !== "win32") {
+    try {
+      preserved = (await stat(filePath)).mode & 0o7777;
+    } catch {
+      // ENOENT (fresh file) or an unstattable target -- nothing to carry.
+    }
+  }
+  const birthMode = mode ?? preserved;
   try {
-    await writeFile(tmp, contents, mode === undefined ? { encoding } : { encoding, mode });
+    await writeFile(tmp, contents, birthMode === undefined ? { encoding } : { encoding, mode: birthMode });
+    if (preserved !== undefined) {
+      try {
+        // writeFile's mode is masked by the process umask, so a preserved
+        // 0o664 would land at 0o644 under a 0o022 umask. chmod pins it back
+        // to exactly what the target had -- preservation must not quietly
+        // rewrite the user's bits either way. Best-effort: some filesystems
+        // (FAT-shaped mounts) reject chmod.
+        await chmod(tmp, preserved);
+      } catch {
+        // Ignored -- the born mode above is already no wider than the target.
+      }
+    }
     await rename(tmp, filePath);
   } catch (err) {
     // Best-effort cleanup so we don't leak orphan temp files when the

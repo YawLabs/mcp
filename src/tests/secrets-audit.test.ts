@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -113,20 +113,41 @@ describe("appendAuditEvent + readAuditLog", () => {
   });
 });
 
-describe("appendAuditEvent -- POSIX perms on first write", () => {
-  const posixOnly = process.platform === "win32" ? it.skip : it;
-
-  posixOnly("the log is born 0o600 and the created .yaw-mcp dir is 0o700", async () => {
+describe("appendAuditEvent -- perms requested on first write", () => {
+  it("asks for a 0o600 log inside a 0o700 .yaw-mcp/", async () => {
     // Fresh home: neither the log nor its parent .yaw-mcp/ exists yet, so the
     // first append takes atomicWriteFile's create path -- the log born 0o600
     // (plus a post-hoc chmod) and the parent dir born 0o700. The dir gets NO
-    // redundant chmod backup, so statting it to 0o700 pins that the birth mode
-    // is what locks it down, matching saveVault.
+    // redundant chmod backup, so the dirMode is the only thing locking it
+    // down, matching saveVault.
+    //
+    // The MODES REQUESTED are the decision this module makes; whether the
+    // filesystem then honours POSIX bits is the OS's business, and Windows
+    // does not (stat reports a synthetic 0o666), so statting the finished file
+    // pinned nothing on the only machine that runs this suite. That the
+    // request reaches creat(2)/mkdir(2) is covered in atomic-write.test.ts.
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
+
     await appendAuditEvent({ server: "gh", secret: "token", event: "injected" }, home);
 
     const logPath = auditLogPath(home);
-    const dirPath = join(home, ".yaw-mcp");
-    expect(statSync(logPath).mode & 0o777).toBe(0o600);
-    expect(statSync(dirPath).mode & 0o777).toBe(0o700);
+    expect(existsSync(logPath)).toBe(true);
+    expect(existsSync(join(home, ".yaw-mcp"))).toBe(true);
+    const call = spy.mock.calls.find((c) => c[0] === logPath);
+    expect(call, "the first append did not take the create path").toBeDefined();
+    expect(call?.[3]).toBe(0o600);
+    expect(call?.[4]).toBe(0o700);
+  });
+
+  it("appends to an existing log instead of rewriting it (no second create)", async () => {
+    // The counterweight: if the create path ran on every append, the modes
+    // above would be asserted about a call the real code only makes once.
+    await appendAuditEvent({ server: "gh", secret: "first", event: "injected" }, home);
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
+    await appendAuditEvent({ server: "gh", secret: "second", event: "injected" }, home);
+    expect(spy.mock.calls.filter((c) => c[0] === auditLogPath(home))).toEqual([]);
+    expect((await readAuditLog({}, home)).map((e) => e.secret)).toEqual(["first", "second"]);
   });
 });

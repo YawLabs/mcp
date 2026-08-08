@@ -32,6 +32,7 @@ import {
   saveVault,
   setSecret,
   unlock,
+  VAULT_CHECK_CORRUPT_ERROR,
   type VaultFile,
   vaultPath,
 } from "./secrets-vault.js";
@@ -57,11 +58,14 @@ Actions:
                           to confirm on a TTY (bare Enter = no) and refuses
                           without --force when there is no TTY to ask on.
   lock                    Forget the passphrase cached in THIS process's
-                          memory. The cache never outlives the process, so
-                          for a one-shot CLI run this is close to a no-op --
-                          it matters for a long-running yaw-mcp server. It
-                          does NOT change the vault on disk (which only ever
-                          holds ciphertext) and it does NOT revoke anything.
+                          memory -- and only this one. Every CLI run is its
+                          own short-lived process with its own cache, so this
+                          is effectively a no-op: it CANNOT reach a yaw-mcp
+                          server that is already running, which keeps its own
+                          cached key until it exits. It does NOT change the
+                          vault on disk (which only ever holds ciphertext)
+                          and it does NOT revoke anything. To cut off a
+                          running server, stop the server.
   rotate                  Re-encrypt every entry under a NEW passphrase
                           (fresh salt + derived key). Re-wraps the
                           ENCRYPTION, NOT the underlying token values -- a
@@ -77,9 +81,16 @@ Actions:
 
 Flags:
   --json                  Machine-readable output (where applicable).
-  --value <v>             Inline secret value (set only). Beware shell
-                          history -- prefer the default stdin prompt.
-  --stdin                 Read the secret from raw stdin (set only).
+  --value <v>             Inline secret value (set only). The value sits in
+                          this process's argv, so it is visible to every
+                          other local user via ps / /proc/<pid>/cmdline for
+                          the whole run (which includes the ~100ms key
+                          derivation), and it lands in your shell history.
+                          For scripting use --stdin; interactively use the
+                          default no-echo prompt.
+  --stdin                 Read the secret from raw stdin (set only). The
+                          scripting-safe alternative to --value: the value
+                          never appears in argv.
   --force                 Skip the destructive-action confirmation
                           (remove, and a set that overwrites an existing
                           name). Required for remove when stdin or stdout
@@ -193,6 +204,38 @@ export function parseSecretsArgs(
     return { ok: false, error: `yaw-mcp secrets: unexpected positional argument "${a}"\n\n${SECRETS_USAGE}` };
   }
   if (!opts.action) return { ok: false, error: `yaw-mcp secrets: missing action\n\n${SECRETS_USAGE}` };
+  // Reject a positional for the actions that take no <name>. Swallowing it
+  // was SILENT and actively misleading: `secrets audit GH_TOKEN` parsed,
+  // dropped the name, and printed the ENTIRE trail -- so an operator asking
+  // "where did GH_TOKEN go" read other secrets' events as if they were
+  // GH_TOKEN's. The mistake is a natural one (set/get/remove all take
+  // <name> positionally), so the audit message names the flag that really
+  // filters.
+  if (opts.name !== undefined && opts.action !== "set" && opts.action !== "get" && opts.action !== "remove") {
+    const hint =
+      opts.action === "audit"
+        ? ` -- audit takes no <name>; filter with \`--secret ${opts.name}\` or \`--server ${opts.name}\``
+        : ` -- ${opts.action} takes no <name>`;
+    return {
+      ok: false,
+      error: `yaw-mcp secrets ${opts.action}: unexpected argument "${opts.name}"${hint}\n\n${SECRETS_USAGE}`,
+    };
+  }
+  // The usage text marks these flags "(set only)" / "(audit only)", but the
+  // parser used to accept and then silently drop them on every other action:
+  // `secrets get NAME --stdin` and `secrets list --secret GH` both looked
+  // like they did something. Refuse instead of ignoring.
+  if (opts.action !== "set" && (opts.value !== undefined || opts.fromStdin)) {
+    const flag = opts.value !== undefined ? "--value" : "--stdin";
+    return { ok: false, error: `yaw-mcp secrets ${opts.action}: ${flag} applies to \`set\` only\n\n${SECRETS_USAGE}` };
+  }
+  if (opts.action !== "audit" && (opts.secretFilter !== undefined || opts.serverFilter !== undefined)) {
+    const flag = opts.secretFilter !== undefined ? "--secret" : "--server";
+    return {
+      ok: false,
+      error: `yaw-mcp secrets ${opts.action}: ${flag} applies to \`audit\` only\n\n${SECRETS_USAGE}`,
+    };
+  }
   if ((opts.action === "set" || opts.action === "get" || opts.action === "remove") && !opts.name) {
     return { ok: false, error: `yaw-mcp secrets ${opts.action}: <name> is required\n\n${SECRETS_USAGE}` };
   }
@@ -246,6 +289,21 @@ async function safeLoadVault(
     else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
     return { ok: false, result: { exitCode: 1 } };
   }
+}
+
+/** Render an unlock() failure for the user.
+ *
+ *  unlock() reports the corrupt-verification-token case distinctly from a
+ *  wrong passphrase, but it cannot name the file the vault came from, so
+ *  the actionable fix hint is attached here. Compared against the exported
+ *  constant rather than sniffed out of the message text -- the same
+ *  discipline safeLoadVault's corrupt-entry hint should have had. Every
+ *  other unlock error (including the real wrong-passphrase one) passes
+ *  through verbatim. */
+function unlockErrorMessage(err: unknown, path: string): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg !== VAULT_CHECK_CORRUPT_ERROR) return msg;
+  return `${msg}. Your entries are intact: delete the "check" key from ${path} by hand and re-run -- the next \`yaw-mcp secrets set\` re-stamps it.`;
 }
 
 /** Returned by the passphrase readers when the user hits ^C at a prompt.
@@ -327,6 +385,27 @@ async function promptYesNo(opts: SecretsCommandOptions, question: string): Promi
   return a === "y" || a === "yes";
 }
 
+/** Warn (never block) when an ACCEPTED passphrase is under the soft floor.
+ *
+ *  Applies to every path a passphrase can arrive on, not just the env var.
+ *  Warning only on the env path was backwards: the interactive prompt is
+ *  the one place a human actually CHOOSES a passphrase, so `secrets set` on
+ *  a fresh vault could create it under "abc" with no feedback while the
+ *  equivalent YAW_MCP_VAULT_PASSPHRASE=abc run warned. Against the exfil
+ *  threat model the vault is built for (offline attack on the stolen file),
+ *  a 3-character passphrase is trivially brute-forced regardless of which
+ *  path it came in on.
+ *
+ *  Always stderr: stdout carries `get`'s cleartext value and the --json
+ *  envelopes, and a warning must never pollute either. */
+function warnIfShortPassphrase(opts: SecretsCommandOptions, passphrase: string, subject: string): void {
+  if (passphrase.length >= MIN_PASSPHRASE_WARN_LEN) return;
+  const stderr = opts.io?.stderr ?? process.stderr;
+  stderr.write(
+    `yaw-mcp secrets: warning -- ${subject} is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.\n`,
+  );
+}
+
 /** Read the passphrase. Env var wins; falls back to a stdin prompt
  *  that disables terminal echo via raw mode. Returns null when no
  *  passphrase can be obtained (non-TTY + no env), or CANCELLED when the
@@ -339,12 +418,7 @@ async function resolvePassphrase(opts: SecretsCommandOptions, confirm = false): 
   // single-shot even when `confirm` is set: a scripted value has no second
   // entry to compare against, and a CI passphrase is not a typo to catch.
   if (typeof fromEnv === "string" && fromEnv.length > 0) {
-    if (fromEnv.length < MIN_PASSPHRASE_WARN_LEN) {
-      const stderr = opts.io?.stderr ?? process.stderr;
-      stderr.write(
-        `yaw-mcp secrets: warning -- YAW_MCP_VAULT_PASSPHRASE is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.\n`,
-      );
-    }
+    warnIfShortPassphrase(opts, fromEnv, "YAW_MCP_VAULT_PASSPHRASE");
     return fromEnv;
   }
   const stdin = opts.io?.stdin ?? process.stdin;
@@ -364,7 +438,12 @@ async function resolvePassphrase(opts: SecretsCommandOptions, confirm = false): 
       }
       const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm passphrase: ");
       if (second === CANCELLED) return CANCELLED;
-      if (first === second) return first;
+      if (first === second) {
+        // This is the ONE prompt where a human picks the vault's passphrase
+        // for good -- warn here or the weak choice is never mentioned.
+        warnIfShortPassphrase(opts, first, "the passphrase you chose");
+        return first;
+      }
       stdout.write("Passphrases did not match. Try again.\n");
     }
     return null;
@@ -375,7 +454,12 @@ async function resolvePassphrase(opts: SecretsCommandOptions, confirm = false): 
   for (let attempt = 0; attempt < MAX_PASSPHRASE_PROMPTS; attempt++) {
     const entered = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout);
     if (entered === CANCELLED) return CANCELLED;
-    if (entered.length > 0) return entered;
+    if (entered.length > 0) {
+      // Unlocking an EXISTING vault: the passphrase is already the vault's,
+      // so the actionable fix is `secrets rotate`, not a retype.
+      warnIfShortPassphrase(opts, entered, "this vault's passphrase (re-key it with `yaw-mcp secrets rotate`)");
+      return entered;
+    }
     stdout.write("Passphrase cannot be empty.\n");
   }
   return null;
@@ -392,12 +476,7 @@ async function resolveNewPassphrase(opts: SecretsCommandOptions): Promise<string
   if (opts.newPassphrase !== undefined) return opts.newPassphrase.length > 0 ? opts.newPassphrase : null;
   const fromEnv = process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
   if (typeof fromEnv === "string" && fromEnv.length > 0) {
-    if (fromEnv.length < MIN_PASSPHRASE_WARN_LEN) {
-      const stderr = opts.io?.stderr ?? process.stderr;
-      stderr.write(
-        `yaw-mcp secrets: warning -- the new passphrase is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.\n`,
-      );
-    }
+    warnIfShortPassphrase(opts, fromEnv, "the new passphrase");
     return fromEnv;
   }
   const stdin = opts.io?.stdin ?? process.stdin;
@@ -412,7 +491,10 @@ async function resolveNewPassphrase(opts: SecretsCommandOptions): Promise<string
     }
     const second = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, "Confirm new passphrase: ");
     if (second === CANCELLED) return CANCELLED;
-    if (first === second) return first;
+    if (first === second) {
+      warnIfShortPassphrase(opts, first, "the new passphrase");
+      return first;
+    }
     stdout.write("Passphrases did not match. Try again.\n");
   }
   return null;
@@ -423,7 +505,9 @@ async function resolveNewPassphrase(opts: SecretsCommandOptions): Promise<string
 const MAX_PASSPHRASE_PROMPTS = 3;
 
 /** Soft floor for a passphrase: shorter than this triggers a stderr
- *  warning (never a hard block). */
+ *  warning (never a hard block) on EVERY path a passphrase arrives on --
+ *  env var, TTY creation prompt, TTY unlock prompt, and rotate's new
+ *  passphrase. See warnIfShortPassphrase. */
 const MIN_PASSPHRASE_WARN_LEN = 12;
 
 /** Control bytes the raw-mode reader reacts to. Spelled as escapes: the
@@ -582,6 +666,12 @@ export async function runSecrets(
   // Short-circuit get/remove when the vault is missing or the entry
   // doesn't exist -- avoids prompting for a passphrase and paying the
   // scrypt derivation just to say "not found".
+  //
+  // This is the ONLY place the not-found message and its exit code live.
+  // The get and remove bodies below used to repeat the same check against
+  // the same (already-proven) vault; both copies were unreachable, and a
+  // future edit to the wording or exit code here would have silently
+  // diverged from them.
   if (opts.action === "get" || opts.action === "remove") {
     const name = opts.name as string;
     // Object.hasOwn, not `in`: entries comes from JSON.parse and inherits
@@ -665,7 +755,7 @@ export async function runSecrets(
   try {
     key = await unlock(vault, passphrase);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = unlockErrorMessage(err, path);
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
     else io.err(`yaw-mcp secrets: ${msg}\n`);
     return { exitCode: 1 };
@@ -715,13 +805,12 @@ export async function runSecrets(
   if (opts.action === "get") {
     const name = opts.name as string;
     try {
-      const value = getSecret(vault, key, name);
-      if (value === null) {
-        const msg = `No secret named "${name}" in the vault.`;
-        if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-        else io.err(`yaw-mcp secrets: ${msg}\n`);
-        return { exitCode: 1 };
-      }
+      // Non-null by construction: the short-circuit above returned exit 1
+      // for a missing name (and for a missing vault) before the passphrase
+      // prompt, so `vault` is `loaded.vault` with `name` present and
+      // getSecret's own hasOwn check cannot fail. The not-found message
+      // lives there, once.
+      const value = getSecret(vault, key, name) as string;
       // Warn (to stderr, never stdout -- keeps the value pipeable) when the
       // caller is interactive: `get` prints cleartext, so an interactive run
       // scrolls a secret into terminal scrollback. Skipped for piped/redirected
@@ -753,12 +842,8 @@ export async function runSecrets(
   // ----- remove ---------------------------------------------------------
   if (opts.action === "remove") {
     const name = opts.name as string;
-    if (!Object.hasOwn(vault.entries, name)) {
-      const msg = `No secret named "${name}" in the vault.`;
-      if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
-      else io.err(`yaw-mcp secrets: ${msg}\n`);
-      return { exitCode: 1 };
-    }
+    // Existence was proven by the short-circuit above (the single owner of
+    // the not-found message), so removeSecret always has something to drop.
     vault = removeSecret(vault, name);
     await saveVault(path, vault);
     if (opts.json) io.out(`${JSON.stringify({ ok: true, removed: name })}\n`);
@@ -818,7 +903,7 @@ async function runSecretsRotate(
   try {
     oldKey = await unlock(vault, currentPassphrase);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = unlockErrorMessage(err, path);
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
     else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
     return { exitCode: 1 };
@@ -902,11 +987,6 @@ async function runSecretsAudit(
     io.out(`${e.ts}  ${e.event === "injected" ? "injected" : "missing "}  ${e.server}  ${e.secret}\n`);
   }
   return { exitCode: 0 };
-}
-
-// Expose for vault file path tests
-export function _vaultPathForHome(home: string): string {
-  return vaultPath(home);
 }
 
 // Re-export for tests + sibling modules

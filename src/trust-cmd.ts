@@ -202,14 +202,23 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     return { exitCode: 1 };
   }
 
+  // The COUNT belongs in the header, not just implicitly in the list below.
+  // The list is unbounded -- a repo can commit 2,000 valid entries -- and at
+  // the [y/N] prompt the viewport holds only the last screenful, so an entry
+  // near the top is off-screen with nothing on the visible page hinting that
+  // there was more to read. Same defence as the control-byte neutering
+  // further down: whatever the user is attesting to has to be legible AT the
+  // decision point.
+  const serverCount = preview.servers.length;
   print("");
   print(`  Project file: ${displaySafe(path)}`);
   print(`  SHA-256:      ${probe.sha256}`);
   print(
     `  Status:       ${probe.status === "changed" ? "CHANGED since you approved it" : probe.status === "store-unreadable" ? `trust store unreadable (${displaySafe(probe.storePath)})` : "never approved"}`,
   );
+  print(`  Servers:      ${serverCount}`);
   print("");
-  if (preview.servers.length === 0) {
+  if (serverCount === 0) {
     print("  This file defines no servers, so approving it spawns nothing. It");
     print("  WILL still take precedence over your user-global bundles.json,");
     print("  which means yaw-mcp would load no servers at all in this project.");
@@ -240,7 +249,14 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
       );
       return { exitCode: 1 };
     }
-    const answer = await askYesNo(opts, "  Read every command above. Approve this file? [y/N] ");
+    // Repeat the count in the question itself: this line is the one thing
+    // guaranteed to be on screen, so it is where "there were N of them"
+    // has to appear.
+    const question =
+      serverCount === 0
+        ? "  Approve this file? It defines no servers. [y/N] "
+        : `  Read ${serverCount === 1 ? "the 1 command" : `all ${serverCount} commands`} above. Approve this file? [y/N] `;
+    const answer = await askYesNo(opts, question);
     if (answer !== "y" && answer !== "yes") {
       printErr("yaw-mcp trust: Aborted. Nothing was approved.");
       return { exitCode: 1 };
@@ -275,6 +291,13 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     granted = await grantTrust(path, raw, { home, now: opts.now });
   } catch (e) {
     if (e instanceof TrustStoreUnreadableError) {
+      if (e.kind === "schema") {
+        printErr(`yaw-mcp trust: ${displaySafe(e.reason)}.`);
+        printErr(
+          "Nothing was approved and the store was NOT touched: your existing approvals are still in that file, in a format this build would have to guess at. Upgrade with `npm i -g @yawlabs/mcp@latest`, then re-run `yaw-mcp trust`.",
+        );
+        return { exitCode: 1 };
+      }
       printErr(
         `yaw-mcp trust: cannot read the trust store at ${displaySafe(e.storePath)}${e.code ? ` (${e.code})` : ""} -- ${e.reason}.`,
       );
@@ -501,7 +524,9 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
     const fix =
       store.malformedKind === "io"
         ? "fix its permissions (do NOT delete it -- your approvals are still in there)"
-        : "it is fixed or deleted";
+        : store.malformedKind === "schema"
+          ? "you upgrade with `npm i -g @yawlabs/mcp@latest` (do NOT delete it -- your approvals are still in there)"
+          : "it is fixed or deleted";
     const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- NOTHING is trusted until ${fix}`;
     if (opts.json) {
       out(

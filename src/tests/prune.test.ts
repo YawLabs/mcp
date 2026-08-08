@@ -214,6 +214,63 @@ describe("pruneContent", () => {
     expect(parsed.results).toBeUndefined();
     expect(parsed.meta).toBe("ok");
   });
+
+  // Number fidelity. Pruning re-serializes through JSON.parse +
+  // JSON.stringify, and JSON numbers are IEEE-754 doubles: a round-trip
+  // rewrites 12345678901234567890 as 12345678901234567000. int64 row ids
+  // are ordinary in SQL and REST MCP servers, so JSON mode is skipped for
+  // the whole document whenever a literal would come back changed.
+  it("returns the original bytes rather than truncating an int64 id", () => {
+    const raw = '{"id": 12345678901234567890, "nextCursor": null, "prevCursor": null, "meta": null, "name": "row"}';
+    const r = pruneContent([{ type: "text", text: raw }]);
+    // Would otherwise clear the savings gate (136 bytes -> 73) and reach the
+    // model with the id silently mangled.
+    expect(r.content[0].text).toBe(raw);
+    expect(r.content[0].text).toContain("12345678901234567890");
+    expect(r.bytesPruned).toBe(r.bytesRaw);
+  });
+
+  it("leaves 2^53+1 alone — the first integer a double cannot hold", () => {
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"id": 9007199254740993, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toContain("9007199254740993");
+    // Proof the whole document was skipped, not merely returned by the
+    // savings gate: the droppable nulls are still there.
+    expect(r.content[0].text).toContain("empty0");
+  });
+
+  it("leaves a literal that overflows to Infinity alone (JSON.stringify emits null)", () => {
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"huge": 1e400, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toContain("1e400");
+    expect(r.content[0].text).not.toContain('"huge": null');
+  });
+
+  it("still prunes when the long digit run is inside a STRING, not a number", () => {
+    // String-quoted ids are the safe shape and must not lose their savings:
+    // the scanner blanks string literals before looking for numbers.
+    const source: Record<string, unknown> = { id: "12345678901234567890", keep: "value" };
+    for (let i = 0; i < 40; i++) source[`empty${i}`] = null;
+    const r = pruneContent([{ type: "text", text: JSON.stringify(source) }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.id).toBe("12345678901234567890");
+    expect(parsed.keep).toBe("value");
+    expect(parsed.empty0).toBeUndefined();
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
+
+  it("still prunes ordinary-sized numbers", () => {
+    const source: Record<string, unknown> = { id: 9007199254740991, price: 19.9, keep: "value" };
+    for (let i = 0; i < 40; i++) source[`empty${i}`] = null;
+    const r = pruneContent([{ type: "text", text: JSON.stringify(source) }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.id).toBe(9007199254740991);
+    expect(parsed.price).toBe(19.9);
+    expect(parsed.empty0).toBeUndefined();
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
 });
 
 // Same footgun as resolveArgs in exec-engine.ts: JSON.parse yields

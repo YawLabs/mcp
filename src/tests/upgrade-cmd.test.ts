@@ -1,14 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
+  fetchLatestVersion,
   type InstallMethod,
   localInstallRoot,
+  npmGlobalPrefix,
   parseUpgradeArgs,
+  REGISTRY_FETCH_TIMEOUT_MS,
   refineInstallMethod,
   runUpgrade,
 } from "../upgrade-cmd.js";
+
+/** An oam probe answer for runUpgrade's advisory floor line. Only the two
+ *  fields the line reads are needed. */
+const oamProbe =
+  (belowMin: boolean, version: string | null = "0.8.2") =>
+  async () => ({ version, belowMin });
 
 function captureIO(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
   const out: string[] = [];
@@ -117,6 +126,43 @@ describe("detectInstallMethod", () => {
 
   it("detects a project-local node_modules install", () => {
     expect(detectInstallMethod("/proj/app/node_modules/@yawlabs/mcp/dist/index.js")).toBe("local-node-modules");
+  });
+
+  it("does NOT classify a workspace package directory named `lib` as a global install", () => {
+    // The POSIX global marker used to be a bare `/lib/node_modules/@yawlabs/mcp/`,
+    // which any monorepo package literally named `lib` satisfies. maybeAutoUpgrade
+    // then treated it as global-npm and spawned
+    // `npm install -g --prefix <repo>/packages` (detectRunningInstallPrefix strips
+    // the trailing /lib), writing a global tree and bin shims into the user's repo
+    // and overwriting the workspace-pinned version. The marker is now anchored on
+    // real Node-root shapes, so this falls through to local-node-modules.
+    expect(detectInstallMethod("/home/u/repo/packages/lib/node_modules/@yawlabs/mcp/dist/index.js")).toBe(
+      "local-node-modules",
+    );
+    expect(detectInstallMethod("C:\\dev\\repo\\packages\\lib\\node_modules\\@yawlabs\\mcp\\dist\\index.js")).toBe(
+      "local-node-modules",
+    );
+  });
+
+  it("still detects the real POSIX global prefixes after anchoring the lib marker", () => {
+    // The anchored marker must keep every shape a global install actually uses:
+    // system prefixes, /opt tool prefixes, and version-manager Node roots. An
+    // exotic prefix that misses these degrades safely (local-node-modules, which
+    // refineInstallMethod then fixes via `npm prefix -g`) -- but these must not
+    // need refinement.
+    for (const p of [
+      "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/opt/homebrew/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/opt/node/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.nvm/versions/node/v22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.volta/tools/image/node/22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.asdf/installs/nodejs/22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.local/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.local/share/fnm/node-versions/v22.11.0/installation/lib/node_modules/@yawlabs/mcp/dist/index.js",
+    ]) {
+      expect(detectInstallMethod(p), p).toBe("global-npm");
+    }
   });
 
   it("detects pnpm global stores on linux/macos/windows", () => {
@@ -228,6 +274,123 @@ describe("refineInstallMethod", () => {
         async () => null,
       ),
     ).toBe("local-node-modules");
+  });
+});
+
+describe("npmGlobalPrefix", () => {
+  it("short-circuits to null under vitest so no unit test spawns a real npm", async () => {
+    // The guard is load-bearing for both callers: refineInstallMethod's
+    // second-chance classification AND auto-upgrade's multi-prefix warning route
+    // through this one helper, and a real `npm prefix -g` in a unit test is a
+    // multi-second subprocess whose answer varies per machine. Tests that need a
+    // prefix inject their own probe (opts.npmPrefix / deps.npmPrefixImpl).
+    expect(process.env.VITEST).toBeTruthy();
+    expect(await npmGlobalPrefix()).toBeNull();
+  });
+});
+
+// The ONE registry probe for the package. `upgrade`, auto-upgrade at serve
+// startup and `doctor` all call this; it used to exist three times over, and the
+// copies had drifted on exactly the two axes covered here -- the abort budget
+// and whether a stand-in could be injected. Both are now parameters, so these
+// tests are what keep a caller with a real difference in requirement from
+// forking the URL and the failure semantics along with it.
+describe("fetchLatestVersion -- the shared registry probe", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /** A fetch that never resolves on its own -- it settles only when the
+   *  AbortController fires, which is what a real fetch does on abort. Captures
+   *  the signal so a test can assert WHEN the abort landed, not just that it
+   *  eventually did. */
+  function hangingFetch(): { mock: ReturnType<typeof vi.fn>; signal: () => AbortSignal | undefined } {
+    let seen: AbortSignal | undefined;
+    const mock = vi.fn(
+      (_url: string, init: { signal?: AbortSignal }) =>
+        new Promise<Response>((_resolve, reject) => {
+          seen = init.signal;
+          init.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted.")));
+        }),
+    );
+    return { mock, signal: () => seen };
+  }
+
+  it("uses the override instead of the network, and never touches fetch", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchLatestVersion({ override: async () => "1.2.3" })).toBe("1.2.3");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("absorbs a throwing override to null -- an injected probe cannot fail its caller", async () => {
+    // doctor's registryFetch hook lands here. A hook that rejects must degrade
+    // the freshness line to "unknown", exactly like an offline registry does,
+    // rather than take down the whole diagnostic.
+    const thrower = async (): Promise<string | null> => {
+      throw new Error("hook blew up");
+    };
+    await expect(fetchLatestVersion({ override: thrower })).resolves.toBeNull();
+  });
+
+  it("aborts at the caller's timeout when one is given, not at the default", async () => {
+    vi.useFakeTimers();
+    const { mock, signal } = hangingFetch();
+    vi.stubGlobal("fetch", mock);
+
+    const pending = fetchLatestVersion({ timeoutMs: 2000 });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(signal()?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal()?.aborted).toBe(true);
+    // An aborted fetch is a failure like any other: null, never a throw.
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it("falls back to the 3s default budget when the caller names none", async () => {
+    // Pins the asymmetry doctor depends on: doctor passes 2000 (see
+    // DOCTOR_REGISTRY_TIMEOUT_MS) precisely because the shared default is
+    // longer. If these two ever collapse to one number, this test and the
+    // 2000ms one above stop disagreeing and the requirement is silently gone.
+    expect(REGISTRY_FETCH_TIMEOUT_MS).toBe(3000);
+    vi.useFakeTimers();
+    const { mock, signal } = hangingFetch();
+    vi.stubGlobal("fetch", mock);
+
+    const pending = fetchLatestVersion();
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(signal()?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal()?.aborted).toBe(true);
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it("returns null for a non-2xx response and for a body with no string version", async () => {
+    const responses = [
+      { ok: false, json: async () => ({ version: "9.9.9" }) },
+      { ok: true, json: async () => ({}) },
+      { ok: true, json: async () => ({ version: 47 }) },
+    ];
+    for (const res of responses) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => res as unknown as Response),
+      );
+      expect(await fetchLatestVersion()).toBeNull();
+    }
+  });
+
+  it("requests @yawlabs/mcp/latest with a JSON accept header and an abort signal", async () => {
+    const fetchMock = vi.fn(
+      async () => ({ ok: true, json: async () => ({ version: "0.47.8" }) }) as unknown as Response,
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchLatestVersion()).toBe("0.47.8");
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { headers: unknown; signal: unknown }];
+    expect(url).toBe("https://registry.npmjs.org/@yawlabs/mcp/latest");
+    expect(init.headers).toEqual({ accept: "application/json" });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 });
 
@@ -720,6 +883,76 @@ describe("runUpgrade", () => {
     expect(r.exitCode).toBe(1);
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed).toMatchObject({ method: "binary", command: null, stale: true });
+  });
+
+  it("warns that oam is below the floor even when yaw-mcp itself has nothing to do", async () => {
+    // MIN_OAM_VERSION tracks the LATEST oam release, so upgrading yaw-mcp can
+    // raise the floor past the user's oam and silently drop every sidecar from
+    // oam to node. `upgrade` is the command a user runs to "get current", and it
+    // used to print "nothing to do" with no mention of that -- the only other
+    // notices are a warn line on the broker's stderr (which MCP clients hide)
+    // and `doctor`.
+    const io = captureIO();
+    const r = await runUpgrade({
+      currentVersion: "0.45.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      oamProbe: oamProbe(true, "0.8.2"),
+      out: io.push,
+      err: io.pushErr,
+    });
+    // Advisory only: the exit-code contract for "already current" is unchanged.
+    expect(r.exitCode).toBe(0);
+    const out = io.out.join("\n");
+    expect(out).toContain("nothing to do");
+    expect(out).toContain("v0.8.2");
+    expect(out).toContain("oam self-update");
+    expect(out).toContain("run on node instead of oam");
+  });
+
+  it("says nothing about oam when it is absent or already at/above the floor", async () => {
+    const io = captureIO();
+    await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      oamProbe: oamProbe(false, "0.8.3"),
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(io.out.join("\n")).not.toContain("oam");
+  });
+
+  it("keeps the oam note out of --json (the snapshot stays machine-parseable)", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      json: true,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      oamProbe: oamProbe(true, "0.8.2"),
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    // Would throw if an advisory line leaked into the snapshot.
+    expect(JSON.parse(io.out.join("\n"))).toMatchObject({ method: "global-npm", stale: true });
+  });
+
+  it("never fails the upgrade when the oam probe throws", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      currentVersion: "0.45.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      oamProbe: async () => {
+        throw new Error("oam probe exploded");
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.out.join("\n")).toContain("nothing to do");
   });
 
   it("offline + binary points at the release page, not the npx restart message", async () => {

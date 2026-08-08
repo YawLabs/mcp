@@ -18,10 +18,12 @@ import { buildToolList } from "../proxy.js";
 import {
   ConnectServer,
   computeToolOverlaps,
+  DEFAULT_IDLE_CALL_THRESHOLD,
   isAutoLoadEnabled,
   isRoutingFaultText,
   ROUTING_FAULT_DISCONNECTED,
   ROUTING_FAULT_UNKNOWN_TOOL,
+  resolveIdleThreshold,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { connectToUpstream, disconnectFromUpstream } from "../upstream.js";
@@ -1211,7 +1213,7 @@ describe("ConnectServer", () => {
       priv.connections.set("slack", makeConnection("slack"));
       priv.idleCallCounts.set("gh", 0);
       // Set slack to threshold - 1; the next increment will trigger deactivation
-      priv.idleCallCounts.set("slack", (ConnectServer as any).IDLE_CALL_THRESHOLD - 1);
+      priv.idleCallCounts.set("slack", resolveIdleThreshold() - 1);
 
       await priv.trackUsageAndAutoDeactivate("gh");
       expect(priv.connections.has("slack")).toBe(false);
@@ -1245,7 +1247,7 @@ describe("ConnectServer", () => {
       priv.connections.set("gh", makeConnection("gh"));
       priv.connections.set("slack", makeConnection("slack"));
 
-      const baseline = (ConnectServer as any).IDLE_CALL_THRESHOLD as number;
+      const baseline = resolveIdleThreshold();
       const now = Date.now();
       // Seed history with recent slack activity so slack has earned
       // adaptive patience. 5 recent calls → bonus 10 → threshold 20.
@@ -3000,6 +3002,28 @@ describe("prewarm race: explicit activate during prewarm inflight", () => {
     expect(priv.connections.has("gh")).toBe(false);
     expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
   });
+
+  it("does not delete a connection that was replaced while its predecessor closed", async () => {
+    // The other half of the same race: disconnectFromUpstream marks the old
+    // connection dead synchronously, so an explicit activate that starts
+    // during the close sees a dead entry, spawns a fresh child, and
+    // re-registers under the same key. Deleting unconditionally after the
+    // await orphans that child -- live, unreferenced, invisible to
+    // shutdown() -- and the user's next tool call gets "no longer
+    // connected" for a server that is actually running.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    const prewarmed = makeConnection("gh", ["create_issue"]);
+    const replacement = makeConnection("gh", ["create_issue"]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(prewarmed);
+    vi.mocked(disconnectFromUpstream).mockImplementationOnce(async () => {
+      priv.connections.set("gh", replacement);
+    });
+
+    await priv.prewarmDormantServers();
+
+    expect(priv.connections.get("gh")).toBe(replacement);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3158,5 +3182,393 @@ describe("ConnectServer.parseStepPayload", () => {
   it("branch 3d: single non-text item -> the content array", () => {
     const input = { content: [{ type: "image" }] };
     expect(parseStepPayload(input)).toBe(input.content);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Review follow-ups: activation without a route rebuild, the idle reaper
+// racing an in-flight call, read_tool bypassing the policy gates, and a
+// per-tool filter that outlived the activation it was set for.
+// ─────────────────────────────────────────────────────────────────────────
+describe("idle threshold env knob", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults to 10 with neither env var set", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "");
+    expect(resolveIdleThreshold()).toBe(DEFAULT_IDLE_CALL_THRESHOLD);
+  });
+
+  it("reads YAW_MCP_IDLE_THRESHOLD", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "25");
+    expect(resolveIdleThreshold()).toBe(25);
+  });
+
+  it("still honors the legacy MCP_CONNECT_IDLE_THRESHOLD spelling", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "7");
+    expect(resolveIdleThreshold()).toBe(7);
+  });
+
+  it("prefers the YAW_MCP_ name when both are set", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "3");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "40");
+    expect(resolveIdleThreshold()).toBe(3);
+  });
+
+  it("falls back to the default on garbage or out-of-range values", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "banana");
+    expect(resolveIdleThreshold()).toBe(DEFAULT_IDLE_CALL_THRESHOLD);
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "0");
+    expect(resolveIdleThreshold()).toBe(DEFAULT_IDLE_CALL_THRESHOLD);
+  });
+
+  it("is re-read per call, not latched at import", async () => {
+    const s = new ConnectServer();
+    const priv = getPrivate(s);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("slack", makeConnection("slack"));
+    // Baseline 1 clamps to the adaptive floor of 5, so an idle count of 4
+    // tips over on the next call. Under the default baseline of 10 it does
+    // not -- which is what makes this a test of the env read.
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "1");
+    priv.idleCallCounts.set("slack", 4);
+
+    await priv.trackUsageAndAutoDeactivate("gh");
+    expect(priv.connections.has("slack")).toBe(false);
+    await s.shutdown();
+  });
+});
+
+describe("activation always refreshes the routing table", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("deferred first call rebuilds routes even when the server was already connected", async () => {
+    // The wedge: discover's auto-warm (or dispatch) connected gh while
+    // toolRoutes still held the deferred entry built from its toolCache.
+    // activateOne then returns isChanged:false, so gating the rebuild on
+    // isChanged left the stale route in place and the call dead-ended on
+    // "no longer available" with no recovery path.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const conn = makeConnection("gh", ["create_issue"]);
+    conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "issue #1" }] });
+    priv.connections.set("gh", conn);
+    // Stale routes: gh is connected but its route still says deferred.
+    priv.toolRoutes = new Map([
+      [
+        "gh_create_issue",
+        { namespace: "gh", originalName: "create_issue", namespacedName: "gh_create_issue", deferred: true },
+      ],
+    ]);
+
+    const result = await priv.handleToolCall("gh_create_issue", {});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("issue #1");
+    // No re-spawn: the server was already connected.
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    // Routes were refreshed, so the deferred entry is gone.
+    expect(priv.toolRoutes.get("gh_create_issue")?.deferred).toBeUndefined();
+  });
+
+  it("auto-load rebuilds routes for the pack it just activated", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "gh-id", namespace: "gh" }),
+      makeServerConfig({ id: "linear-id", namespace: "linear", name: "Linear" }),
+    ]);
+    const t0 = 1_000_000;
+    for (let i = 0; i < 3; i++) {
+      priv.packDetector.recordCall("gh", "create_issue", t0 + i * 300_000);
+      priv.packDetector.recordCall("linear", "list_issues", t0 + i * 300_000 + 1000);
+    }
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
+    );
+
+    await priv.autoLoadRecurringPack();
+
+    // Without the rebuild the routing table keeps whatever start() left
+    // behind and the first call on an auto-loaded tool misses entirely.
+    expect(priv.toolRoutes.has("gh_gh_tool")).toBe(true);
+    expect(priv.toolRoutes.has("linear_linear_tool")).toBe(true);
+  });
+});
+
+describe("idle reaper vs in-flight tool calls", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("does not disconnect a namespace with a call still in flight", async () => {
+    const priv = getPrivate(server);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("slack", makeConnection("slack"));
+    priv.idleCallCounts.set("slack", resolveIdleThreshold() - 1);
+    // slack is mid-call: killing it here rejects the user's own pending
+    // callTool and then books the rejection against slack.
+    priv.inflightCalls.set("slack", 1);
+
+    await priv.trackUsageAndAutoDeactivate("gh");
+
+    expect(priv.connections.has("slack")).toBe(true);
+    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+
+    // Once the call drains, the next completion reaps it as usual.
+    priv.inflightCalls.delete("slack");
+    await priv.trackUsageAndAutoDeactivate("gh");
+    expect(priv.connections.has("slack")).toBe(false);
+  });
+
+  it("counts a live proxied call as in-flight for the duration of the call", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const conn = makeConnection("gh", ["create_issue"]);
+    let seenDuringCall: number | undefined;
+    conn.client.callTool = vi.fn().mockImplementation(async () => {
+      seenDuringCall = priv.inflightCalls.get("gh");
+      return { content: [{ type: "text", text: "ok" }] };
+    });
+    priv.connections.set("gh", conn);
+    priv.rebuildRoutes();
+
+    await priv.handleToolCall("gh_create_issue", {});
+
+    expect(seenDuringCall).toBe(1);
+    // ...and the marker is released afterwards, not leaked.
+    expect(priv.inflightCalls.has("gh")).toBe(false);
+  });
+
+  it("releases the in-flight marker on the error path too", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const conn = makeConnection("gh", ["create_issue"]);
+    conn.client.callTool = vi.fn().mockRejectedValue(new Error("transport closed"));
+    priv.connections.set("gh", conn);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("gh_create_issue", {});
+    expect(result.isError).toBe(true);
+    expect(priv.inflightCalls.has("gh")).toBe(false);
+  });
+});
+
+describe("read_tool honors the same policy gates as activate", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await server.shutdown();
+  });
+
+  it("refuses a profile-blocked server instead of spawning it", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "prod-db", name: "Prod DB" })]);
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", blocked: ["prod-db"] };
+
+    const result = await priv.handleReadTool("prod-db", "query");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not allowed by the project profile");
+    // The transient inspect path spawns the real command with its resolved
+    // env (vault secrets included) -- a deny-listed server must never
+    // reach it just because we disconnect afterwards.
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("refuses a server outside an allow-list profile", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", servers: ["slack"] };
+
+    const result = await priv.handleReadTool("gh", "create_issue");
+
+    expect(result.isError).toBe(true);
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("refuses a below-floor server under YAW_MCP_MIN_COMPLIANCE", async () => {
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", complianceGrade: "D" })]);
+
+    const result = await priv.handleReadTool("gh", "create_issue");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Refused to load "gh"');
+    expect(result.content[0].text).toContain("grade D");
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("still inspects an allowed, in-grade server", async () => {
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", complianceGrade: "A" })]);
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", servers: ["gh"] };
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+    const result = await priv.handleReadTool("gh", "create_issue");
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Tool: gh_create_issue");
+  });
+});
+
+describe("per-tool filter rollback on a failed activation", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("drops the filter when the activation it was set for fails", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
+
+    const result = await priv.handleActivate(["gh"], undefined, ["foo"]);
+    expect(result.isError).toBe(true);
+    // A surviving filter would silently narrow a LATER successful load --
+    // dispatch and the deferred path never touch toolFilters.
+    expect(priv.toolFilters.has("gh")).toBe(false);
+  });
+
+  it("restores the previous filter rather than clearing it outright", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.toolFilters.set("gh", new Set(["create_issue"]));
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
+
+    await priv.handleActivate(["gh"], undefined, ["close_issue"]);
+
+    expect([...(priv.toolFilters.get("gh") ?? [])]).toEqual(["create_issue"]);
+  });
+
+  it("leaves no filter behind for a namespace that isn't installed at all", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([]);
+
+    const result = await priv.handleActivate(["ghost"], undefined, ["x"]);
+    expect(result.isError).toBe(true);
+    expect(priv.toolFilters.has("ghost")).toBe(false);
+  });
+
+  it("keeps the filter when the activation succeeds", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "close_issue"]));
+
+    await priv.handleActivate(["gh"], undefined, ["create_issue"]);
+    expect([...(priv.toolFilters.get("gh") ?? [])]).toEqual(["create_issue"]);
+  });
+});
+
+describe("discover cache invalidation", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("a failed activation invalidates the memoized discover body", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+    const first = priv.handleDiscover();
+    expect(first.content[0].text).not.toContain("last activation failed");
+
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
+    await priv.activateOne("gh");
+
+    // Same cache key, still inside the 3s TTL -- but the failure warning
+    // must show up. This is the exact "discover, failed activate, discover
+    // again" sequence the cache comment names as its motivating case.
+    const second = priv.handleDiscover();
+    expect(second.content[0].text).toContain("last activation failed");
+  });
+});
+
+describe("shutdown drains and refuses activations", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  it("refuses a new activation once shutdown has started", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    await server.shutdown();
+
+    const result = await priv.activateOne("gh");
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("shutting down");
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("waits for an in-flight activation and disconnects what it registered", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+
+    let resolveConnect: (conn: UpstreamConnection) => void = () => {};
+    vi.mocked(connectToUpstream).mockReturnValueOnce(
+      new Promise<UpstreamConnection>((r) => {
+        resolveConnect = r;
+      }),
+    );
+    const activation = priv.activateOne("gh");
+
+    const shutdownPromise = server.shutdown();
+    // The child finishes its handshake AFTER shutdown started: without the
+    // drain its connection lands in a map nobody will ever disconnect.
+    resolveConnect(makeConnection("gh", ["create_issue"]));
+    await Promise.all([activation, shutdownPromise]);
+
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
+    expect(priv.connections.size).toBe(0);
+  });
+
+  it("clears session-elicited credentials, as the field contract promises", async () => {
+    const priv = getPrivate(server);
+    priv.elicitedEnv.set("gh", { GITHUB_TOKEN: "ghp_secret" });
+
+    await server.shutdown();
+
+    expect(priv.elicitedEnv.size).toBe(0);
   });
 });

@@ -45,9 +45,13 @@ export const COMPLETION_USAGE = `Usage: yaw-mcp completion <bash|zsh|fish|powers
 interface SubcommandSpec {
   name: string;
   /** One-line description. Used by the zsh generator (and kept here as the
-   *  single source so descriptions can't drift from the spec). Keep it free of
-   *  ':' and parentheses -- zsh `_values` treats ':' as the value/desc
-   *  separator. */
+   *  single source so descriptions can't drift from the spec). zsh `_values`
+   *  takes each spec in `_arguments` form minus the leading option name --
+   *  `name[description]:message:action` -- so the description is rendered
+   *  INSIDE brackets, not after a colon (`name:description` is `_describe`
+   *  syntax and `_values` would read the text after ':' as an argument spec).
+   *  Keep it free of '[' / ']' (they close the description early) and of
+   *  parentheses (they open an action group). */
   description: string;
   /** Positional argument POSITIONS, in order. Each inner array is the set of
    *  one-of-N alternative candidates that complete at that single position
@@ -84,6 +88,9 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       "--dry-run",
       "--list",
       "--all",
+      // parseInstallArgs accepts --help/-h (install-cmd.ts returns
+      // helpRequested), so it completes here like every other subcommand.
+      "--help",
     ],
   },
   // Local servers -- manage ~/.yaw-mcp/bundles.json (no account).
@@ -292,7 +299,19 @@ complete -F _yaw-mcp yaw-mcp
 function renderZsh(): string {
   // Descriptions come straight from the spec (single source of truth), so a
   // newly-added subcommand can never render with a blank zsh description.
-  const subcommandList = SUBCOMMAND_SPEC.map((s) => `    '${s.name}:${s.description}'`).join("\n");
+  //
+  // Two things this line has to get right, both of which were wrong before:
+  //   1. `name[description]`, NOT `name:description`. `_values` takes each
+  //      spec in `_arguments` form without the leading option name, so the
+  //      description belongs in brackets; with a ':' zsh reads the text after
+  //      it as an argument spec and the subcommand renders with no
+  //      description at all. (`name:description` is `_describe` syntax.)
+  //   2. Join with " \\\n" -- every spec line but the last must end in a
+  //      line-continuation. Joining on a bare newline continued only the
+  //      FIRST spec onto the `_values` call; the other 18 were emitted as
+  //      standalone commands, so a user got `install` as the only candidate
+  //      plus 18 `command not found: add:...` errors on the first TAB.
+  const subcommandList = SUBCOMMAND_SPEC.map((s) => `    '${s.name}[${s.description}]'`).join(" \\\n");
 
   const argsCases = SUBCOMMAND_SPEC.map((spec) => {
     const lines = [`      ${spec.name})`];

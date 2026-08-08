@@ -22,6 +22,22 @@ describe("classifyError", () => {
       "upstream_error",
     ],
     ["identifier-shaped 'set_timeout' is not a timeout", "Error thrown inside set_timeout handler", "upstream_error"],
+    // A quote-delimited `timeout` token is DATA, not a failure report.
+    // server.ts scores EVERY proxied result, so a successful get_config that
+    // echoes a timeout setting used to classify as "timeout" and bank 0.2
+    // reward instead of full credit.
+    ["json config key named timeout is not a timeout", '{"timeout":5000,"retries":3}', "upstream_error"],
+    ["python-repr config key named timeout is not a timeout", "{'timeout': 5000, 'retries': 3}", "upstream_error"],
+    // Same guard on the read side: a zod path segment named "timeout" must not
+    // steal a -32602 reply from validation_error (server.ts's inputShaped
+    // check depends on that classification).
+    [
+      "zod path segment named timeout stays a validation error",
+      'MCP error -32602: Input validation error: Invalid arguments for tool http_get: [{"expected":"number","code":"invalid_type","path":["timeout"]}]',
+      "validation_error",
+    ],
+    // ...and the tightening must not lose an unquoted prose timeout.
+    ["unquoted prose timeout still classifies", "Error: gateway timeout while contacting upstream", "timeout"],
     [
       "zod validation -32602 with missing array",
       'MCP error -32602: Input validation error: Invalid arguments for tool aws_metrics_query: [{"expected":"array","code":"invalid_type","path":["queries"]}]',

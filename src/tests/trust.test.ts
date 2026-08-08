@@ -14,10 +14,10 @@
 // built with join() -- never a POSIX string literal -- because the SUT routes
 // through path.join, which yields backslashes on the Windows runner.
 
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   findShadowingProjectBundles,
   loadLocalBundles,
@@ -37,10 +37,34 @@ import {
   revokeTrust,
   TRUST_BYPASS_ENV,
   TRUST_FILENAME,
+  TRUST_SCHEMA_VERSION,
   TrustStoreUnreadableError,
   trustStatusFor,
   trustStorePath,
 } from "../trust.js";
+
+// An unreadable store is a LOCK (antivirus, a backup agent, a stray chmod),
+// not a shape the filesystem has to be talked into producing -- so it is
+// injected at the readFile boundary rather than staged on disk. That is what
+// lets the "a refused write preserves the grants" case below run everywhere:
+// the store keeps its real bytes while being unreadable, which no portable
+// on-disk trick can arrange (a directory has no bytes; chmod 000 is POSIX-only
+// and a no-op for root). Every other call passes straight through.
+const { readFileErrors } = vi.hoisted(() => ({ readFileErrors: new Map<string, string>() }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const readFile = ((target: unknown, ...rest: unknown[]) => {
+    const code = typeof target === "string" ? readFileErrors.get(target) : undefined;
+    if (code !== undefined) {
+      const err: NodeJS.ErrnoException = new Error(`${code}: injected read failure, open '${String(target)}'`);
+      err.code = code;
+      return Promise.reject(err);
+    }
+    return (actual.readFile as (...a: unknown[]) => unknown)(target, ...rest);
+  }) as unknown as typeof actual.readFile;
+  return { ...actual, readFile };
+});
 
 let synthHome: string;
 let synthCwd: string;
@@ -52,7 +76,21 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
+  readFileErrors.clear();
+  vi.restoreAllMocks();
 });
+
+/** Run `fn` with process.platform reporting a POSIX value. normalizeTrustKey
+ *  reads it at CALL time, so its POSIX branch is reachable from any runner. */
+function asPosix<T>(fn: () => T): T {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+  try {
+    return fn();
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+  }
+}
 
 function projectBundlesPath(dir: string): string {
   return localBundlesPath(join(dir, CONFIG_DIRNAME));
@@ -368,22 +406,45 @@ describe("trust store grant / revoke / list round-trip", () => {
     expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config?.servers).toHaveLength(1);
   });
 
-  it.skipIf(process.platform === "win32")("keeps POSIX keys case-SENSITIVE", () => {
+  it("keeps POSIX keys case-SENSITIVE", () => {
     // Lowercasing on POSIX would merge /Repo and /repo, which are genuinely
-    // different directories there.
-    expect(normalizeTrustKey("/tmp/Repo/bundles.json")).not.toBe(normalizeTrustKey("/tmp/repo/bundles.json"));
+    // different directories there. The case-FOLDING half is asserted by the
+    // Windows-only test above; this is the other side of the same branch.
+    asPosix(() => {
+      expect(normalizeTrustKey("/tmp/Repo/bundles.json")).not.toBe(normalizeTrustKey("/tmp/repo/bundles.json"));
+      // ...while everything else about the key still normalizes.
+      expect(normalizeTrustKey("/tmp/Repo/../Repo/./bundles.json")).toBe(normalizeTrustKey("/tmp/Repo/bundles.json"));
+    });
   });
 
-  it.skipIf(process.platform === "win32")("writes the store owner-only (0600)", async () => {
+  // What the store write ASKS FOR is trust.ts's decision; whether the
+  // filesystem honours POSIX mode bits is not (Windows reports a synthetic
+  // 0o666 and chmod there is a near no-op, so statting the finished file
+  // pinned nothing on the only machine that runs this suite). The request
+  // reaching creat(2)/mkdir(2) is covered in atomic-write.test.ts.
+  it("asks for an owner-only (0600) store file", async () => {
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
     await writeTrustedProjectBundles(synthCwd, HOSTILE);
-    expect(statSync(trustStorePath(synthHome)).mode & 0o777).toBe(0o600);
+    const call = spy.mock.calls.find((c) => c[0] === trustStorePath(synthHome));
+    expect(call, "the trust store was never written").toBeDefined();
+    // The file records which paths on this machine may spawn processes as the
+    // user, so another local account must not be able to append to it.
+    expect(call?.[3]).toBe(0o600);
   });
 
-  it.skipIf(process.platform === "win32")("births a fresh ~/.yaw-mcp/ owner-only (0700)", async () => {
+  it("asks for an owner-only (0700) ~/.yaw-mcp/ when the grant creates it", async () => {
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
     writeBundles(synthCwd, HOSTILE);
     const path = projectBundlesPath(synthCwd);
+    // The dir is genuinely absent beforehand, so the dirMode is the only thing
+    // standing between it and the umask default.
+    expect(existsSync(join(synthHome, CONFIG_DIRNAME))).toBe(false);
     await grantTrust(path, readFileSync(path), { home: synthHome });
-    expect(statSync(join(synthHome, CONFIG_DIRNAME)).mode & 0o777).toBe(0o700);
+    expect(statSync(join(synthHome, CONFIG_DIRNAME)).isDirectory()).toBe(true);
+    const call = spy.mock.calls.find((c) => c[0] === trustStorePath(synthHome));
+    expect(call?.[4]).toBe(0o700);
   });
 });
 
@@ -396,8 +457,6 @@ describe("trust store grant / revoke / list round-trip", () => {
 function makeStoreUnreadable(home: string): void {
   mkdirSync(trustStorePath(home), { recursive: true });
 }
-
-const RUNNING_AS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
 
 describe("an UNREADABLE store is denied but never discarded", () => {
   it("readTrustStore separates an I/O failure from a parse failure, keeping the errno", async () => {
@@ -472,26 +531,91 @@ describe("an UNREADABLE store is denied but never discarded", () => {
     expect(await listTrusted({ home: synthHome })).toHaveLength(1);
   });
 
-  it.skipIf(process.platform === "win32" || RUNNING_AS_ROOT)(
-    "the grants inside a locked store survive the refused write byte for byte",
-    async () => {
-      await writeTrustedProjectBundles(synthCwd, HOSTILE);
-      const storePath = trustStorePath(synthHome);
-      const before = readFileSync(storePath, "utf8");
+  it("the grants inside a locked store survive the refused write byte for byte", async () => {
+    // The scenario the refusal exists for: a store that is FULL of real grants
+    // and momentarily unreadable. EBUSY (an antivirus / backup-agent lock) is
+    // injected rather than staged with chmod 000 -- chmod is POSIX-only and a
+    // no-op for root, and the directory trick used above leaves no bytes to
+    // compare, which is the whole claim here.
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    const storePath = trustStorePath(synthHome);
+    const before = readFileSync(storePath, "utf8");
 
-      chmodSync(storePath, 0o000);
-      const other = join(synthHome, "other-repo", CONFIG_DIRNAME, "bundles.json");
-      await expect(grantTrust(other, "whatever", { home: synthHome })).rejects.toBeInstanceOf(
-        TrustStoreUnreadableError,
-      );
-      chmodSync(storePath, 0o600);
+    readFileErrors.set(storePath, "EBUSY");
+    const other = join(synthHome, "other-repo", CONFIG_DIRNAME, "bundles.json");
+    const err = await grantTrust(other, "whatever", { home: synthHome }).catch((e) => e);
+    expect(err).toBeInstanceOf(TrustStoreUnreadableError);
+    expect((err as TrustStoreUnreadableError).code).toBe("EBUSY");
+    readFileErrors.delete(storePath);
 
-      expect(readFileSync(storePath, "utf8")).toBe(before);
-      const listed = await listTrusted({ home: synthHome });
-      expect(listed).toHaveLength(1);
-      expect(listed[0].path).toBe(projectBundlesPath(synthCwd));
-    },
-  );
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+    const listed = await listTrusted({ home: synthHome });
+    expect(listed).toHaveLength(1);
+    expect(listed[0].path).toBe(projectBundlesPath(synthCwd));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A store from a NEWER schema is denied, and never stamped over
+// ---------------------------------------------------------------------------
+//
+// `version` used to be parsed, returned on TrustStore, and read by nobody --
+// the one place this module did not fail closed. A future yaw-mcp that keys
+// entries differently (realpath, a different digest) would have its store
+// reinterpreted with v1 semantics by an older binary still on the machine.
+
+describe("a store written by a NEWER yaw-mcp", () => {
+  function writeStore(body: unknown): string {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const p = trustStorePath(synthHome);
+    writeFileSync(p, `${JSON.stringify(body, null, 2)}\n`);
+    return p;
+  }
+
+  it("is unusable rather than reinterpreted, and says which version it saw", async () => {
+    writeStore({ version: TRUST_SCHEMA_VERSION + 1, trusted: {} });
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(true);
+    expect(store.malformedKind).toBe("schema");
+    expect(store.version).toBe(TRUST_SCHEMA_VERSION + 1);
+    // Nothing failed at the syscall level, so there is no errno to report.
+    expect(store.errorCode).toBeNull();
+    expect(store.malformedReason).toContain(trustStorePath(synthHome));
+    expect(store.malformedReason).toContain(String(TRUST_SCHEMA_VERSION + 1));
+  });
+
+  it("denies every lookup rather than reporting approved projects as untrusted", async () => {
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const real = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as Record<string, unknown>;
+    // Same grant, same bytes on disk -- only the declared schema moved.
+    writeStore({ ...real, version: TRUST_SCHEMA_VERSION + 1 });
+    const store = await readTrustStore(synthHome);
+    expect(trustStatusFor(path, readFileSync(path), store)).toBe("store-unreadable");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+  });
+
+  it("refuses the write instead of downgrading the file over its grants", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const storePath = writeStore({ version: TRUST_SCHEMA_VERSION + 1, trusted: {}, futureField: "keep me" });
+    const before = readFileSync(storePath, "utf8");
+    const err = await grantTrust(path, readFileSync(path), { home: synthHome }).catch((e) => e);
+    expect(err).toBeInstanceOf(TrustStoreUnreadableError);
+    expect((err as TrustStoreUnreadableError).kind).toBe("schema");
+    expect((err as TrustStoreUnreadableError).code).toBeNull();
+    // Byte for byte -- a v2 store must survive an older binary trying to grant.
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+  });
+
+  it("still loads a store at the current schema version", async () => {
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(false);
+    expect(store.malformedKind).toBeNull();
+    expect(store.version).toBe(TRUST_SCHEMA_VERSION);
+  });
 });
 
 // ---------------------------------------------------------------------------

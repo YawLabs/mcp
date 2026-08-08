@@ -235,6 +235,20 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
   return out;
 }
 
+/**
+ * Point the reader at the config they can actually edit. Shared by the
+ * resolver-failure path and the connect-failure path so both carry the same
+ * suffix -- a failure that skips it reads as an unclassified transport error
+ * with nowhere to go. This used to append a dashboard deep-link
+ * (#server-<id>); that dashboard is gone and the URL 404s, so naming the local
+ * file and namespace is both accurate and more actionable -- the LLM can tell
+ * the user exactly what to open.
+ */
+function withConfigPointer(message: string, config: UpstreamServerConfig): string {
+  if (!config.namespace) return message;
+  return `${message} → Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
+}
+
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
   const msg = err instanceof Error ? err.message : String(err);
   // Node's child_process surfaces ENOENT as the most common spawn failure —
@@ -245,23 +259,42 @@ function categorizeSpawnError(err: unknown): ActivationFailureCategory {
   return "unknown";
 }
 
-/** Per-attempt spawn facts, threaded out of connectToUpstreamOnce so the
- *  wrapper can decide whether a failure qualifies for the oam->node
- *  downgrade (and log the oam version it downgraded from). */
+/** Spawn facts for one connectToUpstream CALL (not one attempt), threaded out
+ *  of connectToUpstreamOnce so the wrapper can decide whether a failure
+ *  qualifies for the oam->node downgrade (and log the oam version it
+ *  downgraded from).
+ *
+ *  The SAME object is handed to the downgrade respawn on purpose and is NOT
+ *  reset between the two attempts -- see oamRewriteApplied. */
 interface SpawnAttempt {
   /** True when resolveOamSpawn actually CHANGED the launch (oam installed,
-   *  command was node/npx, package resolved). False for plain node spawns
-   *  and for oam opt-ins that already fell back inside resolveOamSpawn. */
-  oamRewritten: boolean;
+   *  command was node/npx, package resolved) -- i.e. "the oam rewrite was
+   *  applied on this call", NOT "this connection is hosted on oam". A
+   *  hand-written `command: "oam"` entry is returned unchanged by
+   *  rewriteForOam, so it spawns on oam with this flag false and is reported
+   *  as a plain node spawn. False for plain node spawns and for oam opt-ins
+   *  that already fell back inside resolveOamSpawn.
+   *
+   *  SURVIVES THE DOWNGRADE ATTEMPT ON PURPOSE: it stays true while the second
+   *  launch is plain node, and the runtime log at the end of
+   *  connectToUpstreamOnce keys `downgradedFromOam` on exactly that pair
+   *  (flag true + disableOamRewrite true). Resetting it at the top of
+   *  connectToUpstreamOnce -- which reads like a correct cleanup -- would
+   *  silently turn the post-downgrade success line into an ordinary node line
+   *  and erase the only trace that a server left oam. */
+  oamRewriteApplied: boolean;
   oamVersion: string | null;
 }
 
-/** Namespaces whose oam-hosted boot already failed once this session. The
- *  rewrite gate skips these so the downgrade STICKS: without the memo,
- *  callers with their own retry loops (runActivateOne's two attempts, the
- *  auto-reconnect path) would re-pay the oam boot failure on every outer
- *  attempt and on every later reconnect. Cleared only by process restart --
- *  matching the "for this session" wording of the downgrade log. */
+/** Namespaces whose oam-hosted boot failed this session AND whose node
+ *  respawn produced a different outcome (booted fine, or failed a different
+ *  way) -- i.e. the ones where oam is actually implicated. The rewrite gate
+ *  skips these so a CONFIRMED downgrade STICKS: without the memo, callers
+ *  with their own retry loops (runActivateOne's two attempts, the
+ *  auto-reconnect path, the transient read_tool connect) would re-pay the oam
+ *  boot failure on every outer attempt and on every later reconnect. Nothing
+ *  removes an entry short of a process restart, which is why the add is gated
+ *  on evidence -- see connectToUpstream. */
 const oamDowngradedNamespaces = new Set<string>();
 
 /** Reset the session-scoped oam downgrade memo (test hook). */
@@ -274,7 +307,7 @@ export async function connectToUpstream(
   onDisconnect?: (namespace: string) => void,
   onListChanged?: (namespace: string) => void,
 ): Promise<UpstreamConnection> {
-  const attempt: SpawnAttempt = { oamRewritten: false, oamVersion: null };
+  const attempt: SpawnAttempt = { oamRewriteApplied: false, oamVersion: null };
   try {
     return await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, false);
   } catch (err) {
@@ -283,8 +316,8 @@ export async function connectToUpstream(
     // child dying during the initial capability fetch -- all surfaced as
     // ActivationError), respawn ONCE with the original pre-rewrite command.
     // Exactly one downgrade per call, no retry ladder: a second failure
-    // propagates; the namespace memo above makes the downgrade stick for
-    // the rest of the session. Non-oam spawns and non-activation errors
+    // propagates; the namespace memo above makes a CONFIRMED downgrade stick
+    // for the rest of the session. Non-oam spawns and non-activation errors
     // (e.g. vault refusals, which would fail identically on node) rethrow
     // untouched. A child that dies AFTER a healthy boot still gets no
     // auto-fallback (see oam-spawn.ts).
@@ -295,15 +328,46 @@ export async function connectToUpstream(
     // cheaply distinguishing "dead child" from "healthy server returning a
     // JSON-RPC error" isn't possible at this layer. Worst case is one extra
     // node boot before the same error propagates (bounded by the memo).
-    if (!attempt.oamRewritten || !(err instanceof ActivationError)) throw err;
-    oamDowngradedNamespaces.add(config.namespace);
+    if (!attempt.oamRewriteApplied || !(err instanceof ActivationError)) throw err;
     log("warn", "oam-hosted server failed to boot; downgrading to node for this session", {
       namespace: config.namespace,
       oamVersion: attempt.oamVersion,
       category: err.category,
       error: err.message,
     });
-    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, true);
+    // The memo is deliberately NOT written before this respawn. Nothing clears
+    // it for the life of the process, so adding it up front pins the namespace
+    // to node even when the node attempt fails IDENTICALLY -- and an identical
+    // failure is evidence oam was never the cause (a server missing
+    // GITHUB_TOKEN fails install_failure on both runtimes). server.ts's
+    // maybeElicitAndRetry then supplies the credential and re-connects
+    // IN-PROCESS: that retry, and every later reconnect, would run on node
+    // while doctor still reports "oam". The respawn itself does not need the
+    // memo -- it passes disableOamRewrite = true, which bypasses the gate
+    // directly.
+    try {
+      const connection = await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, true);
+      // node booted where oam did not: oam IS implicated, so make it stick.
+      oamDowngradedNamespaces.add(config.namespace);
+      return connection;
+    } catch (nodeErr) {
+      // A DIFFERENT ActivationError category still points at something
+      // oam-specific, so keep the cost saving for those. The SAME category --
+      // or anything not classifiable as an ActivationError at all -- leaves the
+      // memo untouched so a later connect may try oam again: one wasted oam
+      // boot is far cheaper than silently disabling oam hosting for the rest of
+      // the process on evidence that never implicated it.
+      if (nodeErr instanceof ActivationError && nodeErr.category !== err.category) {
+        oamDowngradedNamespaces.add(config.namespace);
+      } else {
+        log("warn", "node respawn also failed; not pinning this server to node (oam was likely not the cause)", {
+          namespace: config.namespace,
+          category: err.category,
+          error: nodeErr instanceof Error ? nodeErr.message : String(nodeErr),
+        });
+      }
+      throw nodeErr;
+    }
   }
 }
 
@@ -350,38 +414,65 @@ async function connectToUpstreamOnce(
       YAW_MCP_VAULT_PASSPHRASE: _excludedVaultPassphrase,
       ...parentEnv
     } = process.env;
-    // Rewrite `uv`/`uvx` to our managed binary when the user doesn't
-    // have one on PATH. No-op for every other command. Any failure
-    // here (unsupported platform, download/checksum failure) bubbles
-    // out and is caught by the ActivationError handler below — the
-    // stderr tail will be empty, so we fall through to the
-    // categorizeSpawnError path with the actual error message.
-    let resolved = await resolveUvSpawn(config.command, config.args ?? []);
-    // Host on the oam runtime when this server opted in (config.runtime ===
-    // "oam") or the config-level default says so (YAW_MCP_DEFAULT_RUNTIME /
-    // bundles.json `defaultRuntime`) -- per-server "node" stays an escape
-    // hatch. Applied AFTER resolveUvSpawn so uv/uvx stay on their managed
-    // binary; resolveOamSpawn only rewrites node/npx and otherwise (incl. when
-    // oam is absent or below min version) returns the command unchanged -- a
-    // pure optimization. disableOamRewrite is the boot-probe downgrade path:
-    // the wrapper re-runs this function once with the rewrite suppressed so
-    // the ORIGINAL node/npx command spawns.
-    // `optedIn` is the difference between "the user asked for oam" and "oam is
-    // simply the default now". Both spawn on oam when it is available, but only
-    // the former warrants a warning when it isn't -- see default-runtime.ts.
-    const configured = config.runtime ?? (await defaultRuntime());
-    const optedIn = configured !== null;
-    const effectiveRuntime = configured ?? "oam";
-    if (effectiveRuntime === "oam" && !disableOamRewrite && !oamDowngradedNamespaces.has(config.namespace)) {
-      // Awaited since issue #91: the oam probe is async so a wedged oam binary
-      // cannot block the event loop here. The probe result is cached, so only
-      // the first connect of the process actually waits on it.
-      const rewritten = await resolveOamSpawn(resolved.command, resolved.args, optedIn);
-      if (rewritten.command !== resolved.command) {
-        attempt.oamRewritten = true;
-        attempt.oamVersion = (await probeOam()).version;
-        resolved = rewritten;
+    // Resolve the launch command: `uv`/`uvx` to our managed binary, then
+    // node/npx onto the oam runtime. BOTH resolvers can throw (unsupported
+    // platform, download/checksum failure, a wedged oam binary), and the
+    // try/catch further down wraps client.connect() ONLY -- so classify and
+    // wrap here. Without this the failure escapes connectToUpstreamOnce as a
+    // bare Error: no category, no stderr tail, and none of the
+    // `→ Fix in ~/.yaw-mcp/bundles.json` pointer every other local spawn
+    // failure carries (server.ts's activation handler adds nothing on the
+    // raw-Error branch).
+    let resolved: { command: string; args: string[] };
+    try {
+      resolved = await resolveUvSpawn(config.command, config.args ?? []);
+      // Host on the oam runtime when this server opted in (config.runtime ===
+      // "oam") or the config-level default says so (YAW_MCP_DEFAULT_RUNTIME /
+      // bundles.json `defaultRuntime`) -- per-server "node" stays an escape
+      // hatch. Applied AFTER resolveUvSpawn so uv/uvx stay on their managed
+      // binary; resolveOamSpawn only rewrites node/npx and otherwise (incl. when
+      // oam is absent or below min version) returns the command unchanged -- a
+      // pure optimization. disableOamRewrite is the boot-probe downgrade path:
+      // the wrapper re-runs this function once with the rewrite suppressed so
+      // the ORIGINAL node/npx command spawns.
+      // `optedIn` is the difference between "the user asked for oam" and "oam is
+      // simply the default now". Both spawn on oam when it is available, but only
+      // the former warrants a warning when it isn't -- see default-runtime.ts.
+      //
+      // DEFAULT-ON, and that is load-bearing: `configured ?? "oam"` means an
+      // UNSET runtime hosts on oam, so on any machine with a recent-enough oam
+      // installed EVERY node/npx sidecar runs on oam. There is no
+      // package-compat gate or allowlist anywhere in this codebase, and the
+      // only recovery is BOOT-scoped -- the downgrade in connectToUpstream
+      // fires on an ActivationError during connect or the initial capability
+      // fetch. A sidecar that boots clean on oam and breaks only later (a
+      // bundled browser that fails when a tool call launches it, a native addon
+      // loaded lazily) gets no automatic fallback: every reconnect re-hosts it
+      // on oam until someone sets `runtime: "node"` for that server in
+      // ~/.yaw-mcp/bundles.json or flips the config-level default.
+      const configured = config.runtime ?? (await defaultRuntime());
+      const optedIn = configured !== null;
+      const effectiveRuntime = configured ?? "oam";
+      if (effectiveRuntime === "oam" && !disableOamRewrite && !oamDowngradedNamespaces.has(config.namespace)) {
+        // Awaited since issue #91: the oam probe is async so a wedged oam binary
+        // cannot block the event loop here. The probe result is cached, so only
+        // the first connect of the process actually waits on it.
+        const rewritten = await resolveOamSpawn(resolved.command, resolved.args, optedIn);
+        if (rewritten.command !== resolved.command) {
+          attempt.oamRewriteApplied = true;
+          attempt.oamVersion = (await probeOam()).version;
+          resolved = rewritten;
+        }
       }
+    } catch (err) {
+      if (err instanceof ActivationError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new ActivationError(
+        withConfigPointer(`Server "${config.namespace}" could not resolve its launch command. ${message}`, config),
+        categorizeSpawnError(err),
+        undefined,
+        err,
+      );
     }
 
     // Resolve ${secret:NAME} references in the server's env against the
@@ -485,13 +576,7 @@ async function connectToUpstreamOnce(
       }
     }
 
-    // Point at the config the user can actually edit. This used to append a
-    // dashboard deep-link (#server-<id>); that dashboard is gone and the URL
-    // 404s, so naming the local file and namespace is both accurate and more
-    // actionable -- the LLM can tell the user exactly what to open.
-    if (config.namespace) {
-      message = `${message} → Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
-    }
+    message = withConfigPointer(message, config);
 
     const redactedTail = trimmedStderr ? redactSecretsInOutput(trimmedStderr, resolvedServerEnv) : undefined;
     throw new ActivationError(message, category, redactedTail, err);
@@ -500,7 +585,7 @@ async function connectToUpstreamOnce(
   // Name the runtime that actually won: "oam" (with the probed oam version)
   // when the rewrite applied, an explicit downgrade marker when the boot-probe
   // fallback respawned on node, and nothing extra for plain node spawns.
-  const runtimeFields = attempt.oamRewritten
+  const runtimeFields = attempt.oamRewriteApplied
     ? disableOamRewrite
       ? { runtime: "node", downgradedFromOam: true }
       : { runtime: "oam", oamVersion: attempt.oamVersion }
@@ -581,10 +666,19 @@ async function connectToUpstreamOnce(
         });
         return toolsChain;
       });
+      // throwOnError on all three refreshes: a failed fetch must leave the
+      // PREVIOUS inventory standing. Without it the resources/prompts fetchers
+      // return [] on any transport error or LIST_TIMEOUT, so one blip mid-
+      // session assigned [] here, rebuilt routes off it, and made every
+      // resource/prompt of a healthy server vanish from the client until some
+      // future list_changed that may never arrive. The assignment is inside
+      // the try precisely so the throw skips both it and onListChanged --
+      // matching what the tools branch already gets for free from
+      // fetchToolsFromUpstream's rethrow.
       client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
         resourcesChain = resourcesChain.then(async () => {
           try {
-            connection.resources = await fetchResourcesFromUpstream(client, config.namespace);
+            connection.resources = await fetchResourcesFromUpstream(client, config.namespace, { throwOnError: true });
             onListChanged(config.namespace);
           } catch (err: any) {
             log("warn", "Failed to refresh resources from upstream", {
@@ -598,7 +692,7 @@ async function connectToUpstreamOnce(
       client.setNotificationHandler(PromptListChangedNotificationSchema, () => {
         promptsChain = promptsChain.then(async () => {
           try {
-            connection.prompts = await fetchPromptsFromUpstream(client, config.namespace);
+            connection.prompts = await fetchPromptsFromUpstream(client, config.namespace, { throwOnError: true });
             onListChanged(config.namespace);
           } catch (err: any) {
             log("warn", "Failed to refresh prompts from upstream", {
@@ -633,7 +727,28 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
   log("info", "Disconnected from upstream", { namespace: connection.config.namespace });
 }
 
-export async function fetchResourcesFromUpstream(client: Client, namespace: string): Promise<UpstreamResourceDef[]> {
+/** How a resources/prompts list failure is reported.
+ *
+ *  Default (initial connect): SWALLOW and return [] -- a server that simply
+ *  doesn't implement the capability answers with an error, and that is not a
+ *  boot failure.
+ *
+ *  `throwOnError` (the list_changed refresh path): THROW instead, so the
+ *  caller can leave the previous inventory in place. Swallowing on refresh
+ *  meant one transient transport error or LIST_TIMEOUT replaced a live
+ *  inventory with [] and silently un-published every resource/prompt the
+ *  client had. The tools fetcher is already immune because it rethrows; this
+ *  flag is how the other two opt into the same protection without changing
+ *  what "unsupported capability" means at connect time. */
+export interface FetchListOptions {
+  throwOnError?: boolean;
+}
+
+export async function fetchResourcesFromUpstream(
+  client: Client,
+  namespace: string,
+  opts: FetchListOptions = {},
+): Promise<UpstreamResourceDef[]> {
   try {
     const result = await client.listResources({}, { timeout: LIST_TIMEOUT });
     const raw = result.resources ?? [];
@@ -651,13 +766,19 @@ export async function fetchResourcesFromUpstream(client: Client, namespace: stri
       description: r.description,
       mimeType: r.mimeType,
     }));
-  } catch {
-    // Server may not support resources — that's fine
-    return [];
+  } catch (err) {
+    // Server may not support resources — that's fine at connect time.
+    if (!opts.throwOnError) return [];
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`"${namespace}" returned an error on resources/list: ${message}`);
   }
 }
 
-export async function fetchPromptsFromUpstream(client: Client, namespace: string): Promise<UpstreamPromptDef[]> {
+export async function fetchPromptsFromUpstream(
+  client: Client,
+  namespace: string,
+  opts: FetchListOptions = {},
+): Promise<UpstreamPromptDef[]> {
   try {
     const result = await client.listPrompts({}, { timeout: LIST_TIMEOUT });
     const raw = result.prompts ?? [];
@@ -674,9 +795,11 @@ export async function fetchPromptsFromUpstream(client: Client, namespace: string
       description: p.description,
       arguments: p.arguments as UpstreamPromptDef["arguments"],
     }));
-  } catch {
-    // Server may not support prompts — that's fine
-    return [];
+  } catch (err) {
+    // Server may not support prompts — that's fine at connect time.
+    if (!opts.throwOnError) return [];
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`"${namespace}" returned an error on prompts/list: ${message}`);
   }
 }
 

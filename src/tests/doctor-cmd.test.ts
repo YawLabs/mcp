@@ -146,6 +146,89 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
   });
 
+  // A BARE oam command is the shape older installs wrote, and the absolute-path
+  // check above cannot see it. It resolves against the CLIENT's PATH, which a
+  // GUI-launched client does not inherit from the shell, so the broker never
+  // starts. install no longer writes it but nothing rewrites existing configs,
+  // which makes doctor the only surface that can report it.
+  it("flags a bare oam launch command as unresolvable for a GUI-launched client", async () => {
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "oam", args: ["run", "--no-check", entryFile] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamNotAbsolute).toBe("oam");
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).toContain("resolves against the client's PATH");
+    // Must NOT read as OK -- an entry that cannot launch is not a healthy one.
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+  });
+
+  it("flags an oam entry file that no longer exists", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const gone = join(synthHome, "gone", "broker.js");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", gone] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamEntryMissing).toBe(gone);
+    expect(cap.text()).toContain("oam cannot fetch it on demand");
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+  });
+
+  it("reports a fully resolvable oam entry as OK", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", entryFile] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamNotAbsolute).toBeNull();
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).toContain("runs on oam");
+  });
+
+  it("names the missing launch command even when a legacy entry is also present", async () => {
+    // Both problems at once used to hit the combined-legacy branch FIRST, so
+    // doctor printed `OK ... legacy "mcp.hosting" entry also present - remove
+    // it` -- telling the user to delete the OTHER entry while the one left
+    // behind was the broken one that cannot start yaw-mcp at all.
+    const gone = join(synthHome, "definitely", "not", "here", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] },
+          "mcp.hosting": { command: "npx" },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(userScope?.launchCommandMissing).toBe(gone);
+    expect(userScope?.hasLegacyEntry).toBe(true);
+    const txt = cap.text();
+    expect(txt).not.toMatch(/Claude Code \(user\): OK/);
+    expect(txt).toContain("launch command does not exist");
+    // The legacy entry is still named -- appended to the broken-launch line,
+    // not swallowed by it.
+    expect(txt).toMatch(/legacy "mcp\.hosting" entry also present/);
+  });
+
   it("does not flag a PATH-resolved command it cannot verify", async () => {
     // "npx"/"cmd" are resolved via PATH at spawn time; treating an unfound
     // bare name as broken would flag every healthy default install.
@@ -388,6 +471,22 @@ describe("scanShellHistoryForShadows", () => {
     expect(scanShellHistoryForShadows({ home: synthHome, env: {} })).toEqual([]);
   });
 
+  it("reads only the tail of a history file larger than the byte window", () => {
+    // The scan used to readFileSync the WHOLE archive and materialise every
+    // line before slicing the last 500 -- roughly 2x the file size transient,
+    // per source, per doctor run, and an ERR_STRING_TOO_LONG throw (swallowed,
+    // so the section vanished with no diagnostic) on a multi-hundred-MB
+    // history. ~390 KB here is comfortably past the 256 KB tail window.
+    const pad = `ls -la ${"a".repeat(58)}\n`.repeat(6000);
+    writeFileSync(join(synthHome, ".bash_history"), `npm audit\n${pad}tailscale status\n`);
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    // Inside the window: still counted, and the mid-line start of the window
+    // does not corrupt the lines that follow it.
+    expect(hits.find((h) => h.cli === "tailscale")?.count).toBe(1);
+    // Far outside it: never read.
+    expect(hits.find((h) => h.cli === "npm")).toBeUndefined();
+  });
+
   it("sorts hits by count descending", () => {
     writeFileSync(
       join(synthHome, ".bash_history"),
@@ -490,6 +589,29 @@ describe("runDoctor — STATE section", () => {
     expect(txt).toMatch(/disabled via YAW_MCP_DISABLE_PERSISTENCE/);
     expect(txt).not.toMatch(/learning entries/);
     expect(txt).not.toMatch(/last saved/);
+  });
+
+  it("honours the shared predicate's other truthy spellings on the INJECTED env", async () => {
+    // Doctor reads opts.env, not process.env, and the predicate it shares with
+    // server.ts / reset-learning accepts a case-insensitive "true" as well as
+    // "1". Pinned here because the shared predicate is the only thing keeping
+    // doctor from reporting persistence ON while the broker has it OFF.
+    delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", STATE_FILENAME),
+      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning: {}, packHistory: [] }),
+    );
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "TRUE" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    expect(cap.text()).toMatch(/disabled via YAW_MCP_DISABLE_PERSISTENCE/);
   });
 });
 
@@ -709,6 +831,46 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const txt = cap.text();
     expect(txt).toContain("UPGRADE AVAILABLE");
     expect(txt).toContain("yaw-mcp upgrade --run");
+  });
+
+  // The registryFetch hook is now the `override` seam of upgrade-cmd's shared
+  // fetchLatestVersion rather than a doctor-local wrapper. These two pin the
+  // behaviour doctor needs from that seam, so a future change to the shared
+  // probe cannot quietly take it away.
+  it("a registryFetch that REJECTS leaves doctor healthy with no upgrade banner", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => {
+        throw new Error("ENOTFOUND registry.npmjs.org");
+      },
+    });
+    // A freshness check that depends on an external service must never move the
+    // exit code or abort the other ~20 local checks.
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toContain("UPGRADE AVAILABLE");
+  });
+
+  it("a registryFetch returning null is treated as 'unknown', not as 'up to date'", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      registryFetch: async () => null,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toContain("UPGRADE AVAILABLE");
   });
 
   it("dev-checkout / unknown argvPath shows the plan command (not 'upgrade --run')", async () => {
@@ -1168,9 +1330,57 @@ describe("runDoctor — --json", () => {
 // ---------------------------------------------------------------------------
 
 describe("runDoctor — OAM RUNTIME section", () => {
-  const oamOk = () => ({ bin: "/usr/local/bin/oam", version: "0.6.0", belowMin: false });
-  const oamMissing = () => ({ bin: null, version: null, belowMin: false });
-  const oamOld = () => ({ bin: null, version: "0.5.0", belowMin: true });
+  // A USABLE oam. The version is DERIVED from MIN_OAM_VERSION, never a
+  // literal: a literal below the floor (this was "0.6.0" against a floor of
+  // "0.8.3") is a shape probeOam can never return -- it would have reported
+  // {bin: null, belowMin: true} -- so every test in here ran against an
+  // impossible probe and asserted on output no user can produce. The floor is
+  // bumped on every oam release by policy, so a literal drifts further every
+  // release with nothing to catch it.
+  const oamOk = () => ({
+    bin: "/usr/local/bin/oam",
+    binPath: "/usr/local/bin/oam",
+    version: MIN_OAM_VERSION,
+    belowMin: false,
+    failure: null,
+    failureDetail: null,
+  });
+  const oamMissing = () => ({
+    bin: null,
+    binPath: null,
+    version: null,
+    belowMin: false,
+    failure: null,
+    failureDetail: null,
+  });
+  const oamOld = () => ({
+    bin: null,
+    binPath: null,
+    version: "0.5.0",
+    belowMin: true,
+    failure: null,
+    failureDetail: null,
+  });
+  // oam IS on disk but `--version` never answered: `bin` is null exactly like
+  // the absent case, and `failure` is the only thing that separates them.
+  const oamWedged = () => ({
+    bin: null,
+    binPath: null,
+    version: null,
+    belowMin: false,
+    failure: "timeout" as const,
+    failureDetail: "oam --version exceeded 3000ms",
+  });
+  // A `--version` that ran and printed no dotted triple. oam IS used to host
+  // sidecars in this state, and the MIN_OAM_VERSION gate never ran.
+  const oamUnknownVersion = () => ({
+    bin: "/usr/local/bin/oam",
+    binPath: "/usr/local/bin/oam",
+    version: null,
+    belowMin: false,
+    failure: null,
+    failureDetail: null,
+  });
 
   function writeLocalBundles(obj: unknown): void {
     writeYawMcpConfig(synthHome, "bundles.json", obj);
@@ -1181,8 +1391,7 @@ describe("runDoctor — OAM RUNTIME section", () => {
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
     const txt = cap.text();
     expect(txt).toContain("OAM RUNTIME");
-    expect(txt).toContain("/usr/local/bin/oam");
-    expect(txt).toContain("v0.6.0");
+    expect(txt).toContain(`/usr/local/bin/oam (v${MIN_OAM_VERSION}, min ${MIN_OAM_VERSION})`);
   });
 
   it("reports not-installed when the probe finds no binary", async () => {
@@ -1244,6 +1453,33 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toMatch(/plain\s+oam\s+oam is the default when installed/);
   });
 
+  it("reports node for launch shapes the oam rewrite refuses, even with a usable oam", async () => {
+    // These are decidable from bundles.json alone -- rewriteForOam returns the
+    // command unchanged on every machine -- so printing "oam" for them was
+    // printing the POLICY decision instead of the spawn. The reason names the
+    // part of the launch that is responsible, not the oam install (which is
+    // fine here and would change nothing).
+    writeLocalBundles({
+      version: 1,
+      servers: [
+        { namespace: "gitspec", name: "Git", command: "npx", args: ["-y", "github:owner/repo"], runtime: "oam" },
+        { namespace: "ranged", name: "Ranged", command: "npx", args: ["-y", "server-memory@^1.2.3"], runtime: "oam" },
+        { namespace: "flagged", name: "Flagged", command: "node", args: ["--inspect", "server.js"], runtime: "oam" },
+        { namespace: "hosted", name: "Hosted", command: "npx", args: ["-y", "server-memory"], runtime: "oam" },
+      ],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+
+    expect(txt).toMatch(/gitspec\s+node\s+.*git\/path target/);
+    expect(txt).toMatch(/ranged\s+node\s+.*\^1\.2\.3/);
+    expect(txt).toMatch(/flagged\s+node\s+.*--inspect/);
+    // The accepted shape in the same file still reports oam, so the gates are
+    // not just a blanket downgrade of every npx server.
+    expect(txt).toMatch(/hosted\s+oam\s+per-server runtime:"oam"/);
+  });
+
   it("points at `sidecars install` when the managed tree was never created", async () => {
     // The empty state is the one most users see, and it is the line that tells
     // them the command exists at all.
@@ -1278,8 +1514,13 @@ describe("runDoctor — OAM RUNTIME section", () => {
 
     expect(txt).toMatch(/@yawlabs\/fetch-mcp\s+0\.3\.6/);
     // A configured package with nothing installed must say so rather than be
-    // omitted -- omission reads as "fine".
-    expect(txt).toMatch(/@yawlabs\/not-installed\s+not installed/);
+    // omitted -- omission reads as "fine". The wording names what was actually
+    // CHECKED: doctor reads the managed tree and nothing else, so it must not
+    // claim the package "resolves from the npx cache" -- a lookup it never
+    // performs, and false in the case that matters (no cache copy either, so
+    // the server stays on npx/node).
+    expect(txt).toMatch(/@yawlabs\/not-installed\s+not in the managed tree/);
+    expect(txt).not.toContain("resolves from the npx cache");
   });
 
   it("mirrors the managed-install block into --json, not just the text report", async () => {
@@ -1377,6 +1618,317 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(parsed.oamRuntime.servers).toHaveLength(1);
     expect(parsed.oamRuntime.servers[0]).toMatchObject({ namespace: "fetch", runtime: "node" });
     expect(parsed.oamRuntime.servers[0].reason).toContain("below min");
+  });
+
+  // A present-but-broken oam (wedged / non-zero exit / not executable) carries
+  // bin:null exactly like an absent one, so doctor used to report "not
+  // installed" for a binary the user has installed -- sending support down the
+  // wrong path while the real cause sat in a raw JSON log line on stderr that
+  // the pasted report never includes.
+  it("reports a present-but-broken oam as unusable, not as missing", async () => {
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamWedged });
+    const txt = cap.text();
+    expect(txt).toContain("installed but UNUSABLE");
+    expect(txt).toContain("did not answer in time");
+    expect(txt).toContain("oam --version exceeded 3000ms");
+    expect(txt).not.toMatch(/binary: {2}not installed/);
+  });
+
+  it("keeps saying not-installed when oam is genuinely absent", async () => {
+    // The other half of the pair above: absence is bin:null WITH failure:null,
+    // and it must keep the wording that tells the user to install oam.
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamMissing });
+    const txt = cap.text();
+    expect(txt).toMatch(/binary: {2}not installed/);
+    expect(txt).not.toContain("UNUSABLE");
+  });
+
+  it("carries the probe failure into --json so the two states are machine-distinguishable", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamWedged,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime).toMatchObject({ binary: null, version: null, failure: "timeout" });
+    expect(parsed.oamRuntime.failureDetail).toContain("exceeded");
+  });
+
+  it("emits failure:null for an absent oam", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamMissing,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime).toMatchObject({ binary: null, failure: null, failureDetail: null });
+  });
+
+  // probeOam gates the MIN_OAM_VERSION floor on a PARSED version, so an
+  // unparseable `--version` is hosted on without ever being checked. The line
+  // has to say that: "(vunknown, min X)" is the same shape as a version that
+  // PASSED the floor, which is the one reading it must not support.
+  it("says the min-version gate never ran when the version is unparseable", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      oamProbe: oamUnknownVersion,
+    });
+    const txt = cap.text();
+    expect(txt).toContain("/usr/local/bin/oam (version unparseable");
+    expect(txt).toContain(`min ${MIN_OAM_VERSION} NOT verified`);
+    // Neither the old fallback nor an empty version may render here.
+    expect(txt).not.toContain("vunknown");
+    expect(txt).not.toContain("(v, min");
+  });
+
+  it("emits binary non-null with version null for an unparseable version (--json)", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamUnknownVersion,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime).toMatchObject({
+      binary: "/usr/local/bin/oam",
+      version: null,
+      belowMin: false,
+      failure: null,
+    });
+  });
+
+  // An `oam` verdict for an npx server is conditional: rewriteForOam returns
+  // the ORIGINAL npx command when the package resolves on disk nowhere, so a
+  // fresh machine that has never fetched the package runs it on node while
+  // this section says oam.
+  it("qualifies an oam verdict for an npx server with the on-disk requirement", async () => {
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+    expect(txt).toMatch(/fetch\s+oam\s+oam is the default when installed/);
+    expect(txt).toContain("note: an npx server reaches oam only once its package is on disk");
+  });
+
+  it("omits the npx caveat when no server on oam is npx-launched", async () => {
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "local", name: "Local", command: "node", args: ["/abs/server.js"] }],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+    expect(txt).toMatch(/local\s+oam\s+/);
+    expect(txt).not.toContain("note: an npx server");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bundles.json diagnostics. loadYawMcpConfig never reads bundles.json, so the
+// ONLY place its parse / schema warnings can reach a user is doctor -- and
+// doctor discarded them. A hand-edited bundles.json that no longer parses made
+// every server disappear while doctor printed "All good. yaw-mcp should start
+// cleanly." and exited 0: byte-identical to a healthy install with no servers,
+// which is the exact ticket doctor exists to answer.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — bundles.json diagnostics", () => {
+  // Absent oam, injected so these cases don't depend on the host.
+  const oamAbsent = () => ({
+    bin: null,
+    binPath: null,
+    version: null,
+    belowMin: false,
+    failure: null,
+    failureDetail: null,
+  });
+
+  function writeRawBundles(root: string, raw: string): string {
+    mkdirSync(join(root, ".yaw-mcp"), { recursive: true });
+    const path = join(root, ".yaw-mcp", "bundles.json");
+    writeFileSync(path, raw, "utf8");
+    return path;
+  }
+
+  it("warns, hits stderr, and exits 2 on a bundles.json that will not parse", async () => {
+    // An UNTERMINATED document, not a trailing comma: jsonc.ts strips trailing
+    // commas, so that shape parses fine and is not a trigger (pinned below).
+    const path = writeRawBundles(synthHome, '{ "version": 1, "servers": [ ');
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+      oamProbe: oamAbsent,
+    });
+    const txt = cap.text();
+    expect(r.exitCode).toBe(2);
+    expect(txt).toContain("WARNINGS");
+    expect(txt).toContain(path);
+    expect(txt).toContain("invalid JSON");
+    expect(txt).not.toContain("All good");
+    // The always-on stream, so a pipeline capturing only stdout still sees it.
+    expect(errs.join("")).toContain("warning: ");
+  });
+
+  it("surfaces the same warning through --json and exits 2", async () => {
+    writeRawBundles(synthHome, '{ "version": 1, "servers": [ ');
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamAbsent,
+    });
+    const parsed = JSON.parse(r.lines[0]) as { warnings: string[]; diagnosis: { exitCode: number; summary: string } };
+    expect(r.exitCode).toBe(2);
+    expect(parsed.warnings.some((w) => w.includes("invalid JSON"))).toBe(true);
+    expect(parsed.diagnosis).toMatchObject({ exitCode: 2, summary: "Warnings need attention." });
+  });
+
+  it("stays clean on a trailing comma, which jsonc strips", async () => {
+    // Pinned because the original report named a trailing comma as the trigger.
+    // It is not one, and a test asserting exit 2 here would enshrine a
+    // behaviour the parser deliberately does not have.
+    writeRawBundles(synthHome, '{ "version": 1, "servers": [], }');
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      oamProbe: oamAbsent,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toContain("All good");
+  });
+
+  it("surfaces a bundles.json schema version this build cannot fully read", async () => {
+    writeRawBundles(synthHome, JSON.stringify({ version: 999, servers: [] }));
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      oamProbe: oamAbsent,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).toContain("is newer than this yaw-mcp");
+  });
+
+  it("surfaces an invalid top-level defaultRuntime", async () => {
+    // A typo here changes EVERY server's runtime, which is why the loader
+    // warns about it -- and why swallowing that warning was expensive.
+    writeRawBundles(synthHome, JSON.stringify({ version: 1, defaultRuntime: "nodejs", servers: [] }));
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      oamProbe: oamAbsent,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).toContain("ignoring invalid 'defaultRuntime'");
+  });
+
+  it("does not double-report an unapproved project bundles.json", async () => {
+    // The loader raises its own SHORT untrusted warning and doctor raises the
+    // DETAILED one. Folding the loader's warnings without deduping printed the
+    // same fact twice, once in each wording.
+    mkdirSync(join(synthCwd, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthCwd, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({ version: 1, servers: [{ namespace: "pwn", name: "Pwn", command: "sh", args: ["-c", "id"] }] }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamAbsent,
+    });
+    const parsed = JSON.parse(r.lines[0]) as { warnings: string[] };
+    expect(r.exitCode).toBe(2);
+    expect(parsed.warnings).toHaveLength(1);
+    expect(parsed.warnings[0]).toContain("untrusted project bundles.json");
+    // The detailed form is the one doctor keeps -- it is the surface that has
+    // room to explain what the gate means.
+    expect(parsed.warnings[0]).toContain("has to be approved first");
+  });
+
+  it("keeps schema diagnostics for a project bundles.json loaded under the env bypass", async () => {
+    // Bypass means the file IS parsed, so its own diagnostics are new
+    // information and must survive the dedupe alongside the bypass warning.
+    mkdirSync(join(synthCwd, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthCwd, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({ version: 1, defaultRuntime: "nodejs", servers: [] }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamAbsent,
+    });
+    const parsed = JSON.parse(r.lines[0]) as { warnings: string[] };
+    expect(r.exitCode).toBe(2);
+    expect(parsed.warnings.some((w) => w.includes("WITHOUT approval"))).toBe(true);
+    expect(parsed.warnings.some((w) => w.includes("ignoring invalid 'defaultRuntime'"))).toBe(true);
   });
 });
 

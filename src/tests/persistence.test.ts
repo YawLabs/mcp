@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LearningStore } from "../learning.js";
 import { PackDetector } from "../pack-detect.js";
 import {
+  DISABLE_PERSISTENCE_ENV,
   emptyState,
+  isPersistenceDisabled,
   isReadableStateVersion,
   loadState,
   STATE_SCHEMA_VERSION,
@@ -514,5 +516,54 @@ describe("persistence.loadState -- a __proto__ learning key", () => {
     // Without the fix `learning` inherits the entry's fields, so a namespace
     // named "dispatched" resolves to a number instead of undefined.
     expect(s.learning.dispatched).toBeUndefined();
+  });
+});
+
+describe("persistence.isPersistenceDisabled", () => {
+  // The canonical YAW_MCP_DISABLE_PERSISTENCE predicate. server.ts, doctor and
+  // reset-learning each carried their own copy until they were folded into
+  // this one; the table is here so a change to the truthiness rule shows up as
+  // one failing suite rather than as doctor reporting persistence ON while the
+  // broker has it OFF.
+  const cases: Array<[string | undefined, boolean]> = [
+    ["1", true],
+    ["true", true],
+    ["TRUE", true],
+    ["True", true],
+    ["", false],
+    [undefined, false],
+    ["0", false],
+    ["false", false],
+    // Deliberately NOT accepted -- the point of one shared predicate is that
+    // "yes"/"on" mean the same thing (nothing) everywhere, not that they get
+    // added to one copy.
+    ["yes", false],
+    ["on", false],
+    ["2", false],
+  ];
+
+  for (const [raw, want] of cases) {
+    it(`${raw === undefined ? "(unset)" : JSON.stringify(raw)} -> ${want}`, () => {
+      const env: NodeJS.ProcessEnv = raw === undefined ? {} : { YAW_MCP_DISABLE_PERSISTENCE: raw };
+      expect(isPersistenceDisabled(env)).toBe(want);
+    });
+  }
+
+  it("defaults to process.env, re-read on every call", () => {
+    // The default argument is evaluated per call, which is what lets server.ts
+    // drop its own process.env copy: a value exported after module load still
+    // counts.
+    delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    expect(isPersistenceDisabled()).toBe(false);
+    process.env.YAW_MCP_DISABLE_PERSISTENCE = "1";
+    try {
+      expect(isPersistenceDisabled()).toBe(true);
+    } finally {
+      delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    }
+  });
+
+  it("names the env var it reads", () => {
+    expect(DISABLE_PERSISTENCE_ENV).toBe("YAW_MCP_DISABLE_PERSISTENCE");
   });
 });

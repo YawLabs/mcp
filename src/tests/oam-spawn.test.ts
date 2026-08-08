@@ -1,15 +1,19 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createProbeCollector,
   isOamCommand,
   isOamLaunch,
+  isRegistrySpec,
   MIN_OAM_VERSION,
+  nodeLaunchKind,
   npmCacheDir,
   npxCacheNodeModules,
+  npxSpec,
+  npxSpecIndex,
   OAM_PROBE_TIMEOUT_MS,
   packageName,
   parseOamVersion,
@@ -17,10 +21,12 @@ import {
   resetNpmCacheDir,
   resetOamBinCache,
   resetPinnedSidecarLog,
+  resolveBinAbsolute,
   resolveNpmEntry,
   resolveOamSpawn,
   resolveStableNpmEntry,
   rewriteForOam,
+  specConstraint,
   winNormalize,
 } from "../oam-spawn.js";
 
@@ -56,6 +62,54 @@ describe("packageName", () => {
   });
 });
 
+// The rewrite can honour exactly one of the three things a spec suffix can be,
+// so the classification decides whether a server hosts on oam at all.
+describe("specConstraint", () => {
+  it("treats no suffix and a dist-tag alike -- newest on disk is the closest answer", () => {
+    expect(specConstraint("@yawlabs/fetch-mcp")).toEqual({ kind: "any" });
+    expect(specConstraint("@yawlabs/fetch-mcp@latest")).toEqual({ kind: "any" });
+    expect(specConstraint("some-mcp@next")).toEqual({ kind: "any" });
+    expect(specConstraint("some-mcp@beta")).toEqual({ kind: "any" });
+    // npm forbids a dist-tag that parses as semver, so a leading letter is the
+    // reliable tell -- and an empty suffix ("pkg@") is not a constraint either.
+    expect(specConstraint("some-mcp@")).toEqual({ kind: "any" });
+  });
+
+  it("reads a single version as an exact pin, prerelease and build included", () => {
+    expect(specConstraint("some-mcp@1.2.3")).toEqual({ kind: "exact", version: "1.2.3" });
+    expect(specConstraint("@yawlabs/fetch-mcp@0.2.0")).toEqual({ kind: "exact", version: "0.2.0" });
+    expect(specConstraint("some-mcp@1.2.3-rc.1")).toEqual({ kind: "exact", version: "1.2.3-rc.1" });
+    expect(specConstraint("some-mcp@1.2.3+build.5")).toEqual({ kind: "exact", version: "1.2.3+build.5" });
+  });
+
+  it("reads a range or partial as unverifiable, NOT as a tag", () => {
+    // `^1.2.3` satisfied by an on-disk 0.9.0 is the same major-version jump the
+    // exact case exists to prevent, and evaluating it properly would mean a
+    // semver range parser this module has no dependency on. So it stays on npx.
+    for (const raw of ["^1.2.3", "~1.2", "1.x", ">=2", "*", "1.2", "v1.2.3", "1.2.3 || 2.0.0"]) {
+      expect(specConstraint(`some-mcp@${raw}`), raw).toEqual({ kind: "range", raw });
+    }
+  });
+});
+
+// Guards the on-disk lookup: a git/path spec is not a package NAME, and
+// resolveNpmEntry would happily look one up as if it were. sidecars-cmd.ts
+// carries a copy for a different purpose (a manifest dependency key); this
+// pins the behaviour so the follow-up dedupe has something to hold onto.
+describe("isRegistrySpec", () => {
+  it("accepts plain registry specs", () => {
+    for (const ok of ["@yawlabs/fetch-mcp", "@yawlabs/fetch-mcp@latest", "cowsay", "server-memory@1.2.3"]) {
+      expect(isRegistrySpec(ok), ok).toBe(true);
+    }
+  });
+
+  it("rejects protocol and path specs, which npx accepts but a name lookup cannot", () => {
+    for (const bad of ["github:owner/repo", "file:../x", "git+ssh://git@host/x.git", "./local-server", "~/x", "../x"]) {
+      expect(isRegistrySpec(bad), bad).toBe(false);
+    }
+  });
+});
+
 describe("parseOamVersion", () => {
   it("extracts x.y.z from the canonical `oam X.Y.Z` output", async () => {
     expect(parseOamVersion("oam 0.6.0\n")).toBe("0.6.0");
@@ -65,6 +119,20 @@ describe("parseOamVersion", () => {
   });
   it("returns null when no version is present", async () => {
     expect(parseOamVersion("oam dev build")).toBeNull();
+  });
+  it("keeps a prerelease suffix, which an x.y.z-only capture silently dropped", async () => {
+    // Dropping it went wrong twice at once: the rc compared EQUAL to a 0.8.3
+    // floor and was hosted, and doctor plus every oamVersion log line named a
+    // release the machine does not have -- so a bug found on the rc gets filed
+    // against the release.
+    expect(parseOamVersion("oam 0.8.3-rc.1\n")).toBe("0.8.3-rc.1");
+    expect(parseOamVersion("oam 0.9.0-dev.7")).toBe("0.9.0-dev.7");
+  });
+  it("keeps build metadata but stops at ordinary trailing punctuation", async () => {
+    expect(parseOamVersion("oam 1.2.3+abc.1")).toBe("1.2.3+abc.1");
+    // The suffix groups require a literal "-"/"+", so a version at the end of a
+    // sentence does not swallow the period.
+    expect(parseOamVersion("built with oam 1.2.3.")).toBe("1.2.3");
   });
 });
 
@@ -79,20 +147,23 @@ describe("probeOam min-version gate", () => {
     expect(probe.belowMin).toBe(false);
   });
 
-  it("rejects the version one patch below the floor", async () => {
-    // MIN_OAM_VERSION now ends in a non-zero patch, so patch-level
-    // comparison decides the boundary for the first time -- a comparator that
-    // only weighed major.minor would pass every other test here while hosting
-    // on a runtime with the fatal request-stream bug the floor exists to
-    // exclude. Derived from the constant so it tracks future bumps.
+  it("rejects the version immediately below the floor, whatever its shape", async () => {
+    // Patch-level comparison decides this boundary whenever MIN_OAM_VERSION
+    // ends in a non-zero patch -- a comparator that only weighed major.minor
+    // would pass every other case here while hosting on a runtime with the
+    // fatal request-stream bug the floor exists to exclude. Derived from the
+    // constant so it tracks future bumps.
+    //
+    // The `.0` branch used to `return` before its first expect, which made the
+    // whole test a green no-op the moment the floor bumped to a `.0` patch --
+    // and the module's own policy says the floor moves on EVERY oam release.
+    // The boundary below a `.0` patch is simply in the previous minor, so
+    // assert THAT instead of asserting nothing: either way the test still
+    // fails if the comparator stops looking past major.minor.
     const [maj, min, patch] = MIN_OAM_VERSION.split(".").map(Number);
-    if (patch === 0) return; // boundary below is a different minor; nothing to assert
-    const justBelow = `${maj}.${min}.${patch - 1}`;
-    const probe = await probeOam(
-      async () => `oam ${justBelow}
-`,
-    );
-    expect(probe.belowMin).toBe(true);
+    const justBelow = patch === 0 ? `${maj}.${min - 1}.99` : `${maj}.${min}.${patch - 1}`;
+    const probe = await probeOam(async () => `oam ${justBelow}\n`);
+    expect(probe.belowMin, `${justBelow} was admitted against a ${MIN_OAM_VERSION} floor`).toBe(true);
     expect(probe.bin).toBeNull();
   });
 
@@ -101,13 +172,51 @@ describe("probeOam min-version gate", () => {
     expect(probe.bin).toBeNull();
     expect(probe.version).toBe("0.5.9");
     expect(probe.belowMin).toBe(true);
+    // Below-min is not a FAILURE: oam ran and answered. Reporting it as one
+    // would send doctor's "present but broken" message for a working install.
+    expect(probe.failure).toBeNull();
+    expect(probe.failureDetail).toBeNull();
   });
 
-  it("treats a failed probe as not installed", async () => {
+  it("ranks a prerelease of the floor BELOW it, and keeps the suffix it reports", async () => {
+    // "oam 0.8.3-rc.1" against a 0.8.3 floor: semver says the prerelease is
+    // lower, and hosting it means debugging against a build nobody else runs.
+    // The reported version has to keep the suffix or this warn reads as a
+    // comparator bug ("0.8.3 is below the minimum 0.8.3").
+    const probe = await probeOam(async () => `oam ${MIN_OAM_VERSION}-rc.1\n`);
+    expect(probe.belowMin).toBe(true);
+    expect(probe.bin).toBeNull();
+    expect(probe.version).toBe(`${MIN_OAM_VERSION}-rc.1`);
+  });
+
+  it("still hosts a prerelease that is above the floor, reporting its full token", async () => {
+    // The gate is "older than the current release", not "not a release". A
+    // source build of the NEXT version is newer than the floor, so it hosts --
+    // and the version it is reported as must be the one that was actually run.
+    const [maj, min] = MIN_OAM_VERSION.split(".").map(Number);
+    const probe = await probeOam(async () => `oam ${maj}.${min + 1}.0-dev.7\n`);
+    expect(probe.belowMin).toBe(false);
+    expect(probe.bin).not.toBeNull();
+    expect(probe.version).toBe(`${maj}.${min + 1}.0-dev.7`);
+  });
+
+  it("treats a probe that ENOENTs as not installed, with no failure recorded", async () => {
+    // ENOENT is ABSENCE, and absence is already conveyed by bin=null. Tagging
+    // it as a failure would make doctor tell every node-only machine that its
+    // oam install is broken.
     const probe = await probeOam(async () => {
-      throw new Error("ENOENT");
+      const e: NodeJS.ErrnoException = new Error("spawn oam ENOENT");
+      e.code = "ENOENT";
+      throw e;
     });
-    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(probe).toEqual({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: null,
+      failureDetail: null,
+    });
   });
 
   it("treats an unparseable version as usable (a working --version proves oam exists)", async () => {
@@ -129,8 +238,230 @@ describe("probeOam min-version gate", () => {
   });
 });
 
+// `bin === null` is the answer to "can we host on oam", and it is the SAME
+// answer for an oam that is absent and an oam that is present and broken. Those
+// send the user to opposite fixes -- install it, versus repair the install you
+// already have -- so the probe records which one happened. Reporting a broken
+// oam as "not installed" is the specific failure these pin.
+describe("probeOam failure classification", () => {
+  beforeEach(() => resetOamBinCache());
+  afterEach(() => resetOamBinCache());
+
+  /** An injected runner that rejects with a given errno-style code. */
+  function rejectWith(code: string | undefined, message: string): () => Promise<string> {
+    return async () => {
+      const err = new Error(message) as Error & { code?: string };
+      if (code !== undefined) err.code = code;
+      throw err;
+    };
+  }
+
+  it("records a timeout as `timeout`, with the message that names the budget", async () => {
+    const probe = await probeOam(rejectWith("ETIMEDOUT", "oam --version exceeded 3000ms"));
+    expect(probe.failure).toBe("timeout");
+    expect(probe.failureDetail).toBe("oam --version exceeded 3000ms");
+    expect(probe.bin).toBeNull();
+    expect(probe.binPath).toBeNull();
+  });
+
+  it("records a non-zero exit as `exit` -- it RAN and failed", async () => {
+    // EOAMEXIT is the tag spawnVersionProbe puts on a non-zero `close`; the
+    // real tagging is covered end to end in oam-probe-options.test.ts, which
+    // drives the actual child. Here it is injected so the CLASSIFIER is what
+    // gets tested, not the spawn.
+    const probe = await probeOam(rejectWith("EOAMEXIT", "oam exited 1"));
+    expect(probe.failure).toBe("exit");
+    expect(probe.failureDetail).toBe("oam exited 1");
+  });
+
+  it("records an EACCES as `spawn` -- it could not be run at all", async () => {
+    // A non-executable file on PATH, or a permission-denied bin. Distinct from
+    // "exit": there is no exit code because nothing ever started.
+    const probe = await probeOam(rejectWith("EACCES", "spawn oam EACCES"));
+    expect(probe.failure).toBe("spawn");
+    expect(probe.failureDetail).toBe("spawn oam EACCES");
+  });
+
+  it("records an untagged rejection as `spawn`, the conservative answer", async () => {
+    // The one thing an unrecognised rejection definitely was NOT is a clean
+    // run, so it must not fall back to "usable" or to "absent".
+    const probe = await probeOam(rejectWith(undefined, "something unexpected"));
+    expect(probe.failure).toBe("spawn");
+    expect(probe.failureDetail).toBe("something unexpected");
+  });
+});
+
+// `bin` is what to SPAWN; `binPath` is what to PERSIST into someone else's
+// config. A GUI-launched MCP client does not inherit the shell PATH that made a
+// bare `oam` work here, so the install path needs the absolute answer -- and it
+// has to get it without a `where`/`which` subprocess, because the whole async
+// probe rewrite exists to keep child processes off the connect path.
+describe("resolveBinAbsolute", () => {
+  /** A temp dir holding the given filenames, cleaned up by the caller. */
+  function binDir(...names: string[]): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "resolvebin-"));
+    for (const name of names) writeFileSync(join(dir, name), "");
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  it("finds a bare name through PATHEXT on Windows, where `oam` is a file called oam.exe", () => {
+    // The case the install path lives on: `oam` spawns because the loader
+    // appends an extension, so a PATH-only search finds nothing on disk.
+    // Fixture case matches PATHEXT deliberately -- existsSync is
+    // case-insensitive on Windows but case-SENSITIVE on a Linux runner.
+    const { dir, cleanup } = binDir("oam.exe");
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: dir, PATHEXT: ".com;.exe" }, "win32")).toBe(
+        winNormalize(join(dir, "oam.exe"), "win32"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("tries the empty extension FIRST, so a name that carries its own is found as written", () => {
+    // Otherwise "oam.exe" is searched as "oam.exe.exe" and misses.
+    const { dir, cleanup } = binDir("oam.exe");
+    try {
+      expect(resolveBinAbsolute("oam.exe", { PATH: dir, PATHEXT: ".exe" }, "win32")).toBe(
+        winNormalize(join(dir, "oam.exe"), "win32"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("strips quotes from a PATH entry -- they are shell syntax, not the directory name", () => {
+    // Windows PATH entries are commonly quoted; keeping the quote makes every
+    // join miss, so an install silently declines to write an oam launch.
+    const { dir, cleanup } = binDir("oam.exe");
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: `"${dir}"`, PATHEXT: ".exe" }, "win32")).toBe(
+        winNormalize(join(dir, "oam.exe"), "win32"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reads a capitalised `Path`, which a sanitized child env can carry instead", () => {
+    // Windows env vars are case-insensitive but process.env is not.
+    const { dir, cleanup } = binDir("oam.exe");
+    try {
+      expect(resolveBinAbsolute("oam", { Path: dir, PATHEXT: ".exe" }, "win32")).not.toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("falls back to the default PATHEXT when the env does not set one", () => {
+    const { dir, cleanup } = binDir("oam.EXE");
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: dir }, "win32")).toBe(winNormalize(join(dir, "oam.EXE"), "win32"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("skips an empty PATH entry instead of resolving it against the cwd", () => {
+    // An empty entry means "cwd" to a shell. It is skipped rather than resolved,
+    // because a path destined for someone else's config must not depend on
+    // whichever directory the broker happened to be started in -- and skipping
+    // it must not abort the rest of the search either.
+    //
+    // Asserted through the win32 delimiter on purpose: the fixture's own temp
+    // path is Windows-shaped on a Windows runner, and a ":" delimiter would
+    // then split it at the drive letter, so the test would be measuring the
+    // fixture rather than the search.
+    const { dir, cleanup } = binDir("oam.exe");
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: `;${dir}`, PATHEXT: ".exe" }, "win32")).toBe(
+        winNormalize(join(dir, "oam.exe"), "win32"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  // POSIX-only for the reason above: a colon-joined PATH cannot carry a
+  // drive-lettered fixture path, so this can only be exercised where absolute
+  // paths are POSIX-shaped. It still runs on the Linux/macOS CI legs.
+  it.skipIf(process.platform === "win32")("splits PATH on ':' off Windows, and needs no PATHEXT", () => {
+    const { dir, cleanup } = binDir("oam");
+    const other = mkdtempSync(join(tmpdir(), "resolvebin-empty-"));
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: `${other}:${dir}` }, "linux")).toBe(join(dir, "oam"));
+    } finally {
+      cleanup();
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts an absolute path that exists and normalizes it for Windows", () => {
+    const { dir, cleanup } = binDir("oam");
+    try {
+      expect(resolveBinAbsolute(join(dir, "oam"), {}, "linux")).toBe(join(dir, "oam"));
+      expect(resolveBinAbsolute("C:/nope/oam.exe", {}, "win32")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns null for an absolute path that is not there", () => {
+    // "do not persist an oam launch" -- a config entry pointing at nothing is
+    // strictly worse than one running on node.
+    expect(resolveBinAbsolute(join(tmpdir(), "definitely-not-here", "oam"), {}, "linux")).toBeNull();
+  });
+
+  it("returns null for a bare name with no PATH at all", () => {
+    expect(resolveBinAbsolute("oam", {}, "linux")).toBeNull();
+    expect(resolveBinAbsolute("oam", { PATH: "" }, "linux")).toBeNull();
+  });
+
+  it("returns null when the name is on no PATH entry", () => {
+    const { dir, cleanup } = binDir("something-else");
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: dir }, "linux")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Exact `command === "node"` equality -- which this replaced -- silently opted
+// out every launch that names its interpreter by path, and an absolute node path
+// is an ordinary MCP config shape (Windows installs, nvm/volta shims) rather
+// than an edge case. Exported because doctor answers the same question in
+// default-runtime.ts and the two must not disagree.
+describe("nodeLaunchKind", () => {
+  it("recognises node and npx by basename, through either separator", () => {
+    expect(nodeLaunchKind("node")).toBe("node");
+    expect(nodeLaunchKind("/usr/local/bin/node")).toBe("node");
+    expect(nodeLaunchKind(String.raw`C:\Program Files\nodejs\node.exe`)).toBe("node");
+    expect(nodeLaunchKind("npx")).toBe("npx");
+    expect(nodeLaunchKind("npx.cmd")).toBe("npx"); // npm ships this shim on Windows
+    expect(nodeLaunchKind("/usr/local/bin/npx")).toBe("npx");
+  });
+
+  it("is not a substring match -- a look-alike launcher is left alone", () => {
+    // `nodemon` restarts a server on file changes; rewriting it to `oam run`
+    // would drop the watcher entirely.
+    expect(nodeLaunchKind("nodemon")).toBeNull();
+    expect(nodeLaunchKind("/usr/bin/nodemon")).toBeNull();
+    expect(nodeLaunchKind("docker")).toBeNull();
+    expect(nodeLaunchKind("uvx")).toBeNull();
+    expect(nodeLaunchKind("oam")).toBeNull();
+  });
+});
+
 describe("rewriteForOam", () => {
   const oam = { oamBin: "oam", resolveEntry: (p: string) => `/pkgs/${p}/dist/index.js` };
+  /** An oam whose only on-disk copy of any package declares `version`, which is
+   *  what a pin has to be checked against. */
+  const oamWithVersion = (version: string) => ({
+    oamBin: "oam",
+    resolveEntry: (p: string, want: string | null) => (want === null || want === version ? `/pkgs/${p}/x.js` : null),
+  });
 
   it("rewrites `npx -y <pkg>@latest` to `oam run <resolved entry>`", async () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/npmjs-mcp@latest"], oam)).toEqual({
@@ -204,6 +535,85 @@ describe("rewriteForOam", () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/not-installed"], { oamBin: "oam", resolveEntry: () => null })).toEqual(
       { command: "npx", args: ["-y", "@yawlabs/not-installed"] },
     );
+  });
+
+  it("rewrites a launch that names its interpreter by absolute path", async () => {
+    // These used to be skipped outright, so oam silently did nothing for them
+    // while README claimed only non-Node launches were left alone.
+    expect(rewriteForOam("/usr/local/bin/node", ["/srv/index.js"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/srv/index.js"],
+    });
+    expect(rewriteForOam(String.raw`C:\Program Files\nodejs\node.exe`, ["/srv/index.js"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/srv/index.js"],
+    });
+    expect(rewriteForOam("npx.cmd", ["-y", "some-mcp"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/pkgs/some-mcp/dist/index.js"],
+    });
+  });
+
+  it("leaves a look-alike launcher untouched", async () => {
+    // Basename matching must not become substring matching: `nodemon` is not
+    // node, and rewriting it to `oam run` would drop the file watcher.
+    expect(rewriteForOam("nodemon", ["/srv/index.js"], oam)).toEqual({
+      command: "nodemon",
+      args: ["/srv/index.js"],
+    });
+  });
+
+  it("hosts a pinned spec only when the resolved copy declares that version", async () => {
+    // `oam run <entry>` runs whatever is at that path, so a version-agnostic
+    // lookup turned `npx -y pkg@0.2.0` into "run whatever copy is newest" -- a
+    // config that pinned against a major jump getting the major jump anyway.
+    expect(rewriteForOam("npx", ["-y", "some-mcp@0.2.0"], oamWithVersion("0.2.0"))).toEqual({
+      command: "oam",
+      args: ["run", "/pkgs/some-mcp/x.js"],
+    });
+  });
+
+  it("stays on npx when no on-disk copy declares the pinned version", async () => {
+    // npx is not a mere fallback here -- it is the only thing that can honour
+    // the pin, because it re-resolves the spec against the registry.
+    // buildLaunchEntry refuses the oam path for the broker's own pinned spec
+    // for exactly this reason (install-targets.ts).
+    expect(rewriteForOam("npx", ["-y", "some-mcp@0.2.0"], oamWithVersion("2.0.0"))).toEqual({
+      command: "npx",
+      args: ["-y", "some-mcp@0.2.0"],
+    });
+  });
+
+  it("stays on npx for a version RANGE, which it cannot evaluate", async () => {
+    // `^1.2.3` is satisfiable by more than one version, and checking it would
+    // mean a semver range parser. Treating it like a tag would let an on-disk
+    // 0.9.0 answer a `^1.2.3` request.
+    expect(rewriteForOam("npx", ["-y", "some-mcp@^1.2.3"], oam)).toEqual({
+      command: "npx",
+      args: ["-y", "some-mcp@^1.2.3"],
+    });
+  });
+
+  it("still hosts a tag spec, where newest-on-disk is the closest answer", async () => {
+    expect(rewriteForOam("npx", ["-y", "some-mcp@next"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/pkgs/some-mcp/dist/index.js"],
+    });
+  });
+
+  it("stays on npx for a git or path spec, which is not a package name", async () => {
+    // `./local-server` fed to the resolver becomes a lookup for a TOP-LEVEL
+    // package called `local-server` (path.join eats the "."), so on a machine
+    // that happens to have one published by that name the server would be
+    // rewritten to run a different program entirely.
+    expect(rewriteForOam("npx", ["-y", "./local-server"], oam)).toEqual({
+      command: "npx",
+      args: ["-y", "./local-server"],
+    });
+    expect(rewriteForOam("npx", ["-y", "github:owner/repo"], oam)).toEqual({
+      command: "npx",
+      args: ["-y", "github:owner/repo"],
+    });
   });
 });
 
@@ -357,6 +767,165 @@ describe("npmCacheDir", () => {
       a.cleanup();
     }
   });
+
+  // Every case below yields a cache dir that does not exist if it is decoded
+  // wrong, after which readdirSync throws, npmCacheNpxNodeModules returns [],
+  // and every npx sidecar quietly stays on npx -- indistinguishable from "no
+  // sidecars installed". `brokerWithNpmrc` interpolates its argument straight
+  // into the `cache=` line, so these pass the RAW value npm would parse.
+
+  it("drops an inline comment rather than capturing it into the path", () => {
+    const dir = join(tmpdir(), "cache-A");
+    const a = brokerWithNpmrc(`${dir} ; scratch dir`);
+    try {
+      expect(npmCacheDir(a.url)).toBe(dir);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("unquotes a quoted value", () => {
+    const dir = join(tmpdir(), "cache A with spaces");
+    const a = brokerWithNpmrc(`"${dir}"`);
+    try {
+      expect(npmCacheDir(a.url)).toBe(dir);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("keeps the backslashes in a Windows path", () => {
+    // The regression a generic unescape causes: npm's ini keeps an escape that
+    // does NOT precede \ ; or # together WITH its backslash, which is the only
+    // reason `cache=C:\Users\me\npm-cache` survives at all. Getting this wrong
+    // yields `C:Usersmenpm-cache`.
+    const a = brokerWithNpmrc(String.raw`C:\Users\test\npm-cache`);
+    try {
+      expect(npmCacheDir(a.url)).toBe(String.raw`C:\Users\test\npm-cache`);
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("treats an escaped semicolon as part of the value, not a comment", () => {
+    const a = brokerWithNpmrc(String.raw`/tmp/a\;b`);
+    try {
+      expect(npmCacheDir(a.url)).toBe("/tmp/a;b");
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("expands a leading ~/ the way npm does for path fields", () => {
+    // `cache=~/.npm-cache` is a natural thing to write, and an unexpanded "~"
+    // is a directory that does not exist on any platform.
+    const a = brokerWithNpmrc("~/.npm-cache");
+    try {
+      expect(npmCacheDir(a.url)).toBe(join(homedir(), ".npm-cache"));
+    } finally {
+      a.cleanup();
+    }
+  });
+
+  it("reads the GLOBAL npmrc in the POSIX <prefix>/lib/node_modules layout", () => {
+    // The global npmrc is `<prefix>/etc/npmrc`, and how far the prefix sits
+    // above the global root differs by platform: Windows is
+    // `<prefix>\node_modules` (one up), POSIX `<prefix>/lib/node_modules` (two
+    // up). Only the one-up form was pushed, so on mac/Linux the candidate was
+    // `$PREFIX/lib/etc/npmrc` -- a path npm never writes. A relocated cache was
+    // then never seen, the resolver fell back to the compiled-in default, and
+    // npmCacheNpxNodeModules scanned an `_npx` npm no longer fills: every
+    // `npx -y <pkg>` sidecar silently stayed on npx.
+    //
+    // Built with path.join, so this exercises the same two-levels-up arithmetic
+    // on a Windows runner as on POSIX -- ownNodeModules only splits on a
+    // `node_modules` path segment and never touches the real filesystem layout.
+    const root = mkdtempSync(join(tmpdir(), "npmcache-posix-"));
+    try {
+      const nm = join(root, "lib", "node_modules");
+      mkdirSync(join(nm, "@yawlabs", "mcp", "dist"), { recursive: true });
+      mkdirSync(join(root, "etc"), { recursive: true });
+      // No builtin npmrc beside npm here: the global file is the only one that
+      // can answer, which is the point.
+      writeFileSync(join(root, "etc", "npmrc"), `cache=${join(tmpdir(), "cache-GLOBAL")}\n`);
+      const url = pathToFileURL(join(nm, "@yawlabs", "mcp", "dist", "index.js")).href;
+      expect(npmCacheDir(url)).toBe(join(tmpdir(), "cache-GLOBAL"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still reads the GLOBAL npmrc in the Windows <prefix>/node_modules layout", () => {
+    // The other half of the pair: adding the POSIX candidate must not displace
+    // the layout that already worked.
+    const root = mkdtempSync(join(tmpdir(), "npmcache-win-"));
+    try {
+      const nm = join(root, "node_modules");
+      mkdirSync(join(nm, "@yawlabs", "mcp", "dist"), { recursive: true });
+      mkdirSync(join(root, "etc"), { recursive: true });
+      writeFileSync(join(root, "etc", "npmrc"), `cache=${join(tmpdir(), "cache-GLOBAL-WIN")}\n`);
+      const url = pathToFileURL(join(nm, "@yawlabs", "mcp", "dist", "index.js")).href;
+      expect(npmCacheDir(url)).toBe(join(tmpdir(), "cache-GLOBAL-WIN"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the global npmrc ahead of the builtin one", () => {
+    // Precedence check: both etc/npmrc candidates are GLOBAL-tier, so adding
+    // the second one must not push either of them BEHIND the builtin. npm's
+    // order is user > global > builtin, and with both files setting `cache` the
+    // global value is the one that must win.
+    const root = mkdtempSync(join(tmpdir(), "npmcache-order-"));
+    try {
+      const nm = join(root, "lib", "node_modules");
+      mkdirSync(join(nm, "@yawlabs", "mcp", "dist"), { recursive: true });
+      mkdirSync(join(nm, "npm"), { recursive: true });
+      mkdirSync(join(root, "etc"), { recursive: true });
+      writeFileSync(join(root, "etc", "npmrc"), `cache=${join(tmpdir(), "cache-GLOBAL")}\n`);
+      writeFileSync(join(nm, "npm", "npmrc"), `cache=${join(tmpdir(), "cache-BUILTIN")}\n`);
+      const url = pathToFileURL(join(nm, "@yawlabs", "mcp", "dist", "index.js")).href;
+      expect(npmCacheDir(url)).toBe(join(tmpdir(), "cache-GLOBAL"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("npxSpecIndex / npxSpec", () => {
+  // One rule, three callers: rewriteForOam plus the two collectors in
+  // sidecars-cmd that PARTITION the same server set into installed/skipped. The
+  // rule used to be written twice more, in a whole-list-filter shape whose argv
+  // half was the 0.74.2 bug (a server's own trailing `--yes` was eaten).
+
+  it("finds the first argument npx does not consume itself", () => {
+    expect(npxSpecIndex(["-y", "@yawlabs/fetch-mcp@latest"])).toBe(1);
+    expect(npxSpecIndex(["@yawlabs/fetch-mcp"])).toBe(0);
+    expect(npxSpecIndex(["--yes", "-y", "pkg"])).toBe(2);
+  });
+
+  it("returns -1 when npx's own flags are all there is", () => {
+    expect(npxSpecIndex([])).toBe(-1);
+    expect(npxSpecIndex(["-y", "--yes"])).toBe(-1);
+  });
+
+  it("does NOT skip a -y that belongs to the server", () => {
+    // The head-scan half of the 0.74.2 fix: -y is npx's only BEFORE the spec.
+    // A whole-list filter agrees on the index here but not on the tail, which
+    // is how the two shapes drifted apart silently.
+    const args = ["-y", "pkg", "--yes", "--flag"];
+    expect(npxSpecIndex(args)).toBe(1);
+    expect(args.slice(npxSpecIndex(args) + 1)).toEqual(["--yes", "--flag"]);
+  });
+
+  it("refuses a leading flag yaw-mcp does not parse", () => {
+    // `npx --package x -- y` and friends: the first survivor is a flag, not a
+    // package name, and treating it as one would install a nonsense dependency.
+    expect(npxSpec(["--package", "x"])).toBeNull();
+    expect(npxSpec(["-y", "-p", "x"])).toBeNull();
+    expect(npxSpec([])).toBeNull();
+    expect(npxSpec(["-y", "pkg", "--verbose"])).toBe("pkg");
+  });
 });
 
 describe("resolveNpmEntry", () => {
@@ -377,10 +946,34 @@ describe("resolveNpmEntry", () => {
     const brokerUrl = pathToFileURL(join(npx, "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
     return { root, npx, brokerUrl, cleanup: () => rmSync(root, { recursive: true, force: true }) };
   }
-  function writePkg(npx: string, pkg: string, json: Record<string, unknown>): string {
-    const dir = join(npx, "bbb", "node_modules", ...pkg.split("/"));
+  /**
+   * Write a package.json AND the file its bin/main points at.
+   *
+   * packageEntry existsSync's the entry it resolves -- a DECLARED entry is not
+   * an entry on disk -- so a fixture that writes only the manifest resolves to
+   * null and every assertion below collapses into "the package was not found",
+   * which is the condition these tests exist to distinguish resolution FROM.
+   * Deriving the path from the json keeps the two in step when a case changes
+   * its bin shape. A manifest with neither bin nor main gets no file, which is
+   * deliberate: that is the exports-only package the fall-through test needs.
+   */
+  function writeManifest(dir: string, json: Record<string, unknown>): void {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "package.json"), JSON.stringify(json));
+    const bin = json.bin;
+    let rel: string | undefined;
+    if (typeof bin === "string") rel = bin;
+    else if (bin && typeof bin === "object") rel = Object.values(bin as Record<string, string>)[0];
+    else if (typeof json.main === "string") rel = json.main;
+    if (rel === undefined) return;
+    const entry = join(dir, rel);
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "");
+  }
+
+  function writePkg(npx: string, pkg: string, json: Record<string, unknown>): string {
+    const dir = join(npx, "bbb", "node_modules", ...pkg.split("/"));
+    writeManifest(dir, json);
     return dir;
   }
 
@@ -468,11 +1061,7 @@ describe("resolveNpmEntry", () => {
     const { root, npx, brokerUrl, cleanup } = fixture();
     const mk = (hash: string, version: string) => {
       const dir = join(npx, hash, "node_modules", "@yawlabs", "fetch-mcp");
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(
-        join(dir, "package.json"),
-        JSON.stringify({ name: "@yawlabs/fetch-mcp", version, bin: { "fetch-mcp": "./dist/index.js" } }),
-      );
+      writeManifest(dir, { name: "@yawlabs/fetch-mcp", version, bin: { "fetch-mcp": "./dist/index.js" } });
       return dir;
     };
     // The newest copy is deliberately placed so it sorts LAST. Directory order
@@ -495,17 +1084,13 @@ describe("resolveNpmEntry", () => {
     const { root, npx, brokerUrl, cleanup } = fixture();
     const managed = join(root, "managed", "node_modules");
     const managedPkg = join(managed, "@yawlabs", "fetch-mcp");
-    mkdirSync(managedPkg, { recursive: true });
-    writeFileSync(
-      join(managedPkg, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.0", bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+    writeManifest(managedPkg, {
+      name: "@yawlabs/fetch-mcp",
+      version: "0.3.0",
+      bin: { "fetch-mcp": "./dist/index.js" },
+    });
     const cached = join(npx, "aaa0", "node_modules", "@yawlabs", "fetch-mcp");
-    mkdirSync(cached, { recursive: true });
-    writeFileSync(
-      join(cached, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "9.9.9", bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+    writeManifest(cached, { name: "@yawlabs/fetch-mcp", version: "9.9.9", bin: { "fetch-mcp": "./dist/index.js" } });
     try {
       expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed)).toBe(
         join(managedPkg, "dist", "index.js"),
@@ -525,21 +1110,14 @@ describe("resolveNpmEntry", () => {
     const { root, npx, cleanup } = fixture();
     const managed = join(root, "managed", "node_modules");
     const managedPkg = join(managed, "@yawlabs", "fetch-mcp");
-    mkdirSync(managedPkg, { recursive: true });
-    writeFileSync(
-      join(managedPkg, "package.json"),
-      JSON.stringify({
-        name: "@yawlabs/fetch-mcp",
-        version: "9.9.9",
-        exports: { ".": { import: "./dist/lib.js" } },
-      }),
-    );
+    // No bin, no main -- so writeManifest deliberately leaves no entry file.
+    writeManifest(managedPkg, {
+      name: "@yawlabs/fetch-mcp",
+      version: "9.9.9",
+      exports: { ".": { import: "./dist/lib.js" } },
+    });
     const cached = join(npx, "aaa0", "node_modules", "@yawlabs", "fetch-mcp");
-    mkdirSync(cached, { recursive: true });
-    writeFileSync(
-      join(cached, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+    writeManifest(cached, { name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } });
     const brokerUrl = pathToFileURL(join(root, "global", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
     try {
       expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed)).toBe(join(cached, "dist", "index.js"));
@@ -587,12 +1165,16 @@ describe("resolveNpmEntry", () => {
   }
 
   function writeResolvablePkg(nodeModules: string, version: string): void {
-    const dir = join(nodeModules, "@yawlabs", "fetch-mcp");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version, bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+    writeManifest(join(nodeModules, "@yawlabs", "fetch-mcp"), {
+      name: "@yawlabs/fetch-mcp",
+      version,
+      bin: { "fetch-mcp": "./dist/index.js" },
+    });
+  }
+
+  /** The entry writeResolvablePkg produces under a given node_modules. */
+  function entryIn(nodeModules: string): string {
+    return join(nodeModules, "@yawlabs", "fetch-mcp", "dist", "index.js");
   }
 
   it("stays quiet about a managed-tree pin, which the user opted into", () => {
@@ -684,20 +1266,140 @@ describe("resolveNpmEntry", () => {
     const { root, npx, cleanup } = fixture();
     const home = join(root, "global", "node_modules");
     const durable = join(home, "@yawlabs", "fetch-mcp");
-    mkdirSync(durable, { recursive: true });
-    writeFileSync(
-      join(durable, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+    writeManifest(durable, { name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } });
     const brokerUrl = pathToFileURL(join(home, "@yawlabs", "mcp", "dist", "index.js")).href;
     const cachedDir = join(npx, "aaa0", "node_modules", "@yawlabs", "fetch-mcp");
-    mkdirSync(cachedDir, { recursive: true });
-    writeFileSync(
-      join(cachedDir, "package.json"),
-      JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "9.9.9", bin: { "fetch-mcp": "./dist/index.js" } }),
-    );
+    writeManifest(cachedDir, {
+      name: "@yawlabs/fetch-mcp",
+      version: "9.9.9",
+      bin: { "fetch-mcp": "./dist/index.js" },
+    });
     try {
       expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(join(durable, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses a declared entry that is not on disk", async () => {
+    // package.json is a MANIFEST, not a file listing. A `files` field that omits
+    // the bin, a partially pruned cache directory, or an interrupted install all
+    // leave a manifest pointing at nothing -- and resolving it anyway guarantees
+    // a failed spawn (`oam run <missing>` exits 1 immediately with
+    // error[OAM-RT0002]), which then burns upstream's one-shot node respawn
+    // where staying on npx cost nothing.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "gone-mcp");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "gone-mcp", bin: "./dist/index.js" }));
+    try {
+      expect(resolveNpmEntry("gone-mcp", brokerUrl, null, null)).toBeNull();
+      // The SAME manifest resolves once the file it names exists, so this fails
+      // when the existence check is deleted rather than passing for some
+      // unrelated reason (a fixture typo would fail both halves).
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist", "index.js"), "");
+      expect(resolveNpmEntry("gone-mcp", brokerUrl, null, null)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("lets a real version displace a present-but-unparseable one", async () => {
+    // compareVersions returns 0 for anything it cannot parse, so an incumbent
+    // whose `version` is non-null but not x.y.z could never BE displaced: the
+    // copy the directory listing happened to surface first won outright, and
+    // the highest-version pick -- the entire reason this loop exists -- was back
+    // to hash order. The old comment here claimed the rule was symmetric; it
+    // only ever held in the one direction.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    writeResolvablePkg(join(npx, "aaa0", "node_modules"), "1.2"); // listed FIRST
+    const good = join(npx, "zzz9", "node_modules");
+    writeResolvablePkg(good, "0.3.6");
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(entryIn(good));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("prefers a release over its own prerelease, not whichever came first", async () => {
+    // "0.4.0" and "0.4.0-rc.1" both truncate to the same triple, so a
+    // triple-only comparator called them equal and left hash order to decide
+    // which build a config saying `@latest` actually ran. The release is placed
+    // LAST here, so "first hit wins" fails this.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    writeResolvablePkg(join(npx, "aaa0", "node_modules"), "0.4.0-rc.1");
+    const release = join(npx, "zzz9", "node_modules");
+    writeResolvablePkg(release, "0.4.0");
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(entryIn(release));
+    } finally {
+      cleanup();
+    }
+  });
+
+  // A pinned spec (`npx -y pkg@0.2.0`) asks a different question than `@latest`:
+  // not "the best copy on disk" but "this exact build, or nothing". `oam run
+  // <entry>` runs whatever sits at the path, so a version-agnostic lookup
+  // silently answered the first question when the config asked the second.
+
+  it("skips a managed copy at the wrong version and takes the pinned one from the cache", async () => {
+    // The managed tree is authoritative about WHERE, not about WHICH BUILD.
+    // Falling through to a cache copy that does declare the pin honours the
+    // config; taking the managed copy would break it silently.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const managed = join(root, "managed", "node_modules");
+    writeResolvablePkg(managed, "9.9.9");
+    const cached = join(npx, "aaa0", "node_modules");
+    writeResolvablePkg(cached, "0.2.0");
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed, "0.2.0")).toBe(entryIn(cached));
+      // Unpinned, the managed tree still wins outright -- the pin is the only
+      // thing that may override it.
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed)).toBe(entryIn(managed));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns null when nothing on disk declares the pinned version", async () => {
+    // Which keeps npx -- the only thing that can actually fetch the pin.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    writeResolvablePkg(join(npx, "aaa0", "node_modules"), "2.0.0");
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null, "0.2.0")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("accepts a copy that differs from the pin only by build metadata", async () => {
+    // Semver says build metadata carries no precedence, and npm publishes the
+    // same release under it, so refusing here would drop to npx for no reason.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const cached = join(npx, "aaa0", "node_modules");
+    writeResolvablePkg(cached, "1.2.3+build.5");
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null, "1.2.3")).toBe(entryIn(cached));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("never satisfies a pin from a copy that declares no version at all", async () => {
+    // It cannot be shown to be the requested build, and "probably right" is
+    // exactly what the check replaces.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const cached = join(npx, "aaa0", "node_modules");
+    writeManifest(join(cached, "@yawlabs", "fetch-mcp"), {
+      name: "@yawlabs/fetch-mcp",
+      bin: { "fetch-mcp": "./dist/index.js" },
+    });
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null, "1.0.0")).toBeNull();
+      // ...but it is still a perfectly good answer for an unpinned spec.
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(entryIn(cached));
     } finally {
       cleanup();
     }

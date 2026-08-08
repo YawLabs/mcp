@@ -258,13 +258,22 @@ export function buildPromptList(activeConnections: Map<string, UpstreamConnectio
     description?: string;
     arguments?: Array<{ name: string; description?: string; required?: boolean }>;
   }> = [];
+  // Same `seen` guard, and for the same reason, as buildToolList: prompts
+  // flatten to `${namespace}_${prompt}` too, so (ns=`gh`, prompt=`review_pr`)
+  // and (ns=`gh_review`, prompt=`pr`) both render as `gh_review_pr`. MCP
+  // prompt names must be unique; without the check the SAME name is emitted
+  // twice in prompts/list and clients dedupe arbitrarily or error. First
+  // writer wins, and buildPromptRoutes agrees on that winner.
+  const seen = new Set<string>();
   for (const conn of activeConnections.values()) {
     for (const p of conn.prompts) {
+      if (seen.has(p.namespacedName)) continue;
       prompts.push({
         name: p.namespacedName,
         description: p.description,
         arguments: p.arguments,
       });
+      seen.add(p.namespacedName);
     }
   }
   return prompts;
@@ -274,6 +283,24 @@ export function buildPromptRoutes(activeConnections: Map<string, UpstreamConnect
   const routes = new Map<string, PromptRoute>();
   for (const conn of activeConnections.values()) {
     for (const p of conn.prompts) {
+      const existing = routes.get(p.namespacedName);
+      if (existing && existing.namespace !== conn.config.namespace) {
+        // FIRST writer wins, mirroring buildToolRoutes -- and the `continue`
+        // is load-bearing for the same reason. buildPromptList skips a
+        // duplicate namespacedName, so the prompt (description + argument
+        // list) the client was shown belongs to the FIRST upstream. Letting
+        // routes.set fall through made prompts/get last-writer-wins, so a
+        // collision meant the client picked one upstream's prompt and got a
+        // DIFFERENT upstream's -- and a later-activated server could silently
+        // capture an earlier one's traffic. Both surfaces must agree on the
+        // winner; first is the safe direction to agree on.
+        log("warn", "Prompt route collision; keeping the first upstream, ignoring the later one", {
+          prompt: p.namespacedName,
+          keptNamespace: existing.namespace,
+          ignoredNamespace: conn.config.namespace,
+        });
+        continue;
+      }
       routes.set(p.namespacedName, { namespace: conn.config.namespace, originalName: p.name });
     }
   }

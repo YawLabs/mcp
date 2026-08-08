@@ -212,22 +212,109 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
   }
 }
 
-function runCommand(cmd: string, args: string[]): Promise<void> {
+// How long an extract child (tar / powershell Expand-Archive) gets before it is
+// killed and the bootstrap fails.
+//
+// Everything else on this path is already bounded -- onPath's 3s probe,
+// UV_FETCH_TIMEOUT_MS on both undici legs -- and this was the one hole left. A
+// wedged extractor is not hypothetical: tar on a stalled network mount takes no
+// signal at all, and the consequence here is worse than one slow activation.
+// upstream.ts awaits resolveUvSpawn BEFORE it arms its own connect timeout, so
+// a hang inside ensureUv never becomes an ActivationError and never expires;
+// and because ensureUv memoizes, the same never-settling promise is then handed
+// to every later uv/uvx activation for the life of the process. One wedged tar
+// takes out every Python server, permanently.
+//
+// Generous on purpose: this budget is for one archive holding one binary
+// (~20MB), where tar is sub-second and Expand-Archive is a few seconds on a
+// cold PowerShell start. Two minutes is well clear of a slow-but-working
+// machine, so expiry means genuinely stuck rather than merely slow.
+export const UV_EXTRACT_TIMEOUT_MS = 120_000;
+
+/** Cap on retained stderr, so a chatty failure cannot grow unboundedly in a
+ *  message nobody reads past the first lines of. */
+const RUN_COMMAND_MAX_STDERR = 8 * 1024;
+
+/**
+ * Run a child to completion, bounded.
+ *
+ * stdout is "ignore", not "pipe". Nothing here reads it, and an unread pipe is a
+ * hang waiting to happen: an extractor that writes more than the pipe buffer
+ * (tar -v, a PowerShell progress stream) blocks on write and never reaches
+ * 'close'. Letting the OS discard it removes the failure mode rather than
+ * managing it.
+ *
+ * On expiry the child is SIGKILLed -- not the SIGTERM default, which a child
+ * that traps it simply ignores -- and the promise settles independently of
+ * whether the kill lands, because the D-state case this timeout exists for
+ * takes no signal at all. The timer is unref'd so a pending extract cannot hold
+ * the process open at shutdown. Mirrors spawnVersionProbe in oam-spawn.ts.
+ *
+ * `timeoutMs` is a parameter so a test can exercise the deadline without
+ * waiting two minutes.
+ */
+export function runCommand(cmd: string, args: string[], timeoutMs: number = UV_EXTRACT_TIMEOUT_MS): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: false,
-      windowsHide: process.platform === "win32",
-    });
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn();
+    };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(cmd, args, {
+        stdio: ["ignore", "ignore", "pipe"],
+        shell: false,
+        windowsHide: process.platform === "win32",
+      });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
     let stderr = "";
+    // A pipe 'error' with no listener is an uncaught exception that would take
+    // the whole broker down, and the timeout path below destroys this pipe
+    // while a wedged child may still be writing to it.
+    child.stderr?.on("error", () => {});
     child.stderr?.on("data", (c: Buffer) => {
-      stderr += c.toString("utf8");
+      if (stderr.length >= RUN_COMMAND_MAX_STDERR) return;
+      stderr += c.toString("utf8").slice(0, RUN_COMMAND_MAX_STDERR - stderr.length);
     });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`));
-    });
+    child.on("error", (err) => settle(() => reject(err)));
+    child.on("close", (code, signal) =>
+      settle(() => {
+        if (code === 0) resolve();
+        // `code` is null when the child died on a signal; naming the signal is
+        // the only diagnostic that case carries.
+        else reject(new Error(`${cmd} exited ${code ?? signal}: ${stderr.trim()}`));
+      }),
+    );
+
+    timer = setTimeout(() => {
+      settle(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+        // Detach, do not merely kill: a live child with an open pipe keeps the
+        // PARENT's event loop alive, so settling the promise without this
+        // trades an activation hang for a shutdown hang.
+        try {
+          child.stderr?.destroy();
+          child.unref();
+        } catch {
+          /* already gone */
+        }
+        reject(new Error(`${cmd} did not finish within ${timeoutMs}ms`));
+      });
+    }, timeoutMs);
+    timer.unref?.();
   });
 }
 

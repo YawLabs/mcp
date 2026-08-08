@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
-import { parseResetLearningArgs, runResetLearning } from "../reset-learning-cmd.js";
+import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "../reset-learning-cmd.js";
 
 // All tests use an isolated fake home dir so we never touch the real
 // user's ~/.yaw-mcp/state.json. userConfigDir(home) joins home + ".yaw-mcp".
@@ -220,6 +220,68 @@ describe("runResetLearning", () => {
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(false);
     expect(io.out.join("")).toContain("no persisted state to reset");
+  });
+
+  // The delete is a pure filesystem operation with no channel to a live
+  // `yaw-mcp serve`, and serve re-saves its in-memory snapshot without ever
+  // re-reading the file. Deleting state.json while a client is attached
+  // therefore gets silently undone on the next proxied tool call, so the
+  // success report has to say that out loud.
+  describe("running-serve warning", () => {
+    function writeState(): void {
+      writeFileSync(
+        stateFile,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION,
+          savedAt: 1,
+          learning: { gh: { dispatched: 10, succeeded: 4, lastUsedAt: 100 } },
+          packHistory: [],
+        }),
+        "utf8",
+      );
+    }
+
+    it("warns that a running serve process will re-save its in-memory state", async () => {
+      writeState();
+      const io = captureIO();
+      await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+      const combined = io.out.join("\n");
+      expect(combined).toContain("running yaw-mcp serve");
+      expect(combined).toContain("Restart your MCP client");
+      // Counts must still be reported -- the warning is additive.
+      expect(combined).toContain("learning entries removed:     1");
+    });
+
+    it("warns on the unreadable-contents path too", async () => {
+      writeFileSync(stateFile, "{{not json", "utf8");
+      const io = captureIO();
+      await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+      const combined = io.out.join("\n");
+      expect(combined).toContain("contents unreadable");
+      expect(combined).toContain("Restart your MCP client");
+    });
+
+    it("stays silent when there was nothing to remove", async () => {
+      const io = captureIO();
+      await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+      expect(io.out.join("\n")).not.toContain("Restart your MCP client");
+    });
+
+    it("stays silent when persistence is disabled", async () => {
+      writeState();
+      const io = captureIO();
+      await runResetLearning({
+        home,
+        env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(io.out.join("\n")).not.toContain("Restart your MCP client");
+    });
+
+    it("is documented in the usage text, not just the success report", () => {
+      expect(RESET_LEARNING_USAGE).toContain("Restart your MCP client");
+    });
   });
 
   it("preserves the state file contents until unlink succeeds (peek then delete ordering)", async () => {

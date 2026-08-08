@@ -46,14 +46,30 @@ const RX_HTTP_403 = /\b403\b/;
 const RX_HTTP_404 = /\b404\b/;
 const RX_HTTP_429 = /\b429\b/;
 const RX_NO_TOKEN = /no [a-z_]*token (configured|set)/i;
-// "timeout" as a standalone word, anywhere in the message. A leading-space
-// match (the previous shape) missed the single most common client error in
-// the corpus -- axios's "timeout of 5000ms exceeded", which starts the
-// string -- and sent it to upstream_error, where reward.ts treats it as a
-// benign catch-all and grants the call FULL credit. \b on both sides keeps
-// identifier-shaped text (connectTimeoutMs, set_timeout, timeout_ms) from
-// false-positiving, since JS word boundaries treat `_` as a word char.
-const RX_TIMEOUT = /\btimeout\b/;
+// "timeout" as a standalone, UNQUOTED word anywhere in the message. Three
+// constraints, each earning its keep:
+//
+//   - Anywhere, not leading-space-anchored (the previous shape): that missed
+//     the single most common client error in the corpus -- axios's "timeout of
+//     5000ms exceeded", which starts the string -- and sent it to
+//     upstream_error, where reward.ts treats it as a benign catch-all and
+//     grants the call FULL credit.
+//   - \b on both sides: keeps identifier-shaped text (connectTimeoutMs,
+//     set_timeout, timeout_ms) from false-positiving, since JS word boundaries
+//     treat `_` as a word char.
+//   - Not directly quote-delimited: a `timeout` token wrapped in ' " or `
+//     is DATA, not a failure report -- a config key echoed back by a
+//     successful call (`{"timeout":5000,"retries":3}`) or a zod path in a
+//     validation error (`"path":["timeout"]`). classifyError runs the timeout
+//     check FIRST and server.ts scores EVERY proxied result, so a bare-noun
+//     match banked a successful get_config at 0.2 reward instead of 1.0, and
+//     stole -32602 replies from validation_error. Genuine timeouts either say
+//     "timed out" (matched separately below) or use the word in running prose,
+//     where it is unquoted. The tradeoff is a quoted error VALUE
+//     (`{"error":"timeout"}`) falling through to upstream_error; that is the
+//     benign direction, and such payloads normally carry "timed out" or -32001
+//     as well.
+const RX_TIMEOUT = /(?<!["'`])\btimeout\b(?!["'`])/;
 
 export function classifyError(text: string | undefined | null): ErrorCategory {
   if (!text) return "upstream_error";
