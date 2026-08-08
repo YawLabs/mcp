@@ -192,6 +192,14 @@ describe("rewriteForOam", () => {
     });
   });
 
+  it("stays on npx when there is no positional at all", async () => {
+    // A hand-edited bundles.json can carry `npx -y` with nothing after it.
+    // findIndex returns -1 there, and the guard has to hold rather than
+    // treating `undefined` as the package name.
+    expect(rewriteForOam("npx", ["-y"], oam)).toEqual({ command: "npx", args: ["-y"] });
+    expect(rewriteForOam("npx", [], oam)).toEqual({ command: "npx", args: [] });
+  });
+
   it("falls back to npx when the package can't be resolved on disk", async () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/not-installed"], { oamBin: "oam", resolveEntry: () => null })).toEqual(
       { command: "npx", args: ["-y", "@yawlabs/not-installed"] },
@@ -631,6 +639,34 @@ describe("resolveNpmEntry", () => {
       expect(note.source, "the broker's own _npx node_modules was called durable").toBe("npx-cache");
       expect(note.refreshWith).toBe("npx -y @yawlabs/fetch-mcp@latest --help");
       expect(note.from).toBe(cacheNodeModules);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("names the cache directory the WINNING copy came from", () => {
+    // `from` is what makes the refresh advice actionable, so naming a cache
+    // dir the entry did not come from is worse than omitting it. bestRoot is
+    // assigned inside the same conditional as best; if the two fall out of
+    // step nothing else notices, because every other test in this file
+    // asserts only the resolved entry path.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const mk = (hash: string, version: string) => {
+      const dir = join(npx, hash, "node_modules");
+      writeResolvablePkg(dir, version);
+      return dir;
+    };
+    // Hashes deliberately unsorted, and none is the broker's own cache ("aaa"),
+    // so the durable loop misses and the version-picking loop actually runs.
+    mk("aaa0", "0.1.0");
+    const newest = mk("zzz9", "0.3.6");
+    mk("mmm5", "0.3.3");
+    try {
+      const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null));
+      expect(note).toBeDefined();
+      expect(note.source).toBe("npx-cache");
+      expect(note.version).toBe("0.3.6");
+      expect(note.from, "reported a cache dir other than the winning copy's").toBe(newest);
     } finally {
       cleanup();
     }

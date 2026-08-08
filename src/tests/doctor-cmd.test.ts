@@ -1320,6 +1320,35 @@ describe("runDoctor — OAM RUNTIME section", () => {
     ]);
   });
 
+  it("emits the managed block in --json even when the tree was never created", async () => {
+    // The common state: `sidecars install` is opt-in, so most users have no
+    // managed tree at all and hasManagedSidecars short-circuits the
+    // per-package reads. That makes this the version of the block most JSON
+    // consumers will actually receive, and it was the one nothing asserted.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamOk,
+    });
+
+    const parsed = JSON.parse(r.lines[0]);
+    // root is reported even with nothing installed, so a consumer never has to
+    // branch on its absence to learn where yaw-mcp looks.
+    expect(parsed.oamRuntime.managed.root).toBe(join(synthHome, ".yaw-mcp", "sidecars"));
+    expect(parsed.oamRuntime.managed.packages).toEqual([{ pkg: "@yawlabs/fetch-mcp", version: null }]);
+  });
+
   it("emits the oamRuntime block on the --json path (mirror of the text section)", async () => {
     writeLocalBundles({
       version: 1,

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -105,6 +105,26 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     // Same process, file now readable: the next call must SEE it rather than
     // serve the null it just returned.
     writeFileSync(file, JSON.stringify({ version: 1, servers: [], defaultRuntime: "node" }));
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+  });
+
+  it("caches a degraded read that still resolved a value", async () => {
+    // The other half of the exemption, and the shape the whole fix is about:
+    // an approved-but-unparseable PROJECT file leaves config null while the
+    // user-global file still supplies the machine-level knob. That IS an
+    // answer, so it must cache rather than re-read on every connect -- the
+    // exemption is for degraded-AND-empty, not for degraded.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    const projectFile = localBundlesPath(join(synthCwd, CONFIG_DIRNAME));
+    writeFileSync(projectFile, "{ not json at all");
+    const { grantTrust } = await import("../trust.js");
+    await grantTrust(projectFile, readFileSync(projectFile), { home: synthHome });
+
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+
+    // Cached: a later change to the global file must NOT be picked up.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
   });
 

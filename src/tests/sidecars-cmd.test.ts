@@ -385,6 +385,31 @@ describe("runSidecarsInstall", () => {
     expect(res.installed[0].version).toBeNull();
   });
 
+  it("succeeds on a PARTIAL install, and says which package did not land", async () => {
+    // Every other case here is all-or-nothing, but the exit code turns on
+    // `missing.length === installed.length` -- so a partial install is the
+    // only input that distinguishes 0 from 1, and an edit to `> 0` would turn
+    // every partial install into a hard failure with nothing to catch it.
+    const base = { type: "local", transport: "stdio", command: "npx" };
+    writeBundles([
+      { ...base, id: "1", name: "F", namespace: "fetch", args: ["-y", "@yawlabs/fetch-mcp@latest"] },
+      { ...base, id: "2", name: "G", namespace: "gone", args: ["-y", "@yawlabs/not-installed@latest"] },
+    ]);
+    // npm succeeds but only one of the two packages materialises.
+    const runNpm = async () => {
+      const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+      return 0;
+    };
+
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {} });
+
+    expect(res.exitCode, "a partial install is not a failure").toBe(0);
+    expect(res.installed.map((i) => i.version)).toEqual(["0.3.6", null]);
+    expect(res.lines.join("\n")).toContain("1 package(s) did not land");
+  });
+
   it("emits the same --json keys on every path", async () => {
     // The three exit paths used to emit three different objects, so a consumer
     // could not read `root` without first working out which path it hit. Pin
