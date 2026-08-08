@@ -16,6 +16,7 @@ import {
   probeOam,
   resetNpmCacheDir,
   resetOamBinCache,
+  resetPinnedSidecarLog,
   resolveNpmEntry,
   resolveOamSpawn,
   resolveStableNpmEntry,
@@ -178,6 +179,25 @@ describe("rewriteForOam", () => {
       command: "npx",
       args: ["-y", "@yawlabs/npmjs-mcp"],
     });
+  });
+
+  it("keeps a server's own --yes, stripping only the flags npx itself consumes", async () => {
+    // The filter used to run over the WHOLE arg list, so a `--yes` meant for
+    // the SERVER was eaten -- the oam launch and the npx fallback then handed
+    // the child different argv, which is the one thing a rewrite billed as
+    // "a pure optimization, never a correctness dependency" must never do.
+    expect(rewriteForOam("npx", ["-y", "some-mcp", "--yes", "--port", "1"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/pkgs/some-mcp/dist/index.js", "--", "--yes", "--port", "1"],
+    });
+  });
+
+  it("stays on npx when there is no positional at all", async () => {
+    // A hand-edited bundles.json can carry `npx -y` with nothing after it.
+    // findIndex returns -1 there, and the guard has to hold rather than
+    // treating `undefined` as the package name.
+    expect(rewriteForOam("npx", ["-y"], oam)).toEqual({ command: "npx", args: ["-y"] });
+    expect(rewriteForOam("npx", [], oam)).toEqual({ command: "npx", args: [] });
   });
 
   it("falls back to npx when the package can't be resolved on disk", async () => {
@@ -523,6 +543,136 @@ describe("resolveNpmEntry", () => {
     const brokerUrl = pathToFileURL(join(root, "global", "node_modules", "@yawlabs", "mcp", "dist", "index.js")).href;
     try {
       expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed)).toBe(join(cached, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  // The pinned-sidecar notice, per SOURCE. The three sources want different
+  // things: the managed tree is a decision the user already made, while an
+  // ambient durable copy and a cache copy are invisible without this line --
+  // and each is refreshed by a different command, so naming the wrong one is
+  // worse than saying nothing.
+
+  /** Pinned-sidecar notices the logger put on stderr while `fn` ran, PARSED,
+   *  and excluding debug.
+   *
+   *  Parsed rather than substring-matched because the envelope is JSON, so a
+   *  Windows path arrives backslash-escaped and no raw `toContain(dir)` would
+   *  ever match on the platform most likely to have one.
+   *
+   *  Debug is filtered EXPLICITLY rather than relied on being suppressed by
+   *  the default LOG_LEVEL: process.env is process-wide and a sibling file
+   *  raises the level to assert the managed notice, so under worker reuse the
+   *  suppression is not guaranteed. Filtering here makes "empty" mean "said
+   *  nothing at info" by construction instead of by scheduling luck. */
+  function captureNotices(fn: () => void): Array<Record<string, unknown>> {
+    resetPinnedSidecarLog();
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    try {
+      fn();
+    } finally {
+      spy.mockRestore();
+    }
+    return chunks
+      .join("")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((e) => String(e.msg ?? "").includes("will not self-update") && e.level !== "debug");
+  }
+
+  function writeResolvablePkg(nodeModules: string, version: string): void {
+    const dir = join(nodeModules, "@yawlabs", "fetch-mcp");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "@yawlabs/fetch-mcp", version, bin: { "fetch-mcp": "./dist/index.js" } }),
+    );
+  }
+
+  it("stays quiet about a managed-tree pin, which the user opted into", () => {
+    // `sidecars install` prints these versions on its way out and doctor
+    // reports them on demand, so an info line per package on every boot only
+    // restates a decision the user already made.
+    const { root, brokerUrl, cleanup } = fixture();
+    const managed = join(root, "managed", "node_modules");
+    writeResolvablePkg(managed, "0.3.0");
+    try {
+      expect(captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, managed))).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reports a durable install with the command that refreshes it", () => {
+    // An ambient global/project node_modules is not something the user aimed
+    // at yaw-mcp, so the pin genuinely is invisible without this.
+    const { root, cleanup } = fixture();
+    const nm = join(root, "global", "node_modules");
+    writeResolvablePkg(nm, "0.1.0");
+    const brokerUrl = pathToFileURL(join(nm, "@yawlabs", "mcp", "dist", "index.js")).href;
+    try {
+      const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
+      expect(note, "a durable hit reported no pin at all").toBeDefined();
+      expect(note.source).toBe("durable");
+      expect(note.refreshWith).toBe("npm install @yawlabs/fetch-mcp@latest");
+      expect(note.version).toBe("0.1.0");
+      // The command alone is not actionable: a durable tree may be global
+      // (needs -g) or project-local, so without the directory the user would
+      // run it in whatever cwd they happen to be in and update nothing.
+      expect(note.from, "no directory, so the refresh command has nowhere to run").toBe(nm);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("calls the broker's OWN node_modules a cache when it sits under _npx", () => {
+    // `npx -y @yawlabs/mcp` puts the broker itself inside the npx cache, so
+    // ownNodeModules hands back a CACHE path -- the common install shape, not
+    // an edge case. Classifying that as durable advertised `npm install`,
+    // which cannot refresh a content-hashed cache directory.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const cacheNodeModules = join(npx, "aaa", "node_modules");
+    writeResolvablePkg(cacheNodeModules, "0.2.0");
+    try {
+      const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
+      expect(note).toBeDefined();
+      expect(note.source, "the broker's own _npx node_modules was called durable").toBe("npx-cache");
+      expect(note.refreshWith).toBe("npx -y @yawlabs/fetch-mcp@latest --help");
+      expect(note.from).toBe(cacheNodeModules);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("names the cache directory the WINNING copy came from", () => {
+    // `from` is what makes the refresh advice actionable, so naming a cache
+    // dir the entry did not come from is worse than omitting it. bestRoot is
+    // assigned inside the same conditional as best; if the two fall out of
+    // step nothing else notices, because every other test in this file
+    // asserts only the resolved entry path.
+    const { root, npx, brokerUrl, cleanup } = fixture();
+    const mk = (hash: string, version: string) => {
+      const dir = join(npx, hash, "node_modules");
+      writeResolvablePkg(dir, version);
+      return dir;
+    };
+    // Hashes deliberately unsorted, and none is the broker's own cache ("aaa"),
+    // so the durable loop misses and the version-picking loop actually runs.
+    mk("aaa0", "0.1.0");
+    const newest = mk("zzz9", "0.3.6");
+    mk("mmm5", "0.3.3");
+    try {
+      const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null));
+      expect(note).toBeDefined();
+      expect(note.source).toBe("npx-cache");
+      expect(note.version).toBe("0.3.6");
+      expect(note.from, "reported a cache dir other than the winning copy's").toBe(newest);
     } finally {
       cleanup();
     }

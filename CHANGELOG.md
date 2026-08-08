@@ -2,6 +2,40 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## Unreleased
+
+**Changed -- the oam floor moves to 0.8.3**
+
+`MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.8.3 is now current. A machine running oam 0.8.2 falls back to node/npx with one warning naming both versions and the command that fixes it (`oam self-update`), and `doctor` reports `installed (v0.8.2) -- below min 0.8.3; IGNORED, servers run on node`. That is the documented trade: an aggressive floor costs a fallback, a lax one silently hosts production sidecars on a runtime nobody else is running.
+
+**Fixed -- `--help` described the opposite of the shipped default**
+
+The `YAW_MCP_DEFAULT_RUNTIME` entry still read `Unset = node (today's default)`. Unset has meant oam-when-installed since 0.74.1; `doctor`, the README and this changelog all already said so, leaving the CLI's own help as the only surface contradicting the feature it documents.
+
+**Fixed -- an oam-hosted npx server could receive different arguments than the npx fallback**
+
+The `-y`/`--yes` filter ran over the whole argument list rather than only the flags npx itself consumes, so a `--yes` belonging to the SERVER was dropped when the launch was rewritten for oam and kept when it was not. Same configuration, different child argv depending on whether oam happened to be installed -- which the rewrite exists specifically never to do.
+
+**Fixed -- a broken `bundles.json` could invert an explicit `defaultRuntime: "node"`**
+
+A file that exists but cannot be parsed produced no value, and that empty answer was cached for the life of the process. Since unset now means oam-when-installed, the cached blank silently flipped a machine that had explicitly opted OUT back onto oam. Only that degraded-and-empty combination is now left uncached; every healthy shape, including "no bundles.json at all", still resolves once and stays cached, so the connect path does not re-read per spawn.
+
+**Fixed -- the version-pinning notice was silent or misleading depending on where the sidecar came from**
+
+Hosting on oam runs a copy from disk, so `@latest` stops re-resolving and the version pins itself. The notice that says so only fired for npx-cache copies -- never for a durable install, and never for the managed tree that `sidecars install` exists to create. It now covers all three, carries the directory the entry was resolved out of, and names the command that actually refreshes THAT copy. The broker's own `node_modules` is correctly treated as a cache when it sits under `_npx`, which is where `npx -y @yawlabs/mcp` puts it; the managed tree logs at debug, since re-running `sidecars install` is a decision the user already made.
+
+**Fixed -- `sidecars install --json` reported no error on a failed install**
+
+When npm exited 0 but no requested package resolved, the command exited 1 while the JSON document still carried `error: null`, so a caller branching on `error` -- the field that document exists to provide -- read a failed install as a clean one.
+
+**Added -- `doctor --json` reports the managed install**
+
+The `oamRuntime` block now carries `managed`, mirroring the text report: the managed directory and the installed version of each configured package. That version is what an oam-hosted sidecar actually runs and nothing else reports it, since `bundles.json` only ever says `@latest`.
+
+**Fixed -- usage output could be truncated when piped**
+
+Thirteen subcommands wrote their usage to stdout and then called `process.exit()`, which force-flushes the event loop and can cut a buffered body short on a slow consumer (`yaw-mcp install --help | less`). They now set the exit code and let Node drain the write, matching what `--help` and the dispatch tail already did.
+
 ## 0.74.1 -- oam becomes the default sidecar runtime
 
 **Changed -- oam hosts the sidecars by default**

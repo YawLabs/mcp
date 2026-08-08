@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -89,6 +89,53 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     expect(await defaultRuntime()).toBe("oam");
     process.env.YAW_MCP_DEFAULT_RUNTIME = "node";
     expect(await defaultRuntime()).toBe("node");
+  });
+
+  it("does not cache a bundles.json that exists but will not parse", async () => {
+    // The cache holds for the process lifetime, and `null` now means
+    // oam-when-installed -- so caching a failed read as "nothing configured"
+    // would silently INVERT an explicit `defaultRuntime: "node"` until the
+    // broker restarts. A degraded read has to stay retryable.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const file = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+    writeFileSync(file, "{ not json at all");
+
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    // Same process, file now readable: the next call must SEE it rather than
+    // serve the null it just returned.
+    writeFileSync(file, JSON.stringify({ version: 1, servers: [], defaultRuntime: "node" }));
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+  });
+
+  it("caches a degraded read that still resolved a value", async () => {
+    // The other half of the exemption, and the shape the whole fix is about:
+    // an approved-but-unparseable PROJECT file leaves config null while the
+    // user-global file still supplies the machine-level knob. That IS an
+    // answer, so it must cache rather than re-read on every connect -- the
+    // exemption is for degraded-AND-empty, not for degraded.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    const projectFile = localBundlesPath(join(synthCwd, CONFIG_DIRNAME));
+    writeFileSync(projectFile, "{ not json at all");
+    const { grantTrust } = await import("../trust.js");
+    await grantTrust(projectFile, readFileSync(projectFile), { home: synthHome });
+
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+
+    // Cached: a later change to the global file must NOT be picked up.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+  });
+
+  it("still caches the healthy no-bundles.json case", async () => {
+    // Only degraded-AND-empty is exempt. "Nothing configured anywhere" is the
+    // common shape and sits on the connect path, so it must not re-read per
+    // spawn -- pin that the exemption did not swallow the cache whole.
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
   });
 });
 
