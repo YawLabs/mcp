@@ -117,6 +117,8 @@ When oam is installed and meets the minimum, yaw-mcp hosts the MCP servers it sp
 
 Only Node-based launches are rewritten. A server whose command is `docker`, `uvx`, or a native binary is left alone, as is an npx package that cannot be found on disk.
 
+Two more npx shapes stay on npx, because npx re-resolves its spec against the registry while `oam run <entry>` just runs whatever sits at the path it is handed. A spec that **constrains the version** keeps npx unless the copy on disk can be shown to satisfy it — an exact pin moves to oam only when the resolved copy declares that same version, and a range or partial (`^1.2.3`, `~1.2`, `1.x`) always keeps npx, since honouring one would mean evaluating semver ranges against the tree. A spec naming a **git or path target** (`npx -y ./local-server`, `github:owner/repo`) keeps npx too: it is not a package name, so there is nothing to look it up as. A plain `@latest`, or no version at all, is the everyday case and does move over.
+
 **One tradeoff worth knowing.** `npx -y <pkg>@latest` re-resolves that tag on every spawn, so those servers update themselves. `oam run <entry>` cannot — oam has no fetch-on-demand, so it runs the copy already on disk, and because npx then stops running for that server, the copy stops being refreshed. The version pins itself until something fetches a newer one. yaw-mcp logs the resolved version once per package at startup so this is visible rather than silent, and picks the newest copy present.
 
 ### Installing the servers durably

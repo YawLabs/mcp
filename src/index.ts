@@ -253,6 +253,11 @@ if (subcommand === "compliance") {
                              from your bundles.json and cache its A-F grade in
                              ~/.yaw-mcp/grades.json (shown in \`servers\` + the
                              Yaw Terminal MCP panel).
+    foundry export           MAINTAINER. Fold the opt-in dispatch harvest
+                             (~/.yaw-mcp/foundry.jsonl, written only while
+                             YAW_MCP_FOUNDRY is on) into the routing-regression
+                             corpus the test gate replays. Needs a local
+                             bundles.json for the server-catalog snapshot.
     help, --help, -h         Show this help.
     --version, -V            Print yaw-mcp version.
 
@@ -273,8 +278,8 @@ if (subcommand === "compliance") {
                                activated in the same call).
     YAW_MCP_AUTO_UPGRADE          Set to \`0\` to disable the background
                                self-upgrade check at server startup (default:
-                               stale global-npm installs are upgraded in the
-                               background).
+                               stale global installs are upgraded in the
+                               background -- npm, pnpm, and bun globals alike).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
     YAW_MCP_DEFAULT_RUNTIME       Default runtime for local node/npx servers
                                (\`oam\` or \`node\`). Servers without a per-
@@ -283,6 +288,10 @@ if (subcommand === "compliance") {
                                bundles.json top-level \`defaultRuntime\`
                                (env wins). Unset = oam when it is installed
                                and meets the minimum version, else node.
+    YAW_MCP_INSTALL_NUDGE         Set to \`1\` to let discover suggest installing
+                               a first-party server for a CLI you use heavily
+                               (default: off; config \`installNudge: true\` is
+                               the other switch -- either one enables it).
     YAW_MCP_TRUST_PROJECT         Set to \`1\` to skip the consent check on a
                                project-local .yaw-mcp/bundles.json and load
                                it unconditionally. FOR CI/AUTOMATION ONLY --
@@ -290,10 +299,30 @@ if (subcommand === "compliance") {
                                arbitrary commands as you. Default: the file
                                must be approved with \`yaw-mcp trust\`.
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
+    YAW_MCP_FOUNDRY               Set to \`1\` to OPT IN to harvesting dispatch
+                               traces to ~/.yaw-mcp/foundry.jsonl for routing
+                               evals (default: off). Only a redacted, SORTED
+                               token bag plus the candidate/chosen namespaces
+                               are written -- never the raw intent -- but
+                               ordinary words survive, so do not enable it on
+                               intents that carry names or other PII.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
     YAW_MCP_BASE_URL              Base URL \`yaw-mcp try\` resolves its links
                                against (default https://yaw.sh/mcp).
+
+  Environment variables without the YAW_MCP_ prefix (they name things yaw-mcp
+  does not own):
+    OAM_BIN                       The oam binary to run when a server is hosted
+                               on the oam runtime. A name resolved against PATH
+                               or an absolute path; set it when oam is installed
+                               somewhere PATH does not reach. Default: \`oam\`
+                               (\`oam.exe\` on Windows).
+    MCP_CONNECT_TIMEOUT           Milliseconds to wait for a server's MCP
+                               handshake (default 15000). This is the FALLBACK
+                               only -- a server's own \`connectTimeoutMs\` in
+                               bundles.json always wins, so one slow server does
+                               not need the global ceiling raised.
 
   Config resolution (highest precedence first) -- for the \`servers\` allow-list
   and \`blocked\` deny-list:

@@ -171,6 +171,10 @@ import { resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock } from "../secrets-vault.js";
+// Mocked uv resolver -- a test makes it THROW to exercise the resolver-failure
+// wrap (a checksum/download failure inside ensureUv reaches connectToUpstream
+// this way).
+import { resolveUvSpawn } from "../uv-bootstrap.js";
 
 // Minimal stand-in for the MCP SDK Client — only the listTools/listResources/
 // listPrompts methods we call. `as any` covers the type shape mismatch.
@@ -807,24 +811,175 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
   });
 
-  it("the downgrade STICKS for the session: later connects skip the oam rewrite", async () => {
-    // Callers (activation retry, auto-reconnect) call connectToUpstream
-    // repeatedly; without the namespace memo they'd re-pay the oam boot
-    // failure on every outer attempt.
+  it("the downgrade STICKS for the session once node proves oam was the cause", async () => {
+    // Callers (activation retry, auto-reconnect, the transient read_tool
+    // connect) call connectToUpstream repeatedly; without the namespace memo
+    // they'd re-pay the oam boot failure on every outer attempt.
     vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      // ONLY the oam-hosted boot fails. node coming up healthy is the evidence
+      // that oam was the cause -- which is what earns the memo.
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
     const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
 
-    // First call: oam attempt fails, downgrade attempt fails too.
-    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect((await connectToUpstream(config)).status).toBe("connected");
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
 
     // Second call for the same namespace: straight to node, single spawn,
     // rewrite never consulted again.
     _sdkBehavior.stdioConstructions = [];
     vi.mocked(resolveOamSpawn).mockClear();
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
+    expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+  });
+
+  it("does NOT pin the namespace to node when the node respawn fails the SAME way", async () => {
+    // An identical failure on both runtimes is evidence oam was never the
+    // cause -- a server missing GITHUB_TOKEN fails the same on node. The memo
+    // is process-wide and nothing clears it, so writing it here would leave
+    // oam hosting off for the rest of the session the moment server.ts's
+    // maybeElicitAndRetry supplies the credential and reconnects IN-PROCESS,
+    // while doctor still reports "oam".
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+
+    // Both attempts fail identically (no stderr, no ENOENT wording -> the same
+    // "unknown" category on each).
+    await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    // The next connect must try oam AGAIN -- no memo was written -- and a
+    // genuine oam-only failure still downgrades cleanly.
+    _sdkBehavior.stdioConstructions = [];
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+    expect((await connectToUpstream(config)).status).toBe("connected");
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+  });
+
+  it("pins the namespace to node when the node respawn fails a DIFFERENT way", async () => {
+    // A different category still points at something oam-specific, so the cost
+    // saving is kept: later connects skip the oam boot entirely.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      // 1st (oam): unclassifiable -> "unknown". 2nd (node): ENOENT -> "spawn_failure".
+      return Promise.reject(new Error(connects === 1 ? "boot failed" : "spawn npx ENOENT"));
+    };
+    const config = makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] });
+
+    await expect(connectToUpstream(config)).rejects.toMatchObject({ category: "spawn_failure" });
+    expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["/usr/bin/oam", "npx"]);
+
+    _sdkBehavior.stdioConstructions = [];
+    vi.mocked(resolveOamSpawn).mockClear();
     await expect(connectToUpstream(config)).rejects.toBeInstanceOf(ActivationError);
     expect(_sdkBehavior.stdioConstructions.map((c) => c.command)).toEqual(["npx"]);
     expect(vi.mocked(resolveOamSpawn)).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime reporting -- the "Connected to upstream" line is how an operator
+// tells WHICH runtime actually won, and the downgrade warn is the only record
+// that a server left oam. Both are pure logging: nothing else in the process
+// notices if the runtimeFields ternary inverts, so without these assertions a
+// swap that reports `runtime: "oam"` for a connection that actually respawned
+// on node passes the whole suite.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream runtime reporting", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.stdioConstructions = [];
+    _sdkBehavior.lastStdioArgs = null;
+    _sdkBehavior.notificationHandlers = [];
+    resetListHooks();
+    vi.mocked(resolveOamSpawn).mockReset();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    resetListHooks();
+    _sdkBehavior.notificationHandlers = [];
+  });
+
+  it("names runtime 'oam' with the probed version when the rewrite applied", async () => {
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+
+    await connectToUpstream(makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] }));
+
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "oam",
+      oamVersion: "0.6.0",
+    });
+  });
+
+  it("names runtime 'node' + downgradedFromOam after the boot-probe downgrade", async () => {
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
+    let connects = 0;
+    _sdkBehavior.clientConnect = () => {
+      connects++;
+      return connects === 1 ? Promise.reject(new Error("oam crashed on boot")) : Promise.resolve();
+    };
+
+    await connectToUpstream(makeLocalConfig({ runtime: "oam", command: "npx", args: ["-y", "x"] }));
+
+    // The warn is the only trace that a server left oam -- pin its fields.
+    expect(vi.mocked(log)).toHaveBeenCalledWith(
+      "warn",
+      "oam-hosted server failed to boot; downgrading to node for this session",
+      {
+        namespace: "test",
+        oamVersion: "0.6.0",
+        category: "unknown",
+        error: expect.stringContaining("oam crashed on boot"),
+      },
+    );
+    // The success line must name the runtime that ACTUALLY won, not the one
+    // that was attempted first.
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+      runtime: "node",
+      downgradedFromOam: true,
+    });
+    expect(vi.mocked(log)).not.toHaveBeenCalledWith(
+      "info",
+      "Connected to upstream",
+      expect.objectContaining({ runtime: "oam" }),
+    );
+  });
+
+  it("adds no runtime keys at all for a plain node spawn", async () => {
+    // oam absent / package unresolvable: resolveOamSpawn hands the command back
+    // untouched, so the connection is node-hosted and the log must not imply a
+    // runtime decision was made.
+    vi.mocked(resolveOamSpawn).mockImplementation(async (command: string, args: string[]) => ({ command, args }));
+
+    await connectToUpstream(makeLocalConfig({ command: "npx", args: ["-y", "x"] }));
+
+    expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Connected to upstream", {
+      name: "Test Server",
+      namespace: "test",
+      type: "local",
+    });
   });
 });
 
@@ -1139,10 +1294,52 @@ describe("connectToUpstream list-changed chains", () => {
     expect(onListChanged).toHaveBeenCalledTimes(1);
   });
 
-  // fetchResourcesFromUpstream / fetchPromptsFromUpstream SWALLOW their errors
-  // and return [], so a throwing onListChanged is the only thing that can reach
-  // those two catch arms -- and it is a real risk: the callback rebuilds routes
-  // in server.ts. The chain has to absorb it rather than wedge every later
+  // A failed REFRESH must leave the previous inventory standing, for all three
+  // categories. The tools branch gets that for free (fetchToolsFromUpstream
+  // rethrows); resources/prompts only get it because the refresh handlers pass
+  // throwOnError. Without it those two fetchers return [] on any transport
+  // error or LIST_TIMEOUT, so one blip mid-session wiped a healthy server's
+  // entire resource/prompt inventory from the client -- silently, until some
+  // future list_changed that may never arrive.
+  for (const category of LIST_CHANGED_CATEGORIES.filter((c) => c.label !== "tools")) {
+    it(`keeps the previous ${category.label} inventory when the refresh fetch fails`, async () => {
+      const onListChanged = vi.fn();
+      const connection = await connectToUpstream(makeLocalConfig(), undefined, onListChanged);
+
+      // Seed a real inventory via one good refresh ...
+      category.install(() => Promise.resolve(category.result("kept")));
+      const handler = handlerFor(category.schema);
+      await handler({ method: category.method });
+      expect(category.read(connection)).toEqual(["kept"]);
+      expect(onListChanged).toHaveBeenCalledTimes(1);
+
+      // ... then a transient failure on the next one.
+      category.install(() => Promise.reject(new Error("transport blip")));
+      await expect(handler({ method: category.method })).resolves.toBeUndefined();
+
+      // Nothing was published: the seeded inventory stands and no route
+      // rebuild fired off a failed fetch.
+      expect(category.read(connection)).toEqual(["kept"]);
+      expect(onListChanged).toHaveBeenCalledTimes(1);
+      expect(
+        stderr.writes.some(
+          (w) => w.includes(`Failed to refresh ${category.label} from upstream`) && w.includes("transport blip"),
+        ),
+      ).toBe(true);
+
+      // The chain survives the failure: the next notification still refreshes.
+      category.install(() => Promise.resolve(category.result("recovered")));
+      await handler({ method: category.method });
+      expect(category.read(connection)).toEqual(["recovered"]);
+      expect(onListChanged).toHaveBeenCalledTimes(2);
+    });
+  }
+
+  // The fetchers still SWALLOW at connect time (a server that doesn't
+  // implement the capability answers with an error, and that is not a boot
+  // failure), so a throwing onListChanged remains a distinct way into those
+  // catch arms -- and it is a real risk: the callback rebuilds routes in
+  // server.ts. The chain has to absorb it rather than wedge every later
   // notification for that category.
   for (const category of LIST_CHANGED_CATEGORIES.filter((c) => c.label !== "tools")) {
     it(`catches a throwing onListChanged without breaking the ${category.label} chain`, async () => {
@@ -1402,6 +1599,27 @@ describe("connectToUpstream activation failure categories", () => {
 
     expect(err.category).toBe("install_failure");
     expect(err.message).toContain(`Server "test" failed to start. stderr: npm ERR! 404 Not Found - @acme/nope`);
+  });
+
+  it("wraps a resolver failure as an ActivationError carrying the config pointer", async () => {
+    // The connect try/catch wraps client.connect() ONLY, so a throw out of
+    // resolveUvSpawn (ensureUv: unsupported platform, download or checksum
+    // failure) or out of the oam machinery used to escape as a bare Error --
+    // no category, no stderr tail, and none of the "Fix in ..." pointer every
+    // other local spawn failure carries. Callers branching on
+    // `err instanceof ActivationError` then treated it as a transport error.
+    vi.mocked(resolveUvSpawn).mockRejectedValueOnce(
+      new Error("uv archive checksum mismatch (expected abc123, got def456)"),
+    );
+
+    const err = await failedConnect(makeLocalConfig({ command: "uvx", args: ["mcp-server-git"] }));
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err.category).toBe("unknown");
+    expect(err.message).toContain("uv archive checksum mismatch (expected abc123, got def456)");
+    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    // The resolver threw before any transport was constructed.
+    expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
   });
 
   it("rejects a local config with no command before anything is spawned", async () => {

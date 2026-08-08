@@ -259,7 +259,8 @@ describe("maybeAutoUpgrade", () => {
 // detectRunningInstallPrefix
 //
 // The function calls realpathSync(argvPath) then walks dirname() up the
-// tree looking for a `<sep>node_modules<sep>` segment. We mock
+// tree looking for a `<sep>node_modules<sep>` segment (a bare node_modules
+// segment -- no `.bin` directory is involved). We mock
 // realpathSync so the tests control exactly what "resolved" path is
 // seen, and build all fixture paths with path.join / sep so the
 // assertions hold on both Windows (\) and POSIX (/) runners.
@@ -275,7 +276,7 @@ import { realpathSync } from "node:fs";
 const mockRealpathSync = vi.mocked(realpathSync);
 
 describe("detectRunningInstallPrefix", () => {
-  it("returns the install prefix when argv[1] is inside a node_modules/.bin/ path", () => {
+  it("returns the install prefix when argv[1] is inside a node_modules tree", () => {
     // e.g. /usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js
     // -> walks up past @yawlabs/mcp/dist, finds node_modules segment
     // -> candidate = /usr/local/lib  (then strips /lib -> /usr/local)
@@ -326,6 +327,10 @@ describe("detectRunningInstallPrefix", () => {
   });
 
   it("returns null when the path has more than 24 segments (safety cap)", () => {
+    // The cap is a bound, not a symlink-loop guard (realpathSync already
+    // resolved symlinks and the `dir !== prev` check terminates the walk). Its
+    // only observable effect is this one: a legitimately deep install resolves
+    // no prefix, so the background upgrade runs without `--prefix`.
     // Build a 26-segment path with no node_modules to exhaust the cap.
     const deepSegments = Array.from({ length: 26 }, (_, i) => `dir${i}`);
     const argv1 = join(sep, ...deepSegments, "index.js");
@@ -391,11 +396,11 @@ describe("runAutoUpgrade: --prefix injection into spawn args", () => {
 // pieces that touch the user's machine at every server start, so they are
 // exercised here against a mocked `node:child_process` / `fetch`.
 //
-// Mocking node:child_process has a second benefit: without it, the
-// --prefix test above really did spawn `npm prefix -g` on the test
-// machine (compareWithNpmPrefix, unlike upgrade-cmd's defaultNpmPrefix,
-// has no `process.env.VITEST` short-circuit) as an unawaited background
-// child.
+// The `npm prefix -g` comparison probe does NOT appear in cp.calls: it now
+// routes through upgrade-cmd's shared npmGlobalPrefix, which short-circuits
+// to null under `process.env.VITEST` so no unit test ever spawns a real npm.
+// Tests that need the probe to answer inject `npmPrefixImpl` instead (see the
+// compareWithNpmPrefix block below).
 // ═══════════════════════════════════════════════════════════════════════
 
 import type { EventEmitter } from "node:events";
@@ -613,7 +618,9 @@ describe("defaultSpawn -- the real background upgrade child", () => {
       fetchLatestImpl: async () => "0.47.8",
     });
 
-    // calls[0] is the `npm prefix -g` comparison probe; calls[1] is the install.
+    // The comparison probe never reaches child_process under vitest, so the
+    // install is the only recorded spawn.
+    expect(cp.calls).toHaveLength(1);
     const install = cp.calls[cp.calls.length - 1];
     const onWin32 = process.platform === "win32";
     // Quoted only where a shell actually parses it. On POSIX the arg goes
@@ -621,6 +628,14 @@ describe("defaultSpawn -- the real background upgrade child", () => {
     const expected = onWin32 ? `"${spaced}"` : spaced;
     expect(install.args).toEqual(["install", "-g", "--prefix", expected, "@yawlabs/mcp@latest"]);
     expect(install.opts.shell).toBe(onWin32);
+    // The structured log field carries the RAW path, never the quoted argv
+    // form: a log field is read by a human and stray quotes read as part of
+    // the path. Only the spawn argv is quoted.
+    expect(mockLog).toHaveBeenCalledWith(
+      "info",
+      expect.stringContaining("upgrading the global install"),
+      expect.objectContaining({ prefix: spaced }),
+    );
   });
 
   it("drops --prefix entirely when the path cannot be safely quoted on win32", async () => {
@@ -661,74 +676,170 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
 
   const stderrText = (): string => (stderrSpy.mock.calls as unknown[][]).map((c) => String(c[0])).join("");
 
-  it("warns on stderr when `npm prefix -g` disagrees with the running-install prefix", async () => {
-    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
+  /** The comparison is fire-and-forget (`void compareWithNpmPrefix(...)`), so
+   *  maybeAutoUpgrade resolves before the probe's continuation writes to
+   *  stderr. Drain the microtask + immediate queues before asserting. */
+  const settle = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
+
+  /** Every case here needs the same three things: a resolvable prefix, an
+   *  injected upgrade spawn (so no real npm install is recorded), and an
+   *  injected `npm prefix -g` answer -- the shared probe short-circuits to null
+   *  under vitest, so the real one can never answer here. */
+  async function runWithProbe(npmPrefixImpl: () => Promise<string | null>, realpath = PREFIXED_REALPATH) {
+    mockRealpathSync.mockReturnValue(realpath);
+    const probe = vi.fn(npmPrefixImpl);
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
       argvPath: GLOBAL_NPM_PATH,
       fetchLatestImpl: async () => "0.47.8",
-      // Inject the upgrade spawn so the only child_process call recorded
-      // here is the comparison probe itself.
       spawnImpl: vi.fn(),
+      npmPrefixImpl: probe,
     });
+    await settle();
+    return probe;
+  }
 
-    expect(cp.calls).toHaveLength(1);
-    expect(cp.calls[0].cmd).toBe("npm");
-    expect(cp.calls[0].args).toEqual(["prefix", "-g"]);
-    // The probe must not inherit the parent's stdout either -- it pipes so
-    // it can read the answer, and ignores stderr.
-    expect(cp.calls[0].opts).toMatchObject({ stdio: ["ignore", "pipe", "ignore"] });
+  it("warns on stderr when `npm prefix -g` disagrees with the running-install prefix", async () => {
+    const other = join(sep, "usr", "local");
+    const probe = await runWithProbe(async () => other);
 
-    const probe = cp.children[0];
-    probe.stdout.emit("data", Buffer.from(`${join(sep, "usr", "local")}\n`));
-    probe.emit("close", 0);
-
+    expect(probe).toHaveBeenCalledTimes(1);
+    // No `npm prefix -g` child: the probe is upgrade-cmd's shared helper, which
+    // never spawns under vitest. The only spawn arm here is injected too.
+    expect(cp.calls).toHaveLength(0);
     expect(stderrText()).toContain("detected running prefix differs");
     expect(stderrText()).toContain(DETECTED_PREFIX);
-    expect(stderrText()).toContain(join(sep, "usr", "local"));
+    expect(stderrText()).toContain(other);
   });
 
   it("stays quiet when the two prefixes agree", async () => {
-    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
-    await maybeAutoUpgrade({
-      currentVersion: "0.47.0",
-      argvPath: GLOBAL_NPM_PATH,
-      fetchLatestImpl: async () => "0.47.8",
-      spawnImpl: vi.fn(),
-    });
-
-    const probe = cp.children[0];
-    probe.stdout.emit("data", Buffer.from(`${DETECTED_PREFIX}\n`));
-    probe.emit("close", 0);
-
+    await runWithProbe(async () => DETECTED_PREFIX);
     expect(stderrText()).not.toContain("detected running prefix differs");
   });
 
-  it("stays quiet (and does not throw) when the probe emits no output or fails to spawn", async () => {
-    mockRealpathSync.mockReturnValue(PREFIXED_REALPATH);
-    await maybeAutoUpgrade({
-      currentVersion: "0.47.0",
-      argvPath: GLOBAL_NPM_PATH,
-      fetchLatestImpl: async () => "0.47.8",
-      spawnImpl: vi.fn(),
-    });
+  it("stays quiet when the probe cannot answer (spawn failure / non-zero exit / 3s timeout)", async () => {
+    // All three failure shapes collapse to null in npmGlobalPrefix, and null
+    // must skip the warning rather than compare against an empty string.
+    await runWithProbe(async () => null);
+    expect(stderrText()).not.toContain("detected running prefix differs");
+    // Blank output is the same non-answer.
+    await runWithProbe(async () => "   ");
+    expect(stderrText()).not.toContain("detected running prefix differs");
+  });
 
-    // No stdout data at all -> npmPrefix is "" -> falsy -> no warning.
-    cp.children[0].emit("close", 1);
+  it("compares the RAW prefix, not the shell-quoted argv form", async () => {
+    // Regression guard for the spaced-username case. The prefix handed to the
+    // spawn is quoted for cmd.exe (`"C:\Users\Jeff Smith\..."`); comparing THAT
+    // against npm's unquoted answer can never match, so every startup on npm's
+    // DEFAULT Windows global prefix warned about a multi-prefix setup the user
+    // does not have. Real assertion on win32; on POSIX quoting is a no-op, so
+    // the case is trivially true there and the test just documents intent.
+    const spaced = join(sep, "Users", "Jeff Smith", "AppData", "Roaming", "npm");
+    const realpath = join(spaced, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+    await runWithProbe(async () => spaced, realpath);
     expect(stderrText()).not.toContain("detected running prefix differs");
 
-    // And an outright spawn failure resolves the probe instead of leaving
-    // an unhandled "error" event on an EventEmitter with no listener.
-    cp.calls.length = 0;
-    cp.children.length = 0;
-    await maybeAutoUpgrade({
-      currentVersion: "0.47.0",
-      argvPath: GLOBAL_NPM_PATH,
-      fetchLatestImpl: async () => "0.47.8",
-      spawnImpl: vi.fn(),
-    });
-    expect(() => cp.children[0].emit("error", new Error("ENOENT"))).not.toThrow();
-    expect(stderrText()).not.toContain("detected running prefix differs");
+    // And when they genuinely differ, the message shows the raw path -- a
+    // diagnostic with stray quotes in it reads as part of the filename.
+    await runWithProbe(async () => join(sep, "opt", "node"), realpath);
+    expect(stderrText()).toContain("detected running prefix differs");
+    expect(stderrText()).toContain(spaced);
+    expect(stderrText()).not.toContain('"');
+  });
+
+  it("treats a case-differing prefix as the SAME prefix on win32 (and as different on POSIX)", async () => {
+    // Windows paths are case-insensitive, so npm reporting a lowercased prefix
+    // is not a multi-prefix setup. POSIX paths are case-sensitive, so there the
+    // difference is real and must still warn.
+    await runWithProbe(async () => DETECTED_PREFIX.toUpperCase());
+    if (process.platform === "win32") {
+      expect(stderrText()).not.toContain("detected running prefix differs");
+    } else {
+      expect(stderrText()).toContain("detected running prefix differs");
+    }
+  });
+
+  it("never probes when the prefix could not be quoted (no --prefix was passed)", async () => {
+    // With the flag dropped, npm resolves its own prefix -- so the warning's
+    // claim ("installing into the running prefix") would be false, and the
+    // probe is skipped entirely rather than emitting a misleading diagnostic.
+    const nasty = join(sep, "Users", 'we"ird%USERNAME%', "AppData", "Roaming", "npm");
+    const probe = await runWithProbe(
+      async () => join(sep, "opt", "node"),
+      join(nasty, "node_modules", "@yawlabs", "mcp", "dist", "index.js"),
+    );
+    if (process.platform === "win32") {
+      expect(probe).not.toHaveBeenCalled();
+      expect(stderrText()).not.toContain("detected running prefix differs");
+    } else {
+      // POSIX has no unquotable path, so the prefix survives and the probe runs.
+      expect(probe).toHaveBeenCalledTimes(1);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stale-install advice for the methods nothing can be spawned for. The log
+// IS the whole user-facing surface here, so the text is the contract: it has
+// to name a command that actually works for that method.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("maybeAutoUpgrade -- advice for the non-spawnable methods", () => {
+  beforeEach(resetSpawnRecorder);
+  afterEach(resetSpawnRecorder);
+
+  /** The single "out of date" info log, asserted to be the only one. */
+  function adviceLog(): [string, string, Record<string, unknown> | undefined] {
+    const infos = mockLog.mock.calls.filter((c) => c[0] === "info" && String(c[1]).includes("out of date"));
+    expect(infos).toHaveLength(1);
+    return infos[0] as [string, string, Record<string, unknown> | undefined];
+  }
+
+  async function adviseFor(argvPath: string): Promise<[string, string, Record<string, unknown> | undefined]> {
+    mockRealpathSync.mockReturnValue(argvPath);
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath, fetchLatestImpl: async () => "0.47.8", spawnImpl });
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(cp.calls).toHaveLength(0);
+    return adviceLog();
+  }
+
+  it("points a local-node-modules install at `upgrade --run`, which really can upgrade it", async () => {
+    // upgrade-cmd builds a runSpec for local-node-modules (npm install in the
+    // tree root), so --run is honest advice here.
+    const [, message, fields] = await adviseFor(LOCAL_NODE_MODULES_PATH);
+    expect(message).toContain("yaw-mcp upgrade --run");
+    // The old wording called a project's node_modules tree a "global".
+    expect(message).not.toContain("global");
+    expect(fields).toMatchObject({ method: "local-node-modules" });
+  });
+
+  it("points an unknown install at plain `upgrade` -- `--run` always exits 2 there", async () => {
+    // runUpgrade leaves runSpec null for unknown, so --run hits the "can't be
+    // upgraded automatically" arm and exits 2. Advertising it was a dead end
+    // (a bunx launch, say: its path has no node_modules segment at all).
+    const [, message, fields] = await adviseFor(UNKNOWN_PATH);
+    expect(message).toContain("yaw-mcp upgrade");
+    // The dead-end instruction is what must be gone: `--run` may only appear as
+    // the thing that CANNOT work, never as the command to type.
+    expect(message).not.toContain("yaw-mcp upgrade --run");
+    expect(message).toContain("can't automate");
+    expect(fields).toMatchObject({ method: "unknown" });
+  });
+
+  it("points a dev-checkout install at plain `upgrade` too (same exit-2 arm)", async () => {
+    const [, message, fields] = await adviseFor("/home/u/yaw-mcp/dist/index.js");
+    expect(message).not.toContain("yaw-mcp upgrade --run");
+    expect(fields).toMatchObject({ method: "dev-checkout" });
+  });
+
+  it("never spawns `npm install -g --prefix <repo>/packages` for a workspace package named `lib`", async () => {
+    // The bare `/lib/node_modules/` marker classified this as global-npm, and
+    // detectRunningInstallPrefix strips the trailing `/lib` -- so the background
+    // child became `npm install -g --prefix <repo>/packages`, writing a global
+    // tree plus bin shims into the user's repo over the workspace-pinned copy.
+    const [, , fields] = await adviseFor("/home/u/repo/packages/lib/node_modules/@yawlabs/mcp/dist/index.js");
+    expect(fields).toMatchObject({ method: "local-node-modules" });
   });
 });
 

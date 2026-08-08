@@ -154,8 +154,18 @@ describe("probeOam default runner", () => {
     await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
     const probe = await pending;
 
-    // Same degraded shape as "oam is not installed" -- callers fall back to node.
-    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    // Same degraded shape as "oam is not installed" -- callers fall back to
+    // node -- EXCEPT for `failure`, which is the whole point of that field: oam
+    // is on disk and wedged, and telling the user it is "not installed" sends
+    // them to install an oam they already have.
+    expect(probe).toEqual({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: "timeout",
+      failureDetail: `oam --version exceeded ${OAM_PROBE_TIMEOUT_MS}ms`,
+    });
     // Best-effort kill still attempted, with the stronger signal.
     expect(killed).toEqual([OAM_PROBE_KILL_SIGNAL]);
   });
@@ -223,43 +233,81 @@ describe("probeOam default runner", () => {
 
     const probe = await probeOam();
 
-    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    // ENOENT is ABSENCE, not a failure: `bin === null` already says everything
+    // there is to say, and tagging it would make doctor report a broken install
+    // on every node-only machine.
+    expect(probe).toEqual({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: null,
+      failureDetail: null,
+    });
     expect(killed, "probe waited for the deadline instead of settling on 'error'").toEqual([]);
   });
 
   it("falls back to node when the probe exits non-zero", async () => {
-    // A broken install that fails `--version`. Same node fallback as absent.
+    // A broken install that fails `--version`. Same node fallback as absent,
+    // but classified as "exit": it RAN, so the fix is to repair the install
+    // rather than to perform one. The EOAMEXIT tag spawnVersionProbe puts on a
+    // non-zero close is what carries that across, and this is the only test
+    // that drives the real tagging (the sibling file injects the code).
     stdoutChunks = [];
     exitCode = 1;
 
     const probe = await probeOam();
 
-    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(probe).toEqual({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: "exit",
+      failureDetail: "oam exited 1",
+    });
     expect(killed).toEqual([]);
   });
 
   it("falls back to node when the child is killed by a signal", async () => {
     // `close` reports code null + a signal here (OOM killer, external kill),
-    // which is the shape the exit-code branch has to survive.
+    // which is the shape the exit-code branch has to survive -- and the signal
+    // NAME is the one diagnostic the message carries, so it must reach
+    // failureDetail rather than degrading to "oam exited null".
     stdoutChunks = [];
     exitCode = null;
     exitSignal = "SIGKILL";
 
     const probe = await probeOam();
 
-    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(probe).toEqual({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: "exit",
+      failureDetail: "oam exited SIGKILL",
+    });
     expect(killed).toEqual([]);
   });
 
   it("degrades to node when spawn itself throws before any listener exists", async () => {
     // OAM_BIN is user-supplied and node rejects some values outright (a NUL
     // byte, say). This is the one reject path that never reaches settle() or
-    // the deadline, so nothing else covers it.
+    // the deadline, so nothing else covers it. Classified "spawn": nothing ran,
+    // so there is no exit code to report.
     spawnThrows = new TypeError("The argument 'file' must be a string without null bytes");
 
     const probe = await probeOam();
 
-    expect(probe).toEqual({ bin: null, version: null, belowMin: false });
+    expect(probe).toEqual({
+      bin: null,
+      binPath: null,
+      version: null,
+      belowMin: false,
+      failure: "spawn",
+      failureDetail: "The argument 'file' must be a string without null bytes",
+    });
   });
 
   it("treats a clean exit with no parseable stdout as a usable oam", async () => {
@@ -275,6 +323,11 @@ describe("probeOam default runner", () => {
     expect(probe.version).toBeNull();
     expect(probe.belowMin).toBe(false);
     expect(probe.bin).toBe(winNormalize("/usr/local/bin/oam"));
+    expect(probe.failure).toBeNull();
+    // SPAWNABLE but not PERSISTABLE: this OAM_BIN does not exist on disk, so
+    // there is no absolute path to write into someone else's config -- and an
+    // entry pointing at nothing is worse than one running on node.
+    expect(probe.binPath).toBeNull();
   });
 
   it("unrefs its deadline timer so a pending probe cannot hold the process open", async () => {

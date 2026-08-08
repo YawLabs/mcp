@@ -27,7 +27,7 @@
 // whenever no token was configured -- i.e. always, once account mode went
 // away. Do not re-introduce a precondition here.
 
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -42,6 +42,7 @@ import {
   type DefaultRuntimeInfo,
   describeDefaultRuntime,
   describeServerRuntime,
+  oamFailureLabel,
   type ServerRuntimeInfo,
 } from "./default-runtime.js";
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
@@ -56,10 +57,29 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
-import { loadLocalBundles, probeProjectTrust, untrustedProjectWarning } from "./local-bundles.js";
-import { isOamLaunch, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
+import {
+  loadLocalBundles,
+  type ProjectTrustProbe,
+  probeProjectTrust,
+  projectFileIsHonoured,
+  untrustedProjectWarning,
+} from "./local-bundles.js";
+import {
+  isOamLaunch,
+  MIN_OAM_VERSION,
+  nodeLaunchKind,
+  type OamProbe,
+  type OamProbeFailure,
+  probeOam,
+} from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
-import { isReadableStateVersion, loadState, STATE_FILENAME, STATE_SCHEMA_VERSION } from "./persistence.js";
+import {
+  isPersistenceDisabled,
+  isReadableStateVersion,
+  loadState,
+  STATE_FILENAME,
+  STATE_SCHEMA_VERSION,
+} from "./persistence.js";
 import { collectSidecarSpecs, hasManagedSidecars, installedVersion, sidecarsRoot } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
@@ -83,20 +103,16 @@ import { selectFlakyNamespaces } from "./usage-hints.js";
  * cause. Any warning takes doctor to exit 2, which is the right signal --
  * the setup genuinely needs a decision from the user.
  */
-async function projectTrustWarning(opts: {
-  cwd: string;
-  home: string;
-  env: NodeJS.ProcessEnv;
-}): Promise<string | null> {
-  const probe = await probeProjectTrust(opts).catch(() => null);
+function projectTrustWarning(probe: ProjectTrustProbe | null): string | null {
   if (!probe || probe.path === null) return null;
   // "none" = no project file at all; "trusted" is the healthy case.
   if (probe.status === "none" || probe.status === "trusted") return null;
   if (probe.status === "unreadable") {
     // Not a consent problem -- the bytes cannot be read at all, so neither
-    // branch below applies. Doctor is the ONLY place this becomes visible:
-    // the loader's own warnings go to the bundles read path, which doctor
-    // does not fold into config.warnings.
+    // branch below applies. The loader raises its own one-line version of
+    // this (`<path>: could not read file (...) -- skipping`); the detailed
+    // form below replaces it, and foldBundleWarnings drops the short one so
+    // the same fact is not printed twice.
     if (probe.pathTrusted === true || probe.bypassed) {
       // Approved-path (or bypassed) unreadable file: the loader stays
       // committed to it, which means ZERO servers from anywhere.
@@ -114,6 +130,32 @@ async function projectTrustWarning(opts: {
   // repeats on every command), and doctor is where the user gets sent to
   // find out what it actually means.
   return untrustedProjectWarning(probe, { detail: true });
+}
+
+/**
+ * The bundles.json loader warnings doctor should fold into `config.warnings`.
+ *
+ * ALL of them, minus the ones projectTrustWarning above already renders in a
+ * better (detailed) form. Folding is what makes a broken bundles.json visible
+ * at all: `loadYawMcpConfig` never reads bundles.json, so a file that fails to
+ * parse used to leave doctor printing "All good. yaw-mcp should start cleanly."
+ * and exiting 0 with zero servers -- the exact ticket doctor exists to answer,
+ * answered wrong. Once folded they reach the WARNINGS block, the always-on
+ * stderr stream, and the unconditional exit-2 gate.
+ *
+ * The dedupe is keyed on the probe rather than on the warning text: the loader
+ * PARSES the project file only when it is honoured AND readable, so in every
+ * other state the only warnings it can raise about that path are the
+ * trust/readability ones doctor already says itself. When it does parse (an
+ * approved file, or one loaded under the env bypass) its schema diagnostics are
+ * genuinely new information and all of them are kept -- including alongside the
+ * bypass warning, which is a different fact about the same file.
+ */
+function foldBundleWarnings(warnings: readonly string[], probe: ProjectTrustProbe | null): string[] {
+  if (!probe || probe.path === null) return [...warnings];
+  if (projectFileIsHonoured(probe) && probe.status !== "unreadable") return [...warnings];
+  const prefix = `${probe.path}:`;
+  return warnings.filter((w) => !w.startsWith(prefix));
 }
 
 export interface DoctorOptions {
@@ -237,6 +279,14 @@ export interface DoctorJsonSnapshot {
     version: string | null;
     belowMin: boolean;
     minVersion: string;
+    /** Why a PRESENT oam produced no usable binary ("timeout" / "exit" /
+     *  "spawn"), or null. Null covers BOTH a healthy oam and an absent one --
+     *  absence is `binary: null` with `failure: null`. Without this pair a
+     *  wedged binary was indistinguishable from one that was never installed,
+     *  so support read `binary: null` and told the user to install oam. */
+    failure: OamProbeFailure | null;
+    /** The underlying error message behind `failure`, or null. */
+    failureDetail: string | null;
     defaultRuntime: "oam" | "node" | null;
     defaultRuntimeSource: "env" | "bundles" | null;
     defaultRuntimePath: string | null;
@@ -303,16 +353,13 @@ export interface DoctorResult {
 declare const __VERSION__: string;
 const VERSION = typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev";
 
-// Single source of truth for the YAW_MCP_DISABLE_PERSISTENCE truthiness
-// predicate. Was open-coded in four places (both STATE/RELIABILITY pairs
-// across the text and json paths); keeping them in lockstep matters since
-// a divergence would have one section reading state.json while another
-// treats persistence as off. persistence.ts has no exported decision to
-// reuse, so this is the local canonical form.
-function isPersistenceDisabled(env: NodeJS.ProcessEnv): boolean {
-  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
-  return raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
-}
+// The YAW_MCP_DISABLE_PERSISTENCE predicate is imported from persistence.ts,
+// which owns the state file the flag disables. Doctor used to keep its own
+// copy (as did server.ts and reset-learning-cmd.ts); doctor passes its INJECTED
+// `env` rather than process.env, which is why the shared one takes an env.
+// All four of doctor's own uses -- the STATE/RELIABILITY pair on each of the
+// text and json paths -- go through it, so no section can read state.json while
+// another treats persistence as off.
 
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
   if (opts.json) return runDoctorJson(opts);
@@ -338,7 +385,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // Project-trust gate (see trust.ts). Folded into config.warnings so it
   // renders in WARNINGS, hits the always-on stderr stream, and drives the
   // exit-2 gate like every other warning.
-  const trustWarning = await projectTrustWarning({ cwd, home, env });
+  const trustProbe = await probeProjectTrust({ cwd, home, env }).catch(() => null);
+  const trustWarning = projectTrustWarning(trustProbe);
   if (trustWarning) config.warnings = [...config.warnings, trustWarning];
 
   print("CONFIG FILES");
@@ -369,6 +417,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // silently by design (oam absent / below min / non-node command), so
   // this section is where that fallback becomes visible.
   const oamStatus = await collectOamRuntimeStatus({ env, cwd, home, probeFn: opts.oamProbe ?? probeOam });
+  // bundles.json diagnostics (unparseable file, bad schema version, invalid
+  // defaultRuntime, skipped server entries) come back from the loader the
+  // collector already ran. They were DISCARDED here, which is how a hand-edited
+  // bundles.json that no longer parses -- every server gone -- still printed
+  // "All good" and exited 0. See foldBundleWarnings.
+  config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
   renderOamRuntimeSection({ status: oamStatus, print });
 
   // Load state.json ONCE for both the STATE and RELIABILITY sections.
@@ -543,7 +597,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const config = await loadYawMcpConfig({ cwd, home, env });
   // Same project-trust fold as the text path, so `doctor --json` reports the
   // gate in `.warnings` and exits 2 identically.
-  const trustWarning = await projectTrustWarning({ cwd, home, env });
+  const trustProbe = await probeProjectTrust({ cwd, home, env }).catch(() => null);
+  const trustWarning = projectTrustWarning(trustProbe);
   if (trustWarning) config.warnings = [...config.warnings, trustWarning];
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
   const clients = probeClients({ home, os, cwd, claudeConfigDir });
@@ -677,11 +732,16 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // oam runtime block — same collector as the text path's OAM RUNTIME
   // section, so the two surfaces can't drift.
   const oamStatus = await collectOamRuntimeStatus({ env, cwd, home, probeFn: opts.oamProbe ?? probeOam });
+  // Identical fold to the text path -- a malformed bundles.json must reach
+  // `.warnings` and exit 2 on both surfaces.
+  config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
   const oamRuntime: DoctorJsonSnapshot["oamRuntime"] = {
     binary: oamStatus.probe.bin,
     version: oamStatus.probe.version,
     belowMin: oamStatus.probe.belowMin,
     minVersion: MIN_OAM_VERSION,
+    failure: oamStatus.probe.failure,
+    failureDetail: oamStatus.probe.failureDetail,
     defaultRuntime: oamStatus.dflt.runtime,
     defaultRuntimeSource: oamStatus.dflt.source,
     defaultRuntimePath: oamStatus.dflt.path,
@@ -800,16 +860,25 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
 // Everything the OAM RUNTIME section (text) / oamRuntime block (json) needs,
 // collected once so the two paths can't drift: the binary probe, the
 // config-level default (+ provenance), and a per-server verdict for every
-// locally-defined server. Account-mode server defs live on the backend, so
-// the per-server list here covers bundles.json only — `yaw-mcp servers`
-// carries the same verdict for account servers.
+// configured server. The list covers bundles.json because bundles.json is now
+// the ONLY server source -- account mode is gone (`yaw-mcp servers` is a
+// deprecated stub that always exits 1), so there is no second source of server
+// definitions for this section to be missing.
 interface OamRuntimeStatus {
   probe: OamProbe;
   dflt: DefaultRuntimeInfo;
-  servers: Array<{ namespace: string; info: ServerRuntimeInfo }>;
+  /** `command` rides along so the renderer can qualify an `oam` verdict for an
+   *  `npx` server: describeServerRuntime deliberately does not probe package
+   *  resolution (it would make doctor flap), but rewriteForOam DOES, and keeps
+   *  npx when the package is on disk nowhere. */
+  servers: Array<{ namespace: string; command: string | undefined; info: ServerRuntimeInfo }>;
   /** The managed install (`yaw-mcp sidecars install`): where it is, and the
    *  version of each package in it. Empty when it has never been run. */
   managed: { root: string; packages: Array<{ pkg: string; version: string | null }> };
+  /** Diagnostics from the bundles.json read (unparseable file, schema ahead,
+   *  invalid defaultRuntime, skipped entries). The caller folds these into
+   *  config.warnings -- see foldBundleWarnings. */
+  bundleWarnings: string[];
 }
 
 async function collectOamRuntimeStatus(opts: {
@@ -822,9 +891,15 @@ async function collectOamRuntimeStatus(opts: {
 }): Promise<OamRuntimeStatus> {
   const probe = await opts.probeFn();
   const dflt = await describeDefaultRuntime({ env: opts.env, cwd: opts.cwd, home: opts.home });
-  const bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home }).catch(() => null);
+  // `env` is threaded through so the loader's trust gate sees the SAME
+  // environment doctor's own probeProjectTrust does. Without it the loader read
+  // process.env while doctor read opts.env, and the two could disagree about
+  // whether the project file is honoured -- which would print a bypass warning
+  // and an "IGNORED" warning about the same file in the same report.
+  const bundles = await loadLocalBundles({ cwd: opts.cwd, home: opts.home, env: opts.env }).catch(() => null);
   const servers = (bundles?.config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
+    command: s.command,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));
   // Report the version actually installed for each package the config asks
@@ -840,7 +915,7 @@ async function collectOamRuntimeStatus(opts: {
     root: sidecarsRoot(opts.home),
     packages: specs.map((s) => ({ pkg: s.pkg, version: anyManaged ? installedVersion(s.pkg, opts.home) : null })),
   };
-  return { probe, dflt, servers, managed };
+  return { probe, dflt, servers, managed, bundleWarnings: bundles?.warnings ?? [] };
 }
 
 function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: string) => void }): void {
@@ -854,10 +929,25 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
     // place. Naming the one command that fixes it beats re-running an
     // installer that has to be looked up.
     print("           fix: oam self-update");
+  } else if (probe.failure !== null) {
+    // PRESENT but unusable. This used to print "not installed", which sent a
+    // user who has oam installed (and often OAM_BIN set at it) off to install
+    // it again, while the real cause -- a binary that wedges or errors on
+    // --version -- appeared only as a raw JSON log line on stderr.
+    print(`  binary:  installed but UNUSABLE (${oamFailureLabel(probe.failure)}); servers run on node`);
+    if (probe.failureDetail !== null) print(`           detail: ${probe.failureDetail}`);
+    print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");
   } else if (probe.bin === null) {
     print("  binary:  not installed — node/npx spawns are used directly");
+  } else if (probe.version === null) {
+    // A working --version proves oam exists, so the probe treats an
+    // unparseable version as usable and hosts on it (oam-spawn.ts) -- but the
+    // MIN_OAM_VERSION floor is gated on a parsed version, so it never ran.
+    // Rendering this as "(vunknown, min 0.8.3)" read exactly like a version
+    // that PASSED the floor, which is the one thing this line must not do.
+    print(`  binary:  ${probe.bin} (version unparseable -- min ${MIN_OAM_VERSION} NOT verified, hosting anyway)`);
   } else {
-    print(`  binary:  ${probe.bin} (v${probe.version ?? "unknown"}, min ${MIN_OAM_VERSION})`);
+    print(`  binary:  ${probe.bin} (v${probe.version}, min ${MIN_OAM_VERSION})`);
   }
   // What THIS process runs on. Meaningful when doctor is called as a tool
   // through the broker (same process), and explicitly labelled so it is not
@@ -884,6 +974,22 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
     for (const s of servers) {
       print(`    ${s.namespace.padEnd(widest)}  ${(s.info.runtime ?? "-").padEnd(4)}  ${s.info.reason}`);
     }
+    // An `oam` verdict for an npx server is conditional in a way the verdict
+    // itself cannot express: the spawn rewrite needs a real on-disk entry
+    // (oam has no fetch-on-demand), so a package present in no node_modules
+    // and no npx cache stays on npx/node. describeServerRuntime deliberately
+    // does not probe that -- it depends on the caches at spawn time and would
+    // make this section flap -- so say it once here instead of claiming oam
+    // unconditionally.
+    // nodeLaunchKind, not `=== "npx"`: an absolute `/usr/local/bin/npx` or a
+    // `npx.cmd` shim is the same launch and needs the same caveat.
+    const anyNpxOnOam = servers.some(
+      (s) => s.info.runtime === "oam" && s.command !== undefined && nodeLaunchKind(s.command) === "npx",
+    );
+    if (anyNpxOnOam) {
+      print("    note: an npx server reaches oam only once its package is on disk (managed");
+      print("          tree or npx cache); until then the spawn stays on npx/node.");
+    }
   }
   // Which VERSION each sidecar will run. An oam-hosted server runs a copy from
   // disk and cannot re-resolve "@latest" the way npx did, so the version is a
@@ -895,7 +1001,11 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
     if (anyInstalled) {
       const widest = managed.packages.reduce((m, p) => Math.max(m, p.pkg.length), 0);
       for (const p of managed.packages) {
-        print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not installed — resolves from the npx cache"}`);
+        // Says what was actually CHECKED. The old wording ("resolves from the
+        // npx cache") asserted a lookup doctor never performs -- nothing here
+        // reads any npx cache -- and was wrong whenever the package sits in no
+        // cache either, which is the case that keeps the server on npx/node.
+        print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not in the managed tree"}`);
       }
     }
   }
@@ -1099,11 +1209,21 @@ function schemaSuffix(f: LoadedConfigFile): string {
 function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.unavailable) return "unavailable on this OS";
   if (c.malformed) return "exists but JSON is malformed — fix or rerun `yaw-mcp install`";
-  if (c.hasMcpEntry && c.hasLegacyEntry) {
-    return `OK — has "${ENTRY_NAME}" entry; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
-  }
+  // Checked BEFORE the combined legacy branch: a launch command that no longer
+  // exists is the one state that means the client cannot start yaw-mcp AT ALL,
+  // and the combined branch used to swallow it -- a config carrying both a
+  // legacy entry and a rotted absolute command reported "OK" and told the user
+  // to remove the OTHER entry, leaving only the broken one. When both are true
+  // the legacy trim hint is appended rather than dropped, so neither problem
+  // goes unnamed.
   if (c.launchCommandMissing) {
-    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\``;
+    const legacy = c.hasLegacyEntry
+      ? `; legacy "${c.legacyEntryName}" entry also present — remove it once the working entry is back`
+      : "";
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
+  }
+  if (c.hasMcpEntry && c.hasLegacyEntry) {
+    return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
   }
   if (c.hasMcpEntry) {
     return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
@@ -1376,6 +1496,14 @@ export interface ShadowHit {
 // on many setups — reading the whole thing would be wasteful here.
 const SHELL_HISTORY_TAIL_LINES = 500;
 
+// Hard cap on the BYTES read from the end of each history file. This is what
+// makes the memory claim above true: readTailLines seeks to `size - this` and
+// reads forward, so a 400 MB PSReadLine archive costs one 256 KB buffer rather
+// than the whole file (plus a full line array) per doctor run. 256 KB holds
+// far more than 500 lines of any realistic history, so the line cap above is
+// still the binding limit in practice.
+const SHELL_HISTORY_TAIL_BYTES = 256 * 1024;
+
 /** Scan recent bash / zsh / PowerShell history for commands that an
  *  MCP server shadows. Returns a sorted (count desc) list of hits.
  *  Any I/O error on a history file is swallowed — this is purely
@@ -1438,13 +1566,45 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
   return sources;
 }
 
+/** Read at most the last `n` lines of a file, reading at most
+ *  SHELL_HISTORY_TAIL_BYTES from the END of it rather than the whole file.
+ *
+ *  The whole-file read this replaces made the "without loading massive
+ *  archives into memory" claim above false: it allocated the entire file PLUS
+ *  a line array for every one of the three sources on every doctor run, and on
+ *  a multi-hundred-MB history readFileSync throws ERR_STRING_TOO_LONG -- which
+ *  the catch swallowed, so the SHADOWED CLI section silently disappeared with
+ *  no diagnostic. Any I/O error still yields [] (purely diagnostic section).
+ */
 function readTailLines(path: string, n: number): string[] {
+  let fd: number | undefined;
   try {
-    const raw = readFileSync(path, "utf8");
-    const all = raw.split(/\r?\n/);
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const start = size > SHELL_HISTORY_TAIL_BYTES ? size - SHELL_HISTORY_TAIL_BYTES : 0;
+    const length = size - start;
+    const buf = Buffer.allocUnsafe(length);
+    const got = readSync(fd, buf, 0, length, start);
+    let text = buf.subarray(0, got).toString("utf8");
+    if (start > 0) {
+      // The window almost certainly opens mid-line, and its first bytes can be
+      // the tail of a multi-byte character. Drop through the first newline so
+      // only whole, correctly-decoded lines are parsed.
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    const all = text.split(/\r?\n/);
     return all.length <= n ? all : all.slice(all.length - n);
   } catch {
     return [];
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing useful to do with a close failure on a read-only probe.
+      }
+    }
   }
 }
 

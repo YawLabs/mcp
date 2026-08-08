@@ -39,42 +39,50 @@
 // So npm does the install, and this file does not chain `oam install` after
 // it. That is a deliberate decision with the measurement behind it, not an
 // oversight to be tidied up later.
+//
+// It DOES take two npm steps: `install` acquires, and `update` is the only one
+// of the two that can move an already-locked `@latest` forward on a re-run. See
+// the note at the update call for the measurement behind that.
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
-import { loadLocalBundles } from "./local-bundles.js";
-import { packageName } from "./oam-spawn.js";
-import { sidecarsNodeModules, sidecarsRoot } from "./paths.js";
+import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
+import { loadLocalBundles, localBundlesPath } from "./local-bundles.js";
+import { isRegistrySpec, npxSpec, type OamProbe, packageName, probeOam } from "./oam-spawn.js";
+import { sidecarsNodeModules, sidecarsRoot, userConfigDir } from "./paths.js";
 import type { UpstreamServerConfig } from "./types.js";
 
-export { SIDECARS_DIRNAME, sidecarsNodeModules, sidecarsRoot } from "./paths.js";
+// paths.ts owns these; they are re-exported for the callers that think of them
+// as part of this command's surface (doctor-cmd + the tests). SIDECARS_DIRNAME
+// is deliberately NOT among them -- it had no importer here, and one more
+// re-export hides paths.ts as the actual owner.
+export { sidecarsNodeModules, sidecarsRoot } from "./paths.js";
 
-/**
- * Whether a launch spec names a plain REGISTRY package, the only kind that can
- * go in the generated manifest.
- *
- * npx also accepts git and path specs -- `npx -y github:owner/repo`,
- * `npx -y ./local-server`, `file:../x` -- and `packageName` passes those
- * through whole, because there is no `@version` separator to cut at. Used as a
- * dependency KEY that produces `{"github:owner/repo": "latest"}`, which npm
- * rejects as an invalid name. npm then fails the WHOLE install, so one
- * unusually-configured server would stop every other package from installing.
- *
- * A git or path spec is legitimate configuration, so this is a skip rather
- * than an error: those servers keep resolving through npx exactly as before,
- * and the command says which ones it passed over. Resolving them properly
- * would mean fetching the target just to learn the name it declares, which is
- * more than this command should do.
- */
-export function isRegistrySpec(spec: string): boolean {
-  // A protocol (github:, file:, git+ssh:, http:) or a filesystem path.
-  if (spec.includes(":") || /^[./~\\]/.test(spec)) return false;
-  // @scope/name, or a bare name. npm forbids a leading "." or "_".
-  return /^(@[^/@\s]+\/)?[^./_@\s][^/@\s]*$/.test(packageName(spec));
-}
+// isRegistrySpec is imported from oam-spawn.ts rather than reimplemented here.
+// The two files want it for DIFFERENT reasons -- oam-spawn needs a package NAME
+// it can use as an on-disk lookup key, this file needs one it can use as a
+// dependency KEY in a generated manifest -- but the predicate that answers both
+// is the same one, and it was maintained twice as a byte-identical copy. Two
+// copies of a spec-parsing rule is how the spawn path and the install path come
+// to disagree about which servers are registry packages, which is exactly the
+// pair that must not drift: a server the manifest installs but the rewrite
+// skips (or vice versa) is a tree nothing reads.
+//
+// Why THIS file cares, since the reason no longer sits on the function:
+// `packageName` passes a git or path spec through whole -- there is no
+// `@version` separator to cut at -- so `npx -y github:owner/repo` would land in
+// the manifest as `{"github:owner/repo": "latest"}`. npm rejects that as an
+// invalid name and fails the WHOLE install, so one unusually-configured server
+// would stop every other package from installing.
+//
+// A git or path spec is legitimate configuration, so both call sites below skip
+// rather than error: those servers keep resolving through npx exactly as
+// before, and collectNonRegistrySpecs reports which ones were passed over.
+// Resolving them properly would mean fetching the target just to learn the name
+// it declares, which is more than this command should do.
 
 export interface SidecarSpec {
   /** Bare package name, e.g. "@yawlabs/fetch-mcp". */
@@ -108,9 +116,12 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
   const byPkg = new Map<string, SidecarSpec>();
   for (const s of servers) {
     if (s.type !== "local" || s.command !== "npx") continue;
-    const positional = (s.args ?? []).filter((a) => a !== "-y" && a !== "--yes");
-    const spec = positional[0];
-    if (spec === undefined || spec.startsWith("-")) continue;
+    // Which argument is the package spec is oam-spawn's rule, not a second copy
+    // of it: this collector and collectNonRegistrySpecs PARTITION the same
+    // server set into "installed" and "skipped", so a rule that lives in two
+    // places can drop a server out of both reports with nothing to say why.
+    const spec = npxSpec(s.args ?? []);
+    if (spec === null) continue;
     // A git or path spec cannot be a dependency key; including it would make
     // npm reject the manifest and fail the install for every other package
     // too. See isRegistrySpec.
@@ -142,8 +153,9 @@ export function collectNonRegistrySpecs(
   const out: Array<{ namespace: string; spec: string }> = [];
   for (const s of servers) {
     if (s.type !== "local" || s.command !== "npx") continue;
-    const spec = (s.args ?? []).filter((a) => a !== "-y" && a !== "--yes")[0];
-    if (spec === undefined || spec.startsWith("-") || isRegistrySpec(spec)) continue;
+    // Same shared rule as collectSidecarSpecs -- see the note there.
+    const spec = npxSpec(s.args ?? []);
+    if (spec === null || isRegistrySpec(spec)) continue;
     out.push({ namespace: s.namespace ?? "(unnamed)", spec });
   }
   return out;
@@ -193,8 +205,16 @@ export interface SidecarsInstallOptions {
   cwd?: string;
   json?: boolean;
   out?: (s: string) => void;
+  /** Where load-time diagnostics go. Defaults to stderr, which is what keeps
+   *  them out of the `--json` document on stdout -- the same split bundles-cmd
+   *  and local-add-cmd already use. Injected in tests. */
+  err?: (s: string) => void;
   /** Injected in tests. Resolves to the child's exit code. */
   runNpm?: (args: string[], cwd: string) => Promise<number>;
+  /** Injected in tests. Answers "can oam host these servers", which decides
+   *  whether anything will READ the tree this command fills. Defaults to the
+   *  real (process-cached) probe. */
+  oamProbe?: () => Promise<OamProbe>;
 }
 
 export interface SidecarsInstallResult {
@@ -213,6 +233,11 @@ interface SidecarsJson {
   reason: string | null;
   /** What went wrong, else null. */
   error: string | null;
+  /** Why the refresh step failed, else null. Separate from `error` because the
+   *  install itself SUCCEEDED: the packages are on disk and usable, they just
+   *  may not have moved forward. A consumer that treats this as fatal would
+   *  discard a perfectly good tree. */
+  updateError: string | null;
   /** Packages configured at two different versions; the winner is the version
    *  reported in `installed`. Empty in the ordinary case. */
   conflicts: Array<{ pkg: string; used: string; ignored: string[] }>;
@@ -237,6 +262,7 @@ function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
     installed: [],
     reason: null,
     error: null,
+    updateError: null,
     conflicts: [],
     skipped: [],
     ...over,
@@ -254,19 +280,31 @@ function defaultRunNpm(args: string[], cwd: string): Promise<number> {
     // option rather than in the command line, so no user-controlled path is
     // ever parsed by cmd. Do not interpolate a package name into these args.
     const isWindows = process.platform === "win32";
-    const child = spawn(isWindows ? "npm.cmd" : "npm", args, {
-      cwd,
-      // npm's own progress ("added 220 packages in 12s") goes to its STDOUT,
-      // and inheriting that put it ahead of the JSON document under --json --
-      // enough to make `yaw-mcp sidecars install --json | jq` fail outright.
-      // Routing the child's stdout to fd 2 keeps the progress visible while
-      // leaving OUR stdout carrying only the result, which is what a caller
-      // parses. Unconditional rather than --json-only: progress belongs on
-      // stderr in both modes, and a mode-dependent stdio is a second shape to
-      // get wrong.
-      stdio: ["ignore", 2, "inherit"],
-      shell: isWindows,
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(isWindows ? "npm.cmd" : "npm", args, {
+        cwd,
+        // npm's own progress ("added 220 packages in 12s") goes to its STDOUT,
+        // and inheriting that put it ahead of the JSON document under --json --
+        // enough to make `yaw-mcp sidecars install --json | jq` fail outright.
+        // Routing the child's stdout to fd 2 keeps the progress visible while
+        // leaving OUR stdout carrying only the result, which is what a caller
+        // parses. Unconditional rather than --json-only: progress belongs on
+        // stderr in both modes, and a mode-dependent stdio is a second shape to
+        // get wrong.
+        stdio: ["ignore", 2, "inherit"],
+        shell: isWindows,
+      });
+    } catch {
+      // spawn can fail SYNCHRONOUSLY rather than emitting 'error' -- an option
+      // the platform rejects (the EINVAL above, before the shell workaround) or
+      // a cwd that vanished between mkdir and here. Without this catch the
+      // throw escapes the executor, rejects runSidecarsInstall, and the CLI
+      // prints a raw Node message instead of the "keeps resolving from the npx
+      // cache" degradation the ENOENT path reports. Same -1 as that path.
+      resolve(-1);
+      return;
+    }
     child.on("error", () => resolve(-1));
     child.on("close", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
   });
@@ -309,6 +347,52 @@ export function parseSidecarsArgs(
   return { ok: true, options: { json } };
 }
 
+/**
+ * The lines to print when NOTHING will read the tree this command just filled,
+ * or [] when at least one server would be hosted on oam.
+ *
+ * collectSidecarSpecs filters on `command === "npx"` and nothing else -- it
+ * cannot see per-server `runtime: "node"`, the config default, or whether oam
+ * is installed at all. But the managed tree is consumed ONLY by resolveNpmEntry
+ * on the oam rewrite path (oam-spawn.ts): a server that resolves to the node
+ * runtime spawns through npx and never looks here. So on a machine with no oam,
+ * "These versions are now fixed" on its own is a claim the user cannot act on
+ * -- every spawn still goes through the npx cache. Say which gate is closed,
+ * using describeServerRuntime's own reason strings so this and doctor cannot
+ * drift apart.
+ *
+ * The install is still worth having in that state -- the copies are used the
+ * moment oam arrives -- so this is a note, not a failure.
+ */
+async function unhostedNote(
+  servers: Array<Partial<UpstreamServerConfig>>,
+  opts: SidecarsInstallOptions,
+  home: string,
+): Promise<string[]> {
+  const npx = servers.filter((s) => s.type === "local" && s.command === "npx");
+  if (npx.length === 0) return [];
+  const probe = await (opts.oamProbe ?? probeOam)();
+  const { runtime: configDefault } = await describeDefaultRuntime({ cwd: opts.cwd, home });
+  const verdicts = npx.map((s) =>
+    // `args` rides along because describeServerRuntime now mirrors
+    // rewriteForOam's launch-shape gates too: a spec it refuses (a git/path
+    // target, a version range, an npx flag yaw-mcp does not parse) never
+    // reaches oam, and dropping the args here would report those servers as
+    // hosted while the spawn keeps npx.
+    describeServerRuntime(
+      { type: "local", command: s.command, args: s.args, runtime: s.runtime },
+      configDefault,
+      probe,
+    ),
+  );
+  if (verdicts.some((v) => v.runtime === "oam")) return [];
+  const out = ["", "Nothing reads these copies yet:"];
+  for (const reason of [...new Set(verdicts.map((v) => v.reason))]) out.push(`  ${reason}`);
+  out.push("Those servers keep resolving through the npx cache; the managed copies are read only");
+  out.push("on the oam runtime.");
+  return out;
+}
+
 export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Promise<SidecarsInstallResult> {
   const home = opts.home ?? homedir();
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
@@ -318,7 +402,16 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     if (!opts.json) write(`${s}\n`);
   };
 
+  const printErr = opts.err ?? ((s: string) => process.stderr.write(`${s}\n`));
+
   const bundles = await loadLocalBundles({ cwd: opts.cwd, home });
+  // Surface the loader's diagnostics, the way bundles-cmd and local-add-cmd
+  // already do. Without this an invalid JSON / non-array `servers` / EACCES
+  // read reached the user as "you have no servers" with the one line that names
+  // the actual defect thrown away. stderr, so a `--json` consumer's stdout stays
+  // parseable.
+  for (const w of bundles.warnings) printErr(`warning: ${w}`);
+
   const servers = bundles.config?.servers ?? [];
   const specs = collectSidecarSpecs(servers);
   const skipped = collectNonRegistrySpecs(servers);
@@ -339,11 +432,28 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   };
 
   if (specs.length === 0) {
-    // Three different empty states, and telling a first-time user with no
-    // config at all that their bundles.json has no npx servers describes a
-    // file that does not exist. `config` is null exactly when neither the
-    // user-global nor an approved project file was found, so the cases are
-    // distinguishable -- and each wants a different next step.
+    // Four different empty states, and telling a first-time user with no config
+    // at all that their bundles.json has no npx servers describes a file that
+    // does not exist. Each wants a different next step.
+    //
+    // A null `config` is TWO of them, which is the distinction this branch
+    // exists to keep: loadLocalBundles also returns config=null for a file that
+    // IS there and could not be used -- invalid JSON, a non-array `servers`, an
+    // EACCES read -- and it reports which by leaving `path` set. Reporting that
+    // as "no servers configured yet" tells the user to add a server to a file
+    // whose real problem is that it cannot be parsed, and hands a scripted
+    // caller `reason: "no-config", error: null` for a broken machine.
+    if (bundles.config === null && bundles.path !== null) {
+      // Non-zero, and `error` non-null with it: nothing was installed and the
+      // cause is a defect the user has to fix, not an empty config. The npm-
+      // failure path below reports the same shape for the same reason.
+      const detail =
+        bundles.warnings.length > 0 ? bundles.warnings.join("; ") : `${bundles.path}: could not be read or parsed`;
+      print(`Could not read ${bundles.path} -- nothing to install.`);
+      print("Fix the file (the warning above says what is wrong), then run this again.");
+      if (opts.json) write(jsonDocument(root, { reason: "unreadable-config", error: detail }));
+      return { exitCode: 1, installed: [], lines };
+    }
     if (bundles.config === null) {
       print("No servers configured yet -- nothing to install.");
       print("Add one with `yaw-mcp add <slug>`, then run this again.");
@@ -370,6 +480,21 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
 
   print(`Installing ${specs.length} server package(s) into ${root}`);
+  // Name the config the list came from. The managed tree is keyed on HOME
+  // alone, while the server list can come from an approved PROJECT
+  // bundles.json -- so an install run in project A writes A's dependency set
+  // into the one directory every project shares, and npm prunes whatever B put
+  // there. The broker in B then resolves out of that same tree (managed wins
+  // over the npx cache, oam-spawn.ts), on A's versions, with nothing in B to
+  // say why. The in-config conflict note below cannot see this: it compares
+  // specs WITHIN one config. Naming the source is the cheap half of the fix.
+  if (bundles.path !== null) {
+    print(`  from ${bundles.path}`);
+    if (bundles.path !== localBundlesPath(userConfigDir(home))) {
+      print(`  note: ${root} is shared by every project on this machine; installing from a project`);
+      print("        bundles.json replaces what another project's install put there.");
+    }
+  }
   for (const s of specs) print(`  ${s.spec}${s.namespaces.length ? `  (${s.namespaces.join(", ")})` : ""}`);
   printSkipped();
   // A flat tree holds one version per package, so a second spec for the same
@@ -393,6 +518,23 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     return { exitCode: 1, installed: [], lines };
   }
 
+  // The second step is what makes "re-run this command to move them forward"
+  // true. `npm install` CANNOT re-resolve a dist-tag against an existing tree:
+  // with a lockfile present, arborist's dep-valid treats a `tag` spec as
+  // satisfied by ANY node that already carries a `resolved` URL, so a package
+  // locked at 0.3.6 under a `latest` range reports "up to date" and stays
+  // there. Measured against npm on a real tree -- dep at 3.0.0 with the spec
+  // rewritten to `latest` and 3.0.1 published: `install` printed "up to date"
+  // and left 3.0.0; `update` moved it to 3.0.1. Without this the version pins
+  // itself permanently, which is the exact failure this module exists to fix.
+  //
+  // `update` honours the manifest's ranges, so an exact-pinned spec
+  // (`pkg@1.0.0`) still cannot drift -- only the ranges that asked to float do.
+  // Fixed literals only, like the install above: see defaultRunNpm on why the
+  // Windows shell is safe here, and do not interpolate a package name.
+  const updateCode = await runNpm(["update", "--no-audit", "--no-fund"], root);
+  const updateError = updateCode === 0 ? null : `npm update exited ${updateCode}`;
+
   const installed = specs.map((s) => ({
     pkg: s.pkg,
     version: installedVersion(s.pkg, home),
@@ -406,8 +548,14 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     print();
     print(`${missing.length} package(s) did not land; those servers keep resolving from the npx cache.`);
   }
+  if (updateError !== null) {
+    print();
+    print(`npm update failed (exit ${updateCode}). The installed copies are usable, but a server`);
+    print('configured "@latest" may still be on the version it was already on.');
+  }
   print();
   print("These versions are now fixed. Re-run this command to move them forward.");
+  for (const line of await unhostedNote(servers, opts, home)) print(line);
 
   // npm exited 0 but not one requested package resolved in the tree. A
   // scripted caller has to be able to tell that from a real install, so it
@@ -417,7 +565,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   const nothingLanded = missing.length === installed.length;
   const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
 
-  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped, error }));
+  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped, error, updateError }));
   return { exitCode: nothingLanded ? 1 : 0, installed, lines };
 }
 

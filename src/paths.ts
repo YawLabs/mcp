@@ -40,6 +40,16 @@ export function sidecarsRoot(home: string = homedir()): string {
  * Lives here rather than beside the command that writes it because
  * oam-spawn's resolver reads it, and oam-spawn is imported BY that command --
  * putting the path there would be an import cycle.
+ *
+ * IMPORT THIS (and sidecarsRoot) FROM HERE. sidecars-cmd.ts re-exports both,
+ * which makes it read like the owner, and doctor-cmd.ts consumes sidecarsRoot
+ * through that re-export -- but sidecars-cmd.ts also imports from oam-spawn.ts,
+ * so pointing oam-spawn.ts at the re-export instead of at this module recreates
+ * the cycle above. Nothing detects it: both cross-module uses are deferred to
+ * call time (a function body, a default parameter), so the cycle would ship
+ * latent and only bite once either module gains top-level initialization that
+ * touches the other (TDZ on whichever side loads second). There is no cycle
+ * linter in the repo; this note and the paragraph above are the only guard.
  */
 export function sidecarsNodeModules(home: string = homedir()): string {
   return path.join(sidecarsRoot(home), "node_modules");
@@ -68,8 +78,16 @@ function isUnderHome(dir: string, homeResolved: string): boolean {
   const homeKey = normalizeForCompare(homeResolved);
   if (dirKey === homeKey) return false;
   const rel = path.relative(homeResolved, dir);
+  if (rel === "" || path.isAbsolute(rel)) return false;
+  // Anchor the "escapes $HOME" test on a path SEPARATOR. A bare
+  // `startsWith("..")` also rejects a directory literally NAMED `..`-
+  // something: path.relative("/home/alice", "/home/alice/..config/app") is
+  // "..config/app", which starts with ".." while being genuinely under
+  // $HOME. findProjectConfigDir treats a false here as "stop the walk", so
+  // that one character made every `.yaw-mcp/` below `~/..config/`
+  // undiscoverable. Only a segment that IS ".." actually escapes.
   const relNorm = normalizeForCompare(rel);
-  return relNorm !== "" && !relNorm.startsWith("..") && !path.isAbsolute(rel);
+  return relNorm !== ".." && !relNorm.startsWith(`..${path.sep}`);
 }
 
 export async function findProjectConfigDir(start: string, home: string = homedir()): Promise<string | null> {

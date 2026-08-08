@@ -4,6 +4,7 @@ import {
   buildLaunchEntry,
   ENTRY_NAME,
   INSTALL_TARGETS,
+  isProjectLocalEntry,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "../install-targets.js";
@@ -379,7 +380,11 @@ describe("buildLaunchEntry", () => {
   // which hosts the sidecars it spawns).
   it("hosts the broker on oam when both the binary and a durable entry resolve", () => {
     for (const os of ["windows", "macos", "linux"] as const) {
-      const e = buildLaunchEntry({ os, oamBin: "/usr/local/bin/oam", oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" });
+      const e = buildLaunchEntry({
+        os,
+        oamBinPath: "/usr/local/bin/oam",
+        oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
+      });
       expect(e.command).toBe("/usr/local/bin/oam");
       // No cmd /c even on Windows: that wrap exists for npx's .cmd shim, and
       // oam is a real executable the client can spawn directly.
@@ -396,7 +401,7 @@ describe("buildLaunchEntry", () => {
     const e = buildLaunchEntry({
       os: "linux",
       upstream: { command: "uvx", args: ["some-server"] },
-      oamBin: "/usr/local/bin/oam",
+      oamBinPath: "/usr/local/bin/oam",
       oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
     });
     expect(e.command).toBe("uvx");
@@ -410,7 +415,7 @@ describe("buildLaunchEntry", () => {
     const e = buildLaunchEntry({
       os: "linux",
       pkg: "@yawlabs/mcp@0.73.0",
-      oamBin: "/usr/local/bin/oam",
+      oamBinPath: "/usr/local/bin/oam",
       oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js",
     });
     expect(e.command).toBe("npx");
@@ -418,15 +423,43 @@ describe("buildLaunchEntry", () => {
   });
 
   it("keeps the npx entry when either half is missing", () => {
-    // oam absent -> npx. This is the guarantee that the feature can only ever
-    // be an upgrade: it never replaces a working launcher with a broken one.
-    const noBin = buildLaunchEntry({ os: "linux", oamBin: null, oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" });
+    // oam absent -> npx. The feature can only ever be an upgrade AT WRITE TIME:
+    // it never replaces a launcher that works right now. (It says nothing about
+    // later -- the entry is baked, so a subsequent oam or @yawlabs/mcp uninstall
+    // breaks it with no retry and no downgrade. See BuildLaunchEntryOptions.)
+    const noBin = buildLaunchEntry({ os: "linux", oamBinPath: null, oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" });
     expect(noBin.command).toBe("npx");
     // oam present but yaw-mcp only in the npx cache -> npx, because a config
     // file must not persist a path under ~/.npm/_npx that can be evicted.
-    const noEntry = buildLaunchEntry({ os: "linux", oamBin: "/usr/local/bin/oam", oamEntry: null });
+    const noEntry = buildLaunchEntry({ os: "linux", oamBinPath: "/usr/local/bin/oam", oamEntry: null });
     expect(noEntry.command).toBe("npx");
     expect(noEntry.args).toEqual(["-y", "@yawlabs/mcp@latest"]);
+  });
+
+  // The shape the probe actually produces without OAM_BIN. Every other fixture
+  // here passes an absolute path, which is why a bare-name entry shipped:
+  // `{command: "oam"}` resolves against the CLIENT's PATH, and a GUI-launched
+  // client (Claude Desktop / Cursor from the Dock or Explorer) never inherited
+  // the shell PATH that oam's installer nudged. The gate is inside
+  // buildLaunchEntry, not only in its caller, so no caller can reintroduce it.
+  it("refuses a non-absolute oam binary and stays on npx", () => {
+    for (const [os, bareName] of [
+      ["linux", "oam"],
+      ["macos", "oam"],
+      ["windows", "oam.exe"],
+    ] as const) {
+      const e = buildLaunchEntry({ os, oamBinPath: bareName, oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" });
+      expect(e.command).not.toBe(bareName);
+      expect(e.command).toBe(os === "windows" ? "cmd" : "npx");
+      expect(e.args).toEqual(
+        os === "windows" ? ["/c", "npx", "-y", "@yawlabs/mcp@latest"] : ["-y", "@yawlabs/mcp@latest"],
+      );
+    }
+    // A relative path is a bare name with extra steps -- same refusal.
+    expect(
+      buildLaunchEntry({ os: "linux", oamBinPath: "./bin/oam", oamEntry: "/opt/nm/@yawlabs/mcp/dist/index.js" })
+        .command,
+    ).toBe("npx");
   });
 
   // yaw-mcp is local-only: the default entry carries no env at all. There is
@@ -435,6 +468,71 @@ describe("buildLaunchEntry", () => {
     for (const os of ["macos", "linux", "windows"] as const) {
       expect(buildLaunchEntry({ os }).env).toBeUndefined();
     }
+  });
+});
+
+describe("isProjectLocalEntry", () => {
+  // resolveStableNpmEntry calls a project node_modules "durable" too, and
+  // install persists it into a machine-global config -- so install warns. Pure
+  // string work on both separators, so POSIX literals are safe on a Windows
+  // runner (nothing here routes through path.join).
+  it("flags a node_modules under the tree cwd sits in", () => {
+    expect(isProjectLocalEntry("/home/j/repo/node_modules/@yawlabs/mcp/dist/index.js", "/home/j/repo")).toBe(true);
+    // Invoked from a subdirectory: still the same project tree.
+    expect(isProjectLocalEntry("/home/j/repo/node_modules/@yawlabs/mcp/dist/index.js", "/home/j/repo/src/deep")).toBe(
+      true,
+    );
+    // Trailing separator on cwd must not defeat the prefix compare.
+    expect(isProjectLocalEntry("/home/j/repo/node_modules/@yawlabs/mcp/dist/index.js", "/home/j/repo/")).toBe(true);
+  });
+
+  it("does not flag a global install", () => {
+    // The layouts that must stay quiet -- a false positive here would nag on
+    // every correct global install, which is the recommended setup.
+    for (const entry of [
+      "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/opt/homebrew/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/j/.nvm/versions/node/v22.3.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "C:\\Users\\j\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcp\\dist\\index.js",
+    ]) {
+      expect(isProjectLocalEntry(entry, "/home/j/repo")).toBe(false);
+    }
+    // A sibling checkout is not this one.
+    expect(isProjectLocalEntry("/home/j/other/node_modules/@yawlabs/mcp/dist/index.js", "/home/j/repo")).toBe(false);
+    // The reason the containment test only runs one way: an nvm/volta prefix
+    // under HOME is "inside cwd" whenever install is run from the home dir.
+    expect(
+      isProjectLocalEntry("/home/j/.nvm/versions/node/v22.3.0/lib/node_modules/@yawlabs/mcp/dist/index.js", "/home/j"),
+    ).toBe(false);
+    // Prefix-but-not-path-segment: /home/j/repo2 is not inside /home/j/repo.
+    expect(isProjectLocalEntry("/home/j/repo/node_modules/@yawlabs/mcp/dist/index.js", "/home/j/repo2")).toBe(false);
+  });
+
+  it("handles Windows separators and drive-letter case", () => {
+    // process.cwd() and a resolved module path can disagree on drive-letter
+    // case on Windows; a case-sensitive compare would silently never warn.
+    expect(
+      isProjectLocalEntry("C:\\Users\\j\\repo\\node_modules\\@yawlabs\\mcp\\dist\\index.js", "c:\\users\\j\\repo"),
+    ).toBe(true);
+    expect(isProjectLocalEntry("C:/Users/j/repo/node_modules/@yawlabs/mcp/dist/index.js", "C:\\Users\\j\\repo")).toBe(
+      true,
+    );
+  });
+
+  it("returns false for paths with no node_modules segment", () => {
+    expect(isProjectLocalEntry("/home/j/repo/dist/index.js", "/home/j/repo")).toBe(false);
+    expect(isProjectLocalEntry("", "/home/j/repo")).toBe(false);
+    // A node_modules at the filesystem root owns no project tree.
+    expect(isProjectLocalEntry("/node_modules/@yawlabs/mcp/dist/index.js", "/")).toBe(false);
+  });
+
+  it("attributes a transitively-nested copy to the outer project tree", () => {
+    // Anchoring on the innermost node_modules would compute a root of
+    // <repo>/node_modules/x, which cwd is never inside -- so the warning would
+    // silently never fire for a nested copy.
+    expect(
+      isProjectLocalEntry("/home/j/repo/node_modules/x/node_modules/@yawlabs/mcp/dist/index.js", "/home/j/repo"),
+    ).toBe(true);
   });
 });
 

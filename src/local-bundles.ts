@@ -74,8 +74,10 @@ export interface LocalBundlesFile {
   servers: Array<Partial<UpstreamServerConfig>>;
   /** Config-level default runtime for servers that don't set a per-server
    *  `runtime`. Per-server `"node"` stays an escape hatch under a default of
-   *  `"oam"`. Applied in connectToUpstream (via default-runtime.ts) so it
-   *  covers backend-sourced defs in account mode too. */
+   *  `"oam"`. Applied in connectToUpstream (via default-runtime.ts) rather than
+   *  at load time because the effective default is a MACHINE fact -- whether
+   *  oam is installed on the box that spawns the sidecar -- not a property of
+   *  the file. */
   defaultRuntime?: "oam" | "node";
 }
 
@@ -84,9 +86,11 @@ export function localBundlesPath(configDir: string): string {
   return join(configDir, BUNDLES_FILENAME);
 }
 
-/** Canonical regex for valid MCP server namespaces. Exported so all
- *  consumers (config.ts, local-bundles.ts, tests) share the same
- *  definition instead of maintaining independent copies. */
+/** Canonical regex for valid MCP server namespaces. validateEntry below is
+ *  the only production consumer left -- the remote-config fetcher (config.ts)
+ *  that used to share it was deleted with the hosted backend. Still exported
+ *  so the test suite (and any future validator) pins the SAME definition
+ *  instead of maintaining an independent copy that drifts from the loader's. */
 export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 
 /** Coerce a raw entry from bundles.json into a strict UpstreamServerConfig.
@@ -129,11 +133,29 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   const url = typeof e.url === "string" ? e.url : undefined;
   const description = typeof e.description === "string" ? e.description : undefined;
   // Per-server runtime override. "oam" hosts the server on the oam runtime
-  // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`);
-  // "node" or absent = node, the default. Without propagating this here, a
+  // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`).
+  // Absent = oam when it is installed and meets MIN_OAM_VERSION, else node (see
+  // default-runtime.ts for the full resolution order). An explicit "node" is the
+  // escape hatch that keeps a server off oam. Without propagating this here, a
   // bundles.json `"runtime": "oam"` is silently dropped and never reaches the
-  // resolver.
+  // resolver -- and note that absent must stay UNDEFINED rather than being
+  // normalized to "node": normalizing would pin every unconfigured server off
+  // oam, and per-server wins over YAW_MCP_DEFAULT_RUNTIME (upstream.ts), so
+  // nothing could undo it.
   const runtime = e.runtime === "oam" || e.runtime === "node" ? e.runtime : undefined;
+
+  // Per-server connect timeout (types.ts). Carried through for the same reason
+  // as `runtime` above: the return below is a fixed whitelist, so a field
+  // missing from it is DROPPED, and bundles.json is now the only server source
+  // -- without this line nothing in the process can ever set the value
+  // connectToUpstream reads, and a user's `"connectTimeoutMs": 60000` silently
+  // falls back to the global default. Non-numeric and non-positive values are
+  // dropped rather than passed on: upstream ignores anything <= 0 anyway, and
+  // dropping keeps a typo from reading as configured.
+  const connectTimeoutMs =
+    typeof e.connectTimeoutMs === "number" && Number.isFinite(e.connectTimeoutMs) && e.connectTimeoutMs > 0
+      ? e.connectTimeoutMs
+      : undefined;
 
   // Default isActive=true in local mode -- if the user wrote a server
   // into bundles.json they presumably want it loadable. Toggle off with
@@ -156,6 +178,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     env,
     url,
     isActive,
+    connectTimeoutMs,
     description,
     runtime,
   };
@@ -722,20 +745,88 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
   };
 }
 
+/** A raw `env` map off disk, narrowed to its string-valued keys (the only
+ *  shape validateEntry honours). Undefined when the field is absent or isn't
+ *  a plain object, so the merge below leaves a garbage value untouched
+ *  instead of laundering it into a well-formed one. */
+function envStrings(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>).filter(([, v]) => typeof v === "string"),
+  ) as Record<string, string>;
+}
+
 /**
- * Insert or replace a server entry in the user-global bundles.json. An
+ * Fold an incoming entry onto the one already on disk. An upsert is a PARTIAL
+ * update, not a wholesale slot replacement: everything the caller does not
+ * speak to keeps the value the user has there.
+ *
+ * Why this is not `file.servers[idx] = entry`: `yaw-mcp add <slug>` rebuilds
+ * its entry from the catalog every time, so a re-add (to pick up a new catalog
+ * command, say) used to blow away state only the user could have put there --
+ * a persisted `--env` secret, an explicit `"isActive": false`, a per-server
+ * `"runtime": "oam"` override, a hand-tuned `connectTimeoutMs`, and any field
+ * outside the writer's vocabulary. All of it silently, under an "Updated ..."
+ * success line.
+ *
+ * Three rules, in order:
+ *   1. A field the incoming entry leaves UNDEFINED keeps its on-disk value.
+ *      (Defined fields win: command/args/description are exactly what a
+ *      re-add is FOR.)
+ *   2. `env` merges per KEY rather than being swapped wholesale, and an EMPTY
+ *      incoming value never blanks a stored one -- `add` seeds every required
+ *      key with "" and only fills in what came from an explicit `--env`, so a
+ *      wholesale swap is how the stored secret disappeared.
+ *   3. An incoming `isActive: true` does NOT re-enable an entry the user
+ *      explicitly disabled. `true` is boilerplate every writer stamps;
+ *      `"isActive": false` is a deliberate hand-edit, and there is no `enable`
+ *      verb for `add` to be the accidental inverse of. An explicit `false`
+ *      still disables.
+ */
+function mergeServerEntry(
+  existing: Partial<UpstreamServerConfig>,
+  incoming: Partial<UpstreamServerConfig>,
+): Partial<UpstreamServerConfig> {
+  const base = existing as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...base };
+  for (const [k, v] of Object.entries(incoming as Record<string, unknown>)) {
+    if (v === undefined) continue;
+    merged[k] = v;
+  }
+  if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
+
+  const storedEnv = envStrings(base.env);
+  const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
+  if (storedEnv || incomingEnv) {
+    const env: Record<string, string> = { ...storedEnv };
+    for (const [k, v] of Object.entries(incomingEnv ?? {})) {
+      if (v.trim() === "" && (env[k] ?? "").trim() !== "") continue;
+      env[k] = v;
+    }
+    merged.env = env;
+  }
+  return merged as Partial<UpstreamServerConfig>;
+}
+
+/**
+ * Insert or update a server entry in the user-global bundles.json. An
  * existing entry matches by namespace OR display name -- the name fallback
  * mirrors the app's deduper (yaw-install-handler.ts doInstall) so a server
  * added on the other path (e.g. a legacy entry written without a namespace)
- * isn't duplicated. Atomic write. Returns the path written and whether an
- * existing entry was replaced (vs a fresh add).
+ * isn't duplicated. An existing entry is UPDATED, not overwritten: see
+ * mergeServerEntry for exactly what survives. Atomic write.
+ *
+ * Returns the path written, whether an existing entry was updated (vs a fresh
+ * add), and the entry AS WRITTEN -- callers that report what landed on disk
+ * (`add --json`, the ambient-env note) must describe the merged result, not
+ * the pre-merge input they handed in.
  *
  * Serialized via bundleWriteChain so concurrent calls don't lose writes.
  */
 export function upsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string } = {},
-): Promise<{ path: string; replaced: boolean }> {
+): Promise<{ path: string; replaced: boolean; entry: Partial<UpstreamServerConfig> }> {
   const result = bundleWriteChain.then(() => doUpsertUserBundle(entry, opts));
   bundleWriteChain = result.then(
     () => undefined,
@@ -747,7 +838,7 @@ export function upsertUserBundle(
 async function doUpsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string },
-): Promise<{ path: string; replaced: boolean }> {
+): Promise<{ path: string; replaced: boolean; entry: Partial<UpstreamServerConfig> }> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
   const file = await readRawUserBundles(home);
@@ -755,8 +846,9 @@ async function doUpsertUserBundle(
     (s) => s?.namespace === entry.namespace || (entry.name != null && s?.name === entry.name),
   );
   const replaced = idx >= 0;
-  if (replaced) file.servers[idx] = entry;
-  else file.servers.push(entry);
+  const written = replaced ? mergeServerEntry(file.servers[idx] ?? {}, entry) : entry;
+  if (replaced) file.servers[idx] = written;
+  else file.servers.push(written);
   // Preserve a newer on-disk schema version rather than downgrading it; only
   // stamp CURRENT when the file had none (readRawUserBundles guarantees a
   // numeric version when the file existed, so this only fills the fresh case).
@@ -772,7 +864,7 @@ async function doUpsertUserBundle(
       // chmod not supported on this filesystem; not fatal.
     }
   }
-  return { path, replaced };
+  return { path, replaced, entry: written };
 }
 
 /**

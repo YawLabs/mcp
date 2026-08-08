@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -14,7 +23,8 @@ import {
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
-import { MIN_OAM_VERSION } from "../oam-spawn.js";
+import { parseJsonc } from "../jsonc.js";
+import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -269,12 +279,71 @@ describe("mergePermissionsAllow", () => {
 
 /** Deterministic oam seams. `runInstall` probes the real machine by default,
  *  so a maintainer with oam + a global @yawlabs/mcp would get an oam entry
- *  where CI gets npx -- these pin the world each test means to assert. */
-const OAM_ABSENT = async () => ({ bin: null, version: null, belowMin: false });
+ *  where CI gets npx -- these pin the world each test means to assert.
+ *
+ *  Annotated `Promise<OamProbe>` deliberately: a fixture built from an
+ *  un-annotated object literal drifts silently when the probe gains a field,
+ *  and `binPath` is exactly the field whose absence let a bare-name entry ship. */
+const OAM_ABSENT = async (): Promise<OamProbe> => ({
+  bin: null,
+  binPath: null,
+  version: null,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
 // Derived from the constant, not pinned: MIN_OAM_VERSION tracks the latest oam
 // release and so moves every release. A hardcoded version here would silently
 // become a below-min build that the fixture still claims is usable.
-const OAM_PRESENT = async () => ({ bin: "/usr/local/bin/oam", version: MIN_OAM_VERSION, belowMin: false });
+const OAM_PRESENT = async (): Promise<OamProbe> => ({
+  bin: "/usr/local/bin/oam",
+  binPath: "/usr/local/bin/oam",
+  version: MIN_OAM_VERSION,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
+/** The shape the REAL probe returns without OAM_BIN: a bare spawnable name,
+ *  resolved to an absolute path against PATH x PATHEXT. Every fixture used to
+ *  pass an absolute `bin`, which is why the bare-name entry shipped untested. */
+const OAM_BARE_RESOLVED = async (): Promise<OamProbe> => ({
+  bin: "oam",
+  binPath: "/home/j/.oam/bin/oam",
+  version: MIN_OAM_VERSION,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
+/** Bare name that PATH could not locate as a file (a shell function, an alias,
+ *  a sanitized child env). Usable here, not persistable anywhere. */
+const OAM_BARE_UNRESOLVED = async (): Promise<OamProbe> => ({
+  bin: "oam",
+  binPath: null,
+  version: MIN_OAM_VERSION,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
+// Safe to hardcode below-min, unlike the usable fixtures above: MIN_OAM_VERSION
+// only ever moves forward, so a version below today's floor stays below it.
+const OAM_BELOW_MIN = async (): Promise<OamProbe> => ({
+  bin: null,
+  binPath: null,
+  version: "0.8.2",
+  belowMin: true,
+  failure: null,
+  failureDetail: null,
+});
+/** Present on disk but unusable -- distinct from absent, which is why the probe
+ *  carries `failure` at all. */
+const OAM_BROKEN = async (): Promise<OamProbe> => ({
+  bin: null,
+  binPath: null,
+  version: null,
+  belowMin: false,
+  failure: "timeout",
+  failureDetail: "oam --version timed out after 3000ms",
+});
 const OAM_ENTRY = "/opt/nm/@yawlabs/mcp/dist/index.js";
 
 describe("runInstall — settings.json merge edge cases (claude-code)", () => {
@@ -297,6 +366,7 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
 
@@ -320,6 +390,7 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     // settings.json not listed as written because no change was needed.
@@ -341,6 +412,7 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     // Settings patch is best-effort, so the install itself still succeeds.
     expect(r.exitCode).toBe(0);
@@ -376,6 +448,7 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     // Settings patch is best-effort, so the install itself still succeeds
     // (no throw, exit 0).
@@ -401,6 +474,7 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
@@ -451,6 +525,7 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry remains/);
@@ -474,6 +549,7 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       home: synthHome,
       dryRun: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry .* would remain/);
@@ -500,6 +576,7 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       home: synthHome,
       skip: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.stdout()).not.toMatch(/legacy "mcp\.hosting"/);
@@ -523,6 +600,12 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
         home: synthHome,
         claudeConfigDir: wrapperDir,
         io: cap.io,
+        // Pins the npx assertion below. Without the seam this calls the real
+        // probeOam (a live `oam --version` spawn) plus the real
+        // resolveStableNpmEntry, so the entry depends on the machine: it passes
+        // from a repo checkout only because there is no node_modules segment in
+        // import.meta.url, and fails from an installed copy on a box with oam.
+        oamProbe: OAM_ABSENT,
       });
       expect(r.exitCode).toBe(0);
 
@@ -563,6 +646,7 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
         projectDir: synthCwd,
         claudeConfigDir: wrapperDir,
         io: cap.io,
+        oamProbe: OAM_ABSENT,
       });
       expect(r.exitCode).toBe(0);
 
@@ -589,6 +673,7 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
       home: synthHome,
       claudeConfigDir: "",
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
@@ -624,6 +709,7 @@ describe("runInstall — VS Code servers shape", () => {
       home: synthHome,
       projectDir: synthCwd,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthCwd, ".vscode", "mcp.json"), "utf8"));
@@ -645,6 +731,7 @@ describe("runInstall — preserves existing entries", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -667,6 +754,7 @@ describe("runInstall — collision handling", () => {
       os: "linux",
       home: synthHome,
       io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/already has/);
@@ -688,10 +776,35 @@ describe("runInstall — collision handling", () => {
       home: synthHome,
       force: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+  });
+
+  it("--dry-run on a collision says `Would overwrite`, not `Overwriting`", async () => {
+    // dryRun maps onto decision="overwrite" so the collision path is exercised,
+    // but the run returns before any write. The present-tense line told a user
+    // scanning the transcript that their preview had already mutated the file.
+    const initial = JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2);
+    writeFileSync(join(synthHome, ".claude.json"), initial);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain(`Would overwrite existing "${ENTRY_NAME}" entry.`);
+    expect(cap.stdout()).not.toContain(`Overwriting existing "${ENTRY_NAME}" entry.`);
+    expect(r.written).toEqual([]);
+    // And the claim is true: the file is byte-identical.
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
   });
 
   it("--skip leaves existing entry untouched", async () => {
@@ -707,6 +820,7 @@ describe("runInstall — collision handling", () => {
       home: synthHome,
       skip: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -728,6 +842,7 @@ describe("runInstall — collision handling", () => {
       home: synthHome,
       promptAnswer: "overwrite",
       io: { ...cap.io, isTTY: true },
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -745,6 +860,7 @@ describe("runInstall — malformed existing JSON", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/not valid JSON/);
@@ -765,6 +881,7 @@ describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
       home: synthHome,
       token: "mcp_pat_scripted_aaaa",
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.stderr()).toContain(TOKEN_FLAG_DEPRECATION);
@@ -791,6 +908,7 @@ describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
       home: synthHome,
       skipYawMcpConfig: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.stderr()).toContain(NO_CONFIG_FLAG_DEPRECATION);
@@ -810,6 +928,7 @@ describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
       home: synthHome,
       token: "mcp_pat_new_bbbb",
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     // Byte-identical: no rewrite, no rotation, and no `.bak-*` sibling.
@@ -825,6 +944,7 @@ describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
       home: synthHome,
       token: "mcp_pat_all_aaaa",
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     const hits = cap.stderr().split(TOKEN_FLAG_DEPRECATION).length - 1;
@@ -837,7 +957,13 @@ describe("runInstall — deprecated --token / --no-yaw-mcp-config", () => {
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const cap = captureIo();
-    const r = await runInstall({ ...parsed.options, os: "linux", home: synthHome, io: cap.io });
+    const r = await runInstall({
+      ...parsed.options,
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
     expect(r.exitCode).toBe(0);
   });
 });
@@ -852,6 +978,7 @@ describe("runInstall — --dry-run", () => {
       home: synthHome,
       dryRun: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
@@ -873,6 +1000,7 @@ describe("runInstall — --dry-run", () => {
       token: "mcp_pat_super_secret_value",
       dryRun: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     // Nothing renders the token any more -- the config.json dump is gone.
@@ -1051,6 +1179,7 @@ describe("runInstall --all", () => {
       cwd: synthCwd,
       all: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     // Claude Code user → ~/.claude.json exists.
@@ -1092,6 +1221,7 @@ describe("runInstall --all", () => {
       cwd: synthCwd,
       all: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/client install.*failed/);
@@ -1114,6 +1244,7 @@ describe("runInstall --all", () => {
       cwd: synthCwd,
       all: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(1);
     const stderr = cap.stderr();
@@ -1140,6 +1271,7 @@ describe("runInstall --all", () => {
       all: true,
       force: true,
       io: cap.io,
+      oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.stderr()).not.toMatch(/stdin is not a TTY/);
@@ -1172,6 +1304,154 @@ describe("runInstall — oam launch entry", () => {
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("/usr/local/bin/oam");
     expect(client.mcpServers[ENTRY_NAME].args).toEqual(["run", "--no-check", OAM_ENTRY]);
+  });
+
+  it("persists the absolute binPath, never the bare name the probe spawns", async () => {
+    // The regression the whole binPath split exists for. `bin` is "oam" without
+    // OAM_BIN -- correct to spawn from a shell-launched CLI, fatal to persist:
+    // Claude Desktop launched from the Dock has no ~/.oam/bin on PATH, so the
+    // broker ENOENTs with no fallback and doctor exempts non-absolute commands.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_BARE_RESOLVED,
+      resolveOamEntry: () => OAM_ENTRY,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("/home/j/.oam/bin/oam");
+    expect(client.mcpServers[ENTRY_NAME].command).not.toBe("oam");
+    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["run", "--no-check", OAM_ENTRY]);
+  });
+
+  it("stays on npx, and says why, when oam runs but has no persistable path", async () => {
+    // oam works in THIS process and yaw-mcp is durably installed -- both halves
+    // the old check looked at. There is still nothing portable to write, so npx
+    // wins, and the user gets told rather than left with a silent downgrade.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_BARE_UNRESOLVED,
+      resolveOamEntry: () => OAM_ENTRY,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+    const out = r.messages.join(" ");
+    expect(out).toMatch(/absolute path could not be resolved/);
+    expect(out).toContain("OAM_BIN");
+  });
+
+  it("explains a below-min oam instead of printing the oam-absent output", async () => {
+    // Before this, a below-min oam took the same branch as no oam at all and
+    // said nothing -- byte-identical human output for two different machines.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_BELOW_MIN,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+    const out = r.messages.join(" ");
+    // Both versions, so "upgrade oam" is actionable without a second command.
+    expect(out).toContain("0.8.2");
+    expect(out).toContain(MIN_OAM_VERSION);
+  });
+
+  it("distinguishes a broken oam from an absent one", async () => {
+    const broken = captureIo();
+    const withBroken = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: broken.io,
+      oamProbe: OAM_BROKEN,
+    });
+    expect(withBroken.exitCode).toBe(0);
+    const brokenOut = withBroken.messages.join(" ");
+    expect(brokenOut).toMatch(/installed but unusable/);
+    expect(brokenOut).toContain("did not answer in time");
+
+    // Absence stays silent by design: there is nothing for the user to fix, and
+    // a Runtime line on every npx install would be noise. This is the contrast
+    // that makes the branches above worth having.
+    const absentHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-absent-"));
+    try {
+      const absent = captureIo();
+      const withAbsent = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: absentHome,
+        io: absent.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(withAbsent.exitCode).toBe(0);
+      expect(withAbsent.messages.join(" ")).not.toMatch(/Runtime:/);
+    } finally {
+      rmSync(absentHome, { recursive: true, force: true });
+    }
+  });
+
+  it("warns when the durable entry is a project-local node_modules", async () => {
+    // resolveStableNpmEntry calls any non-_npx hit durable, including a repo's
+    // own node_modules -- and this config is machine-global, so an `rm -rf
+    // node_modules` weeks later kills the broker in every project at once.
+    // Built with path.join so the fixture matches the runner's separators.
+    const projectEntry = join(synthCwd, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_PRESENT,
+      resolveOamEntry: () => projectEntry,
+    });
+    expect(r.exitCode).toBe(0);
+    // The entry is still written -- this is a note, not a refusal.
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].args).toEqual(["run", "--no-check", projectEntry]);
+    const out = r.messages.join(" ");
+    expect(out).toMatch(/project-local install/);
+    expect(out).toContain("npm i -g @yawlabs/mcp");
+  });
+
+  it("does not warn when the durable entry is a global install", async () => {
+    const globalHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-global-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: globalHome,
+        cwd: synthCwd,
+        io: cap.io,
+        oamProbe: OAM_PRESENT,
+        resolveOamEntry: () => "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.messages.join(" ")).not.toMatch(/project-local/);
+    } finally {
+      rmSync(globalHome, { recursive: true, force: true });
+    }
   });
 
   it("stays on npx when oam is present but nothing durable resolves", async () => {
@@ -1218,6 +1498,238 @@ describe("runInstall — oam launch entry", () => {
     expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/custom/oam" });
     // and the command was still refreshed -- preservation must not freeze the entry
     expect(client.mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcp@latest"]);
+  });
+});
+
+describe("runInstall — preserves the user's bytes and perms", () => {
+  it("keeps comments in a pre-existing client config instead of flattening it", async () => {
+    // `.vscode/mcp.json` is documented JSONC and its `inputs` array is
+    // routinely commented; ~/.claude.json carries user comments too. install
+    // used to read-modify-write through JSON.parse + JSON.stringify, deleting
+    // every one of them with no warning -- while `yaw-mcp try`, writing the
+    // SAME files, preserved them.
+    const clientPath = join(synthHome, ".claude.json");
+    const original = [
+      "{",
+      "  // keep me: pinned for the design review",
+      '  "model": "claude-opus-4-7",',
+      '  "mcpServers": {',
+      "    /* the spend server is scoped to the finance workspace */",
+      '    "spend": { "url": "https://x" }',
+      "  }",
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(clientPath, original, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const after = readFileSync(clientPath, "utf8");
+    expect(after).toContain("// keep me: pinned for the design review");
+    expect(after).toContain("/* the spend server is scoped to the finance workspace */");
+    // ...and the entry actually landed, next to what was already there.
+    const parsed = parseJsonc(after) as {
+      model: string;
+      mcpServers: Record<string, unknown>;
+    };
+    expect(parsed.model).toBe("claude-opus-4-7");
+    expect(parsed.mcpServers.spend).toEqual({ url: "https://x" });
+    expect(parsed.mcpServers[ENTRY_NAME]).toBeDefined();
+  });
+
+  it("keeps comments in settings.json when patching permissions.allow", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    const original = [
+      "{",
+      "  // team baseline -- do not reorder",
+      '  "permissions": { "allow": ["Bash(git *)"] }',
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(settingsPath, original, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const after = readFileSync(settingsPath, "utf8");
+    expect(after).toContain("// team baseline -- do not reorder");
+    const allow = (parseJsonc(after) as { permissions: { allow: string[] } }).permissions.allow;
+    expect(allow).toEqual(["Bash(git *)", CLAUDE_CODE_ALLOW_PATTERN]);
+  });
+
+  // POSIX-only: Windows does not carry these mode bits.
+  it.skipIf(process.platform === "win32")(
+    "does not widen an owner-only client config to the umask default",
+    async () => {
+      // atomicWriteFile renames a NEW inode over the target, so install used to
+      // hand a 0600 ~/.claude.json back at 0644 -- including one `yaw-mcp try`
+      // had chmod'd 0600 because it holds an inline API key, which install then
+      // rewrites (it deliberately carries a prior entry's env forward).
+      const clientPath = join(synthHome, ".claude.json");
+      writeFileSync(
+        clientPath,
+        JSON.stringify({ mcpServers: { "yaw-mcp-try-demo": { command: "npx", env: { API_KEY: "s" } } } }),
+        { mode: 0o600 },
+      );
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: synthHome,
+        force: true,
+        io: cap.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+      // The secret-bearing trial entry is still in the file it was protecting.
+      const client = JSON.parse(readFileSync(clientPath, "utf8"));
+      expect(client.mcpServers["yaw-mcp-try-demo"].env.API_KEY).toBe("s");
+    },
+  );
+});
+
+describe("runInstall — legacy allow-pattern stripping", () => {
+  function seedSettings(allow: string[]): string {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow } }), "utf8");
+    return settingsPath;
+  }
+
+  it("keeps mcp__yaw_mcp__* while the legacy `yaw-mcp` entry is still wired", async () => {
+    // install does NOT remove the legacy mcpServers entry -- it only warns
+    // that it "remains". Stripping its allow-pattern in the same run revoked
+    // a still-running server's grant, so Claude Code re-prompted on every one
+    // of its tool calls until the user deleted the entry by hand.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "yaw-mcp": { command: "npx", args: ["-y", "@yawlabs/mcp"] } } }),
+      "utf8",
+    );
+    const settingsPath = seedSettings(["Bash(git *)", "mcp__yaw_mcp__*"]);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    // The warning still fires -- the entry is what should go, not the grant.
+    expect(cap.stdout()).toMatch(/legacy "yaw-mcp" entry remains/);
+    const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
+      .allow;
+    expect(allow).toContain("mcp__yaw_mcp__*");
+    expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+
+  it("strips mcp__yaw_mcp__* once the legacy entry is gone", async () => {
+    // Nothing can match the wildcard any more, so it is genuinely dead and
+    // should not accumulate forever.
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }), "utf8");
+    const settingsPath = seedSettings(["Bash(git *)", "mcp__yaw_mcp__*"]);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
+      .allow;
+    expect(allow).not.toContain("mcp__yaw_mcp__*");
+    expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+});
+
+describe("runInstall — cwd override drives project-scope writes", () => {
+  it("resolves project scope against opts.cwd, not process.cwd()", async () => {
+    // `cwd` is documented as the cwd override and --list honors it, but the
+    // write path read process.cwd() directly -- so a call that looked hermetic
+    // created .vscode/mcp.json in whatever directory the runner was in.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "vscode",
+      scope: "project",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(synthCwd, ".vscode", "mcp.json"))).toBe(true);
+    expect(r.written).toContain(join(synthCwd, ".vscode", "mcp.json"));
+  });
+});
+
+describe("runInstall — returned messages match what was printed", () => {
+  it("--all carries the deprecation notice and the aggregate lines, not just the sub-installs", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      all: true,
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_all_aaaa",
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const trail = r.messages.join("\n");
+    // Emitted by the --all layer itself; a second, locally-built array dropped
+    // every one of these while the user saw them all on stdout/stderr.
+    expect(trail).toContain(TOKEN_FLAG_DEPRECATION);
+    expect(trail).toMatch(/Installing into \d+ clients?…/);
+    expect(trail).toContain("── claude-code (user) ──");
+    expect(trail).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
+    // ...and still carries each sub-install's own trail.
+    expect(trail).toContain(`Wrote ${join(synthHome, ".claude.json")}`);
+  });
+
+  it("--list carries the deprecation notice alongside the table", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      listOnly: true,
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_list_aaaa",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const trail = r.messages.join("\n");
+    expect(trail).toContain(TOKEN_FLAG_DEPRECATION);
+    expect(trail).toContain("CLIENT");
   });
 });
 

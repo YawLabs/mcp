@@ -154,6 +154,36 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].runtime).toBeUndefined();
   });
 
+  it("propagates a per-server connectTimeoutMs from bundles.json", async () => {
+    // validateEntry returns a fixed whitelist, so a field missing from it is
+    // dropped at load. bundles.json is the only server source, and nothing else
+    // injects this one -- so without it in the whitelist the knob
+    // connectToUpstream reads is unreachable and a slow server keeps failing
+    // the handshake at the default ceiling with no sign the setting was ignored.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "slow", name: "Slow", command: "npx", args: ["-y", "slow-mcp"], connectTimeoutMs: 60000 }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].connectTimeoutMs).toBe(60000);
+  });
+
+  it("drops a non-positive or non-numeric connectTimeoutMs", async () => {
+    // upstream ignores anything <= 0 and falls back to its default; dropping the
+    // value here keeps a typo from reading as configured downstream (doctor, the
+    // reconcile comparison in server.ts).
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "zero", name: "Zero", command: "npx", args: ["-y", "a"], connectTimeoutMs: 0 },
+        { namespace: "neg", name: "Neg", command: "npx", args: ["-y", "b"], connectTimeoutMs: -5 },
+        { namespace: "str", name: "Str", command: "npx", args: ["-y", "c"], connectTimeoutMs: "60000" },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers.map((s) => s.connectTimeoutMs)).toEqual([undefined, undefined, undefined]);
+  });
+
   it("surfaces a top-level defaultRuntime", async () => {
     writeBundles(synthHome, {
       version: 1,
@@ -638,6 +668,64 @@ describe("defaultRuntime round-trip through the write path", () => {
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.defaultRuntime).toBe("oam");
     expect(r.config?.servers).toEqual([]);
+  });
+});
+
+// An upsert onto an EXISTING slot is a partial update, not a slot swap: the
+// caller (`yaw-mcp add`) rebuilds its entry from the catalog every time, so a
+// wholesale replace silently destroyed state only the user could have put
+// there. See mergeServerEntry.
+describe("upsertUserBundle merges onto the stored entry", () => {
+  const stored = (): Record<string, unknown> =>
+    (
+      JSON.parse(readFileSync(localBundlesPath(join(synthHome, CONFIG_DIRNAME)), "utf8")).servers as Array<
+        Record<string, unknown>
+      >
+    )[0];
+
+  it("merges env per key and never blanks a stored value with an empty one", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "gh", name: "GH", command: "npx", env: { TOKEN: "secret", OTHER: "keep" } }],
+    });
+    const res = await upsertUserBundle(
+      { namespace: "gh", name: "GH", command: "npx", args: ["-y", "new"], env: { TOKEN: "", ADDED: "v" } },
+      { home: synthHome },
+    );
+    expect(res.replaced).toBe(true);
+    expect(stored().env).toEqual({ TOKEN: "secret", OTHER: "keep", ADDED: "v" });
+    // The result reports what actually landed, so callers can describe the file.
+    expect((res.entry.env as Record<string, string>).TOKEN).toBe("secret");
+    expect(res.entry.args).toEqual(["-y", "new"]);
+  });
+
+  it("does not re-enable an entry the user explicitly disabled", async () => {
+    writeBundles(synthHome, { version: 1, servers: [{ namespace: "gh", name: "GH", isActive: false }] });
+    await upsertUserBundle({ namespace: "gh", name: "GH", command: "npx", isActive: true }, { home: synthHome });
+    expect(stored().isActive).toBe(false);
+    // An explicit false still disables an enabled entry.
+    writeBundles(synthHome, { version: 1, servers: [{ namespace: "x", name: "X", isActive: true }] });
+    await upsertUserBundle({ namespace: "x", name: "X", isActive: false }, { home: synthHome });
+    expect(stored().isActive).toBe(false);
+  });
+
+  it("keeps fields the incoming entry says nothing about, and reports a fresh add", async () => {
+    const res = await upsertUserBundle(
+      { namespace: "solo", name: "Solo", command: "npx", isActive: true },
+      { home: synthHome },
+    );
+    expect(res.replaced).toBe(false);
+    expect(res.entry.namespace).toBe("solo");
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "gh", name: "GH", command: "old", runtime: "oam", connectTimeoutMs: 60000, mine: 1 }],
+    });
+    await upsertUserBundle({ namespace: "gh", name: "GH", command: "npx" }, { home: synthHome });
+    const e = stored();
+    expect(e.command).toBe("npx");
+    expect(e.runtime).toBe("oam");
+    expect(e.connectTimeoutMs).toBe(60000);
+    expect(e.mine).toBe(1);
   });
 });
 
