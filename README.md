@@ -281,6 +281,7 @@ Common ones (run `yaw-mcp --help` for the full list):
 | `YAW_MCP_AUTO_UPGRADE` | `0` disables the background self-upgrade check at startup. Default on. |
 | `YAW_MCP_AUTO_LOAD` | `1` pre-activates the top recurring pack at startup (needs persistence). Default off. |
 | `YAW_MCP_PRUNE_RESPONSES` | `0` disables response pruning. Default on. |
+| `YAW_MCP_IDLE_THRESHOLD` | Non-matching tool calls a loaded server tolerates before it is unloaded. Default `10`; bursty servers earn more patience automatically. The older name `MCP_CONNECT_IDLE_THRESHOLD` still works as a fallback. |
 | `YAW_MCP_DISABLE_PERSISTENCE` | `1` keeps learning + pack history process-scoped (CI, containers). Default off. |
 | `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error`. Default `info`. |
 

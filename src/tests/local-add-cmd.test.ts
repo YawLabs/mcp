@@ -449,6 +449,56 @@ describe("runAdd re-add preserves user state", () => {
     expect(entry.args).toEqual(["-y", "@yawlabs/fetch-mcp"]);
   });
 
+  it("says the entry stays disabled instead of telling the user to restart", async () => {
+    // Preserving isActive:false (above) makes the usual "Restart your MCP
+    // client to pick it up" line actively wrong: a disabled entry never
+    // loads, so the user restarts, sees nothing, and has no reason to
+    // suspect the file. There is no `enable` verb, so the note must name the
+    // edit that turns it on.
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          { id: "local-fetch", namespace: "fetch", name: "Fetch", type: "local", command: "npx", isActive: false },
+        ],
+      }),
+    );
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/stays disabled and will NOT load/);
+    expect(io.text()).not.toMatch(/Restart your MCP client/);
+  });
+
+  it("still tells the user to restart when the entry is enabled", async () => {
+    // Counterweight: the note above must not swallow the normal line, or
+    // every ordinary add loses its only next-step instruction.
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Restart your MCP client/);
+    expect(io.text()).not.toMatch(/stays disabled/);
+  });
+
   it("still writes isActive:true on a FRESH add", async () => {
     await runAdd({
       slug: "fetch",

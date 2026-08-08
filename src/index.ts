@@ -281,6 +281,12 @@ if (subcommand === "compliance") {
                                stale global installs are upgraded in the
                                background -- npm, pnpm, and bun globals alike).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
+    YAW_MCP_IDLE_THRESHOLD        Non-matching tool calls a loaded server
+                               tolerates before it is unloaded (default 10).
+                               Bursty servers earn more patience on top of
+                               this. The older name
+                               MCP_CONNECT_IDLE_THRESHOLD is still read as a
+                               fallback.
     YAW_MCP_DEFAULT_RUNTIME       Default runtime for local node/npx servers
                                (\`oam\` or \`node\`). Servers without a per-
                                server \`runtime\` use this; per-server

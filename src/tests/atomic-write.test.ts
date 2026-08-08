@@ -133,6 +133,50 @@ describe("atomicWriteFile", () => {
     expect(chmoddedPaths()).toEqual([]);
   });
 
+  it("re-chmods a preserved mode the umask would have masked (0o664)", async () => {
+    // The 0o600 case above proves chmod is CALLED but not that it changes the
+    // outcome: a 0o022 umask leaves 0o600 untouched, so deleting the chmod
+    // would still produce the right file. 0o664 is the mode that actually
+    // needs it -- writeFile's mode is umask-masked, so the tmp file is born
+    // 0o644 and only the chmod restores the group-write bit the target had.
+    // Without this case the chmod's whole purpose lives in a comment.
+    const file = join(dir, "group-writable.json");
+    writeFileSync(file, '{"a":1}', "utf8");
+    await asPosix(async () => {
+      vi.mocked(stat).mockResolvedValueOnce({ mode: 0o100664 } as unknown as Stats);
+      await atomicWriteFile(file, '{"a":2}');
+    });
+    expect(readFileSync(file, "utf8")).toBe('{"a":2}');
+    // Requested at birth...
+    expect(birthOptions(file)).toEqual({ encoding: "utf8", mode: 0o664 });
+    // ...and pinned back afterwards, which is the half umask cannot undo.
+    expect(vi.mocked(chmod).mock.calls[0]?.[1]).toBe(0o664);
+  });
+
+  it("still publishes a no-wider file when chmod on the tmp file fails", async () => {
+    // Reachable in production: FAT/exFAT and some network mounts reject chmod
+    // outright. The swallow is deliberate, and it is only safe because the tmp
+    // file was already BORN at the preserved mode -- so the published file is
+    // never wider than the target it replaced, it just may be narrower than
+    // intended under a hostile umask. Nothing asserted that invariant, so a
+    // future reordering (chmod before writeFile, or a birthMode of undefined)
+    // would turn this catch into a silent permission widening.
+    const file = join(dir, "chmod-hostile.json");
+    writeFileSync(file, '{"token":"x"}', "utf8");
+    await asPosix(async () => {
+      vi.mocked(stat).mockResolvedValueOnce({ mode: 0o100600 } as unknown as Stats);
+      vi.mocked(chmod).mockRejectedValueOnce(new Error("EPERM: operation not permitted, chmod"));
+      // The rejection must not surface -- the write itself succeeded.
+      await atomicWriteFile(file, '{"token":"y"}');
+    });
+    expect(readFileSync(file, "utf8")).toBe('{"token":"y"}');
+    // The load-bearing part: birth mode already equalled the preserved mode,
+    // so losing the chmod cannot widen anything.
+    expect(birthOptions(file)).toEqual({ encoding: "utf8", mode: 0o600 });
+    // And no orphan tmp file was left behind by the swallowed failure.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
   it("gives concurrent same-path writes distinct tmp files instead of one shared one", async () => {
     // pid+ms alone is not unique WITHIN a process: two overlapping calls in the
     // same millisecond shared a tmp path, and writeFile opens with 'w', so

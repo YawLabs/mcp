@@ -252,7 +252,19 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     print(JSON.stringify({ ok: true, namespace, path: res.path, replaced: res.replaced, entry: written }, null, 2));
   } else {
     print(`${res.replaced ? "Updated" : "Added"} ${server.name} (namespace "${namespace}") in ${res.path}`);
-    print("Restart your MCP client (or yaw-mcp) to pick it up.");
+    // A re-add folds onto a stored `"isActive": false` instead of silently
+    // re-enabling it (mergeServerEntry rule 3). That is deliberate, but it
+    // makes the usual "restart to pick it up" line WRONG: a disabled entry
+    // never loads, so the user restarts, sees nothing, and has no reason to
+    // suspect the file. There is no `enable` verb to point at, so name the
+    // edit that actually turns it on.
+    if (written.isActive === false) {
+      print(
+        `Note: this entry is "isActive": false in ${res.path}, so it stays disabled and will NOT load. Set it to true there to enable it.`,
+      );
+    } else {
+      print("Restart your MCP client (or yaw-mcp) to pick it up.");
+    }
   }
 
   // Required keys that passed the gate but landed on disk EMPTY: the value came
