@@ -2,11 +2,11 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## 0.74.2 -- the oam floor moves to 0.8.3, and a full-pass sweep of the runtime
+## 0.74.2 -- the oam floor moves to 0.9.0, and a full-pass sweep of the runtime
 
-**Changed -- the oam floor moves to 0.8.3**
+**Changed -- the oam floor moves to 0.9.0**
 
-`MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.8.3 is now current. A machine running oam 0.8.2 falls back to node/npx with one warning naming both versions and the command that fixes it (`oam self-update`), and `doctor` reports `installed (v0.8.2) -- below min 0.8.3; IGNORED, servers run on node`. That is the documented trade: an aggressive floor costs a fallback, a lax one silently hosts production sidecars on a runtime nobody else is running.
+`MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.9.0 is now current. A machine running an older oam falls back to node/npx with one warning naming both versions and the command that fixes it (`oam self-update`), and `doctor` reports `installed (v0.8.3) -- below min 0.9.0; IGNORED, servers run on node`. That is the documented trade: an aggressive floor costs a fallback, a lax one silently hosts production sidecars on a runtime nobody else is running.
 
 **Fixed -- `--help` described the opposite of the shipped default**
 

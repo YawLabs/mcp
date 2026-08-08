@@ -180,7 +180,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.8.3";
+export const MIN_OAM_VERSION = "0.9.0";
 
 /** One "oam is missing" warning per process, not one per opted-in server.
  *  Cleared by resetOamBinCache so tests do not leak it across cases. */

@@ -254,6 +254,34 @@ describe("defaultFetchCatalog", () => {
     );
   });
 
+  it("names the catalog, the URL and the cause when the fetch itself cannot connect", async () => {
+    // The most common failure this function has -- offline, DNS, connection
+    // refused, TLS, a proxy that drops the connection -- and the one mode the
+    // wrapping above did not cover. undici reports every one as a bare
+    // `TypeError: fetch failed` with the real reason on `cause`, so `yaw-mcp
+    // add fetch` on a laptop with no network printed exactly
+    // "yaw-mcp add: fetch failed": no URL, no catalog, no next step.
+    const transport = new TypeError("fetch failed");
+    (transport as Error & { cause?: unknown }).cause = new Error("connect ECONNREFUSED 127.0.0.1:9");
+    stubFetch(async () => {
+      throw transport;
+    });
+    await expect(defaultFetchCatalog("https://cat.example/c.json")).rejects.toThrow(
+      /could not reach the Yaw MCP catalog at https:\/\/cat\.example\/c\.json \(connect ECONNREFUSED/,
+    );
+  });
+
+  it("does not re-wrap an error it already prefixed", async () => {
+    // The transport branch is discriminated by whether the message already
+    // carries the url, so an HTTP-status failure must pass through untouched
+    // rather than coming back as "could not reach ... (the Yaw MCP catalog
+    // at ... returned HTTP 500.)".
+    stubFetch(async () => ({ ok: false, status: 500, json: async () => ({}) }));
+    await expect(defaultFetchCatalog("https://cat.example/c.json")).rejects.toThrow(
+      /^the Yaw MCP catalog at https:\/\/cat\.example\/c\.json returned HTTP 500\.$/,
+    );
+  });
+
   it("still reports an abort DURING the body read as a timeout, not a parse failure", async () => {
     stubFetch(async () => ({
       ok: true,
