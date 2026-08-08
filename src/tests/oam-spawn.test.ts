@@ -554,12 +554,18 @@ describe("resolveNpmEntry", () => {
   // and each is refreshed by a different command, so naming the wrong one is
   // worse than saying nothing.
 
-  /** Pinned-sidecar notices the logger put on stderr while `fn` ran, PARSED.
+  /** Pinned-sidecar notices the logger put on stderr while `fn` ran, PARSED,
+   *  and excluding debug.
+   *
    *  Parsed rather than substring-matched because the envelope is JSON, so a
    *  Windows path arrives backslash-escaped and no raw `toContain(dir)` would
-   *  ever match on the platform most likely to have one. Debug lines never
-   *  reach stderr at the default LOG_LEVEL, so an empty result means "said
-   *  nothing at info". */
+   *  ever match on the platform most likely to have one.
+   *
+   *  Debug is filtered EXPLICITLY rather than relied on being suppressed by
+   *  the default LOG_LEVEL: process.env is process-wide and a sibling file
+   *  raises the level to assert the managed notice, so under worker reuse the
+   *  suppression is not guaranteed. Filtering here makes "empty" mean "said
+   *  nothing at info" by construction instead of by scheduling luck. */
   function captureNotices(fn: () => void): Array<Record<string, unknown>> {
     resetPinnedSidecarLog();
     const chunks: string[] = [];
@@ -577,7 +583,7 @@ describe("resolveNpmEntry", () => {
       .split("\n")
       .filter((l) => l.trim().length > 0)
       .map((l) => JSON.parse(l) as Record<string, unknown>)
-      .filter((e) => String(e.msg ?? "").includes("will not self-update"));
+      .filter((e) => String(e.msg ?? "").includes("will not self-update") && e.level !== "debug");
   }
 
   function writeResolvablePkg(nodeModules: string, version: string): void {

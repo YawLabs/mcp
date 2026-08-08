@@ -16,13 +16,24 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Set BEFORE the dynamic import below. A static import of oam-spawn would pull
 // logger.ts in during hoisting, i.e. before this line ever runs.
+const priorLogLevel = process.env.LOG_LEVEL;
 process.env.LOG_LEVEL = "debug";
 
 const { resetPinnedSidecarLog, resolveNpmEntry } = await import("../oam-spawn.js");
+
+// Put it back. vitest's `isolate` gives each FILE a fresh module registry, not
+// a fresh process.env, so a worker reused for a later file would otherwise
+// inherit debug -- and the sibling oam-spawn.test.ts asserts that the managed
+// notice is SILENT, which is exactly what a leak would break. Ordering makes
+// that flaky rather than reliably red, which is worse.
+afterAll(() => {
+  if (priorLogLevel === undefined) delete process.env.LOG_LEVEL;
+  else process.env.LOG_LEVEL = priorLogLevel;
+});
 
 describe("pinned-sidecar notice at debug level", () => {
   let root: string;
