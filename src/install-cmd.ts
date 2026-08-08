@@ -116,6 +116,33 @@ export interface InstallCommandOptions {
    *  USAGE to stdout and exits 0 -- treated as a successful run, not an
    *  argv error. Keeps `-h` distinguishable from unknown-flag rejections. */
   helpRequested?: boolean;
+  /** Internal, set by `--all`: suppress the oam-is-absent Runtime note so it
+   *  prints once for the run instead of once per client. Same reasoning as the
+   *  `token` / `skipYawMcpConfig` stripping at the --all call site -- a
+   *  machine-level fact restated per client is noise, not diagnosis. */
+  suppressOamAbsentNote?: boolean;
+}
+
+/** The oam-absent Runtime line. Shared so `--all`'s single copy and the
+ *  per-client one cannot drift into two wordings of the same fact.
+ *
+ *  Deliberately NOT "node runs everything": uv/uvx and docker sidecars do not
+ *  run on node either (see uv-bootstrap.ts), so the reassurance has to be about
+ *  the runtime yaw-mcp is choosing between, not about server coverage. */
+function oamAbsentNote(os: InstallOS): string {
+  return (
+    "Runtime: node (oam is not installed, which is fine -- node is the supported default. " +
+    `To host yaw-mcp on oam instead: \`${oamInstallCommand(os)}\`, then re-run install.)`
+  );
+}
+
+/** True when the probe means oam is simply NOT INSTALLED -- both handles null,
+ *  not below-min, no failure. The one Runtime reason that is not a
+ *  misconfiguration, and so the one `--all` consolidates. Mirrors the tail of
+ *  runInstall's reason-chain, which reaches its `else` under exactly these
+ *  conditions. */
+function oamIsAbsent(probe: OamProbe): boolean {
+  return probe.bin === null && probe.binPath === null && !probe.belowMin && probe.failure === null;
 }
 
 export interface InstallResult {
@@ -342,17 +369,18 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
         "re-run install to host yaw-mcp on it.)",
     );
-  } else {
+  } else if (!opts.suppressOamAbsentNote) {
     // Plain absence -- binPath and bin both null, not below-min, no failure --
     // and the ONE branch of this chain that said nothing at all. "Every fallback
     // gets a reason" above was true of the misconfigurations and false of the
     // common case, so a user on a fresh machine got an npx entry with no line
-    // saying an alternative existed. Worded as optional, because it is: node is
-    // the supported runtime and nothing here is broken.
-    log(
-      `Runtime: node (oam is not installed, which is fine -- node runs everything. To host yaw-mcp on oam instead: ` +
-        `\`${oamInstallCommand(os)}\`, then re-run install.)`,
-    );
+    // saying an alternative existed.
+    //
+    // Suppressed under --all, which prints it once for the run: unlike the
+    // branches above -- rare misconfigurations worth restating per client --
+    // absence is a MACHINE-level fact and the common case, so repeating it
+    // across every client is the same noise the collision refusal consolidates.
+    log(oamAbsentNote(os));
   }
   const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
@@ -1185,6 +1213,8 @@ async function runInstallAll(
       // Without this the user gets one notice per client.
       token: undefined,
       skipYawMcpConfig: undefined,
+      // Same consolidation, one line down: printed once after the loop.
+      suppressOamAbsentNote: true,
       clientId: plan.clientId,
       scope: plan.scope,
       io: { ...baseIo, stderr: subStderr },
@@ -1199,6 +1229,14 @@ async function runInstallAll(
     else failed += 1;
     log("");
   }
+
+  // The single copy the per-client suppression above defers to. Probed here
+  // rather than threaded out of the loop because probeOam is cached for the
+  // process lifetime, so this is a cache hit, and the test hook has to be
+  // honoured on this path too or a fixture-driven --all run would consult the
+  // real machine. Only the ABSENT case: every other Runtime reason still prints
+  // per client, where it belongs.
+  if (oamIsAbsent(await (opts.oamProbe ?? probeOam)())) log(oamAbsentNote(os));
 
   if (collisionClients.length > 0) {
     err(

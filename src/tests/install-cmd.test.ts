@@ -1588,6 +1588,32 @@ describe("runInstall — oam launch entry", () => {
     }
   });
 
+  it("prints the oam-absent note ONCE under --all, not once per client", async () => {
+    // Absence is a machine-level fact and the common case, so the per-client
+    // Runtime line would stack up one identical copy per installed client --
+    // the same noise the collision refusal is consolidated to avoid. The other
+    // Runtime reasons are rare misconfigurations and still print per client.
+    const allHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-all-absent-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        all: true,
+        os: "linux",
+        home: allHome,
+        io: cap.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(r.exitCode).toBe(0);
+      const out = r.messages.join("\n");
+      // More than one client must actually have been installed, or this pins
+      // nothing -- a single-client run would read as "once" either way.
+      expect(out.split("──").length - 1).toBeGreaterThan(1);
+      expect(out.split(OAM_INSTALL_SH).length - 1).toBe(1);
+    } finally {
+      rmSync(allHome, { recursive: true, force: true });
+    }
+  });
+
   it("names the windows installer when install is asked about windows", async () => {
     // The install command is selected from the --os the report is ABOUT, never
     // process.platform: a report generated on linux for a windows machine that

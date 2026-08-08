@@ -2,6 +2,18 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.74.3 -- an absent oam says how to install it, and bundled browsers turn out to be hostable
+
+**Added -- the two surfaces that reported an absent oam now say what to do about it**
+
+`doctor`'s OAM RUNTIME section ended at `binary: not installed` -- the one line a reader opens doctor to act on, and the only branch with no command under it, while its below-min and unusable siblings each print a `fix:`. It now prints `install:` underneath. The label is deliberate: node is a full fallback, so nothing is broken and this is not a repair instruction. `yaw-mcp install` had the matching hole -- its runtime reason-chain explained relative-path, not-durably-installed, below-min and unusable, then fell off the end for plain absence, so the common case on a fresh machine got an npx entry with no line saying an alternative existed.
+
+Both name the installer for the platform the report is **about**, not the one it runs on, so `--os windows` hands back the PowerShell one-liner rather than a curl command that machine cannot run. Under `install --all` the note prints once for the run instead of once per client: absence is a machine-level fact and the common case, unlike the rare misconfigurations above it, which still print per client where they belong.
+
+**Changed -- bundled browsers are oam-hostable, and the source said they were not**
+
+The compat note in `oam-spawn.ts` called servers with bundled browsers "not oam-hostable yet" and framed oam as an opt-in tier it stopped being two releases ago. Measured against oam 0.9.0: `@modelcontextprotocol/server-puppeteer` and `@playwright/mcp` each launch a real Chromium and navigate hosted on oam, identical in outcome to the node control. oam 0.9.0 is what changed it -- before that release `child_process` ignored `stdio` entirely, which is exactly the npm bin-shim shape every sidecar launches through, so they booted and then sat mute forever. `MIN_OAM_VERSION` gates that fix in. Native addons (ssh2) are marked unverified rather than promoted to either claim.
+
 ## 0.74.2 -- the oam floor moves to 0.9.0, and a full-pass sweep of the runtime
 
 **Changed -- the oam floor moves to 0.9.0**
