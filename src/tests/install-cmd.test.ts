@@ -324,6 +324,18 @@ const OAM_BARE_UNRESOLVED = async (): Promise<OamProbe> => ({
   failure: null,
   failureDetail: null,
 });
+/** A binPath that PATH resolved to a RELATIVE hit. resolveBinAbsolute joins the
+ *  bin onto each PATH dir in turn, so a PATH carrying `.` or `node_modules/.bin`
+ *  yields a relative path -- which buildLaunchEntry rejects (isAbsolute gate)
+ *  while the probe still reports it as found. */
+const OAM_RELATIVE_BINPATH = async (): Promise<OamProbe> => ({
+  bin: "oam",
+  binPath: "node_modules/.bin/oam",
+  version: MIN_OAM_VERSION,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
 // Safe to hardcode below-min, unlike the usable fixtures above: MIN_OAM_VERSION
 // only ever moves forward, so a version below today's floor stays below it.
 const OAM_BELOW_MIN = async (): Promise<OamProbe> => ({
@@ -867,6 +879,142 @@ describe("runInstall — malformed existing JSON", () => {
   });
 });
 
+// A container key holding a non-object is the one shape valid-JSON files reach
+// the splice with, and jsonc-parser throws on it ("Can not add index to parent
+// of type null") -- a message that names neither the file nor the key. The
+// pre-splice merge path repaired such a key and installed fine, so an abort here
+// is a regression as well as an unreadable one.
+describe("runInstall — non-object container key", () => {
+  for (const [label, bad] of [
+    ["null", null],
+    ["an empty array", []],
+    ["a number", 7],
+    ["a string", "mcpServers"],
+  ] as const) {
+    it(`repairs an "mcpServers" key holding ${label} and installs`, async () => {
+      const clientPath = join(synthHome, ".claude.json");
+      writeFileSync(clientPath, `${JSON.stringify({ model: "opus", mcpServers: bad }, null, 2)}\n`, "utf8");
+
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: synthHome,
+        io: cap.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(r.exitCode).toBe(0);
+      // No jsonc-parser internals in the output, either as an error or a warning.
+      expect(cap.stderr()).not.toMatch(/Can not add index/);
+      const parsed = parseJsonc(readFileSync(clientPath, "utf8")) as {
+        model: string;
+        mcpServers: Record<string, unknown>;
+      };
+      expect(parsed.mcpServers[ENTRY_NAME]).toBeDefined();
+      // Siblings of the repaired key are untouched -- only that key is rewritten.
+      expect(parsed.model).toBe("opus");
+      // ...and the user is told, naming the key, since a value did disappear.
+      const msg = r.messages.join(" ");
+      expect(msg).toContain('"mcpServers"');
+      expect(msg).toContain(`is ${label}, not an object`);
+    });
+  }
+
+  it("repairs a non-object INTERMEDIATE key on the project-scope chain", async () => {
+    // Claude Code local scope nests under projects[<absDir>].mcpServers, so the
+    // blocked key can be two levels above the container. jsonc-parser
+    // materializes the segments BELOW the repair, which is why one repair is
+    // enough regardless of depth.
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, `${JSON.stringify({ projects: null }, null, 2)}\n`, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const parsed = parseJsonc(readFileSync(clientPath, "utf8")) as {
+      projects: Record<string, { mcpServers: Record<string, unknown> }>;
+    };
+    expect(parsed.projects[synthCwd].mcpServers[ENTRY_NAME]).toBeDefined();
+    const msg = r.messages.join(" ");
+    expect(msg).toContain('"projects"');
+    expect(msg).toContain("is null, not an object");
+  });
+
+  it("keeps the user's comments while repairing the key", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, ["{", "  // keep me", '  "mcpServers": null', "}", ""].join("\n"), "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(clientPath, "utf8")).toContain("// keep me");
+  });
+
+  it("refuses, naming the key, when the container holds entries in the wrong shape", async () => {
+    // The one non-object shape that can carry real server definitions. The old
+    // merge path dropped them silently to write ours; refusing names the key and
+    // leaves the file alone.
+    const clientPath = join(synthHome, ".claude.json");
+    const original = `${JSON.stringify({ mcpServers: [{ name: "spend", url: "https://x" }] }, null, 2)}\n`;
+    writeFileSync(clientPath, original, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    const stderr = cap.stderr();
+    expect(stderr).toContain('"mcpServers"');
+    expect(stderr).toMatch(/an array of 1/);
+    expect(stderr).toMatch(/not a JSON object/);
+    expect(stderr).not.toMatch(/Can not add index/);
+    // Refusal means refusal: the file is byte-identical.
+    expect(readFileSync(clientPath, "utf8")).toBe(original);
+  });
+
+  it("previews the repair in the conditional under --dry-run without writing", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    const original = `${JSON.stringify({ mcpServers: null }, null, 2)}\n`;
+    writeFileSync(clientPath, original, "utf8");
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.messages.join(" ")).toMatch(/would replace it with an empty object/);
+    expect(readFileSync(clientPath, "utf8")).toBe(original);
+  });
+});
+
 // SOFT deprecation, not a removal: `--token` and `--no-yaw-mcp-config` must
 // keep parsing, keep exiting 0, and warn -- a scripted
 // `yaw-mcp install --all --token mcp_pat_...` in someone's provisioning
@@ -1347,6 +1495,32 @@ describe("runInstall — oam launch entry", () => {
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
     const out = r.messages.join(" ");
     expect(out).toMatch(/absolute path could not be resolved/);
+    expect(out).toContain("OAM_BIN");
+  });
+
+  it("does not claim the oam runtime when the resolved binPath is relative", async () => {
+    // The Runtime line used to be derived from `oamBinPath && oamEntry` while
+    // buildLaunchEntry additionally required isAbsolute(oamBinPath), so this
+    // machine got "will run on oam" printed over an `npx` entry -- and no line
+    // at all explaining why the broker was not on oam.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_RELATIVE_BINPATH,
+      resolveOamEntry: () => OAM_ENTRY,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+    const out = r.messages.join(" ");
+    expect(out).not.toMatch(/will run on oam/);
+    // ...and the fallback is named, with the offending path and the remedy.
+    expect(out).toMatch(/relative path/);
+    expect(out).toContain("node_modules/.bin/oam");
     expect(out).toContain("OAM_BIN");
   });
 

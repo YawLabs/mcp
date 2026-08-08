@@ -347,6 +347,30 @@ describe("runAdd", () => {
     expect(parsed.entry.command).toBe("npx");
   });
 
+  // "Same shape either way" includes the env redaction: the dry-run envelope
+  // would otherwise echo the --env value back on stdout while the real add's
+  // does not, and the text dry-run above it already prints key names only.
+  it("--dry-run --json reduces env to key names too", async () => {
+    const io = captureIO();
+    await runAdd({
+      slug: "tailscale",
+      dryRun: true,
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { TAILSCALE_API_KEY: "tskey-typed" },
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    expect(io.text()).not.toContain("tskey-typed");
+    const parsed = JSON.parse(io.text());
+    expect(parsed.dryRun).toBe(true);
+    expect(parsed.entry.env).toBeUndefined();
+    expect(parsed.entry.envKeys).toEqual(["TAILSCALE_API_KEY"]);
+  });
+
   it("reports replaced on a second add of the same slug", async () => {
     const base = { home: synthHome, cwd: synthCwd, env: {}, fetchCatalog, out: () => {}, err: () => {} };
     await runAdd({ ...base, slug: "fetch" });
@@ -513,6 +537,53 @@ describe("runAdd re-add preserves user state", () => {
   });
 
   it("--json reports the entry as written, not the pre-merge input", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    // isActive:false and the stale args exist only ON DISK -- the entry runAdd
+    // builds carries isActive:true and the catalog's args -- so seeing the
+    // former in --json can only come from the post-merge result. Asserted with
+    // a NON-env field on purpose: the merged env is redacted (see below), so it
+    // can no longer serve as the evidence that the merge was reported.
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          {
+            id: "local-fetch",
+            namespace: "fetch",
+            name: "Fetch",
+            type: "local",
+            transport: "stdio",
+            command: "npx",
+            args: ["-y", "stale"],
+            isActive: false,
+          },
+        ],
+      }),
+    );
+    const io = captureIO();
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      json: true,
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.replaced).toBe(true);
+    expect(parsed.entry.isActive).toBe(false);
+    // ...while what the re-add is FOR is still reported as refreshed.
+    expect(parsed.entry.args).toEqual(["-y", "@yawlabs/fetch-mcp"]);
+  });
+
+  // The envelope prints the POST-MERGE entry, and the merge folds the stored
+  // env back in -- so without redaction a `add --json` run that passes no --env
+  // at all republishes a token an earlier run persisted, onto stdout.
+  it("--json never puts a stored env VALUE on stdout, only key names", async () => {
     const base = { home: synthHome, cwd: synthCwd, fetchCatalog, out: () => {}, err: () => {} };
     await runAdd({ ...base, slug: "tailscale", env: {}, envOverrides: { TAILSCALE_API_KEY: "tskey-stored" } });
     const io = captureIO();
@@ -523,9 +594,16 @@ describe("runAdd re-add preserves user state", () => {
       json: true,
       out: (s) => io.out.push(s),
     });
+    // The stored secret is what the merge folds in; the ambient one reaches the
+    // required-env gate. NEITHER may reach stdout.
+    expect(io.text()).not.toContain("tskey-stored");
+    expect(io.text()).not.toContain("tskey-ambient");
     const parsed = JSON.parse(io.text());
     expect(parsed.replaced).toBe(true);
-    expect(parsed.entry.env.TAILSCALE_API_KEY).toBe("tskey-stored");
+    // Names only -- and no `env` object that a reader could mistake for the
+    // on-disk values (an empty-string value means "not persisted" elsewhere).
+    expect(parsed.entry.env).toBeUndefined();
+    expect(parsed.entry.envKeys).toEqual(["TAILSCALE_API_KEY"]);
   });
 });
 

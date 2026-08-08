@@ -688,8 +688,37 @@ describe("runSecrets -- short-passphrase warning covers the TTY paths", () => {
     const r = await runSecrets({ action: "get", name: "github", home, io: ttyIo(stdin) }, io);
     expect(r.exitCode).toBe(0);
     expect(warned()).toContain("shorter than 12 characters");
-    // The passphrase is already the vault's, so retyping it is not the fix.
+    // Retyping cannot lengthen a passphrase the vault already committed to, so
+    // rotate stays the fix -- offered conditionally (see the next test).
     expect(warned()).toContain("yaw-mcp secrets rotate");
+  });
+
+  // The warning fires on whatever was typed, BEFORE unlock() has verified it.
+  // A fat-fingered short entry must therefore never be described as this
+  // vault's passphrase, nor told outright to re-key one that was never wrong.
+  it("never calls the unverified entry the vault's passphrase on a WRONG one", async () => {
+    expect(
+      (
+        await runSecrets(
+          { action: "set", name: "github", value: "ghp_abc", passphrase: "a-properly-long-passphrase", home },
+          io,
+        )
+      ).exitCode,
+    ).toBe(0);
+    lock();
+    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+
+    // Short AND wrong: the vault's real passphrase is the long one above.
+    const stdin = new FakeTTYStdin(["oops\r"]);
+    const r = await runSecrets({ action: "get", name: "github", home, io: ttyIo(stdin) }, io);
+    expect(r.exitCode).toBe(1);
+    expect(warned()).toContain("shorter than 12 characters");
+    expect(warned()).toContain("the passphrase you entered");
+    // The misleading subject: it asserted the typed string IS the vault's and
+    // told the user to re-key, immediately before "wrong passphrase".
+    expect(warned()).not.toContain("this vault's passphrase");
+    // Any rotate pointer must stay conditional, never an imperative.
+    expect(warned()).toContain("If it unlocks this vault");
   });
 });
 

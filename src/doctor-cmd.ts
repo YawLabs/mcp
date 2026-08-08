@@ -1396,6 +1396,75 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
   return cur as Record<string, unknown>;
 }
 
+/**
+ * The oam argv a launch entry ultimately runs, with any shell wrapper peeled
+ * off -- or null when this entry is not an oam launch we can read.
+ *
+ * DELIBERATE DUPLICATION of the unwrap in `isOamLaunch` (oam-spawn.ts). That
+ * function answers "is this oam?" and throws the unwrapped tokens away;
+ * everything after the wrapper is what THIS needs. The two must stay in step:
+ * `isOamLaunch` is what sets `launchRuntime === "oam"`, so any wrapper shape it
+ * starts accepting has to be added here too, or the entry scan below falls back
+ * to reading the wrapper's own switches as an oam path.
+ */
+function oamArgvTokens(command: string, args: readonly string[]): readonly string[] | null {
+  if (isOamCommand(command)) return args;
+  const base = command.split(/[\\/]/).pop() ?? command;
+
+  if (/^cmd(\.exe)?$/i.test(base)) {
+    // cmd's payload is separate argv entries after its own switches, and the
+    // everyday shape is `/d /s /c` (what npm emits), not just `/c`. Matching
+    // "slash + ONE letter" keeps a POSIX path like /usr/local/bin/oam out of
+    // the switch set.
+    const i = args.findIndex((a) => !/^\/[a-z]$/i.test(a));
+    if (i < 0 || !isOamCommand(args[i])) return null;
+    return args.slice(i + 1);
+  }
+
+  if (/^(sh|bash|zsh|dash)$/i.test(base)) {
+    // A POSIX shell carries the whole command as one string after -c, so the
+    // payload has to be tokenised on whitespace.
+    const dashC = args.indexOf("-c");
+    const payload = dashC >= 0 ? args[dashC + 1] : args[0];
+    if (payload === undefined) return null;
+    // A quote anywhere in the payload means whitespace tokenising can cut a
+    // path in half, and half a path fails the exists() check below -- doctor
+    // would report a healthy entry as missing. Under-reporting is the safe
+    // direction here (isOamLaunch takes the same position), so bail instead.
+    if (/["']/.test(payload)) return null;
+    const tokens = payload.trim().split(/\s+/);
+    if (tokens[0] === undefined || !isOamCommand(tokens[0])) return null;
+    return tokens.slice(1);
+  }
+
+  return null;
+}
+
+/**
+ * The entry file an `oam run` launch entry points at, or null when there is
+ * nothing to check.
+ *
+ * Anchored on the `run` SUBCOMMAND rather than on "first non-flag arg in argv":
+ * the raw argv can start with a wrapper's switches (`cmd /d /s /c ...`), and
+ * picking args[1] off that shape yields `/s` -- which `isAbsolute` accepts on
+ * both platforms and `existsSync` then rejects, reporting a working install as
+ * broken. Anything that is not `<oam> [flags] run [flags] <entry>` returns null
+ * and is simply not checked.
+ *
+ * Known limit: a flag taking a SEPARATE value after `run` (`run --profile x
+ * entry.js`) would pick `x`. No such flag exists today -- install writes
+ * `run --no-check <entry>` -- and the fallout is bounded to a spurious report
+ * only if that value also looks like an absolute path that does not exist.
+ */
+export function oamRunEntryPath(command: string, args: readonly string[]): string | null {
+  const tokens = oamArgvTokens(command, args);
+  if (tokens === null) return null;
+  // Leading flags belong to oam itself; the first bare token is the subcommand.
+  const sub = tokens.findIndex((t) => !t.startsWith("-"));
+  if (sub < 0 || tokens[sub] !== "run") return null;
+  return tokens.slice(sub + 1).find((t) => !t.startsWith("-")) ?? null;
+}
+
 /** Classify raw config file content for a probe result. Shared by both
  *  the sync and async probe variants so the parsing logic lives once. */
 function classifyProbeContent(
@@ -1473,13 +1542,17 @@ function classifyProbeContent(
         // but nothing rewrites the configs that already carry it, so doctor is
         // the only thing that can surface it.
         if (isOamCommand(command) && !isAbsolute(command)) launchOamNotAbsolute = command;
-        // `oam run [--no-check] <entry>`: the entry is the first arg that is
-        // not the subcommand or a flag. Unlike npx, oam cannot fetch a missing
-        // entry on demand, so a stale path here is a hard launch failure rather
-        // than a slow start.
+        // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
+        // missing entry on demand, so a stale path here is a hard launch
+        // failure rather than a slow start.
+        //
+        // Goes through oamRunEntryPath rather than scanning `args` directly:
+        // launchRuntime is "oam" for the `cmd /d /s /c oam run ...` and
+        // `sh -c "oam run ..."` shapes too, and on those the raw argv's first
+        // non-flag token is the wrapper's own switch, not the entry file.
         if (launchRuntime === "oam") {
-          const entryPath = args.find((a, i) => i > 0 && !a.startsWith("-"));
-          if (entryPath !== undefined && isAbsolute(entryPath) && !exists(entryPath)) {
+          const entryPath = oamRunEntryPath(command, args);
+          if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
             launchOamEntryMissing = entryPath;
           }
         }

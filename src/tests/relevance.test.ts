@@ -89,7 +89,15 @@ describe("short identifiers below the prose token floor", () => {
       namespace: "pg",
       name: "Postgres",
       description: "SQL access",
-      tools: [{ name: "run_query", description: "Execute a statement" }],
+      tools: [
+        { name: "run_query", description: "Execute a statement" },
+        // Deliberately carries a closed-class word as a whole identifier
+        // segment: tokenizeIdent splits this into export / to / csv, so `to`
+        // is a real corpus term with a real IDF entry. Without this, the
+        // stopword guard below passes for the wrong reason -- the term simply
+        // wasn't in the corpus.
+        { name: "export_to_csv", description: "Write rows out" },
+      ],
     },
     {
       namespace: "slack",
@@ -122,11 +130,111 @@ describe("short identifiers below the prose token floor", () => {
     expect(rankServers("list s3 buckets", withAws)[0]?.namespace).toBe("aws");
   });
 
-  it("still ignores short query words absent from the corpus", () => {
-    // Widening the query floor must not start matching noise against prose:
-    // descriptions keep the 3-char floor, and a term with no corpus
-    // occurrence has no IDF entry at all, so it is skipped outright.
+  it("still ignores short closed-class words the corpus DOES contain", () => {
+    // This used to pass for the wrong reason -- "no IDF entry, so skipped
+    // outright" only holds while the corpus happens to lack the term. `pg`
+    // now owns `export_to_csv`, so `to` has a real IDF entry (and a high one,
+    // being rare), and the only thing keeping this at [] is the query-side
+    // stopword filter.
     expect(rankServers("of a to", corpus)).toEqual([]);
+  });
+
+  it("keeps short NON-stopword segments of a tool name matchable", () => {
+    // The filter has to be stopword-specific, not another length floor:
+    // `csv` sits in the same tool name as the stripped `to` and must still
+    // rank pg.
+    expect(rankServers("csv", corpus).map((r) => r.namespace)).toEqual(["pg"]);
+  });
+});
+
+// A closed-class function word ("to", "in", "of", "up", "on", "by") is not a
+// content term, but it IS a routine whole segment of a snake_case tool name,
+// so the widened query floor made every one of them a scoring term against a
+// field weighted 2.0 -- and because such a word is rare in a corpus of
+// identifiers, its IDF is HIGH. That combination invented matches out of
+// nothing: dispatch has no score floor and discover's auto-warm gate is 1.0,
+// so a query with no relevant server spawned one anyway.
+describe("closed-class stopwords in the query", () => {
+  const corpus = [
+    {
+      namespace: "gh",
+      name: "GitHub",
+      description: "Repos, issues, and pull requests",
+      tools: [{ name: "create_issue", description: "Create a new issue in a repo" }],
+    },
+    {
+      namespace: "pg",
+      name: "Postgres",
+      description: "SQL queries against a Postgres database",
+      tools: [
+        { name: "run_query", description: "Execute a SQL query" },
+        { name: "export_to_csv", description: "Write query rows out as CSV" },
+      ],
+    },
+    {
+      namespace: "slack",
+      name: "Slack",
+      description: "Team chat and direct messages",
+      tools: [{ name: "send_message", description: "Post a message to a channel" }],
+    },
+  ];
+
+  it("returns no match for a query whose only corpus hit is a stopword", () => {
+    // The reported regression, verbatim: this scored pg ~1.7 purely from `to`
+    // matching the `to` segment of export_to_csv, which cleared both the
+    // dispatch path (no floor) and the auto-warm gate (min 1.0, no runner-up).
+    // Nothing here is about Postgres.
+    expect(rankServers("convert the spreadsheet to a chart", corpus)).toEqual([]);
+  });
+
+  it("gives every short closed-class word zero score against an identifier segment", () => {
+    const withPrepositionTools = [
+      {
+        namespace: "misc",
+        name: "Misc",
+        description: "Assorted helpers",
+        tools: [
+          { name: "export_to_csv", description: "Write rows" },
+          { name: "search_in_files", description: "Grep" },
+          { name: "list_of_users", description: "Roster" },
+          { name: "scale_up_nodes", description: "Resize" },
+          { name: "turn_on_alerts", description: "Enable" },
+          { name: "order_by_date", description: "Sort" },
+          { name: "run_as_admin", description: "Elevate" },
+          { name: "look_at_logs", description: "Tail" },
+        ],
+      },
+      ...corpus,
+    ];
+    for (const word of ["to", "in", "of", "up", "on", "by", "as", "at", "a", "an", "it", "is", "or", "if", "no"]) {
+      expect(rankServers(word, withPrepositionTools), `"${word}" must not score`).toEqual([]);
+    }
+  });
+
+  it("does not strip short words that are plausible identifiers", () => {
+    // `go` (Go toolchain) and `do` (DigitalOcean) are short and function-word
+    // adjacent but are real namespaces, so the filter must leave them alone --
+    // that is the whole reason the query floor was widened.
+    const shortNamespaces = [
+      { namespace: "go", name: "Go", description: "Toolchain", tools: [] },
+      { namespace: "do", name: "DigitalOcean", description: "Droplets", tools: [] },
+      ...corpus,
+    ];
+    expect(rankServers("go", shortNamespaces).map((r) => r.namespace)).toEqual(["go"]);
+    expect(rankServers("do", shortNamespaces).map((r) => r.namespace)).toEqual(["do"]);
+  });
+
+  it("still ranks a short namespace named alongside a stopword", () => {
+    // The stopword goes, the identifier stays: stripping must not take the
+    // short-identifier recall the widened floor exists to provide.
+    expect(rankServers("export to csv in pg", corpus)[0]?.namespace).toBe("pg");
+    expect(rankServers("talk to slack", corpus).map((r) => r.namespace)).toEqual(["slack"]);
+  });
+
+  it("leaves a query of nothing but stopwords with no terms at all", () => {
+    // Every token here is stripped, so the query reduces to zero terms and
+    // takes the same path as an empty context.
+    expect(rankServers("is it up to me or to us", corpus)).toEqual([]);
   });
 });
 

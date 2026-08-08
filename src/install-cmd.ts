@@ -51,7 +51,7 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { editJsoncEntry, parseJsonc } from "./jsonc.js";
-import { MIN_OAM_VERSION, type OamProbe, type OamProbeFailure, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
+import { MIN_OAM_VERSION, type OamProbe, oamFailureLabel, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -150,15 +150,6 @@ export const TOKEN_FLAG_DEPRECATION =
 export const NO_CONFIG_FLAG_DEPRECATION =
   "yaw-mcp install: --no-yaw-mcp-config is deprecated and ignored -- install no longer writes " +
   "~/.yaw-mcp/config.json at all, so there is nothing to suppress.";
-
-/** How a broken-but-present oam is described in the Runtime line. The probe
- *  distinguishes these from absence precisely so the user is not sent looking
- *  for an install they already have. */
-const OAM_FAILURE_PHRASE: Record<OamProbeFailure, string> = {
-  timeout: "`oam --version` did not answer in time",
-  exit: "`oam --version` exited non-zero",
-  spawn: "`oam --version` could not be executed",
-};
 
 export async function runInstall(opts: InstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
@@ -282,7 +273,16 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // can still fail below. Reporting a runtime the user does not have would be
   // worse than saying nothing.
   const oamVersion = oamProbeResult.version ? ` ${oamProbeResult.version}` : "";
-  if (oamBinPath && oamEntry) {
+  // Read off the entry that was actually BUILT, never re-derived from the same
+  // inputs: buildLaunchEntry applies one more gate than the pair below
+  // (isAbsolute(oamBinPath) -- a bare/relative name a GUI-launched client could
+  // not resolve), so re-testing `oamBinPath && oamEntry` here printed "will run
+  // on oam" over an npx entry, with no line saying why.
+  // Tested inline rather than hoisted into a boolean: a `const` collapses to
+  // `boolean` and narrows nothing, so the oamEntry read below would still be
+  // `string | null`. buildLaunchEntry only ever emits the oam command when BOTH
+  // halves were present, so this conjunction is the same condition, typed.
+  if (oamBinPath && oamEntry && newEntry.command === oamBinPath) {
     log(`Runtime: will run on oam${oamVersion}`);
     // The resolved entry is durable but not necessarily GLOBAL: a project
     // node_modules qualifies, and this config is machine-global, so an
@@ -295,6 +295,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           "`npm i -g @yawlabs/mcp` and re-run install for a machine-durable path.",
       );
     }
+  } else if (oamBinPath && oamEntry) {
+    // Both halves resolved and buildLaunchEntry still declined, which leaves
+    // exactly one cause: the path is not absolute. PATH can legitimately carry a
+    // relative dir (`.`, `node_modules/.bin`), and resolveBinAbsolute joins the
+    // bin onto whatever it finds there, so the "absolute" probe result is only
+    // as absolute as the PATH entry it came from.
+    log(
+      `Runtime: node (oam${oamVersion} resolved only to the relative path \`${oamBinPath}\` -- a client config must ` +
+        "carry an absolute one, since a GUI-launched client resolves a relative path against its own working " +
+        "directory, not yours. Set OAM_BIN to oam's full path and re-run install to host yaw-mcp on it.)",
+    );
   } else if (oamBinPath) {
     // oam is present and usable, but yaw-mcp itself resolves only to the npx
     // cache -- a path a config file must not persist.
@@ -314,8 +325,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         "to host yaw-mcp on it)",
     );
   } else if (oamProbeResult.failure) {
+    // oamFailureLabel, not a phrase table of our own: the probe distinguishes
+    // broken from absent precisely so the user is not sent looking for an
+    // install they already have, and doctor's OAM RUNTIME section plus
+    // default-runtime's per-server reason report the same failure. Two wordings
+    // is how one report says "unusable" and the next says "not installed".
     log(
-      `Runtime: node (oam is installed but unusable: ${OAM_FAILURE_PHRASE[oamProbeResult.failure]}` +
+      `Runtime: node (oam is installed but unusable: ${oamFailureLabel(oamProbeResult.failure)}` +
         `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
         "re-run install to host yaw-mcp on it.)",
     );
@@ -425,8 +441,46 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   //     render it (this path also materializes a missing container chain).
   let clientJson: string;
   if (rawClient !== null) {
+    // The splice cannot create a container over a key that already holds a
+    // non-object -- jsonc-parser throws, and its message names neither the file
+    // nor the key. Settle that here so the entry write below is left with only
+    // genuine surprises to report.
+    let spliceSource = rawClient;
+    const blocked = findBlockedContainerSegment(existing, containerPath);
+    if (blocked) {
+      const keyPath = blocked.path.join(".");
+      if (!blocked.reparable) {
+        err(
+          `yaw-mcp install: "${keyPath}" in ${resolved.absolute} is ${describeJsonShape(blocked.value)}, not a JSON object — refusing to overwrite. Make it an object (or remove the key) and re-run.`,
+        );
+        return { written: [], wouldWrite: [], messages, exitCode: 1 };
+      }
+      // Reparable: replace the key with an empty object in the SAME
+      // comment-preserving pass, so the rest of the file keeps its bytes. Every
+      // deeper segment is necessarily absent afterwards, which the splice below
+      // materializes -- so one repair is always enough.
+      try {
+        spliceSource = editJsoncEntry(
+          spliceSource,
+          blocked.path.slice(0, -1),
+          blocked.path[blocked.path.length - 1],
+          {},
+        );
+      } catch (e) {
+        err(
+          `yaw-mcp install: failed to replace the non-object "${keyPath}" key in ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`,
+        );
+        return { written: [], wouldWrite: [], messages, exitCode: 1 };
+      }
+      // Conditional tense under --dry-run, matching the collision message: this
+      // runs before the preview, and nothing has touched the file yet.
+      log(
+        `Note: "${keyPath}" in ${resolved.absolute} is ${describeJsonShape(blocked.value)}, not an object — ` +
+          `${opts.dryRun ? "would replace" : "replaced"} it with an empty object so the "${ENTRY_NAME}" entry has somewhere to live.`,
+      );
+    }
     try {
-      const next = editJsoncEntry(rawClient, containerPath, ENTRY_NAME, entryToWrite);
+      const next = editJsoncEntry(spliceSource, containerPath, ENTRY_NAME, entryToWrite);
       // Keep the file's own trailing-newline convention: editJsoncEntry
       // returns the user's bytes verbatim outside the edited span.
       clientJson = next.endsWith("\n") ? next : `${next}\n`;
@@ -687,6 +741,68 @@ export function readNested(root: Record<string, unknown>, containerPath: string[
     cur = (cur as Record<string, unknown>)[key];
   }
   return cur;
+}
+
+/** A key along the container path whose existing value is not an object, and so
+ *  cannot have the launch entry spliced into it. */
+export interface BlockedContainerSegment {
+  /** Full key path to the offending key, for naming it in a message. */
+  path: string[];
+  /** What is there instead of an object. */
+  value: unknown;
+  /** Whether replacing it with `{}` throws nothing away -- see
+   *  `findBlockedContainerSegment`. */
+  reparable: boolean;
+}
+
+/**
+ * First key along `containerPath` that holds a non-object, or null when the
+ * chain is spliceable as-is.
+ *
+ * jsonc-parser's `modify` materializes MISSING intermediate keys but throws
+ * "Can not add index to parent of type null" on one that exists and holds a
+ * non-object -- an internal message naming neither the file nor the key. The
+ * pre-existing top-level check catches only a non-object ROOT, so `"mcpServers":
+ * null` (hand-edited, or written by a tool that emptied it) reached the splice
+ * and failed the whole install. Walking the chain here is what lets the caller
+ * either repair the key or refuse while naming it.
+ *
+ * `reparable` splits the two shapes deliberately. null, a scalar, and an empty
+ * array hold no server definitions, so replacing them with `{}` loses nothing
+ * and restores the behaviour of the pre-splice merge path (which overwrote any
+ * non-object container). A NON-EMPTY array can hold real entries in the wrong
+ * shape, and silently dropping those to write ours is not a repair -- that case
+ * is the caller's refusal.
+ */
+export function findBlockedContainerSegment(
+  root: Record<string, unknown>,
+  containerPath: string[],
+): BlockedContainerSegment | null {
+  let node: Record<string, unknown> = root;
+  for (let i = 0; i < containerPath.length; i++) {
+    const value = node[containerPath[i]];
+    // Absent from here down: jsonc-parser builds the rest of the chain itself.
+    if (value === undefined) return null;
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      node = value as Record<string, unknown>;
+      continue;
+    }
+    return {
+      path: containerPath.slice(0, i + 1),
+      value,
+      reparable: value === null || !Array.isArray(value) || value.length === 0,
+    };
+  }
+  return null;
+}
+
+/** How to name a non-object container value in a message. Shape, not contents:
+ *  a `~/.claude.json` value can be arbitrarily large and the user needs to know
+ *  WHICH key is wrong, not to have it echoed back. */
+function describeJsonShape(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return value.length === 0 ? "an empty array" : `an array of ${value.length}`;
+  return `a ${typeof value}`;
 }
 
 /** Merge `entry` into the container at `existing[...containerPath][entryName]`,

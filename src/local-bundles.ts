@@ -152,10 +152,24 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // falls back to the global default. Non-numeric and non-positive values are
   // dropped rather than passed on: upstream ignores anything <= 0 anyway, and
   // dropping keeps a typo from reading as configured.
+  //
+  // A dropped value gets a WARNING, unlike transport/runtime/env above, because
+  // this is the one field whose whole purpose is to change a FAILURE the user is
+  // already staring at. `MCP_CONNECT_TIMEOUT`'s help says a server's own
+  // connectTimeoutMs wins, so the natural response to a handshake timeout is to
+  // set it here -- and `"60000"` with the quotes (or a `0`, or a `null`) then
+  // leaves the same timeout firing at the same ceiling with nothing anywhere
+  // saying the setting was thrown away. Only a PRESENT key warns; absent is the
+  // normal case for nearly every entry and must stay silent.
   const connectTimeoutMs =
     typeof e.connectTimeoutMs === "number" && Number.isFinite(e.connectTimeoutMs) && e.connectTimeoutMs > 0
       ? e.connectTimeoutMs
       : undefined;
+  if (connectTimeoutMs === undefined && e.connectTimeoutMs !== undefined) {
+    warnings.push(
+      `bundles.json: ignoring invalid connectTimeoutMs ${JSON.stringify(e.connectTimeoutMs)} on "${namespace}" (expected a positive number)`,
+    );
+  }
 
   // Default isActive=true in local mode -- if the user wrote a server
   // into bundles.json they presumably want it loadable. Toggle off with

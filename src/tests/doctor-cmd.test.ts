@@ -9,7 +9,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
+import { formatRelativeAge, oamRunEntryPath, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
@@ -199,6 +199,93 @@ describe("runDoctor — client detection", () => {
     expect(client?.launchOamNotAbsolute).toBeNull();
     expect(client?.launchOamEntryMissing).toBeNull();
     expect(cap.text()).toContain("runs on oam");
+  });
+
+  // The cmd/sh wrapper shapes. isOamLaunch accepts them, so launchRuntime is
+  // "oam" for them too -- and the entry scan used to read the RAW argv, whose
+  // first non-flag token on a `cmd /d /s /c ...` entry is the wrapper's own
+  // switch. `/s` is absolute by isAbsolute on both platforms and never exists,
+  // so a working install reported "entry file does not exist: /s" and, because
+  // that branch outranks OK, never read as healthy.
+  it("reads the entry file through a cmd wrapper instead of picking up cmd's own switch", async () => {
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", oamBin, "run", "--no-check", entryFile] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).not.toContain("entry file does not exist");
+    expect(cap.text()).toContain("runs on oam");
+  });
+
+  it("still flags a missing entry file through a cmd wrapper", async () => {
+    // The unwrap must not turn the check off -- a rotted path inside the wrapper
+    // is the same hard launch failure as a rotted path in a bare oam entry.
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const gone = join(synthHome, "gone", "broker.js");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", oamBin, "run", "--no-check", gone] } },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchOamEntryMissing).toBe(gone);
+    expect(cap.text()).toContain("oam cannot fetch it on demand");
+  });
+
+  it("reads the entry file out of an `sh -c` payload", async () => {
+    // Fixture paths must be whitespace-free: an `sh -c` payload is one string,
+    // so the tokenising is inherent to the shape rather than to this test (a
+    // quoted path WITH a space is deliberately not checked at all -- see the
+    // oamRunEntryPath unit tests below).
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const gone = join(synthHome, "gone", "broker.js");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "sh", args: ["-c", `${oamBin} run --no-check ${gone}`] } },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchOamEntryMissing).toBe(gone);
+  });
+
+  it("checks nothing when the argv carries no `run` subcommand", async () => {
+    // `oam exec`, `oam --help`, a future subcommand: the entry after a
+    // non-`run` subcommand is not an entry FILE, so guessing at one would
+    // invent a failure. Under-reporting is the safe direction.
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["exec", join(synthHome, "nope", "x.js")] } },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchOamEntryMissing).toBeNull();
   });
 
   it("names the missing launch command even when a legacy entry is also present", async () => {
@@ -2139,5 +2226,46 @@ describe("runDoctor — project guide visibility", () => {
       err: () => {},
     });
     expect((JSON.parse(cap.text()) as { projectGuide: unknown }).projectGuide).toBeNull();
+  });
+});
+
+// Unit-level pins for the argv unwrap. The doctor-level tests above cover the
+// realistic shapes; these cover the ones that are cheap here and awkward to
+// stage through a config file, including the exact token the raw-argv scan
+// used to return.
+describe("oamRunEntryPath", () => {
+  it("returns the entry after `run`, not the wrapper's own switch", () => {
+    // The exact hand-written-but-working Windows shape: `cmd /d /s /c <oam> run`.
+    const wrapped = ["/d", "/s", "/c", String.raw`C:\Users\me\.oam\bin\oam.exe`, "run", "--no-check"];
+    const entry = String.raw`C:\nm\@yawlabs\mcp\dist\index.js`;
+    expect(oamRunEntryPath("cmd", [...wrapped, entry])).toBe(entry);
+    // The regression: the raw-argv scan returned args[1], and isAbsolute("/s") is
+    // true on win32 as well as posix, so it read as a rotted entry path.
+    expect(oamRunEntryPath("cmd", [...wrapped, entry])).not.toBe("/s");
+  });
+
+  it("handles a bare oam command and flags before the subcommand", () => {
+    expect(oamRunEntryPath("oam", ["run", "--no-check", "/b/index.js"])).toBe("/b/index.js");
+    expect(oamRunEntryPath("/usr/local/bin/oam", ["--quiet", "run", "/b/index.js"])).toBe("/b/index.js");
+  });
+
+  it("returns null for shapes that carry no readable `run` entry", () => {
+    // Not oam at all.
+    expect(oamRunEntryPath("npx", ["-y", "@yawlabs/mcp@latest"])).toBeNull();
+    // oam, but a different subcommand -- the token after it is not an entry file.
+    expect(oamRunEntryPath("oam", ["exec", "/b/index.js"])).toBeNull();
+    // `run` with nothing after it.
+    expect(oamRunEntryPath("oam", ["run", "--no-check"])).toBeNull();
+    // A wrapper whose payload is not oam.
+    expect(oamRunEntryPath("cmd", ["/c", "npx", "-y", "@yawlabs/mcp"])).toBeNull();
+    // A quoted sh payload: whitespace tokenising could cut the path in half, and
+    // half a path fails exists() -- so it is deliberately not checked.
+    expect(oamRunEntryPath("sh", ["-c", "'/opt/my oam/oam' run --no-check '/b/my dir/index.js'"])).toBeNull();
+  });
+
+  it("tokenises an unquoted sh -c payload", () => {
+    expect(oamRunEntryPath("sh", ["-c", "/usr/local/bin/oam run --no-check /b/index.js"])).toBe("/b/index.js");
+    // Payload as args[0], the shape isOamLaunch also accepts.
+    expect(oamRunEntryPath("bash", ["oam run /b/index.js"])).toBe("/b/index.js");
   });
 });

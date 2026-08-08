@@ -238,6 +238,15 @@ interface SidecarsJson {
    *  may not have moved forward. A consumer that treats this as fatal would
    *  discard a perfectly good tree. */
   updateError: string | null;
+  /** Why nothing on this machine will READ the tree that was just filled -- one
+   *  entry per distinct reason, from the same verdicts as the human note (see
+   *  unhostedReasons). Empty means at least one server resolves to oam, which
+   *  is the healthy case; NON-empty is the state where `installed` is full and
+   *  every server nonetheless still resolves through the npx cache, so a
+   *  consumer reporting install health has to look here and not only at
+   *  `error`. Empty on the paths that installed nothing, where the question
+   *  does not arise. */
+  unhosted: string[];
   /** Packages configured at two different versions; the winner is the version
    *  reported in `installed`. Empty in the ordinary case. */
   conflicts: Array<{ pkg: string; used: string; ignored: string[] }>;
@@ -263,6 +272,7 @@ function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
     reason: null,
     error: null,
     updateError: null,
+    unhosted: [],
     conflicts: [],
     skipped: [],
     ...over,
@@ -348,8 +358,8 @@ export function parseSidecarsArgs(
 }
 
 /**
- * The lines to print when NOTHING will read the tree this command just filled,
- * or [] when at least one server would be hosted on oam.
+ * Why NOTHING will read the tree this command just filled -- the distinct
+ * reasons, or [] when at least one server would be hosted on oam.
  *
  * collectSidecarSpecs filters on `command === "npx"` and nothing else -- it
  * cannot see per-server `runtime: "node"`, the config default, or whether oam
@@ -363,8 +373,18 @@ export function parseSidecarsArgs(
  *
  * The install is still worth having in that state -- the copies are used the
  * moment oam arrives -- so this is a note, not a failure.
+ *
+ * Returns the REASONS rather than the finished prose so the human note and the
+ * `--json` document are the same verdict rendered twice, not two computations
+ * that can disagree. The probe is paid for in both modes deliberately: the
+ * cheaper alternative was skipping it under `--json`, but the caller that most
+ * needs this answer is a script -- the Yaw Terminal MCP panel shells out to
+ * `sidecars install --json` and would otherwise read a full `installed` array
+ * with `error: null` as a healthy install on a machine where every server still
+ * resolves through the npx cache. probeOam is process-cached, so the cost is one
+ * `oam --version` per run.
  */
-async function unhostedNote(
+async function unhostedReasons(
   servers: Array<Partial<UpstreamServerConfig>>,
   opts: SidecarsInstallOptions,
   home: string,
@@ -386,11 +406,7 @@ async function unhostedNote(
     ),
   );
   if (verdicts.some((v) => v.runtime === "oam")) return [];
-  const out = ["", "Nothing reads these copies yet:"];
-  for (const reason of [...new Set(verdicts.map((v) => v.reason))]) out.push(`  ${reason}`);
-  out.push("Those servers keep resolving through the npx cache; the managed copies are read only");
-  out.push("on the oam runtime.");
-  return out;
+  return [...new Set(verdicts.map((v) => v.reason))];
 }
 
 export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Promise<SidecarsInstallResult> {
@@ -555,7 +571,14 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   }
   print();
   print("These versions are now fixed. Re-run this command to move them forward.");
-  for (const line of await unhostedNote(servers, opts, home)) print(line);
+  const unhosted = await unhostedReasons(servers, opts, home);
+  if (unhosted.length > 0) {
+    print();
+    print("Nothing reads these copies yet:");
+    for (const reason of unhosted) print(`  ${reason}`);
+    print("Those servers keep resolving through the npx cache; the managed copies are read only");
+    print("on the oam runtime.");
+  }
 
   // npm exited 0 but not one requested package resolved in the tree. A
   // scripted caller has to be able to tell that from a real install, so it
@@ -565,7 +588,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   const nothingLanded = missing.length === installed.length;
   const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
 
-  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped, error, updateError }));
+  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped, error, updateError, unhosted }));
   return { exitCode: nothingLanded ? 1 : 0, installed, lines };
 }
 

@@ -83,14 +83,82 @@ export function tokenize(text: string | undefined): string[] {
 }
 
 /** Identifier tokenizer (1-char floor). Used for the namespace / name /
- *  tool-name document fields and for the query, which has to be able to
- *  carry a short identifier or the document-side widening buys nothing.
- *  Short noise words in the query stay harmless: descriptions keep the
- *  prose floor, so a short query term can only ever match an identifier
- *  field, and a term absent from the whole corpus has no IDF entry and is
- *  skipped outright. */
+ *  tool-name DOCUMENT fields, where a 1-2 char token is always a deliberate
+ *  name. The query goes through tokenizeQuery instead -- see why there. */
 function tokenizeIdent(text: string | undefined): string[] {
   return splitTokens(text, MIN_IDENT_TOKEN_LEN);
+}
+
+// English closed-class function words below the prose floor. The query used
+// to be tokenized with the bare identifier floor, on the reasoning that a
+// short noise word "can only ever match an identifier field, and a term
+// absent from the whole corpus has no IDF entry" -- both true, and together
+// they still let the noise score, because a preposition is a routine whole
+// SEGMENT of a snake_case tool name. `export_to_csv` puts `to` in the corpus
+// under toolName (weight 2.0), and a function word inside a corpus of
+// identifiers is RARE, so its IDF is high rather than low. The result was
+// invented relevance: "convert the spreadsheet to a chart" scored a Postgres
+// server ~1.5 on `to` alone, which clears dispatch (no score floor,
+// server.ts:2384) and discover's auto-warm gate (1.0 with no runner-up,
+// server.ts:1372), so an unrelated intent spawned Postgres and was told
+// "loaded top 1 of 1 matching servers".
+//
+// So: keep the 1-char floor on the document side and on the query, and
+// subtract exactly the words that are never content terms. Entries are all
+// sub-floor by construction -- a 3+ char word here would be inert, since
+// terms the prose floor already admitted ("the", "and", "for") are unchanged
+// by this fix and out of its scope.
+//
+// Deliberately ABSENT even though they look like function words: `do`
+// (DigitalOcean), `go` (Go toolchain), `pr`, `id`, `db`, `pg`, `gh`, `ai`,
+// `s3`, `vm`, `os`, `js`, `ts`. Short identifiers are the entire reason the
+// query floor was widened; a filter that ate them would trade one silent
+// recall hole for another.
+const SUB_FLOOR_STOPWORDS = new Set([
+  // articles, prepositions, particles
+  "a",
+  "an",
+  "as",
+  "at",
+  "by",
+  "in",
+  "of",
+  "on",
+  "to",
+  "up",
+  // conjunctions
+  "if",
+  "or",
+  "so",
+  // pronouns
+  "i",
+  "he",
+  "it",
+  "me",
+  "my",
+  "us",
+  "we",
+  // copula / auxiliary, negation
+  "am",
+  "be",
+  "is",
+  "no",
+  // fragments left behind when splitTokens breaks on an apostrophe:
+  // don't -> don/t, it's -> it/s, we're -> we/re, I've -> i/ve, I'll -> i/ll
+  "d",
+  "ll",
+  "m",
+  "re",
+  "s",
+  "t",
+  "ve",
+]);
+
+/** Query tokenizer. Same 1-char floor as the document identifier fields --
+ *  "use pg" has to survive or the document-side widening is unreachable --
+ *  minus the closed-class words that floor would otherwise admit. */
+function tokenizeQuery(text: string | undefined): string[] {
+  return tokenizeIdent(text).filter((t) => t.length >= MIN_TOKEN_LEN || !SUB_FLOOR_STOPWORDS.has(t));
 }
 
 type FieldName = keyof typeof FIELD_WEIGHTS;
@@ -385,8 +453,9 @@ function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedRes
 export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
   // Identifier floor on the query, not the prose floor: "use pg" has to
   // survive tokenization or the short-namespace fix on the document side is
-  // unreachable. See tokenizeIdent for why the extra short terms are inert.
-  const queryTerms = tokenizeIdent(context);
+  // unreachable. Minus closed-class function words -- see SUB_FLOOR_STOPWORDS
+  // for why the identifier floor alone was not safe on the query side.
+  const queryTerms = tokenizeQuery(context);
   if (queryTerms.length === 0 || servers.length === 0) return [];
 
   const signatures = servers.map(serverSignature);

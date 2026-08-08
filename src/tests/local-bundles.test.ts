@@ -199,20 +199,56 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].connectTimeoutMs).toBe(60000);
   });
 
-  it("drops a non-positive or non-numeric connectTimeoutMs", async () => {
+  it("warns on and drops a non-positive or non-numeric connectTimeoutMs", async () => {
     // upstream ignores anything <= 0 and falls back to its default; dropping the
     // value here keeps a typo from reading as configured downstream (doctor, the
     // reconcile comparison in server.ts).
+    //
+    // Dropping SILENTLY was the bug. This is the one field whose whole purpose
+    // is to change a failure the user is already looking at: they read the
+    // MCP_CONNECT_TIMEOUT help ("a server's own connectTimeoutMs always wins"),
+    // write `"60000"` with the quotes, and keep getting the same handshake
+    // timeout at the same ceiling with nothing anywhere saying the setting was
+    // thrown away. The warning has to name the namespace AND the rejected value
+    // -- "some server has a bad timeout" does not find the typo in a 20-server
+    // file.
     writeBundles(synthHome, {
       version: 1,
       servers: [
         { namespace: "zero", name: "Zero", command: "npx", args: ["-y", "a"], connectTimeoutMs: 0 },
         { namespace: "neg", name: "Neg", command: "npx", args: ["-y", "b"], connectTimeoutMs: -5 },
         { namespace: "str", name: "Str", command: "npx", args: ["-y", "c"], connectTimeoutMs: "60000" },
+        { namespace: "nul", name: "Nul", command: "npx", args: ["-y", "d"], connectTimeoutMs: null },
       ],
     });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-    expect(r.config?.servers.map((s) => s.connectTimeoutMs)).toEqual([undefined, undefined, undefined]);
+    expect(r.config?.servers.map((s) => s.connectTimeoutMs)).toEqual([undefined, undefined, undefined, undefined]);
+    // One per offending entry, each naming its own namespace and value -- every
+    // CLI entry point prints these as `warning: ...`.
+    const timeoutWarnings = r.warnings.filter((w) => w.includes("connectTimeoutMs"));
+    expect(timeoutWarnings).toHaveLength(4);
+    expect(timeoutWarnings[0]).toContain('"zero"');
+    expect(timeoutWarnings[0]).toContain("0");
+    expect(timeoutWarnings[2]).toContain('"str"');
+    // The quotes are the whole point of this one: `"60000"` and `60000` read
+    // identically without them, so the user cannot see what is wrong.
+    expect(timeoutWarnings[2]).toContain('"60000"');
+    expect(timeoutWarnings[3]).toContain("null");
+  });
+
+  it("stays silent about connectTimeoutMs when the key is absent or valid", async () => {
+    // The normal case for nearly every entry there has ever been. A warning
+    // here would fire on every yaw-mcp invocation for a config with nothing
+    // wrong with it, which is how a diagnostics channel stops being read.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "plain", name: "Plain", command: "npx", args: ["-y", "a"] },
+        { namespace: "set", name: "Set", command: "npx", args: ["-y", "b"], connectTimeoutMs: 60000 },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.warnings.filter((w) => w.includes("connectTimeoutMs"))).toEqual([]);
   });
 
   it("surfaces a top-level defaultRuntime", async () => {

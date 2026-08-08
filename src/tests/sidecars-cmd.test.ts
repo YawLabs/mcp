@@ -316,7 +316,7 @@ describe("runSidecarsInstall", () => {
     expect(warnings.join("\n")).toContain("invalid JSON");
     // Same keys as every other path, so the document stays uniform.
     expect(Object.keys(doc).sort()).toEqual(
-      ["root", "installed", "reason", "error", "updateError", "conflicts", "skipped"].sort(),
+      ["root", "installed", "reason", "error", "updateError", "unhosted", "conflicts", "skipped"].sort(),
     );
   });
 
@@ -606,7 +606,7 @@ describe("runSidecarsInstall", () => {
     // could not read `root` without first working out which path it hit. Pin
     // the shape: same keys whether the install worked, found nothing, or
     // failed.
-    const KEYS = ["root", "installed", "reason", "error", "updateError", "conflicts", "skipped"].sort();
+    const KEYS = ["root", "installed", "reason", "error", "updateError", "unhosted", "conflicts", "skipped"].sort();
     const npxServer = {
       id: "1",
       name: "F",
@@ -752,6 +752,88 @@ describe("runSidecarsInstall", () => {
     });
 
     expect(res.lines.join("\n")).toContain("Nothing reads these copies yet");
+  });
+
+  it("carries the unhosted verdict in --json, where `print` cannot reach", async () => {
+    // The whole note goes through `print`, which is SUPPRESSED under --json, and
+    // no field carried it -- so the Yaw Terminal MCP panel, which shells out to
+    // `sidecars install --json`, read a full `installed` array with
+    // `error: null` and reported a clean install on a machine where every server
+    // in fact still resolves through the npx cache and the managed tree is dead
+    // weight. The probe was being paid for and then thrown away.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+        runtime: "node",
+      },
+    ]);
+    let out = "";
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      // A genuine success, which is the point: this is the shape a consumer
+      // mistakes for healthy.
+      runNpm: async () => {
+        const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+        return 0;
+      },
+      oamProbe: async () => probeWith("oam"),
+    });
+
+    const doc = JSON.parse(out);
+    expect(res.exitCode, "the install itself worked -- this is a note, not a failure").toBe(0);
+    expect(doc.error).toBeNull();
+    expect(doc.installed[0].version).toBe("0.3.6");
+    // Same verdicts as the human note, so the two surfaces cannot disagree.
+    expect(doc.unhosted).toHaveLength(1);
+    expect(doc.unhosted[0]).toContain('per-server runtime:"node"');
+    // stdout carries the document and nothing else; the prose really is gone.
+    expect(out).not.toContain("Nothing reads these copies yet");
+  });
+
+  it("reports an empty unhosted array when oam will host the servers", async () => {
+    // The healthy case has to be distinguishable from the note-suppressed one by
+    // the FIELD, not by its absence -- an absent key and a key meaning "all
+    // good" are the same read for a consumer that only checks truthiness.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+        runtime: "oam",
+      },
+    ]);
+    let out = "";
+
+    await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      runNpm: async () => 0,
+      oamProbe: async () => probeWith("oam"),
+    });
+
+    expect(JSON.parse(out).unhosted).toEqual([]);
   });
 
   it("reports which spec won when a package is configured at two versions", async () => {

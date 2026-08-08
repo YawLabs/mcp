@@ -25,7 +25,7 @@
 // servers verified to run on oam.
 
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -182,9 +182,14 @@ export function npxSpec(args: readonly string[]): string | null {
  */
 export const MIN_OAM_VERSION = "0.9.0";
 
-/** One "oam is missing" warning per process, not one per opted-in server.
+/** One "your oam opt-in landed on node" warning per process, not one per
+ *  opted-in server -- whether the reason was an absent oam or a broken one.
+ *  Both are the same event to the user (they asked for oam and did not get it),
+ *  the probe result is cached for the process lifetime so only one of them can
+ *  ever be the reason, and a broker hosting a dozen opted-in servers must not
+ *  print either line a dozen times on every boot.
  *  Cleared by resetOamBinCache so tests do not leak it across cases. */
-let warnedOamMissing = false;
+let warnedOamUnavailable = false;
 
 /** Why the probe produced no usable binary even though oam was present on
  *  disk. `null` is BOTH "oam is usable" and "oam is absent" -- absence is the
@@ -194,6 +199,30 @@ let warnedOamMissing = false;
  *    "spawn"   -- it could not be executed at all (EACCES, a non-executable
  *                 file, or an injected `run` that rejected without a code) */
 export type OamProbeFailure = "timeout" | "exit" | "spawn";
+
+/**
+ * Plain-English form of an OamProbeFailure -- the one line a support ticket
+ * actually pastes. The machine-readable code is what `doctor --json` carries.
+ *
+ * ONE wording, shared by every surface that reports a broken oam, because they
+ * must not word it differently: doctor's OAM RUNTIME section prints it for the
+ * binary, default-runtime's describeServerRuntime folds it into a per-server
+ * `reason` (which is also how `sidecars install` reaches it), and
+ * resolveOamSpawn below uses it for the opted-in-but-unusable warn. A second
+ * copy is how "installed but UNUSABLE" in one line and "not installed" in the
+ * next line of the same report happens.
+ *
+ * It lives HERE, next to the type it describes, rather than in default-runtime
+ * where it started: resolveOamSpawn needs it and default-runtime already
+ * imports from this module, so the other direction would be an import cycle on
+ * the connect path. default-runtime re-exports it, so its existing importers
+ * are unaffected.
+ */
+export function oamFailureLabel(failure: OamProbeFailure): string {
+  if (failure === "timeout") return "`oam --version` did not answer in time";
+  if (failure === "exit") return "`oam --version` exited non-zero";
+  return "the binary could not be executed";
+}
 
 /** Result of probing the oam binary (`oam --version`). */
 export interface OamProbe {
@@ -354,15 +383,51 @@ export function winNormalize(p: string, platform: NodeJS.Platform = process.plat
 }
 
 /**
+ * Whether a candidate is something the OS loader would actually execute: a
+ * regular file (following symlinks -- a shim on PATH is normally one), with the
+ * execute bit off Windows.
+ *
+ * `existsSync` alone -- which this replaced -- accepted a DIRECTORY named `oam`
+ * and a non-executable file, both of which the loader skips in favour of the
+ * real binary further down PATH. Returning one of those means the install path
+ * persists a launch that cannot start, which is strictly worse than the node
+ * fallback it displaced.
+ *
+ * X_OK is checked only off Windows because it is a no-op there (Node treats it
+ * as F_OK): on Windows executability IS the extension, which PATHEXT has
+ * already decided by the time a candidate gets here. Gated on the INJECTED
+ * platform, not process.platform, so the search stays testable cross-OS.
+ */
+function isExecutableFile(candidate: string, platform: NodeJS.Platform): boolean {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    if (platform !== "win32") accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    // ENOENT, ENOTDIR, EACCES, a loop of symlinks -- every one of them means
+    // "not the binary", and the caller's next candidate is the answer.
+    return false;
+  }
+}
+
+/**
  * Locate a binary as an ABSOLUTE path, the way the OS loader would: an already
- * absolute path is accepted if it exists, and a bare name is searched across
- * PATH (times PATHEXT on Windows, where a bare `oam` is spawnable but the file
- * on disk is `oam.exe`).
+ * absolute path is accepted if it is an executable file, and a bare name is
+ * searched across PATH (times PATHEXT on Windows, where a bare `oam` is
+ * spawnable but the file on disk is `oam.exe`).
  *
  * Deliberately NOT a `which`/`where` subprocess: this runs on the install path
  * and, via probeOam, on the connect path, where the async-probe rewrite above
  * exists precisely to keep child processes off it. Reading directory entries is
  * cheap and cannot hang the way a spawn can.
+ *
+ * ABSOLUTE is a promise, not a description of the usual case: every caller
+ * either persists the result into someone else's config or prints it as the
+ * resolved binary, and install-targets' buildLaunchEntry silently drops a
+ * non-absolute path back to npx. So a candidate that does not come out absolute
+ * is skipped rather than returned -- otherwise `install` printed "will run on
+ * oam" from a truthy binPath while writing the npx entry into the config file,
+ * and the command output disagreed with what it had just written.
  *
  * `env` and `platform` are injectable so the search is testable cross-OS.
  */
@@ -371,7 +436,7 @@ export function resolveBinAbsolute(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): string | null {
-  if (isAbsolute(bin)) return existsSync(bin) ? winNormalize(bin, platform) : null;
+  if (isAbsolute(bin)) return isExecutableFile(bin, platform) ? winNormalize(bin, platform) : null;
   // Windows env vars are case-insensitive but process.env is not, and a
   // sanitized child env can carry either spelling.
   const pathVar = env.PATH ?? env.Path ?? env.path ?? "";
@@ -387,7 +452,13 @@ export function resolveBinAbsolute(
     const clean = dir.replace(/^"|"$/g, "");
     for (const ext of exts) {
       const candidate = join(clean, bin + ext);
-      if (existsSync(candidate)) return winNormalize(candidate, platform);
+      // A RELATIVE PATH entry resolves the candidate against whatever directory
+      // the broker happens to be in, and `join` hides it: both "." and a
+      // quoted-empty `""` (which survives the filter(Boolean) empty-entry guard
+      // above, because the quotes make the string non-empty) collapse to the
+      // bare name. Skip rather than return -- see the ABSOLUTE promise above.
+      if (!isAbsolute(candidate)) continue;
+      if (isExecutableFile(candidate, platform)) return winNormalize(candidate, platform);
     }
   }
   return null;
@@ -720,7 +791,7 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
 /** Reset the cached oam-binary probe (test hook). Bumps the generation so a
  *  probe still in flight cannot publish its result afterwards. */
 export function resetOamBinCache(): void {
-  warnedOamMissing = false;
+  warnedOamUnavailable = false;
   oamProbeCache = undefined;
   oamProbeInFlight = undefined;
   oamProbeGeneration++;
@@ -742,8 +813,16 @@ export interface OamRewriteDeps {
 
 /** Trailing Windows executable extension. A config's `command` may carry one
  *  (`node.exe`, `npx.cmd` -- npm ships both shims), and it says nothing about
- *  what the program IS. */
-const WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/;
+ *  what the program IS.
+ *
+ *  Case-INSENSITIVE, because Windows is: a hand-written or installer-generated
+ *  config carries `NODE.EXE` as readily as `node.exe`, and the whole point of
+ *  the basename match below is that every real shape of the same launcher is
+ *  recognised. Matching only lowercase left `C:\Program Files\nodejs\NODE.EXE`
+ *  classified as not-Node, so an opted-in server silently ran on node forever
+ *  and doctor -- which calls the same helper -- agreed with the spawn, leaving
+ *  nothing anywhere to explain why the opt-in did nothing. */
+const WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
 
 /**
  * Which Node launcher a command names, or null for anything else.
@@ -1422,14 +1501,35 @@ export async function resolveOamSpawn(
   // working, so say it once. `optedIn` is false when oam is merely the default
   // (nothing configured); an absent oam is then the expected state, not a
   // misconfiguration, and must stay quiet. belowMin already warns in the probe
-  // with its own actionable numbers, so this covers only genuine absence.
-  if (optedIn && probe.bin === null && !probe.belowMin && !warnedOamMissing) {
-    warnedOamMissing = true;
-    log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {
-      install: "curl -fsSL https://oamjs.org/install.sh | sh",
-      installWindows: "irm https://oamjs.org/install.ps1 | iex",
-      overrideWith: "OAM_BIN",
-    });
+  // with its own actionable numbers, so it is excluded here.
+  if (optedIn && probe.bin === null && !probe.belowMin && !warnedOamUnavailable) {
+    warnedOamUnavailable = true;
+    // A BROKEN oam and an ABSENT one both arrive here with bin=null and send
+    // the user to OPPOSITE fixes, so they get opposite messages. Telling
+    // someone whose oam timed out or is non-executable to "install oam" -- with
+    // the install commands attached, one line after the probe already said
+    // `oam --version` failed -- sends them to reinstall software they have.
+    // doctor and describeServerRuntime already branch on `failure`; this was
+    // the last surface reporting every failure as absence.
+    if (probe.failure !== null) {
+      log("warn", "a server opted in to oam but oam is installed and unusable; running it on node instead", {
+        reason: oamFailureLabel(probe.failure),
+        // The raw error behind the label. It is the part a support ticket needs
+        // and the part the plain-English line deliberately does not carry.
+        detail: probe.failureDetail,
+        // No install commands: the install is already there. Pointing OAM_BIN
+        // at a working copy is the actionable move, and the probe is cached for
+        // the process lifetime, so repairing it needs a restart to take effect.
+        overrideWith: "OAM_BIN",
+        thenRestart: "restart yaw-mcp; this probe is cached for the process lifetime",
+      });
+    } else {
+      log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {
+        install: "curl -fsSL https://oamjs.org/install.sh | sh",
+        installWindows: "irm https://oamjs.org/install.ps1 | iex",
+        overrideWith: "OAM_BIN",
+      });
+    }
   }
   return rewriteForOam(command, args, {
     oamBin: probe.bin,

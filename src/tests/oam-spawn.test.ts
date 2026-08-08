@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -15,6 +15,7 @@ import {
   npxSpec,
   npxSpecIndex,
   OAM_PROBE_TIMEOUT_MS,
+  oamFailureLabel,
   packageName,
   parseOamVersion,
   probeOam,
@@ -297,10 +298,19 @@ describe("probeOam failure classification", () => {
 // has to get it without a `where`/`which` subprocess, because the whole async
 // probe rewrite exists to keep child processes off the connect path.
 describe("resolveBinAbsolute", () => {
-  /** A temp dir holding the given filenames, cleaned up by the caller. */
+  /** A temp dir holding the given filenames, cleaned up by the caller.
+   *
+   *  The files are chmod'd EXECUTABLE, which is load-bearing off Windows: the
+   *  search requires X_OK there, and writeFileSync's default mode (0666 minus
+   *  umask) carries no execute bit -- so without this every POSIX assertion
+   *  below would be measuring the fixture's permissions rather than the search.
+   *  A no-op on Windows, which has no execute bit. */
   function binDir(...names: string[]): { dir: string; cleanup: () => void } {
     const dir = mkdtempSync(join(tmpdir(), "resolvebin-"));
-    for (const name of names) writeFileSync(join(dir, name), "");
+    for (const name of names) {
+      writeFileSync(join(dir, name), "");
+      chmodSync(join(dir, name), 0o755);
+    }
     return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
   }
 
@@ -426,6 +436,69 @@ describe("resolveBinAbsolute", () => {
       cleanup();
     }
   });
+
+  // ABSOLUTE is the promise in the name, and every caller depends on it:
+  // install-targets' buildLaunchEntry silently drops a non-absolute path back to
+  // npx, so returning one made `install` print "will run on oam" while writing
+  // the npx entry into the config file it had just written.
+  it("never returns a NON-absolute path, even when a relative PATH entry really has the binary", () => {
+    const { dir, cleanup } = binDir("oam.exe");
+    try {
+      const rel = relative(process.cwd(), dir);
+      // A temp dir on another drive has no relative form on Windows; the shape
+      // this pins is unreachable there, so only the absolute control runs.
+      if (!isAbsolute(rel)) {
+        // existsSync resolves this candidate against the broker's cwd and FINDS
+        // the file, which is exactly why the old existsSync-only search returned
+        // it. A "." entry is the everyday spelling of the same thing.
+        expect(resolveBinAbsolute("oam", { PATH: rel, PATHEXT: ".exe" }, "win32")).toBeNull();
+        // A quoted-EMPTY entry is the same failure by another route: it survives
+        // the filter(Boolean) empty-entry guard because the quotes make the
+        // string non-empty, and then join("", bin) collapses to the bare bin.
+        expect(resolveBinAbsolute(join(rel, "oam.exe"), { PATH: '""' }, "win32")).toBeNull();
+      }
+      // The same directory in ABSOLUTE form still resolves: the skip is about
+      // the shape of the PATH entry, not about this directory.
+      expect(resolveBinAbsolute("oam", { PATH: dir, PATHEXT: ".exe" }, "win32")).toBe(
+        winNormalize(join(dir, "oam.exe"), "win32"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("skips a DIRECTORY named like the binary, which the loader would walk past", () => {
+    // existsSync says yes to a directory. The loader does not run one -- it
+    // keeps searching PATH -- and persisting it into a client's config produces
+    // an entry that cannot launch at all, which is worse than staying on node.
+    const dir = mkdtempSync(join(tmpdir(), "resolvebin-dir-"));
+    mkdirSync(join(dir, "oam"));
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: dir }, "linux")).toBeNull();
+      // Same answer for a directory handed in directly (an OAM_BIN typo).
+      expect(resolveBinAbsolute(join(dir, "oam"), {}, "linux")).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Real fs permissions, so this is gated on the RUNNER, not on the injected
+  // platform: X_OK is a no-op on Windows (Node treats it as F_OK), where
+  // executability is the extension and PATHEXT has already decided it.
+  it.skipIf(process.platform === "win32")("skips a non-executable file off Windows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "resolvebin-noexec-"));
+    writeFileSync(join(dir, "oam"), "");
+    chmodSync(join(dir, "oam"), 0o644);
+    try {
+      // The loader skips it in favour of the real binary further down PATH, and
+      // this is the shape that makes probeOam report a `spawn` failure -- so
+      // returning it as the answer to "where is oam" is doubly wrong.
+      expect(resolveBinAbsolute("oam", { PATH: dir }, "linux")).toBeNull();
+      expect(resolveBinAbsolute(join(dir, "oam"), {}, "linux")).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // Exact `command === "node"` equality -- which this replaced -- silently opted
@@ -441,6 +514,17 @@ describe("nodeLaunchKind", () => {
     expect(nodeLaunchKind("npx")).toBe("npx");
     expect(nodeLaunchKind("npx.cmd")).toBe("npx"); // npm ships this shim on Windows
     expect(nodeLaunchKind("/usr/local/bin/npx")).toBe("npx");
+  });
+
+  it("strips the Windows extension case-INSENSITIVELY, because Windows is", () => {
+    // A hand-written or installer-generated config carries the uppercase form as
+    // readily as the lowercase one. Stripping only lowercase read `NODE.EXE` as
+    // not-Node, so an opted-in server ran on node forever -- and doctor calls
+    // this same helper, so it agreed with the spawn and nothing explained why.
+    expect(nodeLaunchKind(String.raw`C:\Program Files\nodejs\NODE.EXE`)).toBe("node");
+    expect(nodeLaunchKind("NPX.CMD")).toBe("npx");
+    expect(nodeLaunchKind("Node.Exe")).toBe("node");
+    expect(nodeLaunchKind("node.BAT")).toBe("node");
   });
 
   it("is not a substring match -- a look-alike launcher is left alone", () => {
@@ -1660,7 +1744,7 @@ describe("probeOam hardening", () => {
   });
 });
 
-describe("resolveOamSpawn — missing-oam warning", () => {
+describe("resolveOamSpawn — unavailable-oam warning", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => {
     resetOamBinCache();
@@ -1704,6 +1788,72 @@ describe("resolveOamSpawn — missing-oam warning", () => {
     });
     await resolveOamSpawn("node", ["a.js"]);
     expect(lines.filter((l) => l.includes("oam is not installed"))).toHaveLength(0);
+  });
+
+  // A BROKEN oam and an ABSENT one both reach this warn with bin=null, and they
+  // send the user to OPPOSITE fixes. doctor and describeServerRuntime already
+  // branch on probe.failure; this warn was the last surface reporting every
+  // failure as absence -- one line after the probe itself said `--version`
+  // failed, which is how the log told a user with oam on disk to install oam.
+  it("says INSTALLED AND UNUSABLE for a broken oam, with no install instructions", async () => {
+    await probeOam(async () => {
+      const e: NodeJS.ErrnoException = new Error("spawn oam EACCES");
+      e.code = "EACCES";
+      throw e;
+    });
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    // Three servers, one line: the flag is shared with the absent case because
+    // both are the same event to the user (asked for oam, got node).
+    await resolveOamSpawn("node", ["a.js"]);
+    await resolveOamSpawn("node", ["b.js"]);
+    const warnings = lines.filter((l) => l.includes("opted in to oam but oam is installed and unusable"));
+    expect(warnings).toHaveLength(1);
+    // The shared label, not a second wording of it, plus the raw error a ticket
+    // needs.
+    expect(warnings[0]).toContain(oamFailureLabel("spawn"));
+    expect(warnings[0]).toContain("spawn oam EACCES");
+    // The specific harm being fixed: reinstall instructions for software the
+    // user demonstrably already has.
+    expect(lines.filter((l) => l.includes("oamjs.org/install"))).toHaveLength(0);
+    expect(lines.filter((l) => l.includes("oam is not installed"))).toHaveLength(0);
+  });
+
+  it("still says NOT INSTALLED for a timeout's opposite -- absence keeps the install commands", async () => {
+    // The absent case is unchanged; this pins that the new branch did not
+    // capture it. (A timeout is a FAILURE and lands in the branch above.)
+    await primeAbsent();
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await resolveOamSpawn("node", ["a.js"]);
+    expect(lines.filter((l) => l.includes("oam is installed and unusable"))).toHaveLength(0);
+    expect(lines.filter((l) => l.includes("oamjs.org/install.sh"))).toHaveLength(1);
+  });
+
+  it("names the TIMEOUT budget's own label, not the generic one", async () => {
+    // Each failure gets its own wording (oamFailureLabel is what enforces that),
+    // so the warn must not flatten them into one "oam is broken".
+    await probeOam(async () => {
+      const e: NodeJS.ErrnoException = new Error("oam --version exceeded 3000ms");
+      e.code = "ETIMEDOUT";
+      throw e;
+    });
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await resolveOamSpawn("node", ["a.js"]);
+    const warnings = lines.filter((l) => l.includes("oam is installed and unusable"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(oamFailureLabel("timeout"));
+    expect(warnings[0]).not.toContain(oamFailureLabel("spawn"));
   });
 
   it("stays silent for a below-min install, which warns in the probe instead", async () => {

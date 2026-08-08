@@ -398,11 +398,13 @@ async function promptYesNo(opts: SecretsCommandOptions, question: string): Promi
  *
  *  Always stderr: stdout carries `get`'s cleartext value and the --json
  *  envelopes, and a warning must never pollute either. */
-function warnIfShortPassphrase(opts: SecretsCommandOptions, passphrase: string, subject: string): void {
+function warnIfShortPassphrase(opts: SecretsCommandOptions, passphrase: string, subject: string, hint?: string): void {
   if (passphrase.length >= MIN_PASSPHRASE_WARN_LEN) return;
   const stderr = opts.io?.stderr ?? process.stderr;
   stderr.write(
-    `yaw-mcp secrets: warning -- ${subject} is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.\n`,
+    `yaw-mcp secrets: warning -- ${subject} is shorter than ${MIN_PASSPHRASE_WARN_LEN} characters; consider a longer passphrase.${
+      hint ? ` ${hint}` : ""
+    }\n`,
   );
 }
 
@@ -455,9 +457,19 @@ async function resolvePassphrase(opts: SecretsCommandOptions, confirm = false): 
     const entered = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout);
     if (entered === CANCELLED) return CANCELLED;
     if (entered.length > 0) {
-      // Unlocking an EXISTING vault: the passphrase is already the vault's,
-      // so the actionable fix is `secrets rotate`, not a retype.
-      warnIfShortPassphrase(opts, entered, "this vault's passphrase (re-key it with `yaw-mcp secrets rotate`)");
+      // Unlocking an EXISTING vault. unlock() has NOT run yet, so this string
+      // is just what was typed -- it may be a typo that is about to be rejected.
+      // Describe it as "the passphrase you entered" (never as the vault's) and
+      // make the rotate pointer conditional: a fat-fingered short entry must
+      // not be told to re-key a passphrase that was never wrong. When the entry
+      // IS the vault's, `secrets rotate` remains the fix -- a retype cannot
+      // lengthen a passphrase already committed to the vault.
+      warnIfShortPassphrase(
+        opts,
+        entered,
+        "the passphrase you entered",
+        "If it unlocks this vault, re-key it with `yaw-mcp secrets rotate`.",
+      );
       return entered;
     }
     stdout.write("Passphrase cannot be empty.\n");

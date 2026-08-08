@@ -57,6 +57,8 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
                     vars not given here AND not in your shell block the add.
   --dry-run         Print what would be written without writing.
   --json            Emit the written entry as JSON (implies success on stdout).
+                    Env vars appear as \`envKeys\` -- key NAMES only, never the
+                    stored values.
   --catalog <url>   Override the catalog URL (default the public catalog).`;
 
 export interface AddCommandOptions {
@@ -132,6 +134,29 @@ export function parseAddArgs(
   opts.slug = positional[0];
   if (Object.keys(env).length > 0) opts.envOverrides = env;
   return { ok: true, options: opts };
+}
+
+/** Shape an entry for the `add --json` envelope: env KEY NAMES only, never
+ *  values.
+ *
+ *  `add --json` reports the entry AS WRITTEN, and an update folds whatever was
+ *  already on disk back into that object (upsertUserBundle -> mergeServerEntry
+ *  copies the stored env), so printing `env` verbatim would put a token some
+ *  EARLIER run persisted onto stdout for an invocation that passed no --env at
+ *  all -- into CI logs, scrollback, and anything consuming the envelope.
+ *
+ *  `env` is REPLACED by `envKeys` rather than blanked to "": an empty value
+ *  means "nothing persisted, the server depends on the ambient shell var"
+ *  everywhere else here (see the ambient-env note in runAdd), so blanking would
+ *  claim a stored secret is not on disk. Names only, never values -- the same
+ *  posture printRemovalPreview, the dry-run text output and trust-cmd's env
+ *  line already take. Read the values from bundles.json if you need them. */
+function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown> {
+  const { env, ...rest } = entry;
+  const out: Record<string, unknown> = { ...rest };
+  const keys = Object.keys(env ?? {});
+  if (keys.length > 0) out.envKeys = keys;
+  return out;
 }
 
 export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult> {
@@ -224,8 +249,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   if (opts.dryRun) {
     if (opts.json) {
       // Same wrapper shape as the real add below, with dryRun:true, so a
-      // script parsing `add --json` sees one consistent shape either way.
-      print(JSON.stringify({ ok: true, dryRun: true, namespace, entry }, null, 2));
+      // script parsing `add --json` sees one consistent shape either way --
+      // including the env redaction (see jsonEntry).
+      print(JSON.stringify({ ok: true, dryRun: true, namespace, entry: jsonEntry(entry) }, null, 2));
     } else {
       print(`yaw-mcp add (dry-run): would write ${server.name} as namespace "${namespace}"`);
       print(`  command: ${entry.command} ${(entry.args ?? []).join(" ")}`);
@@ -249,7 +275,13 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   const written = res.entry;
 
   if (opts.json) {
-    print(JSON.stringify({ ok: true, namespace, path: res.path, replaced: res.replaced, entry: written }, null, 2));
+    print(
+      JSON.stringify(
+        { ok: true, namespace, path: res.path, replaced: res.replaced, entry: jsonEntry(written) },
+        null,
+        2,
+      ),
+    );
   } else {
     print(`${res.replaced ? "Updated" : "Added"} ${server.name} (namespace "${namespace}") in ${res.path}`);
     // A re-add folds onto a stored `"isActive": false` instead of silently

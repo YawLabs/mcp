@@ -3339,6 +3339,40 @@ describe("idle reaper vs in-flight tool calls", () => {
     expect(priv.connections.has("slack")).toBe(false);
   });
 
+  it("re-checks the guard before each disconnect, not only when listing candidates", async () => {
+    const priv = getPrivate(server);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("b", makeConnection("b"));
+    priv.connections.set("c", makeConnection("c"));
+    // b and c both tick past the threshold on this one completion, so they
+    // land in the same deactivation batch -- b first.
+    priv.idleCallCounts.set("b", resolveIdleThreshold() - 1);
+    priv.idleCallCounts.set("c", resolveIdleThreshold() - 1);
+
+    vi.mocked(disconnectFromUpstream).mockImplementationOnce(async (conn: UpstreamConnection) => {
+      expect(conn.config.namespace).toBe("b");
+      // A tool call for c lands while b's transport is still closing. This is
+      // real event-loop time, not a microtask -- the SDK's stdio close races
+      // a 2s timer twice -- so the snapshot taken when the batch was built is
+      // stale by the time c's turn comes up.
+      priv.inflightCalls.set("c", 1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await priv.trackUsageAndAutoDeactivate("gh");
+
+    expect(priv.connections.has("b")).toBe(false);
+    // Closing c here would reject the user's own pending callTool and then
+    // book a 0.0 reliability hit against a server we killed ourselves.
+    expect(priv.connections.has("c")).toBe(true);
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
+
+    // Once the call drains, the next completion reaps c as usual.
+    priv.inflightCalls.delete("c");
+    await priv.trackUsageAndAutoDeactivate("gh");
+    expect(priv.connections.has("c")).toBe(false);
+  });
+
   it("counts a live proxied call as in-flight for the duration of the call", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
@@ -3561,6 +3595,39 @@ describe("shutdown drains and refuses activations", () => {
 
     expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
     expect(priv.connections.size).toBe(0);
+  });
+
+  it("gives up on a hanging activation instead of outliving the force-exit timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+
+      // A cold npx handshake that never comes back. upstream.ts would give up
+      // after a 15s connect timeout retried once -- already well past the 10s
+      // force-exit timer in index.ts, which exits(1) instead of 0.
+      vi.mocked(connectToUpstream).mockReturnValueOnce(new Promise<UpstreamConnection>(() => {}));
+      void priv.activateOne("gh");
+      expect(priv.activationInflight.has("gh")).toBe(true);
+
+      let done = false;
+      const shutdownPromise = server.shutdown().then(() => {
+        done = true;
+      });
+
+      // Nothing can settle the activation, so only the drain budget elapsing
+      // lets shutdown() through -- and it must elapse well inside 10s.
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await shutdownPromise;
+      expect(done).toBe(true);
+
+      // We tore down without it: the activation is still hung.
+      expect(priv.activationInflight.has("gh")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("clears session-elicited credentials, as the field contract promises", async () => {

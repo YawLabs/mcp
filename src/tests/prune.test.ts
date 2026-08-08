@@ -261,6 +261,45 @@ describe("pruneContent", () => {
     expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
   });
 
+  it("does not mistake digits inside an escaped-quote string for a number", () => {
+    // The fidelity scan is one regex alternating string-literal | number, with
+    // the string form first, instead of blanking strings into a full second
+    // copy of the response. Escapes are where that ordering earns its keep: if
+    // the string branch stopped at the escaped quote, the digits after it would
+    // be read as a bare number, the document would bail, and a perfectly
+    // safe response would lose all its savings.
+    const source: Record<string, unknown> = {
+      note: 'he said "12345678901234567890" out loud',
+      path: "C:\\logs\\",
+      keep: "value",
+    };
+    for (let i = 0; i < 40; i++) source[`empty${i}`] = null;
+    const r = pruneContent([{ type: "text", text: JSON.stringify(source) }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.note).toBe('he said "12345678901234567890" out loud');
+    expect(parsed.path).toBe("C:\\logs\\");
+    expect(parsed.empty0).toBeUndefined();
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
+
+  it("re-scans each content item from the start after an early bail", () => {
+    // The scan returns the moment it sees an unfaithful literal, which leaves
+    // the module-level /g regex with a non-zero lastIndex. Without an explicit
+    // reset the NEXT item is scanned from that offset -- here past its end, so
+    // it would be declared faithful without a single number being looked at,
+    // and reach the model with 9007199254740993 rewritten to ...992.
+    const bailsLate = `{"pad": "${"x".repeat(500)}", "id": 12345678901234567890}`;
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const r = pruneContent([
+      { type: "text", text: bailsLate },
+      { type: "text", text: `{"id": 9007199254740993, ${nulls}}` },
+    ]);
+    expect(r.content[0].text).toContain("12345678901234567890");
+    expect(r.content[1].text).toContain("9007199254740993");
+    // Proof the second item was actually scanned and skipped, not pruned.
+    expect(r.content[1].text).toContain("empty0");
+  });
+
   it("still prunes ordinary-sized numbers", () => {
     const source: Record<string, unknown> = { id: 9007199254740991, price: 19.9, keep: "value" };
     for (let i = 0; i < 40; i++) source[`empty${i}`] = null;

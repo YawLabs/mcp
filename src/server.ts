@@ -221,6 +221,25 @@ function argsEqual(a?: string[], b?: string[]): boolean {
   return a.every((v, i) => v === b[i]);
 }
 
+/**
+ * True if `p` settled within `ms`, false if the budget expired first.
+ * Never rejects — the caller only wants to know whether to keep waiting.
+ * The timer is cleared on the fast path and unref'd on the slow one, so a
+ * bounded wait can neither leak a handle nor hold an embedded host's event
+ * loop open past the wait itself.
+ */
+export function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    if (typeof timer.unref === "function") timer.unref();
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    p.then(done, done);
+  });
+}
+
 // Tokenizer for the discover "matches" summary. Mirrors relevance.ts's
 // split-on-non-alphanumeric behavior so the summary's per-tool match
 // logic lines up with BM25's ranking logic. Kept local rather than
@@ -435,6 +454,12 @@ export class ConnectServer {
   private persistenceReady = false;
   private stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STATE_SAVE_DEBOUNCE_MS = 1000;
+
+  // How long shutdown() will wait for in-flight activations before it
+  // stops caring and tears down anyway. Sized against index.ts's 10s
+  // force-exit timer — see the drain comment in shutdown() for the
+  // arithmetic.
+  private static readonly SHUTDOWN_DRAIN_MS = 2000;
 
   constructor() {
     this.server = new Server(
@@ -2601,19 +2626,36 @@ export class ConnectServer {
       }
     }
 
+    let deactivated = 0;
     for (const ns of toDeactivate) {
-      log("info", "Auto-deactivating idle server", { namespace: ns, idleCalls: this.idleCallCounts.get(ns) });
       const connection = this.connections.get(ns);
-      if (connection) {
-        await disconnectFromUpstream(connection);
-        this.connections.delete(ns);
-        this.idleCallCounts.delete(ns);
-        this.adaptiveSkipLogged.delete(ns);
-        this.toolFilters.delete(ns);
+      if (!connection) continue;
+      // Re-check the in-flight guard immediately before the close, not just
+      // when the list was built: this loop awaits per namespace, and each
+      // disconnectFromUpstream burns real event-loop time (the SDK's stdio
+      // close races a 2s timer twice), so a tools/call for a LATER entry can
+      // be routed and started in that window. The snapshot taken above is
+      // stale by then, and closing under a live call is exactly the 0.0
+      // reliability hit against our own kill that the guard exists to stop.
+      if ((this.inflightCalls.get(ns) ?? 0) > 0) {
+        log("info", "Skipping idle deactivation — tool call landed during teardown", {
+          namespace: ns,
+          idleCalls: this.idleCallCounts.get(ns),
+        });
+        continue;
       }
+      log("info", "Auto-deactivating idle server", { namespace: ns, idleCalls: this.idleCallCounts.get(ns) });
+      await disconnectFromUpstream(connection);
+      this.connections.delete(ns);
+      this.idleCallCounts.delete(ns);
+      this.adaptiveSkipLogged.delete(ns);
+      this.toolFilters.delete(ns);
+      deactivated++;
     }
 
-    if (toDeactivate.length > 0) {
+    // Only notify when a connection actually went away — a run where every
+    // candidate was skipped leaves the routing table exactly as it was.
+    if (deactivated > 0) {
       await this.refreshRoutesAndNotify();
     }
   }
@@ -3344,9 +3386,41 @@ export class ConnectServer {
     // this.connections without waiting would miss them entirely, leaving
     // live child processes nobody ever disconnects (the parent exiting is
     // what masks this in production, not any cleanup we do).
+    //
+    // BOUNDED, deliberately. A single runActivateOne can burn a 15s connect
+    // timeout (upstream.ts) retried once, plus a 60s elicitInput round-trip
+    // — an unbounded await here outlives index.ts's 10s force-exit timer, so
+    // a SIGTERM landing on a cold npx handshake would sit for 10s and then
+    // exit(1) instead of exiting 0 promptly. 2s is what we can spend and
+    // still finish: the disconnects below race the SDK's stdio close timers
+    // (2s, twice) and then server.close() has to run, which leaves ~4s of
+    // headroom under the 10s cap. Anything an activation needs beyond 2s was
+    // never going to fit under that cap anyway, so waiting for it only buys
+    // a forced exit(1).
     if (this.activationInflight.size > 0) {
       log("info", "Waiting for in-flight activations before teardown", { count: this.activationInflight.size });
-      await Promise.allSettled([...this.activationInflight.values()]);
+      const drained = await settledWithin(
+        Promise.allSettled([...this.activationInflight.values()]),
+        ConnectServer.SHUTDOWN_DRAIN_MS,
+      );
+      if (!drained) {
+        log("warn", "In-flight activations did not settle in time — tearing down anyway", {
+          budgetMs: ConnectServer.SHUTDOWN_DRAIN_MS,
+          count: this.activationInflight.size,
+        });
+      }
+    }
+
+    // An activation that landed during the drain calls scheduleStateSave()
+    // for its freshly learned tool list, which re-arms the debounce timer we
+    // cleared above — and that timer is unref'd, so it never fires before
+    // the process exits. Flush once more when the drain re-armed it, so
+    // bounding the drain cannot cost state the pre-drain flush would have
+    // banked.
+    if (this.stateSaveTimer) {
+      clearTimeout(this.stateSaveTimer);
+      this.stateSaveTimer = null;
+      if (this.persistenceReady) await this.flushStateSave();
     }
 
     // Disconnect all upstreams

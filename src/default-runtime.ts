@@ -37,7 +37,7 @@ import {
   nodeLaunchKind,
   npxSpecIndex,
   type OamProbe,
-  type OamProbeFailure,
+  oamFailureLabel,
   specConstraint,
 } from "./oam-spawn.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -166,23 +166,16 @@ export async function defaultRuntime(opts: { cwd?: string; home?: string } = {})
 }
 
 /**
- * Plain-English form of an OamProbeFailure -- the one line a support ticket
- * actually pastes. The machine-readable code is what `doctor --json` carries.
+ * Plain-English form of an OamProbeFailure. It MOVED to oam-spawn.ts, next to
+ * the type it describes, because resolveOamSpawn needs it too for its
+ * opted-in-but-unusable warn and this module already imports from there -- the
+ * other direction would be an import cycle on the connect path.
  *
- * Lives here, not in either consumer, because BOTH of them need it and they
- * must not word it differently: doctor's OAM RUNTIME section prints it for the
- * binary, and describeServerRuntime below folds it into a per-server `reason`.
- * A second copy is how "installed but UNUSABLE" in one line and "not
- * installed" in the next line of the same report happens.
- *
- * `sidecars install` reaches the same wording through describeServerRuntime's
- * `reason`, so all three surfaces stay in one voice.
+ * Re-exported rather than relocated-and-repointed so doctor-cmd (which reaches
+ * every other runtime-reporting helper through this module) keeps one import
+ * site, and so this stays the place a reader looks for the wording.
  */
-export function oamFailureLabel(failure: OamProbeFailure): string {
-  if (failure === "timeout") return "`oam --version` did not answer in time";
-  if (failure === "exit") return "`oam --version` exited non-zero";
-  return "the binary could not be executed";
-}
+export { oamFailureLabel };
 
 /** Machine-readable "why" for a per-server runtime verdict. Everything from
  *  "not-node-command" down is a silent-fallback case the reporting commands
