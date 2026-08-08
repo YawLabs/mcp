@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { formatRelativeAge, oamRunEntryPath, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
-import { MIN_OAM_VERSION } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 
 let synthHome: string;
@@ -1481,10 +1481,26 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(txt).toContain(`/usr/local/bin/oam (v${MIN_OAM_VERSION}, min ${MIN_OAM_VERSION})`);
   });
 
-  it("reports not-installed when the probe finds no binary", async () => {
+  it("reports not-installed when the probe finds no binary, and how to install it", async () => {
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamMissing });
-    expect(cap.text()).toMatch(/binary: {2}not installed/);
+    const txt = cap.text();
+    expect(txt).toMatch(/binary: {2}not installed/);
+    // This branch used to end at "not installed" -- the one line a reader opens
+    // doctor to act on, and the only one with no command under it.
+    expect(txt).toContain(`install: ${OAM_INSTALL_SH}`);
+    // `install:`, not `fix:` -- node is a full fallback, so nothing is broken.
+    expect(txt).not.toMatch(/fix: .*oamjs\.org/);
+  });
+
+  it("names the windows installer when doctor is asked about windows", async () => {
+    // opts.os, never process.platform: a doctor report pulled for a windows
+    // machine that prints the curl line names a command that machine cannot run.
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "windows", out: cap.out, oamProbe: oamMissing });
+    const txt = cap.text();
+    expect(txt).toContain(`install: ${OAM_INSTALL_PS1}`);
+    expect(txt).not.toContain(OAM_INSTALL_SH);
   });
 
   it("names both versions when oam is below the minimum", async () => {

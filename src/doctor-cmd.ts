@@ -72,6 +72,7 @@ import {
   nodeLaunchKind,
   type OamProbe,
   type OamProbeFailure,
+  oamInstallCommand,
   probeOam,
 } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
@@ -437,7 +438,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // bundles.json that no longer parses -- every server gone -- still printed
   // "All good" and exited 0. See foldBundleWarnings.
   config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
-  renderOamRuntimeSection({ status: oamStatus, print });
+  renderOamRuntimeSection({ status: oamStatus, print, os });
 
   // Load state.json ONCE for both the STATE and RELIABILITY sections.
   // Previously each section re-read the file (peek + loadState in STATE,
@@ -944,7 +945,14 @@ async function collectOamRuntimeStatus(opts: {
   return { probe, dflt, servers, managed, bundleWarnings: bundles?.warnings ?? [] };
 }
 
-function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: string) => void }): void {
+function renderOamRuntimeSection(opts: {
+  status: OamRuntimeStatus;
+  print: (s?: string) => void;
+  /** Which platform's install command the not-installed branch names. Doctor's
+   *  own --os override, so a report generated for another machine names that
+   *  machine's installer. */
+  os: InstallOS;
+}): void {
   const { status, print } = opts;
   const { probe, dflt, servers } = status;
   print("OAM RUNTIME");
@@ -965,6 +973,12 @@ function renderOamRuntimeSection(opts: { status: OamRuntimeStatus; print: (s?: s
     print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");
   } else if (probe.bin === null) {
     print("  binary:  not installed — node/npx spawns are used directly");
+    // The one branch a reader can act on and the one that used to end without
+    // saying how. Nothing is broken here -- node is a full fallback -- so this
+    // is `install:`, not the `fix:` the below-min and unusable branches print.
+    // A user who opens doctor to find out why a server says "oam is not
+    // installed" was, until now, sent to the README for the URL.
+    print(`           install: ${oamInstallCommand(opts.os)}`);
   } else if (probe.version === null) {
     // A working --version proves oam exists, so the probe treats an
     // unparseable version as usable and hosts on it (oam-spawn.ts) -- but the

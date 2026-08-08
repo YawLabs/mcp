@@ -15,20 +15,37 @@
 //   * the npx spec constrains the version and no on-disk copy -> npx (Node)
 //     satisfies it (npx honours the pin; `oam run <entry>` cannot)
 //
-// Compat note: opt in the pure-JS/SDK tier (npmjs/fetch/lemonsqueezy) and the
-// pure-JS DB drivers (postgres via `pg`, redis via `ioredis`) first. Servers
-// with native addons (ssh2) or bundled browsers (playwright) are not oam-
-// hostable yet. Boot failures ARE recovered: connectToUpstream respawns once
-// on the original node/npx command when an oam-hosted child fails the connect
-// handshake or dies during the initial capability fetch (see upstream.ts).
-// There is still no auto-fallback after a healthy boot, so only opt in
-// servers verified to run on oam.
+// Compat note: oam is the DEFAULT for every node/npx sidecar (see
+// default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
+// described the opt-in model for two releases after it.
+//
+// MEASURED against oam 0.9.0 on 2026-08-08, so nobody re-derives it: the
+// pure-JS/SDK tier (fetch, lemonsqueezy, memory) completes an MCP initialize
+// handshake hosted on oam, AND so do both bundled-browser servers --
+// @modelcontextprotocol/server-puppeteer and @playwright/mcp each launched a
+// real Chromium and navigated to a live URL on oam, byte-identical in outcome
+// to the node control. The previous note here called bundled browsers
+// "not oam-hostable yet"; that was true and is no longer. oam 0.9.0 is what
+// changed it: before that release `child_process` ignored `stdio` entirely
+// ('inherit'/'ignore' both behaved as 'pipe'), which is precisely the npm
+// bin-shim shape every sidecar launches through -- they booted and then sat
+// mute forever while the launcher reported success. MIN_OAM_VERSION gates that
+// fix in, so a machine below the floor gets node instead.
+//
+// Native addons (ssh2) are UNVERIFIED here -- untested, not known-broken. Do
+// not promote that to either claim without running it.
+//
+// Boot failures ARE recovered: connectToUpstream respawns once on the original
+// node/npx command when an oam-hosted child fails the connect handshake or dies
+// during the initial capability fetch (see upstream.ts). There is still no
+// auto-fallback after a healthy boot.
 
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { InstallOS } from "./install-targets.js";
 import { log } from "./logger.js";
 import { sidecarsNodeModules } from "./paths.js";
 
@@ -181,6 +198,27 @@ export function npxSpec(args: readonly string[]): string | null {
  * hosts production sidecars on a runtime that is no longer current.
  */
 export const MIN_OAM_VERSION = "0.9.0";
+
+/** The oam installer one-liners, as oamjs.org publishes them. Both install the
+ *  current release, which always satisfies MIN_OAM_VERSION. */
+export const OAM_INSTALL_SH = "curl -fsSL https://oamjs.org/install.sh | sh";
+export const OAM_INSTALL_PS1 = "irm https://oamjs.org/install.ps1 | iex";
+
+/**
+ * The install command to print for the platform a report is ABOUT.
+ *
+ * One source for the same reason oamFailureLabel is one source for the failure
+ * wording: doctor's OAM RUNTIME section, `install`'s Runtime line, and the
+ * opted-in-but-absent warn below all print it, and a second copy is how one
+ * surface goes on naming a URL the installer has moved off of.
+ *
+ * `os` is a parameter, never process.platform: doctor and install both take an
+ * --os override, and a report asked about windows must not hand back the curl
+ * line. macos and linux share the shell installer, so only windows branches.
+ */
+export function oamInstallCommand(os: InstallOS): string {
+  return os === "windows" ? OAM_INSTALL_PS1 : OAM_INSTALL_SH;
+}
 
 /** One "your oam opt-in landed on node" warning per process, not one per
  *  opted-in server -- whether the reason was an absent oam or a broken one.
@@ -1525,8 +1563,12 @@ export async function resolveOamSpawn(
       });
     } else {
       log("warn", "a server opted in to oam but oam is not installed; running it on node instead", {
-        install: "curl -fsSL https://oamjs.org/install.sh | sh",
-        installWindows: "irm https://oamjs.org/install.ps1 | iex",
+        // Both, not oamInstallCommand(CURRENT_OS): this is a structured log
+        // line read off a server's stderr, which is routinely a different
+        // machine from the one reading it. The rendered REPORTS (doctor,
+        // install) are the surfaces that know which platform they are about.
+        install: OAM_INSTALL_SH,
+        installWindows: OAM_INSTALL_PS1,
         overrideWith: "OAM_BIN",
       });
     }

@@ -51,7 +51,14 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { editJsoncEntry, parseJsonc } from "./jsonc.js";
-import { MIN_OAM_VERSION, type OamProbe, oamFailureLabel, probeOam, resolveStableNpmEntry } from "./oam-spawn.js";
+import {
+  MIN_OAM_VERSION,
+  type OamProbe,
+  oamFailureLabel,
+  oamInstallCommand,
+  probeOam,
+  resolveStableNpmEntry,
+} from "./oam-spawn.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -334,6 +341,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       `Runtime: node (oam is installed but unusable: ${oamFailureLabel(oamProbeResult.failure)}` +
         `${oamProbeResult.failureDetail ? ` -- ${oamProbeResult.failureDetail}` : ""}. Fix or reinstall oam and ` +
         "re-run install to host yaw-mcp on it.)",
+    );
+  } else {
+    // Plain absence -- binPath and bin both null, not below-min, no failure --
+    // and the ONE branch of this chain that said nothing at all. "Every fallback
+    // gets a reason" above was true of the misconfigurations and false of the
+    // common case, so a user on a fresh machine got an npx entry with no line
+    // saying an alternative existed. Worded as optional, because it is: node is
+    // the supported runtime and nothing here is broken.
+    log(
+      `Runtime: node (oam is not installed, which is fine -- node runs everything. To host yaw-mcp on oam instead: ` +
+        `\`${oamInstallCommand(os)}\`, then re-run install.)`,
     );
   }
   const containerPath = resolved.containerPath;

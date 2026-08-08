@@ -24,7 +24,7 @@ import {
 } from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
-import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe } from "../oam-spawn.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -1560,9 +1560,11 @@ describe("runInstall — oam launch entry", () => {
     expect(brokenOut).toMatch(/installed but unusable/);
     expect(brokenOut).toContain("did not answer in time");
 
-    // Absence stays silent by design: there is nothing for the user to fix, and
-    // a Runtime line on every npx install would be noise. This is the contrast
-    // that makes the branches above worth having.
+    // Absence now gets a line too -- it used to be the one branch of the chain
+    // that said nothing, so a fresh machine got an npx entry with no hint that
+    // oam existed. What must NOT leak across is the broken wording: sending
+    // someone with no oam to "fix or reinstall" it is the inverse of the bug the
+    // branches above exist to prevent.
     const absentHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-absent-"));
     try {
       const absent = captureIo();
@@ -1575,9 +1577,38 @@ describe("runInstall — oam launch entry", () => {
         oamProbe: OAM_ABSENT,
       });
       expect(withAbsent.exitCode).toBe(0);
-      expect(withAbsent.messages.join(" ")).not.toMatch(/Runtime:/);
+      const absentOut = withAbsent.messages.join(" ");
+      expect(absentOut).toMatch(/Runtime: node \(oam is not installed/);
+      expect(absentOut).toContain(OAM_INSTALL_SH);
+      expect(absentOut).not.toMatch(/unusable/);
+      // Nothing is broken, so it must not read as a repair instruction.
+      expect(absentOut).not.toMatch(/Fix or reinstall/);
     } finally {
       rmSync(absentHome, { recursive: true, force: true });
+    }
+  });
+
+  it("names the windows installer when install is asked about windows", async () => {
+    // The install command is selected from the --os the report is ABOUT, never
+    // process.platform: a report generated on linux for a windows machine that
+    // hands back the curl line is a command that machine cannot run.
+    const winHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-absent-win-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "windows",
+        home: winHome,
+        io: cap.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(r.exitCode).toBe(0);
+      const out = r.messages.join(" ");
+      expect(out).toContain(OAM_INSTALL_PS1);
+      expect(out).not.toContain(OAM_INSTALL_SH);
+    } finally {
+      rmSync(winHome, { recursive: true, force: true });
     }
   });
 
