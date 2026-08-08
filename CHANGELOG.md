@@ -2,7 +2,7 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 0.74.2 -- the oam floor moves to 0.8.3, and a full-pass sweep of the runtime
 
 **Changed -- the oam floor moves to 0.8.3**
 
