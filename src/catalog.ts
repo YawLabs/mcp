@@ -102,7 +102,22 @@ export async function defaultFetchCatalog(url: string = DEFAULT_CATALOG_URL): Pr
     if (!res.ok) {
       throw new Error(`the Yaw MCP catalog at ${url} returned HTTP ${res.status}.`);
     }
-    body = await res.json();
+    // A 200 whose body isn't JSON is the captive-portal / corporate-proxy
+    // shape: the request "succeeded" and returned an HTML login page. Left
+    // unwrapped, the raw SyntaxError reaches the user as `yaw-mcp add:
+    // Unexpected token '<', "<!DOCTYPE "... is not valid JSON` -- naming
+    // neither the catalog nor the URL that produced it. Wrap it here so every
+    // failure mode of this function carries the same "catalog at <url>" prefix
+    // its docstring promises. An abort that lands while the BODY is streaming
+    // also rejects here; rethrow that untouched so the outer catch keeps
+    // reporting it as the timeout it is.
+    try {
+      body = await res.json();
+    } catch (parseErr) {
+      if (parseErr instanceof Error && parseErr.name === "AbortError") throw parseErr;
+      const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      throw new Error(`the Yaw MCP catalog at ${url} did not return valid JSON (${msg}).`);
+    }
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error(`timed out fetching the Yaw MCP catalog at ${url}.`);

@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
 import { spawnSync } from "node:child_process";
-import { __resetUvBootstrap, resolveUvSpawn } from "../uv-bootstrap.js";
+import { __resetUvBootstrap, resolveUvSpawn, runCommand, UV_EXTRACT_TIMEOUT_MS } from "../uv-bootstrap.js";
 
 // Is uv reachable on this machine? Probed ONCE here instead of inside each
 // test: the previous shape returned early when uv was absent, so the test
@@ -100,5 +100,55 @@ describe("resolveUvSpawn with uv present", () => {
     const result = await resolveUvSpawn("uvx", []);
     expect(isUvSpawnTarget(result.command)).toBe(true);
     expect(result.args).toEqual(["tool", "run"]);
+  });
+});
+
+// runCommand is what extractArchive runs tar / powershell Expand-Archive
+// through. Real subprocesses (this file deliberately does not mock spawn) --
+// process.execPath is the one binary guaranteed present on any machine running
+// the suite.
+describe("runCommand", () => {
+  it("resolves on a clean exit", async () => {
+    await expect(runCommand(process.execPath, ["-e", "process.exit(0)"], 30_000)).resolves.toBeUndefined();
+  });
+
+  it("rejects with the child's stderr on a non-zero exit", async () => {
+    const err = await runCommand(process.execPath, ["-e", 'console.error("boom"); process.exit(3)'], 30_000).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("exited 3");
+    expect((err as Error).message).toContain("boom");
+  });
+
+  it("kills and rejects a child that never exits, instead of hanging forever", async () => {
+    // The hole this closes: extractArchive had no deadline, and upstream.ts
+    // awaits resolveUvSpawn BEFORE it arms its own connect timeout -- so a
+    // wedged tar never became an ActivationError and never expired. ensureUv
+    // memoizes, so that one never-settling promise was then handed to every
+    // later uv/uvx activation for the life of the process.
+    const started = Date.now();
+    const err = await runCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], 300).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("did not finish within 300ms");
+    expect(Date.now() - started, "settled on the deadline, not on the child").toBeLessThan(10_000);
+  });
+
+  it("does not deadlock on a child that writes more stdout than a pipe buffer holds", async () => {
+    // The self-inflicted half of the same hang: stdout used to be "pipe" with
+    // no reader, so any extractor writing past the pipe buffer (tar -v, a
+    // PowerShell progress stream) blocked on write and never reached 'close'.
+    // 4MB is far past every platform's buffer. A generous deadline, so a
+    // failure here is the deadlock and not a slow machine.
+    await expect(
+      runCommand(process.execPath, ["-e", 'process.stdout.write("x".repeat(4 * 1024 * 1024))'], 30_000),
+    ).resolves.toBeUndefined();
+  });
+
+  it("defaults to a budget sized for an archive extract, not for a probe", () => {
+    // Expiry must mean "genuinely stuck", not "slow but working": a cold
+    // PowerShell start plus Expand-Archive is seconds, so the floor here is
+    // well above it.
+    expect(UV_EXTRACT_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
   });
 });

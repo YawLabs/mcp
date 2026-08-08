@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMPLIANCE_USAGE,
@@ -59,8 +60,9 @@ describe("runComplianceCommand arg handling", () => {
   it("--publish is rejected with an explanation and exit 2 (never reaches the child)", async () => {
     // Behavior, not docs. Unhandled, --publish falls through to runTest as a
     // stray extra arg and the user gets an opaque child-process error instead
-    // of "that flag is gone". Exit 2 is load-bearing: the child path can only
-    // ever return 0 or 1, so a 2 here proves we short-circuited before spawn.
+    // of "that flag is gone". Exit 2 is load-bearing: the child path returns
+    // the mcp-compliance exit code, which is only ever 0 or 1, so a 2 here
+    // proves we short-circuited before spawn.
     const cap = captureIo();
     const code = await runComplianceCommand(["--publish"], cap.io);
     expect(code).toBe(2);
@@ -239,11 +241,42 @@ describe("runComplianceCommand unlaunchable path", () => {
 // numeric score would crash the CLI with a raw TypeError, so the score check
 // lives in the parse gate and routes to the "unexpected JSON" path instead.
 describe("isRenderableReport", () => {
-  const base = { grade: "A", score: 91.5, summary: { total: 1, passed: 1, failed: 0, required: 1, requiredPassed: 1 } };
+  // `url` is part of the fixture because the gate now checks it: printSummary
+  // renders `Target: ${url}`, and the child is spawned unpinned (`npx -y
+  // @yawlabs/mcp-compliance`), so a renamed field must route to the
+  // "unexpected JSON" path rather than printing "Target: undefined".
+  const base = {
+    grade: "A",
+    score: 91.5,
+    url: "stdio:npx -y server",
+    summary: { total: 1, passed: 1, failed: 0, required: 1, requiredPassed: 1 },
+  };
 
   it("accepts a report with grade, summary and a finite numeric score", () => {
     expect(isRenderableReport(base)).toBe(true);
     expect(isRenderableReport({ ...base, score: 0 })).toBe(true);
+  });
+
+  // A truthy-but-empty summary used to pass the gate, and printSummary then
+  // rendered "undefined/undefined passed, undefined/undefined required" with
+  // exit 0 -- garbage presented as a clean result.
+  it("rejects a summary missing the counters printSummary formats", () => {
+    expect(isRenderableReport({ ...base, summary: {} })).toBe(false);
+    expect(isRenderableReport({ ...base, summary: { total: 1, passed: 1 } })).toBe(false);
+    expect(isRenderableReport({ ...base, summary: { ...base.summary, requiredPassed: "1" } })).toBe(false);
+    expect(isRenderableReport({ ...base, summary: { ...base.summary, total: Number.NaN } })).toBe(false);
+  });
+
+  it("rejects a missing or non-string url", () => {
+    expect(isRenderableReport({ grade: "A", score: 1, summary: base.summary })).toBe(false);
+    expect(isRenderableReport({ ...base, url: 42 })).toBe(false);
+  });
+
+  // summary.failed is not rendered, so the gate must not demand it -- this
+  // guard protects what is printed, it does not re-declare the child schema.
+  it("does not require fields printSummary never renders", () => {
+    const { failed: _failed, ...rest } = base.summary;
+    expect(isRenderableReport({ ...base, summary: rest })).toBe(true);
   });
 
   it("rejects a missing, non-numeric or non-finite score", () => {
@@ -258,5 +291,69 @@ describe("isRenderableReport", () => {
     expect(isRenderableReport({ grade: "A", score: 1 })).toBe(false);
     expect(isRenderableReport(null)).toBe(false);
     expect(isRenderableReport("nope")).toBe(false);
+  });
+});
+
+// `--strict` and `--min-grade` are forwarded to the child verbatim, and their
+// ONLY effect is a non-zero exit -- the JSON report is identical either way.
+// Swallowing the child's code made both flags silent no-ops through yaw-mcp:
+// a CI gate printed "Grade F is below threshold A" and exited 0.
+describe("runComplianceCommand child exit propagation", () => {
+  const report = {
+    grade: "F",
+    score: 12,
+    url: "https://example.com/mcp",
+    summary: { total: 10, passed: 2, failed: 8, required: 5, requiredPassed: 1 },
+    tests: [],
+  };
+
+  async function runWithChildExit(exitCode: number | null) {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const spawn = (): EventEmitter & { stdout: EventEmitter; pid: number; kill: () => boolean } => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          pid: number;
+          kill: () => boolean;
+        };
+        child.stdout = new EventEmitter();
+        child.pid = 4242;
+        child.kill = () => true;
+        setImmediate(() => {
+          child.stdout.emit("data", Buffer.from(JSON.stringify(report)));
+          child.emit("close", exitCode);
+        });
+        return child;
+      };
+      return { spawn, default: { spawn } };
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const code = await mod.runComplianceCommand(["https://example.com/mcp", "--min-grade", "A"], cap.io);
+      return { code, out: cap.out(), err: cap.err() };
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  }
+
+  it("propagates a non-zero child exit while still printing the report", async () => {
+    const r = await runWithChildExit(1);
+    expect(r.code).toBe(1);
+    // The report is NOT suppressed -- the user still sees why the gate failed.
+    expect(r.out).toContain("Compliance: F");
+    expect(r.out).toContain("2/10 passed, 1/5 required");
+  });
+
+  it("stays 0 when the child exits cleanly", async () => {
+    const r = await runWithChildExit(0);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("Compliance: F");
+  });
+
+  it("reports a signal death (null code) as 1", async () => {
+    const r = await runWithChildExit(null);
+    expect(r.code).toBe(1);
   });
 });

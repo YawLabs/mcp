@@ -37,6 +37,7 @@ import {
   revokeTrust,
   TRUST_BYPASS_ENV,
   TRUST_FILENAME,
+  TRUST_SCHEMA_VERSION,
   TrustStoreUnreadableError,
   trustStatusFor,
   trustStorePath,
@@ -492,6 +493,69 @@ describe("an UNREADABLE store is denied but never discarded", () => {
       expect(listed[0].path).toBe(projectBundlesPath(synthCwd));
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// A store from a NEWER schema is denied, and never stamped over
+// ---------------------------------------------------------------------------
+//
+// `version` used to be parsed, returned on TrustStore, and read by nobody --
+// the one place this module did not fail closed. A future yaw-mcp that keys
+// entries differently (realpath, a different digest) would have its store
+// reinterpreted with v1 semantics by an older binary still on the machine.
+
+describe("a store written by a NEWER yaw-mcp", () => {
+  function writeStore(body: unknown): string {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const p = trustStorePath(synthHome);
+    writeFileSync(p, `${JSON.stringify(body, null, 2)}\n`);
+    return p;
+  }
+
+  it("is unusable rather than reinterpreted, and says which version it saw", async () => {
+    writeStore({ version: TRUST_SCHEMA_VERSION + 1, trusted: {} });
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(true);
+    expect(store.malformedKind).toBe("schema");
+    expect(store.version).toBe(TRUST_SCHEMA_VERSION + 1);
+    // Nothing failed at the syscall level, so there is no errno to report.
+    expect(store.errorCode).toBeNull();
+    expect(store.malformedReason).toContain(trustStorePath(synthHome));
+    expect(store.malformedReason).toContain(String(TRUST_SCHEMA_VERSION + 1));
+  });
+
+  it("denies every lookup rather than reporting approved projects as untrusted", async () => {
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const real = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as Record<string, unknown>;
+    // Same grant, same bytes on disk -- only the declared schema moved.
+    writeStore({ ...real, version: TRUST_SCHEMA_VERSION + 1 });
+    const store = await readTrustStore(synthHome);
+    expect(trustStatusFor(path, readFileSync(path), store)).toBe("store-unreadable");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+  });
+
+  it("refuses the write instead of downgrading the file over its grants", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const storePath = writeStore({ version: TRUST_SCHEMA_VERSION + 1, trusted: {}, futureField: "keep me" });
+    const before = readFileSync(storePath, "utf8");
+    const err = await grantTrust(path, readFileSync(path), { home: synthHome }).catch((e) => e);
+    expect(err).toBeInstanceOf(TrustStoreUnreadableError);
+    expect((err as TrustStoreUnreadableError).kind).toBe("schema");
+    expect((err as TrustStoreUnreadableError).code).toBeNull();
+    // Byte for byte -- a v2 store must survive an older binary trying to grant.
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+  });
+
+  it("still loads a store at the current schema version", async () => {
+    await writeTrustedProjectBundles(synthCwd, HOSTILE);
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(false);
+    expect(store.malformedKind).toBeNull();
+    expect(store.version).toBe(TRUST_SCHEMA_VERSION);
+  });
 });
 
 // ---------------------------------------------------------------------------

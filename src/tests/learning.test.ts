@@ -107,14 +107,16 @@ describe("LearningStore", () => {
       expect(factor).toBeGreaterThanOrEqual(1.0);
     });
 
-    it("rate stays in [0,1] when dispatched < succeeded", () => {
+    it("clamps a loaded succeeded > dispatched snapshot instead of inflating dispatched", () => {
       const store = new LearningStore();
       store.loadSnapshot({ ns: { dispatched: 2, succeeded: 5, lastUsedAt: 1 } });
-      // loadSnapshot resolves succeeded > dispatched the SAME direction
-      // boostFactor does: dispatched is coerced UP to 5, succeeded keeps its
-      // earned 5. Rate = 1.0, so no penalty fires.
-      expect(store.get("ns")).toEqual({ dispatched: 5, succeeded: 5, lastUsedAt: 1 });
+      // No production recorder can produce succeeded > dispatched, so on load
+      // it is corrupt/hand-edited state and succeeded is clamped DOWN -- the
+      // same direction persistence.ts's sanitizeLearning clamps it, which is
+      // the path every real cross-session load actually goes through.
+      expect(store.get("ns")).toEqual({ dispatched: 2, succeeded: 2, lastUsedAt: 1 });
       const factor = store.boostFactor("ns");
+      expect(Number.isFinite(factor)).toBe(true);
       expect(factor).toBeGreaterThanOrEqual(1.0);
     });
   });
@@ -183,24 +185,34 @@ describe("LearningStore", () => {
       expect(store2.boostFactor("slack")).toBe(store.boostFactor("slack"));
     });
 
-    it("round-trips a succeeded > dispatched store without losing credit", () => {
-      // recordSuccess without a paired recordDispatch legitimately produces
-      // succeeded > dispatched in memory. export -> load must be an identity
-      // on the boost factor: clamping succeeded DOWN to dispatched would
-      // silently delete earned credit on every restart.
+    it("clamps succeeded down to dispatched on load, matching the persistence path", () => {
+      // The deprecated recordSuccess can still produce succeeded > dispatched
+      // in memory, but that shape is NOT persistable: persistence.ts's
+      // sanitizeLearning clamps succeeded to dispatched on every real
+      // cross-session load, so loadSnapshot resolves it the same way.
+      // Coercing dispatched UP here instead would make export -> load look
+      // lossless in-process while the disk path quietly reshaped the record.
       const store = new LearningStore();
       for (let i = 0; i < 5; i++) store.recordSuccess("solo");
-      const before = store.boostFactor("solo");
+      expect(store.get("solo")).toMatchObject({ dispatched: 0, succeeded: 5 });
 
       const store2 = new LearningStore();
       store2.loadSnapshot(store.exportSnapshot());
+      expect(store2.get("solo")).toMatchObject({ dispatched: 0, succeeded: 0 });
 
-      expect(store2.get("solo")?.succeeded).toBe(5);
-      expect(store2.boostFactor("solo")).toBe(before);
       // Loading the loaded snapshot is a fixed point -- no further drift.
       const store3 = new LearningStore();
       store3.loadSnapshot(store2.exportSnapshot());
       expect(store3.get("solo")).toEqual(store2.get("solo"));
+    });
+
+    it("resolves a corrupt overcount entry the same way sanitizeLearning does", () => {
+      // Regression guard against the two files clamping one invariant in
+      // opposite directions. persistence.test.ts pins sanitizeLearning on this
+      // exact input: { dispatched: 3, succeeded: 7 } -> succeeded 3.
+      const store = new LearningStore();
+      store.loadSnapshot({ overcount: { dispatched: 3, succeeded: 7, lastUsedAt: 10 } });
+      expect(store.get("overcount")).toEqual({ dispatched: 3, succeeded: 3, lastUsedAt: 10 });
     });
 
     it("round-tripping an empty store produces an empty store", () => {

@@ -37,13 +37,11 @@ describe("isFoundryEnabled", () => {
 
 describe("redactIntent", () => {
   it("drops a sk_live_...-style secret token but keeps normal words", () => {
-    // tokenize splits on non-alphanumerics, so the secret reaches redaction
-    // as a single long alphanumeric run beginning with the sk_ prefix...
-    // except `_` is a non-alphanumeric, so `sk_live_xxxx` would split. Use a
-    // prefix form that survives splitting AND a long high-entropy form.
+    // Two layers can catch this now: the raw-string prefix scrub eats
+    // `sk_...` whole before tokenize sees it, and even if it did not, the
+    // long mixed letter+digit run left behind trips the entropy rule. Either
+    // way no fragment of the key material reaches the bag.
     const r = redactIntent("please use sk_live4242aaaa9999bbbb8888cccc to authenticate");
-    // "sk" alone survives as a short token; the long mixed run is dropped.
-    // The token containing the live key material is the long high-entropy one.
     expect(r.tokens).toContain("please");
     expect(r.tokens).toContain("use");
     expect(r.tokens).toContain("authenticate");
@@ -103,6 +101,33 @@ describe("redactIntent", () => {
     expect(r.tokens).toContain("and");
     expect(r.tokens).toContain("plus");
     expect(r.tokens).toContain("normalword");
+  });
+
+  it("strips punctuated secret prefixes on the RAW intent, before tokenize splits them", () => {
+    // REGRESSION: every SECRET_PREFIXES entry containing '_' or '-' was dead
+    // code. looksSensitive only ever sees tokenize() output, which is always a
+    // bare [a-z0-9]+ run, so `token.startsWith("ghp_")` could never be true.
+    // These now match on the raw string, where the punctuation still exists.
+    for (const secret of [
+      "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+      "gho_16C7e42F292c6912E7710c838347Ae178B4a",
+      "sk-proj-AbCd1234EfGh5678",
+      "sk_test_51H8xTestKeyMaterial",
+      "tok_1JKlmNOpQrStUvWx",
+      "pk_live_ZZTopKeyMaterial",
+    ]) {
+      const r = redactIntent(`deploy with ${secret} now`);
+      expect(r.tokens).toEqual(["deploy", "now", "with"]);
+      expect(r.redactedCount).toBe(1);
+    }
+  });
+
+  it("does not scrub an ordinary hyphenated word that merely contains a prefix", () => {
+    // The `(?<![A-Za-z0-9])` boundary keeps the raw pattern off the "sk-" in
+    // "task-list"; only a prefix at a real token boundary counts.
+    const r = redactIntent("update the task-list and risk-report");
+    expect(r.redactedCount).toBe(0);
+    expect(r.tokens).toEqual(expect.arrayContaining(["task", "list", "risk", "report"]));
   });
 
   it("strips an email address before tokenize and increments redactedCount", () => {

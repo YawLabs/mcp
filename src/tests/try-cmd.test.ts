@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -468,6 +468,65 @@ describe("runTry — client config perms (POSIX)", () => {
     expect(statSync(clientPath).mode & 0o777).toBe(0o600);
   });
 
+  posixOnly("does NOT widen a pre-existing owner-only config when the trial carries no secret", async () => {
+    // The other half of the perms contract: `try` must not force 0600, but it
+    // must never LOOSEN either. atomicWriteFile renames a new inode over the
+    // target, so before it preserved the target's mode this wrote a 0644 file
+    // over a 0600 one -- exposing whatever the user had already tightened it
+    // for (an earlier trial's inline API key, or a hand chmod).
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, JSON.stringify({ mcpServers: { alpha: { env: { A_TOKEN: "s" } } } }), { mode: 0o600 });
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+    // And the pre-existing secret-bearing entry is still there to protect.
+    const client = JSON.parse(readFileSync(clientPath, "utf8"));
+    expect(client.mcpServers.alpha.env.A_TOKEN).toBe("s");
+  });
+
+  posixOnly("try-cleanup does not widen an owner-only config either", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    const cap1 = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap1.pushOut,
+      err: cap1.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    });
+    // User (or an earlier secret-bearing trial) tightened the config.
+    chmodSync(clientPath, 0o600);
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(statSync(clientPath).mode & 0o777).toBe(0o600);
+  });
+
   posixOnly("does NOT tighten perms when the trial entry carries no inline secret", async () => {
     // Negative arm of the perms contract: SAMPLE has requiredEnvVars:[] and no
     // --env override, so the trial entry's env resolves to undefined
@@ -626,7 +685,233 @@ describe("runTry — preserves existing client config siblings", () => {
   });
 });
 
+describe("runTry — unreadable vs invalid client config", () => {
+  it("reports a read failure as a read failure, not as invalid JSON", async () => {
+    // A directory where the config should be is the portable way to make
+    // readFile fail (EISDIR); the real-world shape is a root-owned or
+    // other-user-0600 ~/.claude.json (EACCES). Folding read and parse into one
+    // catch told the user their JSON was invalid and sent them to inspect a
+    // file they cannot even open.
+    mkdirSync(join(synthHome, ".claude.json"), { recursive: true });
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/could not be read/);
+    expect(cap.errText()).toMatch(/permissions/);
+    expect(cap.errText()).not.toMatch(/not valid JSON/);
+  });
+
+  it("still reports genuinely invalid JSON as invalid JSON", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "{ not json");
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/is not valid JSON/);
+  });
+});
+
+describe("runTry — re-run against a different client", () => {
+  it("peels the previous client's entry before the marker stops naming it", async () => {
+    // The marker path is keyed on SLUG alone, so this re-run overwrites the
+    // only record of the cursor wiring. Without the peel, the cursor entry --
+    // inline secret included -- is orphaned past its TTL: try-cleanup reads
+    // only the current marker and doctor's GC only walks markers.
+    const cap1 = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "cursor",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { D_TOKEN: "secret" },
+      out: cap1.pushOut,
+      err: cap1.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    const cursorPath = join(synthHome, ".cursor", "mcp.json");
+    expect(JSON.parse(readFileSync(cursorPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { D_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    // Old client's entry is gone (and the user was told).
+    expect(JSON.parse(readFileSync(cursorPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
+    expect(cap.text()).toMatch(/Removed the previous demo trial/);
+    // New client's entry is wired and the marker now points at it.
+    const clientPath = join(synthHome, ".claude.json");
+    expect(JSON.parse(readFileSync(clientPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+    const marker = JSON.parse(readFileSync(trialMarkerPath("demo", synthHome), "utf8")) as TrialMarker;
+    expect(marker.clientPath).toBe(clientPath);
+  });
+
+  it("leaves the entry alone when re-run against the SAME client", async () => {
+    const common = {
+      slug: "demo",
+      clientId: "claude-code" as const,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux" as const,
+      env: {},
+      fetchExplore: async () => SAMPLE,
+      postEvent: async () => undefined,
+    };
+    const cap1 = captureIO();
+    await runTry({ ...common, out: cap1.pushOut, err: cap1.pushErr });
+    const cap = captureIO();
+    const r = await runTry({ ...common, ttl: "2h", out: cap.pushOut, err: cap.pushErr });
+    expect(r.exitCode).toBe(0);
+    // Same client + same entry name -> nothing to peel, no scary line.
+    expect(cap.text()).not.toMatch(/Removed the previous/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+  });
+});
+
+describe("marker trust guards", () => {
+  function writeMarker(slug: string, extra: Partial<TrialMarker>): string {
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug,
+      name: "Demo MCP",
+      expiresAt: Date.now() - 1,
+      clientPath: join(synthHome, ".claude.json"),
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: `yaw-mcp-try-${slug}`,
+      createdAt: Date.now() - 3_600_000,
+      ...extra,
+    };
+    const path = trialMarkerPath(slug, synthHome);
+    writeFileSync(path, JSON.stringify(marker));
+    return path;
+  }
+
+  it("try-cleanup refuses a marker naming a non-trial entry instead of deleting that key", async () => {
+    // Blast radius without the guard: a hand-edited / corrupted marker makes
+    // cleanup remove an ARBITRARY key from an arbitrary JSON file -- here the
+    // canonical yaw-mcp launch entry.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }),
+    );
+    writeMarker("evil", { entryName: ENTRY_NAME });
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "evil",
+      home: synthHome,
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/non-trial entry/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
+  });
+
+  it("scanTrials classifies a non-trial entryName as malformed rather than sweepable", async () => {
+    writeMarker("evil", { entryName: ENTRY_NAME });
+    const scan = await scanTrials({ home: synthHome });
+    expect(scan.expired).toHaveLength(0);
+    expect(scan.malformed).toHaveLength(1);
+  });
+
+  it("scanTrials refuses a marker from a NEWER schema, but accepts one with the field absent", async () => {
+    // Above our version = semantics we cannot know, so the GC does not guess.
+    // Absent = older / hand-rolled marker, read as v1; rejecting those would
+    // strand a live trial entry with nothing able to reclaim it.
+    writeMarker("future", { schemaVersion: 2 });
+    writeMarker("legacy", { schemaVersion: undefined as unknown as number });
+    const scan = await scanTrials({ home: synthHome });
+    expect(scan.malformed).toHaveLength(1);
+    expect(scan.malformed[0]).toContain("future");
+    expect(scan.expired.map((e) => e.marker.slug)).toEqual(["legacy"]);
+  });
+
+  it("GC leaves a future-schema marker on disk for the user to deal with", async () => {
+    const path = writeMarker("future", { schemaVersion: 99 });
+    const result = await gcExpiredTrials({ home: synthHome, env: {}, postEvent: async () => undefined });
+    expect(result.cleared).toBe(0);
+    expect(existsSync(path)).toBe(true);
+  });
+});
+
 describe("runTryCleanup", () => {
+  it("leaves a BOM-prefixed config byte-identical when there is no entry to remove", async () => {
+    // removeJsoncEntry's no-op used to return the de-BOM'd source, which reads
+    // as "changed" here -- so cleanup rewrote a Notepad-saved ~/.claude.json,
+    // stripped its BOM, and printed "Removed ..." having removed nothing.
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const clientPath = join(synthHome, ".claude.json");
+    const original = ["﻿{", '  "mcpServers": { "other": { "command": "x" } }', "}", ""].join("\n");
+    writeFileSync(clientPath, original, "utf8");
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "demo",
+      name: "Demo MCP",
+      expiresAt: Date.now() + 3_600_000,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-demo",
+      createdAt: Date.now(),
+    };
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(marker));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(readFileSync(clientPath, "utf8")).toBe(original);
+    expect(cap.text()).not.toMatch(/Removed yaw-mcp-try-demo/);
+  });
+
   it("removes the entry + marker + fires cleanup event, written contains client path", async () => {
     // Wire a trial first.
     const cap1 = captureIO();

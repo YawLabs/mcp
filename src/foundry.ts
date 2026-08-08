@@ -13,9 +13,13 @@
 //      `user@host.com/secret` becomes ["user", "host", "com", "secret"].
 //      That is the FIRST line of defense -- structure is gone.
 //
-//   2. `redactIntent` is the SECOND line of defense: it drops the tokens
-//      that survive splitting but still look sensitive -- long high-entropy
-//      blobs, known secret prefixes, hex digests, long pure-alpha runs, and
+//   2. `redactIntent` is the SECOND line of defense, and it runs in two
+//      passes. BEFORE tokenize it scrubs the raw string of the shapes that
+//      only exist while the punctuation does -- emails, phone runs, issue /
+//      ticket refs, and punctuated secret prefixes (`ghp_...`, `sk-proj-...`).
+//      AFTER tokenize it drops the tokens that survive splitting but still
+//      look sensitive -- long high-entropy blobs, punctuation-free secret
+//      prefixes (`xox...`, `akia...`), hex digests, long pure-alpha runs, and
 //      mixed letter+digit runs (an API key with no punctuation inside it).
 //      The surviving tokens are then SORTED, so word order is destroyed and
 //      the original sentence cannot be reconstructed from the bag.
@@ -43,11 +47,29 @@ export interface RedactedIntent {
   redactedCount: number;
 }
 
-// Known secret/token prefixes. A token is dropped outright if it starts with
-// any of these. All prefixes are stored lowercase because tokenize has
+// Known secret/token prefixes. All are stored lowercase because tokenize has
 // already lowercased every token before it reaches us (so "akia" here matches
 // an "AKIA..." AWS access-key-id that arrived as "akia...").
+//
+// These get matched in TWO places, because tokenize() destroys the punctuation
+// most of them contain. A prefix with a '_' or '-' in it can NEVER match a
+// token -- tokenize splits on every non-alphanumeric, so a token is always a
+// bare [a-z0-9]+ run and `token.startsWith("ghp_")` is unsatisfiable. Those
+// prefixes are therefore matched on the RAW intent string (see
+// RAW_SECRET_PREFIX_PATTERN below), where the punctuation still exists; only
+// the purely-alphanumeric ones ("xox", "akia") are checked per token. The
+// split is DERIVED, not hand-maintained, so the next prefix a maintainer adds
+// ("github_pat_", "sk-proj-") lands in the right layer automatically instead
+// of being dead on arrival.
 const SECRET_PREFIXES = ["sk_", "sk-", "tok_", "ghp_", "gho_", "xox", "pk_", "akia"];
+
+/** Prefixes that survive tokenize() -- purely [a-z0-9], so a token can start
+ *  with one. Checked per token in looksSensitive. */
+const TOKEN_SECRET_PREFIXES = SECRET_PREFIXES.filter((p) => /^[a-z0-9]+$/.test(p));
+
+/** Prefixes containing punctuation -- unreachable from a token, so they are
+ *  matched on the raw intent instead. */
+const RAW_SECRET_PREFIXES = SECRET_PREFIXES.filter((p) => !/^[a-z0-9]+$/.test(p));
 
 // A token "looks like a secret/PII" when any of these hold. tokenize has
 // already lowercased and stripped non-alphanumerics, so by the time we see
@@ -55,7 +77,8 @@ const SECRET_PREFIXES = ["sk_", "sk-", "tok_", "ghp_", "gho_", "xox", "pk_", "ak
 // target what survives: long high-entropy blobs and prefixed/hex tokens.
 function looksSensitive(token: string): boolean {
   // Known secret prefixes (case-insensitive; token is already lowercased).
-  for (const prefix of SECRET_PREFIXES) {
+  // Only the punctuation-free ones can ever match here -- see SECRET_PREFIXES.
+  for (const prefix of TOKEN_SECRET_PREFIXES) {
     if (token.startsWith(prefix)) return true;
   }
 
@@ -106,14 +129,44 @@ const RAW_PII_PATTERNS: RegExp[] = [
   /(?<![A-Za-z0-9])[A-Z]+-\d+(?![A-Za-z0-9])/g,
 ];
 
+// Punctuation-carrying secret prefixes, matched on the RAW intent for the same
+// reason as the patterns above: tokenize() splits on the very '_' / '-' that
+// makes `ghp_...` / `sk-proj-...` recognizable, so by the token loop the prefix
+// is gone. The trailing `[A-Za-z0-9_-]+` swallows the whole key (a GitHub PAT
+// and an OpenAI project key both keep '_' / '-' internally), and the
+// non-alphanumeric boundaries mirror RAW_PII_PATTERNS so this cannot fire on a
+// fragment inside a longer run. Built from SECRET_PREFIXES so the two layers
+// can never drift. Case-insensitive: this runs BEFORE tokenize lowercases.
+//
+// Guarded on a non-empty list: an empty alternation would compile to `(?:)`,
+// which matches the empty string and would turn the pattern into "scrub every
+// word". If every prefix ever becomes punctuation-free the layer just drops
+// out instead.
+const RAW_SECRET_PREFIX_PATTERN: RegExp | null =
+  RAW_SECRET_PREFIXES.length > 0
+    ? new RegExp(
+        `(?<![A-Za-z0-9])(?:${RAW_SECRET_PREFIXES.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[A-Za-z0-9_-]+(?![A-Za-z0-9])`,
+        "gi",
+      )
+    : null;
+
+// Scrubbed off the raw string in order. The secret-prefix pattern runs FIRST so
+// a key is consumed whole before a narrower pattern (e.g. the phone shape) can
+// nibble a digit run out of its middle and double-count it.
+const RAW_SCRUB_PATTERNS: RegExp[] = [
+  ...(RAW_SECRET_PREFIX_PATTERN ? [RAW_SECRET_PREFIX_PATTERN] : []),
+  ...RAW_PII_PATTERNS,
+];
+
 export function redactIntent(intent: string): RedactedIntent {
   let redactedCount = 0;
-  // First pass: strip structured PII from the raw string. Replace each
-  // match with a single space to preserve token boundaries. APPEND to the
-  // existing token-level redaction below -- this layer catches patterns
-  // tokenize() would destroy before looksSensitive could see them.
+  // First pass: strip structured PII and punctuated secret prefixes from the
+  // raw string. Replace each match with a single space to preserve token
+  // boundaries. APPEND to the existing token-level redaction below -- this
+  // layer catches the shapes tokenize() would destroy before looksSensitive
+  // could see them.
   let scrubbed = intent;
-  for (const re of RAW_PII_PATTERNS) {
+  for (const re of RAW_SCRUB_PATTERNS) {
     scrubbed = scrubbed.replace(re, () => {
       redactedCount++;
       return " ";

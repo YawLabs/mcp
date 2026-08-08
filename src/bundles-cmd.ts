@@ -10,10 +10,12 @@
 //           network, no token needed. Good for browsing or sharing in
 //           onboarding docs.
 //
-//   match   Reads the servers yaw-mcp actually loads (bundles.json, project
-//           file winning over user-global) and partitions the bundles into
-//           "ready to activate" vs "partially installed" vs "ignored" (zero
-//           overlap). Also local: no network, no token needed.
+//   match   Reads the servers yaw-mcp actually MAKES AVAILABLE -- enabled
+//           entries from bundles.json (project file winning over user-global)
+//           minus anything the config.json allow/deny profile excludes -- and
+//           partitions the bundles into "ready to activate" vs "partially
+//           installed" vs "ignored" (zero overlap). Also local: no network, no
+//           token needed.
 //
 // Output is human-readable text by default. `--json` on either action
 // emits a machine-readable shape for pipeline use.
@@ -30,6 +32,7 @@ import {
   type CuratedBundle,
   matchBundles,
 } from "./bundles.js";
+import { isAllowed, loadYawMcpConfig } from "./config-loader.js";
 import { loadLocalBundles } from "./local-bundles.js";
 
 export type BundlesAction = "list" | "match";
@@ -114,27 +117,37 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   }
 
   // action === "match" — reads the same local bundles.json server.ts loads at
-  // startup, so the CLI's partition and the LLM-facing `mcp_connect_bundles`
-  // partition are computed over the identical server set.
+  // startup AND the same config.json profile it enforces, so the CLI's
+  // partition and the LLM-facing `mcp_connect_bundles` partition are computed
+  // over the identical server set.
   const loaded = await loadLocalBundles({ cwd: opts.cwd, home: opts.home });
+  const config = await loadYawMcpConfig({ cwd: opts.cwd, home: opts.home });
 
-  // Surface load warnings so a malformed bundles.json reads as "this file is
-  // broken" instead of "you have no servers." stderr keeps stdout clean for
-  // a --json consumer.
+  // Surface load warnings so a malformed bundles.json (or config.json) reads as
+  // "this file is broken" instead of "you have no servers." stderr keeps stdout
+  // clean for a --json consumer.
   for (const w of loaded.warnings) printErr(`warning: ${w}`);
+  for (const w of config.warnings) printErr(`warning: ${w}`);
 
   // Only count enabled servers — disabled ones won't auto-activate so
-  // they shouldn't count toward a bundle being "ready." This mirrors
-  // the filter the LLM-facing `mcp_connect_bundles` uses.
-  const installed = (loaded.config?.servers ?? []).filter((s) => s.isActive).map((s) => s.namespace);
+  // they shouldn't count toward a bundle being "ready."
+  const enabled = (loaded.config?.servers ?? []).filter((s) => s.isActive).map((s) => s.namespace);
+  // ...and only those the config.json allow/deny profile permits. This is the
+  // second half of the filter the LLM-facing `mcp_connect_bundles` uses
+  // (server.ts getProfiledActiveServers = isActive AND profileAllows). Counting
+  // a blocked namespace as installed made the CLI print a bundle as "Ready to
+  // activate" with an `mcp_connect_activate({...})` snippet the server then
+  // hard-refuses -- the one thing this command exists to get right.
+  const installed = enabled.filter((ns) => isAllowed(config, ns));
+  const excluded = enabled.filter((ns) => !isAllowed(config, ns));
   const match = matchBundles(installed);
 
   if (opts.json) {
-    print(JSON.stringify({ installed, ...match }, null, 2));
+    print(JSON.stringify({ installed, excluded, ...match }, null, 2));
     return { exitCode: 0, lines };
   }
 
-  renderMatch(match, installed, print);
+  renderMatch(match, installed, excluded, print);
   return { exitCode: 0, lines };
 }
 
@@ -162,12 +175,25 @@ function renderList(print: (s?: string) => void): void {
   }
 }
 
-function renderMatch(match: BundleMatchResult, installed: string[], print: (s?: string) => void): void {
+function renderMatch(
+  match: BundleMatchResult,
+  installed: string[],
+  excluded: string[],
+  print: (s?: string) => void,
+): void {
   const installedList = installed.length === 0 ? "(none)" : installed.slice().sort().join(", ");
   const serverWord = installed.length === 1 ? "server" : "servers";
   print(
-    `Checked ${CURATED_BUNDLES.length} bundles against ${installed.length} enabled ${serverWord}: ${installedList}`,
+    `Checked ${CURATED_BUNDLES.length} bundles against ${installed.length} available ${serverWord}: ${installedList}`,
   );
+  // Name what the profile took out of the count, or a bundle that "should" be
+  // ready reads as a bug in the matcher rather than as the deny-list doing its
+  // job. Only printed when a profile actually excluded something.
+  if (excluded.length > 0) {
+    print(
+      `Excluded by your config.json allow/deny profile: ${excluded.slice().sort().join(", ")} (enabled in bundles.json, but not activatable)`,
+    );
+  }
   print("");
 
   if (match.ready.length === 0 && match.partial.length === 0) {

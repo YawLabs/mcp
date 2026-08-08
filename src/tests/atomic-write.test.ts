@@ -53,6 +53,54 @@ describe("atomicWriteFile", () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 
+  // POSIX-only: Windows ignores the creation mode and reports 0o666.
+  it.skipIf(process.platform === "win32")(
+    "carries an existing target's mode onto the replacement inode when no mode is passed",
+    async () => {
+      // rename() publishes a NEW inode, so without preservation the surviving
+      // file is born at the umask default (~0644) and every overwrite silently
+      // widens a config the user (or an earlier secret-bearing write) tightened
+      // to owner-only. ~/.claude.json holds OAuth tokens and inline MCP env.
+      const file = join(dir, "tightened.json");
+      writeFileSync(file, '{"token":"x"}', { encoding: "utf8", mode: 0o600 });
+      await atomicWriteFile(file, '{"token":"y"}');
+      expect(readFileSync(file, "utf8")).toBe('{"token":"y"}');
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+    },
+  );
+
+  // POSIX-only for the same reason as above.
+  it.skipIf(process.platform === "win32")("an explicit mode still wins over the target's existing mode", async () => {
+    // Preservation must not block a caller that TIGHTENS on purpose: `yaw-mcp
+    // try` passes 0o600 precisely because the write it is doing is what puts a
+    // plaintext credential in the file.
+    const file = join(dir, "was-open.json");
+    writeFileSync(file, "{}", { encoding: "utf8", mode: 0o644 });
+    await atomicWriteFile(file, '{"token":"x"}', "utf8", 0o600);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it("gives concurrent same-path writes distinct tmp files instead of one shared one", async () => {
+    // pid+ms alone is not unique WITHIN a process: two overlapping calls in the
+    // same millisecond shared a tmp path, and writeFile opens with 'w', so
+    // A.truncate -> B.truncate -> A.rename published a torn/zero-byte target
+    // and the loser's rename threw. appendAuditEvent -> trimToTailCap reaches
+    // this unserialized, once per secret.
+    const file = join(dir, "concurrent.json");
+    const payloads = ["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff"];
+    // allSettled, not all: on Windows several MoveFileEx calls racing for one
+    // destination can still EPERM, which is a platform property of the rename
+    // and not what this test is about. What must hold everywhere is that no
+    // call ever observes another's half-written buffer.
+    const results = await Promise.allSettled(payloads.map((p) => atomicWriteFile(file, p)));
+    expect(results.some((r) => r.status === "fulfilled")).toBe(true);
+    // Last writer wins (that part is the caller's problem) but the surviving
+    // file must be exactly ONE COMPLETE payload -- never empty, never spliced.
+    expect(payloads).toContain(readFileSync(file, "utf8"));
+    // And no tmp file was orphaned by a rename whose source vanished.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
   it("leaves no orphan .tmp- siblings on success", async () => {
     const file = join(dir, "clean.json");
     await atomicWriteFile(file, "ok");

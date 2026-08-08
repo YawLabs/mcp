@@ -131,7 +131,21 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
-  } catch {
+  } catch (err) {
+    // "Not there" is the overwhelmingly common case and stays silent:
+    // ENOENT (no such file) and ENOTDIR (a component of the path isn't a
+    // directory, i.e. `.yaw-mcp/` doesn't exist) both mean there is no file
+    // to load. Anything ELSE means the file IS there and we could not read
+    // it -- EACCES on a root-owned `~/.yaw-mcp/config.json` (sudo-run
+    // install, restored backup), EISDIR on a `config.json/` directory, EIO
+    // on a flaky mount. Swallowing those made the user's allow/deny lists
+    // vanish with `doctor --json` reporting an empty warnings array, while
+    // the far less dangerous invalid-JSON case below did warn. Warn on both.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    const msg = err instanceof Error ? err.message : String(err);
+    warnings.push(`${path}: unreadable (${code ?? msg}) -- file ignored`);
+    log("warn", "Config file exists but could not be read; ignoring", { path, error: msg, code });
     return null;
   }
   let parsed: unknown;

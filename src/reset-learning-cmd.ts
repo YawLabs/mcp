@@ -7,6 +7,15 @@
 // the upstream, rotated its credentials) the history is now stale and
 // that penalty has overstayed its welcome — this command wipes it.
 //
+// IMPORTANT: this deletes the file on disk, it does NOT reach into a
+// running session. `yaw-mcp serve` holds the learning store in memory and
+// flushes a full snapshot (server.ts flushStateSave, on a ~1s debounce
+// after every recorded outcome/miss/exec step, plus once on shutdown)
+// without ever re-reading the file first -- so a serve process attached to
+// an MCP client will recreate state.json with every pre-reset entry on its
+// next proxied tool call. That is the NORMAL configuration, so the success
+// report says so explicitly and tells the user to restart the client.
+//
 // Scope is intentionally "all or nothing." A per-namespace flag feels
 // nice but the failure mode is a footgun (user clears one namespace,
 // forgets about three others, keeps getting silently mis-ranked).
@@ -21,7 +30,7 @@ import { readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { userConfigDir } from "./paths.js";
-import { isReadableStateVersion, loadState, STATE_FILENAME } from "./persistence.js";
+import { isPersistenceDisabled, isReadableStateVersion, loadState, STATE_FILENAME } from "./persistence.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -30,7 +39,24 @@ export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
   rotated, account swapped, server replaced) so the routing penalty
   doesn't keep suppressing it.
 
+  Restart your MCP client afterwards: a running "yaw-mcp serve" keeps
+  the learning it has in memory and re-saves it over the deleted file
+  on its next tool call.
+
   -h, --help  Show this help.`;
+
+// Printed on every path that actually removed the file. The delete is a
+// pure filesystem operation with no channel to a live serve process, and
+// that process re-saves its in-memory snapshot without consulting the file
+// first -- so without this the user watches "cleared persisted state" and
+// then keeps getting the exact routing penalty they just cleared, with
+// nothing on screen connecting the two.
+const RUNNING_SERVE_NOTE = [
+  "  note: a running yaw-mcp serve process still holds this learning in",
+  "        memory and re-saves it over the deleted file within a second of",
+  "        the next tool call. Restart your MCP client (or stop that serve",
+  "        process) for the reset to take effect.",
+];
 
 export type ParsedResetLearning =
   | { kind: "help" }
@@ -102,9 +128,12 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // someone runs this command under the flag would surprise users who
   // expected their opt-out to be non-destructive. If they really want
   // the file gone they can unset the flag and re-run.
-  const raw = env.YAW_MCP_DISABLE_PERSISTENCE;
-  const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
-  if (disabled) {
+  //
+  // The predicate is persistence.ts's -- this command used to open-code the
+  // same expression, and a divergence would have it deleting the file a
+  // running broker still believed it owned (or refusing to when the broker had
+  // already stopped writing).
+  if (isPersistenceDisabled(env)) {
     print("yaw-mcp reset-learning: persistence is disabled (YAW_MCP_DISABLE_PERSISTENCE) — nothing to clear.");
     return { exitCode: 0, lines, removed: false, path: filePath };
   }
@@ -148,6 +177,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   if (!parsedCleanly) {
     print("yaw-mcp reset-learning: cleared persisted state (contents unreadable).");
     print(`  path: ${filePath}`);
+    for (const line of RUNNING_SERVE_NOTE) print(line);
     return { exitCode: 0, lines, removed: true, path: filePath };
   }
 
@@ -155,6 +185,7 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   print(`  path: ${filePath}`);
   print(`  learning entries removed:     ${learningCount}`);
   print(`  pack history entries removed: ${packCount}`);
+  for (const line of RUNNING_SERVE_NOTE) print(line);
   return { exitCode: 0, lines, removed: true, path: filePath };
 }
 

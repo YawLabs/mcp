@@ -70,12 +70,20 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
     return 2;
   }
 
-  const report = await runTest(argv, err);
-  if (!report) return 1;
+  const run = await runTest(argv, err);
+  if (!run) return 1;
 
-  printSummary(report, out);
+  printSummary(run.report, out);
 
-  return 0;
+  // Propagate the child's exit status. `--strict` and `--min-grade` are
+  // forwarded verbatim (see npxArgs in runTest) and COMPLIANCE_USAGE advertises
+  // [extraArgs...], but their ONLY effect is a non-zero exit -- the JSON report
+  // is byte-identical either way. Returning 0 unconditionally made both flags
+  // silent no-ops through yaw-mcp: `yaw-mcp compliance <target> --min-grade A`
+  // printed "Grade F is below threshold A" on stderr and exited 0, so the CI
+  // gate never fired. A signal death (code null) is reported as 1: the run did
+  // not complete normally even though a report was parsed.
+  return run.code ?? 1;
 }
 
 // Guard rails on the child: a hung MCP server blocks forever, and a
@@ -203,17 +211,43 @@ export function resolveNpxLaunch(
   return { command: "npx", args: quoted, shell: true };
 }
 
+/** Finite-number check for one field of a parsed (untrusted) report. */
+function isFiniteNumber(v: unknown): boolean {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
 /**
- * Is a parsed report safe to render? `score` is checked HERE rather than at
- * print time because printSummary calls `score.toFixed(1)`: a report with a
- * missing / non-numeric / NaN score would otherwise crash the CLI with a raw
- * TypeError instead of the "unexpected JSON" diagnostic + exit 1.
+ * Is a parsed report safe to render? Everything printSummary FORMATS is
+ * checked here rather than at print time, because the child is spawned as
+ * `npx -y @yawlabs/mcp-compliance` with no version pin -- every user runs
+ * whatever npm calls latest, so a renamed or restructured field is a live
+ * possibility rather than a hypothetical.
+ *
+ * `score` is the crash case: printSummary calls `score.toFixed(1)`, so a
+ * missing / non-numeric / NaN score would take the CLI down with a raw
+ * TypeError. The summary counters and `url` are the SILENT case: a
+ * truthy-but-empty `summary` used to pass this gate and print
+ * "undefined/undefined passed, undefined/undefined required" with exit 0.
+ * Failing the gate routes both into the "unexpected JSON" diagnostic + exit 1.
+ *
+ * `summary.failed` is deliberately NOT required -- printSummary does not
+ * render it, and this gate exists to protect what is printed, not to
+ * re-declare the whole child schema.
  */
 export function isRenderableReport(parsed: unknown): boolean {
   if (!parsed || typeof parsed !== "object") return false;
   const r = parsed as Partial<ComplianceReport>;
   if (!r.grade || !r.summary) return false;
-  return typeof r.score === "number" && Number.isFinite(r.score);
+  if (!isFiniteNumber(r.score)) return false;
+  if (typeof r.url !== "string") return false;
+  if (typeof r.summary !== "object" || Array.isArray(r.summary)) return false;
+  const s = r.summary as Record<string, unknown>;
+  return (
+    isFiniteNumber(s.total) &&
+    isFiniteNumber(s.passed) &&
+    isFiniteNumber(s.required) &&
+    isFiniteNumber(s.requiredPassed)
+  );
 }
 
 /**
@@ -252,7 +286,15 @@ function killTree(child: ChildProcess): void {
   }
 }
 
-function runTest(args: string[], err: (s: string) => void): Promise<ComplianceReport | null> {
+/** A completed child run: the parsed report plus the exit status that carries
+ *  the `--strict` / `--min-grade` verdict. `code` is null when the child died
+ *  on a signal. */
+interface ComplianceRun {
+  report: ComplianceReport;
+  code: number | null;
+}
+
+function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRun | null> {
   return new Promise((resolve) => {
     let settled = false;
     const fail = (message: string): void => {
@@ -340,8 +382,9 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRe
       settled = true;
       clearTimeout(timer);
       releaseSignals();
-      // mcp-compliance exits non-zero on --strict failures but still writes
-      // a valid JSON report. Try parsing regardless of exit code.
+      // mcp-compliance exits non-zero on --strict / --min-grade failures but
+      // still writes a valid JSON report. Try parsing regardless of exit code,
+      // and hand the code back so the caller can propagate it.
       try {
         const parsed = JSON.parse(stdout) as ComplianceReport;
         if (!isRenderableReport(parsed)) {
@@ -349,7 +392,7 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRe
           resolve(null);
           return;
         }
-        resolve(parsed);
+        resolve({ report: parsed, code });
       } catch {
         err(`\nmcp-compliance exited ${code} without valid JSON output.\n`);
         resolve(null);

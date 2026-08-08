@@ -130,6 +130,19 @@ describe("editJsoncEntry", () => {
 });
 
 describe("removeJsoncEntry", () => {
+  it("returns the input BYTE for byte when the path does not exist, BOM included", () => {
+    // The no-op contract is detected by callers via `next !== raw` (try-cmd's
+    // cleanup and doctor's GC both do). Returning the de-BOM'd copy made a
+    // no-op look like a change on any Notepad-saved config: the caller wrote
+    // the file back and printed "Removed <entry>" having removed nothing,
+    // silently stripping the BOM.
+    const bom = "﻿";
+    const src = `${bom}{\n  "mcpServers": { "keep": 1 }\n}`;
+    const result = removeJsoncEntry(src, ["mcpServers"], "absent");
+    expect(result).toBe(src);
+    expect(result.charCodeAt(0)).toBe(0xfeff);
+  });
+
   it("removes the specified key while preserving other content", () => {
     const src = '// header\n{\n  "keep": "yes",\n  "remove": "gone"\n}';
     const result = removeJsoncEntry(src, [], "remove");

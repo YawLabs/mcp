@@ -1,6 +1,6 @@
 // BM25 ranking for dispatch + context-aware discover.
 //
-// The old scoreRelevance was substring-only: a query for "file a PR" would
+// The pre-BM25 ranker was substring-only: a query for "file a PR" would
 // never match a GitHub server whose description didn't literally contain
 // the word "PR". BM25 fixes that by treating every configured server as a
 // document, computing proper IDF across the corpus, and summing per-term
@@ -47,20 +47,50 @@ const FIELD_WEIGHTS = {
 } as const;
 
 // Drop tokens shorter than 3 chars — kills most noise words (a, an, of,
-// the, to, is) without needing a stopword list. Matches the old relevance
-// behavior so we don't change recall silently.
+// the, to, is) without needing a stopword list. This is the PROSE floor:
+// it applies to descriptions, where noise words actually live.
 const MIN_TOKEN_LEN = 3;
 
-export function tokenize(text: string | undefined): string[] {
+// Identifier fields (namespace, server name, tool name) use a length-1
+// floor instead. The prose floor applied to them too, which silently
+// deleted a whole field from the index for any server named `pg`, `gh`,
+// or `db`: tokenize("pg") is [], so the namespace field -- the
+// second-heaviest weight at 2.0 -- was permanently empty and short-circuited
+// in bm25Score, and an intent that named only the short namespace ("use pg")
+// ranked nothing at all. Same story for `s3` / `ec2` fragments inside tool
+// names. Identifiers are chosen, not written: a 1-2 char identifier is a
+// deliberate name, not a stopword, so there is no noise to suppress.
+const MIN_IDENT_TOKEN_LEN = 1;
+
+function splitTokens(text: string | undefined, minLen: number): string[] {
   if (!text) return [];
   // Split on any non-alphanumeric run so snake_case, kebab-case, and
   // mixed punctuation all produce the same tokens. This is what lets
   // "create issue" match a tool named `create_issue` — critical because
-  // MCP tool names are overwhelmingly snake_case.
+  // MCP tool names are overwhelmingly snake_case. The length filter also
+  // drops the empty strings a leading/trailing separator produces.
   return text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= MIN_TOKEN_LEN);
+    .filter((w) => w.length >= minLen);
+}
+
+/** Prose tokenizer (3-char floor). Also the shape external callers get --
+ *  foundry.ts and the re-dispatch miss detector in server.ts both compare
+ *  intent text with it, so widening THIS would change their recall too. */
+export function tokenize(text: string | undefined): string[] {
+  return splitTokens(text, MIN_TOKEN_LEN);
+}
+
+/** Identifier tokenizer (1-char floor). Used for the namespace / name /
+ *  tool-name document fields and for the query, which has to be able to
+ *  carry a short identifier or the document-side widening buys nothing.
+ *  Short noise words in the query stay harmless: descriptions keep the
+ *  prose floor, so a short query term can only ever match an identifier
+ *  field, and a term absent from the whole corpus has no IDF entry and is
+ *  skipped outright. */
+function tokenizeIdent(text: string | undefined): string[] {
+  return splitTokens(text, MIN_IDENT_TOKEN_LEN);
 }
 
 type FieldName = keyof typeof FIELD_WEIGHTS;
@@ -94,12 +124,12 @@ function buildDocFields(server: RankableServer): DocFields {
   const toolName = emptyField();
   const toolDescription = emptyField();
   for (const tool of server.tools) {
-    addTokens(toolName, tokenize(tool.name));
+    addTokens(toolName, tokenizeIdent(tool.name));
     addTokens(toolDescription, tokenize(tool.description));
   }
   return {
-    namespace: addTokens(emptyField(), tokenize(server.namespace)),
-    name: addTokens(emptyField(), tokenize(server.name)),
+    namespace: addTokens(emptyField(), tokenizeIdent(server.namespace)),
+    name: addTokens(emptyField(), tokenizeIdent(server.name)),
     description: addTokens(emptyField(), tokenize(server.description)),
     toolName,
     toolDescription,
@@ -329,8 +359,7 @@ function buildIndex(servers: RankableServer[], signatures: string[]): RankingInd
   return { docs, idf, avgFieldLen };
 }
 
-/** Score a prepared index against an already-tokenized query. Shared by the
- *  cached corpus path and the uncached single-server path below. */
+/** Score a prepared index against an already-tokenized query. */
 function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedResult[] {
   const results: RankedResult[] = [];
   for (const { namespace, fields } of index.docs) {
@@ -354,7 +383,10 @@ function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedRes
 // least one query term in some field). Zero-score servers are omitted so
 // the caller can cleanly tell "no match" from "weak match".
 export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
-  const queryTerms = tokenize(context);
+  // Identifier floor on the query, not the prose floor: "use pg" has to
+  // survive tokenization or the short-namespace fix on the document side is
+  // unreachable. See tokenizeIdent for why the extra short terms are inert.
+  const queryTerms = tokenizeIdent(context);
   if (queryTerms.length === 0 || servers.length === 0) return [];
 
   const signatures = servers.map(serverSignature);
@@ -370,31 +402,12 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
   return scoreAgainstIndex(queryTerms, index);
 }
 
-// Single-server convenience — kept for legacy callers that score one
-// candidate at a time. Internally wraps the BM25 ranker with a trivial
-// one-document corpus, so scores aren't comparable across different calls
-// but a return of 0 still means "no term matched". Prefer rankServers
-// wherever you're ranking a list.
-//
-// Builds its index inline rather than routing through rankServers: every
-// call is a distinct one-server corpus, so going through indexCache (cap
-// MAX_CACHED_INDEXES) would evict the real corpus index on every iteration
-// of any loop over this function, silently undoing the caching for the
-// discover/dispatch path that actually needs it. The per-server doc cache is
-// still shared, so no text gets re-tokenized.
-export function scoreRelevance(
-  context: string,
-  server: { name: string; namespace: string; description?: string },
-  tools: RankableTool[],
-): number {
-  const queryTerms = tokenize(context);
-  if (queryTerms.length === 0) return 0;
-
-  const one: RankableServer = {
-    namespace: server.namespace,
-    name: server.name,
-    description: server.description,
-    tools,
-  };
-  return scoreAgainstIndex(queryTerms, buildIndex([one], [serverSignature(one)]))[0]?.score ?? 0;
-}
+// A single-server `scoreRelevance` wrapper used to live here, documented as
+// "kept for legacy callers that score one candidate at a time." No such
+// caller existed anywhere in the repo -- only its own tests -- and it carried
+// a bypass of indexCache (plus a regression test guarding that bypass) whose
+// only purpose was to stop a loop over the wrapper from evicting the real
+// corpus index. Deleted rather than re-documented: rankServers with a
+// one-element array is the same computation, and the eviction subtlety stops
+// existing along with the function. Tests that want a single score go through
+// rankServers(query, [server])[0]?.score ?? 0.

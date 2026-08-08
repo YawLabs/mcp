@@ -15,8 +15,19 @@
 //   - The Windows `cmd /c` wrap is delegated to `buildLaunchEntry` —
 //     same code path the canonical `yaw-mcp install` flow uses, so a
 //     future fix to the wrapping logic propagates to trials for free.
-//   - Trial marker fields are versioned (`schemaVersion`) so the GC
-//     pass can refuse to delete entries it doesn't understand.
+//   - Trial marker fields are versioned (`schemaVersion`) so the GC pass can
+//     refuse to act on a marker written by a NEWER yaw-mcp, whose
+//     containerPath/entryName semantics it cannot know. Enforced in
+//     scanTrials + runTryCleanup: a schemaVersion ABOVE TRIAL_SCHEMA_VERSION
+//     is reported as malformed for the user to delete by hand. A marker with
+//     no schemaVersion at all is read as v1 rather than rejected -- older
+//     hand-rolled and third-party markers omit it, and stranding those would
+//     leave real trial entries wired with no path to reclaim them.
+//   - The GC also refuses any marker whose entryName is not `yaw-mcp-try-*`.
+//     Every value it acts on (clientPath, containerPath, entryName) comes
+//     straight out of the marker file, so without that guard a corrupt or
+//     hand-edited marker makes the sweep delete an arbitrary key from an
+//     arbitrary JSON file.
 //   - NOTHING IS SENT ANYWHERE AND NOTHING IS FINGERPRINTED. `try` used to
 //     POST a {slug, action, anonId} triple to /api/try/event; that endpoint
 //     died with the hosted backend and the poster is now a no-op, so no trial
@@ -57,8 +68,9 @@ import { CONFIG_DIRNAME } from "./paths.js";
 export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   Wire a one-off trial of an MCP server into your AI client. No account
-  needed; the trial points directly at the upstream server and expires
-  after --ttl. Run \`yaw-mcp try-cleanup <slug>\` to remove it sooner.
+  needed; the trial points directly at the upstream server. Nothing sweeps
+  it on a timer -- once --ttl has elapsed it is removed by the next
+  \`yaw-mcp doctor\` run. Run \`yaw-mcp try-cleanup <slug>\` to remove it now.
 
   --client <name>      claude-code | claude-desktop | cursor | vscode
                        (default: auto-detect, prefers the first installed
@@ -83,6 +95,14 @@ export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
 export const TRIAL_SCHEMA_VERSION = 1;
 export const TRIALS_DIRNAME = "trials";
+
+/** Every entry `try` writes is named `yaw-mcp-try-<slug>`. The cleanup and GC
+ *  paths delete `marker.entryName` from `marker.clientPath` using values read
+ *  verbatim out of the marker file, so they check this prefix before acting:
+ *  a marker naming anything else is corrupt, hand-edited, or from a writer we
+ *  don't know, and honoring it would remove an arbitrary key from an
+ *  arbitrary JSON file on disk. */
+export const TRIAL_ENTRY_PREFIX = "yaw-mcp-try-";
 
 /** Fixed stand-in for the retired per-machine anon id. `TryEventBody` keeps
  *  the field so the postEvent seam's shape (and doctor's `postTryEvent`
@@ -309,6 +329,71 @@ export function trialMarkerPath(slug: string, home: string = homedir()): string 
   return join(trialsDir(home), `${slug}.json`);
 }
 
+/** Why a marker must NOT be acted on, as a phrase that completes
+ *  "marker at <path> ...", or null when it is safe to honor.
+ *
+ *  Both consumers (runTryCleanup, scanTrials -> gcExpiredTrials) delete
+ *  `entryName` at `containerPath` from `clientPath` using values read verbatim
+ *  from the marker file, so the blast radius of a bad marker is any JSON key
+ *  on disk. `try` only ever writes `yaw-mcp-try-<slug>` at schemaVersion
+ *  TRIAL_SCHEMA_VERSION; anything else is corrupt, hand-edited, or from a
+ *  writer we don't know. */
+function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: number }): string | null {
+  if (!marker.entryName.startsWith(TRIAL_ENTRY_PREFIX)) {
+    return `names a non-trial entry ("${marker.entryName}", expected "${TRIAL_ENTRY_PREFIX}*")`;
+  }
+  // An ABSENT schemaVersion is read as v1 (see the file header): markers
+  // written by hand or by older tooling omit it, and rejecting those would
+  // strand a live trial entry with nothing able to reclaim it. A version
+  // ABOVE ours is the case the field exists for -- a newer yaw-mcp may mean
+  // something different by containerPath/entryName, and we don't guess.
+  if (typeof marker.schemaVersion === "number" && marker.schemaVersion > TRIAL_SCHEMA_VERSION) {
+    return `was written by a newer yaw-mcp (schemaVersion ${marker.schemaVersion} > ${TRIAL_SCHEMA_VERSION})`;
+  }
+  return null;
+}
+
+/** Load a trial marker off disk without throwing. Returns null when the file
+ *  is absent, unreadable, unparseable, or missing the fields the peel path
+ *  needs -- callers treat "cannot tell" the same as "nothing to do". */
+async function readTrialMarker(markerPath: string): Promise<TrialMarker | null> {
+  try {
+    const parsed = JSON.parse(await readFile(markerPath, "utf8")) as TrialMarker;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.clientPath !== "string" || typeof parsed.entryName !== "string") return null;
+    if (!Array.isArray(parsed.containerPath)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Peel `marker.entryName` out of the client config the marker names,
+ *  preserving the user's comments. Best-effort; never throws.
+ *   - "removed": the entry was present and the file was rewritten.
+ *   - "absent":  nothing to do (no file, empty file, entry already gone).
+ *   - "failed":  the marker is untrusted, or the file could not be read /
+ *                parsed / written. The caller warns and carries on. */
+async function peelTrialEntry(marker: TrialMarker): Promise<"removed" | "absent" | "failed"> {
+  if (rejectUntrustedMarker(marker) !== null) return "failed";
+  if (!existsSync(marker.clientPath)) return "absent";
+  try {
+    const raw = await readFile(marker.clientPath, "utf8");
+    if (raw.trim().length === 0) return "absent";
+    const parsed = parseJsonc(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "failed";
+    const next = removeJsoncEntry(raw, marker.containerPath, marker.entryName);
+    if (next === raw) return "absent";
+    // No explicit mode: atomicWriteFile carries the config's existing perms
+    // forward, so peeling a trial can never widen a 0600 file that still
+    // holds another trial's inline secret.
+    await atomicWriteFile(marker.clientPath, next.endsWith("\n") ? next : `${next}\n`);
+    return "removed";
+  } catch {
+    return "failed";
+  }
+}
+
 // NOTE: `computeAnonId` / `loadOrCreateAnonId` / `anonIdPath` used to live
 // here. They hashed hostname + username into a durable id under
 // ~/.yaw-mcp/trials/.anon purely to populate TryEventBody.anonId for a poster
@@ -514,7 +599,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     },
   });
 
-  const entryName = `yaw-mcp-try-${slug}`;
+  const entryName = `${TRIAL_ENTRY_PREFIX}${slug}`;
   const expiresAt = now + ttlMs;
   const marker: TrialMarker = {
     schemaVersion: TRIAL_SCHEMA_VERSION,
@@ -543,20 +628,37 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const clientPreExisted = existsSync(resolved.absolute);
   let rawClient: string | null = null;
   if (clientPreExisted) {
+    // Read and parse are reported SEPARATELY. Folding them into one catch
+    // told a user whose ~/.claude.json is root-owned or 0600-another-user
+    // that their JSON was invalid ("is not valid JSON (EACCES: permission
+    // denied...)"), sending them to inspect a file they cannot even read
+    // instead of to the permissions. Same shape for EISDIR.
+    let raw: string;
     try {
-      const raw = await readFile(resolved.absolute, "utf8");
-      if (raw.trim().length > 0) {
-        const parsed = parseJsonc(raw);
-        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          rawClient = raw;
-        } else {
-          printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
-          return { exitCode: 1, written: [] };
-        }
-      }
+      raw = await readFile(resolved.absolute, "utf8");
     } catch (e) {
-      printErr(`yaw-mcp try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`);
+      const code = (e as NodeJS.ErrnoException).code;
+      printErr(
+        `yaw-mcp try: ${resolved.absolute} could not be read (${code ?? (e as Error).message}) -- check its permissions and ownership. Refusing to overwrite.`,
+      );
       return { exitCode: 1, written: [] };
+    }
+    if (raw.trim().length > 0) {
+      let parsed: unknown;
+      try {
+        parsed = parseJsonc(raw);
+      } catch (e) {
+        printErr(
+          `yaw-mcp try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`,
+        );
+        return { exitCode: 1, written: [] };
+      }
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        rawClient = raw;
+      } else {
+        printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
+        return { exitCode: 1, written: [] };
+      }
     }
   }
 
@@ -601,6 +703,24 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 0, written: [], marker };
   }
 
+  // Step 6b: the marker path is keyed on SLUG alone (trials/<slug>.json), so a
+  // re-run of the same slug against a DIFFERENT --client is about to overwrite
+  // the only record of the previous wiring. Left alone, that entry -- inline
+  // secret and all -- stays in the old client config forever: `try-cleanup`
+  // reads only the current marker and doctor's GC only walks markers, so
+  // nothing would ever name it again. Peel it out first, best-effort.
+  const previousMarker = await readTrialMarker(trialMarkerPath(slug, home));
+  if (previousMarker && (previousMarker.clientPath !== resolved.absolute || previousMarker.entryName !== entryName)) {
+    const outcome = await peelTrialEntry(previousMarker);
+    if (outcome === "removed") {
+      print(`Removed the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`);
+    } else if (outcome === "failed") {
+      printErr(
+        `yaw-mcp try: warning -- couldn't remove the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}. Remove that entry by hand; the marker below no longer points at it.`,
+      );
+    }
+  }
+
   // Step 7: write everything atomically. Order: marker first, then client
   // config. Rationale: if the process CRASHES between the two writes (where
   // the catch-block rollback below cannot run), a sweepable marker is left
@@ -622,10 +742,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // must be owner-only (0600) -- whether `try` created the file or merged the
   // entry into the user's pre-existing config. We just wrote a plaintext
   // credential into it, and atomicWriteFile renames a fresh tmp over the
-  // target (a new inode), so without an explicit mode the file is born at the
-  // umask default (~0644) with the secret world-readable. Entries with no
-  // inline env skip the 0600 (nothing secret to protect). No-op on Windows
-  // (POSIX perms don't apply).
+  // target (a new inode), so without an explicit mode the file would be born
+  // at the umask default (~0644) with the secret world-readable. No-op on
+  // Windows (POSIX perms don't apply).
+  //
+  // The false branch passes `undefined`, which is NOT "born 0644": that is
+  // atomicWriteFile's preserve-the-target's-mode path. A no-secret trial (or a
+  // try-cleanup / doctor GC pass) must never widen a config that is already
+  // 0600 -- it may hold ANOTHER trial's inline secret, or the user may simply
+  // have tightened it by hand. Only a genuinely new file lands at the umask
+  // default.
   const entryHasSecrets = entry.env !== undefined && Object.keys(entry.env).length > 0;
   const tightenPerms = entryHasSecrets && process.platform !== "win32";
   try {
@@ -659,7 +785,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // ~/.yaw-mcp/bundles.json) -- there is no account and no signup page.
   const ttlPretty = formatTtl(ttlMs);
   print(`Trial wired: ${server.name} via yaw-mcp-try-${slug} -> ${resolved.absolute}`);
-  print(`Expires in ${ttlPretty}; remove sooner with: yaw-mcp try-cleanup ${slug}`);
+  // "Expires in Nh" alone read as a timer. Nothing sweeps on a schedule: the
+  // TTL is only consumed by gcExpiredTrials, which runs from `yaw-mcp doctor`
+  // and nowhere else. A user who never runs doctor keeps the entry -- and its
+  // inline secret -- wired indefinitely, so say what actually reclaims it.
+  print(
+    `Expires in ${ttlPretty}, then swept by the next \`yaw-mcp doctor\` run; remove it now with: yaw-mcp try-cleanup ${slug}`,
+  );
   print(`Liking it? Keep ${server.name} for good with: yaw-mcp add ${slug}`);
 
   // If a required key was satisfied by the ambient shell (not --env), its
@@ -712,6 +844,18 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     marker = parsed;
   } catch (e) {
     printErr(`yaw-mcp try-cleanup: marker at ${markerPath} is unreadable (${(e as Error).message}).`);
+    return { exitCode: 1, written: [] };
+  }
+
+  // Everything below deletes marker.entryName at marker.containerPath from
+  // marker.clientPath -- three values read straight out of a file on disk. A
+  // marker we did not write (hand-edited, corrupted, or produced by a newer
+  // yaw-mcp) could therefore name ANY key in ANY JSON file. Refuse instead of
+  // acting; the user deletes the marker by hand.
+  const rejection = rejectUntrustedMarker(marker);
+  if (rejection) {
+    printErr(`yaw-mcp try-cleanup: marker at ${markerPath} ${rejection} -- refusing to edit ${marker.clientPath}.`);
+    printErr(`  Delete it by hand if it is stale: ${markerPath}`);
     return { exitCode: 1, written: [] };
   }
 
@@ -817,7 +961,13 @@ export async function scanTrials(opts: { home?: string; now?: () => number } = {
         typeof parsed.expiresAt !== "number" ||
         typeof parsed.clientPath !== "string" ||
         !Array.isArray(parsed.containerPath) ||
-        typeof parsed.entryName !== "string"
+        typeof parsed.entryName !== "string" ||
+        // Same trust check runTryCleanup applies: the GC deletes these three
+        // fields' worth of state from a file named by the marker itself, so a
+        // marker naming a non-trial entry -- or written by a schema we don't
+        // understand -- is surfaced as malformed for the user rather than
+        // acted on.
+        rejectUntrustedMarker(parsed) !== null
       ) {
         result.malformed.push(path);
         continue;

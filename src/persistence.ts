@@ -32,6 +32,36 @@ import { userConfigDir } from "./paths.js";
 export const STATE_SCHEMA_VERSION = 2;
 export const STATE_FILENAME = "state.json";
 
+/** The env var that turns this whole module off. */
+export const DISABLE_PERSISTENCE_ENV = "YAW_MCP_DISABLE_PERSISTENCE";
+
+/**
+ * Opt-out for cross-session persistence: `YAW_MCP_DISABLE_PERSISTENCE=1` (or
+ * "true") keeps learning + pack history scoped to the current process --
+ * nothing is loaded at start, nothing is written on shutdown. Intended for
+ * ephemeral/shared environments (CI runners, containers, on-call relief boxes)
+ * where a stale state file would lie about recent usage patterns.
+ *
+ * THE single source of truth for that truthiness rule, and it lives here
+ * because this is the module the flag actually disables. Three copies used to
+ * exist -- server.ts (process.env), doctor-cmd.ts (injected env), and an
+ * open-coded expression in reset-learning-cmd.ts. They agreed, but nothing made
+ * them: the first one to start accepting "yes"/"on" would have doctor reporting
+ * persistence ON while the server had it OFF, or `reset-learning` deleting the
+ * file a running broker still believed it owned.
+ *
+ * `env` is a parameter rather than a straight `process.env` read because the
+ * CLI commands thread an injected environment (doctor's `opts.env`), and a
+ * predicate they cannot pass their own env to is a predicate they cannot share.
+ * The default is evaluated per call, so a test mutating process.env between
+ * calls still gets the current value.
+ */
+export function isPersistenceDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[DISABLE_PERSISTENCE_ENV];
+  if (raw === undefined || raw === "") return false;
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
 // Versions loadState will still read. v1 is identical to v2 minus the
 // `toolCache` key, so it migrates for free: the user keeps the learning
 // and pack signal they already earned, and the tool cache starts empty

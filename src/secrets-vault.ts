@@ -56,6 +56,14 @@ export interface VaultFile {
  *  created with -- i.e. the passphrase is correct. */
 export const VAULT_CHECK_PLAINTEXT = "yaw-mcp-vault-v1";
 
+/** Thrown by unlock() when the `check` marker fails to decrypt but a real
+ *  entry succeeds under the same key: the passphrase is RIGHT and the
+ *  verification token itself is damaged. Exported so the CLI can attach a
+ *  path-specific fix hint by comparing against this constant instead of
+ *  sniffing the message text. */
+export const VAULT_CHECK_CORRUPT_ERROR =
+  'vault verification token ("check") is corrupt -- the passphrase is correct, but the check marker does not decrypt';
+
 export function vaultPath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SECRETS_FILENAME);
 }
@@ -247,24 +255,60 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   return key;
 }
 
-/** Throw a clear "wrong passphrase" error if `key` does not match the
- *  vault. Uses vault.check when present (back-compat: falls back to the
- *  first existing entry as a canary; no-op when the vault is empty). */
-function verifyKey(vault: VaultFile, key: Buffer): void {
-  const canary = vault.check ?? Object.values(vault.entries)[0];
-  if (!canary) return; // fresh/empty vault -- nothing to verify yet
+/** True iff `entry` decrypts cleanly under `key`. Swallows the auth-tag
+ *  failure -- callers here only need the boolean. */
+function canDecrypt(entry: EncryptedEntry, key: Buffer): boolean {
   try {
-    decryptEntry(canary, key);
+    decryptEntry(entry, key);
+    return true;
   } catch {
+    return false;
+  }
+}
+
+/** Throw a clear error if `key` does not match the vault.
+ *
+ *  A single failed canary is NOT enough to conclude "wrong passphrase":
+ *  the canary itself can be the damaged thing, and a structurally-valid
+ *  but undecryptable blob survives loadVault (which only type-checks the
+ *  three string fields). Condemning the passphrase on that one failure
+ *  made every secrets command report "wrong passphrase for this vault"
+ *  forever on a vault whose entries were all intact -- with nothing
+ *  anywhere pointing at the real culprit.
+ *
+ *  So: a failure is only reported as a wrong passphrase when NOTHING in
+ *  the vault decrypts under the key.
+ *    - check present, check decrypts        -> ok.
+ *    - check present, check fails, an entry decrypts
+ *                                           -> the key is right and the
+ *                                              MARKER is corrupt; say so
+ *                                              (VAULT_CHECK_CORRUPT_ERROR).
+ *    - check absent (legacy vault)          -> any entry that decrypts
+ *                                              proves the key; only an
+ *                                              all-fail is a wrong
+ *                                              passphrase. (The FIRST
+ *                                              entry alone is not
+ *                                              authoritative -- it can be
+ *                                              the corrupt one.)
+ *    - nothing to check against (fresh/empty vault) -> accept. */
+function verifyKey(vault: VaultFile, key: Buffer): void {
+  const entries = Object.values(vault.entries);
+  if (vault.check) {
+    if (canDecrypt(vault.check, key)) return;
+    if (entries.some((e) => canDecrypt(e, key))) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
     throw new Error("wrong passphrase for this vault (decryption failed)");
   }
+  if (entries.length === 0) return; // fresh/empty vault -- nothing to verify yet
+  if (entries.some((e) => canDecrypt(e, key))) return;
+  throw new Error("wrong passphrase for this vault (decryption failed)");
 }
 
 /** Return a vault guaranteed to carry a verification token under `key`.
  *  Encrypts VAULT_CHECK_PLAINTEXT when vault.check is absent; otherwise
  *  returns the vault unchanged. Called on the mutate path so every saved
- *  vault has a check future unlocks can verify against. */
-export function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
+ *  vault has a check future unlocks can verify against. Module-private:
+ *  setSecret below is its only caller. */
+function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
   if (vault.check) return vault;
   return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key) };
 }

@@ -388,6 +388,36 @@ describe("handleDiscoverWithAutoWarm", () => {
     }
   });
 
+  it("rebuilds the routing table for the server it auto-warmed", async () => {
+    // The auto-warm used to activate without rebuilding routes. With a
+    // persisted toolCache the stale route stays `deferred`, so the very
+    // next tools/call takes the deferred branch, finds gh already
+    // connected (isChanged:false), and returns "no longer available" --
+    // and neither a second discover nor an explicit activate can clear it.
+    const priv = getPrivate(server);
+    const ghConfig = makeServerConfig({
+      id: "gh-id",
+      namespace: "gh",
+      name: "GitHub",
+      description: "Repos, issues, and pull requests on GitHub",
+      toolCache: [{ name: "create_issue", description: "Open an issue" }],
+    });
+    priv.config = { configVersion: "v1", servers: [ghConfig] };
+    // Cold-start shape: routes built from the cache, so gh_create_issue is
+    // present but deferred.
+    priv.rebuildRoutes();
+    expect(priv.toolRoutes.get("gh_create_issue")?.deferred).toBe(true);
+
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "create_issue" }]),
+    );
+
+    await priv.handleDiscoverWithAutoWarm("file a github issue");
+
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    expect(priv.toolRoutes.get("gh_create_issue")?.deferred).toBeUndefined();
+  });
+
   it("names the namespace it actually warmed, not the head of the BM25 list", async () => {
     // The banner used to print sorted[0] from the ranking the list
     // rendering uses, while the server that got activated came from

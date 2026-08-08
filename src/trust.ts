@@ -35,10 +35,11 @@
 // could not READ (antivirus lock, a stray chmod, EIO) almost certainly still
 // holds every grant the user made, so rebuilding it from empty would revoke
 // every other project over a transient error -- security state destroyed by
-// the very code that exists to protect it. A store we could not PARSE is
-// genuinely garbage and there is nothing to preserve. readTrustStore
-// therefore reports WHICH of the two happened (`malformedKind`), both deny,
-// and only the parse case may be overwritten.
+// the very code that exists to protect it. A store written by a NEWER schema
+// likewise holds real grants, in a shape this build must not reinterpret. A
+// store we could not PARSE is genuinely garbage and there is nothing to
+// preserve. readTrustStore therefore reports WHICH of the three happened
+// (`malformedKind`), all deny, and only the parse case may be overwritten.
 
 import { createHash } from "node:crypto";
 import { chmod, readFile } from "node:fs/promises";
@@ -77,6 +78,9 @@ export interface TrustRecord {
 
 /** In-memory view of ~/.yaw-mcp/trusted.json. */
 export interface TrustStore {
+  /** Schema version the file declared (defaults to TRUST_SCHEMA_VERSION when
+   *  absent). A value ABOVE TRUST_SCHEMA_VERSION makes the whole store
+   *  unusable -- see malformedKind "schema". */
   version: number;
   /** normalized-path -> record. Never contains a partially-valid entry. */
   entries: Record<string, TrustRecord>;
@@ -88,42 +92,55 @@ export interface TrustStore {
   /**
    * WHY the store is unusable; null when it is healthy.
    *
-   *   "io"    -- the file exists but could not be READ (EACCES, EPERM, EIO,
-   *              EBUSY, EISDIR...). The grants are almost certainly still on
-   *              disk and intact, so this store must never be overwritten.
-   *   "parse" -- the bytes were read fine but are not valid JSON, or the
-   *              root / `trusted` shape is wrong. Nothing recoverable is in
-   *              there, so rebuilding over it loses nothing.
+   *   "io"     -- the file exists but could not be READ (EACCES, EPERM, EIO,
+   *               EBUSY, EISDIR...). The grants are almost certainly still on
+   *               disk and intact, so this store must never be overwritten.
+   *   "schema" -- the file parsed, but declares a schema version NEWER than
+   *               this build emits. Its grants are real; their key derivation
+   *               or digest may not be the one this build computes, so
+   *               reinterpreting them with v1 semantics could match the wrong
+   *               file. Deny and tell the user to upgrade -- and never
+   *               overwrite, or a downgrade silently revokes everything.
+   *   "parse"  -- the bytes were read fine but are not valid JSON, or the
+   *               root / `trusted` shape is wrong. Nothing recoverable is in
+   *               there, so rebuilding over it loses nothing.
    *
-   * Both deny every lookup. The distinction only governs WRITES.
+   * All three deny every lookup. The distinction only governs WRITES: only
+   * "parse" may be replaced.
    */
-  malformedKind: "io" | "parse" | null;
+  malformedKind: "io" | "schema" | "parse" | null;
   /** errno of the failed read when `malformedKind` is "io" (e.g. "EACCES").
    *  Null otherwise, and null when the platform reported no code. */
   errorCode: string | null;
 }
 
 /**
- * Thrown when a trust-store WRITE is refused because the existing store
- * could not be read. Rebuilding it would silently revoke every project the
- * user approved on the strength of what is usually a transient lock, so the
- * write does not happen and the caller has to tell the user to fix the file.
+ * Thrown when a trust-store WRITE is refused because the existing store still
+ * holds real grants this build must not replace: it could not be read
+ * (usually a transient lock), or it was written by a newer schema. Rebuilding
+ * in either case silently revokes every project the user approved, so the
+ * write does not happen and the caller has to tell the user how to fix it.
  * A separate error type (rather than a flag on the result) so a caller that
  * forgets to check cannot accidentally proceed.
  */
 export class TrustStoreUnreadableError extends Error {
-  /** Absolute path of the store that could not be read. */
+  /** Absolute path of the store that could not be used. */
   readonly storePath: string;
-  /** errno from the failed read, when the platform gave one. */
+  /** errno from the failed read, when the platform gave one. Always null for
+   *  the "schema" kind -- nothing failed at the syscall level there. */
   readonly code: string | null;
   /** The store's `malformedReason` -- already names the path and the cause. */
   readonly reason: string;
-  constructor(storePath: string, reason: string, code: string | null) {
+  /** Why the write was refused, so callers can print the right remedy
+   *  (fix permissions vs upgrade yaw-mcp). */
+  readonly kind: "io" | "schema";
+  constructor(storePath: string, reason: string, code: string | null, kind: "io" | "schema" = "io") {
     super(`refusing to write the trust store: ${reason}`);
     this.name = "TrustStoreUnreadableError";
     this.storePath = storePath;
     this.reason = reason;
     this.code = code;
+    this.kind = kind;
   }
 }
 
@@ -162,19 +179,20 @@ export function hashTrustContent(contents: Buffer | string): string {
 }
 
 /** Is the CI/automation escape hatch enabled? Same truthiness convention as
- *  YAW_MCP_DISABLE_PERSISTENCE (doctor-cmd.ts:isPersistenceDisabled). */
+ *  YAW_MCP_DISABLE_PERSISTENCE (persistence.ts:isPersistenceDisabled). */
 export function isTrustBypassEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[TRUST_BYPASS_ENV];
   return raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
 }
 
 function emptyStore(
-  kind: "io" | "parse" | null = null,
+  kind: "io" | "schema" | "parse" | null = null,
   reason: string | null = null,
   errorCode: string | null = null,
+  version: number = TRUST_SCHEMA_VERSION,
 ): TrustStore {
   return {
-    version: TRUST_SCHEMA_VERSION,
+    version,
     entries: {},
     malformed: kind !== null,
     malformedReason: reason,
@@ -194,10 +212,11 @@ function emptyStore(
  * so accepting comments would only widen what an attacker can smuggle past
  * a reviewer's eye.
  *
- * `malformedKind` splits the two failures the readFile / JSON.parse boundary
+ * `malformedKind` splits the failures the readFile / JSON.parse boundary
  * already distinguishes: everything readFile rejects (other than ENOENT) is
- * "io", everything after it is "parse". Both deny; only "parse" may be
- * overwritten later. See the FAILING CLOSED IS ABOUT READS note at the top.
+ * "io", everything after it is "parse" -- plus "schema" for a store this
+ * build is too old to interpret. All deny; only "parse" may be overwritten
+ * later. See the FAILING CLOSED IS ABOUT READS note at the top.
  *
  * Individual malformed ENTRIES are dropped (with a log line) rather than
  * poisoning the whole store -- one corrupt record must not silently revoke
@@ -227,11 +246,23 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
     return emptyStore("parse", `${path} root must be a JSON object`);
   }
   const obj = parsed as Record<string, unknown>;
+  // Version FIRST, before the `trusted` shape check: a future schema may not
+  // spell the entry map `trusted` at all, and misreporting that as "parse"
+  // would let grantTrust rebuild over a store full of real grants.
+  const version = typeof obj.version === "number" ? obj.version : TRUST_SCHEMA_VERSION;
+  if (version > TRUST_SCHEMA_VERSION) {
+    log("warn", "Trust store was written by a newer yaw-mcp; nothing is trusted", { path, version });
+    return emptyStore(
+      "schema",
+      `${path} was written by a newer yaw-mcp (schema version ${version}; this build understands ${TRUST_SCHEMA_VERSION})`,
+      null,
+      version,
+    );
+  }
   const rawEntries = obj.trusted;
   if (!rawEntries || typeof rawEntries !== "object" || Array.isArray(rawEntries)) {
-    return emptyStore("parse", `${path} is missing a 'trusted' object`);
+    return emptyStore("parse", `${path} is missing a 'trusted' object`, null, version);
   }
-  const version = typeof obj.version === "number" ? obj.version : TRUST_SCHEMA_VERSION;
   const entries: Record<string, TrustRecord> = {};
   for (const [key, value] of Object.entries(rawEntries as Record<string, unknown>)) {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -320,11 +351,13 @@ async function writeTrustStore(home: string, entries: Record<string, TrustRecord
  * alternative is a user who can never grant anything again. Callers should
  * surface `storeWasMalformed` so the user knows other grants were dropped.
  *
- * If the store is UNREADABLE this throws TrustStoreUnreadableError and
- * writes nothing. An EACCES/EPERM/EIO/EBUSY at this moment says nothing
- * about the store's contents -- the grants are still there, just behind a
- * lock -- so replacing it would revoke every other approved project because
- * an antivirus scanner happened to hold the file open.
+ * If the store is UNREADABLE, or was written by a NEWER schema, this throws
+ * TrustStoreUnreadableError and writes nothing. An EACCES/EPERM/EIO/EBUSY at
+ * this moment says nothing about the store's contents -- the grants are still
+ * there, just behind a lock -- so replacing it would revoke every other
+ * approved project because an antivirus scanner happened to hold the file
+ * open. A newer-schema store is the same situation with a different cause:
+ * its grants are real, so an older binary must not stamp a v1 file over them.
  */
 export async function grantTrust(
   path: string,
@@ -333,11 +366,13 @@ export async function grantTrust(
 ): Promise<{ storePath: string; record: TrustRecord; storeWasMalformed: boolean }> {
   const home = opts.home ?? homedir();
   const store = await readTrustStore(home);
-  if (store.malformedKind === "io") {
+  const kind = store.malformedKind;
+  if (kind === "io" || kind === "schema") {
     throw new TrustStoreUnreadableError(
       trustStorePath(home),
-      store.malformedReason ?? `could not read ${trustStorePath(home)}`,
+      store.malformedReason ?? `could not use ${trustStorePath(home)}`,
       store.errorCode,
+      kind,
     );
   }
   // Only the "parse" case reaches here, where there is nothing to preserve.

@@ -237,6 +237,38 @@ describe("defaultFetchCatalog", () => {
     );
   });
 
+  it("names the catalog and the URL when a 200 body is not JSON", async () => {
+    // Captive portal / corporate proxy: HTTP 200 with an HTML login page.
+    // The raw SyntaxError names neither the catalog nor the URL, so `yaw-mcp
+    // add fetch` used to print `Unexpected token '<' ...` with no hint that
+    // the CATALOG FETCH was what failed.
+    stubFetch(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError(`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`);
+      },
+    }));
+    await expect(defaultFetchCatalog("https://cat.example/c.json")).rejects.toThrow(
+      /the Yaw MCP catalog at https:\/\/cat\.example\/c\.json did not return valid JSON \(Unexpected token/,
+    );
+  });
+
+  it("still reports an abort DURING the body read as a timeout, not a parse failure", async () => {
+    stubFetch(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        const err = new Error("This operation was aborted");
+        err.name = "AbortError";
+        throw err;
+      },
+    }));
+    await expect(defaultFetchCatalog("https://cat.example/c.json")).rejects.toThrow(
+      "timed out fetching the Yaw MCP catalog at https://cat.example/c.json.",
+    );
+  });
+
   it("reports an abort as a timeout, not as a raw AbortError", async () => {
     stubFetch(async () => {
       const err = new Error("This operation was aborted");

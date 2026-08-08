@@ -10,11 +10,15 @@
 // to the old binary count, which is why the existing boostFactor math and
 // tests carry over unchanged.
 //
-// Recorded on the proxy path in handleToolCall (every routed tool
-// call increments dispatched; non-errored replies also increment
-// succeeded). Activation success is deliberately NOT recorded —
-// otherwise a server that activates fine but every tool call 500s
-// would still look 100% reliable in the cross-session signal.
+// Recorded on the proxy path in handleToolCall through recordOutcome:
+// ONE call per routed tool call, banking the dispatch (denominator) and
+// the graded reward (numerator) together. The older binary pair
+// (recordDispatch + a conditional recordSuccess) is retired -- it has no
+// production caller left and survives only for tests; see the
+// @deprecated notes on those two methods. Activation success is
+// deliberately NOT recorded -- otherwise a server that activates fine
+// but every tool call 500s would still look 100% reliable in the
+// cross-session signal.
 //
 // Deliberately conservative:
 //   - Positive boost never exceeds +10% — relevance is the primary
@@ -34,13 +38,14 @@
 export const LEARNING_MIN_OBSERVATIONS = 3;
 export const LEARNING_MAX_BOOST = 1.1;
 export const LEARNING_MIN_BOOST = 0.9;
-// Success-rate floor below which the penalty branch fires. Exported and
-// re-used verbatim by usage-hints.ts (as RELIABILITY_THRESHOLD) so
-// formatReliabilityWarning / selectFlakyNamespaces / the cross-session
-// reliability block in handleHealth cannot drift from the routing penalty
-// — otherwise discover says "flaky" about a server that dispatch still
-// happily routes to, or vice versa. Same story for
-// LEARNING_MIN_OBSERVATIONS (re-exported as RELIABILITY_MIN_OBSERVATIONS).
+// Success-rate floor below which the penalty branch fires. Imported
+// directly by usage-hints.ts (formatReliabilityWarning /
+// selectFlakyNamespaces, and through those the cross-session reliability
+// block in handleHealth and `yaw-mcp doctor`) so the "what counts as
+// flaky" definition those surfaces render cannot drift from the routing
+// penalty -- otherwise discover says "flaky" about a server that dispatch
+// still happily routes to, or vice versa. Same story for
+// LEARNING_MIN_OBSERVATIONS.
 export const PENALTY_RATE_THRESHOLD = 0.8;
 const SATURATION_AT = 10;
 
@@ -51,13 +56,22 @@ export interface NamespaceUsage {
 }
 
 export class LearningStore {
-  // Growth bound: the map keys on namespace, and recordDispatch is only
+  // Growth bound: the map keys on namespace, and every recorder is only
   // reached with validated/bounded namespaces from the dispatch path, so
   // cardinality is capped by the number of distinct configured namespaces.
   // No explicit cap is needed unless untrusted strings can reach
-  // recordDispatch (they cannot today).
+  // recordOutcome / recordMiss (they cannot today).
   private usage = new Map<string, NamespaceUsage>();
 
+  /**
+   * @deprecated Test-only. The binary recordDispatch + recordSuccess pair was
+   * replaced on the proxy path by the graded recordOutcome; no production
+   * caller remains (grep src/ outside tests). Kept because existing tests in
+   * persistence.test.ts and server.test.ts still seed stores through it --
+   * delete both methods together with those call sites, not before. Do NOT
+   * reach for it in new code: it records a denominator with no numerator,
+   * which recordMiss already expresses with an accurate name.
+   */
   recordDispatch(namespace: string): void {
     const prev = this.usage.get(namespace);
     this.usage.set(namespace, {
@@ -67,6 +81,11 @@ export class LearningStore {
     });
   }
 
+  /**
+   * @deprecated Test-only -- see recordDispatch. Use recordOutcome, which banks
+   * the dispatch and the graded credit in one call and therefore cannot produce
+   * the succeeded > dispatched state this method can.
+   */
   recordSuccess(namespace: string): void {
     const prev = this.usage.get(namespace);
     // Symmetric with recordDispatch (which leaves succeeded at 0): a bare
@@ -74,7 +93,9 @@ export class LearningStore {
     // fabricates a dispatch the caller never recorded (which would imply a
     // 100% rate from a call that recorded no dispatch). boostFactor coerces
     // dispatched up to succeeded (Math.max), so the rate still lands in [0, 1]
-    // -- see the coerce comment there.
+    // -- see the coerce comment there. Note that this in-memory-only shape does
+    // NOT survive a save/load cycle: both loadSnapshot and persistence.ts's
+    // sanitizeLearning clamp succeeded back down to dispatched.
     this.usage.set(namespace, {
       dispatched: prev?.dispatched ?? 0,
       succeeded: (prev?.succeeded ?? 0) + 1,
@@ -143,10 +164,12 @@ export class LearningStore {
     const u = this.usage.get(namespace);
     if (!u) return 1.0;
 
-    // Coerce: succeeded can exceed dispatched when recordSuccess is called
-    // without a prior recordDispatch (e.g. a caller that only records outcomes
-    // and not the initial dispatch). Treat dispatched as at least succeeded so
-    // the rate computation stays in [0, 1] and the penalty branch is not
+    // Defensive coerce. No production recorder can produce succeeded >
+    // dispatched (recordOutcome banks at most 1.0 of credit per dispatch,
+    // recordMiss banks none, adjustSucceeded clamps to [0, dispatched]) and
+    // neither loading path lets that shape in from disk -- but the deprecated
+    // recordSuccess still can in-memory. Treat dispatched as at least succeeded
+    // so the rate computation stays in [0, 1] and the penalty branch is not
     // triggered by a perfectly-successful namespace that happened to bypass the
     // dispatch counter.
     const dispatched = Math.max(u.dispatched, u.succeeded);
@@ -206,19 +229,23 @@ export class LearningStore {
     this.usage.clear();
     for (const [ns, usage] of Object.entries(snapshot)) {
       // Enforce the store's own invariants rather than trusting upstream
-      // sanitization: reject negatives/NaN (coerce to 0), then resolve a
-      // succeeded > dispatched snapshot the SAME direction boostFactor does
-      // -- coerce dispatched UP to succeeded, never clamp succeeded down.
-      // Clamping down would discard earned credit and make
-      // export -> load a lossy, non-identity round-trip (a store whose
-      // succeeded legitimately exceeds dispatched, e.g. after
-      // recordSuccess without a paired recordDispatch, would come back
-      // smaller than it went in). Coercing up keeps the rate in [0, 1] the
-      // same way boostFactor's Math.max(dispatched, succeeded) does, so a
-      // loaded snapshot yields the identical boost factor.
-      const dispatchedRaw = Number.isFinite(usage.dispatched) ? Math.max(0, usage.dispatched) : 0;
-      const succeeded = Number.isFinite(usage.succeeded) ? Math.max(0, usage.succeeded) : 0;
-      const dispatched = Math.max(dispatchedRaw, succeeded);
+      // sanitization: reject negatives/NaN (coerce to 0), then clamp
+      // succeeded DOWN to dispatched.
+      //
+      // The direction is not a free choice. The only route that reaches
+      // here in production is persistence.ts loadState -> sanitizeLearning,
+      // which ALREADY clamps succeeded to dispatched. Coercing dispatched
+      // UP here instead would leave the two files resolving one invariant
+      // in opposite directions with the disk path silently winning, so the
+      // round-trip would look lossless in-process and quietly change shape
+      // across a restart. Clamping down also matches what every production
+      // recorder maintains (recordOutcome banks at most 1.0 of credit per
+      // dispatch, recordMiss banks none, adjustSucceeded clamps to
+      // [0, dispatched]), so a persisted succeeded > dispatched is corrupt
+      // or hand-edited state, not credit anyone earned.
+      const dispatched = Number.isFinite(usage.dispatched) ? Math.max(0, usage.dispatched) : 0;
+      const succeededRaw = Number.isFinite(usage.succeeded) ? Math.max(0, usage.succeeded) : 0;
+      const succeeded = Math.min(succeededRaw, dispatched);
       const lastUsedAt = Number.isFinite(usage.lastUsedAt) ? usage.lastUsedAt : 0;
       this.usage.set(ns, { dispatched, succeeded, lastUsedAt });
     }

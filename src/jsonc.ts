@@ -185,9 +185,10 @@ export function editJsoncEntry(src: string, containerPath: string[], entryName: 
 }
 
 /** Remove the entry at `[...containerPath, entryName]` from `src`, preserving
- *  comments. Returns the new source text. No-op (returns the input unchanged)
- *  if the path does not exist -- callers can detect this via referential
- *  equality on the input/output strings if they need to.
+ *  comments. Returns the new source text. No-op (returns the input unchanged,
+ *  BYTE for byte, BOM included) if the path does not exist -- callers can
+ *  detect this via referential equality on the input/output strings if they
+ *  need to.
  *
  *  Same rationale as `editJsoncEntry`: a read-modify-write that goes through
  *  JSON.parse + JSON.stringify drops user comments; `jsonc-parser` emits a
@@ -200,6 +201,12 @@ export function removeJsoncEntry(src: string, containerPath: string[], entryName
   const targetPath = [...containerPath, entryName];
   // jsonc-parser's contract: pass `undefined` as the value to remove a node.
   const edits = modify(debommed, targetPath, undefined, { formattingOptions: FORMATTING_OPTIONS });
-  if (edits.length === 0) return debommed === src ? src : debommed;
+  // Nothing to remove -> return the ORIGINAL bytes, not the de-BOM'd copy.
+  // Returning `debommed` for a BOM-prefixed file made the no-op look like a
+  // change to every caller that compares `next !== raw` (try-cmd's cleanup and
+  // doctor's GC both do): they would write the file back and report "Removed
+  // <entry>" having removed nothing, silently stripping the BOM off a
+  // Notepad-saved ~/.claude.json.
+  if (edits.length === 0) return src;
   return applyEdits(debommed, edits);
 }

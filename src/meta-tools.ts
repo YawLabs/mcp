@@ -295,14 +295,20 @@ export function computeSecretsReport(
   vaultKeys: Set<string>,
 ): SecretsReportRow[] {
   const rows: SecretsReportRow[] = [];
+  // SECRET_REF_RE carries /g and is module-shared with secrets-vault's own
+  // callers. matchAll does NOT start from zero: it seeds its internal clone
+  // from the source regex's lastIndex, so a stale lastIndex left behind by
+  // any `.exec()`/`.test()` elsewhere would make this scan silently skip
+  // leading matches -- and a skipped `${secret:NAME}` drops a row from the
+  // report, which reads as "this server needs no secrets". Build a fresh
+  // instance from the shared source instead, exactly as upstream.ts's
+  // collectSecretNames does.
+  const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
   for (const server of servers) {
     const referenced = new Set<string>();
     for (const v of Object.values(server.env ?? {})) {
       if (typeof v !== "string") continue;
-      // String.matchAll clones the regex internally, so sharing the
-      // global-flagged SECRET_REF_RE with secrets-vault's own callers
-      // carries no lastIndex state between calls.
-      for (const m of v.matchAll(SECRET_REF_RE)) referenced.add(m[1]);
+      for (const m of v.matchAll(re)) referenced.add(m[1]);
     }
     if (referenced.size === 0) continue;
     const injectedSecrets: string[] = [];
@@ -320,15 +326,13 @@ export function computeSecretsReport(
   return rows;
 }
 
-export const META_TOOL_NAMES = new Set([
-  META_TOOLS.discover.name,
-  META_TOOLS.activate.name,
-  META_TOOLS.deactivate.name,
-  META_TOOLS.health.name,
-  META_TOOLS.dispatch.name,
-  META_TOOLS.read_tool.name,
-  META_TOOLS.suggest.name,
-  META_TOOLS.exec.name,
-  META_TOOLS.bundles.name,
-  META_TOOLS.secrets.name,
-]);
+/** Every meta-tool name, DERIVED from META_TOOLS rather than re-listed.
+ *
+ *  The sole consumer (server.ts) uses this to enforce the contract advertised
+ *  on mcp_connect_exec: meta-tools are not callable from inside an exec
+ *  pipeline. A hand-maintained copy made that a security-shaped invariant
+ *  guarded by a list someone has to remember to update -- add an 11th
+ *  meta-tool, forget the entry, and that tool becomes exec-callable (a step
+ *  could deactivate a server a later step needs, or recurse exec into
+ *  itself) with nothing to catch it. Deriving removes the drift surface. */
+export const META_TOOL_NAMES = new Set(Object.values(META_TOOLS).map((m) => m.name));

@@ -18,9 +18,13 @@
 //   1  no server with that namespace in bundles.json
 //   2  the server isn't a stdio/command server (nothing to spawn), or the
 //      suite failed to run
+//   3  the suite RAN and produced a grade, but grades.json could not be
+//      written (read-only $HOME, no space, permissions). The grade is still
+//      printed on stdout -- only the cache is missing. Deliberately distinct
+//      from 1 and 2, both of which mean nothing was graded at all.
 
 import { homedir } from "node:os";
-import { writeGrade } from "./grades-cache.js";
+import { gradesCachePath, writeGrade } from "./grades-cache.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -255,14 +259,48 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   }
 
   const gradedAt = new Date().toISOString();
-  const cachePath = await writeGrade(namespace, { grade: report.grade, score: report.score, gradedAt }, home);
-
-  if (opts.json) {
-    print(JSON.stringify({ namespace, grade: report.grade, score: report.score, gradedAt, cache: cachePath }, null, 2));
-    return { exitCode: 0, lines };
+  // writeGrade re-throws its own errors on purpose, and atomicWriteFile throws
+  // on EROFS / EACCES / ENOSPC -- a read-only $HOME (containers, locked-down
+  // CI images) is the common shape. Unguarded, that threw straight out of
+  // runAudit: index.ts's dispatch catch printed a raw errno line, the grade the
+  // 80-test suite just spent minutes computing was never printed at all, and
+  // the process exited 1 -- the code this file documents as "no server with
+  // that namespace", so a caller branching on exit codes misread a cache-write
+  // failure as a typo'd namespace. Print the grade regardless and use the
+  // dedicated exit 3 (see the header): the audit DID produce a result, so this
+  // must not collide with 1 (nothing found) or 2 (nothing graded).
+  let cachePath: string | null = null;
+  let cacheError: string | null = null;
+  try {
+    cachePath = await writeGrade(namespace, { grade: report.grade, score: report.score, gradedAt }, home);
+  } catch (err) {
+    cacheError = err instanceof Error ? err.message : String(err);
+    log("error", "audit: grade cache write failed", { namespace, error: cacheError });
   }
 
-  print(`Grade: ${report.grade} (${report.score.toFixed(1)}%)`);
-  print(`Cached to ${cachePath}`);
+  if (opts.json) {
+    // `cache` stays present and becomes null on failure (rather than being
+    // omitted) so the Yaw MCP panel's parse keeps working; `cacheError` names
+    // what went wrong. The grade itself is reported either way.
+    const payload: Record<string, unknown> = {
+      namespace,
+      grade: report.grade,
+      score: report.score,
+      gradedAt,
+      cache: cachePath,
+    };
+    if (cacheError !== null) payload.cacheError = cacheError;
+    print(JSON.stringify(payload, null, 2));
+  } else {
+    print(`Grade: ${report.grade} (${report.score.toFixed(1)}%)`);
+    if (cachePath !== null) print(`Cached to ${cachePath}`);
+  }
+
+  if (cacheError !== null) {
+    printErr(
+      `yaw-mcp audit: computed grade ${report.grade} but could not write ${gradesCachePath(home)}: ${cacheError}`,
+    );
+    return { exitCode: 3, lines };
+  }
   return { exitCode: 0, lines };
 }
