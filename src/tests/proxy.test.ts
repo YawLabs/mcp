@@ -729,3 +729,56 @@ describe("routePromptGet", () => {
     expect(result.messages[0].content.text).toBe("Error: transport closed");
   });
 });
+
+describe("buildToolList — gateway exposure", () => {
+  const connections = new Map([["db", makeConnection("db", ["query", "explain"])]]);
+  const inactive = [makeInactiveServer("tailscale", [{ name: "status", description: "d" }])];
+
+  it("advertises only the meta-tools before anything is activated", () => {
+    const tools = buildToolList(connections, inactive, undefined, "gateway", new Set());
+    expect(tools).toHaveLength(Object.keys(META_TOOLS).length);
+    expect(tools.every((t) => t.name.startsWith("mcp_connect_"))).toBe(true);
+  });
+
+  it("drops deferred placeholders, which are the bulk of the payload", () => {
+    // 242 of 252 advertised tools were deferred placeholders carrying a
+    // 61-char schema; the cost was in their names and descriptions.
+    const tools = buildToolList(connections, inactive, undefined, "gateway", new Set());
+    expect(tools.some((t) => t.name.startsWith("tailscale_"))).toBe(false);
+  });
+
+  it("surfaces a namespace once it has been activated by name", () => {
+    const tools = buildToolList(connections, inactive, undefined, "gateway", new Set(["db"]));
+    expect(tools.map((t) => t.name)).toContain("db_query");
+    expect(tools.map((t) => t.name)).toContain("db_explain");
+  });
+
+  it("does NOT surface a merely-connected namespace nobody asked for", () => {
+    // prewarmDormantServers connects servers on its own, so keying on
+    // connectedness would re-advertise the catalog through the back door.
+    const tools = buildToolList(connections, inactive, undefined, "gateway", new Set(["other"]));
+    expect(tools.some((t) => t.name.startsWith("db_"))).toBe(false);
+  });
+
+  it("still honors a per-namespace tool filter on an activated namespace", () => {
+    const filters = new Map([["db", new Set(["query"])]]);
+    const tools = buildToolList(connections, inactive, filters, "gateway", new Set(["db"]));
+    expect(tools.map((t) => t.name)).toContain("db_query");
+    expect(tools.map((t) => t.name)).not.toContain("db_explain");
+  });
+
+  it("full exposure is unchanged, and is what the default preserves", () => {
+    const explicit = buildToolList(connections, inactive, undefined, "full", new Set());
+    const bare = buildToolList(connections, inactive);
+    expect(bare).toEqual(explicit);
+    expect(explicit.map((t) => t.name)).toContain("db_query");
+    expect(explicit.map((t) => t.name)).toContain("tailscale_status");
+  });
+
+  it("builds routes for unadvertised tools, so dispatch can still reach them", () => {
+    // The reach guarantee that makes withholding safe.
+    const routes = buildToolRoutes(connections, inactive);
+    expect(routes.has("tailscale_status")).toBe(true);
+    expect(routes.has("db_query")).toBe(true);
+  });
+});

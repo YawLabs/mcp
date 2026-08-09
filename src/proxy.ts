@@ -58,6 +58,33 @@ export interface BuiltinResource {
   read: () => Promise<ResourceContents> | ResourceContents;
 }
 
+/**
+ * How much of the catalog `tools/list` advertises.
+ *
+ * - `gateway` (default): the meta-tools, plus the tools of namespaces
+ *   activated THIS SESSION. Nothing else — no deferred placeholders.
+ * - `full`: the historical behavior — meta-tools, every active upstream's
+ *   tools, and a deferred placeholder for every cached-but-inactive one.
+ *
+ * WHY GATEWAY IS THE DEFAULT. Deferring only the SCHEMA is not enough to make
+ * a large catalog affordable. Measured 2026-08-09 against this install:
+ * `tools/list` returned 252 tools / 108,025 chars (~27,000 tokens), of which
+ * only 10 were meta-tools -- and the other 242 were ALREADY deferred, each
+ * carrying the 61-char placeholder schema. The bytes were in the NAMES and
+ * DESCRIPTIONS, which schema-deferral never removed. That payload is ~13% of a
+ * 200K context and does not fit a 32K one at all: it failed every turn of a
+ * 32,768-token local model with a hard 400 before the user's first token.
+ *
+ * Clients like Claude Code hide those descriptions themselves, which is why
+ * this stayed invisible -- but that is a client-side compensation, and yaw-mcp
+ * is used by clients with no such mechanism. Withholding the catalog at the
+ * SERVER makes the gateway pattern work everywhere: discovery moves to
+ * mcp_connect_discover / _suggest / _bundles, activation is explicit, and
+ * mcp_connect_dispatch still reaches any tool by name without it ever having
+ * been advertised.
+ */
+export type ToolExposure = "gateway" | "full";
+
 export function buildToolList(
   activeConnections: Map<string, UpstreamConnection>,
   inactiveWithCache: UpstreamServerConfig[] = [],
@@ -67,6 +94,15 @@ export function buildToolList(
   // only affects surfacing — mcp_connect_dispatch can still reach
   // hidden tools by name.
   toolFilters?: Map<string, Set<string>>,
+  // Defaults to "full" so this function's contract is unchanged for any
+  // caller that does not pass it. The POLICY default (gateway) lives in
+  // resolveToolExposure() and is applied by the server -- keeping it out of
+  // here means a helper or test calling buildToolList directly cannot
+  // silently lose its tools.
+  exposure: ToolExposure = "full",
+  // Namespaces the client explicitly activated this session. Only consulted
+  // in gateway mode; `full` advertises everything regardless.
+  exposedNamespaces?: ReadonlySet<string>,
 ): Array<{
   name: string;
   description?: string;
@@ -100,6 +136,12 @@ export function buildToolList(
   // arbitrarily or error). First writer wins here, matching the meta-tool
   // precedence above; buildToolRoutes logs the collision.
   for (const conn of activeConnections.values()) {
+    // Gateway mode advertises a namespace only once the client has asked for
+    // it. A server that is merely CONNECTED does not qualify: yaw-mcp
+    // pre-warms dormant servers on its own (prewarmDormantServers), so
+    // keying on connectedness would re-advertise the whole catalog through
+    // the back door and undo the point of the mode.
+    if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     const filter = toolFilters?.get(conn.config.namespace);
     for (const tool of conn.tools) {
       if (filter && !filter.has(tool.name)) continue;
@@ -125,6 +167,11 @@ export function buildToolList(
   for (const server of inactiveWithCache) {
     if (activeConnections.has(server.namespace)) continue;
     if (!server.toolCache || server.toolCache.length === 0) continue;
+    // These placeholders ARE the ~27,000 tokens gateway mode exists to
+    // remove. Withholding them costs nothing in reach: buildToolRoutes
+    // ignores exposure, so mcp_connect_dispatch and a first tools/call
+    // still activate the server and re-dispatch.
+    if (exposure === "gateway") continue;
     const filter = toolFilters?.get(server.namespace);
     for (const cached of server.toolCache) {
       if (filter && !filter.has(cached.name)) continue;

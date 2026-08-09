@@ -53,6 +53,7 @@ import {
   routePromptGet,
   routeResourceRead,
   routeToolCall,
+  type ToolExposure,
   type ToolRoute,
 } from "./proxy.js";
 import { type Content, pruneContent } from "./prune.js";
@@ -121,6 +122,22 @@ export function isAutoLoadEnabled(): boolean {
   const raw = process.env.YAW_MCP_AUTO_LOAD;
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
+}
+
+// How much of the catalog tools/list advertises. Gateway by default -- see
+// ToolExposure in proxy.ts for the measurement that made it the default.
+// YAW_MCP_TOOL_EXPOSURE=full restores the previous behavior for a client that
+// genuinely wants the whole catalog inlined. Re-read per call, same discipline
+// as resolveMinCompliance, so a mid-session change lands on the next
+// tools/list instead of needing a restart.
+export function resolveToolExposure(): ToolExposure {
+  const raw = process.env.YAW_MCP_TOOL_EXPOSURE?.trim().toLowerCase();
+  if (raw === "full") return "full";
+  if (raw === undefined || raw === "" || raw === "gateway") return "gateway";
+  // Unknown value: an operator who mistyped should not silently get the
+  // 27,000-token surface back.
+  log("warn", `unrecognized YAW_MCP_TOOL_EXPOSURE "${raw}"; using "gateway"`, { raw });
+  return "gateway";
 }
 
 // Baseline number of non-matching tool calls a namespace tolerates before
@@ -324,6 +341,14 @@ export class ConnectServer {
   // still reach unlisted tools. Cleared on activate-without-tools of the
   // same namespace, on deactivate, and on config reconcile.
   private toolFilters = new Map<string, Set<string>>();
+  // Namespaces the CLIENT explicitly activated this session. In gateway mode
+  // (the default) this is the entire surface tools/list advertises beyond the
+  // meta-tools. Deliberately NOT the same question as "is it connected":
+  // prewarmDormantServers spawns dormant servers on its own, so keying on
+  // connectedness would re-advertise the whole catalog and defeat the mode.
+  // Session-scoped on purpose -- it is not persisted, so a new session starts
+  // at the meta-tools again and the client re-asks for what it needs.
+  private sessionActivated = new Set<string>();
   private profile: Profile | null = null;
   // Shadow-driven install-nudge gate. Resolved once at start() from the
   // env override (YAW_MCP_INSTALL_NUDGE=1) OR config (installNudge: true);
@@ -516,7 +541,13 @@ export class ConnectServer {
 
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: buildToolList(this.connections, this.getDeferredServers(), this.toolFilters),
+      tools: buildToolList(
+        this.connections,
+        this.getDeferredServers(),
+        this.toolFilters,
+        resolveToolExposure(),
+        this.sessionActivated,
+      ),
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -2277,6 +2308,13 @@ export class ConnectServer {
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);
       if (r.isChanged) anyChanged = true;
+      // Gateway mode advertises a namespace only after the client asks for
+      // it BY NAME, which is here -- not in activateOne, which dispatch and
+      // the deferred first-call path also route through. Those two reach a
+      // tool without the client having chosen the server, so surfacing the
+      // whole namespace off them would grow the tool list as a side effect
+      // of one call. Recorded on success only.
+      if (r.ok) this.sessionActivated.add(namespace);
       // Cap refusals are tracked separately: alongside successes they are
       // informational (the per-namespace message says what to unload), but
       // when NOTHING loads the call did no work and must signal an error.
@@ -2555,6 +2593,10 @@ export class ConnectServer {
       this.idleCallCounts.delete(namespace);
       this.adaptiveSkipLogged.delete(namespace);
       this.toolFilters.delete(namespace);
+      // Without this the namespace stays advertised in gateway mode after
+      // being unloaded, and the message below ("Tools removed from context")
+      // would be a lie.
+      this.sessionActivated.delete(namespace);
       anyChanged = true;
       results.push(`Unloaded "${namespace}". Tools removed from context.`);
     }
