@@ -14,7 +14,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 });
 
 import { CONFIG_DIRNAME } from "../paths.js";
-import { buildToolList } from "../proxy.js";
+import { buildToolList, buildToolRoutes } from "../proxy.js";
 import {
   ConnectServer,
   computeToolOverlaps,
@@ -24,6 +24,7 @@ import {
   ROUTING_FAULT_DISCONNECTED,
   ROUTING_FAULT_UNKNOWN_TOOL,
   resolveIdleThreshold,
+  resolveToolExposure,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { connectToUpstream, disconnectFromUpstream } from "../upstream.js";
@@ -3637,5 +3638,168 @@ describe("shutdown drains and refuses activations", () => {
     await server.shutdown();
 
     expect(priv.elicitedEnv.size).toBe(0);
+  });
+});
+
+describe("resolveToolExposure", () => {
+  const prev = process.env.YAW_MCP_TOOL_EXPOSURE;
+  afterEach(() => {
+    if (prev === undefined) delete process.env.YAW_MCP_TOOL_EXPOSURE;
+    else process.env.YAW_MCP_TOOL_EXPOSURE = prev;
+  });
+
+  it("defaults to gateway when unset or blank", () => {
+    delete process.env.YAW_MCP_TOOL_EXPOSURE;
+    expect(resolveToolExposure()).toBe("gateway");
+    process.env.YAW_MCP_TOOL_EXPOSURE = "   ";
+    expect(resolveToolExposure()).toBe("gateway");
+  });
+
+  it("honors an explicit full opt-out, case-insensitively", () => {
+    process.env.YAW_MCP_TOOL_EXPOSURE = "FULL";
+    expect(resolveToolExposure()).toBe("full");
+  });
+
+  it("falls back to gateway on an unrecognized value, not to the full surface", () => {
+    // A typo must not silently restore the ~27,000-token catalog; failing
+    // toward the smaller surface is the recoverable direction.
+    process.env.YAW_MCP_TOOL_EXPOSURE = "gatway";
+    expect(resolveToolExposure()).toBe("gateway");
+  });
+});
+
+describe("session activation lifetime (gateway mode)", () => {
+  let server: ConnectServer;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  function listed(priv: any): string[] {
+    return buildToolList(
+      priv.connections,
+      priv.getDeferredServers(),
+      priv.toolFilters,
+      "gateway",
+      priv.sessionActivated,
+    )
+      .map((t: { name: string }) => t.name)
+      .filter((n: string) => !n.startsWith("mcp_connect_"));
+  }
+
+  it("advertises a namespace only after an explicit activate", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
+    expect(listed(priv)).toEqual([]);
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(listed(priv)).toEqual(["gh_foo"]);
+  });
+
+  it("stops advertising it after deactivate", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await priv.handleToolCall("mcp_connect_deactivate", { server: "gh" });
+    expect(priv.sessionActivated.has("gh")).toBe(false);
+  });
+
+  it("clears activation when the idle reaper unloads the namespace", async () => {
+    // The regression: the reaper cleared toolFilters but not sessionActivated,
+    // so a later DISPATCH-driven reload re-advertised a namespace the client
+    // had never asked for.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(priv.sessionActivated.has("gh")).toBe(true);
+
+    // Drive the real reaper: trackUsageAndAutoDeactivate unloads namespaces
+    // whose idle-call count is past the adaptive threshold.
+    priv.idleCallCounts.set("gh", 9999);
+    await priv.trackUsageAndAutoDeactivate("other");
+    expect(priv.connections.has("gh")).toBe(false);
+    expect(priv.sessionActivated.has("gh")).toBe(false);
+  });
+
+  it("clears activation when the server is removed from config", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await priv.reconcileConfig(makeConfig([]));
+    expect(priv.sessionActivated.has("gh")).toBe(false);
+  });
+
+  it("does not advertise a namespace that failed to activate", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockRejectedValueOnce(new Error("nope"));
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(priv.sessionActivated.has("gh")).toBe(false);
+  });
+});
+
+describe("gateway activation contract (what a client observes)", () => {
+  let server: ConnectServer;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  function list(priv: any) {
+    return buildToolList(
+      priv.connections,
+      priv.getDeferredServers(),
+      priv.toolFilters,
+      "gateway",
+      priv.sessionActivated,
+    );
+  }
+
+  it("serves only the meta-tools before any activation", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const names = list(priv).map((t) => t.name);
+    expect(names.every((n) => n.startsWith("mcp_connect_"))).toBe(true);
+    expect(names.length).toBeGreaterThan(0);
+  });
+
+  it("replaces nothing with a placeholder: an activated tool carries its REAL schema", async () => {
+    // The deferred placeholder is {type:object, properties:{}, additionalProperties:true}.
+    // A client that activated a server must get the upstream's actual contract,
+    // or it validates arguments against a schema that accepts anything.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    const foo = list(priv).find((t) => t.name === "gh_foo");
+    expect(foo?.inputSchema).toEqual({ type: "object" });
+    expect(foo?.inputSchema).not.toHaveProperty("additionalProperties");
+  });
+
+  it("notifies list_changed on activate, so a client refreshes without polling", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const spy = vi.spyOn(priv.server, "sendToolListChanged").mockResolvedValue(undefined);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it("keeps a route to an unadvertised tool, so dispatch can still reach it", () => {
+    // The guarantee that makes withholding the catalog safe.
+    const priv = getPrivate(server);
+    const inactive = [{ ...makeServerConfig({ namespace: "tailscale" }), toolCache: [{ name: "status" }] }];
+    const routes = buildToolRoutes(priv.connections, inactive as any);
+    expect(routes.has("tailscale_status")).toBe(true);
+    expect(list(priv).some((t) => t.name === "tailscale_status")).toBe(false);
   });
 });
