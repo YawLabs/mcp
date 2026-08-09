@@ -782,3 +782,33 @@ describe("buildToolList — gateway exposure", () => {
     expect(routes.has("db_query")).toBe(true);
   });
 });
+
+describe("gateway exposure covers resources and prompts too", () => {
+  const connections = new Map([["db", makeConnection("db", ["query"], ["db://tables"], ["review"])]]);
+
+  it("hides an unactivated namespace's resources", () => {
+    const list = buildResourceList(connections, [], "gateway", new Set());
+    expect(list.some((r) => r.uri.includes("db"))).toBe(false);
+  });
+
+  it("hides an unactivated namespace's prompts", () => {
+    const list = buildPromptList(connections, "gateway", new Set());
+    expect(list).toHaveLength(0);
+  });
+
+  it("surfaces both once the namespace is activated", () => {
+    expect(buildResourceList(connections, [], "gateway", new Set(["db"])).length).toBeGreaterThan(0);
+    expect(buildPromptList(connections, "gateway", new Set(["db"])).length).toBeGreaterThan(0);
+  });
+
+  it("always lists yaw-mcp's OWN builtin resources, which no upstream owns", () => {
+    const builtin = [{ uri: "yaw-mcp://guide", read: () => ({ contents: [] }) }];
+    const list = buildResourceList(connections, builtin, "gateway", new Set());
+    expect(list.map((r) => r.uri)).toContain("yaw-mcp://guide");
+  });
+
+  it("full exposure still lists everything, unchanged", () => {
+    expect(buildResourceList(connections, [], "full", new Set()).some((r) => r.uri.includes("db"))).toBe(true);
+    expect(buildPromptList(connections, "full", new Set())).toHaveLength(1);
+  });
+});

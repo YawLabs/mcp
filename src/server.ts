@@ -556,7 +556,12 @@ export class ConnectServer {
     });
 
     this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: buildResourceList(this.connections, this.getBuiltinResources()),
+      resources: buildResourceList(
+        this.connections,
+        this.getBuiltinResources(),
+        resolveToolExposure(),
+        this.sessionActivated,
+      ),
     }));
 
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
@@ -564,7 +569,7 @@ export class ConnectServer {
     });
 
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: buildPromptList(this.connections),
+      prompts: buildPromptList(this.connections, resolveToolExposure(), this.sessionActivated),
     }));
 
     this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
@@ -2692,6 +2697,11 @@ export class ConnectServer {
       this.idleCallCounts.delete(ns);
       this.adaptiveSkipLogged.delete(ns);
       this.toolFilters.delete(ns);
+      // Same lifetime as toolFilters: a namespace torn down here is no longer
+      // something the client asked for. Leaving it set means a LATER
+      // dispatch-driven activation would advertise the whole namespace, which
+      // is exactly what keying on explicit activation exists to prevent.
+      this.sessionActivated.delete(ns);
       deactivated++;
     }
 
@@ -2717,6 +2727,9 @@ export class ConnectServer {
         this.idleCallCounts.delete(namespace);
         this.adaptiveSkipLogged.delete(namespace);
         this.toolFilters.delete(namespace);
+        // See the idle-reaper note: session activation is per-namespace state
+        // with the same lifetime as the filter beside it.
+        this.sessionActivated.delete(namespace);
         // Drop any session-elicited credentials for this namespace too —
         // the server is gone (or disabled), so the cached values are stale
         // and could leak into a future re-add of an unrelated config.
@@ -2741,6 +2754,9 @@ export class ConnectServer {
         this.idleCallCounts.delete(namespace);
         this.adaptiveSkipLogged.delete(namespace);
         this.toolFilters.delete(namespace);
+        // See the idle-reaper note: session activation is per-namespace state
+        // with the same lifetime as the filter beside it.
+        this.sessionActivated.delete(namespace);
         // Drop session-elicited credentials too — the connect spec changed,
         // so creds the user provided for the OLD spec may not match the
         // new one (different command/url/env wiring). Better to re-elicit

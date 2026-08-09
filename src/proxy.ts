@@ -267,12 +267,18 @@ export function buildToolRoutes(
 export function buildResourceList(
   activeConnections: Map<string, UpstreamConnection>,
   builtins: BuiltinResource[] = [],
+  // Same gate as buildToolList: "not activated" has to mean the same thing on
+  // every list, or gateway mode leaks the catalog through a different call.
+  // Builtins are always listed -- they are yaw-mcp's own, not an upstream's.
+  exposure: ToolExposure = "full",
+  exposedNamespaces?: ReadonlySet<string>,
 ): Array<{ uri: string; name?: string; description?: string; mimeType?: string }> {
   const resources: Array<{ uri: string; name?: string; description?: string; mimeType?: string }> = [];
   for (const b of builtins) {
     resources.push({ uri: b.uri, name: b.name, description: b.description, mimeType: b.mimeType });
   }
   for (const conn of activeConnections.values()) {
+    if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const r of conn.resources) {
       resources.push({
         uri: r.namespacedUri,
@@ -295,7 +301,11 @@ export function buildResourceRoutes(activeConnections: Map<string, UpstreamConne
   return routes;
 }
 
-export function buildPromptList(activeConnections: Map<string, UpstreamConnection>): Array<{
+export function buildPromptList(
+  activeConnections: Map<string, UpstreamConnection>,
+  exposure: ToolExposure = "full",
+  exposedNamespaces?: ReadonlySet<string>,
+): Array<{
   name: string;
   description?: string;
   arguments?: Array<{ name: string; description?: string; required?: boolean }>;
@@ -313,6 +323,7 @@ export function buildPromptList(activeConnections: Map<string, UpstreamConnectio
   // writer wins, and buildPromptRoutes agrees on that winner.
   const seen = new Set<string>();
   for (const conn of activeConnections.values()) {
+    if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const p of conn.prompts) {
       if (seen.has(p.namespacedName)) continue;
       prompts.push({
