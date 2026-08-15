@@ -662,10 +662,10 @@ export class ConnectServer {
   // reference — which in practice means BOTH are undefined (server.ts
   // has no toolCache and this.toolCache has no entry for this namespace)
   // — we return `server` unchanged. The `===` guard pins that, so
-  // downstream consumers keyed on reference equality (tests at
-  // server.test.ts:280-290, 327-338) keep working. In production,
+  // downstream consumers keyed on reference equality (the identity-
+  // preservation tests in server.test.ts) keep working. In production,
   // server.toolCache is almost always undefined: bundles.json validation
-  // drops the field (local-bundles.ts), and hydrateToolCache (server.ts:679)
+  // drops the field (local-bundles.ts), and hydrateToolCache (below)
   // writes the persisted array into this.toolCache rather than back into
   // server.toolCache. So the commonly-fired path is the
   // "spread a clone" branch — the identity guard mostly catches the

@@ -113,7 +113,7 @@ describe("resolveShadowedClis", () => {
   it("infers the shadow from a single-segment cache (no separator)", () => {
     // Real upstream servers sometimes expose tools named exactly the CLI
     // word (no `_` / `.` / `-` separator). The split pattern at
-    // cli-shadows.ts:215 (`split(/[_.-]/)`) yields `["npm"]` for that input,
+    // cli-shadows.ts:220 (`split(/[_.-]/)`) yields `["npm"]` for that input,
     // so `prefixes` is `{ "npm" }`, `size === 1`, and the heuristic fires.
     // Pin the shape so a regression that swaps `split` for `match` (returns
     // null on no match) or filters falsy first-segments in a way that drops
@@ -129,15 +129,28 @@ describe("resolveShadowedClis", () => {
     // The `if (first)` guard at cli-shadows.ts:221 keeps a degenerate empty
     // name (`""`, from upstream tools/list with a sloppy entry) out of the
     // prefix set. When EVERY entry is empty, `prefixes` is empty, `size !== 1`
-    // at the size-0 boundary, and the heuristic returns []. Pin that boundary
-    // so a future regression that drops the guard (or always-adds even
-    // empty first-segments) silently turns "degenerate input" into
-    // "false-positive shadow match on `""`".
+    // at the size-0 boundary, and the heuristic returns []. (This boundary
+    // holds even without the guard -- prefixes would be `{""}`, size 1, and
+    // the KNOWN_CLI_PREFIXES membership check rejects `""` -- so the
+    // discriminating case for the guard is the mixed cache pinned below.)
     const shadows = resolveShadowedClis({
       namespace: "unknown",
       toolCache: [{ name: "" }, { name: "" }, { name: "" }],
     });
     expect(shadows).toEqual([]);
+  });
+
+  it("still infers the shadow when degenerate entries ride along with real prefixes", () => {
+    // THE case the `if (first)` guard exists for (per the comment at
+    // cli-shadows.ts:214-218): a sloppy empty name or a separator-leading
+    // one (`_meta`) in an otherwise consistent cache. Without the guard,
+    // `""` joins `"npm"` in the prefix set, `size !== 1` fails, and the
+    // shadow hint silently disappears for a server that should match.
+    const shadows = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }, { name: "" }, { name: "_meta" }],
+    });
+    expect(shadows).toEqual([{ cli: "npm" }]);
   });
 
   it("lowercases the tool-name first segment so mixed-case upstreams still match", () => {

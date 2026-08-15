@@ -278,9 +278,9 @@ describe("ConnectServer", () => {
     });
 
     it("preserves object identity when no in-memory cache exists", () => {
-      // The merge comment at server.ts:634 promises "preserves the original
-      // object identity when there's nothing to merge, so downstream
-      // identity-keyed consumers are unaffected." Pin that.
+      // mergeToolCache (server.ts) promises to return `server` unchanged
+      // when there is nothing to merge, so downstream consumers keyed on
+      // reference equality are unaffected. Pin that.
       const priv = getPrivate(server);
       const serverConfig = makeServerConfig({ namespace: "gh" });
       priv.config = makeConfig([serverConfig]);
@@ -306,9 +306,11 @@ describe("ConnectServer", () => {
     });
 
     it("narrows by profile BEFORE merging cache", () => {
-      // If the order flipped (merge then profile), a profile-excluded server
-      // would still see its cache cloned — silent extra work and a confusing
-      // contract for the profile filter.
+      // Filter-then-merge and merge-then-filter produce the same OUTPUT
+      // (mergeToolCache is side-effect-free and profileAllows keys only on
+      // namespace), so the returned array can't pin the order. Spy on the
+      // merge instead: a profile-excluded server must never reach it — the
+      // flipped order would clone caches for servers the profile drops.
       const priv = getPrivate(server);
       priv.config = makeConfig([
         makeServerConfig({ namespace: "gh", name: "GitHub" }),
@@ -317,11 +319,14 @@ describe("ConnectServer", () => {
       priv.toolCache.set("gh", [{ name: "gh_create" }, { name: "gh_list" }, { name: "gh_search" }]);
       priv.profile = { servers: ["gh"] };
 
+      const mergeSpy = vi.spyOn(priv, "mergeToolCache");
       const merged = priv.getProfiledActiveServers();
       expect(merged.map((s: UpstreamServerConfig) => s.namespace)).toEqual(["gh"]);
       // And the surviving gh still got its cache merged.
       expect(merged[0].toolCache).toBeDefined();
       expect(merged[0].toolCache.length).toBe(3);
+      // The ordering pin: only the profile-surviving server reaches the merge.
+      expect(mergeSpy.mock.calls.map((c: any[]) => c[0].namespace)).toEqual(["gh"]);
     });
 
     it("treats an empty-array cache the same as no cache (object identity preserved)", () => {
