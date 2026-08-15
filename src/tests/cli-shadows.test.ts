@@ -95,6 +95,85 @@ describe("resolveShadowedClis", () => {
     });
     expect(shadows).toEqual([]);
   });
+
+  it("refuses the heuristic when the cache spans more than one prefix", () => {
+    // Even with every individual prefix listed in KNOWN_CLI_PREFIXES, a
+    // cache that mixes them must not infer a single shadow — the merge
+    // contract promises `prefixes.size === 1`, and dropping that gate would
+    // shadow-match anything with both `npm_` and `gh_` tools to the first
+    // one alphabetically. Real-world caches (a custom server that wraps
+    // multiple CLIs) hit this branch.
+    const shadows = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "npm_search" }, { name: "npm_audit" }, { name: "gh_list_prs" }],
+    });
+    expect(shadows).toEqual([]);
+  });
+
+  it("infers the shadow from a single-segment cache (no separator)", () => {
+    // Real upstream servers sometimes expose tools named exactly the CLI
+    // word (no `_` / `.` / `-` separator). The split pattern at
+    // cli-shadows.ts:215 (`split(/[_.-]/)`) yields `["npm"]` for that input,
+    // so `prefixes` is `{ "npm" }`, `size === 1`, and the heuristic fires.
+    // Pin the shape so a regression that swaps `split` for `match` (returns
+    // null on no match) or filters falsy first-segments in a way that drops
+    // single-element arrays silently breaks this case.
+    const shadows = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "npm" }, { name: "npm" }, { name: "npm" }],
+    });
+    expect(shadows).toEqual([{ cli: "npm" }]);
+  });
+
+  it("skips tools with empty names and falls through to [] when every entry is empty", () => {
+    // The `if (first)` guard at cli-shadows.ts:221 keeps a degenerate empty
+    // name (`""`, from upstream tools/list with a sloppy entry) out of the
+    // prefix set. When EVERY entry is empty, `prefixes` is empty, `size !== 1`
+    // at the size-0 boundary, and the heuristic returns []. Pin that boundary
+    // so a future regression that drops the guard (or always-adds even
+    // empty first-segments) silently turns "degenerate input" into
+    // "false-positive shadow match on `""`".
+    const shadows = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "" }, { name: "" }, { name: "" }],
+    });
+    expect(shadows).toEqual([]);
+  });
+
+  it("lowercases the tool-name first segment so mixed-case upstreams still match", () => {
+    // The `.toLowerCase()` at cli-shadows.ts:221 normalizes before the
+    // KNOWN_CLI_PREFIXES membership check. MCP servers expose tool names as
+    // their upstream chooses -- many don't lowercase (a server may forward
+    // `NPM_search` directly from a Go or Rust binary that emits PascalCase).
+    // Without the lowercasing, the heuristic checks `KNOWN_CLI_PREFIXES.has("NPM")`
+    // which is false, and the shadow hint silently disappears for that
+    // server. Pin the boundary so dropping the `.toLowerCase()` is caught.
+    const shadows = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "NPM_search" }, { name: "NPM_audit" }, { name: "NPM_view" }],
+    });
+    expect(shadows).toEqual([{ cli: "npm" }]);
+  });
+
+  it("splits tool names on '.' and '-' in addition to '_'", () => {
+    // The split regex at cli-shadows.ts:220 is `/[_.-]/` -- three separators,
+    // not one. Existing tests exercise only `_` (the most common shape); a
+    // regression that narrows the regex to `/[_]/` silently kills shadow
+    // detection for any server using dot or dash separators. Real upstream
+    // examples: older github MCP servers used `github.action_run`; some
+    // HTTP-style servers expose `mcp-tool-call` / `mcp.list-resources`.
+    const dots = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "npm.search" }, { name: "npm.audit" }, { name: "npm.view" }],
+    });
+    expect(dots).toEqual([{ cli: "npm" }]);
+
+    const dashes = resolveShadowedClis({
+      namespace: "unknown",
+      toolCache: [{ name: "npm-search" }, { name: "npm-audit" }, { name: "npm-view" }],
+    });
+    expect(dashes).toEqual([{ cli: "npm" }]);
+  });
 });
 
 describe("formatShadowLine", () => {
@@ -111,6 +190,21 @@ describe("formatShadowLine", () => {
   it("returns null for servers that shadow nothing", () => {
     expect(formatShadowLine({ namespace: "linear" })).toBeNull();
     expect(formatShadowLine({ namespace: "unknown-xyz" })).toBeNull();
+  });
+
+  it("joins multiple shadows with a comma when the registry returns several", () => {
+    // postgres resolves to two bare-CLI entries (no subcommands), so the
+    // joined form is two backtick names with `, ` between. Pin the join
+    // shape so a regression that drops to a single-CLI line -- or adds
+    // ` and ` instead of `, ` -- surfaces here rather than in production
+    // discover output. Order is left as the registry supplies it; the
+    // important shape is "both CLIs are present, comma-separated".
+    const line = formatShadowLine({ namespace: "postgres" });
+    expect(line).not.toBeNull();
+    expect(line).toContain("`pg_dump`");
+    expect(line).toContain("`psql`");
+    expect(line).toMatch(/`\w+`,\s*`\w+`/);
+    expect(line?.startsWith("prefer over local CLI: ")).toBe(true);
   });
 });
 

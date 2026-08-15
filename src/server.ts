@@ -622,24 +622,17 @@ export class ConnectServer {
   // Active servers, narrowed by the project profile if one is loaded.
   // Centralizing this here means discover/dispatch/auto-warm all see the
   // same set — no accidental bypass of the profile via a second code path.
+  // The merge in mergeToolCache feeds the in-memory toolCache (hydrated
+  // from state.json at startup, updated as servers activate) into each
+  // server so callers like formatShadowLine can see learned tools.
+  // bundles.json doesn't carry toolCache (validateEntry's fixed whitelist
+  // drops it), and without this merge the tool-prefix heuristic in
+  // resolveShadowedClis is inert on a real run — see the KNOWN_CLI_PREFIXES
+  // comment in cli-shadows.ts.
   private getProfiledActiveServers(): UpstreamServerConfig[] {
     const all = (this.config?.servers ?? []).filter((s) => s.isActive);
     const profiled = this.profile ? all.filter((s) => profileAllows(this.profile, s.namespace)) : all;
-    // Merge in the in-memory toolCache (hydrated from state.json at startup,
-    // updated as servers activate) so callers like formatShadowLine can see
-    // learned tools. bundles.json doesn't carry toolCache (validateEntry's
-    // fixed whitelist drops it), and without this merge the tool-prefix
-    // heuristic in resolveShadowedClis is inert on a real run — see the
-    // KNOWN_CLI_PREFIXES comment in cli-shadows.ts. Mirrors getDeferredServers'
-    // merge below; preserves the original object identity when there's
-    // nothing to merge, so downstream identity-keyed consumers are unaffected.
-    const out: UpstreamServerConfig[] = [];
-    for (const server of profiled) {
-      const sessionCache = this.toolCache.get(server.namespace);
-      const cache = sessionCache && sessionCache.length > 0 ? sessionCache : server.toolCache;
-      out.push(cache === server.toolCache ? server : { ...server, toolCache: cache });
-    }
-    return out;
+    return profiled.map((server) => this.mergeToolCache(server));
   }
 
   // Configured-but-not-currently-connected servers that have a persisted
@@ -653,12 +646,34 @@ export class ConnectServer {
     const out: UpstreamServerConfig[] = [];
     for (const server of this.getProfiledActiveServers()) {
       if (this.connections.has(server.namespace)) continue;
-      const sessionCache = this.toolCache.get(server.namespace);
-      const cache = sessionCache && sessionCache.length > 0 ? sessionCache : server.toolCache;
-      if (!cache || cache.length === 0) continue;
-      out.push(cache === server.toolCache ? server : { ...server, toolCache: cache });
+      if (!server.toolCache || server.toolCache.length === 0) continue;
+      out.push(server);
     }
     return out;
+  }
+
+  // Return `server` with its in-memory toolCache applied. The in-memory
+  // entry (this.toolCache) wins over server.toolCache when both exist —
+  // the persisted copy can be stale relative to a fresh activation, and
+  // the in-memory map is what tools/list and formatShadowLine should
+  // actually see.
+  //
+  // Identity preservation: when both sides resolve to the same array
+  // reference — which in practice means BOTH are undefined (server.ts
+  // has no toolCache and this.toolCache has no entry for this namespace)
+  // — we return `server` unchanged. The `===` guard pins that, so
+  // downstream consumers keyed on reference equality (tests at
+  // server.test.ts:280-290, 327-338) keep working. In production,
+  // server.toolCache is almost always undefined: bundles.json validation
+  // drops the field (local-bundles.ts), and hydrateToolCache (server.ts:679)
+  // writes the persisted array into this.toolCache rather than back into
+  // server.toolCache. So the commonly-fired path is the
+  // "spread a clone" branch — the identity guard mostly catches the
+  // dormant-namespace case.
+  private mergeToolCache(server: UpstreamServerConfig): UpstreamServerConfig {
+    const sessionCache = this.toolCache.get(server.namespace);
+    const cache = sessionCache && sessionCache.length > 0 ? sessionCache : server.toolCache;
+    return cache === server.toolCache ? server : { ...server, toolCache: cache };
   }
 
   // Does this server's tool list already exist somewhere we trust — the

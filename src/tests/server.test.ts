@@ -336,6 +336,48 @@ describe("ConnectServer", () => {
       const merged = priv.getProfiledActiveServers();
       expect(merged[0]).toBe(serverConfig);
     });
+
+    it("prefers the in-memory sessionCache over the server's own toolCache on collision", () => {
+      // When both `server.toolCache` (the path bundles.json / state.json
+      // hydration would have taken) and `this.toolCache.get(namespace)`
+      // (the live in-memory map, updated as servers activate) have entries,
+      // the in-memory one wins. Pin the precedence so a regression that
+      // flips the ternary can't silently let a stale persisted list
+      // shadow fresh learning.
+      const priv = getPrivate(server);
+      const serverConfig = makeServerConfig({
+        namespace: "my-npm-proxy",
+        name: "npm proxy",
+        toolCache: [{ name: "persisted_old" }, { name: "persisted_stale" }, { name: "persisted_gone" }],
+      });
+      priv.config = makeConfig([serverConfig]);
+      priv.toolCache.set("my-npm-proxy", [{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
+
+      const merged = priv.getProfiledActiveServers();
+      expect(merged[0].toolCache).toEqual([{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
+    });
+
+    it("exposes the merged cache to the guide auto-section via getBuiltinResources", () => {
+      // cli-shadows.ts:166 promises "discover + guide see learned tools".
+      // The discover path is covered above; the guide resource reads the
+      // same merged list inside renderGuide and renders an "Active servers"
+      // block. Pin the guide path so a regression that splits
+      // getProfiledActiveServers between the two callers (or caches the
+      // guide body past toolCache changes) breaks this test rather than
+      // silently dropping the heuristic hint from the guide resource.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "my-npm-proxy", name: "npm proxy" })]);
+      priv.toolCache.set("my-npm-proxy", [{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
+      priv.guides = {
+        user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "user guide" },
+        project: null,
+      };
+
+      const builtin = priv.getBuiltinResources()[0];
+      const text = builtin.read().contents[0].text;
+      expect(text).toContain("my-npm-proxy");
+      expect(text).toContain("prefer over local CLI: `npm`");
+    });
   });
 
   describe("discover tool overlaps", () => {

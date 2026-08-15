@@ -211,6 +211,11 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
   const cache = server.toolCache ?? [];
   if (cache.length < 3) return [];
   const prefixes = new Set<string>();
+  // The `if (first)` guard skips tools whose name is empty (`""` — split
+  // yields `[""]`, first is the falsy empty string). Upstream tools/list
+  // responses occasionally carry a degenerate empty entry; we silently
+  // drop it rather than letting `prefixes.add("")` make every such cache
+  // fail the `size !== 1` test and never match anything.
   for (const t of cache) {
     const first = t.name.split(/[_.-]/)[0];
     if (first) prefixes.add(first.toLowerCase());
