@@ -21,12 +21,10 @@
 //
 // Well-known alias namespaces (gh, k8s, pg, …) are also registered so
 // a user who renamed the server on import still matches. A custom
-// namespace is meant to fall through to a tool-name heuristic (shared
-// lowercase prefix across three or more tool-cache entries), but that
-// heuristic is INERT on a real run -- see the note on KNOWN_CLI_PREFIXES
-// for why and for the one-line callsite change that would revive it. So
-// in practice a custom namespace gets no shadow hint, and the user has to
-// document the mapping in their YAW-MCP.md; that copy is authoritative.
+// namespace falls through to a tool-name heuristic (shared lowercase
+// prefix across three or more tool-cache entries, prefix must be in
+// KNOWN_CLI_PREFIXES); getProfiledActiveServers merges the in-memory
+// toolCache so this fires for any server with learned/persisted tools.
 
 import type { UpstreamServerConfig } from "./types.js";
 
@@ -159,22 +157,14 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
 // shadowing that CLI. Intentionally narrow: broad prefixes ("get",
 // "set", "list") would generate false positives.
 //
-// REACHABLE ONLY FROM TESTS TODAY. The heuristic branch in
-// resolveShadowedClis needs a `toolCache` on the server it is handed, and
-// no production caller supplies one: both callers (server.ts's discover
-// listing via formatShadowLine, and guide.ts's "Installed servers"
-// auto-section) pass raw entries from `config.servers`, bundles.json is
-// the only config source (server.ts start()), and local-bundles.ts's
-// validateEntry returns a FIXED FIELD WHITELIST that does not include
-// `toolCache` -- so the field is always undefined there and the branch
-// bails at the `cache.length < 3` guard every time. Kept rather than
-// deleted because the machinery is correct and one line at either callsite
-// revives it: pass `{ ...server, toolCache: this.toolCache.get(
-// server.namespace) ?? server.toolCache }` instead of `server`, which
-// server.ts already computes twice in that same loop for its cost label
-// and its "known tools" line, and which IS populated in production (from
-// state.json at startup and from a live tools/list after activation).
-// Until then, treat the constant and the branch below as test-only.
+// Heuristic reach: requires a non-empty `toolCache` on the server object
+// handed to resolveShadowedClis. bundles.json doesn't carry one
+// (local-bundles.ts validateEntry returns a fixed whitelist that drops
+// the field), so the only way the heuristic fires is when a callsite
+// merges in the in-memory cache (ConnectServer.toolCache, hydrated from
+// state.json at startup and updated as servers activate). getProfiledActiveServers
+// does that merge so discover + guide see learned tools; a server with no
+// learned/persisted tools for its namespace still falls through to [].
 const KNOWN_CLI_PREFIXES = new Set<string>([
   "npm",
   "tailscale",
@@ -216,9 +206,8 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
   // across the tool cache. Needs at least three tools to trust it; a
   // server with one or two tools could share a prefix by coincidence.
   //
-  // Test-only in practice: no production caller passes a `toolCache`, so
-  // this always returns [] on a real run. See KNOWN_CLI_PREFIXES above for
-  // why, and for the callsite one-liner that would make it fire.
+  // Reachable in production via getProfiledActiveServers' toolCache merge
+  // for any server with persisted/learned tools; see KNOWN_CLI_PREFIXES above.
   const cache = server.toolCache ?? [];
   if (cache.length < 3) return [];
   const prefixes = new Set<string>();

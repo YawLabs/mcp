@@ -62,14 +62,12 @@ describe("resolveShadowedClis", () => {
     expect(resolveShadowedClis({ namespace: "notion" })).toEqual([]);
   });
 
-  // The three heuristic cases below are the ONLY reachers of the
-  // KNOWN_CLI_PREFIXES branch. No production caller passes a `toolCache`
-  // (local-bundles.ts validateEntry whitelists fields and drops it), so the
-  // branch cannot fire on a real run -- these assertions pin the intended
-  // behavior for whenever a callsite starts supplying the cache, not
-  // behavior a user sees today. See the KNOWN_CLI_PREFIXES comment in
-  // cli-shadows.ts. Do not read a green run here as "custom namespaces get
-  // shadow hints"; they do not.
+  // The three heuristic cases below exercise the KNOWN_CLI_PREFIXES branch.
+  // Production reaches this branch via ConnectServer.getProfiledActiveServers,
+  // which merges the in-memory toolCache into each server before handing it
+  // to formatShadowLine -- so custom namespaces with >=3 tools sharing a
+  // KNOWN_CLI_PREFIXES prefix now get a shadow hint. See the
+  // KNOWN_CLI_PREFIXES comment in cli-shadows.ts.
   it("falls back to the tool-prefix heuristic for unknown namespaces", () => {
     // A user who named their server "my-npm-proxy" isn't in the registry,
     // but its tool cache shares the `npm` prefix across ≥3 entries — infer.

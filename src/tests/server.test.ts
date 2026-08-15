@@ -264,6 +264,80 @@ describe("ConnectServer", () => {
     });
   });
 
+  describe("getProfiledActiveServers toolCache merge", () => {
+    // The merge in getProfiledActiveServers feeds the in-memory toolCache into
+    // formatShadowLine so unknown namespaces with learned/persisted tools can
+    // surface a heuristic shadow hint. These tests pin the merge contract.
+    it("surfaces a heuristic shadow hint for an unknown namespace with a learned toolCache", () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "my-npm-proxy", name: "npm proxy" })]);
+      priv.toolCache.set("my-npm-proxy", [{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
+
+      const text = priv.handleDiscover().content[0].text;
+      expect(text).toContain("prefer over local CLI: `npm`");
+    });
+
+    it("preserves object identity when no in-memory cache exists", () => {
+      // The merge comment at server.ts:634 promises "preserves the original
+      // object identity when there's nothing to merge, so downstream
+      // identity-keyed consumers are unaffected." Pin that.
+      const priv = getPrivate(server);
+      const serverConfig = makeServerConfig({ namespace: "gh" });
+      priv.config = makeConfig([serverConfig]);
+
+      const merged = priv.getProfiledActiveServers();
+      expect(merged[0]).toBe(serverConfig); // same reference, not a clone
+    });
+
+    it("does not leak a namespace's cache to a sibling", () => {
+      // gh and github share a prefix but no shared cache — github's output
+      // must not see gh's tools. (The heuristic would also reject this case
+      // via the namespace-name test, but the merge itself keys on namespace.)
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "github", name: "GitHub alias" }),
+      ]);
+      priv.toolCache.set("gh", [{ name: "gh_create_issue" }, { name: "gh_list_prs" }, { name: "gh_search" }]);
+
+      const merged = priv.getProfiledActiveServers();
+      const github = merged.find((s: UpstreamServerConfig) => s.namespace === "github");
+      expect(github?.toolCache).toBeUndefined();
+    });
+
+    it("narrows by profile BEFORE merging cache", () => {
+      // If the order flipped (merge then profile), a profile-excluded server
+      // would still see its cache cloned — silent extra work and a confusing
+      // contract for the profile filter.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "linear", name: "Linear" }),
+      ]);
+      priv.toolCache.set("gh", [{ name: "gh_create" }, { name: "gh_list" }, { name: "gh_search" }]);
+      priv.profile = { servers: ["gh"] };
+
+      const merged = priv.getProfiledActiveServers();
+      expect(merged.map((s: UpstreamServerConfig) => s.namespace)).toEqual(["gh"]);
+      // And the surviving gh still got its cache merged.
+      expect(merged[0].toolCache).toBeDefined();
+      expect(merged[0].toolCache.length).toBe(3);
+    });
+
+    it("treats an empty-array cache the same as no cache (object identity preserved)", () => {
+      // Guards the `sessionCache.length > 0` check. A regression that drops
+      // the guard would always-spread and fragment identity for dormant
+      // servers — every consumer keyed on reference equality breaks silently.
+      const priv = getPrivate(server);
+      const serverConfig = makeServerConfig({ namespace: "gh" });
+      priv.config = makeConfig([serverConfig]);
+      priv.toolCache.set("gh", []); // learned entry that points at nothing
+
+      const merged = priv.getProfiledActiveServers();
+      expect(merged[0]).toBe(serverConfig);
+    });
+  });
+
   describe("discover tool overlaps", () => {
     it("surfaces a bare tool name shared by two connected servers", () => {
       // fs and github both expose `read_file` — the LLM needs a nudge

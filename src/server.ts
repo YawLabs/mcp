@@ -624,8 +624,22 @@ export class ConnectServer {
   // same set — no accidental bypass of the profile via a second code path.
   private getProfiledActiveServers(): UpstreamServerConfig[] {
     const all = (this.config?.servers ?? []).filter((s) => s.isActive);
-    if (!this.profile) return all;
-    return all.filter((s) => profileAllows(this.profile, s.namespace));
+    const profiled = this.profile ? all.filter((s) => profileAllows(this.profile, s.namespace)) : all;
+    // Merge in the in-memory toolCache (hydrated from state.json at startup,
+    // updated as servers activate) so callers like formatShadowLine can see
+    // learned tools. bundles.json doesn't carry toolCache (validateEntry's
+    // fixed whitelist drops it), and without this merge the tool-prefix
+    // heuristic in resolveShadowedClis is inert on a real run — see the
+    // KNOWN_CLI_PREFIXES comment in cli-shadows.ts. Mirrors getDeferredServers'
+    // merge below; preserves the original object identity when there's
+    // nothing to merge, so downstream identity-keyed consumers are unaffected.
+    const out: UpstreamServerConfig[] = [];
+    for (const server of profiled) {
+      const sessionCache = this.toolCache.get(server.namespace);
+      const cache = sessionCache && sessionCache.length > 0 ? sessionCache : server.toolCache;
+      out.push(cache === server.toolCache ? server : { ...server, toolCache: cache });
+    }
+    return out;
   }
 
   // Configured-but-not-currently-connected servers that have a persisted
