@@ -132,7 +132,32 @@ async function runEntry(
   return await new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [bundlePath, ...args], {
       cwd: workDir,
-      env: { ...childEnv, ...env },
+      // HOME/USERPROFILE point at the throwaway workDir, and that is the
+      // difference between a hermetic test and one that runs the developer's
+      // MCP stack. Scrubbing YAW_MCP_* was never enough: config, state and
+      // bundles.json are found through os.homedir() (USERPROFILE on Windows,
+      // HOME elsewhere), not through an env var this loop can see. Without
+      // the redirect the child loaded a real ~/.yaw-mcp/bundles.json and
+      // PRE-WARMED the servers in it -- on a machine whose bundle contains
+      // the docker-hosted `github` server with docker not running, the npipe
+      // connect sat for ~9-11s, and together with the startup version check
+      // it crossed the 15s guard below perhaps one run in four: SIGKILL,
+      // code null, and a truncated stderr that failed the assertions here
+      // for a reason nothing in this file mentioned. It reproduced outside
+      // vitest, so it was never a runner problem. Isolated, the child does
+      // no network-blocked work and exits in about a second.
+      //
+      // YAW_MCP_AUTO_UPGRADE=0 removes the last network call (the startup
+      // "is there a newer version" check against the registry). It sits in
+      // this object rather than in childEnv because the scrub above would
+      // delete it; spreading `env` last still lets a case override it.
+      env: {
+        ...childEnv,
+        HOME: workDir,
+        USERPROFILE: workDir,
+        YAW_MCP_AUTO_UPGRADE: "0",
+        ...env,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";
@@ -143,7 +168,33 @@ async function runEntry(
     child.stdout.resume();
     // If the fix regresses into a hang (server started despite a fatal
     // config), do not wedge the suite -- kill and let the assertion fail.
-    const guard = setTimeout(() => child.kill("SIGKILL"), 15_000);
+    //
+    // The ceiling is for CONTENTION, not for the work -- the same reasoning
+    // the beforeAll build timeout carries, and it has to be far larger than
+    // it looks because the FIRST execution of a freshly-written bundle is
+    // roughly an order of magnitude more expensive than the second.
+    //
+    // Measured from inside vitest on a Windows box with on-access AV, three
+    // iterations of "build the bundle, run it cold, run it warm":
+    //
+    //     build 26.6s | COLD 40.4s | warm 3.8s
+    //     build  1.4s | COLD 15.7s | warm 4.4s
+    //     build 23.9s | COLD 13.0s | warm 2.3s
+    //
+    // A 3 MB file that did not exist a moment ago is scanned before it runs,
+    // and beforeAll writes a new bundle into a new temp dir on every run, so
+    // the first runEntry in this file always pays it. The old 15s guard fired
+    // on roughly one run in four; 25s was still inside the observed range.
+    // 90s clears the worst measurement with room, and a real hang -- the
+    // thing this guard exists for -- is unbounded, so it still gets caught.
+    //
+    // The two tests that call runEntry carry an explicit per-test timeout
+    // ABOVE this value. That ordering is load-bearing: the guard firing is a
+    // legible failure (SIGKILL, code null, an assertion naming what was
+    // missing), while a vitest timeout reports only that the test was slow.
+    // Raise one without the other and you trade the first shape for the
+    // second.
+    const guard = setTimeout(() => child.kill("SIGKILL"), 90_000);
     child.on("error", (err) => {
       clearTimeout(guard);
       rejectPromise(err);
@@ -196,23 +247,28 @@ describe("runServer startup failure", () => {
   // YAW_MCP_URL exported in their shell profile still gets a working server.
   it("boots normally with a would-be-unsafe YAW_MCP_URL instead of dying", async () => {
     const { code, stderr } = await runEntry({ YAW_MCP_URL: "http://evil.example.com" });
-    // 0 or null, never 1 or 2. Both healthy shapes are timing-dependent and
-    // NEITHER indicates a problem: runEntry spawns with stdin on "ignore",
-    // so the stdio transport usually sees EOF and shuts down cleanly (0),
-    // but under full-suite load it can still be running when the 15s guard
-    // SIGKILLs it (null). What actually distinguishes a healthy boot is the
-    // absence of the failure codes -- 1 is the old fatal-config abort this
-    // test guards against, 2 is an argv error. Asserting a bare `toBe(0)`
-    // here is FLAKY (observed failing in the full suite and passing solo);
-    // the `not.toBe(1)` it replaced was stable but also passed for 2.
-    expect([0, null]).toContain(code);
+    // Exactly 0. runEntry spawns with stdin on "ignore", so the stdio
+    // transport sees EOF and shuts down cleanly, and with HOME isolated
+    // there is no bundles.json to pre-warm and no registry check to wait
+    // on -- the child is consistently done in about a second.
+    //
+    // This used to accept `null` (SIGKILLed at the 15s guard) as a second
+    // "healthy" shape, on the theory that a slow box could still be booting.
+    // That was the un-isolated HOME leaking the developer's real servers in;
+    // see runEntry. Accepting null also swallowed the exact regression the
+    // guard exists to catch, since a genuine hang reports null too. 1 is the
+    // old fatal-config abort this test guards against, 2 is an argv error.
+    expect(code).toBe(0);
     // The old fatal line is gone, and nothing fell through to the
     // last-resort handler either.
     expect(stderr).not.toContain("yaw-mcp: apiBase");
     expect(stderr).not.toContain('"unhandledRejection"');
     // It got past config load and actually started.
     expect(stderr).toContain('"yaw-mcp startup"');
-  });
+    // Above runEntry's 90s SIGKILL guard, deliberately -- see the note there.
+    // This is the first runEntry in the file, so it is the one that pays the
+    // cold-bundle cost (13-40s measured).
+  }, 120_000);
 
   it("exits 2 on a mis-cased flag instead of booting a stdio server", async () => {
     // End-to-end proof for the suggestFlag case-variant fix: `yaw-mcp --HELP`
@@ -223,7 +279,9 @@ describe("runServer startup failure", () => {
     expect(code).toBe(2);
     expect(stderr).toContain('unknown flag "--HELP"');
     expect(stderr).toContain("--help");
-  });
+    // Warm by now (the bundle has been executed once), but kept above the
+    // guard for the same reason -- test order is not a contract.
+  }, 120_000);
 
   it("still registers the last-resort handlers before the first await", async () => {
     // The exit-1 path must not be bought by deleting the net that covers
