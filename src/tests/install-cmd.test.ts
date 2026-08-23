@@ -22,7 +22,7 @@ import {
   runInstall,
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
-import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
+import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe } from "../oam-spawn.js";
 
@@ -38,6 +38,12 @@ afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
   rmSync(synthCwd, { recursive: true, force: true });
 });
+
+/** The projects[] key install writes for a project dir: Claude Code spells
+ *  those keys with forward slashes on every OS, so a host-native fixture path
+ *  (backslashes on a Windows runner) must be normalized before indexing into
+ *  the written JSON. No-op on POSIX. */
+const projectsKey = (dir: string): string => dir.replace(/\\/g, "/");
 
 function captureIo() {
   const out: string[] = [];
@@ -153,6 +159,39 @@ describe("parseInstallArgs", () => {
   it("rejects more than one positional", () => {
     const r = parseInstallArgs(["claude-code", "cursor"]);
     expect(r.ok).toBe(false);
+  });
+
+  // `--os` is a preview knob, not a cross-OS writer: resolveInstallPath
+  // builds `absolute` from THIS machine's home/APPDATA/separators, so a real
+  // cross-OS run would mkdir a host-shaped junk tree and report Done.
+  describe("cross-OS --os gate", () => {
+    const otherOs = CURRENT_OS === "windows" ? "macos" : "windows";
+
+    it("refuses a cross-OS --os without --dry-run", () => {
+      const r = parseInstallArgs(["claude-code", "--os", otherOs]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toContain(`--os ${otherOs}`);
+        expect(r.error).toContain("--dry-run");
+      }
+    });
+
+    it("allows a cross-OS --os with --dry-run (preview only)", () => {
+      const r = parseInstallArgs(["claude-code", "--os", otherOs, "--dry-run"]);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.options.os).toBe(otherOs);
+    });
+
+    it("allows a cross-OS --os with --list (read-only)", () => {
+      const r = parseInstallArgs(["--list", "--os", otherOs]);
+      expect(r.ok).toBe(true);
+    });
+
+    it("allows --os naming the current machine without --dry-run", () => {
+      const r = parseInstallArgs(["claude-code", "--os", CURRENT_OS]);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.options.os).toBe(CURRENT_OS);
+    });
   });
 });
 
@@ -274,6 +313,27 @@ describe("mergePermissionsAllow", () => {
     expect(allow).not.toContain("mcp__mcp_hosting__*");
     expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
     expect(allow).toContain("Bash(git *)");
+  });
+
+  it("strips every legacy brand's pattern — including mcp__mcph__*", () => {
+    // The strip table is derived from LEGACY_ENTRY_NAMES (mcp.hosting, mcph,
+    // yaw-mcp); a hand-kept copy silently omitted mcp__mcph__*, so the middle
+    // brand's dead wildcard survived every upgrade.
+    const existing = {
+      permissions: { allow: ["mcp__mcp_hosting__*", "mcp__mcph__*", "mcp__yaw_mcp__*", "Read"] },
+    };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    const allow = (merged.permissions as { allow: string[] }).allow;
+    expect(allow).toEqual(["Read", CLAUDE_CODE_ALLOW_PATTERN]);
+  });
+
+  it("retains mcp__mcph__* when the caller marks it still load-bearing", () => {
+    // Mirrors runInstall's behavior when the legacy `mcph` mcpServers entry is
+    // still wired: its grant is not dead, so `retain` protects it from the strip.
+    const existing = { permissions: { allow: ["mcp__mcph__*"] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN], ["mcp__mcph__*"]);
+    const allow = (merged.permissions as { allow: string[] }).allow;
+    expect(allow).toEqual(["mcp__mcph__*", CLAUDE_CODE_ALLOW_PATTERN]);
   });
 });
 
@@ -666,8 +726,16 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
       expect(existsSync(wrapperClient)).toBe(true);
       const client = JSON.parse(readFileSync(wrapperClient, "utf8"));
       // Nested under projects[<absDir>].mcpServers — locks the local-scope
-      // shape against accidental flattening when redirecting.
-      expect(client.projects[synthCwd].mcpServers[ENTRY_NAME].command).toBe("npx");
+      // shape against accidental flattening when redirecting. Keyed by the
+      // forward-slash spelling Claude Code writes, even on a Windows runner.
+      expect(client.projects[projectsKey(synthCwd)].mcpServers[ENTRY_NAME].command).toBe("npx");
+      // The host-native backslash spelling must NOT exist as a sibling key —
+      // that was the Windows bug: install wrote resolve()'s spelling verbatim,
+      // creating a projects[] entry Claude Code never reads while doctor and
+      // --list (computing the same wrong key) reported "installed".
+      if (synthCwd !== projectsKey(synthCwd)) {
+        expect(client.projects[synthCwd]).toBeUndefined();
+      }
 
       // Home version not created.
       expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
@@ -944,7 +1012,7 @@ describe("runInstall — non-object container key", () => {
     const parsed = parseJsonc(readFileSync(clientPath, "utf8")) as {
       projects: Record<string, { mcpServers: Record<string, unknown> }>;
     };
-    expect(parsed.projects[synthCwd].mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(parsed.projects[projectsKey(synthCwd)].mcpServers[ENTRY_NAME]).toBeDefined();
     const msg = r.messages.join(" ");
     expect(msg).toContain('"projects"');
     expect(msg).toContain("is null, not an object");
@@ -1899,6 +1967,47 @@ describe("runInstall — legacy allow-pattern stripping", () => {
       .allow;
     expect(allow).not.toContain("mcp__yaw_mcp__*");
     expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+});
+
+describe("runInstall — project-scope approval note (claude-code)", () => {
+  // Claude Code gates .mcp.json servers behind a one-time per-project
+  // approval prompt (enabledMcpjsonServers / disabledMcpjsonServers in
+  // ~/.claude.json). "Restart it" alone strands the user: they restart, see
+  // no server, and have no pointer to the actual gate.
+  it("tells the user to approve the .mcp.json server, not just restart", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "project",
+      os: "linux",
+      home: synthHome,
+      projectDir: synthCwd,
+      cwd: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toMatch(/Done: Claude Code is configured\./);
+    expect(out).toMatch(/approve/);
+    expect(out).toMatch(/\.mcp\.json/);
+  });
+
+  it("user scope keeps the plain restart instruction (no approval gate there)", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toMatch(/Restart it to pick up the new MCP server\./);
+    expect(out).not.toMatch(/approve/);
   });
 });
 

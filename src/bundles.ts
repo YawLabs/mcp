@@ -4,12 +4,16 @@
 // `mcp_connect_bundles` meta-tool surfaces these so the model can activate
 // a coherent preset in one step instead of juggling discover + load.
 //
-// Namespaces here are the CANONICAL short names users conventionally pick
-// when installing a given server (e.g. `github`, `linear`, `slack`). If a
-// user picked a different namespace locally, partial-match will still be
-// useful ("you have github + linear, pr-review is ready") even if their
-// slack install is called "myslack" — the bundle just won't fire on that
-// account until they align the names.
+// Namespaces here MUST be the namespaces the install paths actually write:
+// both `yaw-mcp add` (local-add-cmd.ts) and the Yaw Terminal app derive the
+// namespace from the catalog row's display NAME via deriveNamespace
+// (local-bundles.ts) — NOT from the slug. So "Google Analytics" installs as
+// `googleanalytics` even though its catalog slug is `ga`; a bundle listing
+// the slug form could never match any installed set. If a user hand-picked
+// a different namespace locally, partial-match will still be useful ("you
+// have github + linear, pr-review is ready") even if their slack install is
+// called "myslack" — the bundle just won't fire on that account until they
+// align the names.
 
 export type BundleCategory = "dev" | "ops" | "growth" | "data";
 
@@ -40,7 +44,10 @@ export const CURATED_BUNDLES: readonly CuratedBundle[] = [
     id: "growth-stack",
     name: "Growth Stack",
     description: "HubSpot + Slack + GA for lifecycle + funnel signals",
-    namespaces: ["hubspot", "slack", "ga"],
+    // NOT "ga": the catalog slug is `ga`, but every install path derives the
+    // namespace from the row's NAME ("Google Analytics"), so the installed
+    // namespace is `googleanalytics` and the slug form can never match.
+    namespaces: ["hubspot", "slack", "googleanalytics"],
     category: "growth",
   },
   {

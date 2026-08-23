@@ -6,6 +6,7 @@ import {
   matchBundles,
   topPartialBundles,
 } from "../bundles.js";
+import { deriveNamespace } from "../local-bundles.js";
 
 describe("CURATED_BUNDLES data", () => {
   it("every bundle has a non-empty id, name, description, and namespaces array", () => {
@@ -33,6 +34,31 @@ describe("CURATED_BUNDLES data", () => {
     expect(CURATED_BUNDLES.length).toBeGreaterThanOrEqual(4);
     const categories = new Set(CURATED_BUNDLES.map((b) => b.category));
     expect(categories.size).toBeGreaterThanOrEqual(3);
+  });
+
+  // Bundle namespaces must be what the install paths WRITE, which is
+  // deriveNamespace(catalog display name) -- not the catalog slug. The live
+  // catalog's Google Analytics row is slug "ga" / name "Google Analytics",
+  // so the installed namespace is "googleanalytics"; a bundle listing "ga"
+  // could never match any installed set (`add ga` && `bundles match` kept
+  // reporting growth-stack as missing "ga" forever).
+  it("growth-stack requires the NAME-derived googleanalytics namespace, never the ga slug", () => {
+    const growth = CURATED_BUNDLES.find((b) => b.id === "growth-stack");
+    expect(growth?.namespaces).toEqual(["hubspot", "slack", "googleanalytics"]);
+    // deriveNamespace("Google Analytics") === "googleanalytics" -- the exact
+    // namespace `yaw-mcp add ga` writes -- makes the bundle ready.
+    const result = matchBundles(["hubspot", "slack", "googleanalytics"]);
+    expect(result.ready.some((b) => b.id === "growth-stack")).toBe(true);
+    // The slug form must NOT satisfy it (nothing can ever install as "ga").
+    expect(matchBundles(["hubspot", "slack", "ga"]).ready.some((b) => b.id === "growth-stack")).toBe(false);
+  });
+
+  it("every bundle namespace is a deriveNamespace fixed point (lowercase alphanumeric)", () => {
+    for (const bundle of CURATED_BUNDLES) {
+      for (const ns of bundle.namespaces) {
+        expect(deriveNamespace(ns)).toBe(ns);
+      }
+    }
   });
 });
 
@@ -117,7 +143,7 @@ describe("topPartialBundles", () => {
     // Install github + slack. Relevant partials (by seeded bundles):
     //   devops-incident: have=[github,slack], missing=[pagerduty] — 1 missing
     //   product-release: have=[github,slack], missing=[linear]    — 1 missing
-    //   growth-stack:    have=[slack],        missing=[hubspot,ga] — 2 missing
+    //   growth-stack:    have=[slack],        missing=[hubspot,googleanalytics] — 2 missing
     //   support-ops:     have=[slack],        missing=[zendesk,hubspot] — 2 missing
     //   pr-review:       have=[github],       missing=[linear]    — 1 missing
     // Top 3 must all be 1-missing entries.

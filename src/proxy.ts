@@ -105,15 +105,21 @@ export function buildToolList(
   exposedNamespaces?: ReadonlySet<string>,
 ): Array<{
   name: string;
+  title?: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
 }> {
   const tools: Array<{
     name: string;
+    title?: string;
     description?: string;
     inputSchema: Record<string, unknown>;
+    outputSchema?: Record<string, unknown>;
     annotations?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   }> = [];
   const seen = new Set<string>();
 
@@ -146,11 +152,17 @@ export function buildToolList(
     for (const tool of conn.tools) {
       if (filter && !filter.has(tool.name)) continue;
       if (seen.has(tool.namespacedName)) continue;
+      // title / outputSchema / _meta ride along so the structured-output
+      // contract and display name survive the proxy (deferred placeholders
+      // below stay minimal on purpose — their schema is a placeholder too).
       tools.push({
         name: tool.namespacedName,
+        title: tool.title,
         description: tool.description,
         inputSchema: tool.inputSchema,
+        outputSchema: tool.outputSchema,
         annotations: tool.annotations,
+        _meta: tool._meta,
       });
       seen.add(tool.namespacedName);
     }

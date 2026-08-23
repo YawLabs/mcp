@@ -11,7 +11,7 @@ import {
 
 function mockServer(
   caps: Record<string, unknown> | undefined,
-  createMessage?: (params: unknown) => Promise<unknown>,
+  createMessage?: (params: unknown, options?: unknown) => Promise<unknown>,
 ): Server {
   return {
     getClientCapabilities: () => caps,
@@ -171,5 +171,28 @@ describe("gradeOutcomeViaSampling", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Regression: the grader used to abandon the sampling promise locally at 4s
+  // while the SDK request stayed outstanding (and the client generating)
+  // until the SDK's 60s default request timeout. Passing a RequestOptions
+  // timeout makes the SDK send notifications/cancelled at the same deadline.
+  it("passes a request timeout to createMessage so the SDK cancels the sampling request", async () => {
+    let seenOptions: unknown;
+    const server = mockServer({ sampling: {} }, async (_params, options) => {
+      seenOptions = options;
+      return { content: { type: "text", text: "YES" } };
+    });
+    expect(await gradeOutcomeViaSampling(server, ctx)).toBe(1.0);
+    expect(seenOptions).toMatchObject({ timeout: 4000 });
+  });
+
+  it("returns null (never throws) when the SDK's request timeout rejects the call", async () => {
+    // The SDK rejects with an McpError(RequestTimeout) after sending the
+    // cancellation notification; the grader must swallow it into null.
+    const server = mockServer({ sampling: {} }, async () => {
+      throw new Error("MCP error -32001: Request timed out");
+    });
+    expect(await gradeOutcomeViaSampling(server, ctx)).toBeNull();
   });
 });

@@ -245,7 +245,10 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     const fix =
       target.clientId === "claude-desktop" && os === "linux"
         ? "Anthropic ships Claude Desktop on macOS and Windows only. Install Claude Code or Cursor instead."
-        : "Pick a different client or pass --os to override.";
+        : // NOT "pass --os to override": install resolves paths against THIS
+          // machine, so a cross-OS --os write is refused at the flag boundary
+          // (see parseInstallArgs) — only the --dry-run preview is offered.
+          "Pick a different client, or preview another OS's config with --os <os> --dry-run.";
     err(`yaw-mcp install: ${target.label} is not available on ${os}.\n  ${fix}`);
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
@@ -631,7 +634,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       `Note: legacy "${legacyEntry}" entry remains at ${resolved.absolute}. Remove it to avoid running yaw-mcp twice.`,
     );
   }
-  log(`\nDone: ${target.label} is configured. Restart it to pick up the new MCP server.`);
+  // Claude Code gates project-scope (.mcp.json) servers behind a one-time
+  // per-project approval prompt (tracked as enabledMcpjsonServers /
+  // disabledMcpjsonServers under projects[<dir>] in ~/.claude.json), so
+  // "restart it" alone strands the user: the freshly-written entry stays
+  // inert until the prompt is answered, and nothing else names that gate.
+  log(
+    target.clientId === "claude-code" && scope === "project"
+      ? `\nDone: ${target.label} is configured. Restart it in this project and approve the .mcp.json server when ` +
+          "prompted — Claude Code keeps project-scope (.mcp.json) servers disabled until you approve them."
+      : `\nDone: ${target.label} is configured. Restart it to pick up the new MCP server.`,
+  );
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }
 
@@ -726,12 +739,16 @@ function legacyAllowPatternFor(entryName: string): string {
 }
 
 /** Allow-patterns earlier installers wrote into Claude Code's
- *  `permissions.allow` (the dead mcp.hosting brand and the interim yaw-mcp
- *  key). Stripped on upgrade so dead wildcards don't accumulate forever —
- *  no live tool name can match them ONCE THE ENTRY THAT SERVED THEM IS GONE.
+ *  `permissions.allow` (one per LEGACY_ENTRY_NAMES brand). Stripped on
+ *  upgrade so dead wildcards don't accumulate forever — no live tool name can
+ *  match them ONCE THE ENTRY THAT SERVED THEM IS GONE. Derived from
+ *  LEGACY_ENTRY_NAMES via legacyAllowPatternFor, never tabulated by hand: a
+ *  hand-kept copy of this list silently omitted `mcp__mcph__*`, so the middle
+ *  brand's dead wildcard survived every upgrade — exactly the drift the
+ *  derivation in legacyAllowPatternFor exists to prevent.
  *  A pattern whose legacy mcpServers entry is still wired is NOT dead, so the
  *  caller passes it via `retain` (see legacyAllowPatternFor). */
-const LEGACY_CLAUDE_CODE_ALLOW_PATTERNS = ["mcp__mcp_hosting__*", "mcp__yaw_mcp__*"];
+const LEGACY_CLAUDE_CODE_ALLOW_PATTERNS: string[] = LEGACY_ENTRY_NAMES.map(legacyAllowPatternFor);
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every
  *  other key. Deduplicates by string equality so repeated installs don't
@@ -1022,6 +1039,25 @@ export function parseInstallArgs(argv: string[]):
         if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${USAGE}` };
         positional.push(a);
     }
+  }
+
+  // `--os` is a preview knob, not a cross-OS writer: resolveInstallPath
+  // builds `absolute` from THIS machine's home dir / APPDATA / separators
+  // and only the `display` string is target-OS-shaped, so a real cross-OS
+  // run would mkdir a junk host-shaped tree (e.g. `C:\Users\me\Library\
+  // Application Support\Claude\...` for `--os macos` on Windows) and then
+  // report Done. Refuse at the flag boundary; `--dry-run` and `--list`
+  // stay available for previewing another OS. runInstall itself keeps
+  // accepting any os/home combination — that pairing is the hermetic test
+  // seam, and index.ts always routes users through this parser.
+  if (opts.os && opts.os !== CURRENT_OS && !opts.dryRun && !opts.listOnly) {
+    return {
+      ok: false,
+      error:
+        `yaw-mcp install: --os ${opts.os} does not match this machine (${CURRENT_OS}), and install can only ` +
+        `resolve config paths for the machine it runs on — a cross-OS write would create a ${CURRENT_OS}-shaped ` +
+        `junk tree. Add --dry-run to preview, or run install on the ${opts.os} machine itself.`,
+    };
   }
 
   // --list and --all skip the positional-client requirement. They apply

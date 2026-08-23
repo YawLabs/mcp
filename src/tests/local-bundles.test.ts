@@ -398,6 +398,28 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].env).toEqual({ GITHUB_TOKEN: "ghp_abc", OK: "yes" });
   });
 
+  it("drops blank env values so a seeded key cannot clobber the ambient shell var at spawn", async () => {
+    // `yaw-mcp add` seeds required keys with "" (value deliberately NOT
+    // persisted -- the server relies on the ambient shell var). The spawn env
+    // is { ...parentEnv, ...serverEnv } (upstream.ts), so a loaded "" would
+    // override the inherited shell value with an empty one and start the
+    // server unauthenticated. Whitespace-only counts as blank, matching the
+    // add path's trim-based treatment.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "tailscale",
+          name: "Tailscale",
+          command: "npx",
+          env: { TAILSCALE_API_KEY: "", BLANKISH: "   ", KEPT: "value" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].env).toEqual({ KEPT: "value" });
+  });
+
   it("warns on schema version newer than supported", async () => {
     writeBundles(synthHome, { version: 999, servers: [] });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });

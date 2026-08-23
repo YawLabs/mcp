@@ -22,14 +22,56 @@ import { cacheDir } from "./paths.js";
 // partial downloads. A compromise of Astral's release pipeline itself
 // is out of scope; users who need that guarantee pre-install `uv`.
 
-const UV_VERSION = "0.11.7";
+/**
+ * The uv release this bootstrap downloads.
+ *
+ * POLICY: this tracks the LATEST uv release (same policy as MIN_OAM_VERSION in
+ * oam-spawn.ts -- bump it with every uv release we notice, not only when a
+ * release happens to fix something this code hit). The install dir is keyed by
+ * this constant, so a stale pin does not merely download an old build once --
+ * it keeps every user on that build indefinitely, because the cached binary
+ * short-circuits the download forever. There is no auto-upgrade hook; a human
+ * editing this line is the only way the pin moves. Nothing else needs
+ * updating on a bump: the sha256 is fetched alongside the archive from the
+ * same release, so there are no hash constants to refresh.
+ *
+ * Exported for the test that pins the freshness floor.
+ */
+export const UV_VERSION = "0.12.5";
 const RELEASE_BASE = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}`;
+
+// glibc vs musl. Node's diagnostic report carries `glibcVersionRuntime` on
+// every glibc build and omits it on musl (this is the same probe detect-libc
+// and esbuild use). Only meaningful when platform === "linux" -- the caller
+// guards that, because on win32/darwin the field is absent too and would
+// misread as musl. On any error, default to glibc: that keeps the common case
+// working, and a wrong guess on actual musl fails exactly as loudly as the
+// pre-detection behavior did.
+function isMuslLibc(): boolean {
+  try {
+    const raw: unknown = process.report?.getReport();
+    const report = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
+    const header = (report as { header?: { glibcVersionRuntime?: unknown } } | null)?.header;
+    return typeof header?.glibcVersionRuntime !== "string";
+  } catch {
+    return false;
+  }
+}
 
 // uv target triples per (platform, arch). Left null for combinations
 // Astral doesn't publish a binary for — callers get a clear error
-// rather than a silently-wrong download.
-function uvTarget(): string | null {
-  const { platform, arch } = process;
+// rather than a silently-wrong download. On Linux the triple also
+// encodes the libc: Astral publishes separate -musl assets, and a
+// glibc uv on Alpine dies with a loader error that reads as a broken
+// MCP server rather than a wrong download.
+//
+// Parameters exist for tests (a win32 host cannot vary process.platform
+// or its libc); production callers use the defaults.
+export function uvTarget(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+  musl: boolean = platform === "linux" && isMuslLibc(),
+): string | null {
   if (platform === "win32") {
     if (arch === "x64") return "x86_64-pc-windows-msvc";
     if (arch === "arm64") return "aarch64-pc-windows-msvc";
@@ -42,8 +84,9 @@ function uvTarget(): string | null {
     return null;
   }
   if (platform === "linux") {
-    if (arch === "x64") return "x86_64-unknown-linux-gnu";
-    if (arch === "arm64") return "aarch64-unknown-linux-gnu";
+    const libc = musl ? "musl" : "gnu";
+    if (arch === "x64") return `x86_64-unknown-linux-${libc}`;
+    if (arch === "arm64") return `aarch64-unknown-linux-${libc}`;
     return null;
   }
   return null;
@@ -70,8 +113,9 @@ async function exists(p: string): Promise<boolean> {
 // `--version` and considers exit 0 as "present." Faster and more
 // portable than rolling our own PATH walk (which has to cope with
 // PATHEXT on Windows and symlinks on Unix). 3s cap guards against a
-// wedged shim.
-async function onPath(cmd: string): Promise<boolean> {
+// wedged shim. Exported for the timeout-path test; production callers
+// stay inside this module.
+export async function onPath(cmd: string): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     const settle = (v: boolean) => {
@@ -96,9 +140,22 @@ async function onPath(cmd: string): Promise<boolean> {
     }
 
     const timer = setTimeout(() => {
+      // SIGKILL, not the SIGTERM default a trapping child ignores -- and on
+      // win32 the shell:true wrapper means the kill lands on cmd.exe, not on
+      // uv itself, so the kill alone proves nothing either way. unref is the
+      // guarantee: a still-live child no longer holds the broker's event loop
+      // open at shutdown. Mirrors runCommand below and spawnVersionProbe in
+      // oam-spawn.ts.
       try {
-        child.kill();
-      } catch {}
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      try {
+        child.unref();
+      } catch {
+        /* already gone */
+      }
       settle(false);
     }, 3_000);
     timer.unref?.();
@@ -363,7 +420,13 @@ async function resolveUv(): Promise<string> {
     );
   }
 
-  const installDir = path.join(cacheDir(), "uv", UV_VERSION);
+  // Keyed by version AND target triple. Version alone shared one binary
+  // across architectures: on Windows 11 ARM64 an x64 Node bootstraps
+  // x86_64 uv.exe and a later arm64 Node would reuse it (emulated, not
+  // native); on Apple Silicon an `arch -x86_64 node` session would leave
+  // the native session depending on Rosetta. The triple also encodes
+  // linux libc, so a glibc cache entry can't shadow a musl one.
+  const installDir = path.join(cacheDir(), "uv", UV_VERSION, target);
   const finalBin = path.join(installDir, binName());
   if (await exists(finalBin)) return finalBin;
 
@@ -439,6 +502,38 @@ async function resolveUv(): Promise<string> {
   return finalBin;
 }
 
+/** Trailing Windows executable extension, any casing -- mirrors WIN_EXE_EXT
+ *  in oam-spawn.ts: a hand-written or installer-generated config carries
+ *  `uvx.exe` or `UV.EXE` as readily as the bare name, and the extension says
+ *  nothing about what the program IS. */
+const UV_WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
+
+/**
+ * Which uv launcher a BARE command names, or null for anything else.
+ *
+ * Matched with any Windows executable extension stripped, case-insensitively,
+ * so `uvx.exe` / `UV.CMD` get the same bootstrap-and-rewrite treatment as
+ * `uvx` / `uv`. Exact string equality -- which is what this replaced --
+ * silently passed those shapes through, reintroducing the exact Windows
+ * failure the uvx rewrite below exists to prevent (mirrors nodeLaunchKind in
+ * oam-spawn.ts).
+ *
+ * A command WITH a path separator (`C:\...\uv.exe`, `./bin/uvx`) returns null
+ * DELIBERATELY: an explicit path is a user pin on one concrete binary.
+ * Substituting the managed download behind it would silently override the
+ * pin, and rewriting a pinned uvx's args to `tool run` without switching the
+ * binary would mis-launch (a uvx binary does not take `tool run`). A pinned
+ * path either spawns as written or fails with an ENOENT naming exactly what
+ * the user wrote -- both better than quiet substitution.
+ */
+function uvLaunchKind(command: string): "uv" | "uvx" | null {
+  if (/[\\/]/.test(command)) return null;
+  const base = command.replace(UV_WIN_EXE_EXT, "").toLowerCase();
+  if (base === "uv") return "uv";
+  if (base === "uvx") return "uvx";
+  return null;
+}
+
 // Rewrite a spawn target so uv/uvx resolves to our managed binary
 // when the user doesn't have it. Returns the (possibly new) command +
 // args to hand to StdioClientTransport. No-op for any other command.
@@ -455,18 +550,19 @@ async function resolveUv(): Promise<string> {
 // reachable (either because onPath("uv") said so, or we just
 // downloaded it).
 export async function resolveUvSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
-  if (command !== "uv" && command !== "uvx") return { command, args };
+  const kind = uvLaunchKind(command);
+  if (kind === null) return { command, args };
 
   const uvBin = await ensureUv();
 
-  if (command === "uvx") {
+  if (kind === "uvx") {
     // Always rewrite to `uv tool run`. Works regardless of whether
     // uvBin is the literal "uv" (PATH) or an absolute path
     // (bootstrapped cache). Avoids requiring uvx.exe separately.
     return { command: uvBin, args: ["tool", "run", ...args] };
   }
 
-  // command === "uv" — pass through. uvBin is either "uv" (PATH) or
+  // kind === "uv" — pass through. uvBin is either "uv" (PATH) or
   // the absolute path to our managed binary; either way, the spawn
   // target resolves correctly.
   return { command: uvBin, args };

@@ -20,10 +20,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     mkdir: vi.fn(actual.mkdir),
     chmod: vi.fn(actual.chmod),
     stat: vi.fn(actual.stat),
+    rename: vi.fn(actual.rename),
   };
 });
 
-import { chmod, mkdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, stat, writeFile } from "node:fs/promises";
 
 /**
  * Run `fn` with process.platform reporting a POSIX value.
@@ -41,6 +42,23 @@ async function asPosix<T>(fn: () => Promise<T>): Promise<T> {
   } finally {
     if (original) Object.defineProperty(process, "platform", original);
   }
+}
+
+/** Companion to asPosix: run `fn` with process.platform reporting win32, so
+ *  the rename-retry branch (win32-only, read at call time) is reachable from
+ *  any runner. */
+async function asWin32<T>(fn: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    return await fn();
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+  }
+}
+
+function errnoError(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`${code}: injected by test`), { code });
 }
 
 describe("atomicWriteFile", () => {
@@ -262,5 +280,50 @@ describe("atomicWriteFile", () => {
     // And the tmp file the failed write left behind was cleaned up.
     const orphans = readdirSync(dir).filter((f) => f.includes(".tmp-"));
     expect(orphans).toEqual([]);
+  });
+
+  // The publish rename on Windows fails spuriously when an AV scanner,
+  // Search Indexer, or sync client briefly holds the fresh tmp file --
+  // renameWithRetry backs off and retries those codes (win32 only) so one
+  // alien handle doesn't fail the whole write.
+  it("retries a transient EPERM/EBUSY rename on win32 and lands the write", async () => {
+    const file = join(dir, "retry.json");
+    vi.mocked(rename).mockRejectedValueOnce(errnoError("EPERM")).mockRejectedValueOnce(errnoError("EBUSY"));
+    await asWin32(() => atomicWriteFile(file, '{"ok":1}'));
+    expect(readFileSync(file, "utf8")).toBe('{"ok":1}');
+    expect(vi.mocked(rename)).toHaveBeenCalledTimes(3);
+    // No orphan tmp files after the eventual success.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("surfaces the real error and cleans up after the retry budget is spent on win32", async () => {
+    // 3 backoff delays + 1 final attempt = 4 renames; a persistent EPERM
+    // (read-only destination attribute, a genuine ACL denial) still
+    // propagates from the last one and the tmp file is unlinked.
+    const file = join(dir, "persistent.json");
+    const mocked = vi.mocked(rename);
+    for (let i = 0; i < 4; i++) mocked.mockRejectedValueOnce(errnoError("EPERM"));
+    await asWin32(async () => {
+      await expect(atomicWriteFile(file, "x")).rejects.toThrow("EPERM");
+    });
+    expect(mocked).toHaveBeenCalledTimes(4);
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("does not retry a non-transient rename error code on win32", async () => {
+    vi.mocked(rename).mockRejectedValueOnce(errnoError("ENOENT"));
+    await asWin32(async () => {
+      await expect(atomicWriteFile(join(dir, "fast.json"), "x")).rejects.toThrow("ENOENT");
+    });
+    expect(vi.mocked(rename)).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a rename failure on POSIX (no spurious-EPERM failure mode there)", async () => {
+    vi.mocked(rename).mockRejectedValueOnce(errnoError("EPERM"));
+    await asPosix(async () => {
+      await expect(atomicWriteFile(join(dir, "posix.json"), "x")).rejects.toThrow("EPERM");
+    });
+    expect(vi.mocked(rename)).toHaveBeenCalledTimes(1);
   });
 });

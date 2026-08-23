@@ -2,6 +2,10 @@ import { classifyError, type ErrorCategory } from "./error-category.js";
 
 export interface ToolCallResultShape {
   content?: Array<{ type: string; text?: string }>;
+  // Spec-legal structured output: when a tool declares an outputSchema, the
+  // result carries `structuredContent` and `content` "may be empty"
+  // (CallToolResultSchema). Typed unknown -- we only test for presence.
+  structuredContent?: unknown;
   isError?: boolean;
 }
 
@@ -53,12 +57,19 @@ function firstTextBlock(result: ToolCallResultShape): string | undefined {
   return undefined;
 }
 
-// True when the body carries no usable text: no content, empty content,
-// or every text block is empty/whitespace-only.
+// True when the body carries no substance AT ALL: no structuredContent, and
+// every content block is a text block with empty/whitespace-only text (or
+// content is missing/empty). A NON-text block (image, audio, resource,
+// resource_link) is substance -- a screenshot or chart server legitimately
+// returns zero text -- and so is spec-legal structured output, where the
+// schema says `content` "may be empty". Grading those 0.3 marked perfectly
+// healthy servers as flaky (learning down-rank + doctor/discover flaky list).
 function isEmptyBody(result: ToolCallResultShape): boolean {
+  if (result.structuredContent !== undefined) return false;
   const content = result.content;
   if (!content || content.length === 0) return true;
   for (const block of content) {
+    if (block.type !== "text") return false;
     if (typeof block.text === "string" && block.text.trim().length > 0) {
       return false;
     }

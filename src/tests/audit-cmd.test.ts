@@ -99,7 +99,28 @@ describe("runAudit", () => {
     expect(cache.ctxlint.grade).toBe("A");
     expect(cache.ctxlint.score).toBe(97.5);
     expect(typeof cache.ctxlint.gradedAt).toBe("string");
+    // Injected runner returned no suiteVersion -- the field must stay absent,
+    // not be written as undefined/"".
+    expect("suiteVersion" in cache.ctxlint).toBe(false);
     expect(io.out.join("\n")).toContain("Grade: A");
+  });
+
+  it("persists the runner's suiteVersion so the cached letter records its rubric", async () => {
+    // defaultRunner attaches SPEC_VERSION from @yawlabs/mcp-compliance; this
+    // pins the plumbing from the runner's report into grades.json.
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: [] }]);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 99, suiteVersion: "0.17.1" }),
+    });
+    expect(r.exitCode).toBe(0);
+    const cache = await readGradesCache(home);
+    expect(cache.ctxlint.suiteVersion).toBe("0.17.1");
   });
 
   it("emits PURE JSON with --json (no human preamble)", async () => {
@@ -150,6 +171,48 @@ describe("runAudit", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(io.err.join("\n")).toContain('no server named "ctxlint"');
+  });
+
+  it("surfaces loader warnings for a malformed bundles.json instead of a bare not-found", async () => {
+    // A malformed (or unreadable) bundles.json loads as zero servers. The
+    // loader's diagnostic used to be discarded, so the user saw only
+    // `no server named "X"` with exit 1 -- the code the header reserves for a
+    // typo'd namespace -- and nothing pointed at the broken file. The exit
+    // code stays 1 (nothing was graded); the warning is what changes.
+    home = mkdtempSync(join(tmpdir(), "yaw-audit-"));
+    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json");
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 100 }),
+    });
+    expect(r.exitCode).toBe(1);
+    const stderr = io.err.join("\n");
+    expect(stderr).toMatch(/warning: .*invalid JSON/);
+    expect(stderr).toContain('no server named "ctxlint"');
+  });
+
+  it("keeps warnings off stdout in --json mode (stderr only)", async () => {
+    home = mkdtempSync(join(tmpdir(), "yaw-audit-"));
+    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json");
+    const io = captureIO();
+    await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 100 }),
+    });
+    expect(io.out.join("")).not.toContain("warning:");
+    expect(io.err.join("\n")).toMatch(/warning: .*invalid JSON/);
   });
 
   it("exit 2 for a remote (url-only) server", async () => {

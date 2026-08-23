@@ -2,7 +2,9 @@
 // onto the target -- fs.rename is atomic on the same filesystem on POSIX
 // and on modern Windows Node, so a process killed mid-write (SIGINT,
 // OOM, antivirus) leaves the original target intact instead of a half-
-// written file. The pid+timestamp+counter suffix makes the tmp name unique
+// written file. (Atomic on Windows does not mean reliable first try there:
+// see renameWithRetry below for the transient EPERM/EBUSY dance with AV and
+// indexer handles.) The pid+timestamp+counter suffix makes the tmp name unique
 // across concurrent processes AND within this one; in-process serialization
 // of the LOGICAL read-modify-write is still the caller's concern (see
 // persistence.ts:saveState) -- unique tmp names stop the writes from
@@ -19,6 +21,38 @@
 
 import { chmod, mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+
+// Windows-only transient-error retry for the publish rename. On Windows a
+// freshly written file is routinely held open for a beat by antivirus
+// scanners, Search Indexer, or sync clients (OneDrive/Dropbox), and libuv's
+// MoveFileExW surfaces that alien handle as EPERM/EBUSY/EACCES even though
+// nothing is wrong with the write itself. A short backoff run lands those;
+// a persistent error (read-only destination attribute, a real ACL denial)
+// still surfaces from the final attempt. POSIX rename has no spurious
+// failure mode of this shape, so retrying there would only delay reporting
+// a genuine permission error.
+const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const RENAME_RETRY_DELAYS_MS = [10, 50, 100];
+
+async function renameWithRetry(tmp: string, target: string): Promise<void> {
+  if (process.platform !== "win32") {
+    await rename(tmp, target);
+    return;
+  }
+  for (const ms of RENAME_RETRY_DELAYS_MS) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === undefined || !RENAME_RETRY_CODES.has(code)) throw err;
+      await delay(ms);
+    }
+  }
+  // Final attempt outside the loop -- let the real error propagate.
+  await rename(tmp, target);
+}
 
 // Bumped per call so two concurrent atomicWriteFile calls to the same path in
 // the same process never share a tmp path. pid+ms alone is NOT unique there
@@ -93,7 +127,7 @@ export async function atomicWriteFile(
         // Ignored -- the born mode above is already no wider than the target.
       }
     }
-    await rename(tmp, filePath);
+    await renameWithRetry(tmp, filePath);
   } catch (err) {
     // Best-effort cleanup so we don't leak orphan temp files when the
     // write or rename fails. Swallow the unlink error -- the original

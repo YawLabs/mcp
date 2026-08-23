@@ -83,6 +83,9 @@ export interface UpgradeCommandOptions {
   /** Test hook: replace the `npm prefix -g` probe used to refine
    *  ambiguous install-method detections. */
   npmPrefix?: () => Promise<string | null>;
+  /** Test hook: replace the running-install prefix walk behind the
+   *  `--prefix` a global-npm upgrade passes (see defaultRunningPrefix). */
+  runningPrefix?: (argvPath: string | undefined) => string | null | Promise<string | null>;
   /** Test hook: force single-executable (SEA binary) detection. */
   isSea?: () => boolean;
   /** Test hook: replace the `oam --version` probe behind the oam-floor note. */
@@ -527,6 +530,22 @@ async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise
   }
 }
 
+/** Resolve the global prefix the RUNNING install lives under (argv[1] walked
+ *  up to its node_modules parent) so a global-npm upgrade can pass `--prefix`.
+ *  Delegates to auto-upgrade's detectRunningInstallPrefix via dynamic import:
+ *  auto-upgrade.ts statically imports this module, so a static back-import
+ *  would create a cycle (same pattern as the oam-spawn import in
+ *  oamFloorLines). Auto-skips under vitest (mirrors npmGlobalPrefix): the
+ *  walk realpaths argv[1], so on a machine that really has a global install
+ *  an un-injected unit test's spawn args would flip from bare `-g` to
+ *  `--prefix` depending on the machine. Tests exercising the prefix path
+ *  inject opts.runningPrefix. */
+async function defaultRunningPrefix(argvPath: string | undefined): Promise<string | null> {
+  if (process.env.VITEST) return null;
+  const { detectRunningInstallPrefix } = await import("./auto-upgrade.js");
+  return detectRunningInstallPrefix(argvPath);
+}
+
 async function defaultSpawn(cmd: string, args: string[], cwd?: string): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { stdio: "inherit", shell: process.platform === "win32", cwd });
@@ -656,9 +675,32 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // tree and the right command depends on their setup. unknown stays
   // manual because we don't know which install we'd be mutating.
   const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath) : null;
+  // For global-npm, pin the install to the prefix the RUNNING copy lives
+  // under -- the same `--prefix` auto-upgrade passes (maybeAutoUpgrade in
+  // auto-upgrade.ts). A bare `npm install -g` writes into whatever
+  // `npm prefix -g` resolves, which can be a DIFFERENT tree than the one the
+  // client spawned us from (multiple Node versions, custom NPM_CONFIG_PREFIX,
+  // Yaw Terminal's bundled Node); the child then exits 0, we print
+  // "OK: Upgraded", and the running copy stays stale. Quoting matters because
+  // defaultSpawn runs shell:true on win32, where argv is joined unquoted; an
+  // unquotable prefix drops `--prefix` entirely (npm's own resolution is the
+  // worse-but-safe fallback -- same policy as auto-upgrade).
+  let globalPrefixArg: string | null = null;
+  if (method === "global-npm") {
+    const raw = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
+    if (raw !== null) {
+      const { quoteShellArgIfNeeded } = await import("./auto-upgrade.js");
+      globalPrefixArg = quoteShellArgIfNeeded(raw);
+    }
+  }
   const runSpec: { cmd: string; args: string[]; cwd?: string } | null =
     method === "global-npm"
-      ? { cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] }
+      ? {
+          cmd: "npm",
+          args: globalPrefixArg
+            ? ["install", "-g", "--prefix", globalPrefixArg, "@yawlabs/mcp@latest"]
+            : ["install", "-g", "@yawlabs/mcp@latest"],
+        }
       : method === "pnpm-global"
         ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
         : method === "bun-global"
@@ -666,6 +708,12 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
           : method === "local-node-modules" && installRoot !== null
             ? { cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: installRoot }
             : null;
+  // Print the line we actually spawn: once `--prefix` is in the argv, a bare
+  // `npm install -g` would promise a different install than --run performs --
+  // and "run it yourself" must suggest the same command, or the manual path
+  // keeps the silent wrong-tree hazard --prefix exists to close. Identical to
+  // plan.command for every non-global-npm runSpec.
+  const commandLine = runSpec ? [runSpec.cmd, ...runSpec.args].join(" ") : plan.command;
 
   if (!opts.run) {
     if (runSpec) {
@@ -681,7 +729,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     if (installRoot) {
       print(`in ${installRoot}:`);
     }
-    print(`  ${plan.command}`);
+    print(`  ${commandLine}`);
     return { exitCode: 1, lines };
   }
 
@@ -694,7 +742,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       `yaw-mcp upgrade --run: a "${method}" install can't be upgraded automatically (manual upgrade required). Run it yourself:`,
     );
     printErr("");
-    printErr(`  ${plan.command}`);
+    printErr(`  ${commandLine}`);
     return { exitCode: 2, lines };
   }
 
@@ -704,7 +752,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   } else {
     print("Running:");
   }
-  print(`  ${plan.command}`);
+  print(`  ${commandLine}`);
   print("");
   const code = await runner(runSpec.cmd, runSpec.args, runSpec.cwd);
   if (code === 0) {
@@ -714,7 +762,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
   printErr(`yaw-mcp upgrade: ${runSpec.cmd} exited ${code}. Try running the command yourself:`);
   printErr("");
-  printErr(`  ${plan.command}`);
+  printErr(`  ${commandLine}`);
   return { exitCode: 3, lines };
 }
 

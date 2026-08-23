@@ -113,6 +113,21 @@ describe("renderScript — bash", () => {
       expect(s).toContain(flag);
     }
   });
+
+  it("guards every positional clause so a dash word falls through to the flag compgen", () => {
+    // Regression: each positional clause ends in an unconditional `return 0`,
+    // so without the `$cur != -*` guard a flag typed AT the slot
+    // (`install --<TAB>`) compgen'd against the client list and returned an
+    // EMPTY COMPREPLY -- zero candidates, and (`complete -F` without
+    // `-o default`) no fallback. `install --list`/`--all` forbid a client
+    // argument, so slot 0 is the only position those flags can occupy.
+    const s = renderScript("bash");
+    const posClauses = s.split("\n").filter((l) => l.includes("$cword -eq $(("));
+    expect(posClauses.length).toBeGreaterThan(0);
+    for (const clause of posClauses) {
+      expect(clause).toContain("$cur != -*");
+    }
+  });
 });
 
 describe("renderScript — zsh", () => {

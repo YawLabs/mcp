@@ -19,7 +19,7 @@ describe("createProgressReporter", () => {
     expect(() => report("x")).not.toThrow();
   });
 
-  it("sends a progress notification with auto-incrementing counter", () => {
+  it("message-only calls creep strictly upward and never carry a total", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
       sendNotification: send,
@@ -28,14 +28,14 @@ describe("createProgressReporter", () => {
     report("spawning");
     report("loaded 3 tools");
     expect(send).toHaveBeenCalledTimes(2);
-    expect(send.mock.calls[0]![0]).toEqual({
-      method: "notifications/progress",
-      params: { progressToken: "tok-1", progress: 1, message: "spawning" },
-    });
-    expect(send.mock.calls[1]![0]).toEqual({
-      method: "notifications/progress",
-      params: { progressToken: "tok-1", progress: 2, message: "loaded 3 tools" },
-    });
+    const [first, second] = send.mock.calls.map((c) => c[0].params);
+    expect(first.message).toBe("spawning");
+    expect(second.message).toBe("loaded 3 tools");
+    // Strictly increasing (MCP monotonicity), indeterminate (no total).
+    expect(first.progress).toBe(0);
+    expect(second.progress).toBeGreaterThan(first.progress);
+    expect(first.total).toBeUndefined();
+    expect(second.total).toBeUndefined();
   });
 
   it("respects explicit progress and total overrides", () => {
@@ -51,7 +51,7 @@ describe("createProgressReporter", () => {
     });
   });
 
-  it("never emits a progress value below the previous one (MCP monotonicity)", () => {
+  it("never emits a progress value at or below the previous one (MCP monotonicity)", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({
       sendNotification: send,
@@ -59,8 +59,79 @@ describe("createProgressReporter", () => {
     });
     report("jump ahead", 5);
     report("caller regressed", 2);
-    report("auto-increment is still behind"); // step 3, below the 5 already sent
-    expect(send.mock.calls.map((c) => c[0].params.progress)).toEqual([5, 5, 5]);
+    report("message-only is still behind"); // would be far below the 5 already sent
+    const values = send.mock.calls.map((c) => c[0].params.progress);
+    expect(values[0]).toBe(5);
+    // The spec says progress MUST increase per token — a regressing caller
+    // value and a trailing message-only call both nudge strictly upward
+    // instead of replaying the clamped 5 as a duplicate.
+    expect(values[1]).toBeGreaterThan(values[0]!);
+    expect(values[2]).toBeGreaterThan(values[1]!);
+  });
+
+  it("dispatch shape: message-only preamble never inflates past the explicit milestones", () => {
+    // Replays handleDispatch's exact sequence: three message-only sub-steps
+    // ("Ranking N servers", tiebreak, winner) then the loop's explicit
+    // (0, 1). The old integer counter emitted {progress: 3, total: 1} — a
+    // 300% bar — here.
+    const send = vi.fn().mockResolvedValue(undefined);
+    const report = createProgressReporter({
+      sendNotification: send,
+      _meta: { progressToken: "tok-dispatch" },
+    });
+    report("Ranking 4 servers");
+    report("Asking client to break ranking tie");
+    report("Sampling tiebreak picked gh");
+    report("Loading gh (1/1)", 0, 1);
+    const params = send.mock.calls.map((c) => c[0].params);
+    for (let i = 1; i < params.length; i++) {
+      expect(params[i]!.progress).toBeGreaterThan(params[i - 1]!.progress);
+    }
+    const last = params[params.length - 1]!;
+    expect(last.total).toBe(1);
+    expect(last.progress).toBeLessThanOrEqual(1);
+  });
+
+  it("activate shape: interleaved sub-steps never report 100% before the last milestone", () => {
+    // Replays handleActivate with two namespaces: explicit (0, 2),
+    // activateOne's message-only sub-steps, then explicit (1, 2). The old
+    // counter reached 2 during the sub-steps and clamped the second
+    // milestone to 2/2 — 100% before the last server had even started.
+    const send = vi.fn().mockResolvedValue(undefined);
+    const report = createProgressReporter({
+      sendNotification: send,
+      _meta: { progressToken: "tok-activate" },
+    });
+    report("Loading gh (1/2)", 0, 2);
+    report("spawning gh");
+    report("gh: loaded 12 tools");
+    report("Loading slack (2/2)", 1, 2);
+    const params = send.mock.calls.map((c) => c[0].params);
+    for (let i = 1; i < params.length; i++) {
+      expect(params[i]!.progress).toBeGreaterThan(params[i - 1]!.progress);
+    }
+    for (const p of params) {
+      if (p.total !== undefined) expect(p.progress).toBeLessThanOrEqual(p.total);
+    }
+    // The second milestone lands at exactly 1 of 2 — not clamped upward.
+    expect(params[3]!.progress).toBe(1);
+    expect(params[3]!.total).toBe(2);
+  });
+
+  it("drops total when the nudged value would exceed it (never >100% on the wire)", () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const report = createProgressReporter({
+      sendNotification: send,
+      _meta: { progressToken: "tok-cap" },
+    });
+    report("done", 2, 2);
+    report("done again", 2, 2); // duplicate milestone — must nudge past 2
+    const [first, second] = send.mock.calls.map((c) => c[0].params);
+    expect(first).toMatchObject({ progress: 2, total: 2 });
+    expect(second.progress).toBeGreaterThan(2);
+    // Nudged past the total, so the total is dropped (indeterminate beats
+    // a >100% bar).
+    expect(second.total).toBeUndefined();
   });
 
   it("swallows sendNotification rejection without throwing", async () => {

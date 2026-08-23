@@ -19,6 +19,7 @@ import {
   ConnectServer,
   computeToolOverlaps,
   DEFAULT_IDLE_CALL_THRESHOLD,
+  isAutoActivateEnabled,
   isAutoLoadEnabled,
   isRoutingFaultText,
   ROUTING_FAULT_DISCONNECTED,
@@ -27,7 +28,7 @@ import {
   resolveToolExposure,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
-import { connectToUpstream, disconnectFromUpstream } from "../upstream.js";
+import { connectToUpstream, type DownstreamClientBridge, disconnectFromUpstream } from "../upstream.js";
 
 function makeConfig(servers: UpstreamServerConfig[]) {
   return { servers, configVersion: "v1" };
@@ -2211,6 +2212,47 @@ describe("ConnectServer", () => {
       expect(priv.learning.get("gh")).toBeUndefined();
     });
 
+    it("dispatch records loaded namespaces in sessionActivated so gateway mode advertises them", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      expect(priv.sessionActivated.has("gh")).toBe(false);
+      await priv.handleDispatch("github issue", 1);
+      // Without this, the tools/list_changed dispatch fires changes nothing
+      // under the default gateway exposure: the loaded tools stay
+      // unadvertised, and the response's "tools are now callable" promise
+      // is false for any client that can only invoke advertised tools.
+      expect(priv.sessionActivated.has("gh")).toBe(true);
+    });
+
+    it("dispatch does NOT record a namespace whose activation failed", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      // Persistent rejection: runActivateOne retries once, and a
+      // ...Once mock would hand the retry a default-resolved undefined.
+      vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
+
+      await priv.handleDispatch("github issue", 1);
+      // Success-only, mirroring handleActivate.
+      expect(priv.sessionActivated.has("gh")).toBe(false);
+    });
+
+    it("discover auto-warm records the warmed namespace in sessionActivated", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      // Rank decisively so the auto-warm gate fires without depending on
+      // BM25 scoring internals.
+      vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      await priv.handleDiscoverWithAutoWarm("github issue");
+      // Auto-warm exists so a one-shot discover(context) is enough to
+      // start calling tools -- which requires the warmed namespace to be
+      // advertised under the default gateway exposure.
+      expect(priv.sessionActivated.has("gh")).toBe(true);
+    });
+
     it("routes meta-tool suggest and returns friendly message with no patterns", async () => {
       const priv = getPrivate(server);
       const result = await priv.handleToolCall("mcp_connect_suggest", {});
@@ -2755,12 +2797,32 @@ describe("guide resource + session tracking", () => {
       project: null,
     };
     const res1 = priv.attachGuideNudge({ content: [{ type: "text", text: "discover-body" }] });
-    expect(res1.content[0].text).toContain("discover-body");
-    expect(res1.content[0].text).toContain("yaw-mcp://guide");
-    expect(res1.content[0].text).toContain("/h/.yaw-mcp/YAW-MCP.md");
+    // The nudge rides as its OWN content block — the original body stays
+    // byte-identical (exec/secrets return JSON.stringify text that must
+    // survive JSON.parse).
+    expect(res1.content[0].text).toBe("discover-body");
+    expect(res1.content).toHaveLength(2);
+    expect(res1.content[1].text).toContain("yaw-mcp://guide");
+    expect(res1.content[1].text).toContain("/h/.yaw-mcp/YAW-MCP.md");
     // One-shot: a second call does NOT add the nudge again.
     const res2 = priv.attachGuideNudge({ content: [{ type: "text", text: "second-body" }] });
+    expect(res2.content).toHaveLength(1);
     expect(res2.content[0].text).toBe("second-body");
+  });
+
+  it("keeps a JSON body parseable when the nudge fires (exec/secrets contract)", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.yaw-mcp/YAW-MCP.md", content: "u" },
+      project: null,
+    };
+    const body = JSON.stringify({ ok: true, result: { hits: 3 }, steps: [] });
+    const res = priv.attachGuideNudge({ content: [{ type: "text", text: body }] });
+    expect(res.content).toHaveLength(2);
+    // The documented payload block still parses — the nudge did not append
+    // trailing prose to it.
+    expect(JSON.parse(res.content[0].text)).toEqual({ ok: true, result: { hits: 3 }, steps: [] });
+    expect(res.content[1].text).toContain("yaw-mcp://guide");
   });
 
   it("does not bake the one-shot nudge into the cached discover result", async () => {
@@ -2776,12 +2838,15 @@ describe("guide resource + session tracking", () => {
     };
 
     const first = await priv.handleToolCall("mcp_connect_discover", {});
-    expect(first.content[0].text).toContain("yaw-mcp://guide");
+    expect(first.content).toHaveLength(2);
+    expect(first.content[1].text).toContain("yaw-mcp://guide");
 
-    // Second call inside the cache TTL: same body, no nudge.
+    // Second call inside the cache TTL: same body, no nudge block.
     const second = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(second.content).toHaveLength(1);
     expect(second.content[0].text).not.toContain("yaw-mcp://guide");
     // ...and the cache itself is still clean.
+    expect(priv.discoverCache.result.content).toHaveLength(1);
     expect(priv.discoverCache.result.content[0].text).not.toContain("yaw-mcp://guide");
   });
 
@@ -2815,6 +2880,33 @@ describe("guide resource + session tracking", () => {
     const res = priv.attachGuideNudge({ content: [{ type: "text", text: "body" }] });
     // guideRead gates the nudge, so even with a guide loaded we shouldn't nudge.
     expect(res.content[0].text).toBe("body");
+  });
+});
+
+describe("resources/templates/list", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("registers a handler so a probing client gets an empty list, not -32601", async () => {
+    // The constructor declares the resources capability, which implies
+    // resources/templates/list; the SDK ships no default handler, so
+    // without an explicit registration a probe errors with Method not
+    // found. Empty is honest today: buildResourceRoutes only ever sees
+    // concrete conn.resources, so a templated URI could not be read
+    // through the proxy anyway.
+    const priv = getPrivate(server);
+    const handler = priv.server._requestHandlers.get("resources/templates/list");
+    expect(handler).toBeDefined();
+    const res = await handler({ method: "resources/templates/list", params: {} }, {} as never);
+    expect(res).toEqual({ resourceTemplates: [] });
   });
 });
 
@@ -2880,6 +2972,56 @@ describe("prewarmDormantServers", () => {
     expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("slack");
   });
 
+  it("re-warms a server whose learned toolCache is older than the refresh window", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub" })],
+    };
+    // Learned in a prior session, 8 days ago -- past the 7-day refresh
+    // window. Installs resolve @latest, so the upstream may have renamed
+    // tools since; hasKnownTools alone would keep skipping this server
+    // until the 30-day persistence TTL finally dropped the entry.
+    priv.toolCache.set("gh", [{ name: "renamed_away" }]);
+    priv.toolCacheLearnedAt.set("gh", Date.now() - 8 * 24 * 60 * 60 * 1000);
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
+    );
+
+    await priv.prewarmDormantServers();
+
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    // The stale list was replaced and re-stamped.
+    expect(priv.toolCache.get("gh")).toEqual([{ name: "gh_tool", description: undefined }]);
+    expect(Date.now() - priv.toolCacheLearnedAt.get("gh")).toBeLessThan(60_000);
+  });
+
+  it("does not re-warm a fresh learned list or a curated bundles.json toolCache", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub" }),
+        makeServerConfig({
+          id: "slack-id",
+          namespace: "slack",
+          name: "Slack",
+          toolCache: [{ name: "post_message" }],
+        }),
+      ],
+    };
+    // gh: learned yesterday -- inside the refresh window.
+    priv.toolCache.set("gh", [{ name: "list_issues" }]);
+    priv.toolCacheLearnedAt.set("gh", Date.now() - 24 * 60 * 60 * 1000);
+    // slack: curated bundles.json cache only -- carries no learnedAt and is
+    // never refreshed here (that would reintroduce the per-session
+    // `npx -y <pkg>@latest` resolve pre-warm exists to avoid).
+
+    await priv.prewarmDormantServers();
+
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
   it("is a no-op when every server already has a toolCache", async () => {
     const priv = getPrivate(server);
     priv.config = {
@@ -2923,6 +3065,33 @@ describe("prewarmDormantServers", () => {
   });
 });
 
+describe("isAutoActivateEnabled", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults ON when unset or empty, and honors an explicit disable", () => {
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "");
+    expect(isAutoActivateEnabled()).toBe(true);
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "0");
+    expect(isAutoActivateEnabled()).toBe(false);
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "false");
+    expect(isAutoActivateEnabled()).toBe(false);
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "true");
+    expect(isAutoActivateEnabled()).toBe(true);
+  });
+
+  it("trims the value -- `set YAW_MCP_AUTO_ACTIVATE=1 && ...` from cmd.exe stores '1 '", () => {
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "1 ");
+    expect(isAutoActivateEnabled()).toBe(true);
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "0 ");
+    expect(isAutoActivateEnabled()).toBe(false);
+    // Whitespace-only reads as unset -> default ON.
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "  ");
+    expect(isAutoActivateEnabled()).toBe(true);
+  });
+});
+
 describe("auto-load on startup", () => {
   let server: ConnectServer;
 
@@ -2951,6 +3120,16 @@ describe("auto-load on startup", () => {
     vi.stubEnv("YAW_MCP_AUTO_LOAD", "0");
     expect(isAutoLoadEnabled()).toBe(false);
     vi.stubEnv("YAW_MCP_AUTO_LOAD", "yes");
+    expect(isAutoLoadEnabled()).toBe(false);
+  });
+
+  it("trims the value -- cmd.exe's `set VAR=1 && npx ...` stores '1 '", () => {
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1 ");
+    expect(isAutoLoadEnabled()).toBe(true);
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", " true");
+    expect(isAutoLoadEnabled()).toBe(true);
+    // Whitespace-only reads as unset -> default OFF.
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "  ");
     expect(isAutoLoadEnabled()).toBe(false);
   });
 
@@ -3922,5 +4101,77 @@ describe("gateway activation contract (what a client observes)", () => {
     const routes = buildToolRoutes(priv.connections, inactive as any);
     expect(routes.has("tailscale_status")).toBe(true);
     expect(list(priv).some((t) => t.name === "tailscale_status")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Downstream client bridge threading -- every connectToUpstream call site must
+// hand over the bridge that forwards elicitation/sampling/roots to the REAL
+// downstream client via this.server. Without it, upstream.ts declares
+// `capabilities: {}` and the SDK refuses those requests for proxied servers
+// even when the downstream client supports all three.
+// ---------------------------------------------------------------------------
+
+describe("downstream client bridge", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("threads a bridge into activation connects that reads capabilities and forwards elicitation/sampling/roots off this.server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+    await priv.handleActivate(["gh"]);
+
+    const bridge = vi.mocked(connectToUpstream).mock.calls[0][3] as DownstreamClientBridge;
+    expect(bridge).toBeDefined();
+
+    // The bridge reads LAZILY off this.server, so stubs installed after the
+    // connect still answer -- mirroring "the declaration is only known after
+    // the downstream initialize".
+    const caps = { elicitation: { form: {} }, sampling: {}, roots: { listChanged: true } };
+    priv.server.getClientCapabilities = () => caps;
+    expect(bridge.getClientCapabilities()).toBe(caps);
+
+    const elicitResult = { action: "accept", content: { TOKEN: "x" } };
+    priv.server.elicitInput = vi.fn().mockResolvedValue(elicitResult);
+    const elicitParams = { message: "m", requestedSchema: { type: "object", properties: {} } } as any;
+    await expect(bridge.elicitInput(elicitParams, {})).resolves.toBe(elicitResult);
+    expect(priv.server.elicitInput).toHaveBeenCalledWith(elicitParams, {});
+
+    const sampleResult = { model: "m", role: "assistant", content: { type: "text", text: "ok" } };
+    priv.server.createMessage = vi.fn().mockResolvedValue(sampleResult);
+    const sampleParams = { messages: [], maxTokens: 8 } as any;
+    await expect(bridge.createMessage(sampleParams, {})).resolves.toBe(sampleResult);
+    expect(priv.server.createMessage).toHaveBeenCalledWith(sampleParams, {});
+
+    const rootsResult = { roots: [{ uri: "file:///repo" }] };
+    priv.server.listRoots = vi.fn().mockResolvedValue(rootsResult);
+    await expect(bridge.listRoots(undefined, {})).resolves.toBe(rootsResult);
+    expect(priv.server.listRoots).toHaveBeenCalledWith(undefined, {});
+
+    // A downstream rejection surfaces verbatim -- no invented default.
+    priv.server.elicitInput = vi.fn().mockRejectedValue(new Error("client declined"));
+    await expect(bridge.elicitInput(elicitParams)).rejects.toThrow("client declined");
+  });
+
+  it("threads the same bridge into the transient read_tool connect", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+    vi.mocked(disconnectFromUpstream).mockResolvedValue(undefined);
+
+    await priv.handleReadTool("gh", "create_issue", undefined);
+
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(connectToUpstream).mock.calls[0][3]).toBe(priv.clientBridge);
   });
 });

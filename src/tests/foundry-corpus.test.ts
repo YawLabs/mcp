@@ -114,4 +114,36 @@ describe("validateCorpus / loadFoundryCorpus", () => {
   it("loadFoundryCorpus returns null for a missing file", () => {
     expect(loadFoundryCorpus("/no/such/path/foundry-corpus.json")).toBeNull();
   });
+
+  // Regression: validateCorpus used to check only Array.isArray on servers /
+  // entries, so a truncated or hand-edited fixture passed validation and then
+  // crashed scoreCorpus ("server.tools is not iterable") instead of tripping
+  // the gate's hard-fail state with its diagnostic message.
+  it("rejects a server the ranker would crash on (missing / non-array / malformed tools)", () => {
+    const entries = [{ tokens: ["x"], chosen: "a", weight: 1 }];
+    expect(validateCorpus({ version: 1, servers: [{ namespace: "a", name: "A" }], entries })).toBeNull(); // no tools
+    expect(validateCorpus({ version: 1, servers: [{ namespace: "a", name: "A", tools: "oops" }], entries })).toBeNull();
+    expect(validateCorpus({ version: 1, servers: [{ namespace: "a", name: "A", tools: [null] }], entries })).toBeNull();
+    expect(
+      validateCorpus({ version: 1, servers: [{ namespace: "a", name: "A", tools: [{ name: 7 }] }], entries }),
+    ).toBeNull();
+    expect(validateCorpus({ version: 1, servers: [{ namespace: "a", tools: [] }], entries })).toBeNull(); // no name
+  });
+
+  it("rejects an entry scoreCorpus cannot score", () => {
+    const servers = SERVERS;
+    const wrap = (entry: unknown) => validateCorpus({ version: 1, servers, entries: [entry] });
+    expect(wrap({ chosen: "github", weight: 1 })).toBeNull(); // no tokens
+    expect(wrap({ tokens: [], chosen: "github", weight: 1 })).toBeNull(); // empty bag
+    expect(wrap({ tokens: ["a", 2], chosen: "github", weight: 1 })).toBeNull(); // non-string token
+    expect(wrap({ tokens: ["a"], weight: 1 })).toBeNull(); // no chosen
+    expect(wrap({ tokens: ["a"], chosen: "github" })).toBeNull(); // no weight
+    expect(wrap({ tokens: ["a"], chosen: "github", weight: 0 })).toBeNull(); // weightless
+    expect(wrap({ tokens: ["a"], chosen: "github", weight: Number.NaN })).toBeNull();
+  });
+
+  it("still accepts what buildCorpusFromTraces actually produces", () => {
+    const c = buildCorpusFromTraces([{ tokens: ["issue", "repo"], chosen: "github" }], SERVERS);
+    expect(validateCorpus(JSON.parse(JSON.stringify(c)))).not.toBeNull();
+  });
 });

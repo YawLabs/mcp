@@ -43,9 +43,14 @@ vi.mock("undici", () => ({
 
 // Mock node:child_process at module level -- required for ESM mocking.
 // We replace spawn with a factory that stores the last options and emits
-// an error event so onPath returns false immediately.
+// an error event so onPath returns false immediately. The timeout-path
+// test flips spawnMode.hang: the fake child then never emits anything, so
+// onPath's 3s timer is the only way out, and the fake records what the
+// timeout handler did to it (kill signal, unref).
 const spawnCalls: Array<{ cmd: string; opts: Record<string, unknown> }> = [];
 let spawnCallCount = 0;
+const spawnMode = { hang: false };
+let lastHangChild: { killedWith?: string; unrefed?: boolean } | null = null;
 
 vi.mock("node:child_process", () => {
   const { EventEmitter } = require("node:events");
@@ -54,6 +59,19 @@ vi.mock("node:child_process", () => {
       spawnCallCount++;
       spawnCalls.push({ cmd, opts: { ...opts } });
       const fake = new EventEmitter();
+      if (spawnMode.hang) {
+        // A wedged probe: no 'close', no 'error', ever.
+        fake.killedWith = undefined;
+        fake.unrefed = false;
+        fake.kill = (signal?: string) => {
+          fake.killedWith = signal;
+        };
+        fake.unref = () => {
+          fake.unrefed = true;
+        };
+        lastHangChild = fake;
+        return fake;
+      }
       fake.kill = () => {};
       // Emit error asynchronously so the promise chain settles before we check.
       setImmediate(() => fake.emit("error", new Error("ENOENT (mocked)")));
@@ -62,11 +80,13 @@ vi.mock("node:child_process", () => {
   };
 });
 
-import { __resetUvBootstrap, ensureUv } from "../uv-bootstrap.js";
+import { __resetUvBootstrap, ensureUv, onPath } from "../uv-bootstrap.js";
 
 beforeEach(() => {
   spawnCalls.length = 0;
   spawnCallCount = 0;
+  spawnMode.hang = false;
+  lastHangChild = null;
   __resetUvBootstrap();
 });
 
@@ -90,6 +110,30 @@ describe("onPath spawn options (fix 1)", () => {
     const isWin32 = process.platform === "win32";
     expect(probeOpts.shell).toBe(isWin32);
     expect(probeOpts.windowsHide).toBe(isWin32);
+  });
+});
+
+// ── onPath timeout path: SIGKILL + unref, not a bare default kill ─────
+describe("onPath timeout path", () => {
+  it("SIGKILLs and unrefs a wedged probe child, then resolves false", async () => {
+    // child.kill() with no signal is SIGTERM, which a trapping child ignores;
+    // and a still-referenced live child holds the broker's event loop open at
+    // shutdown even after settle(false). The timeout handler must therefore
+    // send SIGKILL AND unref -- same contract as runCommand in the same file
+    // and spawnVersionProbe in oam-spawn.ts.
+    vi.useFakeTimers();
+    spawnMode.hang = true;
+    try {
+      const probe = onPath("uv");
+      await vi.advanceTimersByTimeAsync(3_000);
+      await expect(probe).resolves.toBe(false);
+      expect(lastHangChild).not.toBeNull();
+      expect(lastHangChild?.killedWith).toBe("SIGKILL");
+      expect(lastHangChild?.unrefed).toBe(true);
+    } finally {
+      spawnMode.hang = false;
+      vi.useRealTimers();
+    }
   });
 });
 

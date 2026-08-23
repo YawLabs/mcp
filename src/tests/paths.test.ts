@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -147,5 +147,83 @@ describe("findProjectConfigDir", () => {
     const startFrom = join(innerProject, "src");
     mkdirSync(startFrom);
     expect(await findProjectConfigDir(startFrom, home)).toBe(innerCfg);
+  });
+
+  it("returns null when the start dir IS $HOME (user-global scope, not a project)", async () => {
+    // Relaxing the outside-$HOME bound must not turn $HOME itself into a
+    // "project": its .yaw-mcp/ is the user-global scope (userConfigDir) and
+    // returning it here would double-load it -- and the walk must not then
+    // continue up past $HOME either.
+    mkdirSync(join(home, CONFIG_DIRNAME));
+    expect(await findProjectConfigDir(home, home)).toBeNull();
+  });
+});
+
+describe("findProjectConfigDir outside $HOME", () => {
+  // The project lives OUTSIDE the synthetic $HOME -- a sibling temp dir
+  // stands in for a second drive (D:\proj), a container workspace, or an
+  // /srv checkout. The old under-$HOME-only bound returned null before
+  // probing a single directory, silently disabling project config, the
+  // YAW-MCP.md guide, and project bundles for every such checkout. Every
+  // test here creates the `.yaw-mcp/` INSIDE the synthetic project tree so
+  // the walk finds it (or skips it) before escaping into the real
+  // filesystem -- there is deliberately no "returns null with no config
+  // anywhere" case, because that walk would run to the real root.
+  let home: string;
+  let project: string;
+  const ORIG_GETEUID = Object.getOwnPropertyDescriptor(process, "geteuid");
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-paths-home-"));
+    project = mkdtempSync(join(tmpdir(), "yaw-mcp-paths-outside-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(project, { recursive: true, force: true });
+    if (ORIG_GETEUID) Object.defineProperty(process, "geteuid", ORIG_GETEUID);
+    else delete (process as { geteuid?: unknown }).geteuid;
+  });
+
+  function stubGeteuid(uid: number): void {
+    Object.defineProperty(process, "geteuid", { value: () => uid, configurable: true, writable: true });
+  }
+
+  it("finds a .yaw-mcp/ at the starting directory of a checkout outside $HOME", async () => {
+    // No geteuid stub: on POSIX runners the dir was just created by this
+    // process's own user, on win32 there is no geteuid and candidates are
+    // accepted as-is -- both take the trusted path for real.
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    expect(await findProjectConfigDir(project, home)).toBe(cfgDir);
+  });
+
+  it("walks up within an outside-$HOME tree from a deep subdirectory", async () => {
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    const deep = join(project, "pkg", "src", "nested");
+    mkdirSync(deep, { recursive: true });
+    expect(await findProjectConfigDir(deep, home)).toBe(cfgDir);
+  });
+
+  it("skips an outside-$HOME .yaw-mcp/ not owned by the current euid", async () => {
+    // The trust boundary for the outside-$HOME walk: a planted `.yaw-mcp/`
+    // owned by someone else must not be returned. Stubbing geteuid to a
+    // sentinel uid nothing on this machine owns makes the mismatch
+    // deterministic on every platform (Windows stat reports uid 0).
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    stubGeteuid(999_999_999);
+    expect(await findProjectConfigDir(project, home)).toBeNull();
+  });
+
+  it("accepts an outside-$HOME .yaw-mcp/ owned by the current euid", async () => {
+    // Companion to the skip case, with geteuid pinned to the uid stat
+    // actually reports for the candidate -- proves the gate compares
+    // ownership rather than rejecting everything outside $HOME.
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    stubGeteuid(statSync(cfgDir).uid);
+    expect(await findProjectConfigDir(project, home)).toBe(cfgDir);
   });
 });

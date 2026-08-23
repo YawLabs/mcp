@@ -233,10 +233,19 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     entryEnv[k] = trimmed;
   }
 
-  const entry: Partial<UpstreamServerConfig> = {
+  // `slug` records the CATALOG slug this entry was added with. It is not part
+  // of UpstreamServerConfig (validateEntry drops it at load time, and nothing
+  // at runtime reads it) -- it exists so `yaw-mcp remove <slug>` can map the
+  // slug back to the namespace when the two derive differently: the namespace
+  // comes from the display NAME, so `add ga` ("Google Analytics") lands as
+  // namespace "googleanalytics" and neither the literal target nor
+  // deriveNamespace("ga") could ever find it again. The write path round-trips
+  // unknown per-server fields, so the slug survives later add/remove writes.
+  const entry: Partial<UpstreamServerConfig> & { slug: string } = {
     id: `local-${namespace}`,
     name: server.name,
     namespace,
+    slug: server.slug,
     type: "local",
     transport: "stdio",
     command: server.command,
@@ -481,6 +490,43 @@ async function findRemovalTarget(candidates: string[], home: string): Promise<Re
   return null;
 }
 
+/**
+ * Namespaces recorded for a catalog slug at add time. `add` persists the
+ * resolved slug on the entry (see runAdd) precisely because the namespace
+ * derives from the catalog display NAME, not the slug -- "ga" ("Google
+ * Analytics") lands as namespace "googleanalytics", so neither the literal
+ * target nor deriveNamespace(target) can reach it. Parsed with the write
+ * path's JSONC parser for the same reason findRemovalTarget is; an absent,
+ * unreadable, or malformed file yields [] and leaves the existing miss /
+ * parse-error paths to report themselves. Entries written before the slug
+ * was recorded simply never match here (their namespace, as shown by
+ * `yaw-mcp list`, still works as the removal target).
+ */
+async function namespacesForStoredSlug(target: string, home: string): Promise<string[]> {
+  const path = localBundlesPath(userConfigDir(home));
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseJsonc(raw);
+  } catch {
+    return [];
+  }
+  if (typeof parsed !== "object" || parsed === null) return [];
+  const servers = (parsed as { servers?: unknown }).servers;
+  if (!Array.isArray(servers)) return [];
+  const out: string[] = [];
+  for (const s of servers) {
+    const e = s as { slug?: unknown; namespace?: unknown } | null;
+    if (e?.slug === target && typeof e?.namespace === "string") out.push(e.namespace);
+  }
+  return out;
+}
+
 /** How the entry would be launched, as one reviewable line. Mirrors
  *  trust-cmd's renderLaunch, but reads an UNVALIDATED raw entry (see
  *  findRemovalTarget) so every field is type-checked before use. */
@@ -552,12 +598,15 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   const cwd = opts.cwd ?? process.cwd();
 
   // Try the literal target first -- covers a namespace copied from `list`
-  // (including legacy underscore namespaces from older `add` versions). On a
-  // miss, try its derived form so passing the catalog SLUG also works
-  // ("brave-search" -> "bravesearch"). deriveNamespace strips non-alphanumerics,
-  // so it would mangle an underscore namespace; that's why the literal goes first.
-  const derived = deriveNamespace(opts.target);
-  const candidates = derived === opts.target ? [opts.target] : [opts.target, derived];
+  // (including legacy underscore namespaces from older `add` versions). Then
+  // any namespace whose entry RECORDS this slug (add persists it; "ga" ->
+  // "googleanalytics" is unreachable any other way). Then the derived form so
+  // passing the catalog SLUG also works for the common case where slug and
+  // name agree ("brave-search" -> "bravesearch"). deriveNamespace strips
+  // non-alphanumerics, so it would mangle an underscore namespace; that's why
+  // the literal goes first.
+  const bySlug = await namespacesForStoredSlug(opts.target, home);
+  const candidates = [...new Set([opts.target, ...bySlug, deriveNamespace(opts.target)])];
 
   // ----- destructive-action confirmation --------------------------------
   // Gated on there being something to delete (see findRemovalTarget): a miss
@@ -639,7 +688,9 @@ export const LIST_USAGE = `Usage: yaw-mcp list [--json]
 
   List the MCP servers yaw-mcp loads locally from bundles.json (the
   project-local file wins over user-global), with the compliance grade
-  \`yaw-mcp audit\` last cached for each. --json for machine output.`;
+  \`yaw-mcp audit\` last cached for each. --json for machine output.
+  Env vars appear as \`envKeys\` -- key NAMES only, never the stored
+  values (same posture as \`add --json\`).`;
 
 export interface ListCommandOptions {
   json?: boolean;
@@ -699,7 +750,23 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   });
 
   if (opts.json) {
-    print(JSON.stringify({ path: loaded.path, servers: graded, warnings: loaded.warnings }, null, 2));
+    // Same env redaction as `add --json` (jsonEntry): a bundles.json entry can
+    // carry a `--env` secret, and `list --json` gets piped into CI logs and
+    // bug reports -- so servers are reported with `envKeys` (key NAMES only),
+    // never the stored values. `complianceGradedAt` and (when the cache entry
+    // carries it) `complianceSuiteVersion` ride along with the grade, so a
+    // consumer can tell a letter graded under an older rubric from a current
+    // one; entries audited before suiteVersion existed surface timestamp only.
+    const jsonServers = graded.map((s) => {
+      const entry = jsonEntry(s);
+      const cached = grades[s.namespace];
+      if (cached) {
+        entry.complianceGradedAt = cached.gradedAt;
+        if (cached.suiteVersion) entry.complianceSuiteVersion = cached.suiteVersion;
+      }
+      return entry;
+    });
+    print(JSON.stringify({ path: loaded.path, servers: jsonServers, warnings: loaded.warnings }, null, 2));
     return { exitCode: 0, written: [] };
   }
 

@@ -40,7 +40,7 @@ import { appendFile, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { userConfigDir } from "./paths.js";
-import { tokenize } from "./relevance.js";
+import { tokenizeQuery } from "./relevance.js";
 
 export interface RedactedIntent {
   tokens: string[];
@@ -173,7 +173,10 @@ export function redactIntent(intent: string): RedactedIntent {
     });
   }
 
-  const all = tokenize(scrubbed);
+  // tokenizeQuery, not tokenize: the ranker tokenizes queries at the 1-char
+  // floor (sparing pg/gh/s3), so harvesting at the 3-char prose floor would
+  // silently delete every short identifier from the corpus that scores it.
+  const all = tokenizeQuery(scrubbed);
   const tokens: string[] = [];
   for (const token of all) {
     if (looksSensitive(token)) {

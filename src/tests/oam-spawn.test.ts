@@ -1319,7 +1319,13 @@ describe("resolveNpmEntry", () => {
       const [note] = captureNotices(() => resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null));
       expect(note).toBeDefined();
       expect(note.source, "the broker's own _npx node_modules was called durable").toBe("npx-cache");
-      expect(note.refreshWith).toBe("npx -y @yawlabs/fetch-mcp@latest --help");
+      // No `--help` in the advice: stdio MCP servers ignore the flag and just
+      // start, so the old form hung the user's terminal on a server waiting
+      // for stdin. The flag-free run refreshes the cache before exec; the
+      // trailing `#` comment (valid in sh and PowerShell) says how to exit.
+      expect(note.refreshWith).toBe(
+        "npx -y @yawlabs/fetch-mcp@latest # then Ctrl-C -- the cache is refreshed before the server starts",
+      );
       expect(note.from).toBe(cacheNodeModules);
     } finally {
       cleanup();

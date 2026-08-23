@@ -121,6 +121,12 @@ export const META_TOOLS = {
           description:
             "How many top-ranked servers to load into the session. Defaults to 1. Cap is 10. Raise only when one task genuinely spans multiple servers.",
         },
+        routeEffort: {
+          type: "string",
+          enum: ["off", "auto", "aggressive"],
+          description:
+            'Per-call override of the routing-effort dial. "off" never asks the client LLM to break ranking ties; "auto" (the default) asks once only on genuine ambiguity; "aggressive" samples best-of-3 on milder ambiguity. Falls back to the YAW_MCP_ROUTE_EFFORT env var when omitted. Only meaningful at budget 1.',
+        },
       },
       required: ["intent"],
     },

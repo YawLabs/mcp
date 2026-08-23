@@ -50,6 +50,23 @@ describe("persistence.loadState", () => {
     expect(s.packHistory[0]).toEqual({ namespace: "gh", toolName: "listPrs", at: 101 });
   });
 
+  it("parses a state file with a leading UTF-8 BOM (Notepad hand-edit)", async () => {
+    // Regression: Notepad on Windows saves BOM-prefixed UTF-8, and
+    // JSON.parse throws on the BOM -- without the strip in loadState, one
+    // hand-edit dropped ALL learning, pack history, and tool cache via the
+    // empty-state fallback.
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: 123,
+      learning: { gh: { dispatched: 4, succeeded: 3, lastUsedAt: 100 } },
+      packHistory: [{ namespace: "gh", toolName: "listPrs", at: 101 }],
+    };
+    writeFileSync(file, `\uFEFF${JSON.stringify(payload)}`, "utf8");
+    const s = await loadState(file);
+    expect(s.learning.gh).toEqual({ dispatched: 4, succeeded: 3, lastUsedAt: 100 });
+    expect(s.packHistory).toHaveLength(1);
+  });
+
   it("returns empty state on unparseable JSON", async () => {
     writeFileSync(file, "not json at all", "utf8");
     const s = await loadState(file);

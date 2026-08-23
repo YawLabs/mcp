@@ -281,6 +281,22 @@ if (subcommand === "compliance") {
                                stale global installs are upgraded in the
                                background -- npm, pnpm, and bun globals alike).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
+    YAW_MCP_TOOL_EXPOSURE         How much of the catalog tools/list advertises.
+                               \`gateway\` (default) exposes the meta-tools
+                               plus loaded servers only; \`full\` restores the
+                               pre-gateway behavior and inlines the whole
+                               catalog. Re-read per call -- a change lands on
+                               the next tools/list without a restart.
+    YAW_MCP_ROUTE_EFFORT          How hard dispatch tries to break ranking ties
+                               with the client LLM: \`off\` | \`auto\` |
+                               \`aggressive\` (default auto). The dispatch
+                               tool's \`routeEffort\` argument overrides this
+                               per call.
+    YAW_MCP_REWARD_GRADER         Set to \`1\` to OPT IN to the LLM reward
+                               grader: uncertain dispatch outcomes get a
+                               second opinion via client sampling. It spends
+                               the client's LLM budget and adds a round-trip,
+                               so it is off by default.
     YAW_MCP_IDLE_THRESHOLD        Non-matching tool calls a loaded server
                                tolerates before it is unloaded (default 10).
                                Bursty servers earn more patience on top of
@@ -329,6 +345,9 @@ if (subcommand === "compliance") {
                                only -- a server's own \`connectTimeoutMs\` in
                                bundles.json always wins, so one slow server does
                                not need the global ceiling raised.
+    MCP_LIST_TIMEOUT              Milliseconds to wait for a server's tool/
+                               resource/prompt inventory calls after the
+                               handshake (default 15000).
 
   Config resolution (highest precedence first) -- for the \`servers\` allow-list
   and \`blocked\` deny-list:

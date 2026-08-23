@@ -3,6 +3,17 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
+  type ClientCapabilities,
+  type CreateMessageRequest,
+  CreateMessageRequestSchema,
+  type CreateMessageResult,
+  type CreateMessageResultWithTools,
+  type ElicitRequest,
+  ElicitRequestSchema,
+  type ElicitResult,
+  type ListRootsRequest,
+  ListRootsRequestSchema,
+  type ListRootsResult,
   PromptListChangedNotificationSchema,
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
@@ -302,14 +313,37 @@ export function resetOamDowngrades(): void {
   oamDowngradedNamespaces.clear();
 }
 
+/** Forwarding surface for the DOWNSTREAM MCP client (the LLM host connected
+ *  to yaw-mcp), supplied by server.ts which owns the downstream SDK Server.
+ *  connectToUpstream uses it to mirror the downstream client's declared
+ *  capabilities onto each upstream Client and to proxy the server->client
+ *  requests those capabilities allow (elicitation/create,
+ *  sampling/createMessage, roots/list) back to the real client. Without it
+ *  every upstream sees `capabilities: {}` and the SDK's capability assert
+ *  refuses those requests up front even when the real client supports them.
+ *  Omitted by callers with no downstream to forward to. */
+export interface DownstreamClientBridge {
+  /** The capabilities the downstream client declared at initialize. Read
+   *  lazily at connect time -- upstream connects always happen after the
+   *  downstream initialize, so the declaration is known by then. */
+  getClientCapabilities(): ClientCapabilities | undefined;
+  elicitInput(params: ElicitRequest["params"], options?: { signal?: AbortSignal }): Promise<ElicitResult>;
+  createMessage(
+    params: CreateMessageRequest["params"],
+    options?: { signal?: AbortSignal },
+  ): Promise<CreateMessageResult | CreateMessageResultWithTools>;
+  listRoots(params?: ListRootsRequest["params"], options?: { signal?: AbortSignal }): Promise<ListRootsResult>;
+}
+
 export async function connectToUpstream(
   config: UpstreamServerConfig,
   onDisconnect?: (namespace: string) => void,
   onListChanged?: (namespace: string) => void,
+  bridge?: DownstreamClientBridge,
 ): Promise<UpstreamConnection> {
   const attempt: SpawnAttempt = { oamRewriteApplied: false, oamVersion: null };
   try {
-    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, false);
+    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, false);
   } catch (err) {
     // Boot-probe fallback: when the spawn was oam-rewritten and the boot
     // failed (spawn error, connect/initialize handshake failure, or the
@@ -346,7 +380,7 @@ export async function connectToUpstream(
     // memo -- it passes disableOamRewrite = true, which bypasses the gate
     // directly.
     try {
-      const connection = await connectToUpstreamOnce(config, onDisconnect, onListChanged, attempt, true);
+      const connection = await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, true);
       // node booted where oam did not: oam IS implicated, so make it stick.
       oamDowngradedNamespaces.add(config.namespace);
       return connection;
@@ -371,17 +405,85 @@ export async function connectToUpstream(
   }
 }
 
+// Env keys that are for THIS process only and must never leak into spawned
+// upstream servers:
+//   YAW_MCP_TOKEN                — backend auth token
+//   YAW_MCP_VAULT_PASSPHRASE     — unlocks the local secret vault
+//   YAW_MCP_VAULT_PASSPHRASE_NEW — the incoming passphrase during a rotate
+//     (secrets-cmd.ts), i.e. the LIVE passphrase once the rotate lands
+const INTERNAL_SECRET_ENV_KEYS = new Set(["YAW_MCP_TOKEN", "YAW_MCP_VAULT_PASSPHRASE", "YAW_MCP_VAULT_PASSPHRASE_NEW"]);
+
+/** `process.env` minus yaw-mcp's own secrets, for spawning upstream servers.
+ *
+ *  Matched case-INSENSITIVELY, and that is load-bearing on Windows: env
+ *  lookups there are case-insensitive, so `process.env.YAW_MCP_VAULT_PASSPHRASE`
+ *  happily reads a `yaw_mcp_vault_passphrase=` set in PowerShell or Git Bash
+ *  — the vault unlocks fine — while a byte-exact strip (the previous
+ *  rest-destructure) would miss the lowercase key and hand the passphrase to
+ *  every spawned child. POSIX env IS case-sensitive, but these names are
+ *  yaw-internal enough that stripping a differently-cased twin there costs
+ *  nothing and keeps one code path on every platform.
+ *
+ *  Exported for tests. */
+export function stripInternalSecretsFromEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase())) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 async function connectToUpstreamOnce(
   config: UpstreamServerConfig,
   onDisconnect: ((namespace: string) => void) | undefined,
   onListChanged: ((namespace: string) => void) | undefined,
+  bridge: DownstreamClientBridge | undefined,
   attempt: SpawnAttempt,
   disableOamRewrite: boolean,
 ): Promise<UpstreamConnection> {
+  // Mirror the DOWNSTREAM client's declared capabilities onto this upstream
+  // client, and register a forwarding handler below for each one mirrored.
+  // The two must move together: declaring a capability WITHOUT a handler
+  // turns the SDK's clean "client does not support X" refusal into a
+  // MethodNotFound at call time, so a capability is declared IFF its handler
+  // is registered. Capabilities the downstream client did not declare stay
+  // undeclared -- no invented defaults for a client that can't answer.
+  // elicitation/sampling sub-capabilities (form/url, tools) are mirrored
+  // verbatim: the forwarded request lands on the client that declared them.
+  // roots is mirrored WITHOUT listChanged because yaw-mcp does not forward
+  // notifications/roots/list_changed -- advertising it would promise change
+  // notifications the upstream would never receive.
+  const downstreamCaps = bridge?.getClientCapabilities();
+  const capabilities: ClientCapabilities = {};
+  if (downstreamCaps?.elicitation) capabilities.elicitation = downstreamCaps.elicitation;
+  if (downstreamCaps?.sampling) capabilities.sampling = downstreamCaps.sampling;
+  if (downstreamCaps?.roots) capabilities.roots = {};
+
   const client = new Client(
     { name: "yaw-mcp", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
-    { capabilities: {} },
+    { capabilities },
   );
+
+  // Forwarding handlers for exactly the capabilities declared above. Results
+  // and rejections pass through verbatim (a downstream McpError re-surfaces
+  // to the upstream as the same JSON-RPC error); the abort signal is
+  // forwarded so an upstream cancel tears down the downstream request too.
+  if (bridge && capabilities.elicitation) {
+    client.setRequestHandler(ElicitRequestSchema, (request, extra) =>
+      bridge.elicitInput(request.params, { signal: extra.signal }),
+    );
+  }
+  if (bridge && capabilities.sampling) {
+    client.setRequestHandler(CreateMessageRequestSchema, (request, extra) =>
+      bridge.createMessage(request.params, { signal: extra.signal }),
+    );
+  }
+  if (bridge && capabilities.roots) {
+    client.setRequestHandler(ListRootsRequestSchema, (request, extra) =>
+      bridge.listRoots(request.params, { signal: extra.signal }),
+    );
+  }
 
   let transport: StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
   // Rolling 8KB tail of the child's stderr — captured so activation
@@ -401,19 +503,13 @@ async function connectToUpstreamOnce(
       throw new Error("command is required for local servers");
     }
 
-    // Strip yaw-mcp-internal secrets from the child env. These are for
-    // THIS process only and must never leak into spawned upstream servers:
-    //   YAW_MCP_TOKEN            — backend auth token
-    //   YAW_MCP_VAULT_PASSPHRASE — unlocks the local secret vault
-    // Everything else from process.env (PATH, HOME, proxy vars, etc.) is
-    // intentionally forwarded so the child spawns/runs in the user's
-    // normal environment; server-specific secrets come via serverEnv,
+    // Strip yaw-mcp-internal secrets from the child env — see
+    // stripInternalSecretsFromEnv for the key list and why the match is
+    // case-insensitive. Everything else from process.env (PATH, HOME, proxy
+    // vars, etc.) is intentionally forwarded so the child spawns/runs in the
+    // user's normal environment; server-specific secrets come via serverEnv,
     // resolved from the vault above.
-    const {
-      YAW_MCP_TOKEN: _excludedToken,
-      YAW_MCP_VAULT_PASSPHRASE: _excludedVaultPassphrase,
-      ...parentEnv
-    } = process.env;
+    const parentEnv = stripInternalSecretsFromEnv(process.env);
     // Resolve the launch command: `uv`/`uvx` to our managed binary, then
     // node/npx onto the oam runtime. BOTH resolvers can throw (unsupported
     // platform, download/checksum failure, a wedged oam binary), and the
@@ -751,14 +847,44 @@ export interface FetchListOptions {
   throwOnError?: boolean;
 }
 
+/** Follow MCP list-endpoint pagination (`nextCursor`) and return the
+ *  concatenated inventory. The spec defines cursors for resources/list,
+ *  prompts/list and tools/list alike; a server that paginates would
+ *  otherwise have everything past page 1 silently dropped.
+ *
+ *  Two bounds keep a misbehaving server from spinning this loop forever:
+ *  the fetch stops one page after the item cap is exceeded (the caller
+ *  truncates there anyway, and the overshoot is what lets its truncation
+ *  warning fire), and the page count itself is capped at `cap` -- every
+ *  legitimate inventory reaches the item cap within that many pages
+ *  (>= 1 item per page), while a server that hands out cursors over empty
+ *  pages terminates instead of looping. Each page gets its own
+ *  LIST_TIMEOUT via the caller's request options. */
+async function fetchAllPages<T>(
+  fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>,
+  cap: number,
+): Promise<T[]> {
+  const all: T[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < cap; page++) {
+    const { items, nextCursor } = await fetchPage(cursor);
+    all.push(...items);
+    if (nextCursor === undefined || all.length > cap) break;
+    cursor = nextCursor;
+  }
+  return all;
+}
+
 export async function fetchResourcesFromUpstream(
   client: Client,
   namespace: string,
   opts: FetchListOptions = {},
 ): Promise<UpstreamResourceDef[]> {
   try {
-    const result = await client.listResources({}, { timeout: LIST_TIMEOUT });
-    const raw = result.resources ?? [];
+    const raw = await fetchAllPages(async (cursor) => {
+      const result = await client.listResources(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+      return { items: result.resources ?? [], nextCursor: result.nextCursor };
+    }, MAX_RESOURCES_PER_SERVER);
     if (raw.length > MAX_RESOURCES_PER_SERVER) {
       log("warn", "Upstream returned more resources than cap; truncating", {
         namespace,
@@ -787,8 +913,10 @@ export async function fetchPromptsFromUpstream(
   opts: FetchListOptions = {},
 ): Promise<UpstreamPromptDef[]> {
   try {
-    const result = await client.listPrompts({}, { timeout: LIST_TIMEOUT });
-    const raw = result.prompts ?? [];
+    const raw = await fetchAllPages(async (cursor) => {
+      const result = await client.listPrompts(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+      return { items: result.prompts ?? [], nextCursor: result.nextCursor };
+    }, MAX_PROMPTS_PER_SERVER);
     if (raw.length > MAX_PROMPTS_PER_SERVER) {
       log("warn", "Upstream returned more prompts than cap; truncating", {
         namespace,
@@ -811,9 +939,12 @@ export async function fetchPromptsFromUpstream(
 }
 
 export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {
-  let result: Awaited<ReturnType<typeof client.listTools>>;
+  let all: Awaited<ReturnType<typeof client.listTools>>["tools"];
   try {
-    result = await client.listTools({}, { timeout: LIST_TIMEOUT });
+    all = await fetchAllPages(async (cursor) => {
+      const result = await client.listTools(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+      return { items: result.tools ?? [], nextCursor: result.nextCursor };
+    }, MAX_TOOLS_PER_SERVER);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new ActivationError(
@@ -823,7 +954,21 @@ export async function fetchToolsFromUpstream(client: Client, namespace: string):
       err,
     );
   }
-  const raw = result.tools ?? [];
+
+  // Tools that DEMAND task-based execution can never succeed through this
+  // proxy: the SDK client refuses a plain tools/call for them before
+  // sending anything (Client.callTool throws "requires task-based
+  // execution"), and yaw-mcp has no task path of its own. Republishing one
+  // downstream would advertise a tool whose every call errors — withhold it
+  // and log which ones instead.
+  const raw = all.filter((tool) => tool.execution?.taskSupport !== "required");
+  if (raw.length < all.length) {
+    log("warn", "Withholding tools that require task-based execution (unsupported through the proxy)", {
+      namespace,
+      tools: all.filter((tool) => tool.execution?.taskSupport === "required").map((tool) => tool.name),
+    });
+  }
+
   if (raw.length > MAX_TOOLS_PER_SERVER) {
     log("warn", "Upstream returned more tools than cap; truncating", {
       namespace,
@@ -835,8 +980,14 @@ export async function fetchToolsFromUpstream(client: Client, namespace: string):
   return raw.slice(0, MAX_TOOLS_PER_SERVER).map((tool) => ({
     name: tool.name,
     namespacedName: `${namespace}_${tool.name}`,
+    title: tool.title,
     description: tool.description,
     inputSchema: tool.inputSchema as Record<string, unknown>,
+    outputSchema: tool.outputSchema as Record<string, unknown> | undefined,
     annotations: tool.annotations as Record<string, unknown> | undefined,
+    // `execution` is deliberately NOT carried: the proxy always calls
+    // upstream in plain (non-task) mode, so advertising task support
+    // downstream would be a false claim.
+    _meta: tool._meta as Record<string, unknown> | undefined,
   }));
 }

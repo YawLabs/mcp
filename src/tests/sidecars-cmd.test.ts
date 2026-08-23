@@ -13,11 +13,13 @@ import { isRegistrySpec, type OamProbe } from "../oam-spawn.js";
 import {
   collectNonRegistrySpecs,
   collectSidecarSpecs,
+  installedPlatform,
   installedVersion,
   parseSidecarsArgs,
   runSidecarsInstall,
   sidecarsManifest,
   sidecarsNodeModules,
+  sidecarsPlatformPath,
   sidecarsRoot,
 } from "../sidecars-cmd.js";
 import type { UpstreamServerConfig } from "../types.js";
@@ -85,6 +87,29 @@ describe("collectSidecarSpecs", () => {
     expect(specs).toHaveLength(1);
     expect(specs[0].spec).toBe("@yawlabs/postgres-mcp@1.0.0");
     expect(specs[0].conflicting).toEqual(["@yawlabs/postgres-mcp@latest"]);
+  });
+
+  it("recognises npx via the launch classifier, not string equality", () => {
+    // `npx.cmd` (the Windows shim) and an absolute npx path are the same
+    // launch, and rewriteForOam hosts BOTH on oam through nodeLaunchKind. A
+    // collector matching only the bare string would install nothing for such a
+    // server while the rewrite reads the (empty) managed tree for it -- the
+    // server silently keeps resolving out of the npx cache, the exact failure
+    // this module exists to prevent. Pure string parsing in the SUT, so the
+    // POSIX-shaped absolute path below is fine on every test platform.
+    const specs = collectSidecarSpecs([
+      local({ namespace: "win", command: "npx.cmd", args: ["-y", "@yawlabs/fetch-mcp@latest"] }),
+      local({ namespace: "abs", command: "/usr/local/bin/npx", args: ["-y", "@yawlabs/postgres-mcp@latest"] }),
+    ]);
+    expect(specs.map((s) => s.pkg)).toEqual(["@yawlabs/fetch-mcp", "@yawlabs/postgres-mcp"]);
+
+    // The partition stays a partition: the skip report uses the same
+    // classifier, so a git-spec `npx.cmd` server lands in `skipped` rather
+    // than dropping out of both lists with nothing to say why.
+    const skipped = collectNonRegistrySpecs([
+      local({ namespace: "gitwin", command: "npx.cmd", args: ["-y", "github:owner/repo"] }),
+    ]);
+    expect(skipped).toEqual([{ namespace: "gitwin", spec: "github:owner/repo" }]);
   });
 
   it("skips an npx launch whose first positional is a flag", () => {
@@ -215,6 +240,35 @@ describe("installedVersion", () => {
     writePkg({ name: "@yawlabs/fetch-mcp", version: "0.3.6" });
 
     expect(installedVersion("@yawlabs/fetch-mcp", home)).toBe("0.3.6");
+  });
+});
+
+describe("installedPlatform", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "instplat-"));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("returns null for a missing, malformed, or wrong-shaped marker", () => {
+    // All three are "unknown", not errors: a tree from before the marker
+    // existed is legitimate, and doctor must render it without a mismatch
+    // claim it cannot back.
+    expect(installedPlatform(home)).toBeNull();
+
+    mkdirSync(sidecarsRoot(home), { recursive: true });
+    writeFileSync(sidecarsPlatformPath(home), "{ not json");
+    expect(installedPlatform(home)).toBeNull();
+
+    writeFileSync(sidecarsPlatformPath(home), JSON.stringify({ platform: 5, arch: "arm64" }));
+    expect(installedPlatform(home)).toBeNull();
+  });
+
+  it("round-trips what the installer wrote", () => {
+    mkdirSync(sidecarsRoot(home), { recursive: true });
+    writeFileSync(sidecarsPlatformPath(home), JSON.stringify({ platform: "darwin", arch: "x64" }));
+
+    expect(installedPlatform(home)).toEqual({ platform: "darwin", arch: "x64" });
   });
 });
 
@@ -413,6 +467,85 @@ describe("runSidecarsInstall", () => {
     expect(new Set(cwds)).toEqual(new Set([sidecarsRoot(home)]));
     const manifest = JSON.parse(readFileSync(join(sidecarsRoot(home), "package.json"), "utf8"));
     expect(manifest.dependencies).toEqual({ "@yawlabs/fetch-mcp": "latest" });
+  });
+
+  it("installs for a Windows-shaped `npx.cmd` server, same as bare npx", async () => {
+    // The end-to-end half of the classifier test above: a bundles.json written
+    // by hand on Windows (README documents hand-editing) can carry `npx.cmd`,
+    // and rewriteForOam hosts that server on oam -- so `sidecars install`
+    // answering "No npx-launched servers in bundles.json" for it would leave
+    // the rewrite reading a tree nothing fills.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx.cmd",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    const runNpm = async () => {
+      const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+      return 0;
+    };
+
+    const res = await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {}, oamProbe: noOam });
+
+    expect(res.exitCode).toBe(0);
+    expect(res.installed).toEqual([{ pkg: "@yawlabs/fetch-mcp", version: "0.3.6", namespaces: ["fetch"] }]);
+    expect(res.lines.join("\n")).not.toContain("No npx-launched servers");
+  });
+
+  it("records the installing platform/arch after a successful install", async () => {
+    // The marker is what lets doctor tell "present and fine" from "present but
+    // built for another machine" on a HOME shared across architectures. This
+    // process's own platform/arch, because that is the node npm resolved
+    // native bindings for.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    const runNpm = async () => {
+      const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+      return 0;
+    };
+
+    await runSidecarsInstall({ home, cwd: home, runNpm, out: () => {}, oamProbe: noOam });
+
+    expect(installedPlatform(home)).toEqual({ platform: process.platform, arch: process.arch });
+  });
+
+  it("does not write the platform marker when the install itself failed", async () => {
+    // A failed install leaves whatever tree was there before, so the marker
+    // must keep describing what is actually on disk -- here, nothing.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+
+    await runSidecarsInstall({ home, cwd: home, runNpm: async () => 1, out: () => {} });
+
+    expect(installedPlatform(home)).toBeNull();
   });
 
   it("runs `npm update` after `npm install` so a re-run moves a @latest server forward", async () => {

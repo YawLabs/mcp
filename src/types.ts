@@ -58,9 +58,18 @@ export interface ConnectConfig {
 export interface UpstreamToolDef {
   name: string;
   namespacedName: string;
+  // Human-readable display name (MCP 2025-06-18). Forwarded downstream so
+  // proxied tools keep their intended presentation.
+  title?: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  // Structured-output contract (MCP 2025-06-18). Forwarding it is what lets
+  // a downstream client validate the structuredContent that routeToolCall
+  // already passes through verbatim; dropping it would hand clients
+  // structured payloads for tools they were told have no output schema.
+  outputSchema?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
 }
 
 export interface UpstreamResourceDef {

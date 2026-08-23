@@ -6,6 +6,7 @@ import {
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -78,7 +79,7 @@ import {
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
-import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
+import { ActivationError, connectToUpstream, type DownstreamClientBridge, disconnectFromUpstream } from "./upstream.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
 import { ensureUv } from "./uv-bootstrap.js";
 
@@ -119,7 +120,10 @@ function complianceRefusalReason(grade: string | undefined | null, min: Complian
 // who know their workflow starts the same way every session and want
 // to skip the discover step entirely.
 export function isAutoLoadEnabled(): boolean {
-  const raw = process.env.YAW_MCP_AUTO_LOAD;
+  // Trimmed like every other env resolver (resolveToolExposure,
+  // parseMinCompliance): cmd.exe's `set VAR=1 && ...` keeps the space
+  // before `&&`, so the raw value arrives as "1 " on Windows.
+  const raw = process.env.YAW_MCP_AUTO_LOAD?.trim();
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
 }
@@ -170,7 +174,8 @@ export function resolveIdleThreshold(): number {
 // isAutoLoadEnabled) so a mid-session env change -- or a test stubbing the
 // env between cases -- takes effect without restarting the process.
 export function isAutoActivateEnabled(): boolean {
-  const raw = process.env.YAW_MCP_AUTO_ACTIVATE;
+  // Trimmed for the same cmd.exe trailing-space reason as isAutoLoadEnabled.
+  const raw = process.env.YAW_MCP_AUTO_ACTIVATE?.trim();
   if (raw === undefined || raw === "") return true;
   return raw === "1" || raw.toLowerCase() === "true";
 }
@@ -308,6 +313,7 @@ export function computeToolOverlaps(
 
 export class ConnectServer {
   private server: Server;
+  private clientBridge: DownstreamClientBridge;
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
   private configVersion: string | null = null;
@@ -501,6 +507,20 @@ export class ConnectServer {
     // originates them. The capability declaration for originated features
     // is implicit -- the client advertises whether IT supports receiving
     // them, which we check via getClientCapabilities() before prompting.
+    //
+    // Upstream-originated requests are a different story: this bridge is
+    // handed to every connectToUpstream call so proxied servers keep
+    // elicitation, sampling, and roots when the downstream client declared
+    // them. upstream.ts mirrors the declared set onto each upstream Client
+    // and forwards those requests through these methods; capabilities are
+    // read lazily because upstream connects happen after the downstream
+    // initialize.
+    this.clientBridge = {
+      getClientCapabilities: () => this.server.getClientCapabilities(),
+      elicitInput: (params, options) => this.server.elicitInput(params, options),
+      createMessage: (params, options) => this.server.createMessage(params, options),
+      listRoots: (params, options) => this.server.listRoots(params, options),
+    };
     this.setupHandlers();
   }
 
@@ -562,6 +582,18 @@ export class ConnectServer {
         resolveToolExposure(),
         this.sessionActivated,
       ),
+    }));
+
+    // Registered so a client probing resources/templates/list gets a valid
+    // empty result instead of -32601 — the constructor declares the
+    // resources capability, which implies this method, and the SDK ships no
+    // default handler for it. yaw-mcp does not proxy upstream resource
+    // TEMPLATES yet: buildResourceRoutes only ever sees concrete
+    // conn.resources, so routeResourceRead could not resolve a templated
+    // URI anyway. If template proxying lands, this handler is where the
+    // aggregated upstream templates get returned.
+    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+      resourceTemplates: [],
     }));
 
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
@@ -684,6 +716,31 @@ export class ConnectServer {
     if (server.toolCache && server.toolCache.length > 0) return true;
     const cached = this.toolCache.get(server.namespace);
     return cached !== undefined && cached.length > 0;
+  }
+
+  // How long a LEARNED tool list stays trusted before the next pre-warm
+  // re-spawns the server to refresh it. Installs resolve at @latest, so an
+  // upstream that renames or removes a tool would otherwise keep discover's
+  // "known tools:" line, the BM25 corpus, and the deferred routes pointing
+  // at dead names for the full persistence TTL (TOOLCACHE_TTL_MS, 30 days)
+  // -- the only recovery being the "no longer available after loading"
+  // error on a live call. A weekly re-learn bounds that drift at one extra
+  // spawn per server per week.
+  private static readonly TOOLCACHE_REFRESH_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  // True when the list hasKnownTools trusts came from a PREVIOUS session's
+  // learning and is old enough to re-verify. Scoped to learned entries on
+  // purpose: a toolCache shipped in bundles.json is curated, carries no
+  // learnedAt, and is never refreshed here -- refreshing it every session
+  // is exactly the per-session `npx -y <pkg>@latest` resolve pre-warm
+  // exists to avoid. runActivateOne stamps a fresh learnedAt on every
+  // activation, so a server in actual use never looks stale.
+  private isLearnedCacheStale(namespace: string): boolean {
+    const cached = this.toolCache.get(namespace);
+    if (cached === undefined || cached.length === 0) return false;
+    const learnedAt = this.toolCacheLearnedAt.get(namespace);
+    if (learnedAt === undefined) return false;
+    return Date.now() - learnedAt > ConnectServer.TOOLCACHE_REFRESH_MS;
   }
 
   // Seed the in-memory tool cache from the persisted snapshot. Runs before
@@ -972,9 +1029,13 @@ export class ConnectServer {
   // the one hydrated from state.json — so this is a one-time cost per
   // server rather than a per-session `npx -y <pkg>@latest` resolve for
   // every active server (which is what it degenerated into while the
-  // learned cache had nowhere to persist).
+  // learned cache had nowhere to persist). A learned list past
+  // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
+  // re-learned weekly instead of only at the 30-day persistence expiry.
   private async prewarmDormantServers(): Promise<void> {
-    const dormant = this.getProfiledActiveServers().filter((s) => !this.hasKnownTools(s));
+    const dormant = this.getProfiledActiveServers().filter(
+      (s) => !this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace),
+    );
     if (dormant.length === 0) return;
 
     log("info", "Pre-warming dormant servers", {
@@ -1050,21 +1111,19 @@ export class ConnectServer {
     if (!this.guides.user && !this.guides.project) return result;
     this.guideNudgeFired = true;
     const sources = [this.guides.user?.path, this.guides.project?.path].filter(Boolean).join(", ");
-    const text = `\n\n[yaw-mcp] Tip: read the \`yaw-mcp://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
-    // Clone before appending. Some callers hand us a result that is ALSO
-    // held elsewhere -- buildDiscoverOutput stores its result in
-    // discoverCache -- so mutating content in place would bake this
-    // once-per-session hint into the cached body and replay it on every
-    // cache hit for the rest of the TTL. Copy the array (and the one
-    // element we rewrite) so the cached object is untouched.
-    const content = [...result.content];
-    const last = content[content.length - 1];
-    if (last && last.type === "text") {
-      content[content.length - 1] = { ...last, text: `${last.text}${text}` };
-    } else {
-      content.push({ type: "text", text: text.trimStart() });
-    }
-    return { ...result, content };
+    const text = `[yaw-mcp] Tip: read the \`yaw-mcp://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
+    // Appended as its OWN text block, never spliced into an existing one:
+    // exec and secrets return a single block whose text is JSON.stringify
+    // of a documented payload, and tacking prose onto that text breaks
+    // JSON.parse on the body the tool description promises. A separate
+    // block keeps every documented body byte-identical. Building a fresh
+    // content array (rather than pushing in place) also matters: some
+    // callers hand us a result that is ALSO held elsewhere --
+    // buildDiscoverOutput stores its result in discoverCache -- so
+    // mutating content in place would bake this once-per-session hint
+    // into the cached body and replay it on every cache hit for the rest
+    // of the TTL.
+    return { ...result, content: [...result.content, { type: "text", text }] };
   }
 
   private async handleToolCall(
@@ -1231,6 +1290,7 @@ export class ConnectServer {
                 reconnectConfig,
                 this.onUpstreamDisconnect,
                 this.onUpstreamListChanged,
+                this.clientBridge,
               );
               this.connections.set(ns, newConn);
               await this.refreshRoutesAndNotify();
@@ -1507,6 +1567,13 @@ export class ConnectServer {
     progress?.(`Auto-warming top candidate "${top.namespace}"`);
     const result = await this.activateOne(top.namespace, progress);
     if (result.ok) {
+      // Auto-warm exists so a one-shot discover(context) is enough to
+      // start calling tools -- under the default gateway exposure that
+      // only holds if the warmed namespace is advertised, so record it
+      // like handleActivate/handleDispatch do. This is intent-driven (the
+      // client supplied the context that picked the winner), unlike
+      // prewarm or the deferred first-call path.
+      this.sessionActivated.add(top.namespace);
       // The namespace is connected now, so its `deferred` route (built from
       // the persisted toolCache) is stale. Every other activation site
       // rebuilds + notifies; skipping it here wedged the very next
@@ -2102,6 +2169,7 @@ export class ConnectServer {
             effectiveConfig,
             this.onUpstreamDisconnect,
             this.onUpstreamListChanged,
+            this.clientBridge,
           );
           progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
           this.connections.set(namespace, connection);
@@ -2343,11 +2411,12 @@ export class ConnectServer {
       results.push(r.message);
       if (r.isChanged) anyChanged = true;
       // Gateway mode advertises a namespace only after the client asks for
-      // it BY NAME, which is here -- not in activateOne, which dispatch and
-      // the deferred first-call path also route through. Those two reach a
-      // tool without the client having chosen the server, so surfacing the
-      // whole namespace off them would grow the tool list as a side effect
-      // of one call. Recorded on success only.
+      // it -- BY NAME here, by INTENT in handleDispatch and discover's
+      // auto-warm -- not in activateOne, which the deferred first-call
+      // path and prewarm also route through. Those reach a tool without
+      // the client having chosen the server, so surfacing the whole
+      // namespace off them would grow the tool list as a side effect of
+      // one call. Recorded on success only.
       if (r.ok) this.sessionActivated.add(namespace);
       // Cap refusals are tracked separately: alongside successes they are
       // informational (the per-namespace message says what to unload), but
@@ -2573,6 +2642,15 @@ export class ConnectServer {
       const r = await this.activateOne(winner.namespace, progress);
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
       if (r.isChanged) anyChanged = true;
+      // Gateway mode must advertise what dispatch just loaded: the client
+      // asked for a server for THIS intent (bounded by `budget`), and the
+      // response promises the tools are now callable ("no separate
+      // discover + load step" -- meta-tools.ts). Without this, the
+      // tools/list_changed fired below changes nothing under the default
+      // gateway exposure and the loaded tools stay invisible to any client
+      // that can only invoke advertised tools. Recorded on success only,
+      // mirroring handleActivate.
+      if (r.ok) this.sessionActivated.add(winner.namespace);
       // Cap refusals are expected when the budget exceeds the concurrent
       // server cap -- informational alongside successes, but if NOTHING
       // loaded the dispatch did no work and must signal (same rule as
@@ -2913,7 +2991,7 @@ export class ConnectServer {
       const transientConfig = elicitedForTransient
         ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForTransient } }
         : serverConfig;
-      transient = await connectToUpstream(transientConfig);
+      transient = await connectToUpstream(transientConfig, undefined, undefined, this.clientBridge);
     } catch (err) {
       const message = err instanceof ActivationError ? err.message : err instanceof Error ? err.message : String(err);
       return {

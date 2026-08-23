@@ -144,7 +144,13 @@ export function emptyState(): PersistedState {
 export async function loadState(filePath: string = statePath()): Promise<PersistedState> {
   try {
     const raw = await readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw);
+    // Strip a leading UTF-8 BOM (U+FEFF) before parsing -- same strip
+    // parseJsonc (jsonc.ts) does, for the same reason: Notepad on Windows
+    // defaults to BOM-prefixed UTF-8, and JSON.parse rejects the BOM. This
+    // module explicitly anticipates hand-edited state files (see
+    // sanitizeLearning); without the strip, one Notepad save would drop ALL
+    // learning, pack history, and tool cache via the empty-state fallback.
+    const parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
     if (!parsed || typeof parsed !== "object") return emptyState();
     if (!isReadableStateVersion((parsed as { version?: unknown }).version)) return emptyState();
     const p = parsed as Record<string, unknown>;

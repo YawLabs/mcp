@@ -1,5 +1,8 @@
 import { EventEmitter } from "node:events";
 import {
+  CreateMessageRequestSchema,
+  ElicitRequestSchema,
+  ListRootsRequestSchema,
   PromptListChangedNotificationSchema,
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
@@ -8,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ActivationError,
   connectToUpstream,
+  type DownstreamClientBridge,
   disconnectFromUpstream,
   fetchPromptsFromUpstream,
   fetchResourcesFromUpstream,
@@ -16,6 +20,7 @@ import {
   MAX_RESOURCES_PER_SERVER,
   MAX_TOOLS_PER_SERVER,
   resetOamDowngrades,
+  stripInternalSecretsFromEnv,
 } from "../upstream.js";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +89,14 @@ const _sdkBehavior = {
   // registration order -- the list-changed chain tests invoke the captured
   // handler directly rather than driving a real transport.
   notificationHandlers: [] as Array<{ schema: unknown; handler: (notification: any) => unknown }>,
+  // Every (schema, handler) pair passed to client.setRequestHandler, in
+  // registration order -- the capability-bridge tests invoke the captured
+  // handler directly to drive an upstream-originated request.
+  requestHandlers: [] as Array<{ schema: unknown; handler: (request: any, extra: any) => unknown }>,
+  // The `{ capabilities }` options each Client was constructed with, in
+  // order -- lets the bridge tests assert what the upstream handshake would
+  // declare.
+  clientConstructions: [] as Array<{ capabilities: Record<string, unknown> }>,
   // Remote transport constructions (SSE vs streamable HTTP), in order.
   remoteConstructions: [] as Array<{ kind: "sse" | "http"; url: string }>,
   stderrEmitter: null as EventEmitter | null,
@@ -96,7 +109,8 @@ const _sdkBehavior = {
 };
 
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
-  function MockClient() {
+  function MockClient(_info: unknown, options?: { capabilities?: Record<string, unknown> }) {
+    _sdkBehavior.clientConstructions.push({ capabilities: options?.capabilities ?? {} });
     const client: any = {
       connect: () => _sdkBehavior.clientConnect(),
       close: () => _sdkBehavior.clientClose(),
@@ -113,6 +127,9 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => {
       onclose: undefined as (() => void) | undefined,
       setNotificationHandler: (schema: unknown, handler: (notification: any) => unknown) => {
         _sdkBehavior.notificationHandlers.push({ schema, handler });
+      },
+      setRequestHandler: (schema: unknown, handler: (request: any, extra: any) => unknown) => {
+        _sdkBehavior.requestHandlers.push({ schema, handler });
       },
     };
     return client;
@@ -301,6 +318,183 @@ describe("fetchPromptsFromUpstream size cap", () => {
     const client = makeClient({ listPrompts: vi.fn().mockRejectedValue(new Error("not supported")) });
     const out = await fetchPromptsFromUpstream(client, "ns");
     expect(out).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripInternalSecretsFromEnv -- the child-env secret strip. Case-INSENSITIVE
+// on purpose: Windows env lookups are case-insensitive, so process.env reads
+// a `yaw_mcp_vault_passphrase=` set in PowerShell/Git Bash just fine, and a
+// byte-exact strip would hand that passphrase to every spawned upstream.
+// ---------------------------------------------------------------------------
+
+describe("stripInternalSecretsFromEnv", () => {
+  it("strips the internal secret keys and keeps everything else", () => {
+    const out = stripInternalSecretsFromEnv({
+      PATH: "/usr/bin",
+      HOME: "/home/u",
+      YAW_MCP_TOKEN: "tok",
+      YAW_MCP_VAULT_PASSPHRASE: "hunter2",
+      YAW_MCP_VAULT_PASSPHRASE_NEW: "hunter3",
+    });
+    expect(out).toEqual({ PATH: "/usr/bin", HOME: "/home/u" });
+  });
+
+  it("strips case-variant twins (Windows env lookups are case-insensitive)", () => {
+    const out = stripInternalSecretsFromEnv({
+      yaw_mcp_vault_passphrase: "hunter2",
+      Yaw_Mcp_Token: "tok",
+      yaw_mcp_vault_passphrase_new: "hunter3",
+      HOME: "/home/u",
+    });
+    expect(out).toEqual({ HOME: "/home/u" });
+  });
+
+  it("keeps unrelated YAW_MCP_* keys (only the secret trio is internal)", () => {
+    const out = stripInternalSecretsFromEnv({
+      YAW_MCP_PRUNE_RESPONSES: "0",
+      YAW_MCP_TOKEN_TTL: "60",
+    });
+    expect(out).toEqual({ YAW_MCP_PRUNE_RESPONSES: "0", YAW_MCP_TOKEN_TTL: "60" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nextCursor pagination -- the MCP spec defines cursors for all three list
+// endpoints; a paginating upstream must not have pages past the first
+// silently dropped.
+// ---------------------------------------------------------------------------
+
+describe("list pagination (nextCursor)", () => {
+  let stderr: { restore: () => void; writes: string[] };
+
+  beforeEach(() => {
+    stderr = captureStderr();
+  });
+
+  afterEach(() => {
+    stderr.restore();
+  });
+
+  it("fetchResourcesFromUpstream follows nextCursor across pages", async () => {
+    const listResources = vi
+      .fn()
+      .mockResolvedValueOnce({ resources: [{ uri: "file:///a" }, { uri: "file:///b" }], nextCursor: "c1" })
+      .mockResolvedValueOnce({ resources: [{ uri: "file:///c" }], nextCursor: "c2" })
+      .mockResolvedValueOnce({ resources: [{ uri: "file:///d" }] });
+    const client = makeClient({ listResources });
+
+    const out = await fetchResourcesFromUpstream(client, "ns");
+    expect(out.map((r) => r.uri)).toEqual(["file:///a", "file:///b", "file:///c", "file:///d"]);
+    expect(listResources).toHaveBeenCalledTimes(3);
+    expect(listResources.mock.calls[0][0]).toEqual({});
+    expect(listResources.mock.calls[1][0]).toEqual({ cursor: "c1" });
+    expect(listResources.mock.calls[2][0]).toEqual({ cursor: "c2" });
+  });
+
+  it("fetchPromptsFromUpstream follows nextCursor across pages", async () => {
+    const listPrompts = vi
+      .fn()
+      .mockResolvedValueOnce({ prompts: [{ name: "p0" }], nextCursor: "c1" })
+      .mockResolvedValueOnce({ prompts: [{ name: "p1" }] });
+    const client = makeClient({ listPrompts });
+
+    const out = await fetchPromptsFromUpstream(client, "ns");
+    expect(out.map((p) => p.name)).toEqual(["p0", "p1"]);
+    expect(listPrompts.mock.calls[1][0]).toEqual({ cursor: "c1" });
+  });
+
+  it("fetchToolsFromUpstream follows nextCursor across pages", async () => {
+    const listTools = vi
+      .fn()
+      .mockResolvedValueOnce({ tools: [{ name: "t0", inputSchema: { type: "object" } }], nextCursor: "c1" })
+      .mockResolvedValueOnce({ tools: [{ name: "t1", inputSchema: { type: "object" } }] });
+    const client = makeClient({ listTools });
+
+    const out = await fetchToolsFromUpstream(client, "ns");
+    expect(out.map((t) => t.name)).toEqual(["t0", "t1"]);
+    expect(listTools.mock.calls[1][0]).toEqual({ cursor: "c1" });
+  });
+
+  it("a failure on a later page still surfaces as ActivationError (tools)", async () => {
+    const listTools = vi
+      .fn()
+      .mockResolvedValueOnce({ tools: [{ name: "t0", inputSchema: { type: "object" } }], nextCursor: "c1" })
+      .mockRejectedValueOnce(new Error("boom on page 2"));
+    const client = makeClient({ listTools });
+
+    await expect(fetchToolsFromUpstream(client, "ns")).rejects.toThrow(ActivationError);
+  });
+
+  it("terminates against a server that hands out a cursor forever", async () => {
+    // 1 item per page, always a nextCursor: the page budget (== the item
+    // cap) has to stop the loop rather than spinning indefinitely.
+    const listResources = vi
+      .fn()
+      .mockImplementation(() => Promise.resolve({ resources: [{ uri: "file:///same" }], nextCursor: "again" }));
+    const client = makeClient({ listResources });
+
+    const out = await fetchResourcesFromUpstream(client, "ns");
+    expect(out).toHaveLength(MAX_RESOURCES_PER_SERVER);
+    expect(listResources).toHaveBeenCalledTimes(MAX_RESOURCES_PER_SERVER);
+  });
+
+  it("stops one page past the cap and truncates with a warning", async () => {
+    const page1 = Array.from({ length: MAX_RESOURCES_PER_SERVER }, (_, i) => ({ uri: `file:///r${i}` }));
+    const listResources = vi
+      .fn()
+      .mockResolvedValueOnce({ resources: page1, nextCursor: "c1" })
+      .mockResolvedValueOnce({ resources: [{ uri: "file:///extra" }], nextCursor: "c2" });
+    const client = makeClient({ listResources });
+
+    const out = await fetchResourcesFromUpstream(client, "ns");
+    expect(out).toHaveLength(MAX_RESOURCES_PER_SERVER);
+    // The overshoot page proved there was more than the cap; no third fetch.
+    expect(listResources).toHaveBeenCalledTimes(2);
+    expect(stderr.writes.some((w) => w.includes("truncating"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool metadata forwarding + task-required withholding
+// ---------------------------------------------------------------------------
+
+describe("fetchToolsFromUpstream metadata and task-required tools", () => {
+  let stderr: { restore: () => void; writes: string[] };
+
+  beforeEach(() => {
+    stderr = captureStderr();
+  });
+
+  afterEach(() => {
+    stderr.restore();
+  });
+
+  it("forwards title, outputSchema and _meta; withholds taskSupport=required tools", async () => {
+    const tools = [
+      {
+        name: "plain",
+        title: "Plain Tool",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object", properties: { ok: { type: "boolean" } } },
+        _meta: { "example.com/flag": true },
+      },
+      { name: "tasky", inputSchema: { type: "object" }, execution: { taskSupport: "required" } },
+      { name: "opt", inputSchema: { type: "object" }, execution: { taskSupport: "optional" } },
+    ];
+    const client = makeClient({ listTools: vi.fn().mockResolvedValue({ tools }) });
+
+    const out = await fetchToolsFromUpstream(client, "ns");
+    // "tasky" can never succeed through the proxy (the SDK client refuses a
+    // plain tools/call for it), so it must not be republished.
+    expect(out.map((t) => t.name)).toEqual(["plain", "opt"]);
+    expect(out[0].title).toBe("Plain Tool");
+    expect(out[0].outputSchema).toEqual({ type: "object", properties: { ok: { type: "boolean" } } });
+    expect(out[0]._meta).toEqual({ "example.com/flag": true });
+    // The proxy always calls upstream in plain mode; task support must not
+    // be re-advertised downstream even for taskSupport=optional tools.
+    expect((out[1] as unknown as Record<string, unknown>).execution).toBeUndefined();
+    expect(stderr.writes.some((w) => w.includes("task-based") && w.includes("tasky"))).toBe(true);
   });
 });
 
@@ -1491,6 +1685,143 @@ describe("connectToUpstream onclose after ready", () => {
     expect(() => connection.client.onclose?.()).not.toThrow();
     expect(connection.status).toBe("error");
     expect(connection.error).toBe("Upstream disconnected unexpectedly");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Downstream capability bridge (upstream.ts connectToUpstreamOnce head). The
+// upstream Client must declare EXACTLY the capabilities the downstream client
+// declared at initialize, and register a forwarding handler for each declared
+// one -- declaring without a handler would turn the SDK's clean "client does
+// not support X" refusal into a MethodNotFound at call time.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream downstream capability bridge", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.requestHandlers = [];
+    _sdkBehavior.clientConstructions = [];
+    _sdkBehavior.stdioConstructions = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    _sdkBehavior.requestHandlers = [];
+    _sdkBehavior.clientConstructions = [];
+  });
+
+  /** Bridge whose forwarders resolve canned results, so a captured request
+   *  handler can be driven directly and its round-trip asserted. */
+  function makeBridge(caps: Record<string, unknown> | undefined): DownstreamClientBridge {
+    return {
+      getClientCapabilities: vi.fn(() => caps as any),
+      elicitInput: vi.fn(async () => ({ action: "accept", content: { TOKEN: "abc" } }) as any),
+      createMessage: vi.fn(
+        async () => ({ model: "m", role: "assistant", content: { type: "text", text: "hi" } }) as any,
+      ),
+      listRoots: vi.fn(async () => ({ roots: [{ uri: "file:///w" }] }) as any),
+    };
+  }
+
+  /** The `capabilities` the most recent Client was constructed with -- i.e.
+   *  what the upstream handshake would declare. */
+  function declaredCapabilities(): Record<string, unknown> {
+    const last = _sdkBehavior.clientConstructions[_sdkBehavior.clientConstructions.length - 1];
+    if (!last) throw new Error("no Client was constructed");
+    return last.capabilities;
+  }
+
+  function requestHandlerFor(schema: unknown): (request: any, extra: any) => unknown {
+    const entry = _sdkBehavior.requestHandlers.find((h) => h.schema === schema);
+    if (!entry) throw new Error("no request handler was registered for that schema");
+    return entry.handler;
+  }
+
+  it("declares elicitation (sub-capabilities verbatim) and round-trips elicitation/create through the bridge", async () => {
+    const bridge = makeBridge({ elicitation: { form: {} } });
+    await connectToUpstream(makeLocalConfig(), undefined, undefined, bridge);
+
+    expect(declaredCapabilities()).toEqual({ elicitation: { form: {} } });
+    const handler = requestHandlerFor(ElicitRequestSchema);
+
+    const params = {
+      message: "need TOKEN",
+      requestedSchema: { type: "object", properties: { TOKEN: { type: "string" } } },
+    };
+    const controller = new AbortController();
+    const result = await handler({ method: "elicitation/create", params }, { signal: controller.signal });
+    expect(bridge.elicitInput).toHaveBeenCalledWith(params, { signal: controller.signal });
+    expect(result).toEqual({ action: "accept", content: { TOKEN: "abc" } });
+  });
+
+  it("declares nothing and registers no handlers when the downstream client declared nothing", async () => {
+    const bridge = makeBridge({});
+    await connectToUpstream(makeLocalConfig(), undefined, undefined, bridge);
+
+    expect(declaredCapabilities()).toEqual({});
+    expect(_sdkBehavior.requestHandlers).toEqual([]);
+  });
+
+  it("declares {} and registers no handlers when no bridge is supplied", async () => {
+    await connectToUpstream(makeLocalConfig());
+
+    expect(declaredCapabilities()).toEqual({});
+    expect(_sdkBehavior.requestHandlers).toEqual([]);
+  });
+
+  it("declares sampling verbatim, forwards sampling/createMessage, and passes rejections through untouched", async () => {
+    const bridge = makeBridge({ sampling: { tools: {} } });
+    await connectToUpstream(makeLocalConfig(), undefined, undefined, bridge);
+
+    expect(declaredCapabilities()).toEqual({ sampling: { tools: {} } });
+    // Only the declared capability got a handler -- no elicitation, no roots.
+    expect(_sdkBehavior.requestHandlers.map((h) => h.schema)).toEqual([CreateMessageRequestSchema]);
+
+    const handler = requestHandlerFor(CreateMessageRequestSchema);
+    const params = { messages: [], maxTokens: 8 };
+    const controller = new AbortController();
+    const result = await handler({ method: "sampling/createMessage", params }, { signal: controller.signal });
+    expect(bridge.createMessage).toHaveBeenCalledWith(params, { signal: controller.signal });
+    expect(result).toEqual({ model: "m", role: "assistant", content: { type: "text", text: "hi" } });
+
+    // A downstream refusal must surface to the upstream as the SAME error,
+    // not an invented default result.
+    vi.mocked(bridge.createMessage).mockRejectedValueOnce(new Error("downstream refused"));
+    await expect(
+      handler({ method: "sampling/createMessage", params }, { signal: controller.signal }) as Promise<unknown>,
+    ).rejects.toThrow("downstream refused");
+  });
+
+  it("declares roots WITHOUT listChanged and forwards roots/list", async () => {
+    const bridge = makeBridge({ roots: { listChanged: true } });
+    await connectToUpstream(makeLocalConfig(), undefined, undefined, bridge);
+
+    // listChanged is deliberately stripped: yaw-mcp does not forward
+    // notifications/roots/list_changed, so it must not advertise them.
+    expect(declaredCapabilities()).toEqual({ roots: {} });
+
+    const handler = requestHandlerFor(ListRootsRequestSchema);
+    const controller = new AbortController();
+    const result = await handler({ method: "roots/list", params: undefined }, { signal: controller.signal });
+    expect(bridge.listRoots).toHaveBeenCalledWith(undefined, { signal: controller.signal });
+    expect(result).toEqual({ roots: [{ uri: "file:///w" }] });
+  });
+
+  it("declares and registers all three when the downstream client declared all three", async () => {
+    const bridge = makeBridge({ elicitation: {}, sampling: {}, roots: {} });
+    await connectToUpstream(makeLocalConfig(), undefined, undefined, bridge);
+
+    expect(declaredCapabilities()).toEqual({ elicitation: {}, sampling: {}, roots: {} });
+    expect(_sdkBehavior.requestHandlers.map((h) => h.schema)).toEqual([
+      ElicitRequestSchema,
+      CreateMessageRequestSchema,
+      ListRootsRequestSchema,
+    ]);
   });
 });
 

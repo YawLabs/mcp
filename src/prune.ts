@@ -179,12 +179,19 @@ function numberLiteralIsFaithful(literal: string): boolean {
   return digits.replace(/0+$/, "").length <= MAX_FAITHFUL_MANTISSA_DIGITS;
 }
 
+// CRLF-aware on purpose: a Windows-hosted MCP server that shells out (git,
+// filesystem, any CLI wrapper) returns \r\n line endings, and an LF-only
+// version of these rules was a silent no-op there — the trailing-space
+// regex never matched before a \r, and the blank-run collapse never saw
+// three consecutive \n. The \r itself is preserved (content stays
+// byte-faithful); only the collapsed blank run is rewritten, in the style
+// the run itself used.
 function pruneWhitespace(text: string): string {
   return text
     .split("\n")
-    .map((line) => line.replace(/[ \t]+$/, ""))
+    .map((line) => line.replace(/[ \t]+(?=\r?$)/, ""))
     .join("\n")
-    .replace(/\n{3,}/g, "\n\n");
+    .replace(/(?:\r?\n){3,}/g, (run) => (run.includes("\r") ? "\r\n\r\n" : "\n\n"));
 }
 
 // Walk a parsed JSON tree, dropping keys/elements whose value is

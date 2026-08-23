@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { quoteShellArgIfNeeded } from "../auto-upgrade.js";
 import {
   buildUpgradePlan,
   detectInstallMethod,
@@ -547,6 +548,119 @@ describe("runUpgrade", () => {
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
     expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
+  });
+
+  // --prefix pinning for global-npm: without it, `npm install -g` writes into
+  // whatever `npm prefix -g` resolves, which can be a DIFFERENT tree than the
+  // running install (multiple Node versions, custom NPM_CONFIG_PREFIX, the
+  // bundled Node) -- the child exits 0, we print "OK: Upgraded", and the copy
+  // the client spawns stays stale. Same policy as auto-upgrade's
+  // maybeAutoUpgrade, whose detectRunningInstallPrefix backs the default walk.
+  describe("--prefix pinning for global-npm", () => {
+    it("with --run, passes --prefix from the running-install walk and prints the exact spawned line", async () => {
+      const io = captureIO();
+      const spawned: Array<{ cmd: string; args: string[] }> = [];
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => "/custom/node-root",
+        spawnImpl: async (cmd, args) => {
+          spawned.push({ cmd, args });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(spawned).toHaveLength(1);
+      expect(spawned[0]).toEqual({
+        cmd: "npm",
+        args: ["install", "-g", "--prefix", "/custom/node-root", "@yawlabs/mcp@latest"],
+      });
+      // The printed line matches what was spawned -- not the bare plan.command.
+      expect(io.out.join("\n")).toContain("  npm install -g --prefix /custom/node-root @yawlabs/mcp@latest");
+    });
+
+    it("without --run, the 'run it yourself' suggestion carries the same --prefix the spawn would", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => "/custom/node-root",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(1);
+      expect(io.out.join("\n")).toContain("npm install -g --prefix /custom/node-root @yawlabs/mcp@latest");
+    });
+
+    it("falls back to bare `npm install -g` when the walk finds no prefix", async () => {
+      const io = captureIO();
+      const spawned: Array<{ cmd: string; args: string[] }> = [];
+      await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => null,
+        spawnImpl: async (cmd, args) => {
+          spawned.push({ cmd, args });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
+    });
+
+    it("routes the detected prefix through quoteShellArgIfNeeded (spaces survive win32's shell:true spawn)", async () => {
+      // quoteShellArgIfNeeded quotes only on win32 (POSIX execve needs no
+      // quoting), so compute the expectation with the same helper the SUT
+      // uses rather than hardcoding a platform's answer.
+      const spaced = "/custom/node root";
+      const expected = quoteShellArgIfNeeded(spaced);
+      expect(expected).not.toBeNull();
+      const spawned: Array<{ cmd: string; args: string[] }> = [];
+      const io = captureIO();
+      await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => spaced,
+        spawnImpl: async (cmd, args) => {
+          spawned.push({ cmd, args });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(spawned[0]?.args).toEqual(["install", "-g", "--prefix", expected, "@yawlabs/mcp@latest"]);
+    });
+
+    it("never consults the walk for non-global-npm methods", async () => {
+      const io = captureIO();
+      const runningPrefix = vi.fn(async () => "/should/not/be/used");
+      const spawned: Array<{ cmd: string; args: string[] }> = [];
+      await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix,
+        spawnImpl: async (cmd, args) => {
+          spawned.push({ cmd, args });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(runningPrefix).not.toHaveBeenCalled();
+      expect(spawned[0]).toEqual({ cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] });
+    });
   });
 
   it("with --run, propagates the child exit code as 3 on failure", async () => {

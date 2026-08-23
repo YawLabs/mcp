@@ -14,6 +14,19 @@ describe("mcp_connect_secrets meta-tool definition", () => {
   });
 });
 
+describe("mcp_connect_dispatch inputSchema", () => {
+  it("declares routeEffort so the advertised schema matches what the handler reads", () => {
+    // server.ts reads args.routeEffort ahead of YAW_MCP_ROUTE_EFFORT; a
+    // client that filters arguments against the advertised schema strips
+    // undeclared params, so the per-call dial was dead code until declared.
+    const props = META_TOOLS.dispatch.inputSchema.properties;
+    expect(props.routeEffort).toBeDefined();
+    expect(props.routeEffort.enum).toEqual(["off", "auto", "aggressive"]);
+    // It stays optional -- omitting it falls back to the env var.
+    expect(META_TOOLS.dispatch.inputSchema.required).toEqual(["intent"]);
+  });
+});
+
 describe("META_TOOL_NAMES", () => {
   // server.ts gates exec steps on this set: a name missing from it is a
   // meta-tool that becomes callable from inside an exec pipeline. It used to

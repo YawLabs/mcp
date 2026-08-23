@@ -48,7 +48,7 @@ export interface AuditCommandOptions {
     command: string;
     args: string[];
     env?: Record<string, string>;
-  }) => Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number }>;
+  }) => Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string }>;
 }
 
 export interface AuditCommandResult {
@@ -171,15 +171,18 @@ async function defaultRunner(target: {
   command: string;
   args: string[];
   env?: Record<string, string>;
-}): Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number }> {
-  const { runComplianceSuite } = await import("@yawlabs/mcp-compliance");
+}): Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string }> {
+  // SPEC_VERSION rides along so the cached grade records WHICH rubric produced
+  // the letter -- read here (not at writeGrade) so runner-injecting tests keep
+  // never resolving @yawlabs/mcp-compliance.
+  const { runComplianceSuite, SPEC_VERSION } = await import("@yawlabs/mcp-compliance");
   const report = await runComplianceSuite({
     type: "stdio",
     command: target.command,
     args: target.args,
     env: target.env,
   });
-  return { grade: report.grade, score: report.score };
+  return { grade: report.grade, score: report.score, suiteVersion: SPEC_VERSION };
 }
 
 export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCommandResult> {
@@ -207,7 +210,13 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   }
 
   const home = opts.home ?? homedir();
-  const { config, path } = await loadLocalBundles({ cwd: opts.cwd, home });
+  const { config, path, warnings } = await loadLocalBundles({ cwd: opts.cwd, home });
+  // Surface loader diagnostics the way the sibling commands do (list,
+  // sidecars, bundles). Without this, a malformed or unreadable bundles.json
+  // loads as zero servers and gets reported below as `no server named "X"` --
+  // with exit 1, the code the header reserves for a typo'd namespace -- while
+  // the real problem never surfaces. stderr keeps --json stdout pure.
+  for (const w of warnings) printErr(`warning: ${w}`);
   const servers = config?.servers ?? [];
   const server = findServer(servers, namespace);
 
@@ -248,7 +257,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   }
 
   const runner = opts.runner ?? defaultRunner;
-  let report: { grade: "A" | "B" | "C" | "D" | "F"; score: number };
+  let report: { grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string };
   try {
     report = await runner(target);
   } catch (err) {
@@ -272,7 +281,13 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   let cachePath: string | null = null;
   let cacheError: string | null = null;
   try {
-    cachePath = await writeGrade(namespace, { grade: report.grade, score: report.score, gradedAt }, home);
+    cachePath = await writeGrade(
+      namespace,
+      report.suiteVersion
+        ? { grade: report.grade, score: report.score, gradedAt, suiteVersion: report.suiteVersion }
+        : { grade: report.grade, score: report.score, gradedAt },
+      home,
+    );
   } catch (err) {
     cacheError = err instanceof Error ? err.message : String(err);
     log("error", "audit: grade cache write failed", { namespace, error: cacheError });

@@ -1540,7 +1540,16 @@ type PinSource = "managed" | "durable" | "npx-cache";
 const REFRESH_COMMAND: Record<PinSource, (pkg: string) => string> = {
   managed: () => "yaw-mcp sidecars install",
   durable: (pkg) => `npm install ${pkg}@latest`,
-  "npx-cache": (pkg) => `npx -y ${pkg}@latest --help`,
+  // No trailing flag. `npx -y <pkg>@latest` re-resolves the tag and refreshes
+  // the cache tree BEFORE it execs the binary, which is all the refresh
+  // needs -- and stdio MCP servers ignore flags like `--help` and simply
+  // start, so tacking one on turns "runs briefly" into "hangs the terminal
+  // on a server waiting for stdin" (measured on
+  // @modelcontextprotocol/server-memory). `npm cache add` is no substitute:
+  // it only fills _cacache, never the _npx install tree this resolver reads.
+  // The `#` comment is valid in both sh and PowerShell, so the line stays
+  // copy-paste runnable while telling the user how to get their prompt back.
+  "npx-cache": (pkg) => `npx -y ${pkg}@latest # then Ctrl-C -- the cache is refreshed before the server starts`,
 };
 
 /** Packages already reported as pinned -- one line each, not one per connect. */

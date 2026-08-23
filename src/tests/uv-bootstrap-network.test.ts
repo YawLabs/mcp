@@ -52,7 +52,7 @@ vi.mock("node:child_process", () => {
 });
 
 import { request } from "undici";
-import { __resetUvBootstrap, ensureUv } from "../uv-bootstrap.js";
+import { __resetUvBootstrap, ensureUv, UV_VERSION, uvTarget } from "../uv-bootstrap.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -93,6 +93,25 @@ beforeEach(() => {
 afterEach(async () => {
   __resetUvBootstrap();
   await fs.rm(TEMP_CACHE, { recursive: true, force: true }).catch(() => {});
+});
+
+// ── install dir keying: version AND target triple ─────────────────────────
+
+describe("resolveUv install dir keying", () => {
+  it("keys the install dir by uv/<version>/<target-triple>, not version alone", async () => {
+    // Version-only keying shared one binary across architectures: on Windows
+    // 11 ARM64 an x64 Node bootstrapped x86_64 uv.exe and a later arm64 Node
+    // reused it (emulated, not native). resolveUv mkdirs installDir BEFORE
+    // the download starts, so a failed fetch still leaves the key path on
+    // disk for this test to assert on.
+    mockRequest.mockRejectedValue(new Error("network mocked out"));
+    await ensureUv().catch(() => {});
+
+    const target = uvTarget();
+    expect(target).not.toBeNull();
+    const st = await fs.stat(path.join(TEMP_CACHE, "uv", UV_VERSION, target as string));
+    expect(st.isDirectory()).toBe(true);
+  });
 });
 
 // ── sha256 checksum mismatch ──────────────────────────────────────────────

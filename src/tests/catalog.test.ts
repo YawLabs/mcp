@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CATALOG_STALE_AFTER_DAYS,
   type CatalogServer,
   DEFAULT_CATALOG_URL,
   defaultFetchCatalog,
@@ -345,5 +346,71 @@ describe("defaultFetchCatalog", () => {
       throw "string rejection";
     });
     await expect(defaultFetchCatalog()).rejects.toThrow("string rejection");
+  });
+
+  // generated_at staleness note -- the parser used to read only body.servers
+  // and drop the one field that distinguishes a frozen catalog from a fresh
+  // one, so `add`/`try` handed out an old snapshot's install lines forever
+  // with nothing anywhere able to say the source went stale.
+  describe("generated_at staleness note", () => {
+    const GENERATED = "2026-01-01T00:00:00.000Z";
+    const DAY_MS = 86_400_000;
+
+    function stubCatalog(extra: Record<string, unknown>): void {
+      stubFetch(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ servers: [{ slug: "a" }], ...extra }),
+      }));
+    }
+
+    it("warns once the catalog is CATALOG_STALE_AFTER_DAYS old, naming the date and the age", async () => {
+      stubCatalog({ generated_at: GENERATED });
+      const warned: string[] = [];
+      const now = () => Date.parse(GENERATED) + (CATALOG_STALE_AFTER_DAYS + 1) * DAY_MS;
+      const servers = await defaultFetchCatalog(DEFAULT_CATALOG_URL, { warn: (l) => warned.push(l), now });
+      // The note is advisory: the servers still resolve.
+      expect(servers.map((s) => s.slug)).toEqual(["a"]);
+      expect(warned).toEqual([
+        `yaw-mcp: note: the Yaw MCP catalog was generated 2026-01-01 (${CATALOG_STALE_AFTER_DAYS + 1} days ago); its entries may be out of date.`,
+      ]);
+    });
+
+    it("stays silent below the floor", async () => {
+      stubCatalog({ generated_at: GENERATED });
+      const warned: string[] = [];
+      const now = () => Date.parse(GENERATED) + (CATALOG_STALE_AFTER_DAYS - 1) * DAY_MS;
+      await defaultFetchCatalog(DEFAULT_CATALOG_URL, { warn: (l) => warned.push(l), now });
+      expect(warned).toEqual([]);
+    });
+
+    it.each([
+      ["missing", {}],
+      ["not a string", { generated_at: 1735689600000 }],
+      ["unparsable", { generated_at: "not-a-date" }],
+      // Clock skew is not staleness -- a future stamp must not warn (or wrap
+      // into a huge negative age).
+      ["in the future", { generated_at: "2999-01-01T00:00:00.000Z" }],
+    ])("stays silent when generated_at is %s", async (_label, extra) => {
+      stubCatalog(extra as Record<string, unknown>);
+      const warned: string[] = [];
+      const servers = await defaultFetchCatalog(DEFAULT_CATALOG_URL, { warn: (l) => warned.push(l) });
+      expect(servers.map((s) => s.slug)).toEqual(["a"]);
+      expect(warned).toEqual([]);
+    });
+
+    it("defaults the sink to process.stderr so machine-read stdout stays clean", async () => {
+      stubCatalog({ generated_at: GENERATED });
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const now = () => Date.parse(GENERATED) + (CATALOG_STALE_AFTER_DAYS + 5) * DAY_MS;
+        await defaultFetchCatalog(DEFAULT_CATALOG_URL, { now });
+        const written = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
+        expect(written).toContain("the Yaw MCP catalog was generated 2026-01-01");
+        expect(written.endsWith("\n")).toBe(true);
+      } finally {
+        stderrSpy.mockRestore();
+      }
+    });
   });
 });

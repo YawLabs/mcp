@@ -1658,10 +1658,17 @@ describe("runDoctor — OAM RUNTIME section", () => {
     expect(parsed.oamRuntime.managed.root).toBe(join(synthHome, ".yaw-mcp", "sidecars"));
     // A configured package with nothing installed reports null rather than
     // being omitted -- omission reads as "fine", same rule as the text path.
+    // latest/stale are the uniform no-check shape here: skipRegistryCheck
+    // suppresses the sidecar freshness probe exactly like the @yawlabs/mcp
+    // one, and the keys stay present so a consumer never branches on absence.
     expect(parsed.oamRuntime.managed.packages).toEqual([
-      { pkg: "@yawlabs/fetch-mcp", version: "0.3.6" },
-      { pkg: "@yawlabs/not-installed", version: null },
+      { pkg: "@yawlabs/fetch-mcp", version: "0.3.6", latest: null, stale: false },
+      { pkg: "@yawlabs/not-installed", version: null, latest: null, stale: false },
     ]);
+    // No platform marker in this fixture (a pre-marker tree): "unknown", never
+    // a mismatch claim doctor cannot back.
+    expect(parsed.oamRuntime.managed.installedFor).toBeNull();
+    expect(parsed.oamRuntime.managed.platformMismatch).toBe(false);
   });
 
   it("emits the managed block in --json even when the tree was never created", async () => {
@@ -1690,7 +1697,172 @@ describe("runDoctor — OAM RUNTIME section", () => {
     // root is reported even with nothing installed, so a consumer never has to
     // branch on its absence to learn where yaw-mcp looks.
     expect(parsed.oamRuntime.managed.root).toBe(join(synthHome, ".yaw-mcp", "sidecars"));
-    expect(parsed.oamRuntime.managed.packages).toEqual([{ pkg: "@yawlabs/fetch-mcp", version: null }]);
+    expect(parsed.oamRuntime.managed.packages).toEqual([
+      { pkg: "@yawlabs/fetch-mcp", version: null, latest: null, stale: false },
+    ]);
+    expect(parsed.oamRuntime.managed.installedFor).toBeNull();
+    expect(parsed.oamRuntime.managed.platformMismatch).toBe(false);
+  });
+
+  it("lists the managed version for a Windows-shaped `npx.cmd` server too", async () => {
+    // The managed block filters through the same nodeLaunchKind classifier as
+    // rewriteForOam, not `=== "npx"` string equality -- a hand-edited
+    // bundles.json carrying `npx.cmd` is hosted on oam by the rewrite, so a
+    // block that omitted its package would hide exactly the version that
+    // server runs.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx.cmd", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+
+    expect(cap.text()).toMatch(/@yawlabs\/fetch-mcp\s+0\.3\.6/);
+  });
+
+  it("flags a managed package that is behind the registry, and only probes installed ones", async () => {
+    // oam cannot re-resolve "@latest", so a pin only moves when `sidecars
+    // install` is re-run -- without the registry check "0.3.6" reads
+    // identically whether that is current or a year old. Advisory like the
+    // UPGRADE AVAILABLE hint: no warning, no exit-code change.
+    writeLocalBundles({
+      version: 1,
+      servers: [
+        { namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] },
+        { namespace: "gone", name: "Gone", command: "npx", args: ["-y", "@yawlabs/not-installed@latest"] },
+      ],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+
+    const probed: string[] = [];
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      oamProbe: oamOk,
+      sidecarRegistryFetch: async (pkg) => {
+        probed.push(pkg);
+        return "0.9.9";
+      },
+    });
+
+    expect(cap.text()).toContain("0.3.6  (latest 0.9.9 -- re-run `yaw-mcp sidecars install`)");
+    expect(r.exitCode, "staleness is advisory, never a warning").toBe(0);
+    // A package that is not installed has no version to be stale AGAINST --
+    // its problem is "not in the managed tree", and probing the registry for
+    // it would spend network on a question doctor cannot use the answer to.
+    expect(probed).toEqual(["@yawlabs/fetch-mcp"]);
+  });
+
+  it("stays quiet about freshness when the managed version IS the latest", async () => {
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      oamProbe: oamOk,
+      sidecarRegistryFetch: async () => "0.3.6",
+    });
+
+    expect(cap.text()).not.toContain("(latest ");
+  });
+
+  it("warns when the managed tree was filled on a different platform/arch", async () => {
+    // The tree is keyed on HOME alone, and npm resolves native bindings for
+    // the node that RAN the install -- so on a home shared across
+    // architectures every version can read as present and fine while the
+    // packages fail at spawn. The marker `sidecars install` writes is what
+    // lets doctor say so. "beos/sparc" cannot equal any real test runner.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const root = join(synthHome, ".yaw-mcp", "sidecars");
+    const pkgDir = join(root, "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    writeFileSync(join(root, "platform.json"), JSON.stringify({ platform: "beos", arch: "sparc" }));
+
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+    const txt = cap.text();
+
+    expect(txt).toContain(`! installed on beos/sparc; this process is ${process.platform}/${process.arch}.`);
+    expect(txt).toContain("re-run `yaw-mcp sidecars install` on this machine");
+  });
+
+  it("stays quiet when the platform marker matches this process", async () => {
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const root = join(synthHome, ".yaw-mcp", "sidecars");
+    const pkgDir = join(root, "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    writeFileSync(join(root, "platform.json"), JSON.stringify({ platform: process.platform, arch: process.arch }));
+
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, oamProbe: oamOk });
+
+    expect(cap.text()).not.toContain("! installed on");
+  });
+
+  it("mirrors freshness and install-platform facts into --json", async () => {
+    // Same verdicts as the text path, from the same collector -- a dashboard
+    // consumer reading only the JSON must see the two failure modes the text
+    // path flags: a pin the registry has moved past, and a tree built for a
+    // different machine.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const root = join(synthHome, ".yaw-mcp", "sidecars");
+    const pkgDir = join(root, "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    writeFileSync(join(root, "platform.json"), JSON.stringify({ platform: "beos", arch: "sparc" }));
+
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamOk,
+      // An explicit hook bypasses skipRegistryCheck/VITEST, same contract as
+      // registryFetch -- that is what makes this branch reachable here.
+      sidecarRegistryFetch: async () => "0.9.9",
+    });
+
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.oamRuntime.managed.packages).toEqual([
+      { pkg: "@yawlabs/fetch-mcp", version: "0.3.6", latest: "0.9.9", stale: true },
+    ]);
+    expect(parsed.oamRuntime.managed.installedFor).toEqual({ platform: "beos", arch: "sparc" });
+    expect(parsed.oamRuntime.managed.platformMismatch).toBe(true);
   });
 
   it("emits the oamRuntime block on the --json path (mirror of the text section)", async () => {

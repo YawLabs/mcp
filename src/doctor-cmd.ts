@@ -83,7 +83,14 @@ import {
   STATE_FILENAME,
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
-import { collectSidecarSpecs, hasManagedSidecars, installedVersion, sidecarsRoot } from "./sidecars-cmd.js";
+import {
+  collectSidecarSpecs,
+  hasManagedSidecars,
+  installedPlatform,
+  installedVersion,
+  type SidecarsPlatform,
+  sidecarsRoot,
+} from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
 import {
@@ -177,6 +184,12 @@ export interface DoctorOptions {
   skipRegistryCheck?: boolean;
   /** Test hook: return the latest-version string for @yawlabs/mcp. */
   registryFetch?: () => Promise<string | null>;
+  /** Test hook: return the latest-version string for a managed sidecar
+   *  package. Same contract as registryFetch (null = unknown), but keyed by
+   *  package -- the managed tree holds several. Like registryFetch, an
+   *  explicit hook bypasses the VITEST auto-skip so the stale branches are
+   *  reachable under tests. */
+  sidecarRegistryFetch?: (pkg: string) => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
   /** Test hook: replace the fire-and-forget POST for expiry-gc events. */
@@ -301,8 +314,28 @@ export interface DoctorJsonSnapshot {
      *  npx cache instead. This is the version an oam-hosted sidecar will
      *  ACTUALLY run -- bundles.json only says "@latest" and oam cannot
      *  re-resolve it, so nothing else reports this. `packages` is empty when
-     *  no npx-launched server is configured. */
-    managed: { root: string; packages: Array<{ pkg: string; version: string | null }> };
+     *  no npx-launched server is configured.
+     *
+     *  `latest`/`stale` carry the registry freshness of each INSTALLED
+     *  package: oam cannot re-resolve "@latest", so a pin only moves when
+     *  `sidecars install` is re-run -- without this check a year-old pin reads
+     *  identically to a current one. `latest` is null when the package is not
+     *  installed, the registry did not answer, or the check is skipped
+     *  (skipRegistryCheck / VITEST); `stale` is only ever true on a fetched
+     *  answer.
+     *
+     *  `installedFor`/`platformMismatch`: which platform/arch last filled the
+     *  tree (null when the marker is absent -- a pre-marker tree, or none at
+     *  all), and whether it disagrees with THIS process. The tree is keyed on
+     *  HOME alone, so a home shared across architectures holds bindings for
+     *  the installing machine only -- a mismatch means packages can fail at
+     *  spawn here while every version above reads as present and fine. */
+    managed: {
+      root: string;
+      packages: Array<{ pkg: string; version: string | null; latest: string | null; stale: boolean }>;
+      installedFor: SidecarsPlatform | null;
+      platformMismatch: boolean;
+    };
   };
   upgrade: { current: string; latest: string | null; stale: boolean };
   diagnosis: { exitCode: number; summary: string };
@@ -431,7 +464,13 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // (oam vs node) and why. The oam spawn-rewrite falls back to node
   // silently by design (oam absent / below min / non-node command), so
   // this section is where that fallback becomes visible.
-  const oamStatus = await collectOamRuntimeStatus({ env, cwd, home, probeFn: opts.oamProbe ?? probeOam });
+  const oamStatus = await collectOamRuntimeStatus({
+    env,
+    cwd,
+    home,
+    probeFn: opts.oamProbe ?? probeOam,
+    sidecarLatest: sidecarLatestFetcher(opts),
+  });
   // bundles.json diagnostics (unparseable file, bad schema version, invalid
   // defaultRuntime, skipped server entries) come back from the loader the
   // collector already ran. They were DISCARDED here, which is how a hand-edited
@@ -750,7 +789,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   // oam runtime block — same collector as the text path's OAM RUNTIME
   // section, so the two surfaces can't drift.
-  const oamStatus = await collectOamRuntimeStatus({ env, cwd, home, probeFn: opts.oamProbe ?? probeOam });
+  const oamStatus = await collectOamRuntimeStatus({
+    env,
+    cwd,
+    home,
+    probeFn: opts.oamProbe ?? probeOam,
+    sidecarLatest: sidecarLatestFetcher(opts),
+  });
   // Identical fold to the text path -- a malformed bundles.json must reach
   // `.warnings` and exit 2 on both surfaces.
   config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
@@ -893,13 +938,57 @@ interface OamRuntimeStatus {
    *  resolution (it would make doctor flap), but rewriteForOam DOES, and keeps
    *  npx when the package is on disk nowhere. */
   servers: Array<{ namespace: string; command: string | undefined; info: ServerRuntimeInfo }>;
-  /** The managed install (`yaw-mcp sidecars install`): where it is, and the
-   *  version of each package in it. Empty when it has never been run. */
-  managed: { root: string; packages: Array<{ pkg: string; version: string | null }> };
+  /** The managed install (`yaw-mcp sidecars install`): where it is, the
+   *  version + registry freshness of each package in it, and which
+   *  platform/arch filled it. Empty when it has never been run. Field
+   *  semantics are documented on DoctorJsonSnapshot.oamRuntime.managed, which
+   *  mirrors this object verbatim. */
+  managed: {
+    root: string;
+    packages: Array<{ pkg: string; version: string | null; latest: string | null; stale: boolean }>;
+    installedFor: SidecarsPlatform | null;
+    platformMismatch: boolean;
+  };
   /** Diagnostics from the bundles.json read (unparseable file, schema ahead,
    *  invalid defaultRuntime, skipped entries). The caller folds these into
    *  config.warnings -- see foldBundleWarnings. */
   bundleWarnings: string[];
+}
+
+// Latest-version probe for a managed sidecar package. Same contract and
+// response validation as upgrade-cmd's fetchLatestVersion (null on any
+// failure, hard abort at doctor's budget) but keyed by package -- that one is
+// hardwired to @yawlabs/mcp itself, and doctor is the only caller that asks
+// about arbitrary packages, so it lives here rather than generalizing the
+// shared probe. The unencoded scoped-name URL matches the shape upgrade-cmd
+// has always used against this registry.
+async function fetchSidecarLatest(pkg: string): Promise<string | null> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), DOCTOR_REGISTRY_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
+      signal: ac.signal,
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { version?: unknown };
+    return typeof body.version === "string" ? body.version : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The gate for the per-sidecar freshness probe, shared by the text and --json
+// paths so the two cannot disagree about whether the check ran. Same shape as
+// the @yawlabs/mcp skipCheck in runDoctor (and the same deliberate
+// process.env.VITEST read -- opts.env is stripped to `{}` under vitest, so
+// the auto-skip is only visible there): an explicit sidecarRegistryFetch hook
+// bypasses the skip so tests can reach the stale branches.
+function sidecarLatestFetcher(opts: DoctorOptions): ((pkg: string) => Promise<string | null>) | null {
+  const skip = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.sidecarRegistryFetch;
+  return skip ? null : (opts.sidecarRegistryFetch ?? fetchSidecarLatest);
 }
 
 async function collectOamRuntimeStatus(opts: {
@@ -909,6 +998,9 @@ async function collectOamRuntimeStatus(opts: {
   // Accepts sync OR async so doctor's own test fixtures can keep passing a
   // plain object while production passes the async probeOam (issue #91).
   probeFn: () => OamProbe | Promise<OamProbe>;
+  /** Latest-version probe for a managed sidecar package, or null when the
+   *  registry check is skipped. See sidecarLatestFetcher. */
+  sidecarLatest: ((pkg: string) => Promise<string | null>) | null;
 }): Promise<OamRuntimeStatus> {
   const probe = await opts.probeFn();
   // `env` is threaded through so the loader's trust gate sees the SAME
@@ -938,9 +1030,30 @@ async function collectOamRuntimeStatus(opts: {
   // package would otherwise cost a stat + read + JSON.parse that can only come
   // back null.
   const anyManaged = hasManagedSidecars(opts.home);
+  const packages = await Promise.all(
+    specs.map(async (s) => {
+      const version = anyManaged ? installedVersion(s.pkg, opts.home) : null;
+      // Freshness only for a package that is actually INSTALLED (a missing one
+      // already reads as "not in the managed tree" -- its problem is not
+      // staleness) and only when the registry check is on at all. In parallel,
+      // so N packages cost one timeout window, not N -- doctor must not hang.
+      const latest = version !== null && opts.sidecarLatest !== null ? await opts.sidecarLatest(s.pkg) : null;
+      // Strictly behind, on a fetched answer only -- compareSemver treats
+      // unparseable as equal, so a weird version cannot invent a false stale.
+      const stale = version !== null && latest !== null && compareSemver(version, latest) < 0;
+      return { pkg: s.pkg, version, latest, stale };
+    }),
+  );
+  // Who filled the tree vs who is asking. npm resolves native bindings for the
+  // node that RUNS the install, so a marker from another platform/arch means
+  // the versions above can be present, current, and still fail at spawn here.
+  const installedFor = anyManaged ? installedPlatform(opts.home) : null;
   const managed = {
     root: sidecarsRoot(opts.home),
-    packages: specs.map((s) => ({ pkg: s.pkg, version: anyManaged ? installedVersion(s.pkg, opts.home) : null })),
+    packages,
+    installedFor,
+    platformMismatch:
+      installedFor !== null && (installedFor.platform !== process.platform || installedFor.arch !== process.arch),
   };
   return { probe, dflt, servers, managed, bundleWarnings: bundles?.warnings ?? [] };
 }
@@ -1045,7 +1158,25 @@ function renderOamRuntimeSection(opts: {
         // npx cache") asserted a lookup doctor never performs -- nothing here
         // reads any npx cache -- and was wrong whenever the package sits in no
         // cache either, which is the case that keeps the server on npx/node.
-        print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not in the managed tree"}`);
+        //
+        // The stale suffix is the registry check: oam cannot re-resolve
+        // "@latest", so a pin only moves when `sidecars install` is re-run --
+        // without this, "0.3.6" reads identically whether that is current or a
+        // year old. Advisory like the UPGRADE AVAILABLE hint, never a warning.
+        const staleNote =
+          p.stale && p.latest !== null ? `  (latest ${p.latest} -- re-run \`yaw-mcp sidecars install\`)` : "";
+        print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not in the managed tree"}${staleNote}`);
+      }
+      // The versions above can all be present and current and the tree still
+      // unusable HERE: npm resolved native bindings for the machine that ran
+      // the install, and the tree is keyed on HOME alone (see
+      // installedPlatform in sidecars-cmd.ts).
+      if (managed.platformMismatch && managed.installedFor !== null) {
+        print(
+          `    ! installed on ${managed.installedFor.platform}/${managed.installedFor.arch}; this process is ${process.platform}/${process.arch}.`,
+        );
+        print("      Native bindings resolve for the installing machine, so these packages can fail");
+        print("      at spawn here -- re-run `yaw-mcp sidecars install` on this machine.");
       }
     }
   }

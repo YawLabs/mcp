@@ -35,6 +35,24 @@ describe("resolveServerCap", () => {
     expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "abc" })).toBe(DEFAULT_SERVER_CAP);
     expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "-2" })).toBe(DEFAULT_SERVER_CAP);
   });
+
+  it("falls back to the default on values parseInt would prefix-truncate", () => {
+    // parseInt("0x10", 10) -> 0, parseInt("0.5", 10) -> 0, parseInt("0abc",
+    // 10) -> 0: each malformed value would land on the disable-the-cap
+    // sentinel and silently REMOVE the ceiling instead of defaulting.
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "0x10" })).toBe(DEFAULT_SERVER_CAP);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "0.5" })).toBe(DEFAULT_SERVER_CAP);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "0abc" })).toBe(DEFAULT_SERVER_CAP);
+    // Trailing garbage and scientific notation must not be silently
+    // truncated either: "6 servers" -> 6 and "1e2" -> 1 under parseInt.
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "6 servers" })).toBe(DEFAULT_SERVER_CAP);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: "1e2" })).toBe(DEFAULT_SERVER_CAP);
+  });
+
+  it("tolerates surrounding whitespace on an otherwise-valid value", () => {
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: " 8 " })).toBe(8);
+    expect(resolveServerCap({ YAW_MCP_SERVER_CAP: " 0 " })).toBe(0);
+  });
 });
 
 describe("evaluateServerCap", () => {

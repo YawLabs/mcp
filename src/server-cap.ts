@@ -19,8 +19,14 @@ export const DEFAULT_SERVER_CAP = 6;
 export function resolveServerCap(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.YAW_MCP_SERVER_CAP;
   if (raw === undefined || raw === "") return DEFAULT_SERVER_CAP;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) return DEFAULT_SERVER_CAP;
+  // Strict digit-run parse. parseInt's prefix parsing would turn "0x10",
+  // "0.5", and "0abc" into 0 -- the disable-the-cap sentinel -- and "1e2"
+  // into 1, so a malformed value could silently REMOVE or shrink the
+  // ceiling instead of falling back to the default as promised above.
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_SERVER_CAP;
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(n)) return DEFAULT_SERVER_CAP;
   return n;
 }
 

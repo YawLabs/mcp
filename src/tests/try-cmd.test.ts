@@ -328,6 +328,36 @@ describe("runTry — happy path", () => {
     const canonical = buildLaunchEntry({ os: "windows" });
     expect(entry.command).toBe(canonical.command);
   });
+
+  it("caret-escapes cmd metacharacters in catalog args on Windows (client-spawn injection guard)", async () => {
+    // The trial entry is spawned by the MCP CLIENT, whose libuv only quotes
+    // argv elements containing space/tab/quote — so a catalog arg carrying a
+    // bare `&` would reach cmd.exe unquoted and run the tail as a second
+    // command at client-spawn time, with the config file looking innocuous.
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "windows",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({
+        ...SAMPLE,
+        args: ["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2"],
+      }),
+      postEvent: async () => undefined,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const clientPath = join(synthHome, ".claude.json");
+    const client = JSON.parse(readFileSync(clientPath, "utf8"));
+    const entry = client.mcpServers["yaw-mcp-try-demo"];
+    expect(entry.command).toBe("cmd");
+    expect(entry.args).toEqual(["/c", "npx", "-y", "@demo/mcp", "--url", "https://api/x?a=1^&b=2"]);
+  });
 });
 
 describe("runTry — missing env vars", () => {

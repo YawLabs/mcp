@@ -113,14 +113,6 @@ describe("computeOutcomeReward", () => {
       expect(computeOutcomeReward({ content: [{ type: "text", text: "   \n\t " }] })).toBe(0.3);
     });
 
-    it("scores 0.3 when no block carries text (e.g. image-only)", () => {
-      expect(
-        computeOutcomeReward({
-          content: [{ type: "image" }],
-        }),
-      ).toBe(0.3);
-    });
-
     it("scores 0.3 when all text blocks are empty/whitespace", () => {
       expect(
         computeOutcomeReward({
@@ -178,6 +170,40 @@ describe("computeOutcomeReward", () => {
           content: [{ type: "image" }, { type: "text", text: "ok" }],
         }),
       ).toBe(1.0);
+    });
+
+    // Non-text substance is a genuine success, not an empty body: a
+    // screenshot/chart/audio server legitimately returns zero text, and a
+    // tool with an outputSchema returns structuredContent with content
+    // legally empty (CallToolResultSchema: content "may be empty"). Grading
+    // these 0.3 pushed healthy servers under PENALTY_RATE_THRESHOLD and
+    // listed them as flaky.
+    it("scores 1.0 for a text-free non-text result (image / audio / resource_link)", () => {
+      for (const type of ["image", "audio", "resource_link"]) {
+        expect(computeOutcomeReward({ content: [{ type }] })).toBe(1.0);
+      }
+    });
+
+    it("scores 1.0 for structured output with empty content", () => {
+      expect(computeOutcomeReward({ content: [], structuredContent: { rows: 3 } })).toBe(1.0);
+      expect(computeOutcomeReward({ structuredContent: { ok: true } })).toBe(1.0);
+    });
+
+    it("still scores 0.3 when there is neither text, non-text blocks, nor structuredContent", () => {
+      expect(computeOutcomeReward({ content: [] })).toBe(0.3);
+      expect(computeOutcomeReward({})).toBe(0.3);
+    });
+
+    it("rule 2 still beats non-text substance: an error-shaped text block wins over an image sibling", () => {
+      expect(
+        computeOutcomeReward({
+          content: [{ type: "text", text: "not found" }, { type: "image" }],
+        }),
+      ).toBe(0.2);
+    });
+
+    it("rule 1 still beats structuredContent: isError true is 0.0 regardless", () => {
+      expect(computeOutcomeReward({ isError: true, structuredContent: { ok: true } })).toBe(0.0);
     });
   });
 

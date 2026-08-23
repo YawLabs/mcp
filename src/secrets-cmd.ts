@@ -371,6 +371,22 @@ function nonTTYEnds(opts: SecretsCommandOptions): string {
   return ends.stdin ? "stdout is not a TTY" : "stdin is not a TTY";
 }
 
+/** The "cannot obtain a passphrase" refusal. The default wording sends the
+ *  user to "a TTY" -- which is actively WRONG on Git Bash / MSYS, where the
+ *  user IS sitting at a terminal but MSYS emulates it with named pipes, so
+ *  Node reports isTTY false and the prompt can never fire. When the env says
+ *  MSYS and prompting really was impossible (a std end is not a TTY, as
+ *  opposed to a TTY user exhausting the re-prompt budget), name the real
+ *  cause and the remedies instead of telling the user their terminal does
+ *  not exist. MSYSTEM is set by every Git Bash flavour (MINGW64 / MINGW32 /
+ *  UCRT64 / MSYS). */
+function promptUnavailableMessage(opts: SecretsCommandOptions, required: string, envVar: string): string {
+  if (!isInteractiveTTY(opts) && (process.env.MSYSTEM ?? "") !== "") {
+    return `${required} Node cannot prompt under Git Bash/MSYS -- the terminal is emulated with pipes, not a TTY. Set ${envVar}, run under winpty (winpty yaw-mcp ...), or use PowerShell/cmd.`;
+  }
+  return `${required} Set ${envVar} or run from a TTY so we can prompt.`;
+}
+
 /** Ask a destructive-action question on the TTY. Defaults to NO: only an
  *  explicit y/yes proceeds, so a bare Enter (or ^D, or anything else)
  *  leaves the vault alone. Echoes what is typed -- a confirmation is not
@@ -564,23 +580,41 @@ function readLineFromTTY(
     };
     // Hoisted declaration so `finish` above can name it.
     function onData(chunk: string): void {
+      let consumed = 0;
+      // Settle, then RE-BUFFER whatever follows the byte that ended this
+      // read. A terminal paste arrives as one chunk, so without this,
+      // pasting "passphrase\nvalue\n" consumed the passphrase and silently
+      // dropped the value line -- the next prompt then hung waiting for
+      // input the user believes they already gave. unshift() puts the
+      // residual at the head of the stream (finish() has already paused
+      // it), so the NEXT reader's resume() picks it up. Optional call: the
+      // injectable io contract only promises a ReadableStream shape.
+      const finishAndRebuffer = (value: string | Cancelled): void => {
+        finish(value);
+        const rest = chunk.slice(consumed);
+        if (rest.length > 0) (stdin as { unshift?: (c: string) => void }).unshift?.(rest);
+      };
       for (const ch of chunk) {
+        consumed += ch.length;
         if (ch === "\n" || ch === "\r") {
-          finish(chunks.join(""));
+          // A pasted CRLF is ONE Enter: swallow the \n so it cannot be
+          // re-buffered and submit the next prompt as empty.
+          if (ch === "\r" && chunk[consumed] === "\n") consumed += 1;
+          finishAndRebuffer(chunks.join(""));
           return;
         }
         if (ch === CTRL_D) {
           // Cancel this entry. Resolve to "" so the caller treats it as an
           // empty submission and re-prompts -- never a line terminator that
           // would submit a partial passphrase.
-          finish("");
+          finishAndRebuffer("");
           return;
         }
         if (ch === CTRL_C) {
           // Cancel the command. We deliberately do NOT process.exit() here:
           // the io streams are injectable, so a fed 0x03 must not be able to
           // kill the host process. The caller maps CANCELLED to exit 130.
-          finish(CANCELLED);
+          finishAndRebuffer(CANCELLED);
           return;
         }
         if (ch === "\b" || ch === DEL) {
@@ -757,7 +791,7 @@ export async function runSecrets(
   const passphrase = await resolvePassphrase(opts, creatingVault);
   if (passphrase === CANCELLED) return cancelledResult(io, opts.json);
   if (passphrase === null) {
-    const msg = "Passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.";
+    const msg = promptUnavailableMessage(opts, "Passphrase required.", "YAW_MCP_VAULT_PASSPHRASE");
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
     else io.err(`yaw-mcp secrets: ${msg}\n`);
     return { exitCode: 1 };
@@ -905,7 +939,7 @@ async function runSecretsRotate(
   const currentPassphrase = await resolvePassphrase(opts);
   if (currentPassphrase === CANCELLED) return cancelledResult(io, opts.json);
   if (currentPassphrase === null) {
-    const msg = "Current passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.";
+    const msg = promptUnavailableMessage(opts, "Current passphrase required.", "YAW_MCP_VAULT_PASSPHRASE");
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
     else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
     return { exitCode: 1 };
@@ -924,8 +958,11 @@ async function runSecretsRotate(
   const newPassphrase = await resolveNewPassphrase(opts);
   if (newPassphrase === CANCELLED) return cancelledResult(io, opts.json);
   if (newPassphrase === null) {
-    const msg =
-      "New passphrase required (and must be confirmed). Set YAW_MCP_VAULT_PASSPHRASE_NEW or run from a TTY so we can prompt.";
+    const msg = promptUnavailableMessage(
+      opts,
+      "New passphrase required (and must be confirmed).",
+      "YAW_MCP_VAULT_PASSPHRASE_NEW",
+    );
     if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
     else io.err(`yaw-mcp secrets rotate: ${msg}\n`);
     return { exitCode: 1 };

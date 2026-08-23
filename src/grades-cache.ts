@@ -28,11 +28,17 @@ import { CONFIG_DIRNAME } from "./paths.js";
 export const GRADES_FILENAME = "grades.json";
 
 /** One cached grade entry. `grade` is the A-F letter; `score` is the 0-100
- *  percentage; `gradedAt` is an ISO-8601 timestamp of when the audit ran. */
+ *  percentage; `gradedAt` is an ISO-8601 timestamp of when the audit ran.
+ *  `suiteVersion` is the compliance rubric that produced the letter
+ *  (SPEC_VERSION from @yawlabs/mcp-compliance) -- optional because entries
+ *  written before it existed carry only the timestamp. Without it two rubrics'
+ *  letters are indistinguishable in `list`, so a pre-rubric-change "A" reads
+ *  as current. */
 export interface CachedGrade {
   grade: "A" | "B" | "C" | "D" | "F";
   score: number;
   gradedAt: string;
+  suiteVersion?: string;
 }
 
 /** The on-disk shape: a map of namespace -> cached grade. */
@@ -68,7 +74,12 @@ function validateEntry(entry: unknown): CachedGrade | null {
   if (score < MIN_SCORE || score > MAX_SCORE) return null;
   const gradedAt = typeof e.gradedAt === "string" && e.gradedAt.length > 0 ? e.gradedAt : "";
   if (!gradedAt) return null;
-  return { grade: grade as CachedGrade["grade"], score, gradedAt };
+  // Optional: entries from before suiteVersion existed stay valid without it;
+  // a malformed value is dropped from the entry rather than dropping the entry.
+  const suiteVersion = typeof e.suiteVersion === "string" && e.suiteVersion.length > 0 ? e.suiteVersion : undefined;
+  return suiteVersion
+    ? { grade: grade as CachedGrade["grade"], score, gradedAt, suiteVersion }
+    : { grade: grade as CachedGrade["grade"], score, gradedAt };
 }
 
 /** Read the grade cache. Returns an empty object when the file is absent or

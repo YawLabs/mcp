@@ -177,6 +177,28 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
   });
 
+  // 5b. Regression: the walk-up must not stop at a directory whose NAME
+  // starts with "..". migrate.ts once carried its own isUnderHome with a
+  // bare `startsWith("..")` bound, so relative(home, dir) = "..config/app"
+  // read as "escaped $HOME" and a legacy file under `~/..config/` was
+  // discoverable by the loader but never migrated -- silent config loss.
+  // The predicate is now shared with paths.ts (anchored on a separator).
+  it("migrates a legacy file under a directory whose name starts with '..'", async () => {
+    const projectRoot = join(home, "..config", "app");
+    mkdirSync(projectRoot, { recursive: true });
+    writeLegacy(projectRoot, LEGACY_PROJECT_FILENAME);
+    const deep = join(projectRoot, "src");
+    mkdirSync(deep, { recursive: true });
+
+    await migrateLegacyConfigPaths({ cwd: deep, home });
+
+    const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.json");
+    const { readFile } = await import("node:fs/promises");
+    const content = JSON.parse(await readFile(targetPath, "utf8"));
+    expect(content.token).toBe("mcp_pat_legacy_aaaa");
+    await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
+  });
+
   // 6. Returns null (no project migration) when the walk reaches $HOME itself.
   it("does not migrate a legacy file sitting at $HOME as a project file", async () => {
     // `.yaw-mcp.local.json` at $HOME. The local variant is deliberate: the
@@ -202,9 +224,10 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
   it("is a no-op when cwd is outside $HOME (no walk to the filesystem root)", async () => {
     // A cwd outside $HOME used to send the walker all the way to the
     // filesystem root, destructively renaming any `.yaw-mcp.json` it passed
-    // into a `.yaw-mcp/` that findProjectConfigDir (bounded at $HOME) never
-    // reads -- i.e. silent token loss. The migrator's bound now matches the
-    // loader's: outside $HOME it does nothing.
+    // -- hoisting files from unrelated ancestors (a shared /tmp, `/`).
+    // The loader now walks outside $HOME too (ownership-gated), but the
+    // DESTRUCTIVE migrator deliberately stays strictly under $HOME: legacy
+    // files out there are left in place for the user to move by hand.
     const outside = mkdtempSync(join(tmpdir(), "yaw-mcp-migrate-outside-"));
     try {
       const legacyProject = writeLegacy(outside, LEGACY_PROJECT_FILENAME);

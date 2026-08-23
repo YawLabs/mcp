@@ -25,8 +25,11 @@ function captureIO(): { out: string[]; err: string[]; text: () => string; errTex
   return { out, err, text: () => out.join(""), errText: () => err.join("") };
 }
 
-// Realistic catalog shapes: like the live catalog, each slug's word-form
-// matches its name (so deriveNamespace(slug) === deriveNamespace(name)).
+// Realistic catalog shapes: like the live catalog, most slugs' word-form
+// matches their name (so deriveNamespace(slug) === deriveNamespace(name)).
+// The "ga" row is the live catalog's exception -- its name ("Google
+// Analytics") derives to a namespace ("googleanalytics") that shares nothing
+// with the slug, which is exactly what the persisted-slug removal path is for.
 const CATALOG: CatalogServer[] = [
   {
     slug: "tailscale",
@@ -55,6 +58,11 @@ const CATALOG: CatalogServer[] = [
     slug: "remote-thing",
     name: "Remote Thing",
     install: { command: "", runtime: "remote", url: "https://example.com/mcp" },
+  },
+  {
+    slug: "ga",
+    name: "Google Analytics",
+    install: { command: "npx -y @yawlabs/ga-mcp", runtime: "node" },
   },
 ];
 
@@ -664,6 +672,89 @@ describe("runRemove", () => {
   });
 });
 
+// `add` derives the namespace from the catalog display NAME, so a slug whose
+// name is an expansion of it ("ga" -> "Google Analytics" -> "googleanalytics")
+// produces an entry that neither the literal removal target nor
+// deriveNamespace(target) can reach -- `add ga` then `remove ga` used to
+// silently no-op at exit 0, leaving the entry (and any stored env value) on
+// disk while REMOVE_USAGE promised the slug would work. add now records the
+// slug on the entry, and remove maps it back to the namespace.
+describe("runRemove maps a recorded catalog slug back to its NAME-derived namespace", () => {
+  const addGa = async (): Promise<void> => {
+    await runAdd({
+      slug: "ga",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+  };
+  const rawServers = (): Array<Record<string, unknown>> =>
+    (
+      JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+        servers: Array<Record<string, unknown>>;
+      }
+    ).servers;
+
+  it("add ga writes namespace googleanalytics and records slug ga on the entry", async () => {
+    await addGa();
+    const [entry] = rawServers();
+    expect(entry.namespace).toBe("googleanalytics");
+    expect(entry.slug).toBe("ga");
+  });
+
+  it("remove <slug> removes the entry `add <slug>` just wrote", async () => {
+    await addGa();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "ga",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Removed "googleanalytics"/);
+    expect(rawServers()).toHaveLength(0);
+  });
+
+  it("gates a slug-mapped removal with the same confirmation preview", async () => {
+    // The slug-mapped candidate must flow through findRemovalTarget too, or
+    // the slug form would delete with no confirmation at all (the same hole
+    // the derived-namespace form was tested for).
+    await addGa();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "ga",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.text()).toMatch(/namespace: googleanalytics/);
+    expect(rawServers()).toHaveLength(1);
+  });
+
+  it("removing by the NAMESPACE still works for a slug-recorded entry", async () => {
+    await addGa();
+    const r = await runRemove({
+      target: "googleanalytics",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawServers()).toHaveLength(0);
+  });
+});
+
 // `remove` used to delete the entry with no confirmation, on a TTY or off it --
 // the only destructive verb in the CLI without a gate. These lock the gate's
 // two halves (confirm on a TTY, refuse off one) AND the no-op behaviour that
@@ -1045,6 +1136,34 @@ describe("runList", () => {
     expect(parseListArgs(["--bogus"]).ok).toBe(false);
   });
 
+  // Same posture as `add --json` (jsonEntry): bundles.json entries can carry
+  // `--env` secrets, and `list --json` gets piped into CI logs and bug
+  // reports -- a stored value must never reach stdout, only the key names.
+  it("--json never prints stored env VALUES, only envKeys names", async () => {
+    await runAdd({
+      slug: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      envOverrides: { TAILSCALE_API_KEY: "tskey-REALSECRET-123" },
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(io.text()).not.toContain("tskey-REALSECRET-123");
+    const parsed = JSON.parse(io.text());
+    expect(parsed.servers[0].env).toBeUndefined();
+    expect(parsed.servers[0].envKeys).toEqual(["TAILSCALE_API_KEY"]);
+  });
+
   // Fix 3: malformed bundles.json -- warnings printed to stderr, not silently dropped
   it("prints load warnings to stderr when bundles.json is malformed (fix 3)", async () => {
     const { writeFileSync, mkdirSync } = await import("node:fs");
@@ -1123,11 +1242,33 @@ describe("runList", () => {
       cwd: synthCwd,
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
-      gradesReader: async () => ({ fetch: { grade: "A", score: 100, gradedAt: "t" } }),
+      gradesReader: async () => ({ fetch: { grade: "A", score: 100, gradedAt: "2026-06-11T00:00:00.000Z" } }),
     });
     const parsed = JSON.parse(io.text());
     expect(parsed.servers[0].namespace).toBe("fetch");
     expect(parsed.servers[0].complianceGrade).toBe("A");
+    // The audit timestamp rides along as the staleness signal; this legacy
+    // entry has no suiteVersion, so the field stays absent rather than "".
+    expect(parsed.servers[0].complianceGradedAt).toBe("2026-06-11T00:00:00.000Z");
+    expect(parsed.servers[0].complianceSuiteVersion).toBeUndefined();
+  });
+
+  it("emits complianceSuiteVersion when the cache entry carries one (json)", async () => {
+    await addFetch();
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({
+        fetch: { grade: "A", score: 100, gradedAt: "2026-08-23T00:00:00.000Z", suiteVersion: "0.17.1" },
+      }),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.servers[0].complianceGrade).toBe("A");
+    expect(parsed.servers[0].complianceSuiteVersion).toBe("0.17.1");
   });
 
   it("leaves a never-audited server ungraded in json", async () => {
@@ -1143,6 +1284,7 @@ describe("runList", () => {
     });
     const parsed = JSON.parse(io.text());
     expect(parsed.servers[0].complianceGrade).toBeUndefined();
+    expect(parsed.servers[0].complianceGradedAt).toBeUndefined();
   });
 
   it("renders the cached grade in the GRADE column", async () => {
@@ -1266,10 +1408,20 @@ describe("runAdd env-at-rest [#3]", () => {
       out: () => {},
       err: (s) => errLines.push(s),
     });
+    // The key is seeded EMPTY on disk (documenting the requirement) but the
+    // ambient secret is NOT written.
+    const raw = JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+      servers: Array<Record<string, unknown>>;
+    };
+    expect((raw.servers[0].env as Record<string, string>).GITHUB_PERSONAL_ACCESS_TOKEN).toBe("");
+    expect(JSON.stringify(raw)).not.toContain("ghp_shell_secret");
+    // ...and the LOADER drops the empty seed: the spawn env is
+    // { ...parentEnv, ...serverEnv } (upstream.ts), so a loaded "" would
+    // clobber the ambient shell value the note above says the server relies
+    // on -- the server would start with the var blanked.
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     const entry = loaded.config?.servers.find((s) => s.namespace === "github");
-    // Key is present (seeded) but the ambient secret is NOT written to disk.
-    expect(entry?.env?.GITHUB_PERSONAL_ACCESS_TOKEN).toBe("");
+    expect(entry?.env?.GITHUB_PERSONAL_ACCESS_TOKEN).toBeUndefined();
     expect(JSON.stringify(loaded.config)).not.toContain("ghp_shell_secret");
     // A note warns that the ambient var is not persisted and is needed at launch.
     const note = errLines.join("\n");

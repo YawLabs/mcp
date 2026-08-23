@@ -283,4 +283,47 @@ describe("PackDetector", () => {
     // burst ever contains ≥2 namespaces.
     expect(d.detectChains()).toEqual([]);
   });
+
+  it("detects a pack inside one continuous session (span boundary slices it)", () => {
+    // Regression: a session with tool calls seconds apart never crosses the
+    // 120s idle gap, so the whole history used to collapse into ONE burst --
+    // its namespace set occurred once and MIN_RECURRENCES rejected it.
+    // The span boundary (maxGapMs * BURST_SPAN_FACTOR) slices the session
+    // into windows so recurrence WITHIN it is countable.
+    const d = new PackDetector();
+    const t0 = 1_000_000;
+    const rotation = ["gh", "linear", "slack"];
+    for (let i = 0; i < 100; i++) {
+      d.recordCall(rotation[i % 3], "t", t0 + i * 20_000);
+    }
+
+    const chains = d.detectChains();
+    expect(chains).toHaveLength(1);
+    expect(new Set(chains[0].namespaces)).toEqual(new Set(["gh", "linear", "slack"]));
+    expect(chains[0].frequency).toBeGreaterThanOrEqual(2);
+    expect(chains[0].lastSeenAt).toBe(t0 + 99 * 20_000);
+  });
+
+  it("a 4-namespace rotation surfaces its recurring 3-subsets instead of nothing", () => {
+    // Regression: a burst touching a 4th namespace was discarded whole
+    // (> MAX_NAMESPACES), so a continuous 4-server rotation yielded [].
+    // The overflow boundary cuts the burst BEFORE the 4th namespace joins,
+    // keeping every burst representable as a pack.
+    const d = new PackDetector();
+    const t0 = 1_000_000;
+    const rotation = ["gh", "linear", "slack", "notion"];
+    for (let i = 0; i < 100; i++) {
+      d.recordCall(rotation[i % 4], "t", t0 + i * 20_000);
+    }
+
+    const chains = d.detectChains();
+    expect(chains.length).toBeGreaterThan(0);
+    for (const chain of chains) {
+      expect(chain.namespaces.length).toBeLessThanOrEqual(3);
+      expect(chain.frequency).toBeGreaterThanOrEqual(2);
+    }
+    // The rotation's leading trio is among the surfaced subsets.
+    const sets = chains.map((c) => [...c.namespaces].sort().join("|"));
+    expect(sets).toContain("gh|linear|slack");
+  });
 });

@@ -262,6 +262,18 @@ describe("exec-engine: validateExecRequest", () => {
     if (!r.ok) expect(r.message).toContain("too many steps");
   });
 
+  it('rejects "__proto__" as a step id', () => {
+    // The id becomes a key in the plain-object bindings map, where
+    // `bindings["__proto__"] = payload` hits Object.prototype's setter
+    // instead of creating an own key: the step's output vanishes from the
+    // serialized result and a later $ref to it reports "no step named" for
+    // a step that ran successfully. resolveArgs hardens the args side of
+    // this key; the id side is refused at the door.
+    const r = validateExecRequest({ steps: [{ id: "__proto__", tool: "x" }] });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('"__proto__" is reserved');
+  });
+
   it("rejects duplicate step ids", () => {
     const r = validateExecRequest({
       steps: [

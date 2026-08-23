@@ -124,10 +124,22 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // semantics.
   const command = typeof e.command === "string" ? e.command : undefined;
   const args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === "string") : undefined;
+  // String values only -- and DROP blank ones. `yaw-mcp add` seeds every
+  // required key with "" to record the requirement while deliberately NOT
+  // persisting the ambient shell value ("" means "nothing stored; the server
+  // depends on that var being in the shell wherever yaw-mcp launches"). The
+  // spawn env is `{ ...parentEnv, ...serverEnv }` (upstream.ts), so a loaded
+  // "" would CLOBBER the inherited shell value and start the server with the
+  // var blanked -- the opposite of what `add` prints. Dropping blanks here
+  // keeps the on-disk seed intact (the raw file still documents the required
+  // keys for the removal preview and `add --json`) while every loader
+  // consumer (spawn, `audit`, `list`) sees only the values actually stored.
+  // Trim-blank, not just === "", matching the add path's uniform treatment of
+  // whitespace-only values as missing.
   const env =
     e.env && typeof e.env === "object" && !Array.isArray(e.env)
       ? (Object.fromEntries(
-          Object.entries(e.env as Record<string, unknown>).filter(([, v]) => typeof v === "string"),
+          Object.entries(e.env as Record<string, unknown>).filter(([, v]) => typeof v === "string" && v.trim() !== ""),
         ) as Record<string, string>)
       : undefined;
   const url = typeof e.url === "string" ? e.url : undefined;

@@ -87,6 +87,24 @@ describe("buildToolList", () => {
     const metaCount = Object.keys(META_TOOLS).length;
     expect(tools.length).toBe(metaCount + 2);
   });
+
+  it("forwards title, outputSchema and _meta from upstream tool defs", () => {
+    const conn = makeConnection("srv", ["structured"]);
+    conn.tools[0].title = "Structured Tool";
+    conn.tools[0].outputSchema = { type: "object", properties: { ok: { type: "boolean" } } };
+    conn.tools[0]._meta = { "example.com/k": 1 };
+    const connections = new Map<string, UpstreamConnection>([["srv", conn]]);
+
+    const tools = buildToolList(connections);
+    const entry = tools.find((t) => t.name === "srv_structured");
+    expect(entry).toBeDefined();
+    // The structured-output contract must survive the proxy: routeToolCall
+    // passes structuredContent through verbatim, so the advertised schema
+    // has to travel with the tool for clients to validate against.
+    expect(entry?.title).toBe("Structured Tool");
+    expect(entry?.outputSchema).toEqual({ type: "object", properties: { ok: { type: "boolean" } } });
+    expect(entry?._meta).toEqual({ "example.com/k": 1 });
+  });
 });
 
 describe("buildToolRoutes", () => {

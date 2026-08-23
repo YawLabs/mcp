@@ -80,16 +80,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** Run `fn` with process.platform reporting a POSIX value. normalizeTrustKey
- *  reads it at CALL time, so its POSIX branch is reachable from any runner. */
-function asPosix<T>(fn: () => T): T {
+/** Run `fn` with process.platform reporting `platform`. normalizeTrustKey
+ *  reads it at CALL time, so every branch is reachable from any runner. */
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
   const original = Object.getOwnPropertyDescriptor(process, "platform");
-  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
   try {
     return fn();
   } finally {
     if (original) Object.defineProperty(process, "platform", original);
   }
+}
+
+/** The case-SENSITIVE POSIX branch (linux -- macOS folds case, see below). */
+function asPosix<T>(fn: () => T): T {
+  return withPlatform("linux", fn);
 }
 
 function projectBundlesPath(dir: string): string {
@@ -414,6 +419,21 @@ describe("trust store grant / revoke / list round-trip", () => {
       expect(normalizeTrustKey("/tmp/Repo/bundles.json")).not.toBe(normalizeTrustKey("/tmp/repo/bundles.json"));
       // ...while everything else about the key still normalizes.
       expect(normalizeTrustKey("/tmp/Repo/../Repo/./bundles.json")).toBe(normalizeTrustKey("/tmp/Repo/bundles.json"));
+    });
+  });
+
+  it("folds case on macOS, whose default APFS volume is case-insensitive", () => {
+    // /Users/x/Repo and /Users/x/repo are the SAME file on APFS as Apple
+    // ships it -- keying them separately meant approving from one casing
+    // left the other reporting "never approved" and `trust --list` grew
+    // duplicate rows for one project. "POSIX is case-sensitive" is a Linux
+    // fact, not a macOS one.
+    withPlatform("darwin", () => {
+      expect(normalizeTrustKey("/Users/x/Repo/bundles.json")).toBe(normalizeTrustKey("/Users/x/repo/bundles.json"));
+      // ...and the rest of the normalization still applies on top.
+      expect(normalizeTrustKey("/Users/x/Repo/../Repo/./bundles.json")).toBe(
+        normalizeTrustKey("/Users/x/repo/bundles.json"),
+      );
     });
   });
 

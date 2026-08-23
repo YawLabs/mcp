@@ -2,7 +2,9 @@ import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildLaunchEntry,
+  claudeCodeProjectKey,
   ENTRY_NAME,
+  escapeCmdArg,
   INSTALL_TARGETS,
   isProjectLocalEntry,
   resolveClaudeCodeSettingsPath,
@@ -115,8 +117,13 @@ describe("resolveInstallPath — Claude Code", () => {
     });
     const key = r.containerPath[1];
     expect(isAbsolute(key)).toBe(true);
-    expect(key).toBe(resolve(rel));
-    expect(r.containerPath).toEqual(["projects", resolve(rel), "mcpServers"]);
+    // resolve() spells the key with the HOST separator, but Claude Code
+    // writes projects[] keys with forward slashes on every OS — so on a
+    // Windows runner the key is the normalized spelling (no-op on POSIX,
+    // where resolve() already emits `/`).
+    const expected = resolve(rel).replace(/\\/g, "/");
+    expect(key).toBe(expected);
+    expect(r.containerPath).toEqual(["projects", expected, "mcpServers"]);
   });
 
   it("local scope leaves an ABSOLUTE projectDir untouched in the projects[] key", () => {
@@ -468,6 +475,80 @@ describe("buildLaunchEntry", () => {
     for (const os of ["macos", "linux", "windows"] as const) {
       expect(buildLaunchEntry({ os }).env).toBeUndefined();
     }
+  });
+
+  it("caret-escapes cmd metacharacters in upstream command + args on Windows", () => {
+    // The entry is spawned by the MCP CLIENT, whose libuv only quotes argv
+    // elements containing space/tab/quote. A bare `&` in a catalog arg would
+    // otherwise reach cmd.exe unquoted and run the tail as a second command
+    // at client-spawn time (a query-string arg truncates the same way).
+    const e = buildLaunchEntry({
+      os: "windows",
+      upstream: { command: "npx", args: ["-y", "some-server", "--url", "https://api/x?a=1&b=2"] },
+    });
+    expect(e.command).toBe("cmd");
+    expect(e.args).toEqual(["/c", "npx", "-y", "some-server", "--url", "https://api/x?a=1^&b=2"]);
+  });
+
+  it("leaves upstream args verbatim on macOS/Linux (no cmd.exe in the spawn path)", () => {
+    const e = buildLaunchEntry({
+      os: "linux",
+      upstream: { command: "uvx", args: ["some-server", "--url", "https://api/x?a=1&b=2"] },
+    });
+    expect(e.command).toBe("uvx");
+    expect(e.args).toEqual(["some-server", "--url", "https://api/x?a=1&b=2"]);
+  });
+});
+
+describe("escapeCmdArg (Windows cmd /c metacharacter neutralization)", () => {
+  it("caret-escapes metacharacters in an arg the client will NOT quote", () => {
+    expect(escapeCmdArg("https://api/x?a=1&b=2")).toBe("https://api/x?a=1^&b=2");
+    expect(escapeCmdArg("a|b")).toBe("a^|b");
+    expect(escapeCmdArg("a<b>c")).toBe("a^<b^>c");
+    expect(escapeCmdArg("x^y")).toBe("x^^y");
+    expect(escapeCmdArg("(group)")).toBe("^(group^)");
+  });
+
+  it("leaves an arg containing space/tab/quote alone — the client quotes those itself", () => {
+    // Inside the double quotes libuv adds, cmd.exe treats metacharacters
+    // literally; a caret there would survive as a literal char and corrupt
+    // the value.
+    expect(escapeCmdArg("foo & bar")).toBe("foo & bar");
+    expect(escapeCmdArg('say "hi"')).toBe('say "hi"');
+    expect(escapeCmdArg("a\t&b")).toBe("a\t&b");
+  });
+
+  it("leaves plain args and % untouched", () => {
+    expect(escapeCmdArg("-y")).toBe("-y");
+    expect(escapeCmdArg("@yawlabs/mcp@latest")).toBe("@yawlabs/mcp@latest");
+    // `%` is deliberately not escaped: cmd expands %VAR% before caret
+    // processing, so a caret cannot neutralize it anyway.
+    expect(escapeCmdArg("100%")).toBe("100%");
+  });
+});
+
+describe("claudeCodeProjectKey (projects[] key spelling)", () => {
+  // Claude Code writes projects[] keys with forward slashes on every OS.
+  // Writing resolve()'s backslash spelling verbatim created a NEW sibling
+  // key Claude Code never reads: install printed Done, doctor/--list said
+  // "installed" (same wrong key), and /mcp showed nothing.
+  it("normalizes a Windows drive-letter path to forward slashes", () => {
+    expect(claudeCodeProjectKey("C:\\Users\\me\\repo")).toBe("C:/Users/me/repo");
+  });
+
+  it("leaves an already forward-slash Windows path untouched", () => {
+    expect(claudeCodeProjectKey("C:/Users/me/repo")).toBe("C:/Users/me/repo");
+  });
+
+  it("normalizes a UNC path", () => {
+    expect(claudeCodeProjectKey("\\\\server\\share\\repo")).toBe("//server/share/repo");
+  });
+
+  it("leaves POSIX paths untouched, even ones containing a backslash in a name", () => {
+    expect(claudeCodeProjectKey("/home/alice/repo")).toBe("/home/alice/repo");
+    // Scoped to Windows-shaped paths: a legal (if cursed) POSIX dir name
+    // containing a backslash must not be mangled.
+    expect(claudeCodeProjectKey("/home/alice/weird\\name")).toBe("/home/alice/weird\\name");
   });
 });
 

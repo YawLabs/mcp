@@ -1,6 +1,7 @@
-import { access } from "node:fs/promises";
+import { access, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { log } from "./logger.js";
 
 // Per-platform cache root for anything yaw-mcp fetches at runtime (uv
 // binary today; potentially more later). Matches the conventions each
@@ -73,7 +74,13 @@ function normalizeForCompare(p: string): string {
   return process.platform === "win32" ? p.toLowerCase() : p;
 }
 
-function isUnderHome(dir: string, homeResolved: string): boolean {
+// True iff `dir` is STRICTLY under `homeResolved` ($HOME itself is false).
+// Exported for migrate.ts's findLegacyProjectRoot, whose walk-up bound must
+// be a subset of this one -- sharing the predicate keeps the two from
+// drifting (a bare `startsWith("..")` copy over there once disagreed with
+// the anchored test below, so a legacy config under `~/..config/` was
+// discoverable by the loader but never migrated).
+export function isUnderHome(dir: string, homeResolved: string): boolean {
   const dirKey = normalizeForCompare(dir);
   const homeKey = normalizeForCompare(homeResolved);
   if (dirKey === homeKey) return false;
@@ -90,21 +97,58 @@ function isUnderHome(dir: string, homeResolved: string): boolean {
   return relNorm !== ".." && !relNorm.startsWith(`..${path.sep}`);
 }
 
+// Trust gate for candidates found OUTSIDE $HOME: on POSIX, only accept a
+// `.yaw-mcp/` owned by the current effective uid. A hostile `.yaw-mcp/`
+// planted on the walk-up path (a shared /tmp-style dir, `/` in a container)
+// shouldn't get loaded as project config -- same stance as migrate.ts's
+// owner check on legacy files. process.geteuid is POSIX-only; on win32 it
+// doesn't exist and Windows uses a different ACL model (the dirs above a
+// non-home checkout -- `D:\`, `C:\` -- need admin rights to write into),
+// so candidates are accepted as-is there.
+async function ownedByCurrentUser(candidate: string): Promise<boolean> {
+  const geteuid = (process as { geteuid?: () => number }).geteuid;
+  if (typeof geteuid !== "function") return true;
+  try {
+    const st = await stat(candidate);
+    return typeof st.uid === "number" && st.uid === geteuid.call(process);
+  } catch {
+    // Can't verify ownership of a dir we just saw exist -- treat as
+    // hostile / racy and don't trust it.
+    return false;
+  }
+}
+
 export async function findProjectConfigDir(start: string, home: string = homedir()): Promise<string | null> {
   const homeFallback = home && home.length > 0 ? home : process.env.USERPROFILE || homedir();
   const homeResolved = path.resolve(homeFallback);
   let dir = path.resolve(start);
+  // The bound depends on where the walk STARTS. Starting at or under $HOME,
+  // the walk stops just before $HOME (exclusive): a hijacked `.yaw-mcp/`
+  // ABOVE the user's home (`/home/.yaw-mcp`, `/.yaw-mcp`) must never be
+  // picked up as project config, and $HOME itself is the user-global scope
+  // (userConfigDir). Starting OUTSIDE $HOME -- a second drive (`D:\proj`),
+  // a container workspace (`/workspaces/proj` with HOME=/home/vscode), an
+  // `/srv` checkout -- $HOME is not on the walk-up path at all, so bounding
+  // at $HOME would (and once did) disable project config, the YAW-MCP.md
+  // guide, and project bundles for every such checkout. There the walk runs
+  // to the filesystem root instead, with the POSIX ownership check above as
+  // the trust boundary on each hit.
+  const boundedByHome =
+    isUnderHome(dir, homeResolved) || normalizeForCompare(dir) === normalizeForCompare(homeResolved);
   let prev = "";
   while (dir !== prev) {
-    // Bound the walk at $HOME: only consider dirs strictly under $HOME.
-    // Prevents a hijacked `.yaw-mcp/` above the user's home from being
-    // picked up as a project config, and skips $HOME itself (handled
-    // separately by userConfigDir).
-    if (!isUnderHome(dir, homeResolved)) return null;
+    // Bound the walk at $HOME when it started there: only consider dirs
+    // strictly under $HOME, skipping $HOME itself (handled separately by
+    // userConfigDir).
+    if (boundedByHome && !isUnderHome(dir, homeResolved)) return null;
     const candidate = path.join(dir, CONFIG_DIRNAME);
     try {
       await access(candidate);
-      return candidate;
+      if (boundedByHome || (await ownedByCurrentUser(candidate))) return candidate;
+      // Found but not trusted: skip it and keep walking, mirroring the
+      // unreadable-dir trade-off below -- a planted dir shouldn't be able
+      // to mask a legitimate config further up either.
+      log("warn", "Skipping a .yaw-mcp/ dir not owned by the current user", { candidate });
     } catch {
       // Accepted trade-off: we treat ALL errors (ENOENT, EPERM, EACCES,
       // etc.) as "not found here" and keep walking up the directory tree.

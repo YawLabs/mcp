@@ -156,8 +156,11 @@ const SUB_FLOOR_STOPWORDS = new Set([
 
 /** Query tokenizer. Same 1-char floor as the document identifier fields --
  *  "use pg" has to survive or the document-side widening is unreachable --
- *  minus the closed-class words that floor would otherwise admit. */
-function tokenizeQuery(text: string | undefined): string[] {
+ *  minus the closed-class words that floor would otherwise admit.
+ *  Exported for foundry.ts: the harvest must tokenize intents with the SAME
+ *  floor the live ranker uses, or short identifiers (pg, gh, s3) are deleted
+ *  from the corpus that scores that very ranker. */
+export function tokenizeQuery(text: string | undefined): string[] {
   return tokenizeIdent(text).filter((t) => t.length >= MIN_TOKEN_LEN || !SUB_FLOOR_STOPWORDS.has(t));
 }
 

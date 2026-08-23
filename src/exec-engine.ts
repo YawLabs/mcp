@@ -299,6 +299,17 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
       if (typeof s.id !== "string" || s.id.length === 0) {
         return { ok: false, message: `step ${i}: \`id\` must be a non-empty string` };
       }
+      // The id becomes a key in the plain-object bindings map (server.ts:
+      // `bindings[key] = ...`), where assigning "__proto__" hits
+      // Object.prototype's setter instead of creating an own key: the step's
+      // output silently vanishes from the result and a later $ref to it
+      // reports `no step named "__proto__"` for a step that actually ran.
+      // resolveArgs hardens the ARGS side of this same key via
+      // defineProperty; on the id side refusing up front is cheaper than
+      // threading defineProperty through every bindings writer/reader.
+      if (s.id === "__proto__") {
+        return { ok: false, message: `step ${i}: \`id\` "__proto__" is reserved; use a different id` };
+      }
       if (seenIds.has(s.id)) {
         return { ok: false, message: `step ${i}: duplicate id "${s.id}"` };
       }

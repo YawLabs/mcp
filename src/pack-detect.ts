@@ -20,6 +20,14 @@ const DEFAULT_MAX_GAP_MS = 120_000; // 120s between consecutive calls
 const MIN_NAMESPACES = 2;
 const MAX_NAMESPACES = 3;
 const MIN_RECURRENCES = 2;
+// A burst also closes once it has SPANNED maxGapMs * BURST_SPAN_FACTOR
+// (10 min at the defaults), even with no idle gap. Without this ceiling a
+// continuous agent session -- tool calls seconds apart for half an hour --
+// collapses into ONE burst, so its namespace set occurs exactly once and
+// MIN_RECURRENCES rejects it: the detector returned [] for precisely the
+// workload it targets. Slicing long sessions into span-bounded windows
+// makes recurrence WITHIN a session countable.
+const BURST_SPAN_FACTOR = 5;
 
 export interface PackCall {
   namespace: string;
@@ -40,6 +48,7 @@ export interface PackDetectorOptions {
 
 interface Burst {
   namespaces: string[]; // distinct, order-of-first-appearance
+  startAt: number;
   lastAt: number;
 }
 
@@ -70,8 +79,8 @@ export class PackDetector {
     }
   }
 
-  // Walk the history, segmenting it into "bursts" separated by gaps
-  // longer than maxGapMs. Each burst with ≥2 distinct namespaces is a
+  // Walk the history, segmenting it into "bursts" (see segmentBursts for
+  // the three boundaries). Each burst with ≥2 distinct namespaces is a
   // candidate pack. A pack is returned when the same namespace set
   // appears in ≥MIN_RECURRENCES bursts.
   detectChains(): DetectedPack[] {
@@ -83,6 +92,8 @@ export class PackDetector {
 
     for (const burst of bursts) {
       if (burst.namespaces.length < MIN_NAMESPACES) continue;
+      // Defensive only: segmentBursts cuts at the overflow boundary, so a
+      // burst can never carry more than MAX_NAMESPACES namespaces here.
       if (burst.namespaces.length > MAX_NAMESPACES) continue;
       const id = packIdFromNamespaces(burst.namespaces);
       const prev = packCounts.get(id);
@@ -111,19 +122,35 @@ export class PackDetector {
     return packs;
   }
 
-  // Segment the call history into bursts. A new burst starts whenever
-  // the gap to the previous call exceeds maxGapMs. Within a burst, each
-  // namespace is recorded only once (order-of-first-appearance); the
-  // "last seen" timestamp tracks the most recent call in the burst so
-  // recency ranking is truthful even when the burst has many calls.
+  // Segment the call history into bursts. A new burst starts whenever:
+  //   1. the gap to the previous call exceeds maxGapMs (idle boundary);
+  //   2. the burst has already spanned maxGapMs * BURST_SPAN_FACTOR
+  //      (span boundary -- see the constant for why a continuous session
+  //      must be sliced for recurrence to be countable); or
+  //   3. the call would add a namespace past MAX_NAMESPACES (overflow
+  //      boundary). detectChains drops an over-wide burst entirely, so
+  //      without this cut a single visit to a 4th namespace poisoned the
+  //      whole burst and the recurring trio inside it was never counted.
+  //      Cutting at the overflow keeps each burst representable as a
+  //      pack; a wider rotation surfaces as its recurring 3-subsets, the
+  //      best answer the MAX_NAMESPACES pack-size cap can express.
+  // Within a burst, each namespace is recorded only once
+  // (order-of-first-appearance); the "last seen" timestamp tracks the
+  // most recent call in the burst so recency ranking is truthful even
+  // when the burst has many calls.
   private segmentBursts(): Burst[] {
     const bursts: Burst[] = [];
+    const maxBurstSpanMs = this.maxGapMs * BURST_SPAN_FACTOR;
     let current: Burst | null = null;
     let prevAt = 0;
 
     for (const call of this.history) {
-      if (!current || call.at - prevAt > this.maxGapMs) {
-        current = { namespaces: [call.namespace], lastAt: call.at };
+      const gapExceeded = call.at - prevAt > this.maxGapMs;
+      const spanExceeded = current !== null && call.at - current.startAt > maxBurstSpanMs;
+      const wouldOverflow =
+        current !== null && current.namespaces.length >= MAX_NAMESPACES && !current.namespaces.includes(call.namespace);
+      if (!current || gapExceeded || spanExceeded || wouldOverflow) {
+        current = { namespaces: [call.namespace], startAt: call.at, lastAt: call.at };
         bursts.push(current);
       } else {
         if (!current.namespaces.includes(call.namespace)) {

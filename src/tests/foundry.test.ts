@@ -143,6 +143,16 @@ describe("redactIntent", () => {
     expect(r.tokens).toContain("send");
     expect(r.tokens).toContain("email");
   });
+
+  it("keeps short identifiers (pg, gh, s3) -- harvest tokenizes at the ranker's 1-char floor", () => {
+    // Harvesting with the 3-char prose tokenizer deleted every short
+    // identifier from the corpus, so rankServers (which tokenizes queries at
+    // the 1-char floor) could never be scored on the very tokens that matter.
+    const r = redactIntent("use pg and gh to check the s3 bucket");
+    expect(r.tokens).toEqual(expect.arrayContaining(["pg", "gh", "s3"]));
+    // Closed-class sub-floor words still stay out of the bag.
+    expect(r.tokens).not.toContain("to");
+  });
 });
 
 describe("appendFoundryTrace", () => {

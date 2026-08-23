@@ -263,9 +263,18 @@ function renderBash(): string {
     // four clients at once). The slot's original index computes the cword
     // position (cword == slotIndex + 2 because COMP_WORDS[0] is "yaw-mcp",
     // COMP_WORDS[1] is the subcommand).
+    //
+    // The `$cur != -*` guard is load-bearing: each clause ends in an
+    // unconditional `return 0`, so without it a flag typed AT the slot
+    // (`install --<TAB>`) matched the positional clause, compgen'd against
+    // the positional word list, and returned an empty COMPREPLY -- zero
+    // candidates, and (`complete -F` without `-o default`) no fallback.
+    // `install --list` / `--all` forbid a client argument, so slot 0 is the
+    // ONLY position those flags can occupy; fish and powershell both offer
+    // flags there. A dash word now falls through to the flag compgen below.
     const posClauses = realPositionals(spec).map(
       ({ candidates, index }) =>
-        `    if [[ $cword -eq $((${index} + 2)) ]]; then\n      COMPREPLY=( $(compgen -W "${candidates.join(" ")}" -- "$cur") )\n      return 0\n    fi`,
+        `    if [[ $cword -eq $((${index} + 2)) && $cur != -* ]]; then\n      COMPREPLY=( $(compgen -W "${candidates.join(" ")}" -- "$cur") )\n      return 0\n    fi`,
     );
     const parts = [
       ...posClauses,

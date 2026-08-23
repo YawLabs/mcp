@@ -356,4 +356,53 @@ describe("runComplianceCommand child exit propagation", () => {
     const r = await runWithChildExit(null);
     expect(r.code).toBe(1);
   });
+
+  it("reassembles a multi-byte UTF-8 sequence split across two pipe chunks", async () => {
+    // A report bigger than the pipe's highWaterMark arrives in multiple
+    // Buffer chunks, and the split lands wherever the kernel cuts it --
+    // including MID-character. Decoding each chunk on its own turned both
+    // halves into U+FFFD, silently corrupting the field the split landed in.
+    const utf8Report = {
+      grade: "B",
+      score: 88,
+      url: "https://exämple.com/mcp",
+      summary: { total: 10, passed: 9, failed: 1, required: 5, requiredPassed: 5 },
+      tests: [],
+    };
+    const bytes = Buffer.from(JSON.stringify(utf8Report), "utf8");
+    // Cut INSIDE the two-byte "ä" sequence (0xc3 0xa4).
+    const cut = bytes.indexOf(0xc3) + 1;
+    expect(cut).toBeGreaterThan(0);
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const spawn = (): EventEmitter & { stdout: EventEmitter; pid: number; kill: () => boolean } => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          pid: number;
+          kill: () => boolean;
+        };
+        child.stdout = new EventEmitter();
+        child.pid = 4242;
+        child.kill = () => true;
+        setImmediate(() => {
+          child.stdout.emit("data", bytes.subarray(0, cut));
+          child.stdout.emit("data", bytes.subarray(cut));
+          child.emit("close", 0);
+        });
+        return child;
+      };
+      return { spawn, default: { spawn } };
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const code = await mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      expect(code).toBe(0);
+      expect(cap.out()).toContain("https://exämple.com/mcp");
+      expect(cap.out()).not.toContain("�");
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
 });

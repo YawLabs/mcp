@@ -106,6 +106,22 @@ describe("pruneContent", () => {
     expect(r.content[0].text).toBe("line one\nline two\n\nline three");
   });
 
+  it("prunes CRLF text the same way (Windows-hosted servers)", () => {
+    // The LF-only rules were a silent no-op here: `[ \t]+$` never matched
+    // before a \r, and `\n{3,}` never saw three consecutive \n in
+    // \r\n\r\n\r\n. Line endings are preserved as CRLF.
+    const raw = "line one   \r\nline two\t\t\r\n\r\n\r\n\r\nline three";
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toBe("line one\r\nline two\r\n\r\nline three");
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
+
+  it("keeps LF-only collapse output LF (no CRLF introduced)", () => {
+    const raw = "a   \n\n\n\n\nb                    ";
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toBe("a\n\nb");
+  });
+
   it("returns original content when savings are below 2%", () => {
     const raw = JSON.stringify({ a: 1, b: 2, c: 3 });
     const r = pruneContent([{ type: "text", text: raw }]);

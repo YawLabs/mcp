@@ -15,7 +15,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
 import { spawnSync } from "node:child_process";
-import { __resetUvBootstrap, resolveUvSpawn, runCommand, UV_EXTRACT_TIMEOUT_MS } from "../uv-bootstrap.js";
+import path from "node:path";
+import { compareVersions } from "../oam-spawn.js";
+import {
+  __resetUvBootstrap,
+  resolveUvSpawn,
+  runCommand,
+  UV_EXTRACT_TIMEOUT_MS,
+  UV_VERSION,
+  uvTarget,
+} from "../uv-bootstrap.js";
 
 // Is uv reachable on this machine? Probed ONCE here instead of inside each
 // test: the previous shape returned early when uv was absent, so the test
@@ -49,6 +58,75 @@ describe("resolveUvSpawn", () => {
   it("preserves empty args array", async () => {
     const result = await resolveUvSpawn("custom-cmd", []);
     expect(result).toEqual({ command: "custom-cmd", args: [] });
+  });
+
+  it("passes an explicit uv/uvx PATH through untouched (a pin on one concrete binary)", async () => {
+    // An absolute or relative path is a user pin: substituting the managed
+    // download would silently override it, and rewriting a pinned uvx's args
+    // to `tool run` without switching the binary would mis-launch. These
+    // return before ensureUv(), so they are safe on machines without uv.
+    const winUv = path.join("C:", "Users", "x", ".local", "bin", "uv.exe");
+    expect(await resolveUvSpawn(winUv, ["run", "server.py"])).toEqual({
+      command: winUv,
+      args: ["run", "server.py"],
+    });
+    const posixUvx = "/home/x/.local/bin/uvx";
+    expect(await resolveUvSpawn(posixUvx, ["mcp-server-fetch"])).toEqual({
+      command: posixUvx,
+      args: ["mcp-server-fetch"],
+    });
+    const relUvx = `.${path.sep}bin${path.sep}uvx`;
+    expect(await resolveUvSpawn(relUvx, [])).toEqual({ command: relUvx, args: [] });
+  });
+
+  it("does not treat near-miss bare names as uv", async () => {
+    expect(await resolveUvSpawn("uvx2", [])).toEqual({ command: "uvx2", args: [] });
+    expect(await resolveUvSpawn("guv", [])).toEqual({ command: "guv", args: [] });
+    expect(await resolveUvSpawn("uv.sh", [])).toEqual({ command: "uv.sh", args: [] });
+  });
+});
+
+// Pure function; parameters exist so a single host can exercise every
+// (platform, arch, libc) combination.
+describe("uvTarget", () => {
+  it("selects the musl triple on musl Linux and the gnu triple otherwise", () => {
+    // A glibc uv on Alpine dies with a loader error that reads as a broken
+    // MCP server; Astral publishes -musl assets, so the right answer exists.
+    expect(uvTarget("linux", "x64", true)).toBe("x86_64-unknown-linux-musl");
+    expect(uvTarget("linux", "arm64", true)).toBe("aarch64-unknown-linux-musl");
+    expect(uvTarget("linux", "x64", false)).toBe("x86_64-unknown-linux-gnu");
+    expect(uvTarget("linux", "arm64", false)).toBe("aarch64-unknown-linux-gnu");
+  });
+
+  it("maps windows and darwin arches to their triples", () => {
+    expect(uvTarget("win32", "x64")).toBe("x86_64-pc-windows-msvc");
+    expect(uvTarget("win32", "arm64")).toBe("aarch64-pc-windows-msvc");
+    expect(uvTarget("win32", "ia32")).toBe("i686-pc-windows-msvc");
+    expect(uvTarget("darwin", "arm64")).toBe("aarch64-apple-darwin");
+    expect(uvTarget("darwin", "x64")).toBe("x86_64-apple-darwin");
+  });
+
+  it("returns null for combinations Astral does not publish", () => {
+    expect(uvTarget("freebsd", "x64")).toBeNull();
+    expect(uvTarget("linux", "mips")).toBeNull();
+    expect(uvTarget("win32", "mips")).toBeNull();
+    expect(uvTarget("darwin", "ia32")).toBeNull();
+  });
+
+  it("resolves a real triple for the host running this suite", () => {
+    // The default-parameter path (process.platform/arch + libc probe) must
+    // produce a non-null triple on any machine the suite supports.
+    expect(uvTarget()).toMatch(/^(x86_64|aarch64|i686)-/);
+  });
+});
+
+describe("UV_VERSION freshness floor", () => {
+  it("has moved off the 0.11.x generation (POLICY: track the latest uv release)", () => {
+    // The install dir is keyed by UV_VERSION, so a stale pin keeps every user
+    // on that build indefinitely. 0.12.5 was current when the floor landed;
+    // raise the floor when bumping the pin, never lower the pin below it.
+    expect(UV_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(compareVersions(UV_VERSION, "0.12.5")).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -100,6 +178,23 @@ describe("resolveUvSpawn with uv present", () => {
     const result = await resolveUvSpawn("uvx", []);
     expect(isUvSpawnTarget(result.command)).toBe(true);
     expect(result.args).toEqual(["tool", "run"]);
+  });
+
+  it.skipIf(!UV_PRESENT)("recognises bare names with a Windows executable extension, any casing", async () => {
+    // `"command": "uvx.exe"` is an ordinary config shape on Windows; exact
+    // string equality used to pass it through untouched -- no bootstrap when
+    // uv was missing, and no `uv tool run` rewrite.
+    const exe = await resolveUvSpawn("uvx.exe", ["mcp-server-fetch"]);
+    expect(isUvSpawnTarget(exe.command)).toBe(true);
+    expect(exe.args).toEqual(["tool", "run", "mcp-server-fetch"]);
+
+    const upper = await resolveUvSpawn("UVX.EXE", ["mcp-server-fetch"]);
+    expect(isUvSpawnTarget(upper.command)).toBe(true);
+    expect(upper.args).toEqual(["tool", "run", "mcp-server-fetch"]);
+
+    const uvExe = await resolveUvSpawn("uv.exe", ["--version"]);
+    expect(isUvSpawnTarget(uvExe.command)).toBe(true);
+    expect(uvExe.args).toEqual(["--version"]);
   });
 });
 

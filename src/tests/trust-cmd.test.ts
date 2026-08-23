@@ -520,6 +520,75 @@ describe("yaw-mcp trust --list", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The escape hatch must be visible on the audit surfaces: with
+// YAW_MCP_TRUST_PROJECT set, the loader honours EVERY project file
+// regardless of the approvals `trust --list` reports.
+// ---------------------------------------------------------------------------
+
+describe("YAW_MCP_TRUST_PROJECT is surfaced by --list and the grant path", () => {
+  const BYPASS = { YAW_MCP_TRUST_PROJECT: "1" };
+
+  it("--list warns that every project file loads without approval", async () => {
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "list",
+      home: synthHome,
+      cwd: synthCwd,
+      env: BYPASS,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toContain("YAW_MCP_TRUST_PROJECT is set");
+    expect(io.errText()).toContain("WITHOUT approval");
+  });
+
+  it("--list stays quiet about the escape hatch when it is not set", async () => {
+    const io = captureIO();
+    await runTrust({ mode: "list", home: synthHome, cwd: synthCwd, env: {}, out: io.push, err: io.pushErr });
+    expect(io.errText()).not.toContain("YAW_MCP_TRUST_PROJECT");
+  });
+
+  it("--list --json reports the bypass as data, keeping stdout parseable", async () => {
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "list",
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: BYPASS,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(io.text()) as { bypassed: boolean };
+    expect(parsed.bypassed).toBe(true);
+    expect(io.errText()).toBe("");
+  });
+
+  it("grant names the bypass at review time and does not credit the approval for the load", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const io = captureIO();
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: BYPASS, yes: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    // Review-time: the user deserves to know the gate they are feeding is off.
+    expect(io.text()).toContain("YAW_MCP_TRUST_PROJECT is set");
+    // Post-grant: "restart to load it" would imply approval enabled the load.
+    expect(io.text()).toContain("ALREADY loading without approval");
+    expect(io.text()).not.toContain("Restart your MCP client");
+  });
+
+  it("grant keeps the restart line when the escape hatch is off", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const io = captureIO();
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("Restart your MCP client");
+    expect(io.text()).not.toContain("YAW_MCP_TRUST_PROJECT is set");
+  });
+});
+
 describe("yaw-mcp trust --revoke", () => {
   it("revokes the project found from cwd", async () => {
     writeBundles(synthCwd, HOSTILE);
@@ -734,7 +803,29 @@ describe("the preview says which entries execute content the hash does not cover
     writeBundles(synthCwd, HOSTILE);
     const io = captureIO();
     await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
-    expect(io.text()).toContain("@modelcontextprotocol/server-github has no version");
+    expect(io.text()).toContain("@modelcontextprotocol/server-github is not pinned to an exact version");
+  });
+
+  it("flags a dist-tag or range suffix -- @latest re-resolves exactly like a bare spec", async () => {
+    // `@latest` is the shape every catalog install writes into bundles.json,
+    // so counting any `@` as a pin silenced the line on the entries that most
+    // needed it. A range re-resolves within its bounds the same way.
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [
+        {
+          namespace: "tagged",
+          name: "Tagged",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem@latest"],
+        },
+        { namespace: "ranged", name: "Ranged", command: "npx", args: ["-y", "pkg@^1.2.3"] },
+      ],
+    });
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(io.text()).toContain("@modelcontextprotocol/server-filesystem@latest is not pinned to an exact version");
+    expect(io.text()).toContain("pkg@^1.2.3 is not pinned to an exact version");
   });
 
   it("stays quiet when the spec IS version-pinned", async () => {
@@ -770,7 +861,7 @@ describe("the preview says which entries execute content the hash does not cover
     });
     const io = captureIO();
     await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
-    expect(io.text()).not.toContain("has no version");
+    expect(io.text()).not.toContain("is not pinned to an exact version");
   });
 
   it("no longer promises that re-approval covers the code the commands run", async () => {

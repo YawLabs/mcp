@@ -24,9 +24,11 @@ import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
+import { specConstraint } from "./oam-spawn.js";
 import {
   grantTrust,
   hashTrustContent,
+  isTrustBypassEnabled,
   listTrusted,
   readTrustStore,
   revokeTrust,
@@ -217,6 +219,14 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     `  Status:       ${probe.status === "changed" ? "CHANGED since you approved it" : probe.status === "store-unreadable" ? `trust store unreadable (${displaySafe(probe.storePath)})` : "never approved"}`,
   );
   print(`  Servers:      ${serverCount}`);
+  if (probe.bypassed) {
+    // The user reviewing argv deserves to know the gate they are feeding is
+    // currently switched off -- what they approve here only starts to matter
+    // once the escape hatch is unset.
+    print(
+      `  ! ${TRUST_BYPASS_ENV} is set: this file (like every project bundles.json) loads WITHOUT approval right now. This approval takes effect once it is unset.`,
+    );
+  }
   print("");
   if (serverCount === 0) {
     print("  This file defines no servers, so approving it spawns nothing. It");
@@ -320,7 +330,16 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   print("  NOT PINNED: the code those commands actually run. Files inside this repo and");
   print("  packages fetched at spawn time can change with no edit to bundles.json, and so");
   print("  with no new prompt. Approving is trusting the repo, not just this one file.");
-  print("Restart your MCP client (or yaw-mcp) to load it.");
+  if (probe.bypassed) {
+    // "Restart to load it" would credit the approval for something the
+    // escape hatch is doing: with the env var set the file was loading
+    // all along, approved or not.
+    print(
+      `NOTE: ${TRUST_BYPASS_ENV} is set, so this file was ALREADY loading without approval. This approval takes effect once the variable is unset.`,
+    );
+  } else {
+    print("Restart your MCP client (or yaw-mcp) to load it.");
+  }
   return { exitCode: 0 };
 }
 
@@ -480,11 +499,17 @@ function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
   // A local path / url / git ref is not a registry lookup (inRepoTokens or
   // the closing text covers those).
   if (spec.includes("://") || isAbsolute(spec) || /^\.{1,2}[\\/]/.test(spec)) return null;
-  // Strip the scope sigil and the scope itself, then look for a version:
-  // `@scope/pkg@1.2.3` and `pkg@1.2.3` are pinned, `pkg==1.2.3` is uv's form.
-  const body = spec.startsWith("@") ? spec.slice(1) : spec;
-  const afterScope = body.includes("/") ? body.slice(body.indexOf("/") + 1) : body;
-  if (afterScope.includes("@") || afterScope.includes("==")) return null;
+  // uvx / pipx pin: `pkg==0.4.1` names one exact version (PEP 440 form).
+  // A scope-free substring test is enough -- npm specs never carry `==`.
+  if (spec.includes("==")) return null;
+  // npm-style suffix: only an EXACT version is a pin. A dist-tag
+  // (`@latest`, `@next`) or a range (`@^1.2.3`, `@*`) re-resolves against
+  // the registry at spawn time exactly like a bare spec -- and `@latest`
+  // is the shape every catalog install writes into bundles.json, so
+  // counting any `@` as a pin silenced this line on the entries that most
+  // needed it. Same classification as oam-spawn.ts:specConstraint, which
+  // already treats dist-tags as "any" and ranges as unpinned.
+  if (specConstraint(spec).kind === "exact") return null;
   return spec;
 }
 
@@ -501,7 +526,7 @@ function pinGaps(s: UpstreamServerConfig): string[] {
   const spec = unversionedRegistrySpec(s);
   if (spec !== null) {
     lines.push(
-      `NOT covered by the pin: ${displayArg(spec)} has no version -- it resolves to whatever the registry serves at spawn time.`,
+      `NOT covered by the pin: ${displayArg(spec)} is not pinned to an exact version -- it resolves to whatever the registry serves at spawn time.`,
     );
   }
   return lines;
@@ -516,6 +541,19 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
   const err = opts.err ?? ((s: string) => process.stderr.write(s));
   const print = (s = ""): void => out(`${s}\n`);
   const home = opts.home ?? homedir();
+  const env = opts.env ?? process.env;
+
+  // The escape hatch changes what every line below MEANS: with it set, the
+  // loader honours every project file regardless of the approvals this
+  // command reports. An audit surface that hides that reports a state the
+  // loader is not in -- same warning doctor prints, on stderr so a piped
+  // `trust --list` still parses.
+  const bypassed = isTrustBypassEnabled(env);
+  if (bypassed && !opts.json) {
+    err(
+      `yaw-mcp trust: warning -- ${TRUST_BYPASS_ENV} is set, so EVERY project bundles.json loads WITHOUT approval right now, regardless of what is listed here. Unset it to restore the approval gate.\n`,
+    );
+  }
 
   const store = await readTrustStore(home);
   if (store.malformed) {
@@ -530,7 +568,7 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
     const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- NOTHING is trusted until ${fix}`;
     if (opts.json) {
       out(
-        `${JSON.stringify({ storePath: trustStorePath(home), malformed: true, error: msg, trusted: [] }, null, 2)}\n`,
+        `${JSON.stringify({ storePath: trustStorePath(home), malformed: true, bypassed, error: msg, trusted: [] }, null, 2)}\n`,
       );
     } else {
       err(`yaw-mcp trust: ${msg}\n`);
@@ -545,7 +583,7 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
   }
 
   if (opts.json) {
-    out(`${JSON.stringify({ storePath: trustStorePath(home), malformed: false, trusted: rows }, null, 2)}\n`);
+    out(`${JSON.stringify({ storePath: trustStorePath(home), malformed: false, bypassed, trusted: rows }, null, 2)}\n`);
     return { exitCode: 0 };
   }
 

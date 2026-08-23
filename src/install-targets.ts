@@ -207,6 +207,27 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
   return p;
 }
 
+/** The `projects[...]` key Claude Code uses for `projectDir` in ~/.claude.json.
+ *
+ *  Claude Code writes those keys with FORWARD slashes on every OS — a Windows
+ *  checkout appears as "C:/Users/me/repo", never "C:\\Users\\me\\repo" (every
+ *  project key in a real Windows ~/.claude.json uses `/`). `resolve(cwd)` on
+ *  win32 hands us the backslash spelling, and writing it verbatim creates a
+ *  NEW sibling key Claude Code never reads: install prints Done, doctor and
+ *  --list confirm "installed" (they compute the same wrong key), and /mcp
+ *  shows nothing. Normalize the KEY only — the config-file path itself stays
+ *  platform-native.
+ *
+ *  Scoped to Windows-shaped paths (drive letter or UNC) so a POSIX directory
+ *  whose name legitimately contains a backslash is not mangled.
+ *
+ *  Exported for tests: the Windows-shape branch is unreachable through
+ *  resolveInstallPath on a POSIX runner (isAbsolute("C:\\...") is false
+ *  there, so resolve() rewrites the fixture first). */
+export function claudeCodeProjectKey(projectDir: string): string {
+  return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(projectDir) ? projectDir.replace(/\\/g, "/") : projectDir;
+}
+
 function pathFor(
   client: InstallClientId,
   scope: InstallScope,
@@ -240,14 +261,15 @@ function pathFor(
     // ~/.claude.json projects[<absolute project dir>].mcpServers. The
     // .claude/settings.local.json file is for permissions/hooks, not MCP.
     // Same CLAUDE_CONFIG_DIR redirect applies.
+    const projectKey = claudeCodeProjectKey(projectDir);
     if (claudeConfigDir) {
       const absolute = join(claudeConfigDir, ".claude.json");
-      return { absolute, display: absolute, containerPath: ["projects", projectDir, "mcpServers"] };
+      return { absolute, display: absolute, containerPath: ["projects", projectKey, "mcpServers"] };
     }
     return {
       absolute: join(home, ".claude.json"),
       display: os === "windows" ? "%USERPROFILE%\\.claude.json" : "~/.claude.json",
-      containerPath: ["projects", projectDir, "mcpServers"],
+      containerPath: ["projects", projectKey, "mcpServers"],
     };
   }
 
@@ -370,6 +392,37 @@ export interface LaunchEntry {
   env?: Record<string, string>;
 }
 
+/** cmd.exe metacharacters that split or redirect an UNQUOTED command line:
+ *  `&` (chain), `|` (pipe), `<` `>` (redirect), `^` (escape), `(` `)`
+ *  (grouping). `%` is deliberately absent — cmd expands %VAR% BEFORE caret
+ *  processing, so a caret cannot neutralize it, and mangling every literal
+ *  `%` to dodge an expansion that only fires when the variable exists is the
+ *  worse trade. */
+const CMD_METACHARS = /[&|<>^()]/g;
+
+/** Escape one argv element for the Windows `cmd /c` wrap in buildLaunchEntry.
+ *
+ *  The wrapped entry is spawned by the MCP CLIENT, whose runtime (Node/libuv
+ *  on every client we target) only quotes an argv element containing a space,
+ *  tab, or double quote. Everything else reaches cmd.exe verbatim — where a
+ *  bare `&` ends the command and runs the tail as a second one. Catalog args
+ *  come to us tokenized from upstream install commands, so a plain
+ *  query-string arg (`--url https://api/x?a=1&b=2`) silently truncates, and a
+ *  hostile catalog entry is a command injection at client-spawn time with an
+ *  innocuous-looking config file.
+ *
+ *  Two shapes, two treatments:
+ *    - arg the client will NOT quote (no space/tab/quote): caret-escape the
+ *      metacharacters; cmd strips the carets and hands the original string
+ *      to the child.
+ *    - arg the client WILL quote: leave it alone — inside the double quotes
+ *      the client adds, cmd.exe treats metacharacters literally, and a caret
+ *      there would survive as a literal character and corrupt the value. */
+export function escapeCmdArg(arg: string): string {
+  if (/[ \t"]/.test(arg)) return arg;
+  return arg.replace(CMD_METACHARS, "^$&");
+}
+
 export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   if (opts.upstream) {
     // Upstream-shape entry (yaw-mcp try): preserve the upstream command +
@@ -378,7 +431,14 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
     // spawns it directly.
     const { command, args, env } = opts.upstream;
     if (opts.os === "windows") {
-      const wrapped: LaunchEntry = { command: "cmd", args: ["/c", command, ...args] };
+      // Caret-escape cmd.exe metacharacters (see escapeCmdArg): without it,
+      // any upstream token carrying an unquoted `&` / `|` / `<` / `>` splits
+      // the `cmd /c` line when the CLIENT spawns the entry, running the tail
+      // as a second command.
+      const wrapped: LaunchEntry = {
+        command: "cmd",
+        args: ["/c", escapeCmdArg(command), ...args.map(escapeCmdArg)],
+      };
       if (env && Object.keys(env).length > 0) wrapped.env = { ...env };
       return wrapped;
     }

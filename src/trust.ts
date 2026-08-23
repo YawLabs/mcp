@@ -154,16 +154,25 @@ export function trustStorePath(home: string = homedir()): string {
  *
  * `resolve` collapses `.`/`..`, makes the path absolute, and (on Windows)
  * rewrites forward slashes to backslashes, so `C:/foo` and `C:\foo` agree.
- * Windows paths are additionally lowercased because the filesystem is
- * case-insensitive there -- without it, `C:\Repo\...` and `c:\repo\...`
- * would be two different trust entries and a user who cd'd in with
- * different casing would be re-prompted. POSIX paths are case-SENSITIVE,
- * so they are left exactly as resolved. Same platform split as
- * paths.ts:normalizeForCompare.
+ * Windows AND macOS paths are additionally lowercased because the default
+ * filesystems there (NTFS; APFS as Apple ships it) are case-INSENSITIVE --
+ * without it, `C:\Repo\...` and `c:\repo\...` (or `/Users/x/Repo` and
+ * `/Users/x/repo` on a Mac) name the same file but hash to two different
+ * trust entries, so approving from one casing leaves the other casing
+ * re-prompting and `trust --list` grows duplicate rows for one project.
+ * Linux and the other POSIX platforms are case-sensitive, so their keys are
+ * left exactly as resolved. On the RARE case-sensitive APFS volume (opt-in
+ * at format time) this folds two genuinely distinct paths into one key; the
+ * grant is still pinned to the file's content hash, so what was approved
+ * stays byte-exact -- the same trade Windows has always made. NOTE:
+ * paths.ts:normalizeForCompare keeps its win32-only split; it compares
+ * walk-up boundaries against $HOME, whose casing comes from the OS
+ * consistently, so the duplicate-key failure cannot arise there.
  */
 export function normalizeTrustKey(p: string): string {
   const resolved = resolve(p);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  const caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin";
+  return caseInsensitiveFs ? resolved.toLowerCase() : resolved;
 }
 
 /**

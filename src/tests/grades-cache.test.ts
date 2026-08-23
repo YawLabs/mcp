@@ -247,3 +247,26 @@ describe("readGradesCache -- a __proto__ namespace", () => {
     expect(cache.grade).toBeUndefined();
   });
 });
+
+describe("suiteVersion round-trip", () => {
+  it("preserves suiteVersion through write and read", async () => {
+    const entry = { grade: "A" as const, score: 99, gradedAt: "2026-08-23T00:00:00.000Z", suiteVersion: "0.17.1" };
+    await writeGrade("ctxlint", entry, synthHome);
+    const cache = await readGradesCache(synthHome);
+    expect(cache.ctxlint).toEqual(entry);
+  });
+
+  it("keeps a legacy entry without suiteVersion valid, with the field absent", async () => {
+    writeGradesFile(synthHome, JSON.stringify({ legacy: VALID_ENTRY }));
+    const cache = await readGradesCache(synthHome);
+    expect(cache.legacy).toEqual(VALID_ENTRY);
+    expect("suiteVersion" in cache.legacy).toBe(false);
+  });
+
+  it("drops a malformed suiteVersion from the entry without dropping the entry", async () => {
+    writeGradesFile(synthHome, JSON.stringify({ ctxlint: { ...VALID_ENTRY, suiteVersion: 17 } }));
+    const cache = await readGradesCache(synthHome);
+    expect(cache.ctxlint).toEqual(VALID_ENTRY);
+    expect(cache.ctxlint.suiteVersion).toBeUndefined();
+  });
+});

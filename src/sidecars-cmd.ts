@@ -51,7 +51,7 @@ import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
 import { loadLocalBundles, localBundlesPath } from "./local-bundles.js";
-import { isRegistrySpec, npxSpec, type OamProbe, packageName, probeOam } from "./oam-spawn.js";
+import { isRegistrySpec, nodeLaunchKind, npxSpec, type OamProbe, packageName, probeOam } from "./oam-spawn.js";
 import { sidecarsNodeModules, sidecarsRoot, userConfigDir } from "./paths.js";
 import type { UpstreamServerConfig } from "./types.js";
 
@@ -106,6 +106,14 @@ export interface SidecarSpec {
  * launch carrying flags yaw-mcp does not parse is skipped for the same reason
  * rewriteForOam skips it: the first positional is not reliably the package.
  *
+ * "npx" is recognised via nodeLaunchKind, NOT string equality: `npx.cmd` and
+ * an absolute `/usr/local/bin/npx` are the same launch, and rewriteForOam
+ * hosts them on oam through that same classifier. A collector matching only
+ * the bare string would install nothing for such a server while the rewrite
+ * happily reads the (empty) managed tree for it -- the server silently keeps
+ * resolving out of the npx cache, which is the failure this module exists to
+ * prevent.
+ *
  * When the same package is configured twice at DIFFERENT versions, the first
  * spec wins and the rest are recorded in `conflicting`. One flat node_modules
  * cannot hold two versions of a package, so a loser is unavoidable -- but a
@@ -115,7 +123,7 @@ export interface SidecarSpec {
 export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>>): SidecarSpec[] {
   const byPkg = new Map<string, SidecarSpec>();
   for (const s of servers) {
-    if (s.type !== "local" || s.command !== "npx") continue;
+    if (s.type !== "local" || s.command === undefined || nodeLaunchKind(s.command) !== "npx") continue;
     // Which argument is the package spec is oam-spawn's rule, not a second copy
     // of it: this collector and collectNonRegistrySpecs PARTITION the same
     // server set into "installed" and "skipped", so a rule that lives in two
@@ -152,7 +160,7 @@ export function collectNonRegistrySpecs(
 ): Array<{ namespace: string; spec: string }> {
   const out: Array<{ namespace: string; spec: string }> = [];
   for (const s of servers) {
-    if (s.type !== "local" || s.command !== "npx") continue;
+    if (s.type !== "local" || s.command === undefined || nodeLaunchKind(s.command) !== "npx") continue;
     // Same shared rule as collectSidecarSpecs -- see the note there.
     const spec = npxSpec(s.args ?? []);
     if (spec === null || isRegistrySpec(spec)) continue;
@@ -187,6 +195,46 @@ export function sidecarsManifest(specs: SidecarSpec[]): string {
     null,
     2,
   )}\n`;
+}
+
+/** What `sidecars install` records about the machine that filled the tree. */
+export interface SidecarsPlatform {
+  /** `process.platform` of the installing process, e.g. "darwin". */
+  platform: string;
+  /** `process.arch` of the installing process, e.g. "arm64". */
+  arch: string;
+}
+
+/** Marker file recording which platform/arch last filled the managed tree. */
+export function sidecarsPlatformPath(home: string = homedir()): string {
+  return join(sidecarsRoot(home), "platform.json");
+}
+
+/**
+ * The platform/arch the managed tree was installed FOR, or null when unknown
+ * (no marker -- a tree from before the marker existed, or none at all).
+ *
+ * Why this exists: the tree is keyed on HOME alone, deliberately -- one tree
+ * per machine is the documented design, and keying by arch would double the
+ * disk for the overwhelmingly common single-arch machine. But npm resolves
+ * native bindings (platform-specific optional deps, node-gyp builds) for the
+ * node that RUNS the install, so a home directory shared across architectures
+ * -- an x64 node under Rosetta, an NFS home mounted on two machines -- leaves
+ * a tree whose bindings fail at spawn on the other arch, while the package
+ * version reads as present and fine. Recording who installed it is the cheap
+ * half of the fix: doctor compares this against its own process and says so,
+ * instead of reporting a tree that cannot load as healthy.
+ */
+export function installedPlatform(home: string = homedir()): SidecarsPlatform | null {
+  try {
+    const raw = JSON.parse(readFileSync(sidecarsPlatformPath(home), "utf8"));
+    if (typeof raw?.platform === "string" && typeof raw?.arch === "string") {
+      return { platform: raw.platform, arch: raw.arch };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** The installed version of a package in the managed tree, or null. */
@@ -361,7 +409,7 @@ export function parseSidecarsArgs(
  * Why NOTHING will read the tree this command just filled -- the distinct
  * reasons, or [] when at least one server would be hosted on oam.
  *
- * collectSidecarSpecs filters on `command === "npx"` and nothing else -- it
+ * collectSidecarSpecs filters on the npx launch shape and nothing else -- it
  * cannot see per-server `runtime: "node"`, the config default, or whether oam
  * is installed at all. But the managed tree is consumed ONLY by resolveNpmEntry
  * on the oam rewrite path (oam-spawn.ts): a server that resolves to the node
@@ -389,7 +437,12 @@ async function unhostedReasons(
   opts: SidecarsInstallOptions,
   home: string,
 ): Promise<string[]> {
-  const npx = servers.filter((s) => s.type === "local" && s.command === "npx");
+  // nodeLaunchKind, not `=== "npx"` -- the same classifier the collectors and
+  // rewriteForOam use, so `npx.cmd` / an absolute npx path gets the same
+  // hosted-or-not verdict here as everywhere else.
+  const npx = servers.filter(
+    (s) => s.type === "local" && s.command !== undefined && nodeLaunchKind(s.command) === "npx",
+  );
   if (npx.length === 0) return [];
   const probe = await (opts.oamProbe ?? probeOam)();
   const { runtime: configDefault } = await describeDefaultRuntime({ cwd: opts.cwd, home });
@@ -533,6 +586,17 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts, skipped }));
     return { exitCode: 1, installed: [], lines };
   }
+
+  // Record which platform/arch just filled the tree (see installedPlatform for
+  // why). AFTER the install-succeeded gate, so a failed install leaves the
+  // marker describing whatever tree is actually still on disk -- and this
+  // process's own platform/arch, because that is the node npm resolved native
+  // bindings for. Same failure envelope as the manifest write above: the
+  // directory was just written to, so an unguarded write is fine.
+  await atomicWriteFile(
+    sidecarsPlatformPath(home),
+    `${JSON.stringify({ platform: process.platform, arch: process.arch }, null, 2)}\n`,
+  );
 
   // The second step is what makes "re-run this command to move them forward"
   // true. `npm install` CANNOT re-resolve a dist-tag against an existing tree:

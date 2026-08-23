@@ -130,11 +130,19 @@ export async function gradeOutcomeViaSampling(server: Server, ctx: GraderContext
   const prompt = buildGraderPrompt(ctx);
   try {
     const result = await withTimeout(
-      server.createMessage({
-        messages: [{ role: "user", content: { type: "text", text: prompt } }],
-        maxTokens: GRADER_MAX_TOKENS,
-        includeContext: "none",
-      }),
+      server.createMessage(
+        {
+          messages: [{ role: "user", content: { type: "text", text: prompt } }],
+          maxTokens: GRADER_MAX_TOKENS,
+          includeContext: "none",
+        },
+        // Cancel the REQUEST at the deadline, not just our wait for it: the
+        // SDK's request timeout sends notifications/cancelled to the client
+        // and rejects here. Without it, abandoning the promise left the
+        // sampling request (and the client's generation / token spend)
+        // running until the SDK's 60s DEFAULT_REQUEST_TIMEOUT_MSEC.
+        { timeout: GRADER_TIMEOUT_MS },
+      ),
       GRADER_TIMEOUT_MS,
     );
     if (!result || typeof result !== "object" || !("content" in result) || !result.content) return null;
@@ -148,6 +156,10 @@ export async function gradeOutcomeViaSampling(server: Server, ctx: GraderContext
 }
 
 // Resolve to null after ms rather than hang the (background) grade forever.
+// BACKSTOP only: the real deadline is the RequestOptions timeout passed to
+// createMessage above, which cancels the request client-side. This wrapper
+// covers a transport/mock that ignores RequestOptions, and keeps the
+// resolve-null (never-throw) contract local.
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return new Promise<T | null>((resolve) => {
     const timer = setTimeout(() => resolve(null), ms);

@@ -382,6 +382,11 @@ class FakeTTYStdin {
   pause(): this {
     return this;
   }
+  /** Mirror Readable#unshift: the reader re-buffers paste residue (the bytes
+   *  after the line terminator) here, and the next resume() delivers it. */
+  unshift(chunk: string): void {
+    this.queue.unshift(chunk);
+  }
 }
 
 describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
@@ -446,6 +451,129 @@ describe("readPassphraseFromTTY -- Ctrl-D cancel", () => {
     expect(r.exitCode).toBe(130);
     const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(errOutput.toLowerCase()).toContain("cancelled");
+  });
+});
+
+// -----------------------------------------------------------------------
+// A terminal paste arrives as ONE chunk. The reader must consume exactly
+// through its line terminator and re-buffer the rest for the next prompt --
+// dropping it meant a pasted "passphrase\nvalue\n" lost the value line and
+// the next prompt hung on input the user believes they already gave.
+// -----------------------------------------------------------------------
+
+describe("readLineFromTTY -- multi-line paste feeds successive prompts", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("a single pasted chunk answers the passphrase, its confirm, AND the value prompt (CRLF = one Enter)", async () => {
+    // One chunk, three answers. The CRLF line endings also assert the pair
+    // is swallowed as ONE Enter -- a re-buffered "\n" would submit the next
+    // prompt as empty, fail the confirm, and exhaust the re-prompt budget.
+    const stdin = new FakeTTYStdin(["a-long-passphrase\r\na-long-passphrase\r\nthe-value\r\n"]);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "github",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const prompts = (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .map((c) => c[0] as string)
+      .join("");
+    expect(prompts).toContain("Confirm passphrase: ");
+    expect(prompts).toContain("Secret value: ");
+
+    // Every line landed where it belonged: the vault unlocks under the
+    // pasted passphrase and holds the pasted value.
+    lock();
+    io.out.mockReset();
+    const got = await runSecrets({ action: "get", name: "github", passphrase: "a-long-passphrase", home }, io);
+    expect(got.exitCode).toBe(0);
+    expect(io.out.mock.calls.map((c) => c[0] as string).join("")).toContain("the-value");
+  });
+});
+
+// -----------------------------------------------------------------------
+// The "no passphrase available" refusal must not tell a Git Bash user to
+// "run from a TTY" -- they ARE at a terminal; MSYS just emulates it with
+// pipes, so Node reports isTTY false and the prompt can never fire there.
+// -----------------------------------------------------------------------
+
+describe("passphrase-required message under Git Bash / MSYS", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  // Both ends non-TTY: prompting is genuinely impossible, which is the only
+  // case the MSYS wording may claim.
+  const stdin = { isTTY: false } as unknown as NodeJS.ReadableStream;
+  const stdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+  let savedMsystem: string | undefined;
+
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    savedMsystem = process.env.MSYSTEM;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (savedMsystem === undefined) delete process.env.MSYSTEM;
+    else process.env.MSYSTEM = savedMsystem;
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("names the MSYS pipe emulation and the real remedies when MSYSTEM is set", async () => {
+    process.env.MSYSTEM = "MINGW64";
+    const r = await runSecrets(
+      { action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout, stderr } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain("Passphrase required.");
+    expect(errText()).toContain("Git Bash/MSYS");
+    expect(errText()).toContain("winpty");
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    // The wrong claim is gone: the user is not told to go find a TTY.
+    expect(errText()).not.toContain("run from a TTY");
+  });
+
+  it("keeps the plain TTY wording when MSYSTEM is not set", async () => {
+    delete process.env.MSYSTEM;
+    const r = await runSecrets(
+      { action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout, stderr } },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(errText()).toContain(
+      "Passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.",
+    );
+    expect(errText()).not.toContain("winpty");
   });
 });
 

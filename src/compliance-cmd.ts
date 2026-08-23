@@ -343,7 +343,12 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRu
       process.off("SIGTERM", onInterrupt);
     };
 
-    let stdout = "";
+    // Accumulate raw Buffers and decode ONCE at close: decoding each chunk
+    // independently corrupts a multi-byte UTF-8 sequence that straddles a
+    // pipe-boundary chunk (both halves become U+FFFD), which turned a valid
+    // report bigger than the pipe's highWaterMark into "exited N without
+    // valid JSON output". Byte counting stays exact on the raw chunks.
+    const stdoutChunks: Buffer[] = [];
     let stdoutBytes = 0;
 
     const timer = setTimeout(() => {
@@ -369,7 +374,7 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRu
         resolve(null);
         return;
       }
-      stdout += chunk.toString();
+      stdoutChunks.push(chunk);
     });
     child.on("error", (e) => {
       if (settled) return;
@@ -385,6 +390,7 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRu
       // mcp-compliance exits non-zero on --strict / --min-grade failures but
       // still writes a valid JSON report. Try parsing regardless of exit code,
       // and hand the code back so the caller can propagate it.
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
       try {
         const parsed = JSON.parse(stdout) as ComplianceReport;
         if (!isRenderableReport(parsed)) {

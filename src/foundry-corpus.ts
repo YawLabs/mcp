@@ -19,7 +19,7 @@
 // the gate consumes it. Until a fixture exists the gate cleanly skips.
 
 import { readFileSync } from "node:fs";
-import { type RankableServer, rankServers } from "./relevance.js";
+import { type RankableServer, type RankableTool, rankServers } from "./relevance.js";
 
 export const FOUNDRY_CORPUS_VERSION = 1 as const;
 
@@ -177,6 +177,46 @@ export function scoreCorpus(corpus: FoundryCorpus): CorpusScore {
   };
 }
 
+// A server the BM25 floor can consume without crashing: buildDocFields
+// (relevance.ts) iterates `tools` unguarded and tokenizes namespace / name /
+// description plus each tool's name / description, so each must carry the
+// declared type or be absent. Element-level, because a truncated or
+// hand-edited fixture is exactly what the gate's hard-fail state exists to
+// name -- an Array.isArray check alone let such a fixture pass validation and
+// then crash scoreCorpus with an opaque TypeError instead.
+function isRankableServerShape(s: unknown): s is RankableServer {
+  if (!s || typeof s !== "object") return false;
+  const x = s as Partial<RankableServer>;
+  if (typeof x.namespace !== "string" || typeof x.name !== "string") return false;
+  if (x.description !== undefined && typeof x.description !== "string") return false;
+  if (!Array.isArray(x.tools)) return false;
+  for (const t of x.tools) {
+    if (!t || typeof t !== "object") return false;
+    const tool = t as Partial<RankableTool>;
+    if (typeof tool.name !== "string") return false;
+    if (tool.description !== undefined && typeof tool.description !== "string") return false;
+  }
+  return true;
+}
+
+// An entry scoreCorpus can score: a non-empty all-string token bag, a chosen
+// namespace, and a finite positive weight (buildCorpusFromTraces never writes
+// anything else; a 0/negative/NaN weight would silently corrupt the weighted
+// accuracy rather than crash, which is worse).
+function isCorpusEntryShape(e: unknown): e is FoundryCorpusEntry {
+  if (!e || typeof e !== "object") return false;
+  const x = e as Partial<FoundryCorpusEntry>;
+  return (
+    Array.isArray(x.tokens) &&
+    x.tokens.length > 0 &&
+    x.tokens.every((t) => typeof t === "string") &&
+    typeof x.chosen === "string" &&
+    typeof x.weight === "number" &&
+    Number.isFinite(x.weight) &&
+    x.weight > 0
+  );
+}
+
 // Validate a parsed object as a FoundryCorpus. Returns the typed corpus or null
 // (used by the gate to skip cleanly on a missing/garbage/empty fixture).
 export function validateCorpus(obj: unknown): FoundryCorpus | null {
@@ -185,6 +225,8 @@ export function validateCorpus(obj: unknown): FoundryCorpus | null {
   if (c.version !== FOUNDRY_CORPUS_VERSION) return null;
   if (!Array.isArray(c.servers) || !Array.isArray(c.entries)) return null;
   if (c.entries.length === 0) return null;
+  if (!c.servers.every(isRankableServerShape)) return null;
+  if (!c.entries.every(isCorpusEntryShape)) return null;
   return c as FoundryCorpus;
 }
 

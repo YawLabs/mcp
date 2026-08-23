@@ -298,3 +298,23 @@ describe("runServer startup failure", () => {
     expect(exceptionIdx).toBeLessThan(firstAwaitIdx);
   });
 });
+
+describe("--help environment variable coverage", () => {
+  it("documents every live env knob, including the four that used to be missing", async () => {
+    // Regression: YAW_MCP_REWARD_GRADER (spends the client's LLM budget),
+    // YAW_MCP_TOOL_EXPOSURE (switches the whole tools/list surface),
+    // YAW_MCP_ROUTE_EFFORT, and MCP_LIST_TIMEOUT were all read by the code
+    // but absent from the --help Environment variables block -- and the
+    // help footer points at `yaw-mcp <subcommand> --help` for everything
+    // else, so no other surface named them.
+    const src = await readFile(INDEX_SRC, "utf8");
+    const start = src.indexOf("Environment variables:");
+    const end = src.indexOf("Config resolution");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const envBlock = src.slice(start, end);
+    for (const name of ["YAW_MCP_TOOL_EXPOSURE", "YAW_MCP_ROUTE_EFFORT", "YAW_MCP_REWARD_GRADER", "MCP_LIST_TIMEOUT"]) {
+      expect(envBlock).toContain(name);
+    }
+  });
+});
