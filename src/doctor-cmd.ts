@@ -72,7 +72,7 @@ import {
   nodeLaunchKind,
   type OamProbe,
   type OamProbeFailure,
-  oamInstallCommand,
+  oamInstallAdvice,
   probeOam,
 } from "./oam-spawn.js";
 import { userConfigDir } from "./paths.js";
@@ -978,12 +978,12 @@ function renderOamRuntimeSection(opts: {
     // is `install:`, not the `fix:` the below-min and unusable branches print.
     // A user who opens doctor to find out why a server says "oam is not
     // installed" was, until now, sent to the README for the URL.
-    print(`           install: ${oamInstallCommand(opts.os)}`);
+    print(`           install: ${oamInstallAdvice(opts.os)}`);
   } else if (probe.version === null) {
     // A working --version proves oam exists, so the probe treats an
     // unparseable version as usable and hosts on it (oam-spawn.ts) -- but the
     // MIN_OAM_VERSION floor is gated on a parsed version, so it never ran.
-    // Rendering this as "(vunknown, min 0.8.3)" read exactly like a version
+    // Rendering this as "(vunknown, min <floor>)" read exactly like a version
     // that PASSED the floor, which is the one thing this line must not do.
     print(`  binary:  ${probe.bin} (version unparseable -- min ${MIN_OAM_VERSION} NOT verified, hosting anyway)`);
   } else {

@@ -9,7 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { defaultRuntime } from "./default-runtime.js";
 import { log } from "./logger.js";
-import { probeOam, resolveOamSpawn } from "./oam-spawn.js";
+import { oamHeapOomHint, probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import { hasSecretRefs, loadVault, resolveSecretRefs, SECRET_REF_RE, unlock, vaultPath } from "./secrets-vault.js";
 import type {
@@ -566,7 +566,14 @@ async function connectToUpstreamOnce(
       // the handshake (install failure, missing env var, bad args).
       category = "install_failure";
       const safe = redactSecretsInOutput(trimmedStderr, resolvedServerEnv);
-      message = `Server "${config.namespace}" failed to start. stderr: ${safe.slice(-500)}`;
+      // An oam heap-cap death IS "exited non-zero before handshake", so the
+      // category is already right and the downgrade logic above needs no new
+      // branch -- what it lacks is a message naming the one env var that fixes
+      // it, instead of leaving the banner buried in the tail.
+      const oomHint = oamHeapOomHint(trimmedStderr);
+      message = oomHint
+        ? `Server "${config.namespace}" ran out of memory. ${oomHint} stderr: ${safe.slice(-500)}`
+        : `Server "${config.namespace}" failed to start. stderr: ${safe.slice(-500)}`;
     } else {
       category = categorizeSpawnError(err);
       if (category === "spawn_failure") {

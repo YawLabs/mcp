@@ -56,6 +56,8 @@ import {
   type OamProbe,
   oamFailureLabel,
   oamInstallCommand,
+  oamNoBinaryReason,
+  oamPublishesBinaryForThisMachine,
   probeOam,
   resolveStableNpmEntry,
 } from "./oam-spawn.js";
@@ -130,10 +132,14 @@ export interface InstallCommandOptions {
  *  run on node either (see uv-bootstrap.ts), so the reassurance has to be about
  *  the runtime yaw-mcp is choosing between, not about server coverage. */
 function oamAbsentNote(os: InstallOS): string {
-  return (
-    "Runtime: node (oam is not installed, which is fine -- node is the supported default. " +
-    `To host yaw-mcp on oam instead: \`${oamInstallCommand(os)}\`, then re-run install.)`
-  );
+  const head = "Runtime: node (oam is not installed, which is fine -- node is the supported default. ";
+  // Withhold the installer where it cannot succeed: oam ships no linux-arm64
+  // binary and install.sh refuses outright, so naming the one-liner here sends
+  // the user to a command that exits non-zero for a runtime they never needed.
+  if (os === CURRENT_OS && !oamPublishesBinaryForThisMachine()) {
+    return `${head}oam is not an option on this machine: ${oamNoBinaryReason()}.)`;
+  }
+  return `${head}To host yaw-mcp on oam instead: \`${oamInstallCommand(os)}\`, then re-run install.)`;
 }
 
 /** True when the probe means oam is simply NOT INSTALLED -- both handles null,

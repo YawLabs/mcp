@@ -19,21 +19,38 @@
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// MEASURED against oam 0.9.0 on 2026-08-08, so nobody re-derives it: the
-// pure-JS/SDK tier (fetch, lemonsqueezy, memory) completes an MCP initialize
-// handshake hosted on oam, AND so do both bundled-browser servers --
-// @modelcontextprotocol/server-puppeteer and @playwright/mcp each launched a
-// real Chromium and navigated to a live URL on oam, byte-identical in outcome
-// to the node control. The previous note here called bundled browsers
-// "not oam-hostable yet"; that was true and is no longer. oam 0.9.0 is what
-// changed it: before that release `child_process` ignored `stdio` entirely
-// ('inherit'/'ignore' both behaved as 'pipe'), which is precisely the npm
-// bin-shim shape every sidecar launches through -- they booted and then sat
-// mute forever while the launcher reported success. MIN_OAM_VERSION gates that
-// fix in, so a machine below the floor gets node instead.
+// MEASURED against oam 0.11.0 on 2026-08-22 (first measured against 0.9.0 on
+// 2026-08-08; re-run for the floor move), so nobody re-derives it: the
+// pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres, ctxlint)
+// completes an MCP initialize handshake hosted on oam, AND so do both
+// bundled-browser servers -- @modelcontextprotocol/server-puppeteer and
+// @playwright/mcp each launched a real Chromium and served a real
+// tools/call navigate on oam, matching the node control. An earlier note here
+// called bundled browsers "not oam-hostable yet"; that was true and is no
+// longer. oam 0.9.0 is what changed it: before that release `child_process`
+// ignored `stdio` entirely ('inherit'/'ignore' both behaved as 'pipe'), which
+// is precisely the npm bin-shim shape every sidecar launches through -- they
+// booted and then sat mute forever while the launcher reported success.
+// MIN_OAM_VERSION gates that fix in, so a machine below the floor gets node.
 //
-// Native addons (ssh2) are UNVERIFIED here -- untested, not known-broken. Do
-// not promote that to either claim without running it.
+// Native addons: oam refuses to dlopen a .node addon by default, throwing a
+// CATCHABLE error with code OAM-NATIVE0001 (OAM_ENABLE_NATIVE_ADDONS=1 opts
+// into oam's alpha N-API support). The refusal is designed to be catchable so
+// the universal `try { require(native) } catch { pure-JS fallback }` pattern
+// keeps working, and oam deliberately omits `process.versions.modules`/`napi`
+// so addon loaders do not try in the first place.
+//
+// MEASURED against oam 0.11.0 on 2026-08-22: this does NOT break ssh2. With a
+// compiled sshcrypto.node present on disk, ssh2 loads and its Client and kex
+// layers work identically to the node control -- its binding require is
+// try/catch-wrapped, so it degrades to the pure-JS cipher path. The addon is
+// refused; the sidecar is not. Note OAM_ENABLE_NATIVE_ADDONS=1 would not even
+// help there: that addon is NAN/node-gyp, and the alpha loader rejects it with
+// "napi_register_module_v1 missing".
+//
+// The residual risk is narrower than "native addons are broken": a package that
+// requires a .node with NO fallback, LAZILY at first tool call, would fail past
+// the boot-scoped downgrade below. That case is untested.
 //
 // Boot failures ARE recovered: connectToUpstream respawns once on the original
 // node/npx command when an oam-hosted child fails the connect handshake or dies
@@ -45,7 +62,7 @@ import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync 
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { InstallOS } from "./install-targets.js";
+import { CURRENT_OS, type InstallOS } from "./install-targets.js";
 import { log } from "./logger.js";
 import { sidecarsNodeModules } from "./paths.js";
 
@@ -197,7 +214,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.9.0";
+export const MIN_OAM_VERSION = "0.11.0";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -218,6 +235,95 @@ export const OAM_INSTALL_PS1 = "irm https://oamjs.org/install.ps1 | iex";
  */
 export function oamInstallCommand(os: InstallOS): string {
   return os === "windows" ? OAM_INSTALL_PS1 : OAM_INSTALL_SH;
+}
+
+/**
+ * Whether oamjs.org publishes an oam binary for the machine this process is
+ * running on.
+ *
+ * oam ships five assets: windows x64/arm64, macos x64/arm64, and linux x64.
+ * There is NO aarch64-unknown-linux-gnu build, and install.sh refuses rather
+ * than degrading -- "no published oam binary for Linux aarch64 yet ... use an
+ * x86_64 host or build from source". Handing a Linux/arm64 user the curl
+ * one-liner is handing them a command that cannot succeed, which is worse than
+ * saying nothing: node is already a full fallback, so there is no repair to
+ * make, only a fact to report.
+ *
+ * Answers only for the CURRENT machine, deliberately. doctor and install both
+ * take an --os override, and a report asked about a DIFFERENT os carries no
+ * arch with it -- assuming the running machine's arch for it would turn "I do
+ * not know" into a confident claim about a platform we cannot see. Callers
+ * gate on `os === CURRENT_OS` before consulting this.
+ */
+export function oamPublishesBinaryFor(platform: string, arch: string): boolean {
+  if (platform === "win32" || platform === "darwin") return arch === "x64" || arch === "arm64";
+  if (platform === "linux") return arch === "x64";
+  // Everything else (freebsd, aix, android...) has no asset at all. Refusing
+  // by default rather than assuming keeps a new platform from being handed an
+  // installer nobody has built for it.
+  return false;
+}
+
+/** {@link oamPublishesBinaryFor} for the running machine. Split so the asset
+ *  table can be table-tested without stubbing `process`. */
+export function oamPublishesBinaryForThisMachine(): boolean {
+  return oamPublishesBinaryFor(process.platform, process.arch);
+}
+
+/**
+ * Why there is no oam to install on this machine. Only meaningful when
+ * oamPublishesBinaryForThisMachine() is false.
+ *
+ * One source for the wording, for the same reason oamFailureLabel is one
+ * source: doctor's OAM RUNTIME section and `install`'s absent note both reach
+ * it, and a second copy is how one surface goes on naming a platform the other
+ * has stopped naming.
+ */
+export function oamNoBinaryReason(): string {
+  return `no published oam binary for ${process.platform}-${process.arch} yet — build from source at https://oamjs.org`;
+}
+
+/**
+ * The `install:` line for a report about `os`: the installer one-liner, or the
+ * reason there is nothing to install.
+ *
+ * doctor prints this verbatim. `install` phrases the two cases itself, because
+ * its note is a sentence rather than a labelled field -- it consults the
+ * predicate and this reason directly.
+ */
+export function oamInstallAdvice(os: InstallOS): string {
+  if (os === CURRENT_OS && !oamPublishesBinaryForThisMachine()) return oamNoBinaryReason();
+  return oamInstallCommand(os);
+}
+
+/**
+ * Recognize oam's heap-cap death in a child's stderr, and say what fixes it.
+ *
+ * Since 0.9.2 oam caps the V8 heap -- 4 GiB unless OAM_MAX_HEAP_MB overrides,
+ * 0 disables -- and turns what node renders as an ungraceful "Ineffective
+ * mark-compacts near heap limit" abort into a deterministic exit 134 with
+ * `error[OAM-RT-OOM]` on stderr, stdout left clean so the protocol channel is
+ * not corrupted on the way out. That is a BETTER death than node's: it is
+ * bounded, it names its own cause, and it cannot be mistaken for a crash. But
+ * only if something reads it -- unrecognized it lands inside a 500-char stderr
+ * tail under a generic "failed to start", and the one lever that fixes it is
+ * never mentioned to the person who needs it.
+ *
+ * Matches the stable error CODE, not the prose: the banner carries the
+ * resolved cap and whether it came from the env, so matching the sentence
+ * would break on the next release that rewords it.
+ *
+ * Returns null for every other stderr, including a node-hosted OOM -- node's
+ * abort has no equivalent code, and inventing a hint for it here would put
+ * OAM_MAX_HEAP_MB in front of someone not running oam.
+ */
+export function oamHeapOomHint(stderr: string): string | null {
+  if (!stderr.includes("OAM-RT-OOM")) return null;
+  return (
+    "The oam-hosted child hit its V8 heap cap (oam defaults to 4 GiB). Raise it with " +
+    'OAM_MAX_HEAP_MB=<mb> in this server\'s env, or set "runtime": "node" for this ' +
+    "server in bundles.json."
+  );
 }
 
 /** One "your oam opt-in landed on node" warning per process, not one per

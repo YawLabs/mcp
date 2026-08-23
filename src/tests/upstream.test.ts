@@ -136,7 +136,15 @@ vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => {
 // runtime gate actually reach + apply the rewrite?" -- is tested
 // independently of an installed oam. probeOam feeds the oamVersion field of
 // the connect/downgrade log lines; a fixed probe keeps that deterministic.
-vi.mock("../oam-spawn.js", () => ({
+// Spread the REAL module and override only the two spawn/probe entry points.
+// A bare factory listing just those two silently breaks every test in this file
+// the moment upstream.ts imports one more thing from oam-spawn -- vitest throws
+// "No <name> export is defined on the mock" from inside connectToUpstream, so
+// the failure surfaces as "err is not an ActivationError" in unrelated redaction
+// tests rather than as a missing mock. Keeping the pure helpers real also means
+// the OOM-hint branch below is exercised against the shipped wording.
+vi.mock("../oam-spawn.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../oam-spawn.js")>()),
   resolveOamSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
   probeOam: vi.fn(() => ({ bin: "/usr/bin/oam", version: "0.6.0", belowMin: false })),
 }));
@@ -1599,6 +1607,31 @@ describe("connectToUpstream activation failure categories", () => {
 
     expect(err.category).toBe("install_failure");
     expect(err.message).toContain(`Server "test" failed to start. stderr: npm ERR! 404 Not Found - @acme/nope`);
+    // The generic wording, specifically: an OOM death must NOT read like this.
+    expect(err.message).not.toContain("OAM_MAX_HEAP_MB");
+  });
+
+  it("names OAM_MAX_HEAP_MB when an oam-hosted child dies on its heap cap", async () => {
+    // oam exits 134 with error[OAM-RT-OOM] instead of node's ungraceful
+    // "Ineffective mark-compacts" abort. The category is unchanged -- it really
+    // is "exited non-zero before handshake" -- but a bare "failed to start"
+    // buries the one lever that fixes it inside a 500-char stderr tail.
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit(
+        "data",
+        Buffer.from("error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the 4096 MB cap (default 4 GiB)"),
+      );
+      return Promise.reject(new Error("connection closed"));
+    };
+
+    const err = await failedConnect(makeLocalConfig());
+
+    expect(err.category).toBe("install_failure");
+    expect(err.message).toContain(`Server "test" ran out of memory.`);
+    expect(err.message).toContain("OAM_MAX_HEAP_MB");
+    // Both escape hatches, and the raw banner is still carried for diagnosis.
+    expect(err.message).toContain("bundles.json");
+    expect(err.message).toContain("OAM-RT-OOM");
   });
 
   it("wraps a resolver failure as an ActivationError carrying the config pointer", async () => {

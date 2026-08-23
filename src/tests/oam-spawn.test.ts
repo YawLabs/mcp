@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CURRENT_OS } from "../install-targets.js";
 import {
   createProbeCollector,
   isOamCommand,
@@ -14,8 +15,15 @@ import {
   npxCacheNodeModules,
   npxSpec,
   npxSpecIndex,
+  OAM_INSTALL_PS1,
+  OAM_INSTALL_SH,
   OAM_PROBE_TIMEOUT_MS,
   oamFailureLabel,
+  oamHeapOomHint,
+  oamInstallAdvice,
+  oamNoBinaryReason,
+  oamPublishesBinaryFor,
+  oamPublishesBinaryForThisMachine,
   packageName,
   parseOamVersion,
   probeOam,
@@ -180,10 +188,12 @@ describe("probeOam min-version gate", () => {
   });
 
   it("ranks a prerelease of the floor BELOW it, and keeps the suffix it reports", async () => {
-    // "oam 0.8.3-rc.1" against a 0.8.3 floor: semver says the prerelease is
-    // lower, and hosting it means debugging against a build nobody else runs.
-    // The reported version has to keep the suffix or this warn reads as a
-    // comparator bug ("0.8.3 is below the minimum 0.8.3").
+    // A prerelease OF the floor itself (e.g. "0.11.0-rc.1" against a 0.11.0
+    // floor): semver ranks the prerelease lower, and hosting it means
+    // debugging against a build nobody else runs. The reported version has to
+    // keep the suffix or this warn reads as a comparator bug ("0.11.0 is below
+    // the minimum 0.11.0"). Derived from the constant, so the assertion tracks
+    // future bumps -- only this illustration names a number.
     const probe = await probeOam(async () => `oam ${MIN_OAM_VERSION}-rc.1\n`);
     expect(probe.belowMin).toBe(true);
     expect(probe.bin).toBeNull();
@@ -1921,5 +1931,80 @@ describe("isOamCommand / isOamLaunch", () => {
     expect(isOamLaunch("npx", [])).toBe(false);
     // A POSIX path argument must never be read as a cmd switch.
     expect(isOamLaunch("cmd", ["/c", "/usr/local/bin/oam"])).toBe(true);
+  });
+});
+
+describe("oam published-binary gate", () => {
+  it("ships every windows and macos arch, but linux x64 only", () => {
+    for (const arch of ["x64", "arm64"]) {
+      expect(oamPublishesBinaryFor("win32", arch), `win32-${arch}`).toBe(true);
+      expect(oamPublishesBinaryFor("darwin", arch), `darwin-${arch}`).toBe(true);
+    }
+    expect(oamPublishesBinaryFor("linux", "x64")).toBe(true);
+    // The whole reason this gate exists: install.sh REFUSES on aarch64 Linux
+    // ("no published oam binary for Linux aarch64 yet"), so printing the curl
+    // one-liner there hands over a command that cannot succeed.
+    expect(oamPublishesBinaryFor("linux", "arm64")).toBe(false);
+  });
+
+  it("refuses a platform with no asset at all rather than assuming one", () => {
+    expect(oamPublishesBinaryFor("freebsd", "x64")).toBe(false);
+    expect(oamPublishesBinaryFor("linux", "ppc64")).toBe(false);
+  });
+
+  it("agrees with the running machine's platform and arch", () => {
+    expect(oamPublishesBinaryForThisMachine()).toBe(oamPublishesBinaryFor(process.platform, process.arch));
+  });
+});
+
+describe("oamInstallAdvice", () => {
+  // A report ABOUT another OS carries no arch, so the gate must not fire on it
+  // -- guessing this machine's arch for a platform we cannot see would turn
+  // "I do not know" into a confident claim. These hold on every host.
+  const otherOses = (["macos", "linux", "windows"] as const).filter((o) => o !== CURRENT_OS);
+
+  it("hands back the platform's one-liner for any OS that is not this machine", () => {
+    for (const os of otherOses) {
+      expect(oamInstallAdvice(os), os).toBe(os === "windows" ? OAM_INSTALL_PS1 : OAM_INSTALL_SH);
+    }
+  });
+
+  it("withholds the installer for THIS machine only when no binary is published", () => {
+    const advice = oamInstallAdvice(CURRENT_OS);
+    if (oamPublishesBinaryForThisMachine()) {
+      expect(advice).toBe(CURRENT_OS === "windows" ? OAM_INSTALL_PS1 : OAM_INSTALL_SH);
+    } else {
+      expect(advice).toBe(oamNoBinaryReason());
+      expect(advice).not.toContain("oamjs.org/install");
+    }
+  });
+
+  it("names the platform it could not find a binary for", () => {
+    expect(oamNoBinaryReason()).toContain(`${process.platform}-${process.arch}`);
+  });
+});
+
+describe("oamHeapOomHint", () => {
+  it("recognizes oam's heap-cap death and names the lever that fixes it", () => {
+    const banner = "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the 4096 MB cap (default 4 GiB)";
+    const hint = oamHeapOomHint(banner);
+    expect(hint).not.toBeNull();
+    expect(hint).toContain("OAM_MAX_HEAP_MB");
+    // The other escape hatch: pin the server off oam entirely.
+    expect(hint).toContain("bundles.json");
+  });
+
+  it("matches the stable code, not the banner's wording", () => {
+    // The prose carries the resolved cap and whether it came from the env, so
+    // it is the part most likely to be reworded between oam releases.
+    expect(oamHeapOomHint("error[OAM-RT-OOM]: heap exhausted, cap set by OAM_MAX_HEAP_MB")).not.toBeNull();
+  });
+
+  it("stays silent for every other stderr, including a node-hosted OOM", () => {
+    expect(oamHeapOomHint("")).toBeNull();
+    expect(oamHeapOomHint("Error: connect ECONNREFUSED")).toBeNull();
+    // node's abort carries no OAM code -- surfacing OAM_MAX_HEAP_MB to someone
+    // not running oam would point them at a variable nothing reads.
+    expect(oamHeapOomHint("FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed")).toBeNull();
   });
 });

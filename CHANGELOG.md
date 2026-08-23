@@ -2,6 +2,38 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.75.5 -- the oam floor moves to 0.11.0, and three oam facts get re-measured
+
+**Changed -- the oam floor moves to 0.11.0**
+
+`MIN_OAM_VERSION` tracks the latest oam release as policy, and v0.11.0 is now current (published 2026-08-22). Three of the releases between the old 0.9.0 floor and this one fix things this workload sits directly on top of, so this is not only policy: 0.10.1 fixed a live `kill()` on an extra-fd child being a silent no-op on Unix -- a CDP browser child could not be terminated at all -- and a failed extra-fd spawn emitting `error` with no `close`, which stalled a driver probing for a browser binary that is not installed. 0.11.0 scoped Windows child handle inheritance with a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; without it a concurrent spawn could leak one child's pipe ends into an unrelated child, and pre-warm activates servers three at a time.
+
+A machine below the floor falls back to node/npx with one warning naming both versions and the command that fixes it (`oam self-update`), exactly as before.
+
+**Changed -- the native-addon note says what was measured instead of declining to guess**
+
+The compat note in `oam-spawn.ts` recorded native addons (ssh2) as UNVERIFIED. Measured against oam 0.11.0: oam refuses to dlopen a `.node` addon by default and throws a CATCHABLE error carrying `OAM-NATIVE0001`, and that refusal is deliberate -- it exists so the universal `try { require(native) } catch { pure-JS fallback }` pattern keeps working, which is also why oam omits `process.versions.modules`/`napi` so addon loaders do not try in the first place. With a compiled `sshcrypto.node` on disk, ssh2 loads and its Client and kex layers behave identically to the node control, because its binding require is try/catch-wrapped and it degrades to the pure-JS cipher path. The addon is refused; the sidecar is not. `OAM_ENABLE_NATIVE_ADDONS=1` would not change that outcome either -- that addon is NAN/node-gyp and oam's alpha N-API loader rejects it for a missing `napi_register_module_v1`.
+
+The residual risk is narrower than "native addons are broken", and the note now says so: a package that requires a `.node` with NO fallback, LAZILY at first tool call, would fail past the boot-scoped downgrade. That case is still untested, and it is the one worth writing down.
+
+The bundled-browser measurement was re-run at the same time. Both browser servers now serve a real `tools/call` navigate hosted on oam, not just an initialize handshake.
+
+**Added -- an oam heap-cap death names the one variable that fixes it**
+
+Since oam 0.9.2 the runtime caps its V8 heap (4 GiB unless `OAM_MAX_HEAP_MB` says otherwise) and turns what node renders as an ungraceful "Ineffective mark-compacts near heap limit" abort into a deterministic exit 134 with `error[OAM-RT-OOM]` on stderr, stdout left clean so the protocol channel is not corrupted on the way out. That is a better death than node's -- bounded, self-describing, not mistakable for a crash -- but only if something reads it. Unrecognized, it landed inside a 500-character stderr tail under a generic "failed to start", and the lever that fixes it was never mentioned to the person who needed it. The activation error now leads with the cause and names both escape hatches: `OAM_MAX_HEAP_MB` for the server's env, or `"runtime": "node"` for that server in `bundles.json`.
+
+The failure CATEGORY is deliberately unchanged. An OOM really is "exited non-zero before handshake", so `install_failure` is already correct and the boot-probe downgrade needs no new branch -- inventing a category for it would have made a node respawn look like a different failure and pinned the server to node on evidence that never implicated the runtime.
+
+**Fixed -- `install` and `doctor` no longer offer an installer that cannot run**
+
+oam ships five assets: windows x64/arm64, macos x64/arm64, and linux x64. There is no `aarch64-unknown-linux-gnu` build, and `install.sh` refuses outright rather than degrading. Both surfaces branched on OS alone, so on Linux/arm64 they printed the curl one-liner as the fix -- a command that exits non-zero for a runtime the user never needed, since node is already a full fallback. They now report the platform and point at building from source instead.
+
+The gate answers only for the CURRENT machine, deliberately. `doctor` and `install` both take an `--os` override, and a report asked about a different OS carries no arch with it; assuming this machine's arch for it would turn "I do not know" into a confident claim about a platform we cannot see.
+
+**Fixed -- two stale citations**
+
+`doctor`'s comment explaining the unparseable-version line quoted a floor two bumps old, and the prerelease-ranking test described itself as running "against a 0.8.3 floor" while asserting against whatever `MIN_OAM_VERSION` currently is. Both now read floor-agnostically, so the next bump cannot strand them again. Relatedly, `upstream.test.ts`'s `oam-spawn` mock listed its two exports by hand, so importing one more thing from that module in `upstream.ts` broke every test in the file with an error that surfaced as an unrelated redaction failure; it spreads the real module now and overrides only the spawn and probe entry points.
+
 ## 0.74.3 -- an absent oam says how to install it, and bundled browsers turn out to be hostable
 
 **Added -- the two surfaces that reported an absent oam now say what to do about it**
