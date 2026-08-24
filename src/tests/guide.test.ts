@@ -93,24 +93,10 @@ describe("loadProjectGuide", () => {
     expect(await loadProjectGuide(project, home)).toBeNull();
   });
 
-  it("loads a project guide from a checkout OUTSIDE $HOME (second drive, container workspace)", async () => {
-    // Regression: findProjectConfigDir once bailed before its first probe
-    // whenever cwd was not under $HOME, so a repo on D:\ or /workspaces
-    // silently got no YAW-MCP.md at all. The guide sits at the walk's
-    // starting dir so discovery never escapes into the real filesystem.
-    const outside = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-outside-"));
-    try {
-      writeGuide(join(outside, CONFIG_DIRNAME), "outside-home notes");
-      const g = await loadProjectGuide(outside, home, {});
-      expect(g?.scope).toBe("project");
-      expect(g?.content).toBe("outside-home notes");
-      // The approval gate still applies out there: no approved bundles.json
-      // beside the guide means it loads flagged, not silently trusted.
-      expect(g?.unapproved).toBe(true);
-    } finally {
-      rmSync(outside, { recursive: true, force: true });
-    }
-  });
+  // The outside-$HOME checkout case (second drive, container workspace) now
+  // lives in guide-outside-home-trust.test.ts, which exercises the ownership
+  // gate (POSIX uid match) and the win32 env opt-in deterministically with
+  // geteuid/env stubs the plain temp-dir case here couldn't pin.
 });
 
 // A project YAW-MCP.md sits in the SAME `.yaw-mcp/` as the consent-gated

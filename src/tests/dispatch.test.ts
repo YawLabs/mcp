@@ -339,7 +339,7 @@ describe("handleDiscoverWithAutoWarm", () => {
     expect(result.content[0].text).not.toContain("Auto-loaded");
   });
 
-  it("does not auto-activate a server that is already connected", async () => {
+  it("does not spawn an already-connected winner, but still advertises and names it", async () => {
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -354,8 +354,16 @@ describe("handleDiscoverWithAutoWarm", () => {
     };
     priv.connections.set("gh", makeConnection("gh", [{ name: "create_issue" }]));
     const result = await priv.handleDiscoverWithAutoWarm("file a github issue");
+    // No new spawn -- the connection already exists.
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
-    expect(result.content[0].text).not.toContain("Auto-loaded");
+    // But under the default gateway exposure "connected" is not
+    // "advertised": an auto-loaded winner the client never asked for is
+    // invisible in tools/list, so the intent-driven pick must still reach
+    // sessionActivated and the banner must still name it -- otherwise the
+    // one-shot discover(context) promise breaks exactly when the server
+    // was already warm.
+    expect(priv.sessionActivated.has("gh")).toBe(true);
+    expect(result.content[0].text).toContain('Auto-loaded "gh"');
   });
 
   it("YAW_MCP_AUTO_ACTIVATE=0 disables the auto-warm entirely", async () => {

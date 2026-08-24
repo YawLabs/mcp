@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { quoteShellArgIfNeeded } from "../auto-upgrade.js";
+import { quoteArgForDisplay, quoteShellArgIfNeeded } from "../auto-upgrade.js";
 import {
   buildUpgradePlan,
   detectInstallMethod,
@@ -660,6 +660,127 @@ describe("runUpgrade", () => {
       });
       expect(runningPrefix).not.toHaveBeenCalled();
       expect(spawned[0]).toEqual({ cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] });
+    });
+
+    it("offline suggestion carries the same --prefix the spawn would (walk is filesystem-only)", async () => {
+      // The walk realpaths argv[1] and never touches the network, so the
+      // "when you're back online" suggestion must pin the prefix too -- a
+      // bare `-g` there re-opens the wrong-tree hazard for the one user who
+      // will paste it verbatim later.
+      const io = captureIO();
+      const r = await runUpgrade({
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => null,
+        runningPrefix: async () => "/custom/node-root",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      const out = io.out.join("\n");
+      expect(out).toMatch(/couldn't reach/i);
+      expect(out).toContain("npm install -g --prefix /custom/node-root @yawlabs/mcp@latest");
+      expect(out).not.toContain("npm install -g @yawlabs/mcp@latest");
+    });
+
+    it("--json plan.command carries the same --prefix the spawn would", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        json: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => "/custom/node-root",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(1);
+      const parsed = JSON.parse(io.out.join("\n"));
+      expect(parsed.command).toBe("npm install -g --prefix /custom/node-root @yawlabs/mcp@latest");
+      expect(parsed).toMatchObject({ stale: true, method: "global-npm" });
+    });
+
+    it("--json + offline still pins --prefix in the command", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        json: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => null,
+        runningPrefix: async () => "/custom/node-root",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(io.out.join("\n"));
+      expect(parsed.latest).toBeNull();
+      expect(parsed.command).toBe("npm install -g --prefix /custom/node-root @yawlabs/mcp@latest");
+    });
+
+    it("display-quotes a whitespace prefix in printed lines; the spawn argv keeps the platform form", async () => {
+      // Display and spawn quoting are computed independently: the spawn
+      // argv gets quoteShellArgIfNeeded (raw on POSIX, double-quoted on
+      // win32), the printed line gets quoteArgForDisplay (single-quoted on
+      // POSIX so the paste doesn't split, same double quotes on win32).
+      // Compute both expectations with the SUT's own helpers rather than
+      // hardcoding one platform's answer.
+      const spaced = "/custom/node root";
+      const expectedSpawn = quoteShellArgIfNeeded(spaced);
+      const expectedDisplay = quoteArgForDisplay(spaced);
+      expect(expectedSpawn).not.toBeNull();
+      expect(expectedDisplay).not.toBeNull();
+      const spawned: Array<{ cmd: string; args: string[] }> = [];
+      const io = captureIO();
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => spaced,
+        spawnImpl: async (cmd, args) => {
+          spawned.push({ cmd, args });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(spawned[0]?.args).toEqual(["install", "-g", "--prefix", expectedSpawn, "@yawlabs/mcp@latest"]);
+      expect(io.out.join("\n")).toContain(`  npm install -g --prefix ${expectedDisplay} @yawlabs/mcp@latest`);
+    });
+
+    it("exit-1 and exit-3 manual-run suggestions both use the display-quoted prefix", async () => {
+      const spaced = "/custom/node root";
+      const expectedDisplay = quoteArgForDisplay(spaced);
+      const suggestion = `  npm install -g --prefix ${expectedDisplay} @yawlabs/mcp@latest`;
+
+      // exit 1: stale without --run.
+      const io1 = captureIO();
+      const r1 = await runUpgrade({
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => spaced,
+        out: io1.push,
+        err: io1.pushErr,
+      });
+      expect(r1.exitCode).toBe(1);
+      expect(io1.out.join("\n")).toContain(suggestion);
+
+      // exit 3: --run whose child failed; the retry hint goes to stderr.
+      const io3 = captureIO();
+      const r3 = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => spaced,
+        spawnImpl: async () => 42,
+        out: io3.push,
+        err: io3.pushErr,
+      });
+      expect(r3.exitCode).toBe(3);
+      expect(io3.err.join("\n")).toContain(suggestion);
     });
   });
 

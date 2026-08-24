@@ -16,6 +16,7 @@ import {
   fetchPromptsFromUpstream,
   fetchResourcesFromUpstream,
   fetchToolsFromUpstream,
+  MAX_LIST_PAGES,
   MAX_PROMPTS_PER_SERVER,
   MAX_RESOURCES_PER_SERVER,
   MAX_TOOLS_PER_SERVER,
@@ -426,17 +427,62 @@ describe("list pagination (nextCursor)", () => {
     await expect(fetchToolsFromUpstream(client, "ns")).rejects.toThrow(ActivationError);
   });
 
-  it("terminates against a server that hands out a cursor forever", async () => {
-    // 1 item per page, always a nextCursor: the page budget (== the item
-    // cap) has to stop the loop rather than spinning indefinitely.
+  it("terminates at the page cap against a server that hands out a cursor forever", async () => {
+    // 1 item per page, always a nextCursor: each page carries its own
+    // LIST_TIMEOUT, so the page cap (MAX_LIST_PAGES, far below the item
+    // cap) has to stop the loop -- bounding pages by the item cap would
+    // let a slow dribble hold activation for 1000 sequential requests.
     const listResources = vi
       .fn()
       .mockImplementation(() => Promise.resolve({ resources: [{ uri: "file:///same" }], nextCursor: "again" }));
     const client = makeClient({ listResources });
 
     const out = await fetchResourcesFromUpstream(client, "ns");
-    expect(out).toHaveLength(MAX_RESOURCES_PER_SERVER);
-    expect(listResources).toHaveBeenCalledTimes(MAX_RESOURCES_PER_SERVER);
+    expect(out).toHaveLength(MAX_LIST_PAGES);
+    expect(listResources).toHaveBeenCalledTimes(MAX_LIST_PAGES);
+    expect(stderr.writes.some((w) => w.includes("exceeded page cap"))).toBe(true);
+  });
+
+  it("terminates at the page cap on the tools path too", async () => {
+    const listTools = vi
+      .fn()
+      .mockImplementation(() =>
+        Promise.resolve({ tools: [{ name: "t", inputSchema: { type: "object" } }], nextCursor: "again" }),
+      );
+    const client = makeClient({ listTools });
+
+    const out = await fetchToolsFromUpstream(client, "ns");
+    expect(out).toHaveLength(MAX_LIST_PAGES);
+    expect(listTools).toHaveBeenCalledTimes(MAX_LIST_PAGES);
+    expect(stderr.writes.some((w) => w.includes("exceeded page cap"))).toBe(true);
+  });
+
+  it("breaks out of an empty-page dribble (zero items but a cursor)", async () => {
+    const listResources = vi
+      .fn()
+      .mockResolvedValueOnce({ resources: [{ uri: "file:///a" }], nextCursor: "c1" })
+      .mockResolvedValueOnce({ resources: [], nextCursor: "c2" })
+      .mockResolvedValueOnce({ resources: [{ uri: "file:///never" }] });
+    const client = makeClient({ listResources });
+
+    const out = await fetchResourcesFromUpstream(client, "ns");
+    // The empty cursor'd page ends the loop; the third page is never fetched.
+    expect(out.map((r) => r.uri)).toEqual(["file:///a"]);
+    expect(listResources).toHaveBeenCalledTimes(2);
+    expect(stderr.writes.some((w) => w.includes("empty page"))).toBe(true);
+  });
+
+  it("an empty final page WITHOUT a cursor is a normal end, not a warning", async () => {
+    const listPrompts = vi
+      .fn()
+      .mockResolvedValueOnce({ prompts: [{ name: "p0" }], nextCursor: "c1" })
+      .mockResolvedValueOnce({ prompts: [] });
+    const client = makeClient({ listPrompts });
+
+    const out = await fetchPromptsFromUpstream(client, "ns");
+    expect(out.map((p) => p.name)).toEqual(["p0"]);
+    expect(listPrompts).toHaveBeenCalledTimes(2);
+    expect(stderr.writes.some((w) => w.includes("empty page") || w.includes("page cap"))).toBe(false);
   });
 
   it("stops one page past the cap and truncates with a warning", async () => {

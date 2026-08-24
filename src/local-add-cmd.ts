@@ -702,6 +702,47 @@ export interface ListCommandOptions {
   gradesReader?: (home?: string) => Promise<GradesCache>;
 }
 
+/**
+ * Env KEY names per namespace, read from the RAW winning bundles.json -- keys
+ * only, never values. `list --json` cannot derive envKeys from the
+ * loader-validated entries: validateEntry DROPS blank env values ("" is the
+ * "required key, nothing stored" seed `add` writes -- see the blank-drop note
+ * in local-bundles.ts), which is right for the spawn env but silently erased
+ * exactly the required-key documentation `add --json` reports. Reading the raw
+ * entry is the same posture printRemovalPreview already takes, and for the
+ * same reason: describe what is ON DISK, not what the loader would spawn with.
+ *
+ * Best-effort: an unreadable or unparseable file yields an empty map and the
+ * caller keeps the validated-entry derivation as its fallback. First entry
+ * wins on a duplicated namespace, matching the write path's findIndex.
+ */
+async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (!path) return out;
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return out;
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseJsonc(raw);
+  } catch {
+    return out;
+  }
+  if (typeof parsed !== "object" || parsed === null) return out;
+  const servers = (parsed as { servers?: unknown }).servers;
+  if (!Array.isArray(servers)) return out;
+  for (const s of servers) {
+    const e = s as { namespace?: unknown; env?: unknown } | null;
+    if (!e || typeof e.namespace !== "string" || out.has(e.namespace)) continue;
+    const env = e.env && typeof e.env === "object" && !Array.isArray(e.env) ? (e.env as Record<string, unknown>) : {};
+    out.set(e.namespace, Object.keys(env));
+  }
+  return out;
+}
+
 export function parseListArgs(
   argv: string[],
 ): { ok: true; options: ListCommandOptions } | { ok: false; error: string; help?: boolean } {
@@ -753,12 +794,19 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
     // Same env redaction as `add --json` (jsonEntry): a bundles.json entry can
     // carry a `--env` secret, and `list --json` gets piped into CI logs and
     // bug reports -- so servers are reported with `envKeys` (key NAMES only),
-    // never the stored values. `complianceGradedAt` and (when the cache entry
-    // carries it) `complianceSuiteVersion` ride along with the grade, so a
-    // consumer can tell a letter graded under an older rubric from a current
-    // one; entries audited before suiteVersion existed surface timestamp only.
+    // never the stored values. The keys come from the RAW on-disk entry (see
+    // rawEnvKeysByNamespace): the validated entry has already had `add`'s ""
+    // required-key seeds dropped, so deriving from it hid those keys from the
+    // one machine surface that documents them. `complianceGradedAt` and (when
+    // the cache entry carries it) `complianceSuiteVersion` ride along with the
+    // grade, so a consumer can tell a letter graded under an older rubric from
+    // a current one; entries audited before suiteVersion existed surface
+    // timestamp only.
+    const rawEnvKeys = await rawEnvKeysByNamespace(loaded.path);
     const jsonServers = graded.map((s) => {
       const entry = jsonEntry(s);
+      const keys = rawEnvKeys.get(s.namespace);
+      if (keys !== undefined && keys.length > 0) entry.envKeys = keys;
       const cached = grades[s.namespace];
       if (cached) {
         entry.complianceGradedAt = cached.gradedAt;

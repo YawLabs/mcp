@@ -1,11 +1,15 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   buildLaunchEntry,
   claudeCodeProjectKey,
   ENTRY_NAME,
   escapeCmdArg,
   INSTALL_TARGETS,
+  isCmdShimLauncher,
   isProjectLocalEntry,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
@@ -477,17 +481,59 @@ describe("buildLaunchEntry", () => {
     }
   });
 
-  it("caret-escapes cmd metacharacters in upstream command + args on Windows", () => {
+  it("triple-caret-escapes cmd metacharacters for a .cmd SHIM command on Windows", () => {
     // The entry is spawned by the MCP CLIENT, whose libuv only quotes argv
     // elements containing space/tab/quote. A bare `&` in a catalog arg would
     // otherwise reach cmd.exe unquoted and run the tail as a second command
     // at client-spawn time (a query-string arg truncates the same way).
+    //
+    // `npx` is a `.cmd` shim: cmd parses the line once, launches npx.cmd, and
+    // npx.cmd forwards the args through `%*`, which cmd RE-PARSES. So an arg
+    // must survive TWO cmd parses -- triple-caret (`^^^&` -> `^&` -> `&`). The
+    // single caret this shipped with was a no-op against the shim: the outer
+    // cmd stripped it and the bare `&` split inside the shim (reproduced live).
     const e = buildLaunchEntry({
       os: "windows",
       upstream: { command: "npx", args: ["-y", "some-server", "--url", "https://api/x?a=1&b=2"] },
     });
     expect(e.command).toBe("cmd");
-    expect(e.args).toEqual(["/c", "npx", "-y", "some-server", "--url", "https://api/x?a=1^&b=2"]);
+    // Command token (`npx`, no metachar) unescaped; the metachar ARG triple-caret.
+    expect(e.args).toEqual(["/c", "npx", "-y", "some-server", "--url", "https://api/x?a=1^^^&b=2"]);
+  });
+
+  it("single-caret-escapes cmd metacharacters for a DIRECT-exe command on Windows", () => {
+    // `node` is a real exe, launched directly -- one cmd parse, no `%*`
+    // re-parse -- so its args escape at the single-parse depth (`^&` -> `&`).
+    // Triple-caret here would deliver a corrupted `^&` to the child.
+    const e = buildLaunchEntry({
+      os: "windows",
+      upstream: { command: "node", args: ["server.js", "--url", "https://api/x?a=1&b=2"] },
+    });
+    expect(e.command).toBe("cmd");
+    expect(e.args).toEqual(["/c", "node", "server.js", "--url", "https://api/x?a=1^&b=2"]);
+  });
+
+  it("refuses an upstream arg that combines a quote and a cmd metacharacter", () => {
+    // The exact hostile-catalog injection escapeCmdArg's own comment closes:
+    // `a"&echo X` breaks out of libuv's quoting under cmd.exe's quote-counting
+    // parser and runs `echo X` at client-spawn time. No escaping is safe, so
+    // buildLaunchEntry throws rather than emit an exploitable entry.
+    expect(() =>
+      buildLaunchEntry({
+        os: "windows",
+        upstream: { command: "npx", args: ["-y", "some-server", '--x=a"&calc'] },
+      }),
+    ).toThrow(/double-quote and a cmd\.exe metacharacter/);
+  });
+
+  it("passes a quote-bearing but metachar-free JSON arg through verbatim on Windows", () => {
+    // Legitimate MCP config args (`--config {"a":1}`) must keep working: libuv
+    // quote-wraps them and cmd, with no metachar to act on, passes them intact.
+    const e = buildLaunchEntry({
+      os: "windows",
+      upstream: { command: "npx", args: ["-y", "some-server", "--config", '{"a":1}'] },
+    });
+    expect(e.args).toEqual(["/c", "npx", "-y", "some-server", "--config", '{"a":1}']);
   });
 
   it("leaves upstream args verbatim on macOS/Linux (no cmd.exe in the spawn path)", () => {
@@ -500,30 +546,199 @@ describe("buildLaunchEntry", () => {
   });
 });
 
-describe("escapeCmdArg (Windows cmd /c metacharacter neutralization)", () => {
-  it("caret-escapes metacharacters in an arg the client will NOT quote", () => {
-    expect(escapeCmdArg("https://api/x?a=1&b=2")).toBe("https://api/x?a=1^&b=2");
-    expect(escapeCmdArg("a|b")).toBe("a^|b");
-    expect(escapeCmdArg("a<b>c")).toBe("a^<b^>c");
-    expect(escapeCmdArg("x^y")).toBe("x^^y");
-    expect(escapeCmdArg("(group)")).toBe("^(group^)");
+describe("isCmdShimLauncher", () => {
+  it("classifies known .cmd/.bat shim launchers as shims", () => {
+    for (const c of ["npx", "uvx", "pipx", "npm", "pnpm", "yarn", "bunx"]) {
+      expect(isCmdShimLauncher(c), c).toBe(true);
+    }
+    // Explicit extension and a full path both resolve by basename.
+    expect(isCmdShimLauncher("npx.cmd")).toBe(true);
+    expect(isCmdShimLauncher("C:\\Users\\me\\AppData\\Roaming\\npm\\npx.cmd")).toBe(true);
+    expect(isCmdShimLauncher("some-tool.bat")).toBe(true);
   });
 
-  it("leaves an arg containing space/tab/quote alone — the client quotes those itself", () => {
-    // Inside the double quotes libuv adds, cmd.exe treats metacharacters
-    // literally; a caret there would survive as a literal char and corrupt
-    // the value.
-    expect(escapeCmdArg("foo & bar")).toBe("foo & bar");
-    expect(escapeCmdArg('say "hi"')).toBe('say "hi"');
-    expect(escapeCmdArg("a\t&b")).toBe("a\t&b");
+  it("classifies real executables as direct (not shims)", () => {
+    for (const c of ["node", "deno", "bun", "python", "python3", "docker", "dotnet", "java", "go"]) {
+      expect(isCmdShimLauncher(c), c).toBe(false);
+    }
+    expect(isCmdShimLauncher("node.exe")).toBe(false);
+    expect(isCmdShimLauncher("C:\\Program Files\\nodejs\\node.exe")).toBe(false);
+    expect(isCmdShimLauncher("foo.com")).toBe(false);
+  });
+
+  it("fails SAFE for an unknown bare name (treated as a shim)", () => {
+    // cmd can resolve a bare name to a `.cmd` via PATHEXT, so the injection-safe
+    // default is to over-escape (shim depth), never under-escape.
+    expect(isCmdShimLauncher("mystery-launcher")).toBe(true);
+  });
+});
+
+describe("escapeCmdArg (Windows cmd /c metacharacter neutralization)", () => {
+  it("triple-caret-escapes metachars for the SHIM path (survives the %* re-parse)", () => {
+    // A shim (npx.cmd) forwards args through `%*`, which cmd RE-PARSES, so a
+    // metachar must survive TWO cmd parses: `^^^&` -> `^&` -> `&`.
+    expect(escapeCmdArg("https://api/x?a=1&b=2", { shim: true })).toBe("https://api/x?a=1^^^&b=2");
+    expect(escapeCmdArg("a|b", { shim: true })).toBe("a^^^|b");
+    expect(escapeCmdArg("a<b>c", { shim: true })).toBe("a^^^<b^^^>c");
+    expect(escapeCmdArg("x^y", { shim: true })).toBe("x^^^^y");
+    expect(escapeCmdArg("(group)", { shim: true })).toBe("^^^(group^^^)");
+  });
+
+  it("single-caret-escapes metachars for the DIRECT-exe path (one cmd parse)", () => {
+    expect(escapeCmdArg("https://api/x?a=1&b=2", { shim: false })).toBe("https://api/x?a=1^&b=2");
+    expect(escapeCmdArg("a|b", { shim: false })).toBe("a^|b");
+    expect(escapeCmdArg("a<b>c", { shim: false })).toBe("a^<b^>c");
+    expect(escapeCmdArg("x^y", { shim: false })).toBe("x^^y");
+    expect(escapeCmdArg("(group)", { shim: false })).toBe("^(group^)");
+  });
+
+  it("leaves a quote-bearing but metachar-free arg alone (legit JSON must survive)", () => {
+    // libuv quote-wraps + escapes it and cmd, with nothing to act on, passes it
+    // through intact; a caret would corrupt it inside libuv's quotes.
+    for (const shim of [true, false]) {
+      expect(escapeCmdArg('{"a":1}', { shim })).toBe('{"a":1}');
+      expect(escapeCmdArg('{"a":"b"}', { shim })).toBe('{"a":"b"}');
+      expect(escapeCmdArg('say "hi"', { shim })).toBe('say "hi"');
+    }
+  });
+
+  it("leaves a space/tab arg (no quote) alone -- libuv quotes it, caret would corrupt", () => {
+    for (const shim of [true, false]) {
+      expect(escapeCmdArg("foo & bar", { shim })).toBe("foo & bar");
+      expect(escapeCmdArg("a\t&b", { shim })).toBe("a\t&b");
+    }
+  });
+
+  it("REFUSES an arg combining a double-quote and a cmd metacharacter", () => {
+    // The injection escapeCmdArg's comment closes: parity flips through libuv's
+    // \" and no caret depth can neutralize the exposed metachar, so we throw.
+    for (const shim of [true, false]) {
+      expect(() => escapeCmdArg('a"&echo X', { shim })).toThrow(/double-quote and a cmd\.exe metacharacter/);
+      expect(() => escapeCmdArg('{"url":"https://x?a=1&b=2"}', { shim })).toThrow(/command injection/);
+      expect(() => escapeCmdArg('x"|y', { shim })).toThrow();
+    }
   });
 
   it("leaves plain args and % untouched", () => {
-    expect(escapeCmdArg("-y")).toBe("-y");
-    expect(escapeCmdArg("@yawlabs/mcp@latest")).toBe("@yawlabs/mcp@latest");
-    // `%` is deliberately not escaped: cmd expands %VAR% before caret
-    // processing, so a caret cannot neutralize it anyway.
-    expect(escapeCmdArg("100%")).toBe("100%");
+    for (const shim of [true, false]) {
+      expect(escapeCmdArg("-y", { shim })).toBe("-y");
+      expect(escapeCmdArg("@yawlabs/mcp@latest", { shim })).toBe("@yawlabs/mcp@latest");
+      // `%` is deliberately not escaped: cmd expands %VAR% before caret
+      // processing, so a caret cannot neutralize it anyway.
+      expect(escapeCmdArg("100%", { shim })).toBe("100%");
+    }
+  });
+});
+
+// Empirical proof on a real Windows box: spawn the escaped args through both a
+// `%*`-forwarding `.cmd` shim and a direct exe, EXACTLY as an MCP client would
+// spawn the stored entry, and assert the argv the child actually receives is
+// the intended value -- with no injected command executing. On non-win32 there
+// is no cmd.exe, so this collapses to the string-level assertions above; the
+// win32 spawn is what proves the string-level expectations are the RIGHT ones.
+describe("escapeCmdArg / buildLaunchEntry -- spawn-through-shim (win32 only)", () => {
+  const runWin = process.platform === "win32";
+  const tmp = runWin ? mkdtempSync(join(tmpdir(), "yaw-cmdesc-")) : "";
+  afterAll(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // echo-argv.js prints the argv it received, framed so we can tell it apart
+  // from anything an injection ran. Written via fs (not a bash heredoc) so
+  // backslashes survive verbatim on this box.
+  function setupFixtures(): { echo: string; env: NodeJS.ProcessEnv } {
+    const echo = join(tmp, "echo-argv.js");
+    writeFileSync(echo, 'process.stdout.write("<<<A>>>"+JSON.stringify(process.argv.slice(2))+"<<<Z>>>\\n");\n');
+    // A shim that forwards its args through %*, standing in for npx.cmd.
+    writeFileSync(join(tmp, "myshim.cmd"), `@echo off\r\nnode "${echo}" %*\r\n`);
+    const env = { ...process.env, PATH: `${tmp};${process.env.PATH ?? ""}` };
+    return { echo, env };
+  }
+
+  function argvFrom(stdout: string): string[] | null {
+    const m = stdout.match(/<<<A>>>([\s\S]*?)<<<Z>>>/);
+    return m ? (JSON.parse(m[1]) as string[]) : null;
+  }
+
+  // Spawn `cmd /c myshim <stored...>` -- shim resolves off PATH like npx does.
+  function deliverViaShim(stored: string[], env: NodeJS.ProcessEnv): string[] | null {
+    const r = spawnSync("cmd", ["/c", "myshim", ...stored], { cwd: tmp, encoding: "utf8", env });
+    return argvFrom(r.stdout);
+  }
+
+  // Spawn `cmd /c node echo.js <stored...>` -- node.exe is a real exe (direct).
+  function deliverViaDirect(stored: string[], echo: string): string[] | null {
+    const r = spawnSync("cmd", ["/c", "node", echo, ...stored], { cwd: tmp, encoding: "utf8" });
+    return argvFrom(r.stdout);
+  }
+
+  it.runIf(runWin)("SHIM path delivers every escaped arg intact through the %* re-parse", () => {
+    const { env } = setupFixtures();
+    const intended = [
+      "hello",
+      "https://api/x?a=1&b=2", // the reproduced truncation payload
+      "a|b",
+      "a<b>c",
+      "x^y",
+      "(group)",
+      "a&b|c",
+      "C:\\a&b\\dir\\", // metachar + trailing backslash
+      "foo & bar", // space -> libuv quotes it
+      '{"a":1}', // quote, no metachar -> verbatim
+      '{"a": "b c"}', // quote + space, no metachar
+    ];
+    for (const A of intended) {
+      const stored = escapeCmdArg(A, { shim: true });
+      expect(deliverViaShim([stored], env), `intended=${A} stored=${stored}`).toEqual([A]);
+    }
+  });
+
+  it.runIf(runWin)("DIRECT path delivers every escaped arg intact (single cmd parse)", () => {
+    const { echo } = setupFixtures();
+    const intended = ["hello", "https://api/x?a=1&b=2", "a|b", "x^y", "(group)", "foo & bar", '{"a":1}'];
+    for (const A of intended) {
+      const stored = escapeCmdArg(A, { shim: false });
+      expect(deliverViaDirect([stored], echo), `intended=${A} stored=${stored}`).toEqual([A]);
+    }
+  });
+
+  it.runIf(runWin)("a full buildLaunchEntry shim entry delivers all args intact", () => {
+    const { env } = setupFixtures();
+    // Build the real entry, then swap the shim command name so it resolves to
+    // our %*-forwarding fixture instead of the real npx.
+    const entry = buildLaunchEntry({
+      os: "windows",
+      upstream: { command: "npx", args: ["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2", "--flag", "a|b"] },
+    });
+    expect(entry.command).toBe("cmd");
+    // entry.args = ["/c", "npx", ...escaped]; replace "npx" with "myshim".
+    const stored = entry.args.slice(2);
+    expect(deliverViaShim(stored, env)).toEqual(["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2", "--flag", "a|b"]);
+  });
+
+  it.runIf(runWin)("the reproduced payload does NOT execute the injected command (shim)", () => {
+    const { env } = setupFixtures();
+    // No-space metachar payload -> exercises the CARET path (the one bug #1
+    // fixed), not the libuv-quote path. `x&cd>PWNED.txt` WOULD create the file
+    // if the `&` split the line (verified: unescaped it does). Triple-caret
+    // neutralizes it so the whole thing arrives as one literal argv element.
+    rmSync(join(tmp, "PWNED.txt"), { force: true });
+    const stored = escapeCmdArg("x&cd>PWNED.txt", { shim: true });
+    expect(deliverViaShim([stored], env)).toEqual(["x&cd>PWNED.txt"]);
+    const exists = spawnSync("cmd", ["/c", "if", "exist", "PWNED.txt", "echo", "YES"], {
+      cwd: tmp,
+      encoding: "utf8",
+    }).stdout;
+    expect(exists).not.toContain("YES");
+  });
+
+  it.runIf(runWin)("a bare & would inject WITHOUT escaping -- the fixture proves the harness bites", () => {
+    // Control: the UNescaped payload truncates at `&` through the shim, proving
+    // the shim path really does re-parse (so the pass above is meaningful).
+    const { env } = setupFixtures();
+    expect(deliverViaShim(["https://api/x?a=1&b=2"], env)).toEqual(["https://api/x?a=1"]);
+    // And the OLD single-caret form is likewise a no-op against the shim.
+    expect(deliverViaShim(["https://api/x?a=1^&b=2"], env)).toEqual(["https://api/x?a=1"]);
   });
 });
 

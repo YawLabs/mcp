@@ -841,6 +841,40 @@ describe("the preview says which entries execute content the hash does not cover
     expect(io.text()).not.toContain("NOT covered by the pin");
   });
 
+  it("stays quiet for a v-prefixed exact version -- npm strips the v and pins it", async () => {
+    // `pkg@v1.2.3` installs exactly 1.2.3 forever (npm's semver parser drops
+    // the leading v), so claiming it "resolves to whatever the registry
+    // serves at spawn time" would be false. oam-spawn's specConstraint still
+    // buckets it as "range" for the spawn rewrite -- the strip is the
+    // preview's alone.
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [
+        { namespace: "vpin", name: "VPin", command: "npx", args: ["-y", "pkg@v1.2.3"] },
+        { namespace: "vscoped", name: "VScoped", command: "npx", args: ["-y", "@scope/pkg@v1.2.3-rc.1"] },
+      ],
+    });
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(io.text()).not.toContain("not pinned to an exact version");
+  });
+
+  it("still flags a v-prefixed RANGE, and a dist-tag that merely starts with v", async () => {
+    // The strip must not turn `v1.x` into a pin (it re-resolves within the
+    // range) and must not fire on `vnext` at all (a tag, `v` + no digit).
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [
+        { namespace: "vrange", name: "VRange", command: "npx", args: ["-y", "pkg@v1.x"] },
+        { namespace: "vtag", name: "VTag", command: "npx", args: ["-y", "pkg@vnext"] },
+      ],
+    });
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(io.text()).toContain("pkg@v1.x is not pinned to an exact version");
+    expect(io.text()).toContain("pkg@vnext is not pinned to an exact version");
+  });
+
   it("stays quiet for an absolute command with no repo-relative arguments", async () => {
     writeBundles(synthCwd, {
       version: 1,

@@ -1297,6 +1297,9 @@ describe("resolveNpmEntry", () => {
       expect(note, "a durable hit reported no pin at all").toBeDefined();
       expect(note.source).toBe("durable");
       expect(note.refreshWith).toBe("npm install @yawlabs/fetch-mcp@latest");
+      // No Ctrl-C note here: `npm install` exits on its own, so the guidance
+      // is npx-cache-only and the field must not leak onto other sources.
+      expect("refreshNote" in note, "refreshNote leaked onto a durable pin").toBe(false);
       expect(note.version).toBe("0.1.0");
       // The command alone is not actionable: a durable tree may be global
       // (needs -g) or project-local, so without the directory the user would
@@ -1321,11 +1324,12 @@ describe("resolveNpmEntry", () => {
       expect(note.source, "the broker's own _npx node_modules was called durable").toBe("npx-cache");
       // No `--help` in the advice: stdio MCP servers ignore the flag and just
       // start, so the old form hung the user's terminal on a server waiting
-      // for stdin. The flag-free run refreshes the cache before exec; the
-      // trailing `#` comment (valid in sh and PowerShell) says how to exit.
-      expect(note.refreshWith).toBe(
-        "npx -y @yawlabs/fetch-mcp@latest # then Ctrl-C -- the cache is refreshed before the server starts",
-      );
+      // for stdin. The flag-free run refreshes the cache before exec. And no
+      // trailing `# ...` comment: `#` starts a comment in sh and PowerShell
+      // but NOT cmd.exe, which forwarded it as literal argv the spawned
+      // server then choked on. The Ctrl-C guidance rides in refreshNote.
+      expect(note.refreshWith).toBe("npx -y @yawlabs/fetch-mcp@latest");
+      expect(note.refreshNote).toBe("then Ctrl-C -- the cache is refreshed before the server starts");
       expect(note.from).toBe(cacheNodeModules);
     } finally {
       cleanup();

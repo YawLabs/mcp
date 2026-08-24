@@ -97,6 +97,19 @@ function asPosix<T>(fn: () => T): T {
   return withPlatform("linux", fn);
 }
 
+/** withPlatform for an async body. The sync variant restores the platform as
+ *  soon as fn RETURNS, which for a promise is before readTrustStore's key
+ *  folds ever run -- this one holds the fake across the await. */
+async function withPlatformAsync<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  try {
+    return await fn();
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+  }
+}
+
 function projectBundlesPath(dir: string): string {
   return localBundlesPath(join(dir, CONFIG_DIRNAME));
 }
@@ -465,6 +478,114 @@ describe("trust store grant / revoke / list round-trip", () => {
     expect(statSync(join(synthHome, CONFIG_DIRNAME)).isDirectory()).toBe(true);
     const call = spy.mock.calls.find((c) => c[0] === trustStorePath(synthHome));
     expect(call?.[4]).toBe(0o700);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Legacy store keys are migrated at READ time
+// ---------------------------------------------------------------------------
+//
+// The darwin lowercasing in normalizeTrustKey arrived AFTER real macOS stores
+// existed, and those stores are full of mixed-case /Users/... keys. Lookups
+// go through the CURRENT normalizeTrustKey, so without a read-time fold every
+// legacy grant is orphaned: the project re-prompts, revoke cannot find the
+// row, and re-granting creates exactly the duplicate `trust --list` row the
+// lowercasing set out to prevent. readTrustStore therefore folds every stored
+// key as it builds `entries`; the next write persists the folded form. The
+// fake platform must be held ACROSS the awaits (withPlatformAsync): the fold
+// runs inside readTrustStore, after the readFile resolves.
+
+describe("legacy mixed-case store keys are folded at read time", () => {
+  /** A store as an OLDER yaw-mcp wrote it: keys keep whatever casing the
+   *  caller passed, records are otherwise well-formed. */
+  function seedLegacyStore(rows: Array<{ key: string; sha256: string; path: string }>): void {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const trusted: Record<string, unknown> = {};
+    for (const r of rows) trusted[r.key] = { path: r.path, sha256: r.sha256, grantedAt: "2026-01-01T00:00:00.000Z" };
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 1, trusted }));
+  }
+
+  it("a legacy darwin grant still matches -- from either casing -- instead of re-prompting", async () => {
+    await withPlatformAsync("darwin", async () => {
+      writeBundles(synthCwd, HOSTILE);
+      const path = projectBundlesPath(synthCwd);
+      const bytes = readFileSync(path);
+      seedLegacyStore([{ key: path.toUpperCase(), sha256: hashTrustContent(bytes), path }]);
+
+      const store = await readTrustStore(synthHome);
+      expect(store.malformed).toBe(false);
+      expect(Object.keys(store.entries)).toEqual([normalizeTrustKey(path)]);
+      expect(trustStatusFor(path, bytes, store)).toBe("trusted");
+      expect(trustStatusFor(path.toUpperCase(), bytes, store)).toBe("trusted");
+      // The fold is for MATCHING only; the display path keeps its casing.
+      expect(store.entries[normalizeTrustKey(path)].path).toBe(path);
+    });
+  });
+
+  it("revoke finds and removes a legacy mixed-case row", async () => {
+    await withPlatformAsync("darwin", async () => {
+      writeBundles(synthCwd, HOSTILE);
+      const path = projectBundlesPath(synthCwd);
+      seedLegacyStore([{ key: path.toUpperCase(), sha256: hashTrustContent(readFileSync(path)), path }]);
+
+      const res = await revokeTrust(path, { home: synthHome });
+      expect(res.removed).toBe(true);
+      expect(await listTrusted({ home: synthHome })).toEqual([]);
+      // Gone from DISK too, not merely from this read's in-memory view.
+      const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+      expect(Object.keys(raw.trusted)).toEqual([]);
+    });
+  });
+
+  it("re-granting over a legacy row replaces it -- no duplicate list rows", async () => {
+    await withPlatformAsync("darwin", async () => {
+      writeBundles(synthCwd, HOSTILE);
+      const path = projectBundlesPath(synthCwd);
+      const bytes = readFileSync(path);
+      // A legacy row pinned to a STALE hash, as an upgrade-in-place sees it.
+      seedLegacyStore([{ key: path.toUpperCase(), sha256: "a".repeat(64), path }]);
+
+      await grantTrust(path, bytes, { home: synthHome });
+      const listed = await listTrusted({ home: synthHome });
+      expect(listed).toHaveLength(1);
+      expect(listed[0].sha256).toBe(hashTrustContent(bytes));
+      // The write migrated the key: only the folded form is on disk now.
+      const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+      expect(Object.keys(raw.trusted)).toEqual([normalizeTrustKey(path)]);
+    });
+  });
+
+  it("last write wins when two legacy keys fold to one", async () => {
+    await withPlatformAsync("darwin", async () => {
+      writeBundles(synthCwd, HOSTILE);
+      const path = projectBundlesPath(synthCwd);
+      const bytes = readFileSync(path);
+      // Two casings of the SAME file -- the duplicate-row shape the folding
+      // exists to kill. File order decides: the later row's hash must win,
+      // which "trusted" (not "changed") below is what discriminates.
+      seedLegacyStore([
+        { key: path.toUpperCase(), sha256: "a".repeat(64), path },
+        { key: path, sha256: hashTrustContent(bytes), path },
+      ]);
+
+      const store = await readTrustStore(synthHome);
+      expect(Object.keys(store.entries)).toEqual([normalizeTrustKey(path)]);
+      expect(trustStatusFor(path, bytes, store)).toBe("trusted");
+    });
+  });
+
+  it("does NOT fold case on linux, where the two casings are different files", async () => {
+    await withPlatformAsync("linux", async () => {
+      writeBundles(synthCwd, HOSTILE);
+      const path = projectBundlesPath(synthCwd);
+      const sha256 = hashTrustContent(readFileSync(path));
+      seedLegacyStore([
+        { key: path.toUpperCase(), sha256, path: path.toUpperCase() },
+        { key: path, sha256, path },
+      ]);
+      const store = await readTrustStore(synthHome);
+      expect(Object.keys(store.entries)).toHaveLength(2);
+    });
   });
 });
 
@@ -1005,9 +1126,11 @@ describe("a __proto__ store key survives the rebuild", () => {
     const store = await readTrustStore(synthHome);
 
     expect(store.malformed).toBe(false);
-    expect(Object.hasOwn(store.entries, "__proto__")).toBe(true);
+    // Read-time key folding resolves the hostile key into an absolute path,
+    // so today it cannot even NAME the prototype -- but the setJsonKey guard
+    // is what this test pins, so the prototype must be untouched regardless.
     expect(Object.getPrototypeOf(store.entries)).toBe(Object.prototype);
-    expect(Object.keys(store.entries)).toEqual(["__proto__"]);
+    expect(Object.keys(store.entries)).toEqual([normalizeTrustKey("__proto__")]);
     // Without the fix `entries` inherits the record's own fields, so a lookup
     // for a key named "sha256" resolves to a string instead of undefined.
     expect(store.entries.sha256).toBeUndefined();

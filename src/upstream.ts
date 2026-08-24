@@ -179,6 +179,16 @@ export const MAX_TOOLS_PER_SERVER = 1000;
 export const MAX_RESOURCES_PER_SERVER = 1000;
 export const MAX_PROMPTS_PER_SERVER = 1000;
 
+// Bound on how many cursor'd pages a single list fetch will follow. Each
+// page gets a fresh LIST_TIMEOUT, so bounding pages only by the item caps
+// would let a misbehaving upstream dribble one slow item per page and hold
+// a single activation for up to 1000 sequential requests -- and
+// connectToUpstreamOnce runs three such fetches back to back. 50 pages is
+// plenty for any legitimate inventory under the item caps (real servers
+// paginate in the tens-to-hundreds of items per page), and it bounds the
+// worst case to pages x LIST_TIMEOUT per category instead of hours.
+export const MAX_LIST_PAGES = 50;
+
 // Error categories surfaced to the caller. The dispatch/activate handlers
 // use these to compose actionable messages rather than leaking raw SDK
 // error strings.
@@ -852,26 +862,49 @@ export interface FetchListOptions {
  *  prompts/list and tools/list alike; a server that paginates would
  *  otherwise have everything past page 1 silently dropped.
  *
- *  Two bounds keep a misbehaving server from spinning this loop forever:
- *  the fetch stops one page after the item cap is exceeded (the caller
- *  truncates there anyway, and the overshoot is what lets its truncation
- *  warning fire), and the page count itself is capped at `cap` -- every
- *  legitimate inventory reaches the item cap within that many pages
- *  (>= 1 item per page), while a server that hands out cursors over empty
- *  pages terminates instead of looping. Each page gets its own
- *  LIST_TIMEOUT via the caller's request options. */
+ *  Three bounds keep a misbehaving server from holding activation hostage.
+ *  Each page gets its own LIST_TIMEOUT via the caller's request options, so
+ *  the page count is the only thing standing between one fetch and
+ *  pages x LIST_TIMEOUT of wall time:
+ *  - the fetch stops one page after the item cap is exceeded (the caller
+ *    truncates there anyway, and the overshoot is what lets its truncation
+ *    warning fire);
+ *  - a page that returns zero items but still hands back a cursor ends the
+ *    loop -- that shape is an empty-page dribble, not pagination;
+ *  - the page count is capped at MAX_LIST_PAGES, far below the item cap.
+ *  The latter two log a warning so the operator can see the early stop. */
 async function fetchAllPages<T>(
   fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>,
   cap: number,
+  context: { namespace: string; endpoint: string },
 ): Promise<T[]> {
   const all: T[] = [];
   let cursor: string | undefined;
-  for (let page = 0; page < cap; page++) {
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const { items, nextCursor } = await fetchPage(cursor);
     all.push(...items);
-    if (nextCursor === undefined || all.length > cap) break;
+    if (nextCursor === undefined || all.length > cap) return all;
+    if (items.length === 0) {
+      // A cursor on a zero-item page is a dribble, not pagination -- a
+      // legitimate inventory always makes progress. Stop rather than burn
+      // another LIST_TIMEOUT-bounded round trip on it.
+      log("warn", "Upstream returned an empty page with a cursor; stopping pagination", {
+        namespace: context.namespace,
+        endpoint: context.endpoint,
+        pagesFetched: page + 1,
+        items: all.length,
+      });
+      return all;
+    }
     cursor = nextCursor;
   }
+  // Loop ran out with a live cursor still in hand: the page cap truncated.
+  log("warn", "Upstream pagination exceeded page cap; truncating", {
+    namespace: context.namespace,
+    endpoint: context.endpoint,
+    pageCap: MAX_LIST_PAGES,
+    items: all.length,
+  });
   return all;
 }
 
@@ -881,10 +914,14 @@ export async function fetchResourcesFromUpstream(
   opts: FetchListOptions = {},
 ): Promise<UpstreamResourceDef[]> {
   try {
-    const raw = await fetchAllPages(async (cursor) => {
-      const result = await client.listResources(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
-      return { items: result.resources ?? [], nextCursor: result.nextCursor };
-    }, MAX_RESOURCES_PER_SERVER);
+    const raw = await fetchAllPages(
+      async (cursor) => {
+        const result = await client.listResources(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+        return { items: result.resources ?? [], nextCursor: result.nextCursor };
+      },
+      MAX_RESOURCES_PER_SERVER,
+      { namespace, endpoint: "resources/list" },
+    );
     if (raw.length > MAX_RESOURCES_PER_SERVER) {
       log("warn", "Upstream returned more resources than cap; truncating", {
         namespace,
@@ -913,10 +950,14 @@ export async function fetchPromptsFromUpstream(
   opts: FetchListOptions = {},
 ): Promise<UpstreamPromptDef[]> {
   try {
-    const raw = await fetchAllPages(async (cursor) => {
-      const result = await client.listPrompts(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
-      return { items: result.prompts ?? [], nextCursor: result.nextCursor };
-    }, MAX_PROMPTS_PER_SERVER);
+    const raw = await fetchAllPages(
+      async (cursor) => {
+        const result = await client.listPrompts(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+        return { items: result.prompts ?? [], nextCursor: result.nextCursor };
+      },
+      MAX_PROMPTS_PER_SERVER,
+      { namespace, endpoint: "prompts/list" },
+    );
     if (raw.length > MAX_PROMPTS_PER_SERVER) {
       log("warn", "Upstream returned more prompts than cap; truncating", {
         namespace,
@@ -941,10 +982,14 @@ export async function fetchPromptsFromUpstream(
 export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {
   let all: Awaited<ReturnType<typeof client.listTools>>["tools"];
   try {
-    all = await fetchAllPages(async (cursor) => {
-      const result = await client.listTools(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
-      return { items: result.tools ?? [], nextCursor: result.nextCursor };
-    }, MAX_TOOLS_PER_SERVER);
+    all = await fetchAllPages(
+      async (cursor) => {
+        const result = await client.listTools(cursor === undefined ? {} : { cursor }, { timeout: LIST_TIMEOUT });
+        return { items: result.tools ?? [], nextCursor: result.nextCursor };
+      },
+      MAX_TOOLS_PER_SERVER,
+      { namespace, endpoint: "tools/list" },
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new ActivationError(

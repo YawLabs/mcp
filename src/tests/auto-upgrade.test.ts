@@ -1,6 +1,11 @@
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { detectRunningInstallPrefix, maybeAutoUpgrade } from "../auto-upgrade.js";
+import {
+  detectRunningInstallPrefix,
+  maybeAutoUpgrade,
+  quoteArgForDisplay,
+  quoteShellArgIfNeeded,
+} from "../auto-upgrade.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // maybeAutoUpgrade — fire-and-forget startup self-upgrade check.
@@ -383,6 +388,36 @@ describe("runAutoUpgrade: --prefix injection into spawn args", () => {
 
     mockRealpathSync.mockReset();
     mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
+  });
+});
+
+describe("quoteArgForDisplay -- paste-safe quoting for PRINTED command lines", () => {
+  // Both platforms are pinned explicitly: the helper's job is that a printed
+  // suggestion pastes as ONE token in the user's shell, which the spawn-side
+  // quoteShellArgIfNeeded deliberately does NOT guarantee on POSIX (there the
+  // spawn argv must stay raw -- no shell is involved).
+  it("POSIX: passes shell-inert values through raw", () => {
+    expect(quoteArgForDisplay("/usr/local", "linux")).toBe("/usr/local");
+    expect(quoteArgForDisplay("/opt/node-22.1_x64/lib", "darwin")).toBe("/opt/node-22.1_x64/lib");
+  });
+
+  it("POSIX: single-quotes whitespace so the paste can't split into two tokens", () => {
+    expect(quoteArgForDisplay("/Users/j/My Tools", "darwin")).toBe("'/Users/j/My Tools'");
+    expect(quoteArgForDisplay("/home/j/a\tb", "linux")).toBe("'/home/j/a\tb'");
+  });
+
+  it("POSIX: single-quotes shell metacharacters, escaping embedded single quotes", () => {
+    expect(quoteArgForDisplay("/home/j/$HOME-ish", "linux")).toBe("'/home/j/$HOME-ish'");
+    // The standard '\'' dance: close, escaped literal quote, reopen.
+    expect(quoteArgForDisplay("/Users/j/it's here", "darwin")).toBe("'/Users/j/it'\\''s here'");
+  });
+
+  it("win32: is byte-identical to quoteShellArgIfNeeded (the printed line must match the shell:true argv join)", () => {
+    for (const arg of ["C:\\npm", "C:\\Users\\Jeff Smith\\AppData\\Roaming\\npm", 'C:\\bad"quote', "C:\\pct%path"]) {
+      expect(quoteArgForDisplay(arg, "win32")).toBe(quoteShellArgIfNeeded(arg, "win32"));
+    }
+    expect(quoteArgForDisplay("C:\\Users\\Jeff Smith\\npm", "win32")).toBe('"C:\\Users\\Jeff Smith\\npm"');
+    expect(quoteArgForDisplay('C:\\bad"quote', "win32")).toBeNull();
   });
 });
 

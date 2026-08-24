@@ -525,8 +525,13 @@ const UV_WIN_EXE_EXT = /\.(?:exe|cmd|bat)$/i;
  * binary would mis-launch (a uvx binary does not take `tool run`). A pinned
  * path either spawns as written or fails with an ENOENT naming exactly what
  * the user wrote -- both better than quiet substitution.
+ *
+ * Exported so server.ts's startup uv prewarm gate matches the SAME set of
+ * commands resolveUvSpawn will bootstrap at activation -- an exact-string
+ * gate there let `uvx.exe` / `UV.CMD` configs skip the prewarm and pay the
+ * 2-10s ensureUv download on the activation path instead.
  */
-function uvLaunchKind(command: string): "uv" | "uvx" | null {
+export function uvLaunchKind(command: string): "uv" | "uvx" | null {
   if (/[\\/]/.test(command)) return null;
   const base = command.replace(UV_WIN_EXE_EXT, "").toLowerCase();
   if (base === "uv") return "uv";

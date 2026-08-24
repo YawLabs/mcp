@@ -75,6 +75,29 @@ export function quoteShellArgIfNeeded(arg: string, platform: NodeJS.Platform = p
   return `"${arg}"`;
 }
 
+/** Quote a single argv entry for DISPLAY in a printed command line.
+ *
+ *  quoteShellArgIfNeeded above quotes for the shell the spawn actually uses,
+ *  which on POSIX is no shell at all -- so the SPAWN argv must stay raw
+ *  there. But a printed suggestion gets pasted into an interactive shell,
+ *  which splits on whitespace: a prefix like `/Users/j/My Tools` printed raw
+ *  makes npm read `/Users/j/My` as the prefix and install a package named
+ *  `Tools`. The display form therefore quotes independently of the spawn
+ *  argv: on win32 it reuses quoteShellArgIfNeeded so the printed line stays
+ *  byte-identical to what the shell:true spawn joins; on POSIX it
+ *  single-quotes anything outside the shell-inert character set (with the
+ *  standard '\'' escape for embedded single quotes). Returns null exactly
+ *  when quoteShellArgIfNeeded does (win32 unquotable) -- POSIX display
+ *  quoting always succeeds. */
+export function quoteArgForDisplay(arg: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (platform === "win32") return quoteShellArgIfNeeded(arg, platform);
+  // Allowlist of characters no POSIX shell acts on; anything else (spaces,
+  // `$`, backticks, globs, ...) gets the arg single-quoted. Quoting a tad
+  // too eagerly is harmless; under-quoting silently splits the paste.
+  if (/^[A-Za-z0-9_\-./+,:@=]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
 /** Resolve the global install prefix of the CURRENTLY running yaw-mcp by
  *  walking up from `process.argv[1]` (realpath-resolved so a symlinked shim
  *  like `/usr/local/bin/yaw-mcp -> /opt/node/lib/node_modules/@yawlabs/mcp/...`

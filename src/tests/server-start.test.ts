@@ -73,6 +73,13 @@ vi.mock("../auto-upgrade.js", async (importOriginal) => {
   return { ...actual, maybeAutoUpgrade: vi.fn().mockResolvedValue(undefined) };
 });
 
+// Never let start()'s uv prewarm gate reach the real bootstrap (it would
+// download a uv binary). The gate's own predicate (uvLaunchKind) stays real.
+vi.mock("../uv-bootstrap.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return { ...actual, ensureUv: vi.fn().mockResolvedValue("uv") };
+});
+
 // Pass-through by default; only the "loader throws" case swaps in a
 // rejection. loadLocalBundles swallows every I/O error internally, so the
 // catch in start() is unreachable from the filesystem alone.
@@ -95,6 +102,7 @@ import { ConnectServer } from "../server.js";
 import { grantTrust } from "../trust.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { connectToUpstream } from "../upstream.js";
+import { ensureUv } from "../uv-bootstrap.js";
 
 const ENV_KEYS = [
   "HOME",
@@ -214,29 +222,68 @@ interface Started {
   transport: { started: boolean; closed: boolean; sent: unknown[] };
 }
 
+/** Drive the downstream MCP initialize handshake through a fake transport.
+ *  start() defers pre-warm (and auto-load) until the SDK's `oninitialized`
+ *  fires -- the capability snapshot upstream connects mirror is only
+ *  populated by the initialize request -- so tests that expect the
+ *  startup activation paths to run must complete the handshake first,
+ *  exactly like a real client. */
+async function driveInitialize(
+  transport: { onmessage?: (msg: unknown) => void },
+  capabilities: Record<string, unknown> = {},
+): Promise<void> {
+  transport.onmessage?.({
+    jsonrpc: "2.0",
+    id: 0,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities,
+      clientInfo: { name: "test-client", version: "0.0.0" },
+    },
+  });
+  // Let the initialize response settle before announcing initialized,
+  // mirroring a real client's ordering.
+  await new Promise((r) => setImmediate(r));
+  transport.onmessage?.({ jsonrpc: "2.0", method: "notifications/initialized" });
+}
+
 /** Construct + start a ConnectServer, capturing the pre-warm promise.
  *  The capture wraps the private method on the INSTANCE (production code
- *  is untouched) so the fire-and-forget call becomes awaitable. */
-async function startServer(): Promise<Started> {
+ *  is untouched) so the fire-and-forget call becomes awaitable. By
+ *  default the downstream initialize handshake is driven too;
+ *  `handshake: false` leaves the client un-initialized so the gating
+ *  itself can be observed. */
+async function startServer(opts: { handshake?: boolean } = {}): Promise<Started> {
   const server = new ConnectServer();
   servers.push(server);
   const priv = server as any;
 
   const originalPrewarm = priv.prewarmDormantServers.bind(priv);
+  let capturePrewarm: () => void = () => {};
+  const prewarmCaptured = new Promise<void>((resolve) => {
+    capturePrewarm = resolve;
+  });
   let prewarmPromise: Promise<void> = Promise.resolve();
   priv.prewarmDormantServers = () => {
     prewarmPromise = originalPrewarm();
+    capturePrewarm();
     return prewarmPromise;
   };
 
   await server.start();
+  const transport = hoisted.transports[hoisted.transports.length - 1];
+  if (opts.handshake !== false) {
+    await driveInitialize(transport as any);
+  }
   return {
     server,
     priv,
     prewarmed: (async () => {
+      await prewarmCaptured;
       await prewarmPromise;
     })(),
-    transport: hoisted.transports[hoisted.transports.length - 1],
+    transport,
   };
 }
 
@@ -468,6 +515,82 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     expect(priv.learning.exportSnapshot()).toEqual({});
     // "known" is no longer known, so pre-warm has to spawn it.
     expect(spawnedNamespaces()).toEqual(["fresh", "known"]);
+  });
+});
+
+describe("ConnectServer.start() — uv bootstrap prewarm gate", () => {
+  it("prewarms uv for a cased/.exe uv launcher, matching what activation will bootstrap", async () => {
+    // resolveUvSpawn bootstraps any bare uv/uvx spelling (uvLaunchKind), so
+    // the startup gate must match the same set -- an exact-string gate let
+    // `UVX.exe` configs skip the prewarm and pay the 2-10s ensureUv
+    // download on the activation path instead.
+    writeBundles(synthHome, [serverEntry("py", { command: "UVX.exe" })]);
+
+    const { prewarmed } = await startServer();
+    await prewarmed;
+
+    expect(vi.mocked(ensureUv)).toHaveBeenCalled();
+  });
+
+  it("does not prewarm uv for a path-pinned uv binary", async () => {
+    // A command with a path separator is a user pin on one concrete
+    // binary; resolveUvSpawn passes it through untouched, so prewarming
+    // the managed download would be pure waste.
+    writeBundles(synthHome, [serverEntry("py", { command: "C:/tools/uv.exe" })]);
+
+    const { prewarmed } = await startServer();
+    await prewarmed;
+
+    expect(vi.mocked(ensureUv)).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConnectServer.start() — startup activation waits for the initialize handshake", () => {
+  it("does not pre-warm before the client initializes, then pre-warms after", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+
+    const { transport, prewarmed } = await startServer({ handshake: false });
+    // Transport is up (the client can talk to us), but nothing spawned:
+    // upstream connects mirror the downstream capability snapshot, which
+    // only exists once initialize has been handled, so pre-warm must wait.
+    expect(transport.started).toBe(true);
+    await new Promise((r) => setImmediate(r));
+    expect(spawnedNamespaces()).toEqual([]);
+
+    await driveInitialize(transport as any);
+    await prewarmed;
+    expect(spawnedNamespaces()).toEqual(["gh"]);
+  });
+
+  it("pre-warm's upstream connects see the downstream capability snapshot", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+
+    // Record what the bridge reports AT CONNECT TIME -- upstream.ts reads
+    // it once, at Client construction, so a snapshot that fills in later
+    // would not help a connection spawned too early.
+    const capsAtConnect: unknown[] = [];
+    vi.mocked(connectToUpstream).mockImplementation((async (
+      config: UpstreamServerConfig,
+      _onDisconnect: unknown,
+      _onListChanged: unknown,
+      bridge: { getClientCapabilities: () => unknown } | undefined,
+    ) => {
+      capsAtConnect.push(bridge?.getClientCapabilities());
+      return fakeConnection(config, [`${config.namespace}_live`]);
+    }) as unknown as typeof connectToUpstream);
+
+    const { transport, prewarmed } = await startServer({ handshake: false });
+    await driveInitialize(transport as any, { elicitation: {}, sampling: {} });
+    await prewarmed;
+
+    // Presence, not exact shape: the SDK normalizes sub-capabilities (a
+    // bare `elicitation: {}` gains `form: {}`), and pinning that would
+    // couple the test to an SDK version. What matters is that the
+    // snapshot was non-empty at connect time.
+    expect(capsAtConnect).toHaveLength(1);
+    const caps = capsAtConnect[0] as { elicitation?: unknown; sampling?: unknown };
+    expect(caps.elicitation).toBeDefined();
+    expect(caps.sampling).toBeDefined();
   });
 });
 

@@ -331,9 +331,12 @@ describe("runTry — happy path", () => {
 
   it("caret-escapes cmd metacharacters in catalog args on Windows (client-spawn injection guard)", async () => {
     // The trial entry is spawned by the MCP CLIENT, whose libuv only quotes
-    // argv elements containing space/tab/quote — so a catalog arg carrying a
+    // argv elements containing space/tab/quote -- so a catalog arg carrying a
     // bare `&` would reach cmd.exe unquoted and run the tail as a second
     // command at client-spawn time, with the config file looking innocuous.
+    // `npx` is a `.cmd` shim: it forwards args through `%*`, which cmd RE-PARSES,
+    // so a metachar must survive TWO cmd parses -- triple-caret (`^^^&`). The
+    // single caret this once asserted was a no-op against the shim (bug #1).
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
@@ -356,7 +359,7 @@ describe("runTry — happy path", () => {
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
     const entry = client.mcpServers["yaw-mcp-try-demo"];
     expect(entry.command).toBe("cmd");
-    expect(entry.args).toEqual(["/c", "npx", "-y", "@demo/mcp", "--url", "https://api/x?a=1^&b=2"]);
+    expect(entry.args).toEqual(["/c", "npx", "-y", "@demo/mcp", "--url", "https://api/x?a=1^^^&b=2"]);
   });
 });
 

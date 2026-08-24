@@ -230,6 +230,18 @@ function emptyStore(
  * Individual malformed ENTRIES are dropped (with a log line) rather than
  * poisoning the whole store -- one corrupt record must not silently revoke
  * every other project the user approved.
+ *
+ * Keys are folded through normalizeTrustKey at READ time, not only at write
+ * time. Older builds wrote keys under folding rules that have since changed
+ * (the darwin lowercasing arrived after real macOS stores existed, full of
+ * mixed-case /Users/... keys), and every lookup goes through the CURRENT
+ * normalizeTrustKey -- so without the read-time fold those legacy grants are
+ * orphaned: approved projects re-prompt, revoke cannot find the row, and
+ * re-granting adds exactly the duplicate `trust --list` row the folding was
+ * meant to prevent. Folding here migrates legacy rows on every read (the next
+ * write persists the folded form), on both platforms for free. When two
+ * legacy keys fold together they name the same file on a case-insensitive
+ * filesystem, so keeping both WOULD be the duplicate bug: last write wins.
  */
 export async function readTrustStore(home: string = homedir()): Promise<TrustStore> {
   const path = trustStorePath(home);
@@ -285,10 +297,16 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
       log("warn", "Dropping trust entry with a missing or malformed sha256", { path, key });
       continue;
     }
-    // setJsonKey, not entries[key]: key comes straight from the parsed trust
-    // file, and plain assignment to "__proto__" would silently drop the
-    // record AND repoint `entries`' prototype at it.
-    setJsonKey(entries, key, {
+    // normalizeTrustKey on the STORED key: legacy stores hold keys written
+    // under older folding rules (see the read-time fold note above), and only
+    // the folded form is reachable by today's lookups. The display `path`
+    // keeps the raw key as its fallback -- folding is for matching, not for
+    // what the user reads in `trust --list`. setJsonKey, not entries[k]: the
+    // key comes straight from the parsed trust file, and plain assignment to
+    // "__proto__" would silently drop the record AND repoint `entries`'
+    // prototype at it (the fold makes that key absolute today, but the guard
+    // must not depend on it staying that way).
+    setJsonKey(entries, normalizeTrustKey(key), {
       path: typeof v.path === "string" && v.path.length > 0 ? v.path : key,
       sha256: v.sha256,
       grantedAt: typeof v.grantedAt === "string" ? v.grantedAt : "",

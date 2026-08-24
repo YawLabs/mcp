@@ -472,6 +472,30 @@ const VALUELESS_RUNNER_FLAGS = new Set([
   "--ignore-existing",
 ]);
 
+/**
+ * The spec with a leading `v` stripped from its version suffix, so
+ * specConstraint can judge what npm will actually install. npm's semver
+ * parser drops the `v`, so `pkg@v1.2.3` pins exactly 1.2.3 forever --
+ * telling the user it "resolves to whatever the registry serves at spawn
+ * time" would be false. oam-spawn's specConstraint deliberately buckets a
+ * v-prefixed version as "range" because ITS caller compares the suffix
+ * VERBATIM against a package.json version (which never carries the `v`) and
+ * npx is the safe fallback there; the preview asks a different question, so
+ * the strip lives here in the caller, never in specConstraint itself. Only
+ * a `v` followed by a digit is stripped: a dist-tag may legally start with
+ * `v` (`vnext`), and npm forbids tags that parse as semver, so `v<digit>`
+ * can only be a version expression.
+ */
+function stripVersionPrefixV(spec: string): string {
+  // The version separator is the "@" after the (possibly scoped) name --
+  // same cut as oam-spawn.ts:packageName.
+  const start = spec.startsWith("@") ? 1 : 0;
+  const at = spec.indexOf("@", start);
+  if (at === -1) return spec;
+  const suffix = spec.slice(at + 1);
+  return /^v\d/.test(suffix) ? spec.slice(0, at + 1) + suffix.slice(1) : spec;
+}
+
 /** The registry spec this entry would fetch, when it has no version pin. */
 function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
   const base =
@@ -507,9 +531,11 @@ function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
   // the registry at spawn time exactly like a bare spec -- and `@latest`
   // is the shape every catalog install writes into bundles.json, so
   // counting any `@` as a pin silenced this line on the entries that most
-  // needed it. Same classification as oam-spawn.ts:specConstraint, which
-  // already treats dist-tags as "any" and ranges as unpinned.
-  if (specConstraint(spec).kind === "exact") return null;
+  // needed it. Same classification as oam-spawn.ts:specConstraint (which
+  // already treats dist-tags as "any" and ranges as unpinned), with one
+  // deliberate divergence: a leading `v` on the version is stripped first,
+  // because `pkg@v1.2.3` installs exactly 1.2.3 -- see stripVersionPrefixV.
+  if (specConstraint(stripVersionPrefixV(spec)).kind === "exact") return null;
   return spec;
 }
 

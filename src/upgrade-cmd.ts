@@ -606,8 +606,51 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
 
   const plan = buildUpgradePlan({ current, latest, method });
 
+  // For global-npm, pin the install to the prefix the RUNNING copy lives
+  // under -- the same `--prefix` auto-upgrade passes (maybeAutoUpgrade in
+  // auto-upgrade.ts). A bare `npm install -g` writes into whatever
+  // `npm prefix -g` resolves, which can be a DIFFERENT tree than the one the
+  // client spawned us from (multiple Node versions, custom NPM_CONFIG_PREFIX,
+  // Yaw Terminal's bundled Node); the child then exits 0, we print
+  // "OK: Upgraded", and the running copy stays stale.
+  //
+  // Computed BEFORE the --json and offline returns on purpose: the walk is
+  // filesystem-only (a realpath of argv[1]), so offline can afford it, and
+  // both paths hand out a command the user will run later -- a bare `-g`
+  // there would re-open the exact wrong-tree hazard `--prefix` closes.
+  //
+  // Two quotings of one value, and they must drop together:
+  //   - globalPrefixArg is the SPAWN argv form. defaultSpawn runs shell:true
+  //     on win32, where argv is joined unquoted, so the arg carries its own
+  //     quotes there; POSIX spawns without a shell and needs the raw path.
+  //     An unquotable prefix drops `--prefix` entirely (npm's own resolution
+  //     is the worse-but-safe fallback -- same policy as auto-upgrade).
+  //   - suggestedCommand is the PRINTED, paste-safe form: on POSIX a prefix
+  //     with a space must be single-quoted for the user's shell even though
+  //     the spawn argv stays raw (see quoteArgForDisplay in auto-upgrade.ts).
+  let globalPrefixArg: string | null = null;
+  let suggestedCommand = plan.command;
+  if (method === "global-npm") {
+    const rawPrefix = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
+    if (rawPrefix !== null) {
+      const { quoteArgForDisplay, quoteShellArgIfNeeded } = await import("./auto-upgrade.js");
+      const spawnForm = quoteShellArgIfNeeded(rawPrefix);
+      const displayForm = quoteArgForDisplay(rawPrefix);
+      // The two fail together today (win32 shares one implementation; POSIX
+      // display quoting is total) -- requiring both keeps the spawned argv
+      // and every printed suggestion from ever disagreeing.
+      if (spawnForm !== null && displayForm !== null) {
+        globalPrefixArg = spawnForm;
+        suggestedCommand = `npm install -g --prefix ${displayForm} @yawlabs/mcp@latest`;
+      }
+    }
+  }
+
   if (opts.json) {
-    print(JSON.stringify(plan, null, 2));
+    // The snapshot's command is the paste-safe prefixed form: scripts and
+    // humans both act on it, and a bare `-g` would promise a different
+    // install than `--run` performs (see the pinning note above).
+    print(JSON.stringify({ ...plan, command: suggestedCommand }, null, 2));
     return { exitCode: plan.stale && !opts.run ? 1 : 0, lines };
   }
 
@@ -615,10 +658,10 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // suggested command so the user can run it when they're back online.
   if (latest === null) {
     print("yaw-mcp upgrade: couldn't reach the npm registry (offline? firewall?).");
-    if (plan.command) {
+    if (suggestedCommand) {
       print("When you're back online, run:");
       print("");
-      print(`  ${plan.command}`);
+      print(`  ${suggestedCommand}`);
     } else if (method === "bundled-app") {
       print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app — nothing to run.");
     } else if (method === "binary") {
@@ -675,24 +718,6 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // tree and the right command depends on their setup. unknown stays
   // manual because we don't know which install we'd be mutating.
   const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath) : null;
-  // For global-npm, pin the install to the prefix the RUNNING copy lives
-  // under -- the same `--prefix` auto-upgrade passes (maybeAutoUpgrade in
-  // auto-upgrade.ts). A bare `npm install -g` writes into whatever
-  // `npm prefix -g` resolves, which can be a DIFFERENT tree than the one the
-  // client spawned us from (multiple Node versions, custom NPM_CONFIG_PREFIX,
-  // Yaw Terminal's bundled Node); the child then exits 0, we print
-  // "OK: Upgraded", and the running copy stays stale. Quoting matters because
-  // defaultSpawn runs shell:true on win32, where argv is joined unquoted; an
-  // unquotable prefix drops `--prefix` entirely (npm's own resolution is the
-  // worse-but-safe fallback -- same policy as auto-upgrade).
-  let globalPrefixArg: string | null = null;
-  if (method === "global-npm") {
-    const raw = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
-    if (raw !== null) {
-      const { quoteShellArgIfNeeded } = await import("./auto-upgrade.js");
-      globalPrefixArg = quoteShellArgIfNeeded(raw);
-    }
-  }
   const runSpec: { cmd: string; args: string[]; cwd?: string } | null =
     method === "global-npm"
       ? {
@@ -708,12 +733,16 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
           : method === "local-node-modules" && installRoot !== null
             ? { cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: installRoot }
             : null;
-  // Print the line we actually spawn: once `--prefix` is in the argv, a bare
-  // `npm install -g` would promise a different install than --run performs --
-  // and "run it yourself" must suggest the same command, or the manual path
-  // keeps the silent wrong-tree hazard --prefix exists to close. Identical to
-  // plan.command for every non-global-npm runSpec.
-  const commandLine = runSpec ? [runSpec.cmd, ...runSpec.args].join(" ") : plan.command;
+  // Print the line we actually spawn, in its paste-safe display form: once
+  // `--prefix` is in the argv, a bare `npm install -g` would promise a
+  // different install than --run performs -- and "run it yourself" must
+  // suggest the same command, or the manual path keeps the silent wrong-tree
+  // hazard --prefix exists to close. For global-npm that is suggestedCommand
+  // (the spawn argv with the prefix display-quoted, so a POSIX path with a
+  // space pastes as one token); for every other runSpec the argv join IS
+  // plan.command, no arg of which ever needs quoting.
+  const commandLine =
+    method === "global-npm" ? suggestedCommand : runSpec ? [runSpec.cmd, ...runSpec.args].join(" ") : plan.command;
 
   if (!opts.run) {
     if (runSpec) {

@@ -23,7 +23,10 @@
 //      printed on stdout -- only the cache is missing. Deliberately distinct
 //      from 1 and 2, both of which mean nothing was graded at all.
 
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gradesCachePath, writeGrade } from "./grades-cache.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
@@ -164,6 +167,59 @@ function findServer(servers: UpstreamServerConfig[], namespace: string): Upstrea
   return servers.find((s) => s.namespace === namespace);
 }
 
+/**
+ * Resolve the INSTALLED @yawlabs/mcp-compliance PACKAGE version -- the rubric
+ * identifier defaultRunner records as `suiteVersion`. Rubric changes ship as
+ * package releases (0.17.x -> 0.18.0), so the package version is what tells a
+ * letter graded under an older rubric from a current one. The package's
+ * exported SPEC_VERSION is NOT that: it is the MCP protocol revision date
+ * ("2025-11-25"), identical across compliance releases, so persisting it made
+ * every rubric's letters indistinguishable.
+ *
+ * Read straight off the package.json on disk rather than through the module
+ * system: the package's `exports` map carries only an `import` condition (no
+ * `require`/`default` and no "./package.json" subpath), so both createRequire
+ * resolution and a package.json subpath import throw
+ * ERR_PACKAGE_PATH_NOT_EXPORTED. The ancestor walk below mirrors Node's own
+ * node_modules lookup (<dir>/node_modules at every level up to the root), so
+ * the copy found is the copy `import()` loads.
+ *
+ * `fromUrl` is injectable for tests; it defaults to this module's own URL.
+ * Returns undefined (never throws) when nothing resolvable is found -- the
+ * cache entry then simply omits `suiteVersion`, same as a pre-field entry.
+ */
+export async function resolveComplianceSuiteVersion(fromUrl: string = import.meta.url): Promise<string | undefined> {
+  let here: string;
+  try {
+    here = fileURLToPath(fromUrl);
+  } catch {
+    return undefined;
+  }
+  for (let dir = dirname(here); ; dir = dirname(dir)) {
+    const pjPath = join(dir, "node_modules", "@yawlabs", "mcp-compliance", "package.json");
+    let raw: string;
+    try {
+      raw = await readFile(pjPath, "utf8");
+    } catch {
+      if (dirname(dir) === dir) return undefined;
+      continue;
+    }
+    // Nearest installed copy found -- the one Node resolves. Do NOT keep
+    // walking on a bad manifest: an ancestor's copy would be a DIFFERENT
+    // install, and attributing its version here would mislabel the rubric.
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const version =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>).version
+          : undefined;
+      return typeof version === "string" && version.length > 0 ? version : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 /** Lazily load the real compliance runner. Kept behind a dynamic import so a
  *  test that injects `opts.runner` never resolves @yawlabs/mcp-compliance and
  *  never spawns a child. */
@@ -172,17 +228,22 @@ async function defaultRunner(target: {
   args: string[];
   env?: Record<string, string>;
 }): Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string }> {
-  // SPEC_VERSION rides along so the cached grade records WHICH rubric produced
-  // the letter -- read here (not at writeGrade) so runner-injecting tests keep
-  // never resolving @yawlabs/mcp-compliance.
-  const { runComplianceSuite, SPEC_VERSION } = await import("@yawlabs/mcp-compliance");
+  // The compliance PACKAGE version rides along so the cached grade records
+  // WHICH rubric produced the letter (see resolveComplianceSuiteVersion for
+  // why it is the package version, not the exported SPEC_VERSION) -- read here
+  // (not at writeGrade) so runner-injecting tests keep never resolving
+  // @yawlabs/mcp-compliance.
+  const { runComplianceSuite } = await import("@yawlabs/mcp-compliance");
+  const suiteVersion = await resolveComplianceSuiteVersion();
   const report = await runComplianceSuite({
     type: "stdio",
     command: target.command,
     args: target.args,
     env: target.env,
   });
-  return { grade: report.grade, score: report.score, suiteVersion: SPEC_VERSION };
+  return suiteVersion
+    ? { grade: report.grade, score: report.score, suiteVersion }
+    : { grade: report.grade, score: report.score };
 }
 
 export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCommandResult> {

@@ -1,8 +1,16 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AUDIT_USAGE, parseAuditArgs, redactSecretArgs, runAudit } from "../audit-cmd.js";
+import {
+  AUDIT_USAGE,
+  parseAuditArgs,
+  redactSecretArgs,
+  resolveComplianceSuiteVersion,
+  runAudit,
+} from "../audit-cmd.js";
 import { gradesCachePath, readGradesCache, writeGrade } from "../grades-cache.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
@@ -106,8 +114,9 @@ describe("runAudit", () => {
   });
 
   it("persists the runner's suiteVersion so the cached letter records its rubric", async () => {
-    // defaultRunner attaches SPEC_VERSION from @yawlabs/mcp-compliance; this
-    // pins the plumbing from the runner's report into grades.json.
+    // defaultRunner attaches the @yawlabs/mcp-compliance PACKAGE version (see
+    // resolveComplianceSuiteVersion); this pins the plumbing from the runner's
+    // report into grades.json.
     home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: [] }]);
     const io = captureIO();
     const r = await runAudit({
@@ -382,6 +391,30 @@ describe("runAudit preamble redaction", () => {
       },
     });
     expect(seenArgs).toEqual(["x.js", "--Token", "super-secret-value"]);
+  });
+});
+
+describe("resolveComplianceSuiteVersion", () => {
+  // This is the value defaultRunner records as suiteVersion, exercised for
+  // real (no injected runner, no network, no child process): the resolver
+  // reads the installed @yawlabs/mcp-compliance package.json off disk.
+  it("resolves the installed PACKAGE version -- semver-shaped, not the spec revision date", async () => {
+    const v = await resolveComplianceSuiteVersion();
+    // Ground truth: the package.json of the copy installed in this repo's
+    // node_modules, read at a known relative path so the assertion cannot
+    // drift from what the walk found.
+    const pjPath = fileURLToPath(new URL("../../node_modules/@yawlabs/mcp-compliance/package.json", import.meta.url));
+    const groundTruth = (JSON.parse(await readFile(pjPath, "utf8")) as { version: string }).version;
+    expect(v).toBe(groundTruth);
+    // The rubric identifier must be the package release (changes when the
+    // rubric changes), NEVER the exported SPEC_VERSION protocol date
+    // ("2025-11-25"), which is constant across compliance releases.
+    expect(v).toMatch(/^\d+\.\d+\.\d+/);
+    expect(v).not.toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it("returns undefined (never throws) for an unresolvable fromUrl", async () => {
+    expect(await resolveComplianceSuiteVersion("not-a-file-url")).toBeUndefined();
   });
 });
 

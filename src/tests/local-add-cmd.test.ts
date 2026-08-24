@@ -1164,6 +1164,45 @@ describe("runList", () => {
     expect(parsed.servers[0].envKeys).toEqual(["TAILSCALE_API_KEY"]);
   });
 
+  // A required key with no --env value is seeded "" on disk ("required, nothing
+  // stored"), and the loader's validateEntry DROPS blank values before spawn.
+  // envKeys derived from the validated entry therefore silently lost exactly
+  // the required-env documentation `add --json` reports; `list --json` must
+  // read the RAW on-disk entry (keys only) so the two machine surfaces agree
+  // (LIST_USAGE: "same posture as `add --json`").
+  it("--json keeps a required key seeded empty by add in envKeys, matching add --json", async () => {
+    const addIo = captureIO();
+    await runAdd({
+      slug: "tailscale",
+      home: synthHome,
+      cwd: synthCwd,
+      // Required key satisfied from the ambient shell, NOT --env: add seeds
+      // the on-disk value as "" and persists nothing.
+      env: { TAILSCALE_API_KEY: "tskey-ambient-only" },
+      json: true,
+      fetchCatalog,
+      out: (s) => addIo.out.push(s),
+      err: (s) => addIo.err.push(s),
+    });
+    const added = JSON.parse(addIo.text());
+    expect(added.entry.envKeys).toEqual(["TAILSCALE_API_KEY"]);
+
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const parsed = JSON.parse(io.text());
+    // The seeded key shows up in list --json exactly as it does in add --json...
+    expect(parsed.servers[0].envKeys).toEqual(["TAILSCALE_API_KEY"]);
+    // ...and stays keys-only: no env object, no ambient value on stdout.
+    expect(parsed.servers[0].env).toBeUndefined();
+    expect(io.text()).not.toContain("tskey-ambient-only");
+  });
+
   // Fix 3: malformed bundles.json -- warnings printed to stderr, not silently dropped
   it("prints load warnings to stderr when bundles.json is malformed (fix 3)", async () => {
     const { writeFileSync, mkdirSync } = await import("node:fs");

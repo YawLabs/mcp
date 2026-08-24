@@ -394,33 +394,113 @@ export interface LaunchEntry {
 
 /** cmd.exe metacharacters that split or redirect an UNQUOTED command line:
  *  `&` (chain), `|` (pipe), `<` `>` (redirect), `^` (escape), `(` `)`
- *  (grouping). `%` is deliberately absent — cmd expands %VAR% BEFORE caret
+ *  (grouping). `%` is deliberately absent -- cmd expands %VAR% BEFORE caret
  *  processing, so a caret cannot neutralize it, and mangling every literal
- *  `%` to dodge an expansion that only fires when the variable exists is the
- *  worse trade. */
+ *  `%` to dodge an expansion that only fires when the variable EXISTS is the
+ *  worse trade (a bare `%NAME%` for an unset var is left literal by cmd, the
+ *  common case; verified on Windows). */
 const CMD_METACHARS = /[&|<>^()]/g;
+const HAS_CMD_METACHAR = /[&|<>^()]/;
+
+/** Node/Python launcher names that ship as `.cmd`/`.bat` SHIMS on Windows
+ *  (npx.cmd, uvx.cmd, pipx.cmd, ...). A shim forwards its args through `%*`,
+ *  which cmd.exe RE-PARSES a second time -- so an arg bound for a shim must
+ *  survive TWO cmd parses, not one (see escapeCmdArg for the caret depth). */
+const KNOWN_CMD_SHIM_LAUNCHERS = new Set(["npx", "uvx", "pipx", "npm", "pnpm", "yarn", "bunx"]);
+
+/** Real executables cmd.exe launches DIRECTLY -- one cmd parse, no `%*`
+ *  re-parse. Listed so the common direct launchers get single-level
+ *  (full-fidelity) escaping instead of the fail-safe shim depth. */
+const KNOWN_DIRECT_BINARIES = new Set([
+  "node",
+  "deno",
+  "bun",
+  "python",
+  "python3",
+  "py",
+  "ruby",
+  "php",
+  "docker",
+  "dotnet",
+  "java",
+  "go",
+]);
+
+/** Is `command` a `.cmd`/`.bat` shim whose `%*` forwarding makes cmd.exe parse
+ *  the forwarded args a SECOND time?  npx/uvx/pipx are; node/docker are not.
+ *
+ *  This sets the caret depth in escapeCmdArg: an arg reaching a shim must
+ *  survive two cmd parses (triple-caret), an arg reaching a real exe only one
+ *  (single-caret). An UNKNOWN bare name fails SAFE to "shim" -- cmd can resolve
+ *  it to a `.cmd` via PATHEXT, and over-escaping a real exe merely corrupts a
+ *  hostile metachar arg, whereas under-escaping a shim is a command injection.
+ *  Exported for tests. */
+export function isCmdShimLauncher(command: string): boolean {
+  const base = command.replace(/^.*[\\/]/, "").toLowerCase();
+  if (/\.(?:cmd|bat)$/.test(base)) return true;
+  if (/\.(?:exe|com)$/.test(base)) return false;
+  const stem = base.replace(/\.[^.]*$/, "");
+  if (KNOWN_CMD_SHIM_LAUNCHERS.has(stem)) return true;
+  if (KNOWN_DIRECT_BINARIES.has(stem)) return false;
+  return true;
+}
 
 /** Escape one argv element for the Windows `cmd /c` wrap in buildLaunchEntry.
  *
- *  The wrapped entry is spawned by the MCP CLIENT, whose runtime (Node/libuv
- *  on every client we target) only quotes an argv element containing a space,
- *  tab, or double quote. Everything else reaches cmd.exe verbatim — where a
- *  bare `&` ends the command and runs the tail as a second one. Catalog args
- *  come to us tokenized from upstream install commands, so a plain
- *  query-string arg (`--url https://api/x?a=1&b=2`) silently truncates, and a
- *  hostile catalog entry is a command injection at client-spawn time with an
- *  innocuous-looking config file.
+ *  The wrapped entry is spawned by the MCP CLIENT, whose runtime (Node/libuv on
+ *  every client we target) quote-WRAPS an argv element only when it contains a
+ *  space, tab, or double quote; everything else reaches cmd.exe verbatim -- and
+ *  a bare `&` ends the command and runs the tail as a second one. Catalog args
+ *  arrive tokenized from upstream install commands, so a plain query-string arg
+ *  (`--url https://api/x?a=1&b=2`) silently truncates, and a hostile catalog
+ *  entry is a command injection at client-spawn time behind an innocuous config
+ *  file. Every case below was derived EMPIRICALLY on a native Windows box by
+ *  spawning `cmd /c <target> <arg>` -- through both a `%*`-forwarding `.cmd`
+ *  shim and a real exe -- and asserting the argv the child actually received.
  *
- *  Two shapes, two treatments:
- *    - arg the client will NOT quote (no space/tab/quote): caret-escape the
- *      metacharacters; cmd strips the carets and hands the original string
- *      to the child.
- *    - arg the client WILL quote: leave it alone — inside the double quotes
- *      the client adds, cmd.exe treats metacharacters literally, and a caret
- *      there would survive as a literal character and corrupt the value. */
-export function escapeCmdArg(arg: string): string {
-  if (/[ \t"]/.test(arg)) return arg;
-  return arg.replace(CMD_METACHARS, "^$&");
+ *  Four shapes:
+ *
+ *    1. Contains a double-quote AND a cmd metacharacter -> REFUSE (throw).
+ *       A literal quote forces libuv to quote-WRAP the element and escape the
+ *       inner quote as `\"`. cmd.exe's parser counts quotes and does NOT honour
+ *       that backslash, so `\"` prematurely CLOSES libuv's quote and flips quote
+ *       parity for the rest of the element -- exposing any metacharacter there
+ *       as a live splitter (reproduced: `a"&echo X` runs `echo X`). No caret
+ *       depth fixes it because parity through libuv's wrapping is unpredictable,
+ *       so we refuse the shape loudly rather than emit an exploitable entry.
+ *
+ *    2. Contains a double-quote but NO metacharacter -> verbatim. libuv wraps +
+ *       escapes it and cmd, with nothing to act on, passes it through intact
+ *       (`{"a":1}` round-trips). A caret here would land inside libuv's quotes
+ *       as a literal and corrupt the value. Keeps legitimate JSON args working.
+ *
+ *    3. Contains a space/tab (no quote) -> verbatim. libuv quote-wraps it, and
+ *       inside those quotes cmd treats metacharacters literally on EVERY parse
+ *       (the wrap survives a shim's `%*` re-parse). A caret would corrupt it.
+ *
+ *    4. No quote, no space/tab -> caret-escape the metacharacters, since libuv
+ *       passes the element verbatim and cmd sees them bare. Depth follows how
+ *       many times cmd parses the element: a real exe is reached after ONE cmd
+ *       parse (single caret, `^&` -> `&`); a `.cmd`/`.bat` shim forwards via
+ *       `%*` which cmd RE-PARSES, so the element crosses TWO parses and needs a
+ *       caret that survives both (`^^^&` -> `^&` -> `&`). The single-caret form
+ *       that shipped before was a no-op against the shim: cmd stripped the one
+ *       caret on the outer parse and the bare `&` split inside the shim. */
+export function escapeCmdArg(arg: string, opts: { shim: boolean }): string {
+  if (arg.includes('"')) {
+    if (HAS_CMD_METACHAR.test(arg)) {
+      throw new Error(
+        `Cannot safely encode an argument that contains BOTH a double-quote and a ` +
+          `cmd.exe metacharacter (& | < > ^ ( )) for the Windows cmd /c launcher: ${arg} -- ` +
+          `passing it through cmd.exe risks a command injection at client-spawn time. ` +
+          `Rework the server's args to drop one of the two.`,
+      );
+    }
+    return arg;
+  }
+  if (/[ \t]/.test(arg)) return arg;
+  const caret = opts.shim ? "^^^" : "^";
+  return arg.replace(CMD_METACHARS, (m) => caret + m);
 }
 
 export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
@@ -434,10 +514,17 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
       // Caret-escape cmd.exe metacharacters (see escapeCmdArg): without it,
       // any upstream token carrying an unquoted `&` / `|` / `<` / `>` splits
       // the `cmd /c` line when the CLIENT spawns the entry, running the tail
-      // as a second command.
+      // as a second command. The COMMAND token is parsed by cmd ONCE -- it is
+      // resolved and launched, never forwarded through a shim's `%*` -- so it
+      // escapes at the single-parse depth. The ARG tokens, when `command` is a
+      // `.cmd`/`.bat` shim (npx/uvx/pipx), cross a SECOND cmd parse via that
+      // shim's `%*`, so they escape at the deeper shim depth. escapeCmdArg
+      // throws on a genuinely unsafe shape (quote + metachar); that rejection
+      // propagates to the caller's dispatch and surfaces as a clean error.
+      const shim = isCmdShimLauncher(command);
       const wrapped: LaunchEntry = {
         command: "cmd",
-        args: ["/c", escapeCmdArg(command), ...args.map(escapeCmdArg)],
+        args: ["/c", escapeCmdArg(command, { shim: false }), ...args.map((a) => escapeCmdArg(a, { shim }))],
       };
       if (env && Object.keys(env).length > 0) wrapped.env = { ...env };
       return wrapped;

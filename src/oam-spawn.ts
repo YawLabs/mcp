@@ -1547,9 +1547,23 @@ const REFRESH_COMMAND: Record<PinSource, (pkg: string) => string> = {
   // on a server waiting for stdin" (measured on
   // @modelcontextprotocol/server-memory). `npm cache add` is no substitute:
   // it only fills _cacache, never the _npx install tree this resolver reads.
-  // The `#` comment is valid in both sh and PowerShell, so the line stays
-  // copy-paste runnable while telling the user how to get their prompt back.
-  "npx-cache": (pkg) => `npx -y ${pkg}@latest # then Ctrl-C -- the cache is refreshed before the server starts`,
+  // No inline `#` comment either: that is comment syntax only in sh and
+  // PowerShell -- cmd.exe hands `#` and everything after it to npx as literal
+  // argv for the spawned server, which arg-parsing servers fail on. The
+  // Ctrl-C guidance rides in REFRESH_NOTE instead, so the command itself is
+  // copy-paste safe in all three shells.
+  "npx-cache": (pkg) => `npx -y ${pkg}@latest`,
+};
+
+/** Guidance that belongs NEXT TO a refresh command but must not live IN it.
+ *
+ *  The npx-cache command starts the server it just refreshed, so the user
+ *  needs to know that Ctrl-C at that point is success, not failure. Appending
+ *  that as a `# ...` comment made the string non-runnable in cmd.exe (see the
+ *  REFRESH_COMMAND comment above), so it is a sibling field: every consumer
+ *  of refreshWith surfaces refreshNote beside it when one exists. */
+const REFRESH_NOTE: Partial<Record<PinSource, string>> = {
+  "npx-cache": "then Ctrl-C -- the cache is refreshed before the server starts",
 };
 
 /** Packages already reported as pinned -- one line each, not one per connect. */
@@ -1597,6 +1611,9 @@ function notePinnedSidecar(pkg: string, version: string | null, source: PinSourc
       // rather than something to run in whatever cwd the user happens to be.
       from,
       refreshWith: REFRESH_COMMAND[source](pkg),
+      // Only npx-cache has one today; JSON.stringify drops the field entirely
+      // for the sources that do not, rather than printing "undefined".
+      refreshNote: REFRESH_NOTE[source],
     },
   );
 }

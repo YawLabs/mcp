@@ -81,7 +81,7 @@ import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-c
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, type DownstreamClientBridge, disconnectFromUpstream } from "./upstream.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
-import { ensureUv } from "./uv-bootstrap.js";
+import { ensureUv, uvLaunchKind } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
 
@@ -916,37 +916,58 @@ export class ConnectServer {
     // awaits the same in-flight promise rather than triggering a
     // second download. This moves the 2–10s first-run cost off the
     // activation path (where it could collide with CONNECT_TIMEOUT)
-    // and onto startup, where it's expected.
-    if (this.config?.servers.some((s) => s.command === "uv" || s.command === "uvx")) {
+    // and onto startup, where it's expected. The gate is uvLaunchKind --
+    // the SAME predicate resolveUvSpawn bootstraps against -- so
+    // `uvx.exe` / `UV.CMD` configs prewarm too; an exact-string match
+    // here silently pushed those back onto the activation path.
+    if (this.config?.servers.some((s) => s.command !== undefined && uvLaunchKind(s.command) !== null)) {
       ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
     }
 
     const transport = new StdioServerTransport();
-    await this.server.connect(transport);
 
-    // Dormant servers (isActive but no persisted toolCache yet) are
-    // invisible in tools/list because getDeferredServers() filters on
-    // toolCache presence. That breaks the "I toggled it on in the
-    // bundles.json and it disappeared" user experience. Pre-warm each one
-    // in the background: activate → populate the in-memory toolCache
-    // → disconnect so we're not holding 9 upstream processes idle.
-    // Fire-and-forget so this doesn't gate transport readiness.
-    this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
+    // Both startup activation paths -- pre-warm and the opt-in auto-load --
+    // wait for the downstream client's initialize handshake to complete.
+    // Protocol.connect() below only starts the transport; the SDK records
+    // the client's declared capabilities in _oninitialize and fires
+    // `oninitialized` on the client's notifications/initialized. Upstream
+    // connects mirror that capability snapshot at Client construction
+    // (upstream.ts reads bridge.getClientCapabilities() once), so an
+    // upstream spawned before initialize deterministically mirrors EMPTY
+    // capabilities -- and when an explicit activate later joins a prewarm
+    // inflight and keeps that connection alive, elicitation/sampling/roots
+    // forwarding is silently dead for the connection's whole lifetime.
+    // A client that never initializes never triggers either path: with no
+    // downstream there is nothing to serve. Registered BEFORE connect so
+    // a fast client can't complete the handshake into a missing callback.
+    this.server.oninitialized = () => {
+      // Dormant servers (isActive but no persisted toolCache yet) are
+      // invisible in tools/list because getDeferredServers() filters on
+      // toolCache presence. That breaks the "I toggled it on in the
+      // bundles.json and it disappeared" user experience. Pre-warm each one
+      // in the background: activate → populate the in-memory toolCache
+      // → disconnect so we're not holding 9 upstream processes idle.
+      // Fire-and-forget so this doesn't gate the handshake response.
+      this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
+
+      // Opt-in auto-load of the top recurring pack. Requires persistence
+      // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
+      // alongside prewarm so both paths see the same config snapshot;
+      // they're independent (prewarm populates toolCache for newly-enabled
+      // servers, this one spins up the recurring workflow's servers for
+      // real). Fire-and-forget — the handshake shouldn't block on it.
+      if (isAutoLoadEnabled() && this.persistenceReady) {
+        this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
+      }
+    };
+    await this.server.connect(transport);
 
     // Self-upgrade check: if this install is stale, upgrade it in the
     // background so the next client restart runs the latest version.
     // Fire-and-forget -- never awaited, never gates transport readiness.
+    // Not handshake-gated: it spawns no upstream, so the capability
+    // snapshot is irrelevant to it.
     maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
-
-    // Opt-in auto-load of the top recurring pack. Requires persistence
-    // (so there IS a history to learn from) AND YAW_MCP_AUTO_LOAD=1. Runs
-    // after prewarm so both paths see the same config snapshot; they're
-    // independent (prewarm populates toolCache for newly-enabled
-    // servers, this one spins up the recurring workflow's servers for
-    // real). Fire-and-forget — startup shouldn't block on it.
-    if (isAutoLoadEnabled() && this.persistenceReady) {
-      this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
-    }
 
     log("info", "yaw-mcp started", {
       servers: this.config?.servers.length ?? 0,
@@ -1033,8 +1054,17 @@ export class ConnectServer {
   // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
   // re-learned weekly instead of only at the 30-day persistence expiry.
   private async prewarmDormantServers(): Promise<void> {
+    // An already-connected namespace is never dormant, even when its
+    // learned cache is past the refresh window: runActivateOne stamps a
+    // fresh learnedAt on every real activation, and the connections here
+    // (auto-loaded pack members, early explicit activates) are ones
+    // prewarm didn't create and must not tear down. The isChanged gate
+    // in the batch below covers the race where a namespace connects
+    // between this snapshot and its activation turn.
     const dormant = this.getProfiledActiveServers().filter(
-      (s) => !this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace),
+      (s) =>
+        this.connections.get(s.namespace)?.status !== "connected" &&
+        (!this.hasKnownTools(s) || this.isLearnedCacheStale(s.namespace)),
     );
     if (dormant.length === 0) return;
 
@@ -1052,6 +1082,16 @@ export class ConnectServer {
           try {
             const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) return;
+            // isChanged:false means runActivateOne's already-connected
+            // early return fired -- someone else (an earlier batch's claimed
+            // activate, auto-load, a client call) connected this namespace
+            // after the dormant snapshot. Prewarm spawned nothing, so it
+            // owns nothing to tear down; disconnecting here would kill a
+            // LIVE connection. Drop the prewarm claim and leave it alone.
+            if (!result.isChanged) {
+              this.prewarmNamespaces.delete(server.namespace);
+              return;
+            }
             // Only disconnect if no explicit activate claimed this namespace
             // while the inflight promise was in flight. If an explicit activate
             // joined our shared promise, prewarmNamespaces will no longer
@@ -1560,9 +1600,26 @@ export class ConnectServer {
 
     if (!topWinsDecisively || !top) return this.handleDiscover(context);
 
-    // Already active — nothing to warm. Surface that fact in the output.
+    // Already connected -- nothing to SPAWN, but under gateway exposure
+    // "connected" is not "advertised": an auto-loaded or prewarm-claimed
+    // winner the client never asked for is still invisible in tools/list.
+    // The pick is intent-driven (the client's context chose it), so record
+    // it like the freshly-warmed path below, notify if that grew the
+    // advertised set, and name it in the banner -- otherwise the one-shot
+    // discover(context) promise breaks exactly when the server was already
+    // warm, and this branch stays asymmetric with dispatch's handling of
+    // an already-connected winner.
     const existing = this.connections.get(top.namespace);
-    if (existing && existing.status === "connected") return this.handleDiscover(context);
+    if (existing && existing.status === "connected") {
+      const grew = !this.sessionActivated.has(top.namespace);
+      this.sessionActivated.add(top.namespace);
+      if (grew) {
+        // Routes are current (whoever connected it rebuilt them); only the
+        // tools/list surface moved.
+        await this.notifyAllListsChanged();
+      }
+      return this.buildDiscoverOutput(context, top.namespace);
+    }
 
     progress?.(`Auto-warming top candidate "${top.namespace}"`);
     const result = await this.activateOne(top.namespace, progress);
@@ -2392,6 +2449,12 @@ export class ConnectServer {
     let anyChanged = false;
     let anyError = false;
     let anyCapped = false;
+    // Did sessionActivated actually GROW? A winner can succeed without a
+    // connection change (isChanged:false -- e.g. auto-loaded pack member the
+    // client is now asking for by name). Under gateway exposure that still
+    // moves the tools/list surface, so the anyChanged-gated notify below is
+    // not enough on its own.
+    let advertisedGrew = false;
 
     // NB: no compliance pre-check here. The YAW_MCP_MIN_COMPLIANCE floor is
     // enforced once, inside runActivateOne, so every activation path shares
@@ -2417,7 +2480,10 @@ export class ConnectServer {
       // the client having chosen the server, so surfacing the whole
       // namespace off them would grow the tool list as a side effect of
       // one call. Recorded on success only.
-      if (r.ok) this.sessionActivated.add(namespace);
+      if (r.ok) {
+        if (!this.sessionActivated.has(namespace)) advertisedGrew = true;
+        this.sessionActivated.add(namespace);
+      }
       // Cap refusals are tracked separately: alongside successes they are
       // informational (the per-namespace message says what to unload), but
       // when NOTHING loads the call did no work and must signal an error.
@@ -2448,10 +2514,14 @@ export class ConnectServer {
 
     if (anyChanged) {
       await this.refreshRoutesAndNotify();
-    } else if (filtersChanged) {
-      // Filter changed on an already-connected server — routes are
-      // unchanged (dispatch still reaches hidden tools) but the
-      // tools/list surface moved, so notify the client to re-list.
+    } else if (filtersChanged || advertisedGrew) {
+      // Filter changed, or the advertised set grew, on an already-connected
+      // server -- routes are unchanged (whoever connected it rebuilt them,
+      // and dispatch still reaches hidden tools) but the tools/list surface
+      // moved, so notify the client to re-list. Without the advertisedGrew
+      // arm, a gateway-exposure client that activates an auto-loaded-but-
+      // never-advertised namespace is told the tools are "now callable"
+      // while its tools/list never learns they exist.
       await this.notifyAllListsChanged();
     }
 
@@ -2634,6 +2704,11 @@ export class ConnectServer {
     let anyChanged = false;
     let anyError = false;
     let anyCapped = false;
+    // Same growth tracking as handleActivate: an already-connected winner
+    // (isChanged:false) can still be newly advertised, and the notify below
+    // must fire for that too or the "now callable" tools stay invisible to
+    // a list_changed-driven gateway client.
+    let advertisedGrew = false;
 
     let i = 0;
     for (const winner of winners) {
@@ -2650,7 +2725,10 @@ export class ConnectServer {
       // gateway exposure and the loaded tools stay invisible to any client
       // that can only invoke advertised tools. Recorded on success only,
       // mirroring handleActivate.
-      if (r.ok) this.sessionActivated.add(winner.namespace);
+      if (r.ok) {
+        if (!this.sessionActivated.has(winner.namespace)) advertisedGrew = true;
+        this.sessionActivated.add(winner.namespace);
+      }
       // Cap refusals are expected when the budget exceeds the concurrent
       // server cap -- informational alongside successes, but if NOTHING
       // loaded the dispatch did no work and must signal (same rule as
@@ -2671,6 +2749,11 @@ export class ConnectServer {
 
     if (anyChanged) {
       await this.refreshRoutesAndNotify();
+    } else if (advertisedGrew) {
+      // Advertised set grew without a connection change (winner already
+      // connected but never advertised) -- routes are current, but the
+      // tools/list surface moved. Mirrors handleActivate.
+      await this.notifyAllListsChanged();
     }
 
     const header = `Dispatched "${trimmed}" — loaded top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;

@@ -79,6 +79,9 @@ describe("pinned-sidecar notice at debug level", () => {
     expect(note?.level).toBe("debug");
     expect(note?.source).toBe("managed");
     expect(note?.refreshWith).toBe("yaw-mcp sidecars install");
+    // No Ctrl-C note: `sidecars install` exits on its own; the note is
+    // npx-cache-only.
+    expect(note !== undefined && "refreshNote" in note).toBe(false);
     expect(note?.version).toBe("0.3.0");
     expect(note?.from).toBe(managed);
   });
