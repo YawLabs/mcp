@@ -17,7 +17,9 @@
 // for why the two differ. --force skips only the confirmation, never the
 // passphrase.
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { type AuditEvent, readAuditLog } from "./secrets-audit.js";
 import {
@@ -289,6 +291,81 @@ async function safeLoadVault(
     else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
     return { ok: false, result: { exitCode: 1 } };
   }
+}
+
+/** "The vault file exists but could not be read", for the fingerprint
+ *  guard below. A branded object (never a hex digest, never the null that
+ *  means "file absent") carrying the read error so the refusal can name
+ *  the real errno the way get/list do via loadVault. An unreadable file at
+ *  either end of the comparison must read as CHANGED (refuse to save),
+ *  never as a match. */
+interface VaultUnreadable {
+  readonly unreadable: true;
+  readonly error: NodeJS.ErrnoException;
+}
+type VaultFingerprint = string | null | VaultUnreadable;
+
+function isVaultUnreadable(fp: VaultFingerprint): fp is VaultUnreadable {
+  return typeof fp === "object" && fp !== null && fp.unreadable === true;
+}
+
+/** sha256 of the vault file's current bytes; null when the file does not
+ *  exist. Same role as trust-cmd's re-read-before-grant hash. */
+async function vaultFingerprint(path: string): Promise<VaultFingerprint> {
+  try {
+    return createHash("sha256")
+      .update(await readFile(path))
+      .digest("hex");
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return e.code === "ENOENT" ? null : { unreadable: true, error: e };
+  }
+}
+
+/** True when the vault on disk no longer matches the bytes the command
+ *  loaded. Every mutating secrets action blocks on unbounded interactive
+ *  pauses (confirmations, passphrase and value prompts) between its load
+ *  and its save; without this check, a concurrent `secrets set` in
+ *  another terminal -- or a `rotate` the user was just told succeeded --
+ *  was silently reverted by the stale in-memory snapshot. Mirrors
+ *  trust-cmd's "a prompt is an unbounded pause" re-read-and-refuse. */
+async function vaultChangedSinceLoad(path: string, baseline: VaultFingerprint): Promise<boolean> {
+  const now = await vaultFingerprint(path);
+  if (isVaultUnreadable(now) || isVaultUnreadable(baseline)) return true;
+  return now !== baseline;
+}
+
+/** Refusal for a vault file that exists but could not be read for the
+ *  baseline fingerprint. Emitted BEFORE any prompt: the pre-save re-check
+ *  treats an unreadable baseline as "changed", so continuing would only
+ *  collect the user's input and then refuse with the wrong reason. Names
+ *  the errno so set/remove/rotate report the same cause get/list surface
+ *  through loadVault for the identical on-disk state. */
+function vaultUnreadableResult(
+  io: { out: (s: string) => void; err: (s: string) => void },
+  json: boolean | undefined,
+  action: string,
+  path: string,
+  fp: VaultUnreadable,
+): SecretsCommandResult {
+  const cause = fp.error.code ?? fp.error.message;
+  const msg = `could not read the vault file at ${path} (${cause}) -- fix that and re-run. Nothing was written.`;
+  if (json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+  else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
+  return { exitCode: 1 };
+}
+
+/** Standard refusal for a vault that changed under a prompt. */
+function vaultChangedResult(
+  io: { out: (s: string) => void; err: (s: string) => void },
+  json: boolean | undefined,
+  action: string,
+): SecretsCommandResult {
+  const msg =
+    "the vault changed on disk while this command was waiting for input -- nothing was written. Re-run to work from the current vault.";
+  if (json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+  else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
+  return { exitCode: 1 };
 }
 
 /** Render an unlock() failure for the user.
@@ -706,6 +783,20 @@ export async function runSecrets(
   // One load for every remaining action -- the get/remove existence check
   // below and the mutate path share it (reading the file twice raced with
   // itself and doubled the I/O for no benefit).
+  // Fingerprint the on-disk bytes BEFORE the load, not after: the mutating
+  // actions re-check it immediately before their save and refuse if the
+  // file moved (vaultChangedSinceLoad), and taking the baseline second
+  // would open a load-to-baseline gap where a concurrent writer's bytes
+  // become the baseline while the in-memory vault is the older parse --
+  // the re-check would then pass and silently revert that write. In the
+  // baseline-first order a write landing between the two reads makes the
+  // re-check FAIL (refusal), the safe direction. get never saves, so it
+  // skips the extra read.
+  const baseline = opts.action === "get" ? null : await vaultFingerprint(path);
+  // An unreadable baseline dooms every save (the re-check can never match),
+  // so fail NOW with the real cause rather than after the confirmation,
+  // scrypt derivation and value prompt with a misleading "changed on disk".
+  if (isVaultUnreadable(baseline)) return vaultUnreadableResult(io, opts.json, opts.action ?? "", path, baseline);
   const loaded = await safeLoadVault(path, io, opts.json, opts.action ?? "");
   if (!loaded.ok) return loaded.result;
 
@@ -836,6 +927,7 @@ export async function runSecrets(
       else io.err(`yaw-mcp secrets set: ${msg}\n`);
       return { exitCode: 1 };
     }
+    if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "set");
     // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
     await saveVault(path, vault);
     // "Replaced" vs "Stored" is the only signal a scripted run gets that it
@@ -890,6 +982,7 @@ export async function runSecrets(
     const name = opts.name as string;
     // Existence was proven by the short-circuit above (the single owner of
     // the not-found message), so removeSecret always has something to drop.
+    if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "remove");
     vault = removeSecret(vault, name);
     await saveVault(path, vault);
     if (opts.json) io.out(`${JSON.stringify({ ok: true, removed: name })}\n`);
@@ -926,6 +1019,16 @@ async function runSecretsRotate(
   // safeLoadVault, not raw loadVault: a corrupt vault must come back as the
   // same {ok:false} envelope the sibling actions emit (and stay JSON under
   // --json) instead of escaping as a rejection the dispatcher formats.
+  // Same pre-load fingerprint as runSecrets (baseline BEFORE the load so a
+  // write straddling the two reads fails the re-check instead of slipping
+  // under it): both passphrase prompts below are unbounded pauses, and
+  // saving a rotation derived from a stale snapshot would revert whatever
+  // landed in the meantime (or, the mirror image, a concurrent `set`
+  // would revert this rotation).
+  const baseline = await vaultFingerprint(path);
+  // Same fail-fast as runSecrets: an unreadable baseline can never pass the
+  // pre-save re-check, so refuse before either passphrase prompt.
+  if (isVaultUnreadable(baseline)) return vaultUnreadableResult(io, opts.json, "rotate", path, baseline);
   const loaded = await safeLoadVault(path, io, opts.json, "rotate");
   if (!loaded.ok) return loaded.result;
   const vault = loaded.vault;
@@ -982,6 +1085,13 @@ async function runSecretsRotate(
     return { exitCode: 1 };
   }
 
+  if (await vaultChangedSinceLoad(path, baseline)) {
+    // Drop the cached key: it was derived against the snapshot we just
+    // refused to overwrite, and the file that replaced it may carry a
+    // different salt.
+    lock();
+    return vaultChangedResult(io, opts.json, "rotate");
+  }
   await saveVault(path, rotated);
   // Drop the stale key derived from the OLD passphrase. The salt changed,
   // so the next secrets command must re-derive against the new passphrase.

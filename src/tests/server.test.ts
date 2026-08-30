@@ -14,7 +14,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 });
 
 import { CONFIG_DIRNAME } from "../paths.js";
-import { buildToolList, buildToolRoutes } from "../proxy.js";
+import { buildToolList, buildToolRoutes, isRoutingFaultResult } from "../proxy.js";
 import {
   ConnectServer,
   computeToolOverlaps,
@@ -2050,6 +2050,9 @@ describe("ConnectServer", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("auto-reconnect failed");
       expect(result.content[0].text).toContain("still down");
+      // The structural brand is what keeps this fault out of the health /
+      // learning booking -- pin it on the REAL result, not a typed string.
+      expect(isRoutingFaultResult(result)).toBe(true);
     });
 
     it("returns error for unknown tools", async () => {
@@ -2067,10 +2070,12 @@ describe("ConnectServer", () => {
       // real strings, not the constants alone.
       const priv = getPrivate(server);
 
-      // 1. Unknown tool (proxy.ts).
+      // 1. Unknown tool (proxy.ts). Both the pinned text AND the
+      // structural brand (the authoritative booking signal) must hold.
       const unknown = await priv.handleToolCall("nonexistent_tool", {});
       expect(unknown.content[0].text).toContain(ROUTING_FAULT_UNKNOWN_TOOL);
       expect(isRoutingFaultText(unknown.content[0].text)).toBe(true);
+      expect(isRoutingFaultResult(unknown)).toBe(true);
 
       // 2. Route survives but the connection is gone (proxy.ts).
       priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
@@ -2080,14 +2085,217 @@ describe("ConnectServer", () => {
       const gone = await priv.handleToolCall("gh_create_issue", {});
       expect(gone.content[0].text).toContain(ROUTING_FAULT_DISCONNECTED);
       expect(isRoutingFaultText(gone.content[0].text)).toBe(true);
+      expect(isRoutingFaultResult(gone)).toBe(true);
 
       // 3. Auto-reconnect exhausted (server.ts) -- covered by the
       // "returns error when auto-reconnect fails" case above; assert the
       // marker predicate agrees with the phrasing it asserts.
       expect(isRoutingFaultText('Server "gh" disconnected and auto-reconnect failed: still down.')).toBe(true);
 
+      // 4. Deferred first-call load failure (server.ts). An activation
+      // result, which is deliberately never a learning signal -- without
+      // this marker, an exec step landing on a deferred route whose load
+      // fails (including a server-cap or compliance refusal) was booked
+      // as a 0.0 outcome against a server that never got to run.
+      expect(isRoutingFaultText('Server "gh" could not be loaded on first call: spawn failed.')).toBe(true);
+
       // Negative control: a genuine upstream failure is NOT a routing fault.
       expect(isRoutingFaultText("GITHUB_TOKEN is invalid")).toBe(false);
+    });
+
+    it("a routing-fault error on the direct path books no learning outcome or redispatch reply", async () => {
+      // Reproduce the reaper/prewarm teardown window: the route snapshot
+      // still resolves but the connection is gone, so routeToolCall
+      // returns the ROUTING_FAULT_DISCONNECTED text. That is yaw-mcp's
+      // own fault -- booking it as a 0.0 outcome (the old behavior) sank
+      // a healthy server's reliability for a fault the ROUTING_FAULT_*
+      // comment promises is never counted against it.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+      priv.rebuildRoutes();
+      priv.connections.delete("gh");
+      const markReply = vi.spyOn(priv.redispatch, "markReply");
+      const markUse = vi.spyOn(priv.redispatch, "markUse");
+      const result = await priv.handleToolCall("gh_create_issue", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain(ROUTING_FAULT_DISCONNECTED);
+      expect(priv.learning.get("gh")).toBeUndefined();
+      expect(markReply).not.toHaveBeenCalled();
+      // Not graded, but still USAGE: markUse keeps a graded-clean record
+      // from freezing into a detectMiss "loser" over yaw-mcp's own fault.
+      expect(markUse).toHaveBeenCalledWith("gh");
+    });
+
+    it("a routing fault on a still-registered connection is a health NON-observation", async () => {
+      // The connection is still in the map (status "error") but its config
+      // entry is gone, so the reconnect branch is skipped and routeToolCall
+      // returns the branded DISCONNECTED fault while connForHealth is
+      // non-null. The fault must book NOTHING on health: not an error (the
+      // original bug), and not a call either -- a call-without-error is a
+      // success-shaped observation that dilutes a flaky server's error
+      // rate and drags its latency toward 0ms.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"], "error");
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      priv.config = makeConfig([]);
+      const result = await priv.handleToolCall("gh_create_issue", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain(ROUTING_FAULT_DISCONNECTED);
+      expect(isRoutingFaultResult(result)).toBe(true);
+      expect(conn.health.totalCalls).toBe(0);
+      expect(conn.health.errorCount).toBe(0);
+      expect(conn.health.totalLatencyMs).toBe(0);
+      expect(conn.health.lastErrorMessage).toBeUndefined();
+    });
+
+    it("tool-gone-after-activation carries the routing-fault brand", async () => {
+      // A deferred route for a tool the (already-connected) upstream no
+      // longer exposes: activation is a no-op, the rebuild drops the stale
+      // route, and the TOOL_GONE fault is emitted. It is yaw-mcp's stale
+      // cache, not the upstream's failure -- brand + no booking.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      const conn = makeConnection("gh", ["create_issue"]);
+      priv.connections.set("gh", conn);
+      priv.toolRoutes = new Map([
+        ["gh_renamed_tool", { namespace: "gh", originalName: "renamed_tool", deferred: true }],
+      ]);
+      const result = await priv.handleToolCall("gh_renamed_tool", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("no longer available");
+      // Only the brand is asserted here: this fault returns BEFORE the
+      // direct-path booking block, so "no booking" is vacuous on the direct
+      // path. Where the brand is load-bearing for an early-return fault is
+      // exec's step attribution -- see the two exec tests below.
+      expect(isRoutingFaultResult(result)).toBe(true);
+    });
+
+    it("exec step attribution skips a branded early-return fault (tool gone after activation)", async () => {
+      // handleExec books its OWN outcome per step after handleToolCall
+      // returns, so an early-return fault that never reaches the direct-path
+      // booking block IS booked here unless the brand says otherwise. This
+      // test fails only if the exec brand check is DROPPED outright -- every
+      // branded fault's text also carries a marker phrase, so a revert to
+      // the old text sniff ALSO skips booking here and passes. The
+      // text-sniff revert is caught by the next test (an upstream error
+      // that merely CONTAINS a marker phrase must still book); the two
+      // tests are a pair and both must stay.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      const conn = makeConnection("gh", ["create_issue"]);
+      priv.connections.set("gh", conn);
+      priv.toolRoutes = new Map([
+        ["gh_renamed_tool", { namespace: "gh", originalName: "renamed_tool", deferred: true }],
+      ]);
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [{ id: "a", tool: "gh_renamed_tool", args: {} }],
+      });
+      expect(result.isError).toBe(true);
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.failedStep).toBe("a");
+      expect(parsed.error).toContain("no longer available");
+      expect(priv.learning.get("gh")).toBeUndefined();
+    });
+
+    it("tool-gone-after-RECONNECT carries the routing-fault brand", async () => {
+      // The fifth emitter: auto-reconnect SUCCEEDS but the fresh upstream
+      // no longer exposes the requested tool ("no longer available after
+      // reconnecting"). Removing brandRoutingFault from that emitter left
+      // the whole suite green -- this pins it on the real result.
+      const priv = getPrivate(server);
+      const errorConn = makeConnection("gh", ["create_issue"], "error");
+      priv.connections.set("gh", errorConn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["other_tool"]));
+      const result = await priv.handleToolCall("gh_create_issue", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("after reconnecting");
+      expect(isRoutingFaultResult(result)).toBe(true);
+      expect(priv.learning.get("gh")).toBeUndefined();
+    });
+
+    it("exec step attribution still books an upstream error that merely CONTAINS a marker phrase", async () => {
+      // The exec counterpart of the direct-path brand test: a genuine
+      // upstream error whose text includes "no longer available" carries no
+      // brand, so the step is the server's own failure and books 0.0.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["get_resource"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "This resource is no longer available (deleted by owner)." }],
+        isError: true,
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [{ id: "a", tool: "gh_get_resource", args: {} }],
+      });
+      expect(result.isError).toBe(true);
+      expect(priv.learning.get("gh")).toMatchObject({ dispatched: 1, succeeded: 0 });
+    });
+
+    it("an upstream error that merely CONTAINS a marker phrase is still booked (brand, not text)", async () => {
+      // The routing-fault guard is structural: only results yaw-mcp's own
+      // routing layer constructed carry the brand. A genuine upstream
+      // error whose text happens to include "no longer available" must
+      // still count against the upstream's health and learning -- a text
+      // sniff here would let real failures accumulate invisibly.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["get_resource"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "This resource is no longer available (deleted by owner)." }],
+        isError: true,
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      const markReply = vi.spyOn(priv.redispatch, "markReply");
+      const result = await priv.handleToolCall("gh_get_resource", {});
+      expect(result.isError).toBe(true);
+      expect(isRoutingFaultResult(result)).toBe(false);
+      expect(priv.learning.get("gh")).toMatchObject({ dispatched: 1, succeeded: 0 });
+      expect(conn.health.errorCount).toBe(1);
+      expect(markReply).toHaveBeenCalledWith("gh", false);
+    });
+
+    it('exportToolCache preserves a "__proto__" namespace as an own key', () => {
+      // sanitizeToolCache/hydrateToolCache preserve a "__proto__" toolCache
+      // namespace on load; the export side must not undo that one flush
+      // later via the inherited setter (same shape as learning's
+      // exportSnapshot hardening).
+      const priv = getPrivate(server);
+      priv.toolCache.set("__proto__", [{ name: "t", namespacedName: "__proto___t", inputSchema: {} }]);
+      priv.toolCacheLearnedAt.set("__proto__", 123);
+      const out = priv.exportToolCache();
+      expect(Object.hasOwn(out, "__proto__")).toBe(true);
+      const roundTripped = JSON.parse(JSON.stringify(out));
+      expect(Object.getOwnPropertyDescriptor(roundTripped, "__proto__")?.value.learnedAt).toBe(123);
+    });
+
+    it("exec steps mark redispatch replies on the dispatched namespace", async () => {
+      // markReply must run OUTSIDE the deferLearning guard: exec steps are
+      // real usage even though their learning credit is attributed per
+      // step by handleExec. When they were skipped, a direct-call-then-
+      // exec sequence left the namespace's dispatch record frozen as
+      // cleanReply-without-furtherUse, and detectMiss flagged the server
+      // as an abandoned "loser" on the next similar dispatch.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "created #1" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      const markReply = vi.spyOn(priv.redispatch, "markReply");
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [{ id: "a", tool: "gh_create_issue", args: {} }],
+      });
+      expect(result.isError).toBeFalsy();
+      expect(markReply).toHaveBeenCalledWith("gh", true);
     });
 
     it("auto-activates a deferred upstream on first tools/call and re-dispatches", async () => {
@@ -2128,6 +2336,10 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("gh_create_issue", {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("could not be loaded");
+      // Activation is never a learning signal: the deferred-load failure
+      // must carry the routing-fault brand so exec's step attribution and
+      // the direct-path booking both skip it.
+      expect(isRoutingFaultResult(result)).toBe(true);
     });
 
     it("records successful proxied calls into the pack detector", async () => {

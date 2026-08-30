@@ -22,6 +22,39 @@ describe("RedispatchTracker", () => {
     expect(miss).toEqual({ loser: "github" });
   });
 
+  it("markUse after a graded reply protects the record from detectMiss (routing-fault path)", () => {
+    // handleToolCall calls markUse instead of markReply when the reply is
+    // yaw-mcp's own routing fault: the fault must not GRADE the record,
+    // but it is evidence the model kept using the server. Before markUse
+    // existed, skipping the tracker on faults left this record frozen as
+    // cleanReply-without-furtherUse and detectMiss booked a recordMiss
+    // penalty for yaw-mcp's own teardown fault.
+    const t = new RedispatchTracker();
+    t.push("github", tokenize(INTENT_A), 1000);
+    t.markReply("github", true); // graded clean reply
+    t.markUse("github"); // routing fault on the next call -> still usage
+    const miss = t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude);
+    expect(miss).toBeNull();
+  });
+
+  it("markUse on an un-replied record leaves it gradable by a later clean retry", () => {
+    // A fault as the FIRST reply says nothing about the server, so markUse
+    // must not set replied/cleanReply -- the later clean retry grades the
+    // record, and a subsequent abandonment can still be detected.
+    const t = new RedispatchTracker();
+    t.push("github", tokenize(INTENT_A), 1000);
+    t.markUse("github"); // routing fault before any graded reply
+    t.markReply("github", true); // clean retry grades the record...
+    const miss = t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude);
+    expect(miss).toEqual({ loser: "github" }); // ...and abandonment still detects
+  });
+
+  it("markUse on an unknown namespace is a no-op", () => {
+    const t = new RedispatchTracker();
+    t.markUse("never-dispatched");
+    expect(t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude)).toBeNull();
+  });
+
   it("returns null when the new intent is dissimilar", () => {
     const t = new RedispatchTracker();
     t.push("github", tokenize(INTENT_A), 1000);

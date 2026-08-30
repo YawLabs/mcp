@@ -34,6 +34,7 @@ import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
 import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
 import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
+import { setJsonKey } from "./json-key.js";
 import { LearningStore } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
@@ -43,12 +44,14 @@ import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveSta
 import { createProgressReporter, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
+  brandRoutingFault,
   buildPromptList,
   buildPromptRoutes,
   buildResourceList,
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  isRoutingFaultResult,
   type PromptRoute,
   type ResourceRoute,
   routePromptGet,
@@ -181,23 +184,35 @@ export function isAutoActivateEnabled(): boolean {
 }
 
 // Marker phrases that identify an INTERNAL routing/cache fault rather than
-// a genuine upstream failure. handleExec substring-matches an errored
-// step's text against these to decide whether to sink the namespace's
-// reliability score, so the phrases MUST stay byte-identical between the
-// message that produces them and the check that reads them -- hence the
-// shared constants instead of two copies of a string literal.
-// TOOL_GONE / RECONNECT_FAILED are emitted by handleToolCall below;
-// DISCONNECTED / UNKNOWN_TOOL are emitted by routeToolCall in proxy.ts
+// a genuine upstream failure. The AUTHORITATIVE signal is the structural
+// brand every emitter attaches via brandRoutingFault (proxy.ts) -- the
+// health/learning/redispatch booking in handleToolCall and handleExec's
+// step attribution check isRoutingFaultResult, never the text, because
+// these phrases are generic English an upstream error can legitimately
+// contain ("This resource is no longer available"), and such an error must
+// still count against the upstream. The text constants remain the pinned
+// user-facing message shapes (shared constants so the messages and the
+// isRoutingFaultText predicate cannot drift), and isRoutingFaultText stays
+// exported for callers that only have text in hand.
+// TOOL_GONE / RECONNECT_FAILED / LOAD_FAILED are emitted by handleToolCall
+// below; DISCONNECTED / UNKNOWN_TOOL by routeToolCall in proxy.ts
 // (see the guard test in tests/server.test.ts that pins those two).
 export const ROUTING_FAULT_TOOL_GONE = "no longer available";
 export const ROUTING_FAULT_DISCONNECTED = "no longer connected";
 export const ROUTING_FAULT_RECONNECT_FAILED = "auto-reconnect failed";
 export const ROUTING_FAULT_UNKNOWN_TOOL = "Unknown tool:";
+// A deferred first-call activation that fails is an ACTIVATION result, and
+// activation is deliberately not a learning signal (see handleDispatch) --
+// without this marker, an exec step landing on a deferred route whose
+// load fails (including a server-cap or compliance refusal) was booked as
+// a 0.0 tool-call outcome against a server that never got to run.
+export const ROUTING_FAULT_LOAD_FAILED = "could not be loaded on first call";
 export const ROUTING_FAULT_MARKERS: readonly string[] = [
   ROUTING_FAULT_TOOL_GONE,
   ROUTING_FAULT_DISCONNECTED,
   ROUTING_FAULT_RECONNECT_FAILED,
   ROUTING_FAULT_UNKNOWN_TOOL,
+  ROUTING_FAULT_LOAD_FAILED,
 ];
 
 /** True when an error text came from yaw-mcp's own routing layer (stale
@@ -767,7 +782,14 @@ export class ConnectServer {
     const out: Record<string, PersistedToolCacheEntry> = {};
     for (const [namespace, tools] of this.toolCache) {
       if (tools.length === 0) continue;
-      out[namespace] = { tools, learnedAt: this.toolCacheLearnedAt.get(namespace) ?? Date.now() };
+      // setJsonKey, not out[namespace]: sanitizeToolCache preserves a
+      // "__proto__" namespace on LOAD (Object.fromEntries makes it an own
+      // property) and hydrateToolCache copies it into the Map; plain
+      // assignment here invoked the inherited setter on the next save, so
+      // the entry silently vanished from state.json -- the same
+      // load-side-hardening-undone-one-flush-later shape exportSnapshot
+      // (learning.ts) had.
+      setJsonKey(out, namespace, { tools, learnedAt: this.toolCacheLearnedAt.get(namespace) ?? Date.now() });
     }
     return out;
   }
@@ -837,7 +859,13 @@ export class ConnectServer {
         });
       }
       this.hydrateToolCache(persisted.toolCache);
-      this.persistenceReady = true;
+      // loadFailed means the state file exists but could not be READ (a
+      // transient handle error, not a missing or corrupt file). The empty
+      // snapshot we just hydrated is a stand-in, not the truth -- leaving
+      // persistenceReady false keeps scheduleStateSave and the shutdown
+      // flush from overwriting the real file with it. Session-local
+      // learning is lost for this run; that is the safe direction.
+      if (!persisted.loadFailed) this.persistenceReady = true;
     }
 
     // Load the effective config (allow/deny lists + the install-nudge flag)
@@ -1259,15 +1287,15 @@ export class ConnectServer {
       progress?.(`Loading "${deferredNs}" on first tools/call…`);
       const activation = await this.activateOne(deferredNs, progress);
       if (!activation.ok) {
-        return {
+        return brandRoutingFault({
           content: [
             {
               type: "text",
-              text: `Server "${deferredNs}" could not be loaded on first call: ${activation.message}`,
+              text: `Server "${deferredNs}" ${ROUTING_FAULT_LOAD_FAILED}: ${activation.message}`,
             },
           ],
           isError: true,
-        };
+        });
       }
       // Rebuild unconditionally on a successful activation, NOT only when
       // isChanged. We got here holding a `deferred` route, so toolRoutes is
@@ -1283,7 +1311,7 @@ export class ConnectServer {
       routes = this.toolRoutes;
       route = routes.get(name);
       if (!route || route.deferred) {
-        return {
+        return brandRoutingFault({
           content: [
             {
               type: "text",
@@ -1291,7 +1319,7 @@ export class ConnectServer {
             },
           ],
           isError: true,
-        };
+        });
       }
     }
 
@@ -1345,7 +1373,7 @@ export class ConnectServer {
               routes = this.toolRoutes;
               route = routes.get(name);
               if (!route || route.deferred) {
-                return {
+                return brandRoutingFault({
                   content: [
                     {
                       type: "text",
@@ -1353,7 +1381,7 @@ export class ConnectServer {
                     },
                   ],
                   isError: true,
-                };
+                });
               }
               break;
             } catch (err) {
@@ -1370,7 +1398,7 @@ export class ConnectServer {
             conn.status = "error";
             const lastErrMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
             log("error", "Auto-reconnect failed", { namespace: ns, error: lastErrMsg });
-            return {
+            return brandRoutingFault({
               content: [
                 {
                   type: "text",
@@ -1378,7 +1406,7 @@ export class ConnectServer {
                 },
               ],
               isError: true,
-            };
+            });
           }
         }
       }
@@ -1414,7 +1442,27 @@ export class ConnectServer {
     const latencyMs = Date.now() - startMs;
 
     if (route) {
-      if (connForHealth) {
+      // yaw-mcp's own routing faults (stale toolCache, dropped connection,
+      // failed auto-reconnect, failed deferred load) say nothing about the
+      // upstream's reliability. Keep them out of the health error stats,
+      // the learning signal, the reward grader, and the graded redispatch
+      // reply below -- the same guard handleExec applies to its step
+      // attribution. Without this, any call landing in the window between
+      // disconnectFromUpstream and connections.delete (idle reaper, prewarm
+      // teardown) booked a 0.0 outcome against a healthy server for
+      // yaw-mcp's own fault -- exactly what the ROUTING_FAULT_* comment
+      // above promises does not happen. Checked STRUCTURALLY (the brand
+      // every fault emitter attaches), not by text: an upstream error that
+      // happens to contain a marker phrase must still be booked.
+      const routingFault = result.isError === true && isRoutingFaultResult(result);
+      // A routing fault is a NON-observation for health, not a success: it
+      // must skip totalCalls and totalLatencyMs as well as errorCount.
+      // Booking the call without the error would dilute a genuinely flaky
+      // server's error rate toward 0 (healthFactor is errorCount /
+      // totalCalls), push totalCalls past the observation floor with zero
+      // real upstream observations, and drag average latency toward the
+      // fault's near-0ms -- the opposite bias, not neutrality.
+      if (connForHealth && !routingFault) {
         connForHealth.health.totalCalls++;
         connForHealth.health.totalLatencyMs += latencyMs;
         if (result.isError) {
@@ -1453,7 +1501,7 @@ export class ConnectServer {
       // cross-session reliability block in handleHealth all read — activation
       // success is deliberately NOT counted here (see handleDispatch). Exec
       // steps defer it (opts.deferLearning) for step-level attribution.
-      if (!opts?.deferLearning) {
+      if (!opts?.deferLearning && !routingFault) {
         const reward = computeOutcomeReward(result);
         this.learning.recordOutcome(route.namespace, reward);
         this.scheduleStateSave();
@@ -1472,11 +1520,28 @@ export class ConnectServer {
             resultText: firstResultText(result),
           });
         }
-        // Re-dispatch routing-miss tracking: record whether the server the
-        // model most recently dispatched to produced a clean reply. An
-        // abandoned clean reply becomes a negative signal when a similar
-        // intent later re-routes elsewhere (detectMiss in handleDispatch).
+      }
+
+      // Re-dispatch routing-miss tracking: record whether the server the
+      // model most recently dispatched to produced a clean reply. An
+      // abandoned clean reply becomes a negative signal when a similar
+      // intent later re-routes elsewhere (detectMiss in handleDispatch).
+      // OUTSIDE the deferLearning guard, like packDetector below: exec
+      // steps are real USAGE of the namespace even though their learning
+      // credit is attributed per step by handleExec. Skipping them let
+      // detectMiss flag a server as an abandoned "loser" after a
+      // direct-call-then-exec sequence in which the model never left it.
+      if (!routingFault) {
         this.redispatch.markReply(route.namespace, !result.isError);
+      } else {
+        // A routing fault must not GRADE the record (it says nothing about
+        // the server), but it must still count as USAGE: before the guard,
+        // this fault called markReply(ns, false), whose second-reply path
+        // set furtherUse and protected a clean earlier record from
+        // detectMiss. Skipping the tracker entirely would leave that
+        // record frozen as cleanReply-without-furtherUse and let yaw-mcp's
+        // own teardown fault turn into a recordMiss penalty.
+        this.redispatch.markUse(route.namespace);
       }
 
       // Only count successful calls toward chain detection. An errored
@@ -3530,9 +3595,12 @@ export class ConnectServer {
       if (stepResult.isError) {
         const errText = stepResult.content?.[0]?.text ?? "unknown error";
         // Internal routing/cache faults (stale toolCache, dropped connection,
-        // failed auto-reconnect, unknown tool) are NOT the upstream's failure,
-        // so don't penalize the namespace's reliability for them.
-        const routingFault = isRoutingFaultText(errText);
+        // failed auto-reconnect, unknown tool, failed deferred load) are NOT
+        // the upstream's failure, so don't penalize the namespace's
+        // reliability for them. Checked structurally (the brand the fault
+        // emitters attach), not by text -- an upstream error that happens to
+        // contain a marker phrase must still count against the upstream.
+        const routingFault = isRoutingFaultResult(stepResult);
         if (stepNs && !routingFault) {
           // Invalid-params is recognized either by the transport-level code
           // tag ("[code=-32602]") OR by classifyError on a structured isError

@@ -128,6 +128,16 @@ export interface PersistedState {
   /** Learned tool lists keyed by namespace. Added in schema v2; absent in
    *  a v1 file, which reads as `{}`. */
   toolCache: Record<string, PersistedToolCacheEntry>;
+  /** Set by loadState when the file EXISTS but could not be READ (EACCES,
+   *  EBUSY, EISDIR, ...). The state on disk is presumed healthy, so the
+   *  caller must not save over it with the empty state returned alongside
+   *  this flag -- server.ts leaves persistenceReady false for the session.
+   *  Never set for ENOENT/ENOTDIR (no file to protect) or for a
+   *  parse/version failure (the file is genuinely unusable; overwriting it
+   *  with fresh state is the documented start-over behavior). Never
+   *  persisted: saveState builds its own object from the fields it is
+   *  handed. */
+  loadFailed?: boolean;
 }
 
 export function statePath(configDir: string = userConfigDir()): string {
@@ -142,8 +152,29 @@ export function emptyState(): PersistedState {
 // object — on any failure (missing file, bad JSON, version mismatch,
 // sanitization drops everything) we silently fall through to empty.
 export async function loadState(filePath: string = statePath()): Promise<PersistedState> {
+  let raw: string;
   try {
-    const raw = await readFile(filePath, "utf8");
+    raw = await readFile(filePath, "utf8");
+  } catch (err) {
+    // ENOENT: no file. ENOTDIR: a path component is a regular file, so the
+    // state file CANNOT exist either -- both mean "nothing to protect",
+    // start empty. Same split as grades-cache/config-loader.
+    if (isFileNotFound(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR") return emptyState();
+    // The file EXISTS but we could not read it -- a transient handle error
+    // (win32 AV/indexer EBUSY, EACCES) on a presumed-HEALTHY file. Flag it
+    // so the caller does not overwrite real learning/packHistory/toolCache
+    // with the empty state we are about to return: without the flag, one
+    // transient read error plus one debounced save silently wiped the file.
+    log(
+      "warn",
+      "Could not read yaw-mcp state file; state saves are disabled for this session so it is not overwritten",
+      {
+        error: errorMessage(err),
+      },
+    );
+    return { ...emptyState(), loadFailed: true };
+  }
+  try {
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing -- same strip
     // parseJsonc (jsonc.ts) does, for the same reason: Notepad on Windows
     // defaults to BOM-prefixed UTF-8, and JSON.parse rejects the BOM. This
@@ -164,7 +195,9 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
       toolCache: sanitizeToolCache(p.toolCache),
     };
   } catch (err) {
-    if (isFileNotFound(err)) return emptyState();
+    // Reached only for a parse failure -- read errors are handled above.
+    // The file is genuinely unusable, so starting fresh (and letting the
+    // next save replace it) is the intended behavior; no loadFailed flag.
     log("warn", "Failed to load yaw-mcp state, starting fresh", { error: errorMessage(err) });
     return emptyState();
   }

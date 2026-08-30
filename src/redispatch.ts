@@ -119,6 +119,26 @@ export class RedispatchTracker {
     }
   }
 
+  // A reply-shaped event that must NOT grade the record but must still
+  // count as continued use: yaw-mcp's own routing faults (see the
+  // ROUTING_FAULT_* markers in server.ts). A fault says nothing about the
+  // server's quality, so it must not set replied/cleanReply on a fresh
+  // record -- a later clean retry still gets to grade it -- but on a
+  // record that already has its graded reply, the fault IS evidence the
+  // model kept using the server, so flip furtherUse exactly the way a
+  // second markReply would. Without this, excluding faults from markReply
+  // left a clean record frozen as cleanReply-without-furtherUse, and
+  // detectMiss turned yaw-mcp's own teardown fault into a recordMiss
+  // penalty against a healthy server.
+  markUse(namespace: string): void {
+    for (let i = this.ring.length - 1; i >= 0; i--) {
+      const rec = this.ring[i];
+      if (rec.namespace !== namespace) continue;
+      if (rec.replied) rec.furtherUse = true;
+      return;
+    }
+  }
+
   // When a new dispatch (newNamespace) lands, look back over the recent ring
   // for an ABANDONED record (cleanReply && !furtherUse) on a DIFFERENT
   // namespace whose intent is SIMILAR to newTokens and within the time

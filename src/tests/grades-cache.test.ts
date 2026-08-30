@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -268,5 +268,42 @@ describe("suiteVersion round-trip", () => {
     const cache = await readGradesCache(synthHome);
     expect(cache.ctxlint).toEqual(VALID_ENTRY);
     expect(cache.ctxlint.suiteVersion).toBeUndefined();
+  });
+});
+
+describe("writeGrade -- read failures must not clobber the cache", () => {
+  it("rejects (and leaves the path alone) when grades.json exists but cannot be read", async () => {
+    // A DIRECTORY at the cache path makes readFile fail with EISDIR --
+    // standing in for the transient EACCES/EBUSY handle class. The old
+    // behavior treated ANY read failure as an empty cache and published a
+    // one-entry file, silently destroying every other cached grade. The
+    // strict read on the write path rethrows instead, which audit-cmd
+    // reports as grade-computed-but-cache-write-failed (exit 3).
+    const dirAtCachePath = gradesCachePath(synthHome);
+    mkdirSync(dirAtCachePath, { recursive: true });
+    await expect(writeGrade("gh", VALID_ENTRY, synthHome)).rejects.toThrow();
+    // Still a directory -- nothing was renamed over it.
+    expect(statSync(dirAtCachePath).isDirectory()).toBe(true);
+  });
+
+  it("still treats an absent file as an empty cache and creates it", async () => {
+    await writeGrade("gh", VALID_ENTRY, synthHome);
+    const parsed = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8"));
+    expect(parsed.gh.grade).toBe("A");
+  });
+});
+
+describe('writeGrade -- "__proto__" namespace', () => {
+  it("persists it as an own key instead of invoking the inherited setter", async () => {
+    // Mirrors the setJsonKey discipline the READ side already has: plain
+    // assignment of "__proto__" would drop the grade from the serialized
+    // file (JSON.stringify only sees own properties).
+    writeGradesFile(synthHome, JSON.stringify({ gh: VALID_ENTRY }));
+    await writeGrade("__proto__", VALID_ENTRY, synthHome);
+    const parsed = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8"));
+    expect(Object.hasOwn(parsed, "__proto__")).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(parsed, "__proto__")?.value.grade).toBe("A");
+    // The pre-existing entry survived the read-modify-write.
+    expect(parsed.gh).toEqual(VALID_ENTRY);
   });
 });

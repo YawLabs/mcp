@@ -82,7 +82,156 @@ describe("classifyError", () => {
       "TypeError: Cannot read properties of undefined (reading 'foo')",
       "upstream_error",
     ],
+    // Bare status-code tokens inside SUCCESSFUL reply text must NOT
+    // classify as errors: reward.ts runs classifyError over every proxied
+    // result, so a false positive here banks a healthy call at 0.2 credit
+    // and feeds the flaky list. The regexes require a status-ish intro
+    // word (status/code/http/error/failed/response/returned/received/
+    // rejected) before the digits -- see httpStatusRe in error-category.ts.
+    ["issue number is not a rate limit", "#429 fix flaky build", "upstream_error"],
+    ["stack-trace line/column is not a 404", "at handler (server.js:404:12)", "upstream_error"],
+    ["JSON payload number is not a 401", '{"number":401,"title":"Fix login flow"}', "upstream_error"],
+    ["byte count is not a 429", "rx 429 bytes in 12ms", "upstream_error"],
+    ["spelled-out byte count is not a 429", "received 429 bytes in 12ms", "upstream_error"],
+    ["result count is not a 403", "search returned 403 results", "upstream_error"],
+    ["PID is not a 403", "PID 403 running", "upstream_error"],
+    // ...while codes INTRODUCED by a status-ish word still classify.
+    ["status-code phrasing", "Request failed with status code 429", "rate_limited"],
+    ["http-prefixed code", "HTTP 404", "not_found"],
+    ["error-prefixed code", "upstream error: 401", "unauthorized"],
+    ["returned-prefixed code", "the API returned 403", "unauthorized"],
+    // Real MCP error-body spellings: Node/AWS/Hapi statusCode, Python
+    // requests/httpx status_code, raw HTTP/1.1 status lines, and
+    // post-positioned phrasings the intro-word shape cannot see.
+    ["Node-style statusCode JSON", '{"statusCode":429,"retryAfter":30}', "rate_limited"],
+    ["Python-style status_code", "status_code: 401", "unauthorized"],
+    ["status_code with intro", "request failed with status_code 404", "not_found"],
+    ["HTTP/1.1 status line", "HTTP/1.1 429", "rate_limited"],
+    ["post-positioned response", "got a 429 response", "rate_limited"],
+    ["post-positioned error", "404 error from server", "not_found"],
+    // Counts the first unit-noun guard missed: nouns outside the original
+    // list, an adjective between count and noun, a table row with the noun
+    // BEFORE the intro word, and a test-runner summary.
+    ["request count is not a rate limit", "received 429 requests in the last hour", "upstream_error"],
+    ["message count is not a 401", "received 401 unread messages", "upstream_error"],
+    ["item count with adjective is not a 429", "received 429 new items", "upstream_error"],
+    ["row count with adjective is not a 403", "query returned 403 matching rows", "upstream_error"],
+    ["table row with leading noun is not a 429", "| bytes received | 429 |", "upstream_error"],
+    ["test-runner summary is not a 429", "0 failed, 429 passed", "upstream_error"],
+    // Real errors with a function-word bridge between intro and code, and
+    // the "responded" / "access denied" spellings.
+    ["bridge word: failed with", "request failed with 429", "rate_limited"],
+    ["bridge word: returned a", "the API returned a 429", "rate_limited"],
+    ["responded with + access denied", "GitHub API responded with 403: access denied to repo", "unauthorized"],
+    ["responded with a status of", "the server responded with a status of 429", "rate_limited"],
+    ["bare access denied", "Access denied.", "unauthorized"],
+    // A ":" or "," right after the code introduces a MESSAGE, never a unit,
+    // and token/user/request/... are the ordinary objects of a real failure
+    // message after a STATUS intro -- neither may veto the code.
+    ["colon then message clause", "HTTP 401: the token has expired", "unauthorized"],
+    ["comma then message field", "status: 429, message: quota exceeded", "rate_limited"],
+    ["colon then request clause", "Error: status 429: the request could not be completed", "rate_limited"],
+    ["colon then user clause", "HTTP 403: user lacks the required scope", "unauthorized"],
+    ["comma then not-found message", "status: 404, message: no such workspace", "not_found"],
+    ["domain noun after status intro", "status 401 token expired", "unauthorized"],
+    ["domain noun after status-code intro", "Request failed with status code 401: token invalid", "unauthorized"],
+    ["domain noun after error intro", "error 429 requests exhausted, retry later", "rate_limited"],
+    // ...while the same domain noun after a COUNT verb is a count.
+    ["domain noun after count verb", "received 429 requests in the last hour", "upstream_error"],
+    // Punctuation after a bridge word.
+    ["bridge then parenthesised code", "Request failed with (429)", "rate_limited"],
+    ["bridge then bracketed code", "responded with [429]", "rate_limited"],
+    ["bridge then colon", "failed with: 429", "rate_limited"],
+    // Bodies that BEGIN with the code (Anthropic / OpenAI SDK convention)
+    // and go-github's "<METHOD> <url>: <code> <reason> []" reason phrases.
+    [
+      "Anthropic SDK body",
+      '401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+      "unauthorized",
+    ],
+    [
+      "OpenAI SDK quota body",
+      "429 You exceeded your current quota, please check your plan and billing details.",
+      "rate_limited",
+    ],
+    [
+      "go-github bad credentials",
+      "failed to get issue: GET https://api.github.com/repos/o/r/issues/1: 401 Bad credentials []",
+      "unauthorized",
+    ],
+    [
+      "go-github not accessible",
+      "GET https://api.github.com/repos/o/r: 403 Resource not accessible by personal access token []",
+      "unauthorized",
+    ],
+    // ...but a body that opens with a COUNT is not an error.
+    ["leading count of users", "429 users match the filter", "upstream_error"],
+    ["leading count of issues", "404 issues found", "upstream_error"],
+    ["leading count of rows", "401 rows returned", "upstream_error"],
+    // CamelCase-glued class names and the JSON key spellings beyond
+    // statusCode/status_code (incl. AWS SDK v3's $metadata.httpStatusCode).
+    ["python requests HTTPError", "HTTPError: 404 Client Error: No such resource for url: https://x", "not_found"],
+    ["HttpException class name", "HttpException: 429", "rate_limited"],
+    ["bare Exception class name", "Exception: 429", "rate_limited"],
+    ["StatusCodeError class name", "StatusCodeError: 429 - {}", "rate_limited"],
+    ["errorCode JSON key", '{"errorCode":401,"errorMessage":"Invalid token"}', "unauthorized"],
+    ["error_code JSON key", '{"error_code":429,"detail":"slow down"}', "rate_limited"],
+    ["AWS SDK v3 metadata", '{"$metadata":{"httpStatusCode":403}}', "unauthorized"],
+    ["http_status assignment", "http_status=429", "rate_limited"],
+    // The fetch-wrapper template ("Failed to fetch <url>: <status>") whose
+    // HTTP/2 statusText is empty, so no reason phrase can rescue it.
+    ["fetch wrapper with URL", "Failed to fetch https://api.example.com/v1/x: 401", "unauthorized"],
+    ["fetch wrapper with path", "Failed to fetch robots.txt: 404", "not_found"],
+    ["fetching prose with URL", "error fetching url https://example.com: 429", "rate_limited"],
+    // Singular domain nouns are the OBJECTS of a reason phrase; only the
+    // plural forms are counts.
+    ["singular token after count verb", "Server returned 401 invalid token", "unauthorized"],
+    ["singular user after count verb", "returned 403 user lacks scope", "unauthorized"],
+    ["leading code, singular token", "401 Token expired", "unauthorized"],
+    ["leading code, singular request", "429 Request rate exceeded", "rate_limited"],
+    // Quoted/bracketed SDK bodies.
+    ["re-quoted SDK body", '"401 {\\"type\\":\\"error\\"}"', "unauthorized"],
+    ["bracketed code", '[401] {"type":"error"}', "unauthorized"],
+    ["parenthesised leading code", "(401) invalid x-api-key", "unauthorized"],
+    // A count noun BEFORE a status intro must not veto the failure...
+    ["count noun before failed", "3 files failed with 429", "rate_limited"],
+    ["count noun before failed colon", "2 files failed: 401", "unauthorized"],
+    // ...while issue refs and table count columns stay out.
+    ["issue ref after error", "fixed error #429 in the build", "upstream_error"],
+    ["table count column", "| errors | 429 |", "upstream_error"],
+    // The URL token is captured UNCAPPED: a {1,300} cap made presigned
+    // S3/Azure/GCS URLs (routinely 400-1500 chars) fall out of the
+    // fetch-wrapper shape -- atomicity forbade retrying a shorter capture.
+    [
+      "fetch wrapper with a presigned URL",
+      `Failed to fetch https://bucket.s3.amazonaws.com/key?X-Amz-Signature=${"a".repeat(400)}: 403`,
+      "unauthorized",
+    ],
+    // The count-verb shape shares the URL bridge; a numbered backreference
+    // was silently renumbered by the second interpolation, leaving this
+    // branch dead -- the named groups pin it alive.
+    ["count verb with URL", "returned https://api.example.com/v1: 429", "rate_limited"],
+    // Glued identifiers must not match: every real error spelling has at
+    // least one separator between intro and code (the gaps are {1,10}).
+    ["glued key spelling in a filename", "wrote errorcode429.log", "upstream_error"],
+    ["glued http_status in a filename", "saved http_status429.json", "upstream_error"],
+    ["glued camel suffix in a filename", "see typeerror429.md", "upstream_error"],
+    // The uncapped token still refuses a non-colon-terminated one.
+    ["stack trace after error intro", "error at handler (server.js:404:12)", "upstream_error"],
   ];
+
+  it("does not backtrack quadratically on a long run of intro/bridge tokens", () => {
+    // "status" used to sit in BOTH the intro and the bridge alternation, so
+    // a whitespace-separated run of it re-entered the bridge from every
+    // intro position: 11 s on a 98 KB reply (measured). Every proxied
+    // result is classified by reward.ts, so this must stay linear-ish.
+    for (const word of ["status", "with", "a", "error", "status with a status of", "failed with a"]) {
+      const big = `${word} `.repeat(Math.ceil(98_000 / (word.length + 1)));
+      const t0 = performance.now();
+      classifyError(big);
+      expect(performance.now() - t0, `run of ${JSON.stringify(word)}`).toBeLessThan(500);
+    }
+  });
 
   for (const [name, input, expected] of cases) {
     it(`classifies: ${name} -> ${expected}`, () => {

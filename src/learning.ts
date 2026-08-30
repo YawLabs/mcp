@@ -35,6 +35,8 @@
 //     (see persistence.ts); ConnectServer handles the load/save
 //     lifecycle via exportSnapshot/loadSnapshot.
 
+import { setJsonKey } from "./json-key.js";
+
 export const LEARNING_MIN_OBSERVATIONS = 3;
 export const LEARNING_MAX_BOOST = 1.1;
 export const LEARNING_MIN_BOOST = 0.9;
@@ -203,7 +205,11 @@ export class LearningStore {
   exportSnapshot(): Record<string, NamespaceUsage> {
     const out: Record<string, NamespaceUsage> = {};
     for (const [ns, usage] of this.usage) {
-      out[ns] = { dispatched: usage.dispatched, succeeded: usage.succeeded, lastUsedAt: usage.lastUsedAt };
+      // setJsonKey, not out[ns]: persistence.ts deliberately preserves a
+      // "__proto__" learning key on LOAD (setJsonKey + a pinning test);
+      // plain assignment here invoked the inherited setter on the next
+      // SAVE, so the entry silently vanished from state.json.
+      setJsonKey(out, ns, { dispatched: usage.dispatched, succeeded: usage.succeeded, lastUsedAt: usage.lastUsedAt });
     }
     return out;
   }

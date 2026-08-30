@@ -185,6 +185,27 @@ describe("LearningStore", () => {
       expect(store2.boostFactor("slack")).toBe(store.boostFactor("slack"));
     });
 
+    it('exports a "__proto__" namespace as an own key (matching the persistence load side)', () => {
+      // persistence.ts deliberately preserves a "__proto__" learning key on
+      // LOAD via setJsonKey (with its own pinning test). Plain `out[ns] =`
+      // in exportSnapshot invoked the inherited setter instead, so the
+      // entry silently vanished from state.json on the next SAVE -- the
+      // load-side hardening was undone one flush later.
+      const store = new LearningStore();
+      // JSON.parse creates "__proto__" as an OWN property, exactly like a
+      // hand-edited state.json arriving through loadState.
+      store.loadSnapshot(JSON.parse('{"__proto__":{"dispatched":2,"succeeded":1,"lastUsedAt":5}}'));
+      const snapshot = store.exportSnapshot();
+      expect(Object.hasOwn(snapshot, "__proto__")).toBe(true);
+      // And it survives serialization, which only sees own properties.
+      const roundTripped = JSON.parse(JSON.stringify(snapshot));
+      expect(Object.getOwnPropertyDescriptor(roundTripped, "__proto__")?.value).toEqual({
+        dispatched: 2,
+        succeeded: 1,
+        lastUsedAt: 5,
+      });
+    });
+
     it("clamps succeeded down to dispatched on load, matching the persistence path", () => {
       // The deprecated recordSuccess can still produce succeeded > dispatched
       // in memory, but that shape is NOT persistable: persistence.ts's

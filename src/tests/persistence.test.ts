@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -34,6 +34,39 @@ describe("persistence.loadState", () => {
   it("returns empty state when file does not exist", async () => {
     const s = await loadState(file);
     expect(s).toEqual(emptyState());
+  });
+
+  it("flags loadFailed when the file EXISTS but cannot be read", async () => {
+    // A directory at the state path makes readFile fail with EISDIR --
+    // standing in for the transient EACCES/EBUSY handle class. The state
+    // on disk is presumed healthy, so the caller must be told not to save
+    // the empty stand-in over it: server.ts leaves persistenceReady false
+    // when this flag is set.
+    mkdirSync(file, { recursive: true });
+    const s = await loadState(file);
+    expect(s.loadFailed).toBe(true);
+    expect(s.learning).toEqual({});
+    expect(s.packHistory).toEqual([]);
+  });
+
+  it("does NOT flag loadFailed for a missing or unparseable file", async () => {
+    // Missing: nothing on disk to protect.
+    expect((await loadState(file)).loadFailed).toBeUndefined();
+    // Unparseable: the file is genuinely unusable -- starting fresh (and
+    // letting the next save replace it) is the documented behavior.
+    writeFileSync(file, "not json at all", "utf8");
+    expect((await loadState(file)).loadFailed).toBeUndefined();
+  });
+
+  it("does NOT flag loadFailed when a path component is a regular file", async () => {
+    // POSIX reports this ENOTDIR; win32 reports ENOENT. Either way the
+    // state file cannot exist -- there is nothing to protect, so it must
+    // behave like a missing file (empty state, saves stay enabled),
+    // matching the grades-cache/config-loader errno split.
+    writeFileSync(join(dir, "blocker"), "i am a file", "utf8");
+    const s = await loadState(join(dir, "blocker", "state.json"));
+    expect(s).toEqual(emptyState());
+    expect(s.loadFailed).toBeUndefined();
   });
 
   it("parses a valid state file", async () => {

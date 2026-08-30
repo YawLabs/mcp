@@ -37,14 +37,113 @@ export type ErrorCategory = (typeof ERROR_CATEGORIES)[number];
 // is more actionable as "fix the auth" than "fix the URL." Anything
 // that matches none falls through to upstream_error.
 //
-// HTTP status codes match against \b-anchored regexes so a request ID
-// or path segment that happens to contain "401" / "404" / "429" / "403"
-// doesn't false-positive. Substring matches on bare digits would catch
-// rows like "GET /v1/r/4040" or "request id: 401abc" and misclassify.
-const RX_HTTP_401 = /\b401\b/;
-const RX_HTTP_403 = /\b403\b/;
-const RX_HTTP_404 = /\b404\b/;
-const RX_HTTP_429 = /\b429\b/;
+// HTTP status codes require CONTEXT, not just \b-anchored digits. The \b
+// anchors alone only reject contiguous-digit shapes ("GET /v1/r/4040",
+// "request id: 401abc"); they still matched standalone tokens in
+// SUCCESSFUL replies -- issue numbers ("#429 fix flaky build"),
+// stack-trace line numbers ("server.js:404:12"), byte counts ("rx 429
+// bytes"), JSON payload numbers ('{"number":401}') -- and reward.ts runs
+// classifyError over EVERY proxied result, so each false positive banked
+// a healthy call at 0.2 credit and fed the flaky list.
+//
+// Four context shapes match, chosen against real MCP error bodies:
+//   A1. A STATUS intro before the code: status / statuscode / status_code
+//      and the key spellings with an http/error/response prefix
+//      (errorcode, error_code, httpstatus, httpstatuscode -- the AWS SDK
+//      v3 $metadata spelling -- http_status, response_code; all seen
+//      lowercased because classifyError lowercases its input), code, http
+//      (incl. an HTTP/1.1-style status line), error, exception, failed,
+//      responded, response, rejected. error/exception also match as a
+//      CamelCase-glued suffix ("httperror: 404", "httpexception: 429",
+//      "statuscodeerror: 429" after lowercasing). Between the intro word
+//      and the code: punctuation / whitespace, OR a short bridge of
+//      function words followed by optional punctuation ("failed with
+//      429", "returned a 429", "failed with (429)"), OR up to three plain
+//      words plus one URL/path-ish token ending in ":" ("failed to fetch
+//      https://api.x.com/v1: 401", "error fetching robots.txt: 404" --
+//      the fetch-wrapper template, whose HTTP/2 statusText is empty so no
+//      reason phrase can rescue it). The bridges are closed shapes so an
+//      arbitrary word cannot smuggle a count past the guard; "status" is
+//      deliberately NOT a bridge word (it is already an intro, and
+//      listing it in both places made a run of the token backtrack
+//      quadratically -- 11 s on a 98 KB reply, measured); the URL token
+//      is captured atomically (lookahead + backreference) so a long
+//      dotted run stays linear; and the punctuation gaps exclude "#"
+//      (an issue/PR reference: "fixed error #429") and "|" (a table cell
+//      boundary: "| errors | 429 |" is a count column, and excluding the
+//      pipe kills "| bytes received | 429 |" structurally).
+//   A2. A COUNT-VERB intro (returned / received) with the same bridges --
+//      but see the wider veto below.
+//   B. The code immediately followed by error / response / status ("got a
+//      429 response", "404 error from server") -- post-positioned
+//      phrasings A1/A2 cannot see.
+//   C. The body BEGINS with the code, after optional whitespace/quotes/
+//      brackets -- the `${status} ${body}` convention of the Anthropic /
+//      OpenAI SDK error messages ('401 {"type":"error",...}', "429 You
+//      exceeded your current quota ...", '"401 {...}"' re-quoted by a
+//      wrapper, "[401] ...").
+//   Vetoes: A1 rejects a PLURAL count noun after the code ("received 429
+//   bytes"-class); A2 and C additionally reject the plural domain nouns
+//   (tokens/users/requests/repos/issues/commits/errors), because after a
+//   count verb or at the start of a body those are counts ("received 429
+//   requests in the last hour", "429 users match the filter") -- while
+//   after a STATUS intro they are the objects of a real failure message
+//   ("status 401 token expired"). Both lists are PLURAL-ONLY: a count of
+//   401 is never followed by a singular noun, but a reason phrase often
+//   is ("401 invalid token", "403 user lacks scope"). One adjective is
+//   tolerated before the noun; ":" and "," right after the code are NOT
+//   treated as count punctuation (they introduce a message: "HTTP 401:
+//   the token has expired"). A2 also refuses when the count verb is
+//   itself preceded by a bare count noun ("bytes received 429" -- an rx
+//   stats line).
+// Replies that carry the reason phrase instead ("401 Unauthorized",
+// "Forbidden (403)", "429 Too Many Requests", "Bad credentials") are
+// matched by the word checks in classifyError below, not by these regexes.
+function httpStatusRe(code: number): RegExp {
+  const keyPrefix = "(?:https?|error|response)?[\\s_-]*";
+  const statusIntro = `${keyPrefix}status(?:[\\s_-]*code)?|${keyPrefix}code|https?(?:/[\\d.]{1,4})?|error|exception|failed|responded|response|rejected`;
+  const countVerbIntro = "returned|received";
+  // Atomic via lookahead+backreference: the token is captured once and
+  // consumed verbatim, so the engine cannot re-split it while
+  // backtracking. Three subtleties, each learned from a defect:
+  //   - The capture is UNCAPPED \\S+: greedy \\S+ inside a lookahead is
+  //     deterministic (no interior choice points), so it is not what
+  //     keeps the shape linear -- and a {1,300} cap made the token
+  //     capture exactly 300 chars of a longer URL, the (?<=:) then
+  //     demanded char 300 be ":", and atomicity (correctly) forbade
+  //     retrying: presigned S3/Azure/GCS URLs (routinely 400-1500 chars)
+  //     silently fell out of the fetch-wrapper shape. Only the first
+  //     lookahead -- the one that CAN backtrack -- keeps its 300 bound.
+  //   - The group is NAMED, with a distinct name per interpolation:
+  //     `bridge` is spliced into both shapeA1 and shapeA2, and a numbered
+  //     backreference (\\1) in the second copy silently pointed at the
+  //     FIRST copy's group after renumbering -- a non-participating group
+  //     matches empty, the lookbehind then always failed, and shapeA2's
+  //     URL branch was dead code no test could see.
+  const urlToken = (g: string) => `(?=\\S{0,300}[/.])(?=(?<${g}>\\S+))\\k<${g}>(?<=:)`;
+  //   - The punctuation gaps are {1,10}, never {0,10}: a zero-width gap
+  //     let identifiers that GLUE an intro spelling onto the digits match
+  //     ("wrote errorcode429.log", "saved http_status429.json",
+  //     "typeerror429.md" in a file listing); every real error spelling
+  //     has at least one separator between intro and code.
+  const bridge = (g: string) =>
+    `(?:[^\\w#|]{1,10}|(?:\\s+(?:with|a|an|the|of))+[^\\w#|]{1,10}|(?:\\s+[a-z]+){0,3}\\s+${urlToken(g)}\\s*)`;
+  const countNouns = "bytes|rows|results|items|records|entries|files|lines|ms|messages|matches|findings|hits";
+  const afterCode = `(?:${countNouns}|passed|failed|warnings)`;
+  const domainNouns = "tokens|users|requests|repos|issues|commits|errors";
+  const notCount = `(?![\\s|]{0,3}(?:[a-z]+\\s+)?${afterCode}\\b)`;
+  const notCountOrDomain = `(?![\\s|]{0,3}(?:[a-z]+\\s+)?(?:${afterCode}|${domainNouns})\\b)`;
+  const nounBefore = `(?<!\\b(?:${countNouns})\\s{0,3})`;
+  const shapeA1 = `(?:\\b(?:${statusIntro})|(?<=[a-z])(?:error|exception))${bridge("u1")}${code}\\b${notCount}`;
+  const shapeA2 = `${nounBefore}\\b(?:${countVerbIntro})${bridge("u2")}${code}\\b${notCountOrDomain}`;
+  const shapeB = `\\b${code}\\s+(?:error|response|status)\\b`;
+  const shapeC = `^[\\s"'\`\\[(]*${code}\\b${notCountOrDomain}`;
+  return new RegExp(`${shapeA1}|${shapeA2}|${shapeB}|${shapeC}`);
+}
+const RX_HTTP_401 = httpStatusRe(401);
+const RX_HTTP_403 = httpStatusRe(403);
+const RX_HTTP_404 = httpStatusRe(404);
+const RX_HTTP_429 = httpStatusRe(429);
 const RX_NO_TOKEN = /no [a-z_]*token (configured|set)/i;
 // "timeout" as a standalone, UNQUOTED word anywhere in the message. Three
 // constraints, each earning its keep:
@@ -110,7 +209,13 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
   // Rate-limit: HTTP 429 + a couple of common phrasings. Has to come
   // before unauthorized because some providers say "auth rate limit
   // exceeded" and we want the rate-limit interpretation to win.
-  if (RX_HTTP_429.test(t) || t.includes("rate limit") || t.includes("too many requests")) {
+  if (
+    RX_HTTP_429.test(t) ||
+    t.includes("rate limit") ||
+    t.includes("too many requests") ||
+    // OpenAI SDK quota body: "429 You exceeded your current quota, ..."
+    t.includes("exceeded your current quota")
+  ) {
     return "rate_limited";
   }
 
@@ -123,6 +228,13 @@ export function classifyError(text: string | undefined | null): ErrorCategory {
     t.includes("unauthorized") ||
     t.includes("forbidden") ||
     t.includes("permission denied") ||
+    t.includes("access denied") ||
+    // go-github / github-mcp-server reason phrases, which follow a URL
+    // rather than an intro word ("GET https://api.github.com/...: 401 Bad
+    // credentials []") so the status regex cannot see the code.
+    t.includes("bad credentials") ||
+    t.includes("requires authentication") ||
+    t.includes("not accessible by") ||
     RX_NO_TOKEN.test(t)
   ) {
     return "unauthorized";

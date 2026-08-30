@@ -89,11 +89,29 @@ function validateEntry(entry: unknown): CachedGrade | null {
  *  malformed -- never throws, so a list command degrades to "no cached grades"
  *  instead of crashing on a hand-edited file. */
 export async function readGradesCache(home: string = homedir()): Promise<GradesCache> {
+  return readGradesCacheImpl(home, { strictRead: false });
+}
+
+/** strictRead: true is the WRITE path's posture. writeGrade's
+ *  read-modify-write must not treat a transient read failure (EACCES,
+ *  EBUSY from a win32 AV/indexer handle -- the same class atomic-write.ts
+ *  retries renames for, EISDIR) as "no cache": doing so published a
+ *  one-entry file and silently destroyed every other cached grade,
+ *  contradicting writeGrade's own "preserving every other entry" doc.
+ *  Rethrowing instead lands in audit-cmd's writeGrade catch, which
+ *  reports grade-computed-but-cache-write-failed as exit 3. Only
+ *  ENOENT/ENOTDIR mean "no cache yet" (same split as config-loader).
+ *  A file that reads but does not PARSE still yields {} on both paths:
+ *  replacing a malformed cache with a rebuilt one is fine -- it is
+ *  disposable derived data, and the read side already warned. */
+async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }): Promise<GradesCache> {
   const path = gradesCachePath(home);
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (opts.strictRead && code !== "ENOENT" && code !== "ENOTDIR") throw err;
     return {};
   }
   let parsed: unknown;
@@ -137,8 +155,13 @@ export async function writeGrade(namespace: string, grade: CachedGrade, home: st
   const path = gradesCachePath(home);
   const prev = writeGradeChain.get(path) ?? Promise.resolve();
   const run = async (): Promise<void> => {
-    const cache = await readGradesCache(home);
-    cache[namespace] = grade;
+    // strictRead: a transient read failure must throw (surfacing as audit's
+    // exit 3), not clobber the cache -- see readGradesCacheImpl.
+    const cache = await readGradesCacheImpl(home, { strictRead: true });
+    // setJsonKey, not cache[namespace]: mirrors the read side above. Plain
+    // assignment of "__proto__" would invoke the inherited setter and the
+    // grade would vanish from the serialized file.
+    setJsonKey(cache, namespace, grade);
     await atomicWriteFile(path, `${JSON.stringify(cache, null, 2)}\n`);
   };
   // .then(run, run) means: run AFTER the previous link settles, regardless of

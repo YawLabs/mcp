@@ -446,6 +446,35 @@ export async function routePromptGet(
   }
 }
 
+// Brand for tool-call error results produced by yaw-mcp's OWN routing
+// layer (stale toolCache, dropped connection, failed auto-reconnect,
+// failed deferred load, unknown tool) rather than by the upstream server.
+// server.ts's health/learning/redispatch booking and handleExec's step
+// attribution check the brand -- an in-process object property -- instead
+// of sniffing the error TEXT, because the ROUTING_FAULT_* marker phrases
+// are generic English: a genuine upstream error that happens to say "no
+// longer available" or echo "Unknown tool:" must still be booked against
+// the upstream's reliability, and only results yaw-mcp itself constructed
+// can carry the brand. A symbol property is invisible to JSON.stringify
+// (and non-enumerable besides), so it never leaks onto the wire; it only
+// travels between in-process callers. The ROUTING_FAULT_* text constants
+// in server.ts remain the pinned user-facing message shapes.
+const ROUTING_FAULT_BRAND: unique symbol = Symbol("yaw-mcp:routing-fault");
+
+/** Mark `result` as a yaw-mcp-internal routing fault. Returns `result`. */
+export function brandRoutingFault<T extends object>(result: T): T {
+  Object.defineProperty(result, ROUTING_FAULT_BRAND, { value: true, enumerable: false });
+  return result;
+}
+
+/** True when `result` was constructed by yaw-mcp's own routing layer
+ *  (see brandRoutingFault). Never true for upstream-produced results. */
+export function isRoutingFaultResult(result: unknown): boolean {
+  return (
+    typeof result === "object" && result !== null && (result as Record<symbol, unknown>)[ROUTING_FAULT_BRAND] === true
+  );
+}
+
 export async function routeToolCall(
   toolName: string,
   args: Record<string, unknown>,
@@ -455,7 +484,7 @@ export async function routeToolCall(
   const route = toolRoutes.get(toolName);
 
   if (!route) {
-    return {
+    return brandRoutingFault({
       content: [
         {
           type: "text",
@@ -463,13 +492,13 @@ export async function routeToolCall(
         },
       ],
       isError: true,
-    };
+    });
   }
 
   const connection = activeConnections.get(route.namespace);
 
   if (connection?.status !== "connected") {
-    return {
+    return brandRoutingFault({
       content: [
         {
           type: "text",
@@ -477,7 +506,7 @@ export async function routeToolCall(
         },
       ],
       isError: true,
-    };
+    });
   }
 
   try {

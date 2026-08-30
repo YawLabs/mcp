@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import nodePath from "node:path";
@@ -279,7 +279,7 @@ describe("parseSecretsArgs", () => {
 // surface -- `secrets push` and `secrets pull` no longer exist. The local
 // vault suites below (set / rotate / audit / TTY) are unaffected.
 
-import { lock, vaultPath } from "../secrets-vault.js";
+import { loadVault, lock, rotateVault, saveVault, unlock, vaultPath } from "../secrets-vault.js";
 
 /** Fresh throwaway HOME per test. mkdtemp (not a fixed tmpdir path) so
  *  parallel runs can't collide, and rmSync in afterEach so the suite does
@@ -2174,5 +2174,280 @@ describe("runSecrets audit -- human render, filters, and read failure", () => {
     }
     // Sanity: the unmocked module the rest of the suite holds still works.
     expect(errText()).toBe("");
+  });
+});
+
+// -----------------------------------------------------------------------
+// Concurrent-writer guard: every mutating action blocks on unbounded
+// interactive pauses between its vault load and its save. The fingerprint
+// re-check (vaultChangedSinceLoad) must refuse the save when the file on
+// disk moved during the pause -- mirroring trust-cmd's "a prompt is an
+// unbounded pause" re-read-and-refuse -- instead of silently reverting the
+// concurrent write with the stale in-memory snapshot.
+// -----------------------------------------------------------------------
+
+describe("runSecrets -- concurrent-writer guard", () => {
+  let home: string;
+
+  beforeEach(() => {
+    lock();
+    // Both env passphrases: the rotate test below drives the NEW passphrase
+    // through the TTY fixture, and a leaked YAW_MCP_VAULT_PASSPHRASE_NEW
+    // would bypass that prompt (and the concurrent write it injects).
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    home = makeHome();
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
+    lock();
+  });
+
+  it("set refuses to save when the vault changed while waiting for the value", async () => {
+    // Seed a vault the normal way.
+    const seedIo = { out: vi.fn(), err: vi.fn() };
+    const seeded = await runSecrets(
+      { action: "set", name: "FIRST", value: "one", passphrase: "a-long-passphrase", home },
+      seedIo,
+    );
+    expect(seeded.exitCode).toBe(0);
+    const file = vaultPath(home);
+    const seededBytes = readFileSync(file);
+
+    // The second set reads its value from a piped stdin whose iterator --
+    // before yielding -- rewrites the vault file, standing in for a
+    // concurrent `secrets set` / `rotate` in another terminal landing
+    // during the pause. Appending a byte keeps the JSON valid; ANY byte
+    // change must trip the guard.
+    let mutatedBytes: Buffer | null = null;
+    const rewritingStdin = {
+      isTTY: false,
+      setEncoding(): void {},
+      async *[Symbol.asyncIterator](): AsyncGenerator<string> {
+        writeFileSync(file, `${seededBytes.toString("utf8")}\n`);
+        mutatedBytes = readFileSync(file);
+        yield "two\n";
+      },
+    };
+
+    const io = { out: vi.fn(), err: vi.fn() };
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "SECOND",
+        fromStdin: true,
+        passphrase: "a-long-passphrase",
+        home,
+        io: {
+          stdin: rewritingStdin as unknown as NodeJS.ReadableStream,
+          stdout: { write: vi.fn() } as unknown as NodeJS.WritableStream,
+          stderr: { write: vi.fn() } as unknown as NodeJS.WritableStream,
+        },
+      },
+      io,
+    );
+
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput).toMatch(/changed on disk/);
+    // Nothing was written over the concurrent change.
+    expect(mutatedBytes).not.toBeNull();
+    expect(readFileSync(file)).toEqual(mutatedBytes);
+  });
+
+  it("set still saves normally when nothing touched the vault during the pause", async () => {
+    const io = { out: vi.fn(), err: vi.fn() };
+    const quietStdin = {
+      isTTY: false,
+      setEncoding(): void {},
+      async *[Symbol.asyncIterator](): AsyncGenerator<string> {
+        yield "value-two\n";
+      },
+    };
+    const seeded = await runSecrets(
+      { action: "set", name: "FIRST", value: "one", passphrase: "a-long-passphrase", home },
+      io,
+    );
+    expect(seeded.exitCode).toBe(0);
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "SECOND",
+        fromStdin: true,
+        passphrase: "a-long-passphrase",
+        home,
+        io: {
+          stdin: quietStdin as unknown as NodeJS.ReadableStream,
+          stdout: { write: vi.fn() } as unknown as NodeJS.WritableStream,
+          stderr: { write: vi.fn() } as unknown as NodeJS.WritableStream,
+        },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(vaultPath(home), "utf8")).entries.SECOND).toBeDefined();
+  });
+
+  // The remove and rotate sites carry their own re-check; each is driven
+  // through its OWN prompt so dropping either site's guard fails a test.
+  // The concurrent write is injected from the TTY fixture's resume(),
+  // which the raw-mode reader calls at the start of every prompt -- i.e.
+  // the write lands exactly inside the pause the guard exists for.
+
+  it("remove refuses to save when the vault changed while waiting for the confirmation", async () => {
+    const io = { out: vi.fn(), err: vi.fn() };
+    const seeded = await runSecrets(
+      { action: "set", name: "TOKEN", value: "one", passphrase: "a-long-passphrase", home },
+      io,
+    );
+    expect(seeded.exitCode).toBe(0);
+    const file = vaultPath(home);
+    const seededBytes = readFileSync(file);
+
+    let mutatedBytes: Buffer | null = null;
+    const stdin = new FakeTTYStdin(["y\r"]);
+    const deliver = stdin.resume.bind(stdin);
+    stdin.resume = () => {
+      if (mutatedBytes === null) {
+        writeFileSync(file, `${seededBytes.toString("utf8")}\n`);
+        mutatedBytes = readFileSync(file);
+      }
+      return deliver();
+    };
+    const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+    const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+
+    const r = await runSecrets(
+      {
+        action: "remove",
+        name: "TOKEN",
+        passphrase: "a-long-passphrase",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput).toMatch(/changed on disk/);
+    expect(mutatedBytes).not.toBeNull();
+    expect(readFileSync(file)).toEqual(mutatedBytes);
+    // The entry the user asked to delete is still there.
+    expect(JSON.parse(readFileSync(file, "utf8")).entries.TOKEN).toBeDefined();
+  });
+
+  it("rotate refuses to save when a concurrent rotate landed while waiting for the new passphrase", async () => {
+    // The strongest scenario: the concurrent writer is a REAL rotate to a
+    // third passphrase, so the salt on disk changes under the pending
+    // rotation. Saving the stale rotation would revert the concurrent one
+    // and silently un-do a passphrase change its user was told succeeded.
+    const OLD = "old-passphrase-xyz";
+    const PENDING_NEW = "pending-new-passphrase";
+    const CONCURRENT_NEW = "concurrent-new-passphrase";
+    const io = { out: vi.fn(), err: vi.fn() };
+    const seeded = await runSecrets({ action: "set", name: "TOKEN", value: "one", passphrase: OLD, home }, io);
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    const file = vaultPath(home);
+
+    // Holder object (not a `let`): TS narrows a `let x: Buffer | null = null`
+    // to `null` and ignores the closure assignments below.
+    const concurrent: { bytes: Buffer | null; started: boolean } = { bytes: null, started: false };
+    // The new passphrase is prompted (confirm-twice) on the TTY; the
+    // concurrent rotate runs to completion before the first prompt's chunk
+    // is delivered.
+    const stdin = new FakeTTYStdin([`${PENDING_NEW}\r`, `${PENDING_NEW}\r`]);
+    const deliver = stdin.resume.bind(stdin);
+    stdin.resume = () => {
+      if (!concurrent.started) {
+        concurrent.started = true; // latch before the await so a re-entrant resume() cannot re-run it
+        // The concurrent rotate is done with the vault PRIMITIVES rather than
+        // a nested runSecrets: a second CLI run in the SAME process would
+        // call lock(), which zero-fills the module-cached key Buffer the
+        // outer command still holds by reference -- a shape that cannot
+        // occur in production (every CLI run is its own process) and would
+        // make the outer rotate fail for the wrong reason.
+        void (async () => {
+          const onDisk = await loadVault(file);
+          if (!onDisk) throw new Error("fixture: vault vanished");
+          const key = await unlock(onDisk, OLD);
+          await saveVault(file, await rotateVault(onDisk, key, CONCURRENT_NEW));
+          concurrent.bytes = readFileSync(file);
+          deliver();
+        })();
+        return stdin;
+      }
+      return deliver();
+    };
+    const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+    const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+
+    const r = await runSecrets(
+      {
+        action: "rotate",
+        passphrase: OLD,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput).toMatch(/changed on disk/);
+    expect(concurrent.bytes).not.toBeNull();
+    expect(concurrent.bytes?.length).toBeGreaterThan(0);
+    expect(readFileSync(file)).toEqual(concurrent.bytes);
+
+    // The vault on disk is the CONCURRENT rotation: its passphrase reads,
+    // the pending one (never saved) and the old one do not.
+    lock();
+    const okIo = { out: vi.fn(), err: vi.fn() };
+    const ok = await runSecrets({ action: "get", name: "TOKEN", passphrase: CONCURRENT_NEW, home, json: true }, okIo);
+    expect(ok.exitCode).toBe(0);
+    lock();
+    const stale = await runSecrets(
+      { action: "get", name: "TOKEN", passphrase: PENDING_NEW, home, json: true },
+      { out: vi.fn(), err: vi.fn() },
+    );
+    expect(stale.exitCode).toBe(1);
+    lock();
+    const old = await runSecrets(
+      { action: "get", name: "TOKEN", passphrase: OLD, home, json: true },
+      { out: vi.fn(), err: vi.fn() },
+    );
+    expect(old.exitCode).toBe(1);
+  });
+
+  // A DIRECTORY at the vault path makes the baseline read fail (EISDIR),
+  // standing in for the transient EACCES/EBUSY class. NOTE on what this
+  // pins: with a directory, loadVault itself also fails, so even before the
+  // fail-fast existed no prompt was reached -- the pre-fix run surfaced
+  // loadVault's raw errno via safeLoadVault. The wasted-prompts shape needs
+  // a file that is unreadable for the baseline read but readable a moment
+  // later, which no fixture can stage deterministically. What IS pinned:
+  // the fail-fast fires (its own message, not safeLoadVault's), at BOTH
+  // sites, and it names the errno the way get/list do for the same state.
+  it.each([
+    "set",
+    "rotate",
+  ] as const)("%s fails fast, naming the errno, when the vault file exists but cannot be read", async (action) => {
+    const file = vaultPath(home);
+    mkdirSync(file, { recursive: true });
+    const io = { out: vi.fn(), err: vi.fn() };
+    const r = await runSecrets(
+      action === "set"
+        ? { action, name: "TOKEN", value: "one", passphrase: "a-long-passphrase", home, json: true }
+        : { action, passphrase: "a-long-passphrase", newPassphrase: "another-long-passphrase", home, json: true },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    const parsed = JSON.parse(errOutput.trim());
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/could not read the vault file/);
+    expect(parsed.error).toMatch(/EISDIR/);
   });
 });
