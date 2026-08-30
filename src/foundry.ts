@@ -120,8 +120,9 @@ interface RawScrubRule {
   applies?: (match: string) => boolean;
 }
 
-// A dotted run of 3+ numeric groups: an IPv4 literal (192.168.1.100) or a
-// dotted version (1.2.3.4.5). Phone numbers are written with spaces, parens
+// A dotted run of 4+ numeric groups (three or more dots): an IPv4 literal
+// (192.168.1.100) or a dotted version (1.2.3.4.5). Phone numbers are
+// written with spaces, parens
 // or hyphens far more often than with three or more dots, so excluding this
 // shape costs essentially no real phone coverage.
 const DOTTED_NUMERIC_RE = /^\d+(?:\.\d+){3,}$/;

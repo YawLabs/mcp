@@ -10,9 +10,10 @@
 // GC pass (gcExpiredTrials, both the text and --json paths), which is a
 // read-modify-write + unlink on client config files: it peels expired
 // `yaw-mcp-try-*` entries out of each client config and deletes the trial
-// marker. Nothing is reported anywhere -- the expiry-gc telemetry event this
+// marker. Nothing leaves the MACHINE -- the expiry-gc telemetry event this
 // used to fire went with the rest of the postEvent seam (see try-cmd.ts's
-// header). There is
+// header) -- but the sweep is still reported to the user on both surfaces,
+// and an un-finishable sweep raises the exit code. There is
 // no lock around that write, so it carries the same TOCTOU class as any
 // other config mutation. The sweep is best-effort: any failure is swallowed
 // and never aborts the diagnostic.

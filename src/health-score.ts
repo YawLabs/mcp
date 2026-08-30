@@ -159,9 +159,11 @@ export function scrubForWarning(msg: string): string {
 // Scrubs BEFORE truncating so the 120-char cut is applied to already-redacted
 // text: a secret sitting past char 120 is REMOVED rather than merely hidden by
 // the cut, and an expanded redaction cannot push the result past the cap.
-// (A redaction does not shorten -- "<redacted>" is 10 chars, so `token=x`
-// grows to `token=<redacted>`. Scrubbing first is what keeps that growth
-// inside the cap rather than after it.)
+// (A redaction changes length in EITHER direction: `token=x` grows to
+// `token=<redacted>`, while a long API key collapses to those same 10 chars.
+// The ordering does not depend on which way it goes -- what matters is that
+// the cut is applied to the FINAL text, so whatever the substitution did to
+// the length is already accounted for by the time we measure.)
 function truncateForWarning(msg: string): string {
   const clean = scrubForWarning(msg).replace(/\s+/g, " ").trim();
   return clean.length > 120 ? `${clean.slice(0, 117)}...` : clean;

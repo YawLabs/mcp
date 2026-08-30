@@ -1259,10 +1259,15 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
   if (abs === "(n/a)") return abs;
   if (home && abs.startsWith(home)) {
     const sep = os === "windows" ? "\\" : "/";
+    // Only characters that are separators on the HOST that built `absolute`
+    // are rewritten. A blanket class would treat a backslash as a separator
+    // on a POSIX host, where it is a legal filename character, and would
+    // mangle the component containing it.
+    const hostSep = process.platform === "win32" ? /[\\/]/g : /\//g;
     const tail = abs
       .slice(home.length)
       .replace(/^[\\/]/, "")
-      .replace(/[\\/]/g, sep);
+      .replace(hostSep, sep);
     return `~${sep}${tail}`;
   }
   return abs;

@@ -33,9 +33,7 @@
 // defaultRuntime below.
 
 import { statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
+import { type LoadLocalBundlesResult, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import {
   isRegistrySpec,
@@ -46,7 +44,6 @@ import {
   oamFailureLabel,
   specConstraint,
 } from "./oam-spawn.js";
-import { CONFIG_DIRNAME } from "./paths.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export type RuntimeChoice = "oam" | "node";
@@ -67,7 +64,22 @@ let warnedInvalidEnv = false;
  *  `defaultRuntime: "node"` written afterwards was never picked up -- the
  *  exact silent inversion this exemption exists to prevent. A `null`
  *  signature records "absent", so CREATING a file invalidates too. */
-let degradedProbe: Array<{ path: string; signature: string | null }> | null = null;
+let degradedProbe: { files: Array<{ path: string; signature: string | null }>; at: number } | null = null;
+
+/** How long a degraded verdict may be reused before it is re-derived, even
+ *  when every watched file is byte-identical.
+ *
+ *  The stat signatures catch the common invalidations immediately (the user
+ *  fixes the broken file, or sets the knob in the file it falls back to). But
+ *  the verdict also depends on an input no stat can watch: whether a project
+ *  `.yaw-mcp/` exists ANYWHERE between cwd and $HOME. That is a directory
+ *  walk, not a path, so a project bundles.json created mid-process would
+ *  otherwise stay invisible for the process lifetime -- silently inverting an
+ *  explicit defaultRuntime, which is the one failure this exemption exists to
+ *  prevent. Bounding the reuse in time makes EVERY input converge, including
+ *  the ones that cannot be enumerated, while still collapsing a burst of
+ *  connects into a single read. */
+const DEGRADED_RECHECK_MS = 5_000;
 let warnedDegradedBundles = false;
 
 /** mtime + size of a file, or null when it cannot be stat'ed (deleted, or the
@@ -181,7 +193,9 @@ export async function describeDefaultRuntime(
  * cwd for the process, so this is a test-ergonomics parameter, NOT a
  * per-call override -- key the cache before treating it as one.
  */
-export async function defaultRuntime(opts: { cwd?: string; home?: string } = {}): Promise<RuntimeChoice | null> {
+export async function defaultRuntime(
+  opts: { cwd?: string; home?: string; now?: () => number } = {},
+): Promise<RuntimeChoice | null> {
   const fromEnv = readEnvChoice(process.env);
   if (fromEnv !== null) return fromEnv;
   if (bundlesDefaultCache === undefined) {
@@ -189,7 +203,14 @@ export async function defaultRuntime(opts: { cwd?: string; home?: string } = {})
     // mean the whole load -- read, project-trust hash, parse -- ran again on
     // every connect for as long as the file stayed broken. One stat says
     // whether it is still the same file; if it is, so is the verdict.
-    if (degradedProbe?.every((f) => statSignature(f.path) === f.signature)) return null;
+    const now = opts.now ?? Date.now;
+    if (
+      degradedProbe !== null &&
+      now() - degradedProbe.at < DEGRADED_RECHECK_MS &&
+      degradedProbe.files.every((f) => statSignature(f.path) === f.signature)
+    ) {
+      return null;
+    }
     const bundles = await loadLocalBundles({ cwd: opts.cwd ?? process.cwd(), home: opts.home }).catch(() => null);
     // A bundles.json that EXISTS but yielded no config (unreadable, or JSON
     // that will not parse) is a degraded read, not an answer -- and it is
@@ -219,13 +240,27 @@ export async function defaultRuntime(opts: { cwd?: string; home?: string } = {})
       if (path === null || signature === null) {
         degradedProbe = null;
       } else {
-        // The broken file plus the user-global file it falls back to. Same
-        // construction local-bundles uses, so the two cannot disagree about
-        // which path that is. Deduped for the case where the broken file IS
-        // the user-global one.
-        const globalPath = localBundlesPath(join(opts.home ?? homedir(), CONFIG_DIRNAME));
-        const watched = path === globalPath ? [path] : [path, globalPath];
-        degradedProbe = watched.map((f) => ({ path: f, signature: statSignature(f) }));
+        // Watch every file the load CONSULTED, as reported by the loader --
+        // not a set derived from `path` here. Deriving it locally was wrong
+        // in both directions: keying on the broken file alone missed the
+        // user-global fallback, and adding the global path by hand still
+        // missed the project candidate when the GLOBAL file was the broken
+        // one (a project bundles.json created afterwards would never be
+        // seen). consultedPaths is built where those inputs are actually
+        // read, so it cannot drift from them.
+        // Watch every file the load CONSULTED, as reported by the loader --
+        // not a set derived from `path` here. Deriving it locally was wrong
+        // in both directions: keying on the broken file alone missed the
+        // user-global fallback, and adding the global path by hand still
+        // missed the project candidate. consultedPaths is built where those
+        // inputs are actually read, so it cannot drift from them. The
+        // DEGRADED_RECHECK_MS bound above covers what it still cannot list --
+        // a project `.yaw-mcp/` that does not exist yet.
+        const watched = bundles?.consultedPaths?.length ? bundles.consultedPaths : [path];
+        degradedProbe = {
+          files: watched.map((f) => ({ path: f, signature: statSignature(f) })),
+          at: now(),
+        };
       }
       if (!warnedDegradedBundles) {
         warnedDegradedBundles = true;

@@ -246,6 +246,41 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
   });
 
+  it("picks up a PROJECT bundles.json created after a broken GLOBAL file armed the cache", async () => {
+    // The mirror of the case above, and the hole the first version of this
+    // fix still had: when the BROKEN file is the user-global one, a watch set
+    // derived from it alone never sees the project candidate, so a project
+    // bundles.json created afterwards is invisible for the process lifetime.
+    // The watch set now comes from the loader's own consultedPaths, which
+    // lists the project candidate even when it does not exist yet -- its
+    // ABSENCE is part of the verdict, so creating it must invalidate.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(localBundlesPath(join(synthHome, CONFIG_DIRNAME)), "{ not json at all");
+
+    // Broken global, no project file -> degraded AND empty -> cache armed.
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    // User drops a project bundles.json in and approves it. The global file
+    // is untouched, so a global-only stat gate skips the re-read.
+    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    const projectFile = localBundlesPath(join(synthCwd, CONFIG_DIRNAME));
+    writeFileSync(projectFile, JSON.stringify({ version: 1, servers: [], defaultRuntime: "node" }));
+    const { grantTrust } = await import("../trust.js");
+    await grantTrust(projectFile, readFileSync(projectFile), { home: synthHome });
+
+    // Still inside the recheck window: the global file is byte-identical and
+    // no stat can see a directory that did not exist when the probe was
+    // armed, so the stale null is served. This is the documented bound, not
+    // an accident -- pinning it keeps the window from being quietly widened.
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    // Past the window, the verdict is re-derived and the new project file
+    // wins. Injected clock rather than a real wait: the guarantee is "bounded
+    // staleness", and a test that sleeps would pin the duration instead.
+    const past = () => Date.now() + 10_000;
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome, now: past })).toBe("node");
+  });
+
   it("still caches the healthy no-bundles.json case", async () => {
     // Only degraded-AND-empty is exempt. "Nothing configured anywhere" is the
     // common shape and sits on the connect path, so it must not re-read per

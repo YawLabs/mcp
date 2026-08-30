@@ -176,7 +176,11 @@ describe("redactIntent", () => {
     // thing deciding, and it decided wrong.
     const phone = redactIntent("call me at 555.123.4567 tomorrow");
     expect(phone.redactedCount).toBe(1);
-    expect(phone.tokens).not.toContain("555.123.4567");
+    // Assert on the DIGIT GROUPS, not the joined literal: tokenize splits on
+    // the dots, so no implementation can ever emit "555.123.4567" as a token
+    // and asserting its absence proves nothing. These are what the pre-fix
+    // code actually persisted.
+    expect(phone.tokens).toEqual(["call", "tomorrow"]);
 
     // The shapes the exclusion exists for must still survive it. tokenize()
     // splits on the dots, so the surviving evidence is the digit groups plus

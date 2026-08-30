@@ -1097,7 +1097,7 @@ describe("scanTrials + gcExpiredTrials", () => {
     expect(scan.malformed).toHaveLength(1);
   });
 
-  it("GC peels the expired entry out of the client config + fires expiry-gc event + deletes the marker", async () => {
+  it("GC peels the expired entry out of the client config + deletes the marker", async () => {
     const baseNow = 1_700_000_000_000;
     // Pre-populate the client config with the entry the marker points at.
     writeFileSync(

@@ -521,11 +521,17 @@ describe("scanShellHistoryForShadows", () => {
     // then name the SAME file, and the scan counted every command in it twice
     // -- which inflates SHADOWED CLI USAGE and can push a CLI over the
     // reporting threshold on a single real invocation.
+    // The fixture is deliberately MIXED -- one extended-history line and one
+    // bare line. An all-extended fixture cannot manifest the bug at all: the
+    // `plain` reader scores ':' as the leading binary for every line, so it
+    // contributes nothing, the double-count never appears, and the test
+    // passes against the un-deduped code too. With one bare line, a single
+    // number separates all three behaviours: 3 un-deduped (the bare line
+    // counted by both readers), 1 if the dedupe wrongly keeps the FIRST
+    // (plain) entry, and 2 only when it keeps the format-aware one.
     const zsh = join(synthHome, ".zsh_history");
-    writeFileSync(zsh, [": 1700000000:0;npm audit", ": 1700000001:0;npm search lodash"].join("\n"));
+    writeFileSync(zsh, [": 1700000000:0;npm audit", "npm search lodash"].join("\n"));
     const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: zsh } });
-    // 2, not 4 (double-counted) and not 0 (deduped down to the `plain`
-    // reader, which sees ':' as the leading binary for a zsh-format line).
     expect(hits.find((h) => h.cli === "npm")?.count).toBe(2);
   });
 

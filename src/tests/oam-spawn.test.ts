@@ -1262,8 +1262,9 @@ describe("resolveNpmEntry", () => {
     // The broker's own node_modules is authoritative only when it is DURABLE.
     // Under _npx it is a cache copy like any other, so taking it outright let
     // a stale sidecar sitting in our own content-hashed dir preempt a newer
-    // copy the highest-version scan exists to find -- and it carried the
-    // "npm install" refresh advice, which cannot refresh a hashed dir anyway.
+    // copy the highest-version scan exists to find. (Only the ranking was
+    // wrong: the replaced branch already tagged an own _npx copy "npx-cache",
+    // so the refresh advice it carried was the npx one, not "npm install".)
     const { npx, brokerUrl, cleanup } = fixture();
     const own = join(npx, "aaa", "node_modules", "@yawlabs", "fetch-mcp");
     writeManifest(own, { name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } });

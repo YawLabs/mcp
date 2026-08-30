@@ -564,6 +564,23 @@ export interface LoadLocalBundlesResult {
    *  the user-global file even when servers came from a project file -- see
    *  above). Undefined when defaultRuntime is undefined. */
   defaultRuntimePath?: string;
+  /** Every path this load READ or would have read, whether or not it
+   *  contributed: the project candidate (when the walk found a `.yaw-mcp/`,
+   *  trusted or not) and the user-global file, deduped.
+   *
+   *  Exists so a caller that CACHES a verdict can invalidate on any input
+   *  that could change it. Deriving that set from `path` alone is wrong in
+   *  both directions -- a broken PROJECT file still falls back to the global
+   *  file for defaultRuntime, and a broken GLOBAL file can be superseded by a
+   *  project file created later -- and each direction was a separate bug in
+   *  default-runtime's negative cache. A path is listed even when it does not
+   *  exist: its ABSENCE is part of the verdict, so creating it must
+   *  invalidate too.
+   *
+   *  ORDERING IS PART OF THE CONTRACT: the user-global path is always LAST,
+   *  and a project candidate, when the walk found one, is first. A caller can
+   *  therefore tell the two apart without re-deriving either path. */
+  consultedPaths: string[];
 }
 
 /** Load bundles.json from the canonical locations. An APPROVED project-local
@@ -590,6 +607,10 @@ export async function loadLocalBundles(
   const probe = await probeProjectTrust({ cwd, home, env: opts.env });
   const honoured = projectFileIsHonoured(probe);
   const projectPath = honoured ? probe.path : null;
+  // probe.path, NOT projectPath: an UNTRUSTED project file is still an input
+  // to the verdict (approving it later changes the answer), so a caller
+  // caching on this set has to see it.
+  const consultedPaths = probe.path !== null && probe.path !== globalPath ? [probe.path, globalPath] : [globalPath];
   if (probe.path !== null && probe.status !== "none" && !honoured) {
     warnings.push(untrustedProjectWarning(probe));
     // DEBUG, not warn: the same facts are already in the warning above, which
@@ -650,10 +671,11 @@ export async function loadLocalBundles(
           warnings,
           defaultRuntime: globalResult.file.defaultRuntime,
           defaultRuntimePath: globalPath,
+          consultedPaths,
         };
       }
     }
-    return { config: null, path: sourcePath, warnings };
+    return { config: null, path: sourcePath, warnings, consultedPaths };
   }
 
   const servers: UpstreamServerConfig[] = [];
@@ -687,6 +709,7 @@ export async function loadLocalBundles(
     warnings,
     defaultRuntime,
     defaultRuntimePath,
+    consultedPaths,
   };
 }
 

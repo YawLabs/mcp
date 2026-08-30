@@ -2465,4 +2465,27 @@ describe("runInstall --all — an all-refused run", () => {
     expect(r.exitCode).toBe(1);
     expect(cap.stdout()).not.toContain(OAM_INSTALL_SH);
   });
+
+  it("DOES print the oam-absent tip on a fully successful --all --skip run", async () => {
+    // The other side of the gate above, and the case that had no coverage: a
+    // client that already has an entry is a SUCCESS that writes nothing, so
+    // both aggregate lists are empty. Gating on those alone made the tip
+    // vanish from exactly the run where every entry it describes is present
+    // and about to be used -- and the per-client copies are suppressed on
+    // --all, so it disappeared entirely rather than merely being duplicated.
+    seedBothColliding();
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      skip: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toHaveLength(0);
+    expect(cap.stdout()).toContain(OAM_INSTALL_SH);
+  });
 });
