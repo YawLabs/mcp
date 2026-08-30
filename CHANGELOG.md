@@ -72,7 +72,41 @@ Only the leading separator was keyed to the listed OS, leaving the rest host-sha
 
 The config JSON schema was referenced by `$id` and reachable only through a raw GitHub URL; it is in the `files` array now. `@types/node` moved from `^26` to `^20` to match `engines: >=20` and the `node20` build target -- the type surface had been admitting APIs that compile clean and throw on the oldest Node the package claims to support. It type-checks clean at the lower floor, so nothing was relying on them.
 
-## 0.75.5 -- the oam floor moves to 0.11.0, and three oam facts get re-measured
+## 0.76.2 -- no code changes
+
+Published 2026-08-27 carrying nothing but the version number: no source change, no dependency change, no metadata change beyond the bump itself. 0.76.1 had published to npm successfully three days earlier, so this was not a recovery from a failed release, and the repository records no reason for it -- the tag is unannotated and the commit touches only `package.json`, `package-lock.json` and `server.json`. Documented so a reader who finds no entry can tell "nothing shipped" from "nobody wrote it down".
+
+## 0.76.1 -- seventeen review findings against the 0.76.0 hardening pass
+
+The follow-up round to the sweep below, fixing what that sweep got wrong or left half-applied.
+
+**Changed (BREAKING) -- a `.yaw-mcp/` outside `$HOME` is no longer trusted by default**
+
+A project config directory found above the current checkout but outside `$HOME` is now skipped unless it is demonstrably owned by the current user. On platforms where ownership cannot be verified -- Windows in particular, where `geteuid` does not exist -- that means it is skipped outright, with one warning naming the candidate and the way back: `YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS=1`. A shared checkout on a multi-user box, or a repo cloned to a drive outside the home tree, will stop picking up a `bundles.json` it used to load.
+
+**Fixed -- Windows launcher entries lost or gained arguments to the `.cmd` shim**
+
+An argument containing `&` was re-parsed by the npm `.cmd` shim's `%*` expansion, truncating the command at the ampersand and, in the worst shape, letting the remainder run as a second command. Entries are now written so they survive that re-parse intact.
+
+**Fixed -- a symlinked or case-variant `$HOME` made yaw-mcp load the user's own config as project config**
+
+The walk that looks for a project `.yaw-mcp/` compared paths without resolving symlinks or normalising case, so on macOS and Windows the user-global directory could be claimed as a project directory and loaded twice under two different scopes.
+
+**Fixed -- startup pre-warm could disconnect a server that was already live**
+
+Pre-warm spawns dormant servers and tears them down again. It did not check whether a namespace had been activated in the meantime, so a server the client had explicitly loaded could be dropped underneath it. Servers started during boot now also see the client's real capabilities, so elicitation, sampling and roots work on them instead of being silently unavailable.
+
+**Fixed -- an activation could be held open by a misbehaving upstream**
+
+A server that kept returning a next-page cursor could hold an activation open for roughly a thousand sequential list requests. That is now bounded.
+
+**Fixed -- smaller truth-ups**
+
+`activate`, `dispatch` and `discover` announce a `tools/list` change when they advertise a server that was already connected. Every upgrade command yaw-mcp prints now pins the same `--prefix` it would actually spawn and pastes as a single token. macOS trust grants written by older builds are recognised again instead of re-prompting, and the `trust grant` review stops calling a `pkg@v1.2.3` pin unpinned. Cached compliance grades record the rubric that produced them rather than a constant protocol date. `list --json` shows required env keys that were seeded blank, matching `add --json`. The oam pinned-sidecar refresh command is copy-paste safe in `cmd.exe`.
+
+## 0.76.0 -- the oam floor moves to 0.11.0, and a full-pass sweep across platform, protocol and freshness
+
+The oam section below was previously filed in this changelog under a `0.75.5` heading. That version was never tagged and never published; the work shipped here, and the heading has been folded in rather than left pointing at a release that does not exist.
 
 **Changed -- the oam floor moves to 0.11.0**
 
@@ -103,6 +137,86 @@ The gate answers only for the CURRENT machine, deliberately. `doctor` and `insta
 **Fixed -- two stale citations**
 
 `doctor`'s comment explaining the unparseable-version line quoted a floor two bumps old, and the prerelease-ranking test described itself as running "against a 0.8.3 floor" while asserting against whatever `MIN_OAM_VERSION` currently is. Both now read floor-agnostically, so the next bump cannot strand them again. Relatedly, `upstream.test.ts`'s `oam-spawn` mock listed its two exports by hand, so importing one more thing from that module in `upstream.ts` broke every test in the file with an error that surfaced as an unrelated redaction failure; it spreads the real module now and overrides only the spawn and probe entry points.
+
+**Fixed -- the vault passphrase reached spawned upstream servers**
+
+`YAW_MCP_VAULT_PASSPHRASE`, its rotation counterpart, and the legacy `YAW_MCP_TOKEN` were inherited by every child process yaw-mcp spawned, so an upstream server could read the key that unlocks the local secret vault out of its own environment. All three are now stripped from the child environment, and the match is case-insensitive because Windows environment lookups are.
+
+**Fixed -- `list --json` printed stored secret values**
+
+A `bundles.json` entry can carry a `--env` secret, and `list --json` is exactly the output that gets piped into CI logs and pasted into bug reports. It now reports `envKeys` -- key names only, never the values -- matching what `add --json` already did.
+
+**Fixed -- Windows `cmd /c` entries let cmd.exe metacharacters split the command**
+
+An entry whose command or arguments contained `&`, `|`, `<`, `>`, `^` or parentheses was written unquoted into the client config, where cmd.exe would treat those characters as chaining, piping and redirection rather than as data. They are escaped now.
+
+**Fixed -- data loss and platform-correctness on the storage paths**
+
+A `state.json` hand-edited in Notepad came back with a UTF-8 BOM, which failed to parse and took every learned tool list, every pack detection and all cross-session learning with it -- the file now tolerates the BOM. Atomic writes on Windows survive a transient handle held by antivirus, an indexer or a sync client instead of failing the write. The bootstrapped `uv` binary is selected to match the machine's libc and architecture rather than assuming glibc/x64, a `uv` or `uvx` server configured with a Windows executable extension now bootstraps instead of failing to launch, and a wedged `uv` PATH probe can no longer keep the process from exiting.
+
+**Fixed -- protocol conformance against real upstream servers**
+
+Paginated upstreams lost everything past the first page. Proxied servers could no longer prompt for input, request sampling, or read workspace roots. Proxied tools lost their `outputSchema`, `title` and `_meta` in `tools/list`, tools requiring task-based execution were advertised as directly callable, and `resources/templates/list` answered `Method not found` instead of an empty result. Progress notifications stalled, duplicated, or ran past 100%. Screenshot and structured-output servers were marked flaky for the crime of returning no text.
+
+**Fixed -- config and CLI surfaces that reported the wrong thing**
+
+Servers added with `yaw-mcp add` started with their shell-provided env vars blanked. `audit` blamed the namespace you typed when the real fault was a malformed `bundles.json`. Windows project-scope installs wrote a `projects` key Claude Code does not read. `install --os <other-os>` is now refused unless paired with `--dry-run` or `--list`, since it can only ever describe another machine. Upgrading over an older install strips every dead `permissions.allow` wildcard rather than the hand-kept subset. Project config, the `YAW-MCP.md` guide and project bundles are found for checkouts outside `$HOME`, and legacy migration reaches a home directory reached by a dot-dot path.
+
+Malformed and whitespace-padded environment settings fall back to their documented defaults instead of silently changing behaviour; four working-but-undocumented environment variables appear in `--help`; and `exec` rejects a step named `__proto__` up front instead of losing its output.
+
+**Changed -- freshness policy**
+
+Learned tool lists are re-verified weekly rather than trusted for the full 30-day persistence window, so an upstream that renames or drops a tool is caught within a week. `add` and `try` warn when the catalog snapshot they resolved against is more than 90 days old. Cached compliance grades record which rubric produced the letter, and the compliance suite dependency moves to `^0.17.1`.
+
+## 0.75.4 -- the "prefer over local CLI" hint starts firing
+
+**Fixed -- the CLI-shadow hint never appeared for a configured server**
+
+`formatShadowLine` decided whether a server shadowed a local CLI by reading `server.toolCache` -- a field that production config never carries. `validateEntry` drops every key outside its whitelist, so a `toolCache` written into `bundles.json` by hand was stripped on load, the cached list was always undefined, and the guard bailed before emitting anything. The hint was unreachable in normal use.
+
+It now reads the tool list yaw-mcp learns at connect time, so a server whose tools share a known CLI prefix (`npm_search`, `npm_audit`, ...) gets `prefer over local CLI: npm` in `mcp_connect_discover`, and the built-in guide resource starts appearing in `resources/list` for the same reason -- it renders empty, and is therefore withheld, when nothing matches.
+
+This works for any namespace the loader accepts: lowercase letters, digits and underscores. A namespace containing a hyphen is rejected by the loader itself and the whole server entry is skipped, so hyphenated names do not reach this path at all.
+
+The rest of the release is internal: the tool-cache merge was deduplicated into a single helper, its object-identity and profile-ordering invariants were pinned by tests, and several comments describing the shadow guard as dead code were corrected now that the path is live.
+
+## 0.75.2 -- no code changes
+
+Published 2026-08-11 carrying nothing but the version number, the same shape as 0.76.2 above. 0.75.1 had published successfully two days earlier, and the repository records no reason for the bump. (0.75.3 was never tagged and never published; there is nothing missing between this entry and the next.)
+
+## 0.75.1 -- the gateway gate reaches resources and prompts
+
+**Fixed -- `resources/list` and `prompts/list` still advertised servers the client had never activated**
+
+0.75.0 gated `tools/list` on the set of servers activated in this session but left the other two list surfaces ungated, so a server the client had not asked for still contributed its resources and its prompts. Both now take the same gate.
+
+Two carve-outs are deliberate. Built-in resources are emitted before the connection loop, so they are never withheld. And the read and get routes are left ungated: a resource or prompt that is not listed is still reachable by URI or by name, exactly as an unadvertised tool remains callable.
+
+The stakes are lower than for tools. Neither list is inlined into every model request the way the tool list is, so the cost this removes is client surface area -- the entries that fill @-mention and slash-command menus -- rather than per-turn context.
+
+**Fixed -- the session-activation flag outlived the teardown paths that should have cleared it**
+
+Unloading a server now clears its gateway activation alongside the existing idle-count and tool-filter cleanup, so a namespace cannot stay advertised after being unloaded. Two of the paths hardened here turned out to be unreachable -- `reconcileConfig` ran once during startup, before any connection could exist, so its body never had a connection to iterate -- and were deleted outright in 0.77.0.
+
+## 0.75.0 -- the gateway becomes the default surface
+
+**Changed (BREAKING) -- `tools/list` advertises the gateway, not the whole catalog**
+
+Every `tools/list` used to inline the entire catalog: the ten `mcp_connect_*` meta-tools, every tool of every connected upstream, and a deferred placeholder for every cached-but-inactive configured server. On the maintainer's install that came to 252 tools and roughly 27,000 tokens -- about 13% of a 200K context window -- sent before the user had typed anything. A 32,768-token local model died with a hard 400 on every turn; that install now fits.
+
+It now advertises the ten meta-tools plus only the namespaces the client has explicitly activated this session. Nothing becomes unreachable: the routing table still covers every tool whether advertised or not, so `mcp_connect_dispatch` and a direct `tools/call` by name both still activate the server and reach a tool that was never listed. Discovery moves to `mcp_connect_discover` / `_suggest` / `_bundles` followed by an explicit activate.
+
+The old cost was invisible in Claude Code, which hides tool descriptions locally. Clients without that compensation paid the full 27,000 tokens.
+
+**Added -- `YAW_MCP_TOOL_EXPOSURE`**
+
+`full` restores the previous surface, and it is the only way back -- there is no `bundles.json` key and no CLI flag for it. Unset, empty and `gateway` all select the new default. An unrecognised value logs `unrecognized YAW_MCP_TOOL_EXPOSURE "..."; using "gateway"` rather than silently restoring the 27,000-token payload, and the variable is re-read on every `tools/list` instead of being cached at startup.
+
+**Changed -- `activate` and `deactivate` now actually move tools in and out of the client's list**
+
+Both used to be no-ops as far as the advertised surface went: everything was listed all the time, live tools directly and idle ones as placeholders, which made `Unloaded "X". Tools removed from context.` untrue. Activating a server by name now adds its namespace to the advertised surface and unloading removes it.
+
+Being merely connected does not qualify, and that is deliberate -- pre-warm spawns dormant servers on its own, so keying on connectedness would have re-advertised the whole catalog through the back door. A dispatch, a deferred first call or a discover auto-warm each reach their tool without dumping the rest of that namespace into the list. The set is session-scoped and never persisted, so every new client session starts back at the ten meta-tools.
 
 ## 0.74.3 -- an absent oam says how to install it, and bundled browsers turn out to be hostable
 
