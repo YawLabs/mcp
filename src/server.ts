@@ -80,7 +80,7 @@ import {
   shouldSample,
 } from "./sampling-rank.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
-import { evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
+import { type CapDecision, evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, type DownstreamClientBridge, disconnectFromUpstream } from "./upstream.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
@@ -241,23 +241,6 @@ export function resolveNamespaces(args: Record<string, unknown>): string[] {
   return [];
 }
 
-/** Shallow value-equality for two env maps (undefined == undefined). */
-export function envEqual(a?: Record<string, string>, b?: Record<string, string>): boolean {
-  if (!a && !b) return true;
-  if (!a || !b) return false;
-  const keysA = Object.keys(a);
-  const keysB = Object.keys(b);
-  if (keysA.length !== keysB.length) return false;
-  return keysA.every((k) => a[k] === b[k]);
-}
-
-function argsEqual(a?: string[], b?: string[]): boolean {
-  if (!a && !b) return true;
-  if (!a || !b) return false;
-  if (a.length !== b.length) return false;
-  return a.every((v, i) => v === b[i]);
-}
-
 /**
  * True if `p` settled within `ms`, false if the budget expired first.
  * Never rejects — the caller only wants to know whether to keep waiting.
@@ -360,7 +343,7 @@ export class ConnectServer {
   // When a namespace has an entry, only those BARE tool names surface in
   // tools/list; routing tables stay complete so mcp_connect_dispatch can
   // still reach unlisted tools. Cleared on activate-without-tools of the
-  // same namespace, on deactivate, and on config reconcile.
+  // same namespace and on deactivate.
   private toolFilters = new Map<string, Set<string>>();
   // Namespaces the CLIENT explicitly activated this session. In gateway mode
   // (the default) this is the entire surface tools/list advertises beyond the
@@ -758,8 +741,8 @@ export class ConnectServer {
     return Date.now() - learnedAt > ConnectServer.TOOLCACHE_REFRESH_MS;
   }
 
-  // Seed the in-memory tool cache from the persisted snapshot. Runs before
-  // reconcileConfig so the first tools/list of the session can already
+  // Seed the in-memory tool cache from the persisted snapshot. Runs early
+  // in start() so the first tools/list of the session can already
   // include deferred servers' tools. Entries for namespaces no longer in
   // bundles.json are harmless — every reader iterates the CONFIGURED
   // servers — and age out via the persistence-layer TTL.
@@ -916,9 +899,9 @@ export class ConnectServer {
     });
     for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
     this.config = result.config ?? { servers: [], configVersion: "" };
-    // Deduplicate by namespace -- keep first occurrence. reconcileConfig
-    // and the routing state assume one server per namespace, so a
-    // duplicate in bundles.json has to be filtered before either sees it.
+    // Deduplicate by namespace -- keep first occurrence. The routing
+    // state assumes one server per namespace, so a duplicate in
+    // bundles.json has to be filtered before it is ever read.
     const seenNs = new Set<string>();
     this.config.servers = this.config.servers.filter((s) => {
       if (seenNs.has(s.namespace)) {
@@ -933,11 +916,19 @@ export class ConnectServer {
       path: result.path,
       serverCount: this.config.servers.length,
     });
-    // Overlay cached compliance grades BEFORE reconcile, so the routing
-    // state and every downstream grade reader see the same graded config.
+    // Overlay cached compliance grades BEFORE anything reads the config,
+    // so the routing state and every downstream grade reader see the same
+    // graded server list.
+    //
+    // NOTE: there is deliberately NO config "reconcile" step here. A
+    // reconcileConfig method (deactivate servers removed/changed in a new
+    // config) lived at this call site for a long time, but bundles.json is
+    // read exactly ONCE per process (discover's own user-facing text says
+    // so) and start() runs before any connection can exist, so its entire
+    // diff/deactivate body was dead code with live-looking tests. If a
+    // hot-reload path ever lands, reintroduce it AS the reload handler --
+    // do not resurrect it here.
     await this.hydrateComplianceGrades();
-    // Reconcile so the loaded servers populate the routing state.
-    await this.reconcileConfig(this.config);
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
@@ -1109,7 +1100,16 @@ export class ConnectServer {
         batch.map(async (server) => {
           try {
             const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
-            if (!result.ok) return;
+            if (!result.ok) {
+              // A failed prewarm means the namespace gets no toolCache
+              // entry and stays invisible in tools/list for the session --
+              // the exact UX prewarm exists to prevent. Never silent.
+              log("warn", "Pre-warm could not learn a dormant server's tools", {
+                namespace: server.namespace,
+                message: result.message,
+              });
+              return;
+            }
             // isChanged:false means runActivateOne's already-connected
             // early return fired -- someone else (an earlier batch's claimed
             // activate, auto-load, a client call) connected this namespace
@@ -1209,7 +1209,15 @@ export class ConnectServer {
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
       // calling tools. Ambiguous queries fall through to the manual list.
-      return this.attachGuideNudge(await this.handleDiscoverWithAutoWarm(args.context as string | undefined, progress));
+      // typeof guard like every sibling arg (intent, server, tool): the
+      // low-level Server does not validate tool input against inputSchema,
+      // so a non-string context from a misbehaving client would otherwise
+      // survive the `!context` falsiness check and throw a TypeError inside
+      // the BM25 tokenizer -- surfacing as a raw JSON-RPC internal error
+      // instead of a tool result.
+      return this.attachGuideNudge(
+        await this.handleDiscoverWithAutoWarm(typeof args.context === "string" ? args.context : undefined, progress),
+      );
     }
     if (name === META_TOOLS.dispatch.name) {
       const intent = typeof args.intent === "string" ? args.intent : "";
@@ -1334,75 +1342,91 @@ export class ConnectServer {
       if (conn && conn.status === "error") {
         const serverConfig = this.config?.servers.find((s) => s.namespace === ns);
         if (serverConfig) {
-          let reconnected = false;
-          let lastErr: unknown;
-          // Retry once with a 1s delay between attempts. Two attempts is
-          // intentional (we don't want a slow upstream to stall a tool call
-          // for a long time -- after this, surface the error and let the
-          // user re-activate manually).
-          const RECONNECT_ATTEMPTS = 2;
-          const RECONNECT_DELAY_MS = 1000;
-          for (let attempt = 0; attempt < RECONNECT_ATTEMPTS; attempt++) {
-            if (attempt > 0) await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
-            try {
-              await disconnectFromUpstream(conn);
-              // Re-inject any session-elicited credentials for this namespace
-              // before re-spawning — otherwise the reconnect uses the raw
-              // configured env and re-trips the same missing-credential error
-              // the user already supplied a value for this session.
-              const elicitedForReconnect = this.elicitedEnv.get(ns);
-              const reconnectConfig = elicitedForReconnect
-                ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForReconnect } }
-                : serverConfig;
-              const newConn = await connectToUpstream(
-                reconnectConfig,
-                this.onUpstreamDisconnect,
-                this.onUpstreamListChanged,
-                this.clientBridge,
-              );
-              this.connections.set(ns, newConn);
-              await this.refreshRoutesAndNotify();
-              log("info", "Auto-reconnected to upstream", { namespace: ns });
-              reconnected = true;
-              // rebuildRoutes() replaced this.toolRoutes; re-snapshot so the
-              // dispatch below routes against the fresh map, not the stale
-              // one captured at method entry. If the reconnected upstream no
-              // longer exposes a tool by this name (its tool set changed),
-              // fall through to the same clear "no longer available" message
-              // the deferred path emits above.
-              routes = this.toolRoutes;
-              route = routes.get(name);
-              if (!route || route.deferred) {
-                return brandRoutingFault({
-                  content: [
-                    {
-                      type: "text",
-                      text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after reconnecting "${serverConfig.namespace}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
-                    },
-                  ],
-                  isError: true,
-                });
-              }
-              break;
-            } catch (err) {
-              lastErr = err;
-              if (attempt < RECONNECT_ATTEMPTS - 1) {
-                log("warn", "Auto-reconnect attempt failed, retrying", {
-                  namespace: ns,
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
-            }
-          }
-          if (!reconnected) {
-            conn.status = "error";
-            const lastErrMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
-            log("error", "Auto-reconnect failed", { namespace: ns, error: lastErrMsg });
+          // Route the reconnect through activateOne rather than calling
+          // connectToUpstream inline. The inline path was a second,
+          // unguarded activation surface: it bypassed the in-flight dedup,
+          // the server cap (with a self-allowance for the slot this
+          // namespace already owns -- see evaluateCapFor), the
+          // compliance/profile gates, the shuttingDown latch, and the
+          // toolCache/learnedAt/activationFailures refresh. activateOne
+          // provides all of those plus the same retry and elicited-env
+          // re-injection semantics (runActivateOne merges this.elicitedEnv
+          // and retries once).
+          //
+          // ORDER MATTERS: the dead transport is closed AFTER the
+          // activation settles, never before. The old shape disconnected
+          // first, and disconnectFromUpstream flips status to
+          // "disconnected" synchronously -- so for the whole respawn await,
+          // a concurrent tools/call failed this branch's status === "error"
+          // gate, fell through to routeToolCall, and got a spurious "no
+          // longer connected" fault while yaw-mcp was itself
+          // mid-reconnect. Leaving the error-state entry in the map keeps
+          // every concurrent caller entering THIS branch, where
+          // activateOne's dedup makes them all await the one shared
+          // respawn. runActivateOne replaces the map entry on success
+          // without closing the old client, so the close below is the old
+          // transport's only teardown.
+          const staleConn = conn;
+          // Sampled BEFORE activateOne: false means we are about to START
+          // the activation (its initiator); true means we will JOIN one
+          // already in flight. Used below to send the list_changed
+          // notifications exactly once per reconnect.
+          const joinedExisting = this.activationInflight.has(ns);
+          progress?.(`Reconnecting "${ns}"…`);
+          const activation = await this.activateOne(ns, progress);
+          if (!activation.ok) {
+            // Close the dead transport (idempotent, swallows errors), then
+            // restore "error" so a later call can still retry -- this
+            // branch gates on it.
+            await disconnectFromUpstream(staleConn);
+            staleConn.status = "error";
+            log("error", "Auto-reconnect failed", { namespace: ns, error: activation.message });
             return brandRoutingFault({
               content: [
                 {
                   type: "text",
-                  text: `Server "${ns}" disconnected and ${ROUTING_FAULT_RECONNECT_FAILED}: ${lastErrMsg}. Use mcp_connect_activate with server "${ns}" to reload it manually.`,
+                  text: `Server "${ns}" disconnected and ${ROUTING_FAULT_RECONNECT_FAILED}: ${activation.message} Use mcp_connect_activate with server "${ns}" to reload it manually.`,
+                },
+              ],
+              isError: true,
+            });
+          }
+          // Success: the map now holds the fresh connection; close the
+          // orphaned old transport. The guard's ONE invariant is never
+          // closing the connection currently in the map (the live one).
+          // Every sharer of a deduped activation passes the check and
+          // closes staleConn -- that repeat close is safe only because
+          // disconnectFromUpstream is idempotent and swallows close errors
+          // (and the "error" status means the transport was already dead).
+          // Do not make disconnectFromUpstream non-idempotent.
+          if (this.connections.get(ns) !== staleConn) {
+            await disconnectFromUpstream(staleConn);
+          }
+          log("info", "Auto-reconnected to upstream", { namespace: ns });
+          // Rebuild is needed by construction (we got here holding a route
+          // into a dead connection, and the fresh upstream's tool set may
+          // differ) -- so EVERY sharer rebuilds the routing tables locally
+          // (synchronous, idempotent, no wire traffic) before its own
+          // re-dispatch. The list_changed NOTIFICATIONS, though, go out
+          // once per reconnect: only the activation's initiator sends
+          // them. Notifying per sharer emitted N x three list_changed
+          // triplets (and N list refetches from clients like Claude Code)
+          // for one reconnect. If the upstream no longer exposes a tool by
+          // this name, surface the same clear "no longer available"
+          // message the deferred path emits.
+          if (joinedExisting) {
+            this.rebuildRoutes();
+          } else {
+            await this.refreshRoutesAndNotify();
+          }
+          routes = this.toolRoutes;
+          route = routes.get(name);
+          if (!route || route.deferred) {
+            return brandRoutingFault({
+              content: [
+                {
+                  type: "text",
+                  text: `Tool "${name}" is ${ROUTING_FAULT_TOOL_GONE} after reconnecting "${serverConfig.namespace}" — the upstream's tool set changed. Call mcp_connect_discover to list the current tools for that namespace.`,
                 },
               ],
               isError: true,
@@ -2143,7 +2167,27 @@ export class ConnectServer {
     // An explicit (non-prewarm) activation claims the namespace: prewarm
     // must not tear down a connection the user asked for.
     if (!fromPrewarm) {
-      this.prewarmNamespaces.delete(namespace);
+      const wasPrewarmClaim = this.prewarmNamespaces.delete(namespace);
+
+      // Joining a PREWARM-initiated in-flight activation needs its own cap
+      // check: the prewarm activation skipped it (prewarm never advertises
+      // tools), but a claim converts that connection into a real, advertised
+      // one. Without this, an explicit activate landing while prewarm was
+      // mid-spawn slipped a live server past a full cap. On refusal, restore
+      // the prewarm claim so prewarm's teardown proceeds normally, and
+      // refuse exactly like a fresh activation would.
+      if (wasPrewarmClaim && this.activationInflight.has(namespace)) {
+        const capDecision = this.evaluateCapFor(namespace);
+        if (!capDecision.allow) {
+          this.prewarmNamespaces.add(namespace);
+          return Promise.resolve({
+            ok: false,
+            isChanged: false,
+            capped: true,
+            message: capDecision.message ?? "Concurrent server cap reached.",
+          });
+        }
+      }
     }
 
     const inflight = this.activationInflight.get(namespace);
@@ -2156,7 +2200,7 @@ export class ConnectServer {
       this.prewarmNamespaces.add(namespace);
     }
 
-    const promise = this.runActivateOne(namespace, progress).finally(() => {
+    const promise = this.runActivateOne(namespace, progress, fromPrewarm).finally(() => {
       // Clear only if this promise is still the registered one. If a
       // retry path (maybeElicitAndRetry → activateOne) has already
       // registered a follow-up, leave that one in place.
@@ -2168,9 +2212,59 @@ export class ConnectServer {
     return promise;
   }
 
+  // Evaluate the concurrent-server cap for one candidate namespace against
+  // the CURRENT slot occupancy. Shared by runActivateOne and the prewarm
+  // claim path in activateOne so the two can never disagree on what counts.
+  //
+  // What occupies a slot: connected non-prewarm connections, plus pending
+  // reservations (a DIFFERENT namespace mid-`await connectToUpstream`
+  // occupies a slot even though its connection isn't in this.connections
+  // yet -- without that, two concurrent activations of distinct namespaces
+  // both pass the check against the same connected set and overshoot the
+  // cap, a TOCTOU). Prewarm-claimed namespaces are exempt in both
+  // directions -- see the fromPrewarm note at the runActivateOne call site.
+  //
+  // What gets a self-allowance: the candidate's OWN entry in
+  // this.connections, at status "error" ONLY. A dead (error-state)
+  // connection represents a slot that was already granted -- auto-reconnect
+  // re-spawns through this same path, and refusing it at a full cap would
+  // strand a legitimately-loaded server in its error state (with a refusal
+  // message pointing at mcp_connect_activate, which would refuse
+  // identically). evaluateServerCap treats a namespace present in `loaded`
+  // as free. A "disconnected" entry gets NO allowance: that status only
+  // exists mid-teardown (disconnectFromUpstream flips it synchronously,
+  // then the prewarm teardown / idle reaper / deactivate await the close
+  // before deleting the map entry), i.e. the slot is being RELEASED -- an
+  // activate landing in that multi-second window must queue behind the cap
+  // like any fresh activation, not ride a slot that is going away. The
+  // auto-reconnect path never sees this: its stale entry reads "error" for
+  // the entire activation (the failure path restores "error" after the
+  // close, keeping later retries eligible).
+  private evaluateCapFor(namespace: string): CapDecision {
+    const loadedSlots: LoadedSlot[] = [];
+    const counted = new Set<string>();
+    for (const [ns, conn] of this.connections) {
+      const ownDeadSlot = ns === namespace && conn.status === "error";
+      if ((conn.status === "connected" || ownDeadSlot) && !this.prewarmNamespaces.has(ns)) {
+        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        counted.add(ns);
+      }
+    }
+    for (const ns of this.pendingActivations) {
+      // Skip self (not reserved yet), anything already counted as a
+      // live connection, and prewarm-claimed reservations.
+      if (ns !== namespace && !counted.has(ns) && !this.prewarmNamespaces.has(ns)) {
+        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        counted.add(ns);
+      }
+    }
+    return evaluateServerCap(namespace, loadedSlots, this.serverCap);
+  }
+
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
+    fromPrewarm = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
@@ -2241,30 +2335,28 @@ export class ConnectServer {
     // its connection isn't in this.connections yet. Without this, two
     // concurrent activations of distinct namespaces both pass the check
     // against the same connected set and overshoot the cap (TOCTOU).
-    const loadedSlots: LoadedSlot[] = [];
-    const counted = new Set<string>();
-    for (const [ns, conn] of this.connections) {
-      if (conn.status === "connected") {
-        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
-        counted.add(ns);
+    // The cap exists to bound the LLM's context (server-cap.ts), and
+    // prewarm contributes nothing to it: prewarm connections are never
+    // advertised (gateway exposure keys on sessionActivated) and are torn
+    // down within milliseconds of learning the tool list. So prewarm is
+    // exempt in BOTH directions -- a prewarm activation skips the check
+    // (fromPrewarm), and prewarm-claimed namespaces do not occupy slots
+    // that would refuse a concurrent real activation (the startup race
+    // with autoLoadRecurringPack: both fire from oninitialized, and a
+    // batch of 3 prewarm reservations used to eat half a default cap of
+    // 6). A prewarm namespace CLAIMED by an explicit activate leaves
+    // prewarmNamespaces (activateOne with fromPrewarm=false deletes it)
+    // and starts counting like any other connection.
+    if (!fromPrewarm) {
+      const capDecision = this.evaluateCapFor(namespace);
+      if (!capDecision.allow) {
+        return {
+          ok: false,
+          isChanged: false,
+          capped: true,
+          message: capDecision.message ?? "Concurrent server cap reached.",
+        };
       }
-    }
-    for (const ns of this.pendingActivations) {
-      // Skip self (not reserved yet) and anything already counted as a
-      // live connection, so a reservation never double-occupies a slot.
-      if (ns !== namespace && !counted.has(ns)) {
-        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
-        counted.add(ns);
-      }
-    }
-    const capDecision = evaluateServerCap(namespace, loadedSlots, this.serverCap);
-    if (!capDecision.allow) {
-      return {
-        ok: false,
-        isChanged: false,
-        capped: true,
-        message: capDecision.message ?? "Concurrent server cap reached.",
-      };
     }
 
     // Reserve our slot synchronously — before the first `await` below — so
@@ -2333,7 +2425,7 @@ export class ConnectServer {
       //
       // Guarded by the haven't-just-tried-this-credential check: if elicited
       // values are already present for every detected name, don't ask twice.
-      const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress);
+      const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress, fromPrewarm);
       if (elicitedRetry) return elicitedRetry;
 
       log("error", "Failed to activate upstream", {
@@ -2374,6 +2466,7 @@ export class ConnectServer {
     namespace: string,
     lastError: unknown,
     progress?: ProgressReporter,
+    fromPrewarm = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
     const stderr = lastError instanceof ActivationError ? lastError.stderrTail : undefined;
     const errMessage = lastError instanceof Error ? lastError.message : String(lastError);
@@ -2447,7 +2540,11 @@ export class ConnectServer {
     // already inside the in-flight activation promise registered by
     // activateOne; going through the wrapper again would deadlock on
     // our own entry in activationInflight.
-    return this.runActivateOne(namespace, progress);
+    // Thread fromPrewarm through the retry: dropping it re-entered
+    // runActivateOne as a REAL activation, so a prewarm spawn that elicited
+    // credentials could be refused by the cap prewarm is exempt from --
+    // resurrecting the silent-invisibility UX the exemption exists to stop.
+    return this.runActivateOne(namespace, progress, fromPrewarm);
   }
 
   private async handleActivate(
@@ -2700,18 +2797,21 @@ export class ConnectServer {
     // Uses the same model the user is already running — no extra
     // provider key, no extra cost from yaw-mcp's side. Silently skips if
     // the client doesn't advertise the sampling capability.
-    // budget === 1 is intentional: the tiebreak only matters when a single
-    // primary is returned. A multi-load (budget>1) tolerates a wrong primary
-    // because the close runner-up is also in the returned slice — paying the
-    // sampling round-trip there buys nothing. Do not "fix" this to fire for
-    // budget>1.
+    // safeBudget === 1 is intentional: the tiebreak only matters when a
+    // single primary is returned. A multi-load (safeBudget>1) tolerates a
+    // wrong primary because the close runner-up is also in the returned
+    // slice — paying the sampling round-trip there buys nothing. Do not
+    // "fix" this to fire for safeBudget>1. The gate keys on the CLAMPED
+    // budget, not the raw one: 0, 0.5, 1.5 and -1 all resolve to exactly
+    // one winner below, and skipping the tiebreak for them was a hole the
+    // schema (type integer) narrows but cannot close.
     // The effort dial generalizes the old fixed 10%-tiebreak into an
     // ambiguity-aware gate (off|auto|aggressive). auto preserves today's
     // behavior (one sample on genuine ambiguity); aggressive samples
-    // best-of-3 on milder ambiguity. budget>1 still skips — a multi-load
-    // tolerates a wrong primary, so paying the round-trip buys nothing.
+    // best-of-3 on milder ambiguity.
+    const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
     const effort = parseRouteEffort(routeEffortOverride ?? process.env.YAW_MCP_ROUTE_EFFORT);
-    if (budget === 1 && shouldSample(ranked, effort)) {
+    if (safeBudget === 1 && shouldSample(ranked, effort)) {
       progress?.("Top candidates close — asking LLM to pick…");
       const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
       const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, this.toolCache);
@@ -2730,7 +2830,6 @@ export class ConnectServer {
       }
     }
 
-    const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
     const winners = ranked.slice(0, safeBudget);
 
     // Re-dispatch routing-miss + opt-in foundry harvest. The primary winner
@@ -2963,65 +3062,6 @@ export class ConnectServer {
     // Only notify when a connection actually went away — a run where every
     // candidate was skipped leaves the routing table exactly as it was.
     if (deactivated > 0) {
-      await this.refreshRoutesAndNotify();
-    }
-  }
-
-  private async reconcileConfig(newConfig: ConnectConfig): Promise<void> {
-    const newServersByNs = new Map(newConfig.servers.map((s) => [s.namespace, s]));
-    let changed = false;
-
-    // Deactivate servers that were removed from config or disabled
-    for (const [namespace, connection] of this.connections) {
-      const newServerConfig = newServersByNs.get(namespace);
-
-      if (!newServerConfig?.isActive) {
-        log("info", "Server removed or disabled in config, deactivating", { namespace });
-        await disconnectFromUpstream(connection);
-        this.connections.delete(namespace);
-        this.idleCallCounts.delete(namespace);
-        this.adaptiveSkipLogged.delete(namespace);
-        this.toolFilters.delete(namespace);
-        // See the idle-reaper note: session activation is per-namespace state
-        // with the same lifetime as the filter beside it.
-        this.sessionActivated.delete(namespace);
-        // Drop any session-elicited credentials for this namespace too —
-        // the server is gone (or disabled), so the cached values are stale
-        // and could leak into a future re-add of an unrelated config.
-        this.elicitedEnv.delete(namespace);
-        changed = true;
-        continue;
-      }
-
-      // Check if config changed (different command, args, url, env, type, or timeout)
-      const oldConfig = connection.config;
-      if (
-        oldConfig.command !== newServerConfig.command ||
-        !argsEqual(oldConfig.args, newServerConfig.args) ||
-        oldConfig.url !== newServerConfig.url ||
-        !envEqual(oldConfig.env, newServerConfig.env) ||
-        oldConfig.type !== newServerConfig.type ||
-        oldConfig.connectTimeoutMs !== newServerConfig.connectTimeoutMs
-      ) {
-        log("info", "Server config changed, deactivating stale connection", { namespace });
-        await disconnectFromUpstream(connection);
-        this.connections.delete(namespace);
-        this.idleCallCounts.delete(namespace);
-        this.adaptiveSkipLogged.delete(namespace);
-        this.toolFilters.delete(namespace);
-        // See the idle-reaper note: session activation is per-namespace state
-        // with the same lifetime as the filter beside it.
-        this.sessionActivated.delete(namespace);
-        // Drop session-elicited credentials too — the connect spec changed,
-        // so creds the user provided for the OLD spec may not match the
-        // new one (different command/url/env wiring). Better to re-elicit
-        // than silently inject stale values that produce a confusing failure.
-        this.elicitedEnv.delete(namespace);
-        changed = true;
-      }
-    }
-
-    if (changed) {
       await this.refreshRoutesAndNotify();
     }
   }

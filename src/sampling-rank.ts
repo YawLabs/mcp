@@ -285,14 +285,26 @@ export async function bestOfNViaSampling(
   const samples = Math.min(MAX_SAMPLES, Math.max(1, Math.floor(n)));
   const prompt = buildTiebreakPrompt(intent, candidates);
 
+  // One controller for the whole call: aborted in the finally below, so
+  // when the race resolves -- by timeout OR by the aggregate winning --
+  // any still-in-flight createMessage requests are torn down with it.
+  // Without this, a timed-out "aggressive" dispatch left up to
+  // MAX_SAMPLES client-LLM requests running (and billed) to the SDK's
+  // 60s default request timeout, their results discarded. The timeout
+  // is also passed per request so the SDK enforces the same bound.
+  const controller = new AbortController();
+
   // One sampling call -> parsed namespace or null. Never throws.
   const sampleOnce = async (): Promise<string | null> => {
     try {
-      const result = await server.createMessage({
-        messages: [{ role: "user", content: { type: "text", text: prompt } }],
-        maxTokens: SAMPLING_MAX_TOKENS,
-        includeContext: "none",
-      });
+      const result = await server.createMessage(
+        {
+          messages: [{ role: "user", content: { type: "text", text: prompt } }],
+          maxTokens: SAMPLING_MAX_TOKENS,
+          includeContext: "none",
+        },
+        { signal: controller.signal, timeout: SAMPLING_TIMEOUT_MS },
+      );
       const text =
         result && typeof result === "object" && "content" in result && result.content
           ? extractText(result.content)
@@ -347,5 +359,9 @@ export async function bestOfNViaSampling(
     return await Promise.race([aggregate, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
+    // Tear down the losing samples with the race: on timeout this cancels
+    // every in-flight request; on a normal win the aggregate has already
+    // awaited all of them (Promise.all), so aborting is a no-op.
+    controller.abort();
   }
 }

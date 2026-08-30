@@ -1406,68 +1406,6 @@ describe("ConnectServer", () => {
     });
   });
 
-  describe("reconcileConfig", () => {
-    it("removes servers no longer in config", async () => {
-      const priv = getPrivate(server);
-      priv.connections.set("gh", makeConnection("gh"));
-      priv.idleCallCounts.set("gh", 0);
-
-      await priv.reconcileConfig(makeConfig([]));
-      expect(priv.connections.has("gh")).toBe(false);
-      expect(disconnectFromUpstream).toHaveBeenCalled();
-    });
-
-    it("removes servers that became disabled", async () => {
-      const priv = getPrivate(server);
-      priv.connections.set("gh", makeConnection("gh"));
-
-      await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", isActive: false })]));
-      expect(priv.connections.has("gh")).toBe(false);
-    });
-
-    it("removes servers whose config changed", async () => {
-      const priv = getPrivate(server);
-      const conn = makeConnection("gh");
-      conn.config = makeServerConfig({ namespace: "gh", command: "old-cmd" });
-      priv.connections.set("gh", conn);
-
-      await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", command: "new-cmd" })]));
-      expect(priv.connections.has("gh")).toBe(false);
-    });
-
-    it("keeps servers whose config is unchanged", async () => {
-      const priv = getPrivate(server);
-      const config = makeServerConfig({ namespace: "gh" });
-      const conn = makeConnection("gh");
-      conn.config = config;
-      priv.connections.set("gh", conn);
-
-      await priv.reconcileConfig(makeConfig([config]));
-      expect(priv.connections.has("gh")).toBe(true);
-      expect(disconnectFromUpstream).not.toHaveBeenCalled();
-    });
-
-    it("detects args changes without JSON.stringify", async () => {
-      const priv = getPrivate(server);
-      const conn = makeConnection("gh");
-      conn.config = makeServerConfig({ namespace: "gh", args: ["--flag"] });
-      priv.connections.set("gh", conn);
-
-      await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", args: ["--other-flag"] })]));
-      expect(priv.connections.has("gh")).toBe(false);
-    });
-
-    it("detects env changes", async () => {
-      const priv = getPrivate(server);
-      const conn = makeConnection("gh");
-      conn.config = makeServerConfig({ namespace: "gh", env: { KEY: "old" } });
-      priv.connections.set("gh", conn);
-
-      await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", env: { KEY: "new" } })]));
-      expect(priv.connections.has("gh")).toBe(false);
-    });
-  });
-
   describe("handleHealth", () => {
     it("returns empty message when no connections", () => {
       const priv = getPrivate(server);
@@ -2201,6 +2139,128 @@ describe("ConnectServer", () => {
       expect(priv.learning.get("gh")).toBeUndefined();
     });
 
+    it("concurrent calls during auto-reconnect share ONE activation (no spurious error, no double spawn)", async () => {
+      // The reconnect now routes through activateOne, whose in-flight dedup
+      // is the guarantee the old inline connectToUpstream path lacked: two
+      // tool calls landing on an error-state upstream used to each spawn a
+      // child (or, in production, the second got a spurious "no longer
+      // connected" error while yaw-mcp was itself mid-reconnect).
+      const priv = getPrivate(server);
+      const errorConn = makeConnection("gh", ["create_issue"], "error");
+      priv.connections.set("gh", errorConn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      let release!: (c: ReturnType<typeof makeConnection>) => void;
+      const gate = new Promise<ReturnType<typeof makeConnection>>((r) => {
+        release = r;
+      });
+      const fresh = makeConnection("gh", ["create_issue"]);
+      fresh.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      vi.mocked(connectToUpstream).mockImplementation(() => gate as never);
+      // Mirror the PRODUCTION disconnect: flip status synchronously
+      // (upstream.ts does exactly this before awaiting close). With the old
+      // disconnect-first ordering, this flip made every concurrent caller
+      // skip the reconnect branch and take a spurious "no longer connected"
+      // fault -- the default resolved-undefined mock could never catch that.
+      vi.mocked(disconnectFromUpstream).mockImplementation(async (c: UpstreamConnection) => {
+        c.status = "disconnected";
+      });
+      const refresh = vi.spyOn(priv, "refreshRoutesAndNotify");
+      const p1 = priv.handleToolCall("gh_create_issue", {});
+      const p2 = priv.handleToolCall("gh_create_issue", {});
+      // Let both callers reach the reconnect await before the spawn lands,
+      // then fire a THIRD caller mid-spawn: the stale entry must still read
+      // status "error" (the disconnect happens after activation), so it
+      // joins the shared inflight instead of erroring.
+      await new Promise((r) => setTimeout(r, 20));
+      const p3 = priv.handleToolCall("gh_create_issue", {});
+      await new Promise((r) => setTimeout(r, 20));
+      release(fresh);
+      const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+      expect(r1.isError).toBeFalsy();
+      expect(r2.isError).toBeFalsy();
+      expect(r3.isError).toBeFalsy();
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+      // The orphaned stale transport was closed (idempotently -- each
+      // caller's identity check sees the map already holds the fresh conn).
+      expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledWith(errorConn);
+      // And the live connection was never closed.
+      expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalledWith(fresh);
+      // ONE routes rebuild serves all sharers: rebuilding per sharer
+      // emitted N x three list_changed notifications for one reconnect.
+      expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it("an activate landing in a teardown window (status disconnected) gets no cap self-allowance", async () => {
+      // "disconnected" only exists mid-teardown (prewarm teardown, idle
+      // reaper, deactivate all flip it and then await the close before
+      // deleting the map entry): the slot is being RELEASED, so an
+      // activate in that window must queue behind the cap like a fresh
+      // activation. Only an "error" entry -- a granted slot whose
+      // transport died -- rides the self-allowance (see the reconnect-at-
+      // full-cap test).
+      const priv = getPrivate(server);
+      priv.serverCap = 1;
+      priv.connections.set("busy", makeConnection("busy", ["t"])); // holds the only slot
+      const tearingDown = makeConnection("gh", ["create_issue"]);
+      tearingDown.status = "disconnected" as never;
+      priv.connections.set("gh", tearingDown);
+      priv.config = makeConfig([makeServerConfig({ namespace: "busy" }), makeServerConfig({ namespace: "gh" })]);
+      const result = await priv.activateOne("gh");
+      expect(result.ok).toBe(false);
+      expect(result.capped).toBe(true);
+      expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    });
+
+    it("auto-reconnect succeeds at a FULL cap (the namespace already owns its slot)", async () => {
+      // A dead connection represents a slot that was already granted:
+      // refusing the respawn at a full cap would strand a legitimately
+      // loaded server in its error state, with a refusal message pointing
+      // at mcp_connect_activate -- which would refuse identically.
+      const priv = getPrivate(server);
+      priv.serverCap = 2;
+      priv.connections.set("other", makeConnection("other", ["t"]));
+      const errorConn = makeConnection("gh", ["create_issue"], "error");
+      priv.connections.set("gh", errorConn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "other" }), makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      const fresh = makeConnection("gh", ["create_issue"]);
+      fresh.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(fresh);
+      const result = await priv.handleToolCall("gh_create_issue", {});
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("ok");
+    });
+
+    it("auto-reconnect refuses after shutdown has latched (no spawn)", async () => {
+      // The old inline path ignored the shuttingDown latch; through
+      // activateOne a reconnect during shutdown is refused before any
+      // child is spawned into the torn-down bookkeeping.
+      const priv = getPrivate(server);
+      const errorConn = makeConnection("gh", ["create_issue"], "error");
+      priv.connections.set("gh", errorConn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      priv.shuttingDown = true;
+      const result = await priv.handleToolCall("gh_create_issue", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("auto-reconnect failed");
+      expect(isRoutingFaultResult(result)).toBe(true);
+      expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    });
+
+    it("a non-string discover context is ignored instead of throwing", async () => {
+      // The low-level Server never validates input against inputSchema, so
+      // a misbehaving client can send context: 123. It must degrade to an
+      // unranked discover, not a TypeError inside the BM25 tokenizer
+      // surfacing as a raw JSON-RPC internal error.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      const result = await priv.handleToolCall("mcp_connect_discover", { context: 123 });
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("gh");
+    });
+
     it("tool-gone-after-RECONNECT carries the routing-fault brand", async () => {
       // The fifth emitter: auto-reconnect SUCCEEDS but the fresh upstream
       // no longer exposes the requested tool ("no longer available after
@@ -2712,59 +2772,6 @@ describe("ConnectServer", () => {
   });
 });
 
-describe("argsEqual (via reconcileConfig)", () => {
-  let server: ConnectServer;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer();
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("treats identical args as unchanged", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", args: ["--verbose", "--flag"] });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", args: ["--verbose", "--flag"] })]));
-    expect(priv.connections.has("gh")).toBe(true);
-  });
-
-  it("treats different arg order as changed", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", args: ["--flag", "--verbose"] });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", args: ["--verbose", "--flag"] })]));
-    expect(priv.connections.has("gh")).toBe(false);
-  });
-
-  it("treats undefined vs empty array as changed", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", args: undefined });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", args: [] })]));
-    expect(priv.connections.has("gh")).toBe(false);
-  });
-
-  it("treats both undefined as unchanged", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", args: undefined });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", args: undefined })]));
-    expect(priv.connections.has("gh")).toBe(true);
-  });
-});
-
 // ─────────────────────────────────────────────────────────────────────────
 // Concurrency and atomicity regression tests. These cover the races
 // exposed by the review:
@@ -3157,6 +3164,90 @@ describe("prewarmDormantServers", () => {
     // toolCache populated for both so getDeferredServers() can surface them.
     expect(priv.toolCache.get("gh")).toEqual([{ name: "gh_tool", description: undefined }]);
     expect(priv.toolCache.get("slack")).toEqual([{ name: "slack_tool", description: undefined }]);
+  });
+
+  it("is exempt from the server cap in BOTH directions", async () => {
+    // The cap bounds the LLM's context; prewarm contributes nothing to it
+    // (never advertised, torn down within milliseconds). So (a) a prewarm
+    // activation must not be refused by a full cap -- the refusal was
+    // SILENT and left the namespace invisible in tools/list all session --
+    // and (b) a prewarm-claimed connection must not occupy a slot that
+    // refuses a concurrent real activation (the startup race with
+    // autoLoadRecurringPack).
+    const priv = getPrivate(server);
+    priv.serverCap = 1;
+    // (a) One real connected server holds the only slot; prewarm still runs.
+    priv.connections.set("busy", makeConnection("busy", ["t"]));
+    priv.config = makeConfig([makeServerConfig({ namespace: "busy" }), makeServerConfig({ namespace: "gh" })]);
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
+    );
+    await priv.prewarmDormantServers();
+    expect(priv.toolCache.get("gh")).toEqual([{ name: "gh_tool", description: undefined }]);
+
+    // (b) A prewarm-claimed connection does not block a real activation.
+    priv.connections.delete("busy");
+    priv.connections.set("warm", makeConnection("warm", ["t"]));
+    priv.prewarmNamespaces.add("warm");
+    priv.config = makeConfig([makeServerConfig({ namespace: "warm" }), makeServerConfig({ namespace: "slack" })]);
+    const result = await priv.activateOne("slack");
+    expect(result.ok).toBe(true);
+    expect(result.capped).toBeUndefined();
+  });
+
+  it("an explicit claim of an in-flight prewarm activation is cap-checked (no bypass)", async () => {
+    // The prewarm activation itself skips the cap (it never advertises
+    // tools) -- but an explicit activate that CLAIMS it converts the
+    // connection into a real, advertised one, so the claim must pass the
+    // cap a fresh activation would. On refusal the prewarm claim is
+    // restored so prewarm's teardown proceeds normally.
+    const priv = getPrivate(server);
+    priv.serverCap = 1;
+    priv.connections.set("busy", makeConnection("busy", ["t"])); // holds the only slot
+    priv.config = makeConfig([makeServerConfig({ namespace: "busy" }), makeServerConfig({ namespace: "gh" })]);
+    let release!: (c: ReturnType<typeof makeConnection>) => void;
+    const gate = new Promise<ReturnType<typeof makeConnection>>((r) => {
+      release = r;
+    });
+    vi.mocked(connectToUpstream).mockImplementation(() => gate as never);
+    // Prewarm starts activating "gh" (cap skipped) and stalls mid-spawn.
+    const prewarmP = priv.activateOne("gh", undefined, /* fromPrewarm */ true);
+    // An explicit activate lands while the prewarm spawn is in flight.
+    const claim = await priv.activateOne("gh");
+    expect(claim.ok).toBe(false);
+    expect(claim.capped).toBe(true);
+    // The claim was refused, so the prewarm claim is back in place and the
+    // prewarm teardown still owns the connection.
+    expect(priv.prewarmNamespaces.has("gh")).toBe(true);
+    release(makeConnection("gh", ["t"]));
+    await prewarmP;
+  });
+
+  it("a prewarm activation that elicits credentials keeps its cap exemption on the retry", async () => {
+    // maybeElicitAndRetry re-enters runActivateOne; dropping fromPrewarm
+    // there re-ran the cap check prewarm is exempt from, so a prewarm spawn
+    // that elicited credentials could be refused at a full cap -- and the
+    // namespace stayed invisible in tools/list, the exact UX the exemption
+    // exists to prevent.
+    const priv = getPrivate(server);
+    priv.serverCap = 1;
+    priv.connections.set("busy", makeConnection("busy", ["t"])); // cap full
+    priv.config = makeConfig([makeServerConfig({ namespace: "busy" }), makeServerConfig({ namespace: "gh" })]);
+    // First spawn fails naming a missing credential; the elicited retry
+    // succeeds. Elicitation needs the client capability + a bridge answer.
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { GITHUB_TOKEN: "ghp_x" },
+    });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
+      .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+    const result = await priv.activateOne("gh", undefined, /* fromPrewarm */ true);
+    expect(result.ok).toBe(true);
+    // The retry ran cap-exempt: toolCache learned, namespace visible.
+    expect(priv.toolCache.get("gh")).toBeDefined();
   });
 
   it("skips servers that already have a persisted toolCache", async () => {
@@ -3572,79 +3663,6 @@ describe("fetchToolsFromUpstream propagates protocol_error on listTools failure"
     }
     expect(caught).not.toBeNull();
     expect(caught!.message).toContain("my-ns");
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Bug #4: reconcileConfig must detect type and connectTimeoutMs changes.
-// ─────────────────────────────────────────────────────────────────────────
-describe("reconcileConfig: detects type and connectTimeoutMs changes", () => {
-  let server: ConnectServer;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    server = new ConnectServer();
-  });
-
-  afterEach(async () => {
-    await server.shutdown();
-  });
-
-  it("disconnects when server type changes from local to remote", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", type: "local" });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(
-      makeConfig([makeServerConfig({ namespace: "gh", type: "remote", url: "https://example.com/mcp" })]),
-    );
-    expect(priv.connections.has("gh")).toBe(false);
-    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalled();
-  });
-
-  it("keeps connection when type is unchanged", async () => {
-    const priv = getPrivate(server);
-    const config = makeServerConfig({ namespace: "gh", type: "local" });
-    const conn = makeConnection("gh");
-    conn.config = config;
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", type: "local" })]));
-    expect(priv.connections.has("gh")).toBe(true);
-    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
-  });
-
-  it("disconnects when connectTimeoutMs changes", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", connectTimeoutMs: 5000 });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", connectTimeoutMs: 10000 })]));
-    expect(priv.connections.has("gh")).toBe(false);
-    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalled();
-  });
-
-  it("disconnects when connectTimeoutMs is added (was undefined)", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh" }); // no connectTimeoutMs
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", connectTimeoutMs: 8000 })]));
-    expect(priv.connections.has("gh")).toBe(false);
-  });
-
-  it("keeps connection when connectTimeoutMs is unchanged", async () => {
-    const priv = getPrivate(server);
-    const conn = makeConnection("gh");
-    conn.config = makeServerConfig({ namespace: "gh", connectTimeoutMs: 7500 });
-    priv.connections.set("gh", conn);
-
-    await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", connectTimeoutMs: 7500 })]));
-    expect(priv.connections.has("gh")).toBe(true);
-    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
   });
 });
 
@@ -4235,15 +4253,6 @@ describe("session activation lifetime (gateway mode)", () => {
     priv.idleCallCounts.set("gh", 9999);
     await priv.trackUsageAndAutoDeactivate("other");
     expect(priv.connections.has("gh")).toBe(false);
-    expect(priv.sessionActivated.has("gh")).toBe(false);
-  });
-
-  it("clears activation when the server is removed from config", async () => {
-    const priv = getPrivate(server);
-    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
-    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
-    await priv.reconcileConfig(makeConfig([]));
     expect(priv.sessionActivated.has("gh")).toBe(false);
   });
 

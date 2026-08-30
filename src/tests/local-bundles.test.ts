@@ -201,8 +201,8 @@ describe("loadLocalBundles", () => {
 
   it("warns on and drops a non-positive or non-numeric connectTimeoutMs", async () => {
     // upstream ignores anything <= 0 and falls back to its default; dropping the
-    // value here keeps a typo from reading as configured downstream (doctor, the
-    // reconcile comparison in server.ts).
+    // value here keeps a typo from reading as configured downstream (doctor, and
+    // anything else reading the loaded config).
     //
     // Dropping SILENTLY was the bug. This is the one field whose whole purpose
     // is to change a failure the user is already looking at: they read the

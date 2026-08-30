@@ -456,6 +456,35 @@ describe("bestOfNViaSampling", () => {
     expect(out).toBe("github");
   });
 
+  it("passes an abort signal + per-request timeout to every sample and aborts them when the race ends", async () => {
+    // A timed-out race must tear the losing samples DOWN, not merely stop
+    // waiting for them: without the signal, up to MAX_SAMPLES client-LLM
+    // requests kept running (and billing) to the SDK's 60s default request
+    // timeout with their results discarded.
+    vi.useFakeTimers();
+    try {
+      const seen: Array<{ signal?: AbortSignal; timeout?: number }> = [];
+      const createMessage = vi.fn().mockImplementation((_params: unknown, options: never) => {
+        seen.push(options as { signal?: AbortSignal; timeout?: number });
+        return new Promise<unknown>(() => {}); // never settles
+      });
+      const server = mockServer({ sampling: {} }, createMessage as unknown as (params: unknown) => Promise<unknown>);
+      const resultPromise = bestOfNViaSampling(server, "intent", candidates, 2);
+      await vi.advanceTimersByTimeAsync(SAMPLING_TIMEOUT_MS + 100);
+      const out = await resultPromise;
+      expect(out).toBeNull();
+      expect(seen).toHaveLength(2);
+      for (const o of seen) {
+        expect(o.timeout).toBe(SAMPLING_TIMEOUT_MS);
+        expect(o.signal).toBeInstanceOf(AbortSignal);
+        // Torn down with the race, not left to the SDK default.
+        expect(o.signal?.aborted).toBe(true);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns null when all samples resolve after SAMPLING_TIMEOUT_MS", async () => {
     // All sample promises resolve after the timeout deadline. The race must
     // resolve to null (falling back to the ranker's order) rather than

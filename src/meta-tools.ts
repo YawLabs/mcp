@@ -116,7 +116,14 @@ export const META_TOOLS = {
             'What you want to accomplish, in plain English (e.g., "file a github issue titled Fix login bug")',
         },
         budget: {
-          type: "number",
+          // integer with bounds, matching the server-side clamp
+          // (handleDispatch floors into [1,10]). Advisory only -- the
+          // low-level Server never validates input against this schema --
+          // but it steers well-behaved clients away from the fractional /
+          // sub-1 band the clamp exists to absorb.
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
           default: 1,
           description:
             "How many top-ranked servers to load into the session. Defaults to 1. Cap is 10. Raise only when one task genuinely spans multiple servers.",

@@ -128,6 +128,35 @@ describe("handleDispatch", () => {
     expect(result.content[0].text).toContain('Loaded "gh"');
   });
 
+  it("a fractional budget resolves to ONE winner and still reaches the sampling-tiebreak gate", async () => {
+    // The gate keys on the CLAMPED budget: 1.5 (or 0, or 0.5) yields
+    // exactly one primary, so the single-winner tiebreak must fire for it.
+    // The old `budget === 1` test on the RAW value silently skipped the
+    // tiebreak that exists precisely for the single-primary case. Two
+    // servers with identical matched terms tie the BM25 scores, so
+    // shouldSample("auto") fires; the mock server has no sampling
+    // capability, so bestOfNViaSampling returns null and the ranker order
+    // stands -- the observable is the progress line emitted at the gate.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "a", namespace: "alpha", name: "Alpha", description: "manage github issues" }),
+        makeServerConfig({ id: "b", namespace: "beta", name: "Beta", description: "manage github issues" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "tool_one", description: "Example" }]),
+    );
+    const progress = vi.fn();
+    const result = await priv.handleDispatch("manage github issues", 1.5, progress);
+    expect(result.isError).toBeUndefined();
+    // One winner, not two: 1.5 floors to 1.
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    // The tiebreak gate fired for the single-winner dispatch.
+    expect(progress.mock.calls.some((c) => String(c[0]).includes("Top candidates close"))).toBe(true);
+  });
+
   it("respects a budget larger than 1", async () => {
     const priv = getPrivate(server);
     priv.config = {
