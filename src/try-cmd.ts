@@ -442,12 +442,14 @@ async function autoDetectClient(opts: {
   os: InstallOS;
   cwd: string;
   claudeConfigDir: string | undefined;
+  appData?: string;
 }): Promise<InstallClientId> {
   const probes = await probeClientsAsync({
     home: opts.home,
     os: opts.os,
     cwd: opts.cwd,
     claudeConfigDir: opts.claudeConfigDir,
+    appData: opts.appData,
   });
   // First: any client whose config file already exists (the user is
   // actively using it).
@@ -518,7 +520,15 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
 
   // Step 2: pick a client (explicit > auto-detect).
-  const clientId = opts.clientId ?? (await autoDetectClient({ home, os, cwd, claudeConfigDir }));
+  const clientId =
+    opts.clientId ??
+    (await autoDetectClient({
+      home,
+      os,
+      cwd,
+      claudeConfigDir,
+      appData: opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined,
+    }));
 
   // Step 3: resolve the config file path (user scope; project scope
   // requires extra flags we don't expose in `try` -- trials are
@@ -529,7 +539,17 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
   try {
-    resolved = resolveInstallPath({ clientId, scope, os, home, projectDir, claudeConfigDir });
+    resolved = resolveInstallPath({
+      clientId,
+      scope,
+      os,
+      home,
+      // Hermetic-home seam: keep the %APPDATA%-based claude-desktop path
+      // inside an overridden home (mirrors install-cmd / doctor).
+      appData: opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined,
+      projectDir,
+      claudeConfigDir,
+    });
   } catch (e) {
     printErr(`yaw-mcp try: ${(e as Error).message}`);
     return { exitCode: 1, written: [] };

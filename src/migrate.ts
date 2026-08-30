@@ -22,7 +22,7 @@
 import { mkdir, rename, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { log } from "./logger.js";
-import { CONFIG_DIRNAME, isUnderHome, userConfigDir } from "./paths.js";
+import { CONFIG_DIRNAME, isUnderHome, realpathOrSelf, userConfigDir } from "./paths.js";
 
 export const LEGACY_GLOBAL_FILENAME = ".yaw-mcp.json";
 export const LEGACY_PROJECT_FILENAME = ".yaw-mcp.json";
@@ -172,8 +172,15 @@ export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<vo
 // outside $HOME the migration stays a no-op -- legacy files are left in
 // place for the user to move by hand.
 async function findLegacyProjectRoot(cwd: string, home: string): Promise<string | null> {
-  const homeResolved = resolve(home);
-  let dir = resolve(cwd);
+  // Realpath BOTH inputs, exactly like findProjectConfigDir (paths.ts):
+  // sharing the isUnderHome predicate is not enough when the INPUTS differ.
+  // On a symlinked $HOME (/home -> /var/home, NFS automounts), the lexical
+  // home spelling and the physical process.cwd() never match, the first
+  // loop iteration bailed, and pre-0.12 project configs were silently
+  // never migrated -- with the loader only discovering .yaw-mcp/ dirs, the
+  // legacy allow/deny list was lost with no warning.
+  const homeResolved = resolve(await realpathOrSelf(resolve(home)));
+  let dir = resolve(await realpathOrSelf(resolve(cwd)));
   let prev = "";
   while (dir !== prev) {
     if (!isUnderHome(dir, homeResolved)) return null;

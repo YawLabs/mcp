@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -244,6 +244,39 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
       await expect(stat(join(userConfigDir(home), "config.json"))).rejects.toThrow();
     } finally {
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // 8. A symlinked $HOME spelling still migrates (realpath'd bound).
+  it("migrates when $HOME is passed via a symlinked spelling of the same directory", async () => {
+    // Production shape: HOME is the logical spelling (/home/u) while
+    // process.cwd() reports the physical path (/var/home/u) -- symlinked
+    // homes, NFS automounts. findLegacyProjectRoot used to compare the two
+    // lexically, so the first isUnderHome test failed and pre-0.12 project
+    // configs were silently never migrated. Both inputs are realpath'd now
+    // (the same treatment findProjectConfigDir gives the loader). The link
+    // is a directory junction so the fixture works unelevated on Windows;
+    // on POSIX symlinkSync ignores the type hint.
+    const linkParent = mkdtempSync(join(tmpdir(), "yaw-mcp-migrate-link-"));
+    const homeLink = join(linkParent, "home-link");
+    try {
+      symlinkSync(home, homeLink, "junction");
+    } catch {
+      rmSync(linkParent, { recursive: true, force: true });
+      return; // symlink creation unavailable in this environment; nothing to pin
+    }
+    try {
+      const projectRoot = mkdtempSync(join(home, "proj-"));
+      const legacyPath = writeLegacy(projectRoot, LEGACY_PROJECT_FILENAME);
+
+      // home via the LINK, cwd via the PHYSICAL path -- lexically disjoint.
+      await migrateLegacyConfigPaths({ cwd: projectRoot, home: homeLink });
+
+      // Migrated: legacy renamed into the project's .yaw-mcp/.
+      await expect(stat(legacyPath)).rejects.toThrow();
+      await expect(stat(join(projectRoot, CONFIG_DIRNAME, "config.json"))).resolves.toBeDefined();
+    } finally {
+      rmSync(linkParent, { recursive: true, force: true });
     }
   });
 });

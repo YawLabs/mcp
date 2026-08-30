@@ -909,6 +909,135 @@ describe("runInstall — collision handling", () => {
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
+  it("a home override is hermetic for claude-desktop on Windows (APPDATA never leaks in)", async () => {
+    // claude-desktop is the one client that lives under %APPDATA% rather
+    // than $HOME on Windows. The `home` test seam did not cover it: with
+    // a real APPDATA set, `runInstall({ os: "windows", home: synthHome,
+    // force: true })` resolved through process.env.APPDATA and would have
+    // overwritten the DEVELOPER'S real Claude Desktop config. appData now
+    // derives from an overridden home. Asserted via --dry-run so even a
+    // regression only reports the wrong path instead of writing to it.
+    const prev = process.env.APPDATA;
+    process.env.APPDATA = join(synthHome, "DECOY-real-appdata");
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-desktop",
+        scope: "user",
+        os: "windows",
+        home: synthHome,
+        dryRun: true,
+        io: cap.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.wouldWrite).toHaveLength(1);
+      expect(r.wouldWrite[0]).toBe(join(synthHome, "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
+      expect(r.wouldWrite[0]).not.toContain("DECOY");
+    } finally {
+      if (prev === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = prev;
+    }
+  });
+
+  it("--skip --dry-run previews the SKIP, not an overwrite", async () => {
+    // dryRun used to win the decision ladder, so `--skip --dry-run`
+    // previewed "Would overwrite" -- a preview contradicting the real
+    // `--skip` run it claims to preview (which leaves the entry alone).
+    const initial = JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2);
+    writeFileSync(join(synthHome, ".claude.json"), initial);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      skip: true,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain("Would leave existing");
+    expect(cap.stdout()).not.toContain("Would overwrite");
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
+  });
+
+  it("a malformed env on the existing entry is NOT carried into the overwrite", async () => {
+    // The user chose --force precisely to replace a broken entry; carrying
+    // `"env": "abc"` (whose Object.keys are 0,1,2) into the fresh entry
+    // re-broke the file the overwrite was meant to fix.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old", env: "abc" } } }, null, 2),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).not.toContain("Kept existing env");
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].env).toBeUndefined();
+  });
+
+  it("a MIXED env carries its valid string keys and drops only the malformed ones", async () => {
+    // All-or-nothing validation silently dropped OAM_BIN -- the carry-over
+    // comment's own load-bearing example -- whenever one sibling value was
+    // non-string. Filter per key instead.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify(
+        { mcpServers: { [ENTRY_NAME]: { command: "old", env: { OAM_BIN: "/x/oam", DEBUG: 1 } } } },
+        null,
+        2,
+      ),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain("Kept existing env on the mcp entry: OAM_BIN");
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/x/oam" });
+  });
+
+  it("a VALID env on the existing entry still carries into the overwrite", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old", env: { OAM_BIN: "/x/oam" } } } }, null, 2),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain("Kept existing env on the mcp entry: OAM_BIN");
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/x/oam" });
+  });
+
   it("promptAnswer override exercises the interactive branch deterministically", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
@@ -1302,6 +1431,16 @@ describe("parseInstallArgs — --list / --all", () => {
     if (!r.ok) expect(r.error).toContain("--all does not take a client argument");
   });
 
+  it("rejects --all combined with --scope instead of silently dropping it", () => {
+    // runInstallAll plans its own scope per client and used to spread-then-
+    // override opts.scope -- so `--all --scope project` wrote claude-code
+    // and cursor at USER scope with no message. A flag that is accepted and
+    // ignored reads as honored; refuse at the boundary.
+    const r = parseInstallArgs(["--all", "--scope", "project"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("cannot honor --scope");
+  });
+
   it("accepts --all combined with --token", () => {
     const r = parseInstallArgs(["--all", "--token", "mcp_pat_xyz"]);
     expect(r.ok).toBe(true);
@@ -1333,6 +1472,33 @@ describe("runInstall --list (read-only)", () => {
     expect(out).toContain("not installed");
     expect(out).not.toContain("installed "); // "installed" word only appears in status heading/rows
     expect(out).toContain("0/");
+  });
+
+  it("--list honors --project-dir for the project-scope rows", async () => {
+    // `install vscode --project-dir /repo` writes under /repo, so
+    // `install --list --project-dir /repo` must report the same file --
+    // accepting the flag and probing cwd instead made the two surfaces
+    // describe different directories.
+    const projDir = mkdtempSync(join(synthHome, "elsewhere-"));
+    mkdirSync(join(projDir, ".vscode"), { recursive: true });
+    writeFileSync(
+      join(projDir, ".vscode", "mcp.json"),
+      JSON.stringify({ servers: { [ENTRY_NAME]: { command: "npx" } } }),
+      "utf8",
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd, // deliberately different from projectDir
+      projectDir: projDir,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    // The seeded entry under projectDir is visible -- the probe ran against
+    // --project-dir, not cwd (where nothing exists).
+    expect(cap.stdout()).toMatch(/VS Code\s+project\s+\S*[\\/]\.vscode[\\/]mcp\.json\s+installed/);
   });
 
   it("detects an installed yaw-mcp entry in ~/.claude.json", async () => {

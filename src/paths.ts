@@ -83,7 +83,7 @@ function normalizeForCompare(p: string): string {
 // path differ from the physical one. Falls back to the raw path when
 // realpath fails (nonexistent segment, permission error) so callers degrade
 // to the plain lexical comparison rather than throwing.
-async function realpathOrSelf(p: string): Promise<string> {
+export async function realpathOrSelf(p: string): Promise<string> {
   try {
     return await realpath(p);
   } catch {

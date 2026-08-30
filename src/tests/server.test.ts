@@ -485,6 +485,24 @@ describe("ConnectServer", () => {
       expect(text).toContain("add: linear");
     });
 
+    it("feeds the nudge the ACTIVE profile-allowed set, matching mcp_connect_bundles", () => {
+      // github disabled + linear active: pr-review must read as PARTIAL
+      // with github missing -- the same verdict mcp_connect_bundles match
+      // and `yaw-mcp bundles match` give (both filter to active+allowed).
+      // Feeding ALL configured servers here made the bundle read complete
+      // in discover while the other two surfaces called it partial.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "github", name: "GitHub", isActive: false }),
+        makeServerConfig({ namespace: "linear", name: "Linear" }),
+      ]);
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).toContain("pr-review");
+      expect(text).toContain("have: linear");
+      expect(text).toContain("add: github");
+    });
+
     it("suppresses the bundle-completions block when no bundle has any overlap", () => {
       // Install only a namespace that matches no seeded bundle — the
       // block should not even print its header.

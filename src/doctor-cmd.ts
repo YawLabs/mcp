@@ -421,6 +421,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
 
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
+  // Keep the %APPDATA%-based claude-desktop path inside a synthetic home
+  // whenever home is overridden (test seam hermeticity; see ProbeOptions).
+  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
   const os = opts.os ?? CURRENT_OS;
   const env = opts.env ?? process.env;
 
@@ -516,7 +519,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
   // when run inside a wrapper (Yaw Mode, dev container with the env set).
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
-  const clients = probeClients({ home, os, cwd, claudeConfigDir });
+  const clients = probeClients({ home, os, cwd, claudeConfigDir, appData });
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
     const installCmd = `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
@@ -648,6 +651,9 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
+  // Keep the %APPDATA%-based claude-desktop path inside a synthetic home
+  // whenever home is overridden (test seam hermeticity; see ProbeOptions).
+  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
   const os = opts.os ?? CURRENT_OS;
   const env = opts.env ?? process.env;
 
@@ -659,7 +665,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const trustWarning = projectTrustWarning(trustProbe);
   if (trustWarning) config.warnings = [...config.warnings, trustWarning];
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
-  const clients = probeClients({ home, os, cwd, claudeConfigDir });
+  const clients = probeClients({ home, os, cwd, claudeConfigDir, appData });
 
   // Same project-guide probe as the text path's PROJECT GUIDE section.
   const guide = await loadProjectGuide(cwd, home, env).catch(() => null);
@@ -1419,6 +1425,12 @@ interface ProbeOptions {
   home: string;
   os: InstallOS;
   cwd: string;
+  /** Windows %APPDATA% override, threaded to resolveInstallPath so the
+   *  claude-desktop path stays inside a test's synthetic home. Derived from
+   *  home at the call sites whenever home itself is overridden -- without
+   *  it, a home override was NOT hermetic for the one client that lives
+   *  under %APPDATA% on Windows. */
+  appData?: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`. When set, claude-code probes hit
    *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
    *  `yaw-mcp install --list` see the same file Claude Code reads. */
@@ -1483,6 +1495,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           scope: scope.scope,
           os: opts.os,
           home: opts.home,
+          appData: opts.appData,
           projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
           claudeConfigDir: opts.claudeConfigDir,
         });

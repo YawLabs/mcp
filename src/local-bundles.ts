@@ -835,24 +835,55 @@ function mergeServerEntry(
 }
 
 /**
- * Insert or update a server entry in the user-global bundles.json. An
- * existing entry matches by namespace OR display name -- the name fallback
- * mirrors the app's deduper (yaw-install-handler.ts doInstall) so a server
- * added on the other path (e.g. a legacy entry written without a namespace)
- * isn't duplicated. An existing entry is UPDATED, not overwritten: see
+ * Insert or update a server entry in the user-global bundles.json. The
+ * lookup is TWO-PASS, namespace first and display name only as a fallback
+ * -- mirroring the app's merge path (yaw-install-handler.ts
+ * addCatalogServer): a name collision with an unrelated server must not
+ * hijack the merge away from an exact namespace match. The name fallback
+ * exists so a server added on the other path (e.g. a legacy entry written
+ * without a namespace) isn't duplicated -- and a name-matched entry KEEPS
+ * its stored namespace and id ("never rename out from under the user",
+ * ditto the app): config allow/deny lists, grades.json and vault refs are
+ * all keyed by namespace, and a silent rename would detach every one.
+ *
+ * A namespace match against a DIFFERENT catalog slug REFUSES (throws)
+ * instead of merging: two catalog servers can derive the same namespace
+ * (live example: slugs "redis" and "redis-yawlabs" both display as
+ * "Redis" -> namespace "redis"), and merging silently swapped the launch
+ * command AND overwrote the stored slug -- after which `yaw-mcp remove
+ * <old-slug>` was an exit-0 no-op. (The app's one-click doInstall refuses
+ * ALL duplicates; this is the CLI's equivalent for the case where the
+ * merge would provably change which server runs.)
+ *
+ * A SLUG-LESS namespace match (entries written by the Yaw Terminal app or
+ * a pre-0.76 CLI) is genuinely ambiguous: "same server whose catalog row
+ * drifted" and "different server with the same display name" are
+ * indistinguishable without the slug, and refusing would break the
+ * deliberate re-add-to-refresh flow. So it MERGES (gaining the slug
+ * stamp) -- but the merge reports a launchChanged note whenever the
+ * command/args it replaced differ, so a swap is never silent; there is
+ * also no stored slug to orphan, so `remove <namespace>` keeps working
+ * either way.
+ *
+ * An existing entry is otherwise UPDATED, not overwritten: see
  * mergeServerEntry for exactly what survives. Atomic write.
  *
- * Returns the path written, whether an existing entry was updated (vs a fresh
- * add), and the entry AS WRITTEN -- callers that report what landed on disk
- * (`add --json`, the ambient-env note) must describe the merged result, not
- * the pre-merge input they handed in.
+ * Returns the path written, whether an existing entry was updated (vs a
+ * fresh add), and the entry AS WRITTEN -- callers that report what landed
+ * on disk (`add --json`, the ambient-env note, the kept-namespace note)
+ * must describe the merged result, not the pre-merge input they handed in.
  *
  * Serialized via bundleWriteChain so concurrent calls don't lose writes.
  */
 export function upsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string } = {},
-): Promise<{ path: string; replaced: boolean; entry: Partial<UpstreamServerConfig> }> {
+): Promise<{
+  path: string;
+  replaced: boolean;
+  entry: Partial<UpstreamServerConfig>;
+  launchChanged?: { from: string; to: string };
+}> {
   const result = bundleWriteChain.then(() => doUpsertUserBundle(entry, opts));
   bundleWriteChain = result.then(
     () => undefined,
@@ -861,18 +892,117 @@ export function upsertUserBundle(
   return result;
 }
 
+/** How doUpsertUserBundle will treat `entry` against the given on-disk
+ *  server array. Pure -- shared by the write path and by
+ *  previewUpsertUserBundle so `add --dry-run` can never contradict the
+ *  run it previews. */
+function resolveUpsertTarget(
+  servers: Array<Partial<UpstreamServerConfig> | undefined>,
+  entry: Partial<UpstreamServerConfig>,
+): {
+  idx: number;
+  matchedByNamespace: boolean;
+  refusal: string | null;
+  namespace?: string;
+  id?: string;
+  launchChanged?: { from: string; to: string };
+} {
+  const incoming = entry as Record<string, unknown>;
+  // Two-pass lookup, namespace first -- see the upsertUserBundle doc.
+  let idx = servers.findIndex((s) => s?.namespace === entry.namespace);
+  const matchedByNamespace = idx >= 0;
+  if (idx < 0 && entry.name != null) {
+    idx = servers.findIndex((s) => s?.name === entry.name);
+  }
+  if (idx < 0) return { idx, matchedByNamespace, refusal: null };
+  const stored = (servers[idx] ?? {}) as Record<string, unknown>;
+  // Cross-slug collision -- see the upsertUserBundle doc. Checked on BOTH
+  // match paths: a name-fallback hit on an entry that carries a different
+  // slug is the same "different server, same display name" case.
+  if (typeof stored.slug === "string" && typeof incoming.slug === "string" && stored.slug !== incoming.slug) {
+    const storedLabel = typeof stored.name === "string" ? stored.name : stored.slug;
+    const storedNs = typeof stored.namespace === "string" ? stored.namespace : entry.namespace;
+    return {
+      idx,
+      matchedByNamespace,
+      refusal:
+        `can't add catalog server "${incoming.slug}": namespace "${storedNs}" is already used by ` +
+        `"${storedLabel}" (added as "${stored.slug}"). Remove it first with \`yaw-mcp remove ${stored.slug}\`.`,
+    };
+  }
+  // Slug-less stored entry: merges on either match path, but a launch swap
+  // must be LOUD -- see the upsertUserBundle doc for why this cannot refuse.
+  // The name-fallback path needs it MORE than the namespace path: a
+  // name-only match is the weaker identity signal.
+  let launchChanged: { from: string; to: string } | undefined;
+  if (typeof stored.slug !== "string" && typeof incoming.command === "string") {
+    const renderLaunch = (cmd: unknown, args: unknown): string =>
+      [cmd, ...(Array.isArray(args) ? args : [])].filter((x) => typeof x === "string").join(" ");
+    const from = renderLaunch(stored.command, stored.args);
+    const to = renderLaunch(incoming.command, incoming.args);
+    if (from !== to && from.length > 0) launchChanged = { from, to };
+  }
+  if (matchedByNamespace) return { idx, matchedByNamespace, refusal: null, launchChanged };
+  // Name-fallback match: keep the stored namespace and id (see doc).
+  return {
+    idx,
+    matchedByNamespace,
+    refusal: null,
+    namespace: typeof stored.namespace === "string" ? stored.namespace : undefined,
+    id: typeof stored.id === "string" ? stored.id : undefined,
+    launchChanged,
+  };
+}
+
+/** Read-only preview of what upsertUserBundle would do -- the refusal it
+ *  would throw (if any) and the namespace the file would actually hold.
+ *  `add --dry-run` reports THIS instead of re-deriving its own answer, so
+ *  the preview and the real run can never disagree. Throws the same
+ *  could-not-be-parsed error the real run throws for an unreadable file. */
+export async function previewUpsertUserBundle(
+  entry: Partial<UpstreamServerConfig>,
+  opts: { home?: string } = {},
+): Promise<{
+  replaced: boolean;
+  refusal: string | null;
+  namespace: string | undefined;
+  launchChanged?: { from: string; to: string };
+}> {
+  const home = opts.home ?? homedir();
+  const file = await readRawUserBundles(home);
+  const target = resolveUpsertTarget(file.servers, entry);
+  return {
+    replaced: target.idx >= 0,
+    refusal: target.refusal,
+    namespace: target.namespace ?? entry.namespace,
+    launchChanged: target.launchChanged,
+  };
+}
+
 async function doUpsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string },
-): Promise<{ path: string; replaced: boolean; entry: Partial<UpstreamServerConfig> }> {
+): Promise<{
+  path: string;
+  replaced: boolean;
+  entry: Partial<UpstreamServerConfig>;
+  launchChanged?: { from: string; to: string };
+}> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
   const file = await readRawUserBundles(home);
-  const idx = file.servers.findIndex(
-    (s) => s?.namespace === entry.namespace || (entry.name != null && s?.name === entry.name),
-  );
+  const target = resolveUpsertTarget(file.servers, entry);
+  if (target.refusal) throw new Error(target.refusal);
+  const { idx, matchedByNamespace } = target;
   const replaced = idx >= 0;
-  const written = replaced ? mergeServerEntry(file.servers[idx] ?? {}, entry) : entry;
+  let written = replaced ? mergeServerEntry(file.servers[idx] ?? {}, entry) : entry;
+  if (replaced && !matchedByNamespace) {
+    written = {
+      ...written,
+      namespace: target.namespace ?? written.namespace,
+      id: target.id ?? written.id,
+    };
+  }
   if (replaced) file.servers[idx] = written;
   else file.servers.push(written);
   // Preserve a newer on-disk schema version rather than downgrading it; only
@@ -890,7 +1020,7 @@ async function doUpsertUserBundle(
       // chmod not supported on this filesystem; not fatal.
     }
   }
-  return { path, replaced, entry: written };
+  return { path, replaced, entry: written, launchChanged: target.launchChanged };
 }
 
 /**

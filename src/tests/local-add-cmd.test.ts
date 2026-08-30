@@ -1400,25 +1400,261 @@ describe("upsertUserBundle round-trip", () => {
     ).rejects.toThrow(/could not be parsed/);
   });
 
-  it("dedups a name-matched legacy entry (no second copy) [#1 cross-path]", async () => {
+  it("dedups a name-matched legacy entry (no second copy) and KEEPS its namespace [#1 cross-path]", async () => {
     // A legacy/app entry written under a different namespace but the same name.
     await upsertUserBundle(
       { namespace: "legacy_gh", name: "GitHub", command: "x", args: [], isActive: true },
       { home: synthHome },
     );
+    const outLines: string[] = [];
+    const errLines: string[] = [];
     await runAdd({
       slug: "github",
       home: synthHome,
       cwd: synthCwd,
       env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
       fetchCatalog,
-      out: () => {},
-      err: () => {},
+      out: (s) => outLines.push(s),
+      err: (s) => errLines.push(s),
     });
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     // One GitHub entry total -- matched by name, replaced in place, not duplicated.
     expect(loaded.config?.servers.filter((s) => s.name === "GitHub")).toHaveLength(1);
     expect(loaded.config?.servers).toHaveLength(1);
+    // The stored namespace SURVIVES the merge ("never rename out from under
+    // the user"): config allow/deny lists, grades.json and vault refs are
+    // keyed by namespace, and the old single-pass merge silently renamed it
+    // to the catalog-derived "github", detaching all three. The success line
+    // must say which namespace the file actually holds.
+    expect(loaded.config?.servers[0]?.namespace).toBe("legacy_gh");
+    expect(outLines.join("")).toContain('kept existing namespace "legacy_gh"');
+    // A name-ONLY match is the weaker identity signal, so the launch swap
+    // (x -> docker run ...) must be reported here just like on the
+    // namespace-match path -- the note was originally computed only there.
+    const errText = errLines.join("");
+    expect(errText).toContain("launch command changed");
+    expect(errText).toContain("from: x");
+    expect(errText).toContain("docker run");
+  });
+
+  it("namespace match wins over an earlier name match (two-pass lookup) [#1]", async () => {
+    // Seed BOTH: an entry that matches the incoming NAME (legacy_gh /
+    // "GitHub") sitting EARLIER in the array than the exact namespace
+    // match. The single-pass `namespace || name` findIndex let the earlier
+    // name match hijack the merge, rename legacy_gh to "github", and leave
+    // the file with two entries sharing one namespace.
+    await upsertUserBundle(
+      { namespace: "legacy_gh", name: "GitHub", command: "x", args: [], isActive: true },
+      { home: synthHome },
+    );
+    await upsertUserBundle(
+      { namespace: "github", name: "GitHub Enterprise", command: "y", args: [], isActive: true },
+      { home: synthHome },
+    );
+    await upsertUserBundle(
+      { namespace: "github", name: "GitHub", command: "npx", args: ["-y", "@x/gh"], isActive: true },
+      { home: synthHome },
+    );
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const namespaces = (loaded.config?.servers ?? []).map((s) => s.namespace);
+    // Two entries, distinct namespaces -- the exact namespace match was
+    // updated; the name-matched legacy entry was left alone.
+    expect(namespaces.sort()).toEqual(["github", "legacy_gh"]);
+    const gh = loaded.config?.servers.find((s) => s.namespace === "github");
+    expect(gh?.command).toBe("npx");
+    const legacy = loaded.config?.servers.find((s) => s.namespace === "legacy_gh");
+    expect(legacy?.command).toBe("x");
+  });
+
+  it("REFUSES a namespace collision between two different catalog slugs [#1]", async () => {
+    // The live catalog really carries this pair: slugs "redis" and
+    // "redis-yawlabs" both display as "Redis" and both derive namespace
+    // "redis". Merging silently swapped the launch command AND overwrote
+    // the stored slug -- after which `yaw-mcp remove redis-yawlabs` was an
+    // exit-0 no-op. The app refuses; so does the CLI now.
+    const { readFileSync } = await import("node:fs");
+    await upsertUserBundle(
+      {
+        namespace: "redis",
+        name: "Redis",
+        slug: "redis-yawlabs",
+        command: "npx",
+        args: ["-y", "@yawlabs/redis-mcp@latest"],
+        isActive: true,
+      } as Parameters<typeof upsertUserBundle>[0],
+      { home: synthHome },
+    );
+    const bundlesPath = join(synthHome, ".yaw-mcp", "bundles.json");
+    const before = readFileSync(bundlesPath, "utf8");
+    await expect(
+      upsertUserBundle(
+        {
+          namespace: "redis",
+          name: "Redis",
+          slug: "redis",
+          command: "uvx",
+          args: ["--from", "redis-mcp-server@latest", "redis-mcp-server"],
+          isActive: true,
+        } as Parameters<typeof upsertUserBundle>[0],
+        { home: synthHome },
+      ),
+    ).rejects.toThrow(/already used by "Redis" \(added as "redis-yawlabs"\)/);
+    // Nothing was written over the existing entry.
+    expect(readFileSync(bundlesPath, "utf8")).toBe(before);
+  });
+
+  it("a slug-less namespace match merges but reports the launch swap LOUDLY [#1]", async () => {
+    // Entries written by the Yaw Terminal app (and by pre-0.76 CLIs) carry
+    // no `slug`, so "same server whose catalog row drifted" and "different
+    // server with the same display name" are indistinguishable. The merge
+    // proceeds (refusing would break re-add-to-refresh, and there is no
+    // stored slug for `remove` to orphan) -- but a changed launch command
+    // must be reported, never silent.
+    await upsertUserBundle(
+      // App-shaped: no slug field at all.
+      { namespace: "fetch", name: "Fetch", command: "docker", args: ["run", "old/fetch"], isActive: true },
+      { home: synthHome },
+    );
+    const errLines: string[] = [];
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: (s) => errLines.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const errText = errLines.join("");
+    expect(errText).toContain("launch command changed");
+    expect(errText).toContain("docker run old/fetch");
+    expect(errText).toContain("npx -y @yawlabs/fetch-mcp");
+    // Merged: refreshed launch + slug stamped, remove-by-namespace intact.
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers[0]?.command).toBe("npx");
+  });
+
+  it("a slug-less namespace match with the SAME launch merges quietly and gains the slug [#1]", async () => {
+    await upsertUserBundle(
+      { namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"], isActive: true },
+      { home: synthHome },
+    );
+    const res = await upsertUserBundle(
+      {
+        namespace: "fetch",
+        name: "Fetch",
+        slug: "fetch",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp"],
+        isActive: true,
+      } as Parameters<typeof upsertUserBundle>[0],
+      { home: synthHome },
+    );
+    expect(res.replaced).toBe(true);
+    expect(res.launchChanged).toBeUndefined();
+    expect((res.entry as { slug?: string }).slug).toBe("fetch");
+  });
+
+  it("add --dry-run predicts the collision refusal (exit 1, nothing written) [#1]", async () => {
+    // The preview must describe the run it previews: a dry-run that says
+    // 'would write' with exit 0 while the real run refuses with exit 1 is
+    // the same preview-contradicts-run class install's --skip --dry-run had.
+    const { readFileSync } = await import("node:fs");
+    await upsertUserBundle(
+      {
+        namespace: "github",
+        name: "GitHub",
+        slug: "github-enterprise",
+        command: "other",
+        args: [],
+        isActive: true,
+      } as Parameters<typeof upsertUserBundle>[0],
+      { home: synthHome },
+    );
+    const bundlesPath = join(synthHome, ".yaw-mcp", "bundles.json");
+    const before = readFileSync(bundlesPath, "utf8");
+    const errLines: string[] = [];
+    const r = await runAdd({
+      slug: "github",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+      fetchCatalog,
+      out: () => {},
+      err: (s) => errLines.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(errLines.join("")).toContain("would refuse");
+    expect(errLines.join("")).toContain('added as "github-enterprise"');
+    expect(readFileSync(bundlesPath, "utf8")).toBe(before);
+  });
+
+  it("add --dry-run --json refuses on the SAME channel and shape as the real --json run [#1]", async () => {
+    // Both must exit 1 with text on stderr and NOTHING on stdout: a
+    // {ok:false} JSON body on the dry-run's stdout would be the one place
+    // the preview's channel differed from the run it previews (every other
+    // add error, --json or not, is stderr text).
+    await upsertUserBundle(
+      {
+        namespace: "github",
+        name: "GitHub",
+        slug: "github-enterprise",
+        command: "other",
+        args: [],
+        isActive: true,
+      } as Parameters<typeof upsertUserBundle>[0],
+      { home: synthHome },
+    );
+    const run = async (dryRun: boolean) => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const r = await runAdd({
+        slug: "github",
+        json: true,
+        dryRun,
+        home: synthHome,
+        cwd: synthCwd,
+        env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+        fetchCatalog,
+        out: (s) => out.push(s),
+        err: (s) => err.push(s),
+      });
+      return { exitCode: r.exitCode, out: out.join(""), err: err.join("") };
+    };
+    const preview = await run(true);
+    const real = await run(false);
+    expect(preview.exitCode).toBe(1);
+    expect(real.exitCode).toBe(1);
+    expect(preview.out).toBe("");
+    expect(real.out).toBe("");
+    expect(preview.err).toContain('added as "github-enterprise"');
+    expect(real.err).toContain('added as "github-enterprise"');
+  });
+
+  it("add --dry-run predicts the KEPT namespace for a name-matched legacy entry [#1]", async () => {
+    await upsertUserBundle(
+      { namespace: "legacy_gh", name: "GitHub", command: "x", args: [], isActive: true },
+      { home: synthHome },
+    );
+    const outLines: string[] = [];
+    const r = await runAdd({
+      slug: "github",
+      dryRun: true,
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+      fetchCatalog,
+      out: (s) => outLines.push(s),
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    const parsed = JSON.parse(outLines.join(""));
+    // The real run keeps legacy_gh; the preview must say so, not "github".
+    expect(parsed.namespace).toBe("legacy_gh");
+    expect(parsed.dryRun).toBe(true);
   });
 
   it("preserves a newer on-disk schema version on write [#4]", async () => {

@@ -2006,9 +2006,14 @@ export class ConnectServer {
     // the user already has ≥1 member installed. Top 3 by fewest-missing-
     // first (cheapest to complete), ties broken by most-momentum then id.
     // Suppressed when every bundle is either fully installed or entirely
-    // absent. Same data source as mcp_connect_bundles action="match" but
-    // surfaced here so the model can act without the extra round-trip.
-    const allInstalled = this.config.servers.map((s) => s.namespace);
+    // absent. Same data source AND same server set as mcp_connect_bundles
+    // action="match" and `yaw-mcp bundles match` (active + profile-allowed
+    // via getProfiledActiveServers) but surfaced here so the model can act
+    // without the extra round-trip. Feeding ALL configured servers here --
+    // disabled and profile-blocked included -- made the three surfaces
+    // disagree: a bundle whose only missing member was a DISABLED server
+    // read as complete in discover while match called it partial.
+    const allInstalled = this.getProfiledActiveServers().map((s) => s.namespace);
     const bundleGaps = topPartialBundles(allInstalled, 3);
     if (bundleGaps.length > 0) {
       lines.push("\nBundle completions (install to unlock curated stacks):");

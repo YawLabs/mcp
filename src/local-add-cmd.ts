@@ -29,6 +29,7 @@ import {
   findShadowingProjectBundles,
   loadLocalBundles,
   localBundlesPath,
+  previewUpsertUserBundle,
   removeUserBundle,
   upsertUserBundle,
 } from "./local-bundles.js";
@@ -256,13 +257,44 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   };
 
   if (opts.dryRun) {
+    // The preview must describe the run it previews: the real run can
+    // REFUSE (a namespace collision with a different server) or KEEP an
+    // existing entry's namespace (a name-matched legacy entry), and both
+    // outcomes depend on the file on disk. previewUpsertUserBundle shares
+    // the real write path's resolution logic, so the two cannot drift.
+    let preview: Awaited<ReturnType<typeof previewUpsertUserBundle>>;
+    try {
+      preview = await previewUpsertUserBundle(entry, { home });
+    } catch (e) {
+      // Same unreadable-file failure the real run surfaces.
+      printErr(`yaw-mcp add: ${(e as Error).message}`);
+      return { exitCode: 1, written: [] };
+    }
+    if (preview.refusal) {
+      // stderr text under --json too: that is what the REAL refusal (the
+      // catch around upsertUserBundle below) emits, and every other error
+      // exit in this command. A {ok:false} body on stdout here would be the
+      // one place the preview's channel differed from the run it previews.
+      printErr(`yaw-mcp add (dry-run): would refuse: ${preview.refusal}`);
+      return { exitCode: 1, written: [] };
+    }
+    const previewNamespace = preview.namespace ?? namespace;
+    if (preview.launchChanged) {
+      printErr(
+        `Note: this would CHANGE the entry's launch command:\n  from: ${preview.launchChanged.from}\n    to: ${preview.launchChanged.to}\nIf the existing entry is a different server you meant to keep, remove/re-add via the app or edit bundles.json instead.`,
+      );
+    }
     if (opts.json) {
       // Same wrapper shape as the real add below, with dryRun:true, so a
       // script parsing `add --json` sees one consistent shape either way --
       // including the env redaction (see jsonEntry).
-      print(JSON.stringify({ ok: true, dryRun: true, namespace, entry: jsonEntry(entry) }, null, 2));
+      print(JSON.stringify({ ok: true, dryRun: true, namespace: previewNamespace, entry: jsonEntry(entry) }, null, 2));
     } else {
-      print(`yaw-mcp add (dry-run): would write ${server.name} as namespace "${namespace}"`);
+      const nsNote =
+        previewNamespace === namespace
+          ? `as namespace "${previewNamespace}"`
+          : `keeping existing namespace "${previewNamespace}"`;
+      print(`yaw-mcp add (dry-run): would ${preview.replaced ? "update" : "write"} ${server.name} ${nsNote}`);
       print(`  command: ${entry.command} ${(entry.args ?? []).join(" ")}`);
       if (entry.env) print(`  env keys: ${Object.keys(entry.env).join(", ")}`);
     }
@@ -279,20 +311,37 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
 
   // Report the entry AS WRITTEN, not the one built above: an update folds onto
   // whatever was already on disk (env values, an explicit isActive:false, a
-  // per-server runtime override -- see mergeServerEntry), so the pre-merge
-  // object would describe a file that doesn't exist.
+  // per-server runtime override, a name-matched entry's KEPT namespace -- see
+  // mergeServerEntry / upsertUserBundle), so the pre-merge object would
+  // describe a file that doesn't exist.
   const written = res.entry;
+  const finalNamespace = typeof written.namespace === "string" ? written.namespace : namespace;
+
+  // A slug-less stored entry (app-written, pre-0.76 CLI) merges even when
+  // the launch command differs -- identity is unknowable without the slug,
+  // and refusing would break re-add-to-refresh. The swap must never be
+  // SILENT though: name what changed, on stderr so it survives --json.
+  if (res.launchChanged) {
+    printErr(
+      `Note: the entry's launch command changed:\n  from: ${res.launchChanged.from}\n    to: ${res.launchChanged.to}\nIf the previous entry was a different server you meant to keep, restore it from the app or edit bundles.json.`,
+    );
+  }
 
   if (opts.json) {
     print(
       JSON.stringify(
-        { ok: true, namespace, path: res.path, replaced: res.replaced, entry: jsonEntry(written) },
+        { ok: true, namespace: finalNamespace, path: res.path, replaced: res.replaced, entry: jsonEntry(written) },
         null,
         2,
       ),
     );
   } else {
-    print(`${res.replaced ? "Updated" : "Added"} ${server.name} (namespace "${namespace}") in ${res.path}`);
+    // Name the namespace the file actually holds -- and say so explicitly
+    // when the merge kept an existing one instead of the catalog-derived
+    // spelling, so the user is never told a namespace that does not exist.
+    const nsNote =
+      finalNamespace === namespace ? `namespace "${finalNamespace}"` : `kept existing namespace "${finalNamespace}"`;
+    print(`${res.replaced ? "Updated" : "Added"} ${server.name} (${nsNote}) in ${res.path}`);
     // A re-add folds onto a stored `"isActive": false` instead of silently
     // re-enabling it (mergeServerEntry rule 3). That is deliberate, but it
     // makes the usual "restart to pick it up" line WRONG: a disabled entry

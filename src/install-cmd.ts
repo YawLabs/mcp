@@ -30,7 +30,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { atomicWriteFile } from "./atomic-write.js";
@@ -95,6 +95,11 @@ export interface InstallCommandOptions {
   all?: boolean;
   /** Override for tests; defaults to homedir(). */
   home?: string;
+  /** Windows %APPDATA% override for tests. When home is overridden and this
+   *  is not, it is derived as <home>/AppData/Roaming so the claude-desktop
+   *  path cannot escape a synthetic home (a write test with os=windows used
+   *  to resolve through the REAL process.env.APPDATA). */
+  appData?: string;
   /** Override for tests; defaults to process.cwd(). */
   cwd?: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`. When set, claude-code writes go
@@ -279,6 +284,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       scope,
       os,
       home: opts.home,
+      appData: opts.appData ?? (opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined),
       projectDir,
       claudeConfigDir: opts.claudeConfigDir,
     });
@@ -444,8 +450,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   if (existingHasEntry) {
     let decision: "overwrite" | "skip" | "abort";
-    if (opts.force || opts.dryRun) decision = "overwrite";
-    else if (opts.skip) decision = "skip";
+    // --skip WINS over --dry-run: the preview must describe the run it
+    // previews, and the real `--skip` run leaves the entry untouched --
+    // dryRun-first made `--skip --dry-run` preview an OVERWRITE.
+    if (opts.skip) decision = "skip";
+    else if (opts.force || opts.dryRun) decision = "overwrite";
     else if (opts.promptAnswer) decision = opts.promptAnswer;
     else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {
       decision = await promptCollision(resolved.absolute, opts.io);
@@ -456,7 +465,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
     if (decision === "skip") {
-      log(`Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`);
+      log(
+        opts.dryRun
+          ? `Would leave existing "${ENTRY_NAME}" entry untouched (--skip). Nothing to do.`
+          : `Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`,
+      );
       return { written: [], wouldWrite: [], messages, exitCode: 0 };
     }
     if (decision === "abort") {
@@ -898,7 +911,27 @@ export function readEntryAt(
   if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
   const entry = (node as Record<string, unknown>)[entryName];
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
-  return entry as { command?: string; args?: string[]; env?: Record<string, string> };
+  // Validate `env` before anyone carries it forward: the user chose
+  // overwrite (or --force) precisely to replace a broken entry, and a
+  // malformed env (a string -- whose Object.keys are "0","1","2" -- or an
+  // array) would otherwise ride into the fresh entry and get the whole
+  // file rejected by the client. Filter PER KEY, not all-or-nothing: one
+  // hand-added numeric value ("DEBUG": 1) must not silently drop the
+  // valid string keys beside it -- OAM_BIN is the load-bearing example
+  // (losing it moves the sidecars to a different runtime with no
+  // diagnostic, the exact failure the carry-over exists to prevent).
+  const result = { ...entry } as { command?: string; args?: string[]; env?: Record<string, string> };
+  const env = (entry as Record<string, unknown>).env;
+  if (typeof env === "object" && env !== null && !Array.isArray(env)) {
+    const kept = Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === "string")) as Record<
+      string,
+      string
+    >;
+    result.env = Object.keys(kept).length > 0 ? kept : undefined;
+  } else {
+    result.env = undefined;
+  }
+  return result;
 }
 
 export function mergeClientConfig(
@@ -1070,6 +1103,16 @@ export function parseInstallArgs(argv: string[]):
         error: `yaw-mcp install: ${opts.listOnly ? "--list" : "--all"} does not take a client argument.\n${USAGE}`,
       };
     }
+    // --all plans its own scope per client (user where available), so an
+    // explicit --scope would be silently discarded for every client but
+    // the project-only ones. Refuse instead of ignoring: a flag that is
+    // accepted and dropped reads as honored.
+    if (opts.all && opts.scope) {
+      return {
+        ok: false,
+        error: `yaw-mcp install: --all chooses each client's scope itself and cannot honor --scope. Install the client you want at a specific scope individually.\n${USAGE}`,
+      };
+    }
     return { ok: true, options: opts as InstallCommandOptions };
   }
 
@@ -1100,9 +1143,20 @@ async function runInstallList(
   // before the dispatch included. An earlier local array here captured only
   // the rows below and dropped everything else.
   const home = opts.home ?? homedir();
-  const cwd = opts.cwd ?? process.cwd();
+  // Honor --project-dir like the single-client install path does
+  // (install-cmd resolves projectDir ?? cwd for the write), so `install
+  // --list --project-dir /repo` reports the same files `install vscode
+  // --project-dir /repo` would write -- accepting the flag and probing
+  // process.cwd() instead made the two surfaces disagree.
+  const cwd = opts.projectDir ?? opts.cwd ?? process.cwd();
   const os = opts.os ?? CURRENT_OS;
-  const probes = await probeClientsAsync({ home, os, cwd, claudeConfigDir: opts.claudeConfigDir });
+  const probes = await probeClientsAsync({
+    home,
+    os,
+    cwd,
+    claudeConfigDir: opts.claudeConfigDir,
+    appData: opts.appData ?? (opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined),
+  });
 
   const rows = probes.map((p) => ({
     client: INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId,
