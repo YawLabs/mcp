@@ -29,6 +29,30 @@ describe("loadUserGuide", () => {
     expect(await loadUserGuide(home)).toBeNull();
   });
 
+  it("returns null but WARNS when the guide exists and cannot be read (a directory at its path)", async () => {
+    // The header promises "an unreadable one logs and returns null", but
+    // readGuide only logged the abort timeout: EACCES / EISDIR / EIO were
+    // swallowed and looked identical to "no guide" from the resource and
+    // from doctor -- a guide the user wrote, silently not served. A
+    // directory at YAW-MCP.md is EISDIR on every platform.
+    const dir = join(home, CONFIG_DIRNAME);
+    mkdirSync(join(dir, GUIDE_FILENAME), { recursive: true });
+    const warned: string[] = [];
+    const orig = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown): boolean => {
+      warned.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      expect(await loadUserGuide(home)).toBeNull();
+    } finally {
+      process.stderr.write = orig;
+    }
+    const joined = warned.join("");
+    expect(joined).toContain("Guide exists but could not be read");
+    expect(joined).toContain(GUIDE_FILENAME);
+  });
+
   it("loads content when present", async () => {
     const p = writeGuide(join(home, CONFIG_DIRNAME), "# User guide\n\nuse gh for github.\n");
     const g = await loadUserGuide(home);

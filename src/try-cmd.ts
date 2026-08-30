@@ -1019,17 +1019,21 @@ export async function gcExpiredTrials(opts: {
    *  doctor passes the scan it already needs for readout so the trials dir
    *  is scanned once per invocation instead of once here + once for readout. */
   scan?: TrialScanResult;
-}): Promise<{ cleared: number; failed: number }> {
+}): Promise<{ cleared: number; failed: number; failures: TrialGcFailure[] }> {
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
   const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   const postEvent = opts.postEvent ?? defaultPostEvent;
   const scan = opts.scan ?? (await scanTrials({ home, now: opts.now }));
-  if (scan.expired.length === 0) return { cleared: 0, failed: 0 };
+  if (scan.expired.length === 0) return { cleared: 0, failed: 0, failures: [] };
 
   let cleared = 0;
-  let failed = 0;
+  const failures: TrialGcFailure[] = [];
   for (const { marker, path } of scan.expired) {
+    // Which step blew up decides what the user is told: a failed PEEL means
+    // the entry is still wired into the client config; a failed UNLINK means
+    // the config is already clean and only the marker lingers.
+    let stage: TrialGcFailure["stage"] = "peel";
     try {
       if (existsSync(marker.clientPath)) {
         const raw = await readFile(marker.clientPath, "utf8");
@@ -1053,15 +1057,39 @@ export async function gcExpiredTrials(opts: {
       }
       // Unlink the file that was actually scanned -- deriving the path from
       // marker.slug would orphan a marker whose filename mismatches its slug.
+      stage = "unlink";
       await unlink(path);
       await postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId: ANON_ID_PLACEHOLDER }).catch(
         () => undefined,
       );
       cleared++;
     } catch (e) {
-      log("debug", "trial gc failed", { slug: marker.slug, error: (e as Error).message });
-      failed++;
+      const error = (e as Error).message;
+      log("debug", "trial gc failed", { slug: marker.slug, stage, error });
+      failures.push({ slug: marker.slug, clientPath: marker.clientPath, markerPath: path, stage, error });
     }
   }
-  return { cleared, failed };
+  return { cleared, failed: failures.length, failures };
+}
+
+/** One expired trial the sweep could not finish. Surfaced by doctor (text,
+ *  --json, and the warnings that drive exit 2) with enough detail to act
+ *  on: which slug, which file, and which step failed. */
+export interface TrialGcFailure {
+  slug: string;
+  clientPath: string;
+  markerPath: string;
+  /** "peel": the entry is STILL in the client config. "unlink": the config
+   *  is clean; only the marker file could not be deleted. */
+  stage: "peel" | "unlink";
+  error: string;
+}
+
+/** The doctor-facing wording for one gc failure, shared by the text TRIALS
+ *  section, the --json warnings, and the stderr warning stream so all three
+ *  surfaces say the same thing and gate exit 2 identically. */
+export function trialGcFailureWarning(f: TrialGcFailure): string {
+  return f.stage === "unlink"
+    ? `trial "${f.slug}": its entry was removed from ${f.clientPath}, but the marker ${f.markerPath} could not be deleted (${f.error}) -- delete that marker by hand`
+    : `trial "${f.slug}": expired but could not be removed from ${f.clientPath} (${f.error}) -- still wired in; run \`yaw-mcp try-cleanup ${f.slug}\` or edit that file by hand`;
 }

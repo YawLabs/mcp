@@ -66,11 +66,21 @@ async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | n
   try {
     raw = await readFile(path, { encoding: "utf8", signal: ac.signal });
   } catch (err) {
-    // Missing file is the common case and stays silent. Timeouts warn so
-    // a genuinely hung disk isn't swallowed.
-    const isTimeout = err instanceof Error && (err as NodeJS.ErrnoException).code === "ABORT_ERR";
-    if (isTimeout) {
+    // Missing file is the common case and stays silent (ENOENT, and ENOTDIR
+    // for a path component that is a regular file -- both mean "no guide").
+    // Everything else warns, as the header promises: a timeout is a hung
+    // disk, and EACCES / EISDIR (a directory at YAW-MCP.md) / EIO are a
+    // guide the user wrote that is silently not being served -- they looked
+    // identical to "no guide" from the resource and from doctor.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    if (code === "ABORT_ERR") {
       log("warn", "Guide read timed out", { path });
+    } else {
+      log("warn", "Guide exists but could not be read; serving no guide", {
+        path,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
     return null;
   } finally {

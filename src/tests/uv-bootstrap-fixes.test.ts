@@ -7,7 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Pins for the two uv-bootstrap bug fixes that require mocking spawn:
 //
 //   Fix 1: onPath must pass shell:true on win32 so PATHEXT shims (.cmd)
-//          are found and the probe doesn't false-negative on Windows.
+//          are found and the probe doesn't false-negative on Windows --
+//          which MATCHES the real spawn: the SDK's StdioClientTransport
+//          goes through cross-spawn, which resolves PATHEXT shims and
+//          wraps them in cmd.exe itself. A shell-less probe was tried and
+//          reverted (it sent every .cmd-shim host to the bootstrap download).
 //
 //   Fix 2: ensureUv must clear the memo on rejection so a transient
 //          failure doesn't poison every subsequent call for the process
@@ -97,10 +101,15 @@ afterEach(async () => {
   await fs.rm(path.join(os.tmpdir(), "yaw-mcp-uvbf-test-cache"), { recursive: true, force: true }).catch(() => {});
 });
 
-// ── Fix 1: onPath passes the right shell option ───────────────────────
+// ── Fix 1: onPath resolves the binary the way the SDK's spawn does ────
 describe("onPath spawn options (fix 1)", () => {
   it("passes shell=process.platform==='win32' and matching windowsHide", async () => {
-    // ensureUv() calls onPath("uv") first, which is the spawn we intercept.
+    // The value onPath vouches for is handed to StdioClientTransport, which
+    // spawns via cross-spawn: PATHEXT resolution + a cmd.exe wrapper for
+    // .cmd/.bat shims. shell:true on win32 is the raw-spawn equivalent, so
+    // a uv.cmd that passes this probe really does spawn at activation. A
+    // shell:false probe false-NEGATIVED on that shim and sent every such
+    // host to the ~20MB bootstrap download -- fatal with no github.com route.
     await ensureUv().catch(() => {});
 
     // At least one spawn call must have been made (the onPath probe).

@@ -18,7 +18,13 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { FOUNDRY_FILENAME } from "./foundry.js";
-import { buildCorpusFromTraces, DEFAULT_CORPUS_CAP, parseTraceLines, scoreCorpus } from "./foundry-corpus.js";
+import {
+  buildCorpusFromTraces,
+  DEFAULT_CORPUS_CAP,
+  FOUNDRY_TOP3_FLOOR,
+  parseTraceLines,
+  scoreCorpus,
+} from "./foundry-corpus.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import type { RankableServer } from "./relevance.js";
@@ -151,6 +157,11 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
   writeFileSync(opts.out, `${JSON.stringify(corpus, null, 2)}\n`, "utf8");
 
   const score = scoreCorpus(corpus);
+  // The routing gate (foundry-routing.test.ts) fails when top-3 is below
+  // FOUNDRY_TOP3_FLOOR. Say so HERE, at export time, rather than letting a
+  // maintainer commit a corpus that reds `npm test` with no warning --
+  // the fixtures README only tells them to ratchet the floor UP.
+  const belowFloor = score.top3 < FOUNDRY_TOP3_FLOOR;
   if (opts.json) {
     print(
       JSON.stringify(
@@ -161,6 +172,8 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
           fromTraces: traces.length,
           top1: score.top1,
           top3: score.top3,
+          floor: FOUNDRY_TOP3_FLOOR,
+          belowFloor,
         },
         null,
         2,
@@ -173,5 +186,10 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
   print(
     `BM25-floor accuracy on this corpus: top-1 ${(score.top1 * 100).toFixed(1)}%, top-3 ${(score.top3 * 100).toFixed(1)}%`,
   );
+  if (belowFloor) {
+    printErr(
+      `yaw-mcp foundry: warning -- top-3 ${(score.top3 * 100).toFixed(1)}% is BELOW the routing gate floor (${(FOUNDRY_TOP3_FLOOR * 100).toFixed(0)}%, FOUNDRY_TOP3_FLOOR in foundry-corpus.ts). Committing this fixture will fail foundry-routing.test.ts; harvest more traces or lower the floor deliberately.`,
+    );
+  }
   return { exitCode: 0, lines };
 }

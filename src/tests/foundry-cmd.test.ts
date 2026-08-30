@@ -71,6 +71,45 @@ describe("runFoundryExport", () => {
     expect(gh.weight).toBe(2);
   });
 
+  it("warns at export time when the corpus scores below the routing-gate floor", async () => {
+    // foundry-routing.test.ts fails on a committed fixture below
+    // FOUNDRY_TOP3_FLOOR; the fixture README only says to ratchet the floor
+    // UP, so an export could land below it with no warning until `npm test`
+    // went red. Traces whose tokens name NEITHER server's vocabulary rank
+    // both near-zero, so top-3 for these two chosen servers is well under 0.7.
+    const out = join(dir, "corpus.json");
+    const blob = [
+      JSON.stringify({ tokens: ["zzz", "qqq"], chosen: "github" }),
+      JSON.stringify({ tokens: ["yyy", "www"], chosen: "slack" }),
+    ].join("\n");
+    const errs: string[] = [];
+    const r = await runFoundryExport({
+      out,
+      cap: 500,
+      json: false,
+      readTraces: () => blob,
+      loadServers: async () => SERVERS,
+      write: () => {},
+      writeErr: (s) => errs.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(errs.join("")).toContain("BELOW the routing gate floor");
+    // --json carries the floor and the verdict so a script can gate on it.
+    const jsonLines: string[] = [];
+    await runFoundryExport({
+      out,
+      cap: 500,
+      json: true,
+      readTraces: () => blob,
+      loadServers: async () => SERVERS,
+      write: (s) => jsonLines.push(s),
+      writeErr: () => {},
+    });
+    const summary = JSON.parse(jsonLines.join(""));
+    expect(summary.floor).toBe(0.7);
+    expect(summary.belowFloor).toBe(true);
+  });
+
   it("exits 1 when there is no harvest file", async () => {
     const r = await runFoundryExport({
       out: join(dir, "c.json"),

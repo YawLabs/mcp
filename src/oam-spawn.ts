@@ -1672,7 +1672,13 @@ export async function resolveOamSpawn(
   // (nothing configured); an absent oam is then the expected state, not a
   // misconfiguration, and must stay quiet. belowMin already warns in the probe
   // with its own actionable numbers, so it is excluded here.
-  if (optedIn && probe.bin === null && !probe.belowMin && !warnedOamUnavailable) {
+  // Gated on the launch actually being one oam would host: upstream.ts calls
+  // this for EVERY local server whose effective runtime is oam, including
+  // docker / uvx / python commands rewriteForOam would never touch. For
+  // those, "opted in to oam but oam is not installed; running it on node
+  // instead" told the user to install oam (doctor reports the same server
+  // as `not-node-command`) and claimed a node fallback that never happens.
+  if (optedIn && probe.bin === null && !probe.belowMin && !warnedOamUnavailable && nodeLaunchKind(command) !== null) {
     warnedOamUnavailable = true;
     // A BROKEN oam and an ABSENT one both arrive here with bin=null and send
     // the user to OPPOSITE fixes, so they get opposite messages. Telling

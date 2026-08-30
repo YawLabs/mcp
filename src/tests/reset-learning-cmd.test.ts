@@ -79,6 +79,36 @@ describe("runResetLearning", () => {
     expect(io.err).toEqual([]);
   });
 
+  it("reports real counts for a BOM-prefixed state file (Notepad save), like loadState reads it", async () => {
+    // persistence.ts strips U+FEFF before parsing; peekParsedCleanly used a
+    // bare JSON.parse, so a Notepad-saved state.json that loadState read
+    // FINE was reported "contents unreadable" and its real counts thrown
+    // away. Built in code -- never hand-type an escape into a fixture.
+    const BOM = String.fromCharCode(0xfeff);
+    writeFileSync(
+      stateFile,
+      `${BOM}${JSON.stringify({
+        version: 2,
+        savedAt: 1,
+        learning: {
+          gh: { dispatched: 2, succeeded: 2, lastUsedAt: 1 },
+          slack: { dispatched: 1, succeeded: 1, lastUsedAt: 1 },
+        },
+        packHistory: [{ namespace: "gh", toolName: "t", at: 1 }],
+        toolCache: {},
+      })}`,
+      "utf8",
+    );
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    const combined = io.out.join("");
+    expect(combined).not.toContain("contents unreadable");
+    expect(combined).toContain("learning entries removed:     2");
+    expect(combined).toContain("pack history entries removed: 1");
+  });
+
   it("removes a malformed state file and reports it as unreadable (not 0 counts)", async () => {
     // loadState is tolerant and returns emptyState here; the unlink
     // still deletes the file, which is what we want — a corrupt state

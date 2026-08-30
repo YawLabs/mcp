@@ -48,7 +48,10 @@ import { resolveUvSpawn } from "./uv-bootstrap.js";
  * step that pre-seeds the derived key into a session file -- that
  * is deferred to a follow-up.
  */
-async function resolveServerEnv(env: Record<string, string>, namespace: string): Promise<Record<string, string>> {
+export async function resolveServerEnv(
+  env: Record<string, string>,
+  namespace: string,
+): Promise<Record<string, string>> {
   if (!hasSecretRefs(env)) return env;
   const refKeys = Object.entries(env)
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
@@ -421,7 +424,24 @@ export async function connectToUpstream(
 //   YAW_MCP_VAULT_PASSPHRASE     — unlocks the local secret vault
 //   YAW_MCP_VAULT_PASSPHRASE_NEW — the incoming passphrase during a rotate
 //     (secrets-cmd.ts), i.e. the LIVE passphrase once the rotate lands
-const INTERNAL_SECRET_ENV_KEYS = new Set(["YAW_MCP_TOKEN", "YAW_MCP_VAULT_PASSPHRASE", "YAW_MCP_VAULT_PASSPHRASE_NEW"]);
+export const INTERNAL_SECRET_ENV_KEYS: ReadonlySet<string> = new Set([
+  "YAW_MCP_TOKEN",
+  "YAW_MCP_VAULT_PASSPHRASE",
+  "YAW_MCP_VAULT_PASSPHRASE_NEW",
+]);
+
+/** Delete yaw-mcp's own secrets from THIS process's env, in place. For the
+ *  one-shot CLI paths that hand `process.env` to a third party that spawns a
+ *  server with it (`yaw-mcp audit` -> @yawlabs/mcp-compliance spreads
+ *  process.env into the child): the broker's spawn path strips these via
+ *  stripInternalSecretsFromEnv, and a CLI that requires the passphrase to be
+ *  SET (audit resolving vault refs) must not then forward it to the audited
+ *  server. Same case-insensitive match, for the same Windows reason. */
+export function scrubInternalSecretsFromProcessEnv(): void {
+  for (const key of Object.keys(process.env)) {
+    if (INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase())) delete process.env[key];
+  }
+}
 
 /** `process.env` minus yaw-mcp's own secrets, for spawning upstream servers.
  *

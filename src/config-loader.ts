@@ -85,6 +85,12 @@ export interface LoadConfigOptions {
  *  Detected (not consumed) so the loader can tell the user to clean up. */
 const DEPRECATED_KEYS = ["token", "apiBase"] as const;
 
+/** Every top-level key the loader reads. Mirrors the shipped JSON schema
+ *  (schemas/yaw-mcp.config.v1.json, additionalProperties:false) so an
+ *  unrecognized key gets a warning instead of being a silent no-op --
+ *  `$schema` is the editor-autocomplete pointer the schema itself allows. */
+const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set(["$schema", "version", "servers", "blocked", "installNudge"]);
+
 /** Build the soft-deprecation warning for a file that still carries
  *  `token` / `apiBase`. Named separately so the exact wording is
  *  assertable from tests and identical on every surface (startup log,
@@ -113,11 +119,14 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
  *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
 function filterStringArray(raw: unknown, field: string, path: string, warnings: string[]): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
-  const strings = raw.filter((v): v is string => typeof v === "string");
+  // Non-strings AND blank strings are dropped (the shipped schema says
+  // minLength 1). A kept "" was a silent deny-everything: isAllowed then
+  // required namespace === "", which NAMESPACE_RE makes unreachable.
+  const strings = raw.filter((v): v is string => typeof v === "string" && v.trim() !== "");
   const dropped = raw.length - strings.length;
   if (dropped > 0) {
     warnings.push(
-      `${path}: '${field}' dropped ${dropped} non-string ${dropped === 1 ? "entry" : "entries"} -- only string namespaces are honored.`,
+      `${path}: '${field}' dropped ${dropped} non-string or empty ${dropped === 1 ? "entry" : "entries"} -- only non-empty string namespaces are honored.`,
     );
   }
   // All entries invalid (non-empty array that filtered to []): treat as
@@ -179,6 +188,19 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   if (staleKeys.length > 0) {
     warnings.push(deprecatedKeyWarning(path, [...staleKeys]));
     log("warn", "Config file carries retired hosted-backend keys", { path, keys: staleKeys.join(",") });
+  }
+
+  // Unknown top-level keys warn (the shipped schema is
+  // additionalProperties:false): a typo like "blocke" was a silent no-op
+  // that fails OPEN to allow-all. Deprecated keys are reported above with
+  // their own migration hint, so they are excluded here.
+  const unknownKeys = Object.keys(obj).filter(
+    (k) => !KNOWN_CONFIG_KEYS.has(k) && !(DEPRECATED_KEYS as readonly string[]).includes(k),
+  );
+  if (unknownKeys.length > 0) {
+    warnings.push(
+      `${path}: unknown ${unknownKeys.length === 1 ? "key" : "keys"} ${unknownKeys.map((k) => `'${k}'`).join(", ")} ignored -- known keys: ${[...KNOWN_CONFIG_KEYS].join(", ")}.`,
+    );
   }
 
   const servers = filterStringArray(obj.servers, "servers", path, warnings);

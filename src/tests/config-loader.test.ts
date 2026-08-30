@@ -263,7 +263,32 @@ describe("loadYawMcpConfig — non-string servers/blocked entries (fix F1)", () 
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: ["github", 123, "slack"] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toEqual(["github", "slack"]);
-    expect(r.warnings.some((w) => w.includes("'servers' dropped 1 non-string entry"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("'servers' dropped 1 non-string or empty entry"))).toBe(true);
+  });
+
+  it("drops an empty-string namespace with a warning instead of keeping a silent deny-all", async () => {
+    // The shipped schema says minLength 1. A kept "" made isAllowed require
+    // namespace === "" -- unreachable under NAMESPACE_RE -- so `servers: [""]`
+    // silently denied every real server with no diagnostic.
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: ["github", "", "  "] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual(["github"]);
+    expect(r.warnings.some((w) => w.includes("'servers' dropped 2 non-string or empty entries"))).toBe(true);
+  });
+
+  it("warns on an unknown top-level key instead of ignoring it silently", async () => {
+    // A typo like "blocke" was a silent no-op that fails OPEN to allow-all;
+    // the shipped schema is additionalProperties:false.
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocke: ["slack"], $schema: "x" }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blocked).toBeUndefined();
+    const w = r.warnings.find((x) => x.includes("unknown key 'blocke'"));
+    expect(w).toBeDefined();
+    // Exactly ONE unknown key: $schema is the editor pointer the schema
+    // itself allows, so it must not appear as an unknown key (the singular
+    // "key" and the absence of a quoted '$schema' pin that).
+    expect(w).toMatch(/unknown key 'blocke' ignored/);
+    expect(w).not.toContain("'$schema'");
   });
 
   it("a genuinely empty servers array is preserved (explicit 'no filter', not all-invalid)", async () => {
@@ -285,7 +310,7 @@ describe("loadYawMcpConfig — non-string blocked entries (fix F1, blocked field
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: ["slack", 42] }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.blocked).toEqual(["slack"]);
-    expect(r.warnings.some((w) => w.includes("'blocked' dropped 1 non-string entry"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("'blocked' dropped 1 non-string or empty entry"))).toBe(true);
   });
 
   it("an all-invalid blocked array resolves to undefined, not an empty deny-list", async () => {

@@ -128,9 +128,15 @@ export async function onPath(cmd: string): Promise<boolean> {
     try {
       child = spawn(cmd, ["--version"], {
         stdio: "ignore",
-        // Windows needs a shell for PATHEXT shim resolution (.cmd/.exe)
-        // so `uv --version` finds uv.cmd without an ENOENT false-negative.
-        // Mirrors the PROBES spawn options in runtime-detect.ts.
+        // Windows needs a shell here so PATHEXT shims (uv.cmd / uv.bat)
+        // resolve, and that MATCHES the real spawn: the SDK's
+        // StdioClientTransport spawns through cross-spawn, which resolves
+        // the bare name via PATHEXT and wraps a non-.exe/.com target in
+        // `cmd.exe /d /s /c` itself. So a .cmd-only uv that passes this
+        // probe DOES spawn at activation. A shell-less probe here was tried
+        // and reverted: it false-NEGATIVED on that shim, sent every such
+        // host to the ~20MB bootstrap download, and broke activation
+        // outright on hosts with no route to github.com.
         shell: process.platform === "win32",
         windowsHide: process.platform === "win32",
       });
@@ -185,10 +191,26 @@ export async function onPath(cmd: string): Promise<boolean> {
 // stalled GitHub CDN connection would hang ensureUv() (and thus first
 // Python-server activation) indefinitely. Cap both at 30s and surface
 // a clear "uv download timed out" error rather than blocking forever.
+//
+// Those two are IDLE timers (bodyTimeout resets on every chunk), so they
+// do not bound a connection that trickles: a CDN delivering one byte per
+// 29s would keep ensureUv pending for hours, and -- because upstream.ts
+// awaits resolveUvSpawn BEFORE arming its connect timer, and ensureUv
+// memoizes the pending promise -- that one wedged download would then be
+// handed to every later uv/uvx activation for the life of the process.
+// UV_FETCH_TOTAL_MS is the wall-clock bound on the whole download. Sized to
+// the ARTIFACT, not to a fast link: the uv archives are 18-23 MB, so a
+// 5-minute bound demanded ~0.6 Mbit/s sustained and killed slow-but-steady
+// links (throttled hotspot, satellite, congested proxy) that used to finish
+// in 10-20 min -- and because ensureUv clears its memo on rejection, every
+// later activation re-burned the budget. 20 minutes still bounds the
+// one-byte-per-29s wedge this exists for (that shape would take ~10 hours).
 const UV_FETCH_TIMEOUT_MS = 30_000;
+export const UV_FETCH_TOTAL_MS = 20 * 60_000;
 
 async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
   let current = url;
+  const totalDeadline = AbortSignal.timeout(UV_FETCH_TOTAL_MS);
   for (let i = 0; i < maxHops; i++) {
     let res: Awaited<ReturnType<typeof request>>;
     try {
@@ -196,11 +218,15 @@ async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
         method: "GET",
         headersTimeout: UV_FETCH_TIMEOUT_MS,
         bodyTimeout: UV_FETCH_TIMEOUT_MS,
+        signal: totalDeadline,
       });
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
         throw new Error(`uv download timed out after ${UV_FETCH_TIMEOUT_MS}ms (${current})`);
+      }
+      if (totalDeadline.aborted) {
+        throw new Error(`uv download exceeded the ${UV_FETCH_TOTAL_MS}ms total budget (${current})`);
       }
       throw e;
     }
@@ -221,6 +247,9 @@ async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
       const code = (e as { code?: string }).code;
       if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
         throw new Error(`uv download timed out after ${UV_FETCH_TIMEOUT_MS}ms (${current})`);
+      }
+      if (totalDeadline.aborted) {
+        throw new Error(`uv download exceeded the ${UV_FETCH_TOTAL_MS}ms total budget (${current})`);
       }
       throw e;
     }
@@ -273,7 +302,8 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
 // killed and the bootstrap fails.
 //
 // Everything else on this path is already bounded -- onPath's 3s probe,
-// UV_FETCH_TIMEOUT_MS on both undici legs -- and this was the one hole left. A
+// UV_FETCH_TIMEOUT_MS (idle) plus UV_FETCH_TOTAL_MS (wall-clock) on the
+// download -- and this was the one hole left. A
 // wedged extractor is not hypothetical: tar on a stalled network mount takes no
 // signal at all, and the consequence here is worse than one slow activation.
 // upstream.ts awaits resolveUvSpawn BEFORE it arms its own connect timeout, so

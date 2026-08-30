@@ -30,7 +30,9 @@ import { fileURLToPath } from "node:url";
 import { gradesCachePath, writeGrade } from "./grades-cache.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
+import { hasSecretRefs } from "./secrets-vault.js";
 import type { UpstreamServerConfig } from "./types.js";
+import { resolveServerEnv, scrubInternalSecretsFromProcessEnv } from "./upstream.js";
 
 export interface AuditCommandOptions {
   /** Positional: the namespace to audit. Required. */
@@ -303,10 +305,40 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     return { exitCode: 2, lines };
   }
 
+  // Resolve ${secret:NAME} vault refs the same way the real spawn does
+  // (upstream.ts resolveServerEnv: fail CLOSED on a locked/missing vault or
+  // a missing secret). Handing the compliance suite the raw bundles.json env
+  // graded a vault-backed server with the literal placeholder in its
+  // environment -- it auth-failed, the wrong letter was cached, and `list`
+  // and the MCP panel then showed it. Now the audited env IS the env the
+  // server actually runs with.
+  let auditEnv: Record<string, string> | undefined = server.env;
+  if (server.env && hasSecretRefs(server.env)) {
+    try {
+      auditEnv = await resolveServerEnv(server.env, namespace);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const refNames = Object.entries(server.env)
+        .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
+        .map(([k]) => k);
+      printErr(
+        `yaw-mcp audit: "${namespace}" references vault secrets (${refNames.join(", ")}) that could not be resolved: ${msg}. Set YAW_MCP_VAULT_PASSPHRASE (and store the secrets with \`yaw-mcp secrets set\`) so the audit runs with the server's real environment.`,
+      );
+      return { exitCode: 2, lines };
+    }
+  }
+  // The compliance runner spawns the audited server with `{ ...process.env,
+  // ...env }`. The broker's real spawn strips yaw-mcp's own secrets from the
+  // child env (upstream.ts stripInternalSecretsFromEnv); this path must too,
+  // and it matters MORE here: resolving the refs above requires
+  // YAW_MCP_VAULT_PASSPHRASE to be set, so without the scrub the documented
+  // way to audit a vault-backed server hands the vault passphrase to a
+  // third-party server. One-shot CLI, so mutating process.env is safe.
+  scrubInternalSecretsFromProcessEnv();
   const target = {
     command: server.command,
     args: server.args ?? [],
-    env: server.env,
+    env: auditEnv,
   };
 
   // In --json mode stdout must be pure JSON (the Yaw MCP panel parses it), so

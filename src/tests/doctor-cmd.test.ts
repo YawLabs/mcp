@@ -1302,7 +1302,7 @@ describe("runDoctor — --json", () => {
       skipRegistryCheck: true,
     });
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.trials).toEqual({ cleared: 0, live: [], malformed: [] });
+    expect(parsed.trials).toEqual({ cleared: 0, failed: 0, failures: [], live: [], malformed: [] });
     // backgroundPosters is soft-deprecated: the posters that fed it are
     // gone, but the key AND its nested shape must survive one minor so
     // `doctor --json` output is byte-identical for external consumers.
@@ -1311,6 +1311,81 @@ describe("runDoctor — --json", () => {
     // flattening to a bare `null` would break `.backgroundPosters.analytics`.
     expect(Object.hasOwn(parsed, "backgroundPosters")).toBe(true);
     expect(parsed.backgroundPosters).toEqual({ analytics: null, toolReport: null });
+  });
+
+  it("reports an expired trial the sweep could NOT peel (still wired in), in text, json and warnings", async () => {
+    // gcExpiredTrials returned a `failed` count that no caller read: an
+    // expired trial whose client config could not be rewritten stayed wired
+    // into the client while the TRIALS section was omitted, `trials` had no
+    // field for it, and DIAGNOSIS said "All good". Make the client config
+    // unwritable-for-the-peel by making it a DIRECTORY at the expected path:
+    // readFile fails, the sweep counts it as failed and (by design) leaves
+    // the marker so the next run retries.
+    const clientConfigPath = join(synthHome, "client.json");
+    mkdirSync(clientConfigPath, { recursive: true });
+    const trialsRoot = join(synthHome, ".yaw-mcp", "trials");
+    mkdirSync(trialsRoot, { recursive: true });
+    const fixedNow = 1_000_000_000_000;
+    const marker = {
+      slug: "foo",
+      expiresAt: fixedNow - 60_000,
+      clientPath: clientConfigPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-foo",
+    };
+    writeFileSync(join(trialsRoot, "foo.json"), JSON.stringify(marker));
+
+    const capJson = captureOut();
+    const rj = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: capJson.out,
+      json: true,
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+    });
+    const parsed = JSON.parse(rj.lines[0]);
+    expect(parsed.trials.failed).toBe(1);
+    expect(parsed.trials.cleared).toBe(0);
+    // Actionable: the failure names the slug, the file and the step, so the
+    // MCP panel (and the user) can act -- a bare count told them nothing,
+    // and `yaw-mcp try-cleanup` without a slug just prints usage.
+    expect(parsed.trials.failures).toHaveLength(1);
+    expect(parsed.trials.failures[0]).toMatchObject({ slug: "foo", clientPath: clientConfigPath, stage: "peel" });
+    const jsonWarning = parsed.warnings.find((w: string) => w.includes('trial "foo"'));
+    expect(jsonWarning).toBeDefined();
+    expect(jsonWarning).toContain("still wired in");
+    expect(jsonWarning).toContain("yaw-mcp try-cleanup foo");
+    expect(jsonWarning).toContain(clientConfigPath);
+    // Non-zero warnings drive the exit-2 gate, so this is no longer "All good".
+    expect(rj.exitCode).toBe(2);
+
+    // Text path: the TRIALS section renders the SAME line, and the state
+    // gates exit 2 identically -- the two surfaces used to disagree (text
+    // printed the line, exited 0, and said "All good").
+    writeFileSync(join(trialsRoot, "foo.json"), JSON.stringify(marker));
+    const capText = captureOut();
+    const errLines: string[] = [];
+    const rt = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: capText.out,
+      err: (s) => errLines.push(s),
+      skipRegistryCheck: true,
+      now: () => fixedNow,
+    });
+    const text = rt.lines.join("\n");
+    expect(text).toContain("TRIALS (yaw-mcp try)");
+    expect(text).toContain(`! ${jsonWarning}`);
+    expect(text).toContain("Warnings above need attention");
+    expect(text).not.toContain("All good");
+    expect(rt.exitCode).toBe(2);
+    expect(errLines.join("")).toContain(`warning: ${jsonWarning}`);
   });
 
   it("runs the trial GC pass on the --json path (same side effect as text)", async () => {

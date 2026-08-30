@@ -1799,6 +1799,26 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
     expect(warnings[0]).toContain("oamjs.org/install.sh");
   });
 
+  it("stays silent for a launch oam could never host (docker / uvx / python)", async () => {
+    // upstream.ts calls resolveOamSpawn for EVERY local server whose
+    // effective runtime is oam. For a non-node command the warn told the
+    // user to install oam while doctor reported the same server as
+    // `not-node-command`, and claimed a node fallback that never happens.
+    await primeAbsent();
+    const lines: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await resolveOamSpawn("docker", ["run", "-i", "x/mcp"]);
+    await resolveOamSpawn("uvx", ["some-mcp"]);
+    await resolveOamSpawn("python", ["-m", "server"]);
+    expect(lines.filter((l) => l.includes("opted in to oam but oam is not installed"))).toHaveLength(0);
+    // ...and a node launch after them still gets the (single) warn.
+    await resolveOamSpawn("node", ["a.js"]);
+    expect(lines.filter((l) => l.includes("opted in to oam but oam is not installed"))).toHaveLength(1);
+  });
+
   it("stays silent when oam is present", async () => {
     await probeOam(async () => "oam 99.0.0");
     const lines: string[] = [];

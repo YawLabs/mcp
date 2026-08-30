@@ -81,6 +81,82 @@ describe("runAudit", () => {
   let home: string;
   afterEach(() => {
     if (home) rmSync(home, { recursive: true, force: true });
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+  });
+
+  it("scrubs yaw-mcp's own secrets from process.env before the suite spawns the audited server", async () => {
+    // The compliance runner spawns the server with `{ ...process.env, ...env }`.
+    // Resolving vault refs REQUIRES YAW_MCP_VAULT_PASSPHRASE to be set, so
+    // without this scrub the documented way to audit a vault-backed server
+    // handed the vault passphrase (and YAW_MCP_TOKEN) to a third-party
+    // server -- the broker's real spawn strips exactly these keys.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "probe-passphrase";
+    process.env.YAW_MCP_TOKEN = "probe-token";
+    process.env.AUDIT_SCRUB_CANARY = "keep-me";
+    try {
+      home = makeHome([{ namespace: "ctxlint", name: "ctxlint", type: "local", command: "node", args: ["x.js"] }]);
+      const io = captureIO();
+      let seenEnv: NodeJS.ProcessEnv | null = null;
+      const r = await runAudit({
+        namespace: "ctxlint",
+        home,
+        cwd: home,
+        out: io.push,
+        err: io.pushErr,
+        runner: async () => {
+          seenEnv = { ...process.env };
+          return { grade: "A", score: 97.5 };
+        },
+      });
+      expect(r.exitCode).toBe(0);
+      expect(seenEnv).not.toBeNull();
+      const env = seenEnv as unknown as NodeJS.ProcessEnv;
+      expect(env.YAW_MCP_VAULT_PASSPHRASE).toBeUndefined();
+      expect(env.YAW_MCP_TOKEN).toBeUndefined();
+      // Only yaw-mcp's own keys go; everything else the server needs stays.
+      expect(env.AUDIT_SCRUB_CANARY).toBe("keep-me");
+    } finally {
+      delete process.env.YAW_MCP_TOKEN;
+      delete process.env.AUDIT_SCRUB_CANARY;
+    }
+  });
+
+  it("refuses (exit 2, nothing cached) when the env carries a ${secret:} ref the vault cannot resolve", async () => {
+    // The suite used to receive the raw bundles.json env with the literal
+    // `${secret:gh}` placeholder: the server auth-failed, the WRONG letter
+    // was cached, and `list` / the MCP panel showed it. Audit now resolves
+    // refs the way the real spawn does and fails CLOSED on a locked vault.
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome([
+      {
+        namespace: "gh",
+        name: "gh",
+        type: "local",
+        command: "node",
+        args: ["x.js"],
+        env: { GITHUB_TOKEN: "${secret:gh}" },
+      },
+    ]);
+    const io = captureIO();
+    let runnerCalled = false;
+    const r = await runAudit({
+      namespace: "gh",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => {
+        runnerCalled = true;
+        return { grade: "F", score: 0 };
+      },
+    });
+    expect(r.exitCode).toBe(2);
+    expect(runnerCalled).toBe(false);
+    expect(io.err.join("")).toContain("GITHUB_TOKEN");
+    expect(io.err.join("")).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    // Nothing graded, nothing cached.
+    const cache = await readGradesCache(home);
+    expect(cache.gh).toBeUndefined();
   });
 
   it("audits a stdio server and writes the grade", async () => {

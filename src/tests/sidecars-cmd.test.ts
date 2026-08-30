@@ -370,7 +370,7 @@ describe("runSidecarsInstall", () => {
     expect(warnings.join("\n")).toContain("invalid JSON");
     // Same keys as every other path, so the document stays uniform.
     expect(Object.keys(doc).sort()).toEqual(
-      ["root", "installed", "reason", "error", "updateError", "unhosted", "conflicts", "skipped"].sort(),
+      ["root", "installed", "reason", "error", "updateError", "markerError", "unhosted", "conflicts", "skipped"].sort(),
     );
   });
 
@@ -734,12 +734,68 @@ describe("runSidecarsInstall", () => {
     expect(res.lines.join("\n")).toContain("1 package(s) did not land");
   });
 
+  it("still emits the --json document when the managed tree cannot be written", async () => {
+    // The mkdir + manifest write used to be unguarded: EACCES / EROFS /
+    // ENOSPC rejected out of runSidecarsInstall, the dispatcher printed
+    // `yaw-mcp sidecars: <errno>` on stderr, and stdout -- which the MCP
+    // panel parses -- carried nothing. A regular FILE where the managed root
+    // directory must go makes mkdirSync fail with EEXIST/ENOTDIR on every
+    // platform, standing in for the permission class.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    const root = sidecarsRoot(home);
+    mkdirSync(join(root, ".."), { recursive: true });
+    writeFileSync(root, "not a directory", "utf8");
+    let out = "";
+    let npmCalled = false;
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      oamProbe: noOam,
+      runNpm: async () => {
+        npmCalled = true;
+        return 0;
+      },
+    });
+    expect(res.exitCode).toBe(1);
+    expect(npmCalled).toBe(false);
+    const doc = JSON.parse(out);
+    expect(Object.keys(doc).sort()).toEqual(
+      ["root", "installed", "reason", "error", "updateError", "markerError", "unhosted", "conflicts", "skipped"].sort(),
+    );
+    expect(doc.error).toMatch(/manifest write failed/);
+    expect(doc.installed).toEqual([]);
+  });
+
   it("emits the same --json keys on every path", async () => {
     // The three exit paths used to emit three different objects, so a consumer
     // could not read `root` without first working out which path it hit. Pin
     // the shape: same keys whether the install worked, found nothing, or
     // failed.
-    const KEYS = ["root", "installed", "reason", "error", "updateError", "unhosted", "conflicts", "skipped"].sort();
+    const KEYS = [
+      "root",
+      "installed",
+      "reason",
+      "error",
+      "updateError",
+      "markerError",
+      "unhosted",
+      "conflicts",
+      "skipped",
+    ].sort();
     const npxServer = {
       id: "1",
       name: "F",

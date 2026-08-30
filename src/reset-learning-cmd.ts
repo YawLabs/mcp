@@ -207,7 +207,10 @@ async function peekParsedCleanly(filePath: string): Promise<boolean> {
     return false;
   }
   try {
-    const parsed = JSON.parse(raw);
+    // Same BOM strip loadState applies (persistence.ts): a Notepad-saved,
+    // BOM-prefixed state.json loads fine there, so this peek must not
+    // report it as "contents unreadable" and discard the real counts.
+    const parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
     if (!parsed || typeof parsed !== "object") return false;
     // Any version loadState can READ counts as parsed-cleanly, not just the
     // current one. STATE_SCHEMA_VERSION went 1 -> 2 for the additive

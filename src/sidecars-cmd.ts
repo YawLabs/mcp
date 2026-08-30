@@ -286,6 +286,10 @@ interface SidecarsJson {
    *  may not have moved forward. A consumer that treats this as fatal would
    *  discard a perfectly good tree. */
   updateError: string | null;
+  /** Why the platform marker beside the tree could not be written, else null.
+   *  Like `updateError`, the install itself SUCCEEDED; doctor will just read
+   *  the tree as pre-marker until the next successful install. */
+  markerError: string | null;
   /** Why nothing on this machine will READ the tree that was just filled -- one
    *  entry per distinct reason, from the same verdicts as the human note (see
    *  unhostedReasons). Empty means at least one server resolves to oam, which
@@ -320,6 +324,7 @@ function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
     reason: null,
     error: null,
     updateError: null,
+    markerError: null,
     unhosted: [],
     conflicts: [],
     skipped: [],
@@ -545,8 +550,19 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
     return { exitCode: 0, installed: [], lines };
   }
 
-  mkdirSync(root, { recursive: true });
-  await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
+  // Guarded: on EACCES/EROFS/ENOSPC these used to reject out of the command,
+  // and the dispatcher printed `yaw-mcp sidecars: <errno>` on stderr with
+  // NOTHING on stdout -- breaking the one-shape-on-every-path --json contract
+  // the MCP panel relies on (it shells out to `sidecars install --json`).
+  try {
+    mkdirSync(root, { recursive: true });
+    await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    print(`Could not prepare ${root}: ${msg}. Servers keep resolving from the npx cache.`);
+    if (opts.json) write(jsonDocument(root, { error: `manifest write failed: ${msg}`, conflicts, skipped }));
+    return { exitCode: 1, installed: [], lines };
+  }
 
   print(`Installing ${specs.length} server package(s) into ${root}`);
   // Name the config the list came from. The managed tree is keyed on HOME
@@ -591,12 +607,22 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   // why). AFTER the install-succeeded gate, so a failed install leaves the
   // marker describing whatever tree is actually still on disk -- and this
   // process's own platform/arch, because that is the node npm resolved native
-  // bindings for. Same failure envelope as the manifest write above: the
-  // directory was just written to, so an unguarded write is fine.
-  await atomicWriteFile(
-    sidecarsPlatformPath(home),
-    `${JSON.stringify({ platform: process.platform, arch: process.arch }, null, 2)}\n`,
-  );
+  // bindings for. Guarded like the manifest write: the tree itself is
+  // installed at this point, so a marker-write failure does not undo the
+  // install (exit 0) -- but it is reported on stderr (visible under --json,
+  // where `print` is suppressed) AND carried as `markerError` in the --json
+  // document, so the panel never reads a clean install that doctor will
+  // later call pre-marker with no trail to why.
+  let markerError: string | null = null;
+  try {
+    await atomicWriteFile(
+      sidecarsPlatformPath(home),
+      `${JSON.stringify({ platform: process.platform, arch: process.arch }, null, 2)}\n`,
+    );
+  } catch (err) {
+    markerError = err instanceof Error ? err.message : String(err);
+    printErr(`note: could not record the platform marker (${markerError}); doctor will read this tree as pre-marker.`);
+  }
 
   // The second step is what makes "re-run this command to move them forward"
   // true. `npm install` CANNOT re-resolve a dist-tag against an existing tree:
@@ -652,7 +678,9 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   const nothingLanded = missing.length === installed.length;
   const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
 
-  if (opts.json) write(jsonDocument(root, { installed, conflicts, skipped, error, updateError, unhosted }));
+  if (opts.json) {
+    write(jsonDocument(root, { installed, conflicts, skipped, error, updateError, unhosted, markerError }));
+  }
   return { exitCode: nothingLanded ? 1 : 0, installed, lines };
 }
 

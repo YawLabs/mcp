@@ -92,7 +92,14 @@ import {
   sidecarsRoot,
 } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
-import { formatTtl, gcExpiredTrials, scanTrials, type TryEventBody } from "./try-cmd.js";
+import {
+  formatTtl,
+  gcExpiredTrials,
+  scanTrials,
+  type TrialGcFailure,
+  type TryEventBody,
+  trialGcFailureWarning,
+} from "./try-cmd.js";
 import {
   BINARY_DOWNLOAD_URL,
   buildUpgradePlan,
@@ -273,6 +280,11 @@ export interface DoctorJsonSnapshot {
   // lists marker files that failed to parse.
   trials: {
     cleared: number;
+    /** Expired trials the sweep could NOT finish. `failed` is the count;
+     *  `failures` says which slug / file / step, so a consumer (the MCP
+     *  panel) can act on it. Each one is also folded into `warnings`. */
+    failed: number;
+    failures: TrialGcFailure[];
     live: Array<{ slug: string; clientName: string; clientPath: string; msUntilExpiry: number }>;
     malformed: string[];
   };
@@ -513,7 +525,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // so the readout shows the post-GC state (no stale "expired" rows
   // hanging around). Best-effort: any sweep failure is logged via
   // try-cmd's debug logger; doctor itself never errors out on it.
-  await renderTrialsSection({ home, env, print, postEvent: opts.postTryEvent, now: opts.now });
+  // Un-finishable expired trials come back as warnings and are folded into
+  // config.warnings, so the text path gates exit 2 exactly like --json does
+  // for the same state (they used to diverge: text printed the line and
+  // exited 0 "All good", json exited 2).
+  const trialWarnings = await renderTrialsSection({ home, env, print, postEvent: opts.postTryEvent, now: opts.now });
+  if (trialWarnings.length > 0) config.warnings = [...config.warnings, ...trialWarnings];
 
   // Probe every supported client/scope combo on the current OS. Honor
   // CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
@@ -781,9 +798,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     postEvent: opts.postTryEvent,
     now: opts.now,
     scan: trialScan,
-  }).catch(() => ({ cleared: 0, failed: 0 }));
+  }).catch(() => ({ cleared: 0, failed: 0, failures: [] }));
   const trials: DoctorJsonSnapshot["trials"] = {
     cleared: trialGc.cleared,
+    failed: trialGc.failed,
+    failures: trialGc.failures,
     live: trialScan.live.map(({ marker, msUntilExpiry }) => ({
       slug: marker.slug,
       clientName: marker.clientName,
@@ -805,6 +824,13 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // Identical fold to the text path -- a malformed bundles.json must reach
   // `.warnings` and exit 2 on both surfaces.
   config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
+  // Trial-GC failures fold AFTER the bundle warnings, matching the text
+  // path's order (trust -> bundle -> trials) so the two surfaces emit the
+  // same warning list in the same order. Same per-failure wording helper
+  // as the text path, so they cannot drift on content either.
+  if (trialGc.failures.length > 0) {
+    config.warnings = [...config.warnings, ...trialGc.failures.map(trialGcFailureWarning)];
+  }
   const oamRuntime: DoctorJsonSnapshot["oamRuntime"] = {
     binary: oamStatus.probe.bin,
     version: oamStatus.probe.version,
@@ -1269,7 +1295,9 @@ async function peekStateFile(filePath: string): Promise<StatePeek> {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    // Same BOM strip loadState applies (persistence.ts), so a Notepad-saved
+    // state.json is not reported malformed by doctor while loading fine.
+    parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
   } catch (err) {
     return { kind: "malformed", message: err instanceof Error ? err.message : String(err) };
   }
@@ -1338,17 +1366,29 @@ async function renderTrialsSection(opts: {
   print: (s?: string) => void;
   postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   now?: () => number;
-}): Promise<void> {
+}): Promise<string[]> {
   const { home, env, print, postEvent, now } = opts;
   // Scan once, then hand the scan to the GC pass (GC only unlinks expired
   // markers, so live/malformed here match the post-sweep readout state).
   const scan = await scanTrials({ home, now });
-  const gc = await gcExpiredTrials({ home, env, postEvent, now, scan }).catch(() => ({ cleared: 0, failed: 0 }));
-  if (scan.live.length === 0 && gc.cleared === 0 && scan.malformed.length === 0) return;
+  const gc = await gcExpiredTrials({ home, env, postEvent, now, scan }).catch(() => ({
+    cleared: 0,
+    failed: 0,
+    failures: [],
+  }));
+  // The failures are part of the visibility predicate AND are returned as
+  // warnings: an expired trial the sweep could not finish used to vanish
+  // from this section entirely (the sweep logged it at debug and doctor
+  // said "All good"). Returning them lets the text path fold them into
+  // config.warnings exactly like the --json path, so both surfaces exit 2
+  // for the same state.
+  const warnings = gc.failures.map(trialGcFailureWarning);
+  if (scan.live.length === 0 && gc.cleared === 0 && gc.failed === 0 && scan.malformed.length === 0) return warnings;
   print("TRIALS (yaw-mcp try)");
   if (gc.cleared > 0) {
     print(`  swept ${gc.cleared} expired trial${gc.cleared === 1 ? "" : "s"} this run`);
   }
+  for (const w of warnings) print(`  ! ${w}`);
   for (const { marker, msUntilExpiry } of scan.live) {
     print(`  ${marker.slug} -> ${marker.clientName} (${marker.clientPath}) — expires in ${formatTtl(msUntilExpiry)}`);
   }
@@ -1356,6 +1396,7 @@ async function renderTrialsSection(opts: {
     print(`  ! malformed marker at ${path} (delete by hand)`);
   }
   print("");
+  return warnings;
 }
 
 // Compact relative age for STATE output. We'd rather show "3m" than a
