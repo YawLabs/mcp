@@ -107,26 +107,93 @@ function looksSensitive(token: string): boolean {
 // pass through as ordinary tokens, which is acceptable since the
 // identifying structure (the @ and dots) is already destroyed. We document
 // this rather than re-detect a structure tokenize has already removed.
+// A raw-string scrub rule. `re` NOMINATES a match; `applies`, when present,
+// decides whether it is really PII. The two are split because the phone and
+// ticket-ref shapes are ambiguous with ordinary technical vocabulary, and the
+// disambiguation (count the digits, exclude the standards prefixes) reads as
+// code but not as a lookaround. Over-redaction is not free: every token
+// wrongly dropped here is a token the routing corpus can never be scored on.
+interface RawScrubRule {
+  re: RegExp;
+  /** Return false to keep the nominated match verbatim (not PII after all).
+   *  Absent means "always scrub what `re` matched". */
+  applies?: (match: string) => boolean;
+}
+
+// A dotted run of 3+ numeric groups: an IPv4 literal (192.168.1.100) or a
+// dotted version (1.2.3.4.5). Phone numbers are written with spaces, parens
+// or hyphens far more often than with three or more dots, so excluding this
+// shape costs essentially no real phone coverage.
+const DOTTED_NUMERIC_RE = /^\d+(?:\.\d+){3,}$/;
+
+/** True when a nominated phone-shape run really looks like a phone number.
+ *  The nominating regex is deliberately loose (any run of digits and phone
+ *  punctuation), so it also matched ISO dates and IP literals; both fall out
+ *  here. */
+function isPhoneShape(match: string): boolean {
+  // Real numbers carry 9+ digits (NANP is 10, E.164 allows up to 15). An ISO
+  // date has 8 ("2024-01-15") and a short dotted version fewer still.
+  const digits = match.replace(/[^0-9]/g, "");
+  if (digits.length < 9) return false;
+  return !DOTTED_NUMERIC_RE.test(match.trim());
+}
+
+// Standards, algorithms and encodings share Jira's PROJ-1234 shape. They are
+// ordinary technical vocabulary -- exactly the words a routing corpus needs --
+// so they are excluded by name. Stored lowercase; the check lowercases the
+// alpha side before the lookup.
+const TECH_REF_PREFIXES = new Set([
+  "aes",
+  "base",
+  "crc",
+  "cve",
+  "ecma",
+  "es",
+  "gpt",
+  "http",
+  "ipv",
+  "iso",
+  "md",
+  "rfc",
+  "rsa",
+  "sha",
+  "ssl",
+  "tls",
+  "utf",
+]);
+
+/** True when a nominated `LETTERS-digits` run really looks like a ticket ref.
+ *  Excludes 1-digit suffixes (UTF-8, GPT-4, ES-6 are version/bit-width
+ *  markers, not ticket numbers) and the standards prefixes above (SHA-256,
+ *  ISO-8601, CVE-2024 all carry multi-digit suffixes). */
+function isTicketRef(match: string): boolean {
+  const dash = match.indexOf("-");
+  const alpha = match.slice(0, dash);
+  const digits = match.slice(dash + 1);
+  if (digits.length < 2) return false;
+  return !TECH_REF_PREFIXES.has(alpha.toLowerCase());
+}
+
 // Structured PII patterns we strip from the RAW intent BEFORE tokenize()
 // shreds it into bare alphanumeric runs. Tokenize splits on every
 // non-alphanumeric, which loses the structure that makes these
 // recognizable -- so we have to scrub here, not in the token loop.
-// Each pattern's matched substrings are replaced with " " (so a token
+// Each rule's matched substrings are replaced with " " (so a token
 // boundary is preserved) and counted toward redactedCount.
 //   - email: user@host.tld
-//   - phone-shape: 9+ digits with optional +/separators
+//   - phone-shape: 9+ actual digits with optional +/separators (isPhoneShape)
 //   - GitHub-style refs: #1234
-//   - bracketed IDs: PROJ-1234, ABC-9 (Jira-style ticket refs)
+//   - Jira-style ticket refs: PROJ-1234 (isTicketRef)
 // Each pattern is wrapped with `(?<![A-Za-z0-9])...(?![A-Za-z0-9])` so it only
 // matches when bounded by non-alphanumerics (start/end of string, whitespace,
 // punctuation). Without these, the phone-shape pattern matches a digit run
 // INSIDE a longer alphanumeric token (e.g. the "0123456789" tail of
 // "xoxbabcdef0123456789"), double-counting against the prefix-token rule.
-const RAW_PII_PATTERNS: RegExp[] = [
-  /(?<![A-Za-z0-9])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])/g,
-  /(?<![A-Za-z0-9])\+?[0-9][0-9\s().-]{8,}(?![A-Za-z0-9])/g,
-  /(?<![A-Za-z0-9])#\d+(?![A-Za-z0-9])/g,
-  /(?<![A-Za-z0-9])[A-Z]+-\d+(?![A-Za-z0-9])/g,
+const RAW_PII_RULES: RawScrubRule[] = [
+  { re: /(?<![A-Za-z0-9])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])/g },
+  { re: /(?<![A-Za-z0-9])\+?[0-9][0-9\s().-]{8,}(?![A-Za-z0-9])/g, applies: isPhoneShape },
+  { re: /(?<![A-Za-z0-9])#\d+(?![A-Za-z0-9])/g },
+  { re: /(?<![A-Za-z0-9])[A-Z]+-\d+(?![A-Za-z0-9])/g, applies: isTicketRef },
 ];
 
 // Punctuation-carrying secret prefixes, matched on the RAW intent for the same
@@ -134,7 +201,7 @@ const RAW_PII_PATTERNS: RegExp[] = [
 // makes `ghp_...` / `sk-proj-...` recognizable, so by the token loop the prefix
 // is gone. The trailing `[A-Za-z0-9_-]+` swallows the whole key (a GitHub PAT
 // and an OpenAI project key both keep '_' / '-' internally), and the
-// non-alphanumeric boundaries mirror RAW_PII_PATTERNS so this cannot fire on a
+// non-alphanumeric boundaries mirror RAW_PII_RULES so this cannot fire on a
 // fragment inside a longer run. Built from SECRET_PREFIXES so the two layers
 // can never drift. Case-insensitive: this runs BEFORE tokenize lowercases.
 //
@@ -153,9 +220,9 @@ const RAW_SECRET_PREFIX_PATTERN: RegExp | null =
 // Scrubbed off the raw string in order. The secret-prefix pattern runs FIRST so
 // a key is consumed whole before a narrower pattern (e.g. the phone shape) can
 // nibble a digit run out of its middle and double-count it.
-const RAW_SCRUB_PATTERNS: RegExp[] = [
-  ...(RAW_SECRET_PREFIX_PATTERN ? [RAW_SECRET_PREFIX_PATTERN] : []),
-  ...RAW_PII_PATTERNS,
+const RAW_SCRUB_RULES: RawScrubRule[] = [
+  ...(RAW_SECRET_PREFIX_PATTERN ? [{ re: RAW_SECRET_PREFIX_PATTERN }] : []),
+  ...RAW_PII_RULES,
 ];
 
 export function redactIntent(intent: string): RedactedIntent {
@@ -166,8 +233,12 @@ export function redactIntent(intent: string): RedactedIntent {
   // layer catches the shapes tokenize() would destroy before looksSensitive
   // could see them.
   let scrubbed = intent;
-  for (const re of RAW_SCRUB_PATTERNS) {
-    scrubbed = scrubbed.replace(re, () => {
+  for (const rule of RAW_SCRUB_RULES) {
+    scrubbed = scrubbed.replace(rule.re, (match) => {
+      // A rule with an `applies` gate can decline: the shape matched but the
+      // text is ordinary technical vocabulary (a date, an IP, SHA-256), so it
+      // stays verbatim and is NOT counted as a redaction.
+      if (rule.applies && !rule.applies(match)) return match;
       redactedCount++;
       return " ";
     });

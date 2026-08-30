@@ -5,12 +5,23 @@
 //
 // File format:
 //   {
-//     "version": 1,
+//     "version": 2,
 //     "salt": "<base64>",           // 16 bytes, vault-level
+//     "kdf": { "N": 32768, "r": 8, "p": 1 },   // scrypt cost, vault-level
 //     "entries": {
 //       "<secret-name>": { iv, ciphertext, authTag }  // per-entry
 //     }
 //   }
+//
+// SCHEMA HISTORY
+//   v1 -- no `kdf` (the scrypt parameters were a compile-time constant), and
+//         entry ciphertexts carried no additional authenticated data, so a
+//         blob could be moved between entry names and still decrypt.
+//   v2 -- `kdf` recorded in the file, and every ciphertext is bound to the
+//         name it is stored under (AAD). A v1 vault is still read: its
+//         entries are decrypted without the binding (see decryptBound), and
+//         it stays v1 on disk until `secrets rotate` rewrites it. A v2 vault
+//         does NOT accept unbound blobs -- that is the point of the bump.
 //
 // Process lifetime: the derived key is cached in module-scoped memory
 // so subsequent operations within the same yaw-mcp process don't
@@ -28,20 +39,40 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import {
+  DEFAULT_KDF,
   decryptEntry,
   deriveKey,
   type EncryptedEntry,
   encryptEntry,
   generateSalt,
+  isValidKdfParams,
+  type KdfParams,
+  normalizePassphrase,
   SALT_LEN,
 } from "./secrets-crypto.js";
 
 export const SECRETS_FILENAME = "secrets.json";
-export const SECRETS_SCHEMA_VERSION = 1;
+export const SECRETS_SCHEMA_VERSION = 2;
+
+/** What a vault that declares NO version is assumed to be. Absent means
+ *  "written before the field existed", i.e. the OLDEST schema -- never the
+ *  current one, or a v1 vault's unbound ciphertexts would be read under v2
+ *  rules and every entry would look corrupt. */
+const LEGACY_SCHEMA_VERSION = 1;
+
+/** AAD for the vault-level `check` marker. Cannot collide with an entry name
+ *  (SECRET_NAME_RE forbids the colon), so the marker and an entry named
+ *  "check" stay distinct ciphertexts. Exported alongside
+ *  VAULT_CHECK_PLAINTEXT so a test or a recovery tool can decrypt the marker
+ *  the way this module does instead of re-deriving the constant. */
+export const VAULT_CHECK_AAD = "yaw-mcp:vault-check";
 
 export interface VaultFile {
   version: number;
   salt: string; // base64
+  /** scrypt parameters the vault's key is derived under. Absent on v1
+   *  vaults, which were all written with DEFAULT_KDF. */
+  kdf?: KdfParams;
   entries: Record<string, EncryptedEntry>;
   /** Vault-level verification token: a fixed known constant encrypted
    *  under the derived key. Lets unlock() detect a wrong passphrase
@@ -72,8 +103,25 @@ function emptyVault(): VaultFile {
   return {
     version: SECRETS_SCHEMA_VERSION,
     salt: generateSalt().toString("base64"),
+    // Recorded, never assumed: see KdfParams. A vault that carries its own
+    // cost factor keeps opening after the default is raised.
+    kdf: { ...DEFAULT_KDF },
     entries: {},
   };
+}
+
+/** Thrown by loadVault when one entry's shape is wrong. Carries the entry
+ *  NAME as a field so the CLI can render its "delete this key by hand" hint
+ *  without regex-matching the message text -- a name holding a newline (a
+ *  legacy vault could store one) defeated the sniff and silently dropped the
+ *  only actionable part of the error. */
+export class VaultEntryCorruptError extends Error {
+  readonly entryName: string;
+  constructor(entryName: string) {
+    super(`vault corrupt at entry ${entryName}`);
+    this.name = "VaultEntryCorruptError";
+    this.entryName = entryName;
+  }
 }
 
 export async function loadVault(path: string): Promise<VaultFile | null> {
@@ -116,10 +164,24 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
   // reading it under the old reader could silently drop or misinterpret a
   // field a future version added. Equal-or-older loads fine (forward reads
   // stay compatible); only a strictly-greater version is refused.
+  // A PRESENT but non-numeric version is corrupt, never "assume current":
+  // defaulting it let a hand edit of `"version": 2` to `"version": "2"` walk
+  // straight past the newer-schema guard below and be read under this build's
+  // rules -- the one thing that guard exists to prevent.
+  if (obj.version !== undefined && typeof obj.version !== "number") {
+    throw new Error(`vault at ${path} is corrupt: "version" must be a number`);
+  }
   if (typeof obj.version === "number" && obj.version > SECRETS_SCHEMA_VERSION) {
     throw new Error(
       `vault at ${path} was written by a newer yaw-mcp (schema version ${obj.version} > ${SECRETS_SCHEMA_VERSION}); upgrade yaw-mcp to read it`,
     );
+  }
+  // The recorded KDF parameters decide how much memory scrypt allocates and
+  // which key comes out, so a present-but-nonsense `kdf` is a corrupt vault,
+  // not something to silently fall back from: falling back to the default
+  // would derive the wrong key and report a wrong passphrase.
+  if (obj.kdf !== undefined && !isValidKdfParams(obj.kdf)) {
+    throw new Error(`vault at ${path} is corrupt: invalid kdf parameters`);
   }
   // Validate each entry's shape up front rather than deferring to decrypt
   // time -- a malformed entry (missing/non-string iv/ciphertext/authTag) is
@@ -127,13 +189,14 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
   const entries = obj.entries as Record<string, unknown>;
   for (const [name, entry] of Object.entries(entries)) {
     if (!isEncryptedEntry(entry)) {
-      throw new Error(`vault corrupt at entry ${name}`);
+      throw new VaultEntryCorruptError(name);
     }
   }
   const check = isEncryptedEntry(obj.check) ? obj.check : undefined;
   return {
-    version: typeof obj.version === "number" ? obj.version : SECRETS_SCHEMA_VERSION,
+    version: typeof obj.version === "number" ? obj.version : LEGACY_SCHEMA_VERSION,
     salt: obj.salt,
+    ...(isValidKdfParams(obj.kdf) ? { kdf: obj.kdf } : {}),
     entries: obj.entries as Record<string, EncryptedEntry>,
     ...(check ? { check } : {}),
   };
@@ -247,19 +310,59 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
     return cachedKey;
   }
   const salt = Buffer.from(vault.salt, "base64");
-  const key = await deriveKey(passphrase, salt);
-  verifyKey(vault, key);
+  // The vault's OWN parameters, not this build's default: a vault written
+  // under a different cost factor must keep opening.
+  const params = vault.kdf ?? DEFAULT_KDF;
+  let key = await deriveKey(passphrase, salt, params);
+  try {
+    verifyKey(vault, key);
+  } catch (err) {
+    // Legacy retry: a vault created before passphrases were NFC-normalized was
+    // keyed on the exact bytes the user typed. If those differ from the
+    // normalized form (a decomposed accent from a macOS keyboard), give the
+    // un-normalized derivation one chance before condemning the passphrase --
+    // otherwise this change would lock those users out of their own vault.
+    if (normalizePassphrase(passphrase) === passphrase) throw err;
+    key.fill(0); // best-effort zeroize the derivation we are discarding
+    key = await deriveKey(passphrase, salt, params, false);
+    try {
+      verifyKey(vault, key);
+    } catch {
+      key.fill(0);
+      throw err; // report the primary (normalized) failure, not the retry's
+    }
+  }
   cachedKey = key;
   cachedSalt = vault.salt;
   cachedFingerprint = fingerprint;
   return key;
 }
 
-/** True iff `entry` decrypts cleanly under `key`. Swallows the auth-tag
- *  failure -- callers here only need the boolean. */
-function canDecrypt(entry: EncryptedEntry, key: Buffer): boolean {
+/** May this vault still hold ciphertexts written WITHOUT the entry-name
+ *  binding? True only for a pre-v2 file. A v2 vault refusing the unbound form
+ *  is what makes the binding a real control: otherwise an attacker could strip
+ *  the AAD by swapping in blobs that were never bound. */
+function allowsUnboundDecrypt(vault: VaultFile): boolean {
+  return vault.version < SECRETS_SCHEMA_VERSION;
+}
+
+/** Decrypt `entry` with `aad` bound in, falling back to an UNBOUND decrypt on
+ *  a v1 vault (whose ciphertexts predate the binding). Throws the bound
+ *  failure when no fallback is allowed. */
+function decryptBound(vault: VaultFile, entry: EncryptedEntry, key: Buffer, aad: string): string {
   try {
-    decryptEntry(entry, key);
+    return decryptEntry(entry, key, aad);
+  } catch (err) {
+    if (!allowsUnboundDecrypt(vault)) throw err;
+    return decryptEntry(entry, key);
+  }
+}
+
+/** True iff `entry` decrypts cleanly under `key` (bound to `aad`). Swallows
+ *  the auth-tag failure -- callers here only need the boolean. */
+function canDecrypt(vault: VaultFile, entry: EncryptedEntry, key: Buffer, aad: string): boolean {
+  try {
+    decryptBound(vault, entry, key, aad);
     return true;
   } catch {
     return false;
@@ -290,17 +393,35 @@ function canDecrypt(entry: EncryptedEntry, key: Buffer): boolean {
  *                                              entry alone is not
  *                                              authoritative -- it can be
  *                                              the corrupt one.)
- *    - nothing to check against (fresh/empty vault) -> accept. */
+ *    - nothing to check against (fresh/empty vault) -> accept.
+ *
+ *  The check marker is DECRYPTED AND COMPARED to VAULT_CHECK_PLAINTEXT, the
+ *  same predicate rotateVault uses. Accepting "it decrypted" alone is
+ *  equivalent under GCM (the auth tag already proves the plaintext), but the
+ *  two verifiers must not disagree: if the cipher were ever changed to a
+ *  non-AEAD mode, the looser one would silently accept any key. */
 function verifyKey(vault: VaultFile, key: Buffer): void {
-  const entries = Object.values(vault.entries);
+  const entries = Object.entries(vault.entries);
+  const someEntryDecrypts = (): boolean => entries.some(([name, e]) => canDecrypt(vault, e, key, name));
   if (vault.check) {
-    if (canDecrypt(vault.check, key)) return;
-    if (entries.some((e) => canDecrypt(e, key))) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
+    if (checkMarkerMatches(vault, key)) return;
+    if (someEntryDecrypts()) throw new Error(VAULT_CHECK_CORRUPT_ERROR);
     throw new Error("wrong passphrase for this vault (decryption failed)");
   }
   if (entries.length === 0) return; // fresh/empty vault -- nothing to verify yet
-  if (entries.some((e) => canDecrypt(e, key))) return;
+  if (someEntryDecrypts()) return;
   throw new Error("wrong passphrase for this vault (decryption failed)");
+}
+
+/** True iff the vault's check marker decrypts under `key` AND holds the
+ *  expected constant. Shared by verifyKey and rotateVault. */
+function checkMarkerMatches(vault: VaultFile, key: Buffer): boolean {
+  if (!vault.check) return false;
+  try {
+    return decryptBound(vault, vault.check, key, VAULT_CHECK_AAD) === VAULT_CHECK_PLAINTEXT;
+  } catch {
+    return false;
+  }
 }
 
 /** Return a vault guaranteed to carry a verification token under `key`.
@@ -310,7 +431,7 @@ function verifyKey(vault: VaultFile, key: Buffer): void {
  *  setSecret below is its only caller. */
 function ensureCheck(vault: VaultFile, key: Buffer): VaultFile {
   if (vault.check) return vault;
-  return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key) };
+  return { ...vault, check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, VAULT_CHECK_AAD) };
 }
 
 /** True iff an unlock has been performed in this process. */
@@ -347,15 +468,8 @@ export function isUnlocked(): boolean {
 export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphrase: string): Promise<VaultFile> {
   // Step 1: verify the old key against the check marker first, so a wrong
   // old passphrase aborts loudly before we attempt any entry decrypt.
-  if (vault.check) {
-    try {
-      const probe = decryptEntry(vault.check, oldKey);
-      if (probe !== VAULT_CHECK_PLAINTEXT) {
-        throw new Error("vault check marker did not match expected plaintext");
-      }
-    } catch {
-      throw new Error("rotate aborted: current passphrase is wrong (vault check failed to decrypt)");
-    }
+  if (vault.check && !checkMarkerMatches(vault, oldKey)) {
+    throw new Error("rotate aborted: current passphrase is wrong (vault check failed to decrypt)");
   }
 
   // Step 2: decrypt every entry into memory. Any failure aborts the whole
@@ -363,7 +477,7 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
   const plaintext = new Map<string, string>();
   for (const [name, entry] of Object.entries(vault.entries)) {
     try {
-      plaintext.set(name, decryptEntry(entry, oldKey));
+      plaintext.set(name, decryptBound(vault, entry, oldKey, name));
     } catch {
       // Best-effort scrub of whatever we already decrypted before bailing.
       plaintext.clear();
@@ -372,19 +486,23 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
   }
 
   // Step 3: all plaintext in hand -- derive a fresh key under a new salt
-  // and re-encrypt everything (entries + a fresh check marker).
+  // and re-encrypt everything (entries + a fresh check marker). Rotate is
+  // also the migration path: the rewritten file is stamped with the current
+  // schema and this build's KDF parameters, and every ciphertext comes out
+  // bound to its entry name.
   const newSalt = generateSalt();
-  const newKey = await deriveKey(newPassphrase, newSalt);
+  const newKey = await deriveKey(newPassphrase, newSalt, DEFAULT_KDF);
   try {
     const entries: Record<string, EncryptedEntry> = {};
     for (const [name, value] of plaintext) {
-      entries[name] = encryptEntry(value, newKey);
+      entries[name] = encryptEntry(value, newKey, name);
     }
     return {
       version: SECRETS_SCHEMA_VERSION,
       salt: newSalt.toString("base64"),
+      kdf: { ...DEFAULT_KDF },
       entries,
-      check: encryptEntry(VAULT_CHECK_PLAINTEXT, newKey),
+      check: encryptEntry(VAULT_CHECK_PLAINTEXT, newKey, VAULT_CHECK_AAD),
     };
   } finally {
     // Best-effort: drop references to plaintext. Strings can't be wiped in
@@ -418,13 +536,14 @@ export function setSecret(vault: VaultFile, key: Buffer, name: string, value: st
     );
   }
   // ensureCheck stamps vault.check on first save so future unlocks can
-  // verify the passphrase before caching the derived key.
+  // verify the passphrase before caching the derived key. The ciphertext is
+  // bound to `name` (AAD) so it cannot be moved to another entry later.
   return ensureCheck(
     {
       ...vault,
       entries: {
         ...vault.entries,
-        [name]: encryptEntry(value, key),
+        [name]: encryptEntry(value, key, name),
       },
     },
     key,
@@ -446,7 +565,7 @@ export function getSecret(vault: VaultFile, key: Buffer, name: string): string |
   if (!Object.hasOwn(vault.entries, name)) return null;
   const entry = vault.entries[name];
   if (!entry) return null;
-  return decryptEntry(entry, key);
+  return decryptBound(vault, entry, key, name);
 }
 
 /** Bootstrap a fresh vault when no file exists yet. */
@@ -508,7 +627,7 @@ export function resolveSecretRefs(
         return full; // leave literal; reported via `missing` (see doc above)
       }
       try {
-        const value = decryptEntry(entry, key);
+        const value = decryptBound(vault, entry, key, name);
         decrypted.set(name, value);
         return value;
       } catch {

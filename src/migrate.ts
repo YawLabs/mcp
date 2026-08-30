@@ -19,7 +19,8 @@
 //   - Quiet but visible: every successful move logs at INFO so users
 //     can trace where their config went.
 
-import { mkdir, rename, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, mkdir, rename, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME, isUnderHome, realpathOrSelf, userConfigDir } from "./paths.js";
@@ -31,6 +32,10 @@ export const LEGACY_LOCAL_FILENAME = ".yaw-mcp.local.json";
 const NEW_CONFIG_FILENAME = "config.json";
 const NEW_LOCAL_FILENAME = "config.local.json";
 
+// Existence probe for the WALKER only (findLegacyProjectRoot), which just asks
+// "is there a legacy file here" -- following a symlink is the right answer for
+// discovery. migrateFile does its own lstat instead; see the comment there for
+// why the thing it renames must be the thing it inspected.
 async function exists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -45,7 +50,36 @@ async function exists(path: string): Promise<boolean> {
 // `.yaw-mcp/` may not have been created yet). Logs on move, logs on skip
 // due to an already-populated target, logs on error.
 async function migrateFile(legacy: string, target: string, scope: string): Promise<void> {
-  if (!(await exists(legacy))) return;
+  // ONE lstat serves as both the existence probe and the ownership check
+  // below -- the path used to be stat'ed twice, and the two stats could
+  // disagree about the file they described.
+  //
+  // lstat, not stat: a symlink at the legacy path has to be judged as
+  // ITSELF. stat() follows the link, so the ownership decision was about the
+  // TARGET inode while rename() below moves the LINK -- two different files,
+  // and a link with a RELATIVE target dangles the moment it lands one
+  // directory deeper in `.yaw-mcp/`. A missing/unreadable path throws here
+  // and is treated as "nothing to migrate", exactly as the old existence
+  // probe did.
+  let st: Stats;
+  try {
+    st = await lstat(legacy);
+  } catch {
+    return;
+  }
+
+  if (st.isSymbolicLink()) {
+    // Skipped rather than followed: renaming the link breaks a relative
+    // target, and copying through it would hoist a file the ownership check
+    // above never covered. Left in place with a warn so the drop is visible.
+    log("warn", "yaw-mcp config: legacy path is a symlink -- skipping migration", {
+      scope,
+      legacy,
+      target,
+      action: "move the file the link points at into .yaw-mcp/ by hand, then delete the link",
+    });
+    return;
+  }
 
   // POSIX-only owner check: confirm the legacy file is owned by the
   // current effective uid before we rename it. A hostile or stale file
@@ -57,25 +91,13 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
   if (process.platform !== "win32") {
     const geteuid = (process as { geteuid?: () => number }).geteuid;
     if (typeof geteuid === "function") {
-      try {
-        const st = await stat(legacy);
-        const myUid = geteuid.call(process);
-        if (typeof st.uid === "number" && st.uid !== myUid) {
-          log("warn", "yaw-mcp config: legacy file not owned by current user -- skipping migration", {
-            scope,
-            legacy,
-            fileUid: st.uid,
-            processUid: myUid,
-          });
-          return;
-        }
-      } catch (err) {
-        // Couldn't stat the file we just verified exists -- treat as
-        // hostile / racy and skip rather than blindly trust it.
-        log("warn", "yaw-mcp config: could not stat legacy file -- skipping migration", {
+      const myUid = geteuid.call(process);
+      if (typeof st.uid === "number" && st.uid !== myUid) {
+        log("warn", "yaw-mcp config: legacy file not owned by current user -- skipping migration", {
           scope,
           legacy,
-          error: err instanceof Error ? err.message : String(err),
+          fileUid: st.uid,
+          processUid: myUid,
         });
         return;
       }
@@ -130,6 +152,22 @@ export async function migrateLegacyConfigPaths(opts: MigrateOptions): Promise<vo
   const legacyGlobal = join(home, LEGACY_GLOBAL_FILENAME);
   const newGlobal = join(userConfigDir(home), NEW_CONFIG_FILENAME);
   await migrateFile(legacyGlobal, newGlobal, "global");
+
+  // A `.yaw-mcp.local.json` sitting AT $HOME is the one legacy file with no
+  // new-layout home: the loader's machine-local scope is per-project
+  // (config-loader.ts reads <project>/.yaw-mcp/config.local.json only), and
+  // the project walk below stops strictly BEFORE $HOME, so this file is read
+  // by nothing after the upgrade. Renaming it into ~/.yaw-mcp/config.local.json
+  // would move it somewhere equally unread, so we warn and leave it -- the
+  // drop used to be entirely silent.
+  const homeLocal = join(home, LEGACY_LOCAL_FILENAME);
+  if (await exists(homeLocal)) {
+    log("warn", "yaw-mcp config: legacy machine-local file at $HOME has no new location -- leaving it in place", {
+      scope: "local",
+      legacy: homeLocal,
+      action: `merge its contents into a project ${CONFIG_DIRNAME}/config.local.json, or into ${newGlobal} for user-global scope, then delete it`,
+    });
+  }
 
   // Project scope: find the nearest legacy file by walking up from cwd.
   // We use a dedicated walker rather than findProjectConfigDir because

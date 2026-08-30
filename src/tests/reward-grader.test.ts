@@ -90,6 +90,8 @@ describe("buildGraderPrompt", () => {
     expect(p).toContain("Goal: find open PRs");
     expect(p).toContain("Tool called: list_prs");
     expect(p).toContain("YES, PARTIAL, or NO");
+    // The labelled form parseGrade prefers.
+    expect(p).toContain("GRADE: <word>");
   });
 
   it("omits the goal line when no intent is known", () => {
@@ -122,6 +124,25 @@ describe("parseGrade", () => {
   it("returns null when no verdict word appears", () => {
     expect(parseGrade("maybe?")).toBeNull();
     expect(parseGrade("")).toBeNull();
+  });
+
+  // Regression: the parse took the FIRST whole-word verdict, so a reply that
+  // narrated before deciding was graded on a word from its subordinate
+  // clause -- always in the harsh direction, wiping success credit off a
+  // namespace whose call actually worked.
+  it("takes the LAST verdict when the reply narrates before deciding", () => {
+    expect(parseGrade("No results were returned, but YES the call succeeded")).toBe(1.0);
+    expect(parseGrade("Yes, it answered, but NO it did not accomplish the goal")).toBe(0.0);
+  });
+
+  it("prefers an explicit GRADE: token over any verdict word in the prose", () => {
+    // buildGraderPrompt asks for this shape, so it wins outright -- even when
+    // a later bare word would otherwise be the last match. NL is built, not
+    // typed, so no escape sequence is hand-written into the fixture.
+    const NL = String.fromCharCode(10);
+    expect(parseGrade(`GRADE: YES${NL}no errors were reported`)).toBe(1.0);
+    expect(parseGrade(`The call looks fine.${NL}GRADE: partial`)).toBe(0.5);
+    expect(parseGrade("grade:no")).toBe(0.0);
   });
 });
 

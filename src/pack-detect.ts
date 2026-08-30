@@ -92,8 +92,12 @@ export class PackDetector {
 
     for (const burst of bursts) {
       if (burst.namespaces.length < MIN_NAMESPACES) continue;
-      // Defensive only: segmentBursts cuts at the overflow boundary, so a
-      // burst can never carry more than MAX_NAMESPACES namespaces here.
+      // UNREACHABLE today, kept as a guard: segmentBursts cuts a burst at the
+      // overflow boundary, so no burst reaching here can carry more than
+      // MAX_NAMESPACES namespaces. It survives because the pack-size cap is a
+      // detectChains-level invariant -- if the overflow cut is ever relaxed or
+      // a caller builds bursts another way, this is what keeps an over-wide
+      // set out of the results instead of surfacing an undispatchable pack.
       if (burst.namespaces.length > MAX_NAMESPACES) continue;
       const id = packIdFromNamespaces(burst.namespaces);
       const prev = packCounts.get(id);
@@ -147,9 +151,16 @@ export class PackDetector {
     for (const call of this.history) {
       const gapExceeded = call.at - prevAt > this.maxGapMs;
       const spanExceeded = current !== null && call.at - current.startAt > maxBurstSpanMs;
+      // Both comparisons above are one-sided (`>`), so a BACKWARDS `at` -- a
+      // wall-clock step during a live session, or a snapshot that reached us
+      // out of order -- makes both false and welds every later call into the
+      // burst that preceded the jump, manufacturing a pack that never ran.
+      // We cannot tell how much real time passed across a non-monotonic step,
+      // so treat it as a boundary.
+      const wentBackwards = current !== null && call.at < prevAt;
       const wouldOverflow =
         current !== null && current.namespaces.length >= MAX_NAMESPACES && !current.namespaces.includes(call.namespace);
-      if (!current || gapExceeded || spanExceeded || wouldOverflow) {
+      if (!current || gapExceeded || spanExceeded || wentBackwards || wouldOverflow) {
         current = { namespaces: [call.namespace], startAt: call.at, lastAt: call.at };
         bursts.push(current);
       } else {
@@ -184,6 +195,13 @@ export class PackDetector {
   // configured maxHistory cap — if the snapshot exceeds it, the oldest
   // entries are dropped, matching the cap behavior of recordCall.
   //
+  // Entries are SORTED by `at` after cleaning. segmentBursts reads the history
+  // as a time-ordered stream (see the boundary comparisons there), and the
+  // snapshot comes off disk where a hand-edited, merged or torn file can carry
+  // entries out of order; an out-of-order run would otherwise be segmented as
+  // one welded burst plus spurious boundaries. Sorting is stable, so equal
+  // timestamps keep their recorded order.
+  //
   // `at` is validated as a finite number, not just present: the snapshot
   // comes off disk (persistence.ts) where a hand-edited or torn file can
   // carry null / "12345" / NaN. segmentBursts compares `call.at - prevAt >
@@ -197,6 +215,7 @@ export class PackDetector {
       if (typeof c.at !== "number" || !Number.isFinite(c.at)) continue;
       clean.push({ namespace: c.namespace, toolName: c.toolName, at: c.at });
     }
+    clean.sort((a, b) => a.at - b.at);
     if (clean.length > this.maxHistory) {
       this.history = clean.slice(clean.length - this.maxHistory);
     } else {

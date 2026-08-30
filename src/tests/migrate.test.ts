@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   LEGACY_GLOBAL_FILENAME,
@@ -140,6 +140,68 @@ describe("migrateLegacyConfigPaths", () => {
 
     await expect(stat(targetPath)).resolves.toBeDefined();
     await expect(stat(legacyPath)).rejects.toThrow();
+  });
+
+  // 9. A symlinked legacy path is left alone: the inode the trust check
+  //    covered (stat follows) was never the one rename() would have moved.
+  it("skips a legacy file that is a symlink instead of moving the link", async () => {
+    // The old code stat'ed (following the link) for the ownership decision and
+    // then renamed the LINK, so the file it vetted and the file it moved were
+    // different inodes -- and a relative link target dangles once the link
+    // lands one directory deeper inside .yaw-mcp/.
+    const realDir = mkdtempSync(join(home, "real-"));
+    const realFile = writeLegacy(realDir, "actual-config.json");
+    const linkPath = join(home, LEGACY_GLOBAL_FILENAME);
+    try {
+      symlinkSync(realFile, linkPath, "file");
+    } catch {
+      return; // symlink creation unavailable (unelevated Windows); nothing to pin
+    }
+    const warns: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      warns.push(String(chunk));
+      return true;
+    });
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The link is still a link, still where it was...
+    await expect(lstat(linkPath)).resolves.toMatchObject({});
+    expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
+    // ...nothing was hoisted into ~/.yaw-mcp/, and the target is untouched.
+    await expect(stat(join(userConfigDir(home), "config.json"))).rejects.toThrow();
+    await expect(stat(realFile)).resolves.toBeDefined();
+    // The skip is visible, not silent.
+    expect(warns.join("")).toContain("legacy path is a symlink");
+  });
+
+  // 10. `.yaw-mcp.local.json` AT $HOME: no new-layout home, so it is left in
+  //     place -- but the drop is announced instead of silent.
+  it("warns about a legacy machine-local file sitting at $HOME instead of dropping it silently", async () => {
+    // The loader's local scope is per-project and the project walk stops
+    // strictly before $HOME, so this file becomes unread on upgrade with
+    // nothing anywhere saying so.
+    const legacyAtHome = writeLegacy(home, LEGACY_LOCAL_FILENAME);
+    const warns: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      warns.push(String(chunk));
+      return true;
+    });
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const out = warns.join("");
+    expect(out).toContain("legacy machine-local file at $HOME has no new location");
+    // Non-destructive: the file stays put and nothing was written under
+    // ~/.yaw-mcp/ on its behalf.
+    await expect(stat(legacyAtHome)).resolves.toBeDefined();
+    await expect(stat(join(userConfigDir(home), "config.local.json"))).rejects.toThrow();
   });
 });
 

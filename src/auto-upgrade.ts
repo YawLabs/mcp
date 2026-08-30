@@ -22,12 +22,18 @@
 // thing is fire-and-forget. A failure is a no-op -- worst case the user
 // runs the current version for one more session.
 //
+// Concurrent runs ARE serialized, best-effort, by a lockfile in the target
+// prefix (acquireUpgradeLock): N MCP clients starting at once -- the realistic
+// trigger being several Claude Code panes -- would otherwise each fire their
+// own `npm install -g` into the same tree. Losers skip the spawn entirely and
+// pick the new version up on the next restart, which is what a background
+// upgrade promises anyway.
+//
 // KNOWN GAPS in the background install (documented rather than papered
 // over -- see defaultSpawn):
-//   - Nothing serializes concurrent runs. Two MCP clients starting at
-//     once fire two `npm install -g` into the same prefix; npm's own
-//     cache lock makes that slow rather than corrupting, but it is not
-//     safe by construction. A lockfile in the prefix is the real fix.
+//   - The lock is advisory and best-effort: a prefix we cannot write to
+//     yields no lock and the old unserialized behavior, and a lock left
+//     behind by a killed process is stolen once it goes stale.
 //   - The child is NOT detached, which on POSIX does not mean it dies
 //     with yaw-mcp -- it only dies when the client kills the whole
 //     process group/tree (which MCP clients commonly do). If it IS
@@ -42,11 +48,13 @@
 // globals where `npm install -g` would always EACCES.
 
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { dirname, sep } from "node:path";
+import { closeSync, openSync, realpathSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, sep } from "node:path";
 import { log } from "./logger.js";
 import {
   buildUpgradePlan,
+  comparablePath,
   detectInstallMethod,
   detectSea,
   fetchLatestVersion,
@@ -98,15 +106,16 @@ export function quoteArgForDisplay(arg: string, platform: NodeJS.Platform = proc
   return `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
-/** Resolve the global install prefix of the CURRENTLY running yaw-mcp by
- *  walking up from `process.argv[1]` (realpath-resolved so a symlinked shim
- *  like `/usr/local/bin/yaw-mcp -> /opt/node/lib/node_modules/@yawlabs/mcp/...`
- *  points at the real install root) until a path segment `node_modules` is
- *  found. The directory ABOVE that `node_modules` is the prefix that owns this
- *  install -- minus a trailing `lib`, which POSIX globals insert
- *  (`<prefix>/lib/node_modules/...`) and `npm prefix -g` does not report. No
- *  `.bin` directory is involved: the walk matches the bare `node_modules`
- *  segment and never reads the filesystem beyond the initial realpath.
+/** Resolve the global install prefix of the CURRENTLY running yaw-mcp from the
+ *  LAST `node_modules` segment of `process.argv[1]`'s directory
+ *  (realpath-resolved first, so a symlinked shim like
+ *  `/usr/local/bin/yaw-mcp -> /opt/node/lib/node_modules/@yawlabs/mcp/...`
+ *  points at the real install root). The directory ABOVE that `node_modules`
+ *  is the prefix that owns this install -- minus a trailing `lib`, which POSIX
+ *  globals insert (`<prefix>/lib/node_modules/...`) and `npm prefix -g` does
+ *  not report. No `.bin` directory is involved: the match is on the bare
+ *  `node_modules` segment, and nothing reads the filesystem beyond the initial
+ *  realpath.
  *
  *  We need this because `npm prefix -g` reports the user's *configured*
  *  global prefix -- which can differ from the prefix the running install
@@ -123,39 +132,26 @@ export function detectRunningInstallPrefix(argvPath: string | undefined): string
   } catch {
     return null;
   }
-  let dir = dirname(resolved);
-  // Walk up until a `node_modules` segment appears OR we hit the filesystem
-  // root (`dir !== prev` terminates there -- dirname() is monotonic and
-  // symlinks are already resolved, so the loop cannot cycle). The 24-segment
-  // cap is a belt-and-braces bound, not a loop guard; its observable effect is
-  // that an install nested deeper than 24 segments returns null and gets no
-  // `--prefix` (pinned by the safety-cap test in tests/auto-upgrade.test.ts).
-  let prev = "";
-  let safety = 24;
-  while (dir !== prev && safety-- > 0) {
-    // Two recognized shapes:
-    //   1. <prefix>/node_modules/<pkg>/...    -> prefix is the dir above node_modules
-    //   2. <prefix>/lib/node_modules/<pkg>/.. -> common on Linux global installs
-    const idx = dir.lastIndexOf(`${sep}node_modules${sep}`);
-    if (idx !== -1) {
-      const candidate = dir.slice(0, idx);
-      // Linux-style global: strip a trailing `/lib` if present so the
-      // prefix is the bin/lib parent (matches `npm prefix -g` output).
-      if (candidate.endsWith(`${sep}lib`)) return candidate.slice(0, -`${sep}lib`.length);
-      return candidate;
-    }
-    prev = dir;
-    dir = dirname(dir);
-  }
-  return null;
-}
-
-/** Normalize a prefix for comparison. Windows paths are case-insensitive, so
- *  `C:\Users\Jeff\AppData\Roaming\npm` and the lowercased form npm may report
- *  are the SAME prefix and must not produce a "your prefixes differ" warning. */
-function comparablePrefix(p: string): string {
-  const trimmed = p.trim();
-  return process.platform === "win32" ? trimmed.toLowerCase() : trimmed;
+  // ONE lastIndexOf on the entrypoint's directory. This used to be a walk-up
+  // loop with a 24-iteration cap, which was theatre: lastIndexOf scans the
+  // WHOLE string, so any `node_modules` segment is found on the first pass and
+  // walking up can never introduce one that pass missed. The cap's documented
+  // effect ("an install nested deeper than 24 segments returns null") was
+  // therefore never real, and the test that claimed to pin it used a
+  // node_modules-free path -- i.e. it pinned the null that the -1 below
+  // returns anyway. Depth does not matter; the presence of the segment does.
+  //
+  // Two recognized shapes:
+  //   1. <prefix>/node_modules/<pkg>/...    -> prefix is the dir above node_modules
+  //   2. <prefix>/lib/node_modules/<pkg>/.. -> common on Linux global installs
+  const dir = dirname(resolved);
+  const idx = dir.lastIndexOf(`${sep}node_modules${sep}`);
+  if (idx === -1) return null;
+  const candidate = dir.slice(0, idx);
+  // Linux-style global: strip a trailing `/lib` if present so the prefix is
+  // the bin/lib parent (matches `npm prefix -g` output).
+  if (candidate.endsWith(`${sep}lib`)) return candidate.slice(0, -`${sep}lib`.length);
+  return candidate;
 }
 
 /** Emit a stderr warning when npm's configured global prefix differs from the
@@ -167,7 +163,12 @@ function comparablePrefix(p: string): string {
  *
  *  The probe itself is upgrade-cmd's npmGlobalPrefix: shared so there is one
  *  timeout, one kill and one VITEST short-circuit instead of two divergent
- *  copies. Best-effort -- a spawn failure, non-zero exit or timeout resolves
+ *  copies. The COMPARATOR is shared for the same reason: this used to trim +
+ *  lowercase only, while upgrade-cmd's comparablePath realpaths both sides --
+ *  so on a junction-style prefix (scoop's `current` pointing into a versioned
+ *  dir) the two names for one directory read as two prefixes and every stale
+ *  startup printed a multi-prefix warning about a setup the user does not
+ *  have. Best-effort -- a spawn failure, non-zero exit or timeout resolves
  *  null and silently skips the warning. Never blocks the caller. */
 async function compareWithNpmPrefix(
   detected: string,
@@ -177,13 +178,114 @@ async function compareWithNpmPrefix(
   // Null is the probe's own "couldn't answer"; blank output is the same thing
   // said differently, and comparing a path against "" would always "differ".
   if (!npmPrefix?.trim()) return;
-  if (comparablePrefix(npmPrefix) === comparablePrefix(detected)) return;
+  // Trim BEFORE comparablePath: realpath of a path with trailing whitespace
+  // throws, which would silently drop the resolution back to a literal
+  // comparison and reintroduce the junction false positive.
+  if (comparablePath(npmPrefix.trim()) === comparablePath(detected)) return;
   process.stderr.write(
     `yaw-mcp self-upgrade: detected running prefix differs from \`npm prefix -g\`:\n` +
       `  running:  ${detected}\n` +
       `  npm -g:   ${npmPrefix}\n` +
       `  Installing into the running prefix so the upgrade lands in the same tree the client spawned from.\n`,
   );
+}
+
+/** Lockfile name, in the prefix being installed into. Dotted so it does not
+ *  show up in a casual `ls` of a global prefix. */
+const UPGRADE_LOCK_NAME = ".yaw-mcp-upgrade.lock";
+
+/** How long a lock is honoured before it is treated as abandoned. An install
+ *  is seconds; ten minutes is far past that. The holder is NOT guaranteed to
+ *  release -- an MCP client that tears down the process tree mid-install
+ *  leaves the file behind -- so an unstealable lock would disable self-upgrade
+ *  on that prefix forever, which is strictly worse than one duplicated npm. */
+const UPGRADE_LOCK_STALE_MS = 10 * 60 * 1000;
+
+/** How far ahead of Date.now() a lock's mtime may sit and still count as
+ *  "taken just now". Filesystem timestamp granularity routinely reports an
+ *  mtime a hair ahead of the clock we compare it against; without this margin
+ *  a lock taken microseconds ago reads as future-dated and gets stolen
+ *  immediately, which is the same as having no lock at all. Anything further
+ *  ahead than this really is a stepped clock (see the steal rule below). */
+const UPGRADE_LOCK_FUTURE_SKEW_MS = 5 * 1000;
+
+/** Best-effort cross-process lock around the background `npm install -g`.
+ *
+ *  Returns a release callback when the caller may proceed, and null ONLY when
+ *  another live process is already installing into this prefix. "Best-effort"
+ *  is the load-bearing word: a lock we cannot CREATE (read-only prefix,
+ *  EACCES, EPERM) must not block the upgrade, so those cases hand back a
+ *  no-op release and the caller proceeds exactly as it did before the lock
+ *  existed. Only a live EEXIST means "someone else has this".
+ *
+ *  `openSync(path, "wx")` is the whole mutual-exclusion primitive: O_EXCL is
+ *  atomic on both POSIX and Windows, so two processes racing it cannot both
+ *  win. */
+export function acquireUpgradeLock(dir: string, now: number = Date.now()): (() => void) | null {
+  const lockPath = join(dir, UPGRADE_LOCK_NAME);
+  /** undefined = the lock is held by someone else; otherwise a release fn. */
+  const take = (): (() => void) | undefined => {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try {
+        // The pid is purely diagnostic -- nothing reads it back. It exists so
+        // an operator who finds a stuck lock can tell whether the owner lives.
+        writeSync(fd, `${process.pid}\n`);
+      } finally {
+        closeSync(fd);
+      }
+      // Idempotent: both of defaultSpawn's handlers fire for an ENOENT
+      // spawn, and an unguarded second unlink would delete whatever lock
+      // has been taken since -- including another process's.
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // Already gone (stolen as stale, or the dir was cleaned up).
+        }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+      return () => {};
+    }
+  };
+
+  const first = take();
+  if (first !== undefined) return first;
+
+  // Held. Steal it only once it is provably stale. An mtime further than the
+  // skew margin into the FUTURE (clock stepped backwards between the two runs)
+  // counts as stale too: no live process on this clock could have written it,
+  // and honouring it would suppress every upgrade until wall-clock caught up.
+  let ageMs: number;
+  try {
+    ageMs = now - statSync(lockPath).mtimeMs;
+  } catch {
+    // Vanished between the open and the stat -- treat as free and retry.
+    ageMs = UPGRADE_LOCK_STALE_MS;
+  }
+  if (ageMs > -UPGRADE_LOCK_FUTURE_SKEW_MS && ageMs < UPGRADE_LOCK_STALE_MS) return null;
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Lost the steal race; whoever won it owns the lock now.
+    return null;
+  }
+  const second = take();
+  return second === undefined ? null : second;
+}
+
+/** The lock the serve path actually uses. Short-circuits under vitest --
+ *  mirroring npmGlobalPrefix's probe guard -- so no unit test writes a
+ *  lockfile into a real global prefix, or leaves one behind for the next test
+ *  in the run to trip over. Tests that mean to exercise locking either call
+ *  acquireUpgradeLock directly against a temp dir, or inject acquireLockImpl. */
+function defaultAcquireLock(dir: string): (() => void) | null {
+  if (process.env.VITEST) return () => {};
+  return acquireUpgradeLock(dir);
 }
 
 export interface AutoUpgradeDeps {
@@ -193,8 +295,13 @@ export interface AutoUpgradeDeps {
   argvPath?: string;
   /** Test hook: replace the npm registry fetch. */
   fetchLatestImpl?: () => Promise<string | null>;
-  /** Test hook: replace the background npm spawn. */
-  spawnImpl?: (cmd: string, args: string[]) => void;
+  /** Test hook: replace the background npm spawn. `onDone` releases the
+   *  upgrade lock and MUST be called once the install has finished (or
+   *  failed); defaultSpawn wires it to the child's close/error handlers. */
+  spawnImpl?: (cmd: string, args: string[], onDone?: () => void) => void;
+  /** Test hook: replace the prefix lockfile that serializes concurrent
+   *  background installs. Returning null means "someone else holds it". */
+  acquireLockImpl?: (dir: string) => (() => void) | null;
   /** Test hook: replace the `npm prefix -g` probe behind the multi-prefix
    *  warning. Needed in tests because the shared probe short-circuits to null
    *  under VITEST so no unit test ever spawns a real npm. */
@@ -203,11 +310,20 @@ export interface AutoUpgradeDeps {
   isSeaImpl?: () => boolean | Promise<boolean>;
 }
 
-function defaultSpawn(cmd: string, args: string[]): void {
+function defaultSpawn(cmd: string, args: string[], onDone: () => void = () => {}): void {
   // Track whether the error handler already fired so the close handler
   // stays silent after it -- both handlers fire for ENOENT, but the
   // error handler has the right message and fires first.
   let errorFired = false;
+  // Release the upgrade lock exactly once, whichever handler gets there
+  // first. Both fire for ENOENT, and a double release would unlink a lock a
+  // DIFFERENT process had since taken.
+  let released = false;
+  const finish = (): void => {
+    if (released) return;
+    released = true;
+    onDone();
+  };
 
   // Build the corrective command the user should run for their tool.
   // Only npm gets the EACCES/sudo hint -- pnpm and bun manage their own
@@ -232,6 +348,7 @@ function defaultSpawn(cmd: string, args: string[]): void {
     shell: process.platform === "win32",
   });
   child.on("close", (code) => {
+    finish();
     if (errorFired) return; // error handler already logged; stay silent here.
     if (code === 0) {
       log("info", "yaw-mcp self-upgrade complete; the next client restart will run the new version");
@@ -249,6 +366,7 @@ function defaultSpawn(cmd: string, args: string[]): void {
   });
   child.on("error", (err: Error) => {
     errorFired = true;
+    finish();
     log("warn", `yaw-mcp self-upgrade: ${cmd} spawn failed`, { error: err?.message });
   });
 }
@@ -324,6 +442,27 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
           ? { cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"] }
           : null;
   if (globalSpec) {
+    // Serialize concurrent background installs into one prefix. N MCP clients
+    // starting at once each reach this line with the same verdict; without the
+    // lock they each fire `npm install -g` at the same tree. Losing the race
+    // is not a failure -- the winner's install is the one this process would
+    // have run, and the next client restart picks it up either way.
+    //
+    // The lock lives in the prefix being written to, so two processes contend
+    // only when they would actually collide. pnpm/bun have no detected prefix
+    // (that walk is global-npm only), so they fall back to the temp dir --
+    // still one lock per machine per tool family, which is what matters.
+    const lockDir = rawPrefix ?? tmpdir();
+    const releaseLock = (deps.acquireLockImpl ?? defaultAcquireLock)(lockDir);
+    if (releaseLock === null) {
+      log("info", "yaw-mcp self-upgrade: another process is already upgrading this install; skipping this one", {
+        current,
+        latest,
+        tool: globalSpec.cmd,
+        lockDir,
+      });
+      return;
+    }
     log("info", "yaw-mcp is out of date; upgrading the global install in the background", {
       current,
       latest,
@@ -344,7 +483,17 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     if (method === "global-npm" && rawPrefix !== null && quotedPrefix !== null) {
       void compareWithNpmPrefix(rawPrefix, deps.npmPrefixImpl);
     }
-    (deps.spawnImpl ?? defaultSpawn)(globalSpec.cmd, globalSpec.args);
+    try {
+      (deps.spawnImpl ?? defaultSpawn)(globalSpec.cmd, globalSpec.args, releaseLock);
+    } catch (err) {
+      // A synchronous spawn throw would otherwise leave the lock held for the
+      // full stale window, suppressing the next N startups' upgrade for a
+      // failure that already happened.
+      releaseLock();
+      log("warn", `yaw-mcp self-upgrade: could not start ${globalSpec.cmd}`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     return;
   }
 

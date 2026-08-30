@@ -5,9 +5,14 @@
 //   - guide: auto-generated "Installed servers" section appended to YAW-MCP.md
 //   - doctor: scan shell history for shadowed-CLI invocations
 //
-// Covers every slug in the yaw.sh/mcp Explore catalog so a user who
-// imports from the catalog with the default namespace gets the hint
-// with no configuration. Namespace keys are lowercased at lookup time.
+// Written to cover every slug in the yaw.sh/mcp Explore catalog (checked
+// against the 2026-08-23 snapshot of https://yaw.sh/data/mcp-catalog.json,
+// 80 servers) so a user who imports from the catalog with the default
+// namespace gets the hint with no configuration. Nothing ENFORCES that
+// coverage: the catalog is generated outside this repo, no slug list is
+// vendored here, and no test diffs the two -- so read the claim as "true as
+// of that snapshot", and re-check it against the live catalog before relying
+// on it. Namespace keys are lowercased at lookup time.
 //
 // A multi-word catalog slug needs TWO keys, and both are registered below.
 // The forward lookup is keyed on a real namespace, and every namespace that
@@ -275,12 +280,18 @@ export function cliToNamespaces(): Map<string, string[]> {
  *
  *  Deliberately HARDCODED and first-party only. This is NOT the inverse of
  *  NAMESPACE_REGISTRY — that registry maps many CLIs (npm, ssh, gh, kubectl,
- *  docker, ...) to servers, but only the entries below correspond to a
+ *  psql, ...) to servers, but only the entries below correspond to a
  *  Yaw Labs npm package we are willing to recommend installing unprompted.
- *  A heavily-used CLI with no entry here (kubectl, npm, ssh, docker, gh)
- *  produces NO nudge — we never push a third-party server, and we never
- *  push a CLI whose package isn't confirmed live on npm. Adding an entry is
- *  an explicit decision; do not derive this table from NAMESPACE_REGISTRY. */
+ *  A heavily-used CLI with no entry here (kubectl, npm, ssh, gh) produces NO
+ *  nudge — we never push a third-party server, and we never push a CLI whose
+ *  package isn't confirmed live on npm. Adding an entry is an explicit
+ *  decision; do not derive this table from NAMESPACE_REGISTRY.
+ *
+ *  Note the two tiers, easy to conflate: NAMESPACE_REGISTRY is the only one
+ *  the doctor reverse index (cliToNamespaces) can report from. docker, redis,
+ *  heroku and flyctl appear ONLY in KNOWN_CLI_PREFIXES, which feeds the
+ *  tool-name-prefix heuristic -- they have no registry entry, so they can
+ *  never surface as a shadow hit and are not candidates here either. */
 export const SHADOW_INSTALL_TARGETS: Record<string, { package: string; namespace: string; name: string }> = {
   aws: { package: "@yawlabs/aws-mcp", namespace: "aws", name: "AWS" },
   caddy: { package: "@yawlabs/caddy-mcp", namespace: "caddy", name: "Caddy" },

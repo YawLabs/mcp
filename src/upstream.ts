@@ -420,7 +420,11 @@ export async function connectToUpstream(
 
 // Env keys that are for THIS process only and must never leak into spawned
 // upstream servers:
-//   YAW_MCP_TOKEN                — backend auth token
+//   YAW_MCP_TOKEN                — RETIRED. It authenticated the hosted Yaw
+//     MCP backend, which is decommissioned; nothing in this process reads it
+//     any more. Kept in the strip list purely for hygiene: an operator whose
+//     shell still exports the old key must not have it forwarded into every
+//     spawned upstream.
 //   YAW_MCP_VAULT_PASSPHRASE     — unlocks the local secret vault
 //   YAW_MCP_VAULT_PASSPHRASE_NEW — the incoming passphrase during a rotate
 //     (secrets-cmd.ts), i.e. the LIVE passphrase once the rotate lands
@@ -629,6 +633,34 @@ async function connectToUpstreamOnce(
       throw new Error("url is required for remote servers");
     }
 
+    // Remote entries never spawn a child, so there is no process env to fill:
+    // resolveServerEnv runs only in the local branch above, and nothing here
+    // turns `env` into request headers. A `${secret:TOKEN}` sitting in a
+    // remote entry's env therefore gets NEITHER auth NOR a failure -- the
+    // connect just goes out unauthenticated and the server answers 401. Say
+    // so once, at connect, rather than leaving the operator to infer it.
+    // (Header injection is the real fix; this is the missing diagnostic.)
+    if (config.env && Object.keys(config.env).length > 0) {
+      log(
+        "warn",
+        "Ignoring env on a remote server: env (and ${secret:...} refs in it) is never sent to remote upstreams",
+        { namespace: config.namespace, keys: Object.keys(config.env) },
+      );
+    }
+
+    // bundles.json validation accepts "stdio" as a transport on ANY entry, so
+    // a remote entry can declare a transport this branch cannot honour -- it
+    // falls through to streamable-http below. Without a warning the operator
+    // sees only a confusing HTTP-shaped connect failure against a URL they
+    // thought was speaking stdio.
+    if (config.transport === "stdio") {
+      log(
+        "warn",
+        'Remote server declares transport "stdio", which only applies to local servers; using streamable-http',
+        { namespace: config.namespace },
+      );
+    }
+
     const url = new URL(config.url);
     if (config.transport === "sse") {
       transport = new SSEClientTransport(url);
@@ -752,29 +784,16 @@ async function connectToUpstreamOnce(
       }
     };
 
-    const tools = await fetchToolsFromUpstream(client, config.namespace);
-    const resources = await fetchResourcesFromUpstream(client, config.namespace);
-    const prompts = await fetchPromptsFromUpstream(client, config.namespace);
-
-    // Client closed while we were still fetching capabilities -- treat it as
-    // a boot failure rather than returning a dead "connected" connection.
-    if (closedBeforeReady) {
-      throw new ActivationError(`Server "${config.namespace}" disconnected during initialization`, "protocol_error");
-    }
-
-    // Populate the connection object (referenced by onclose handler above)
-    Object.assign(connection, {
-      config,
-      client,
-      transport,
-      tools,
-      resources,
-      prompts,
-      health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
-      status: "connected" as const,
-    });
-
     // Subscribe to upstream list changes so we pick up dynamic tools/resources/prompts.
+    //
+    // Registered BEFORE the initial inventory fetch, on purpose. When the
+    // three setNotificationHandler calls came after the fetches there was a
+    // window -- from connect() to the last fetch -- in which a
+    // notifications/*/list_changed had no handler, and the SDK DROPS an
+    // unhandled notification. An upstream that publishes a dynamic tool right
+    // after initialize therefore left the inventory frozen at whatever the
+    // initial fetch happened to see, until some later list_changed that may
+    // never arrive. Registering first turns that drop into a queued refresh.
     //
     // Each handler serializes onto a per-category chain so two rapid
     // notifications from the same upstream can't race fetchXFromUpstream
@@ -783,10 +802,23 @@ async function connectToUpstreamOnce(
     // last wins connection.tools, and onListChanged fires twice (each
     // rebuilding routes). The chain preserves ordering and bounds
     // in-flight fetches to one per category.
+    //
+    // Every chain STARTS from chainsGate, which is resolved only once the
+    // initial fetches have landed and the connection object is populated.
+    // That gate is load-bearing twice over: a queued refresh must not race
+    // the initial fetch it would otherwise clobber, and each handler body
+    // writes connection.<category>, which does not exist until the
+    // Object.assign below. On a FAILED connect the gate is never resolved,
+    // so a queued refresh never fires against the client the catch closes.
+    let releaseChains: () => void = () => {};
+    const chainsGate = new Promise<void>((resolve) => {
+      releaseChains = resolve;
+    });
+
     if (onListChanged) {
-      let toolsChain: Promise<void> = Promise.resolve();
-      let resourcesChain: Promise<void> = Promise.resolve();
-      let promptsChain: Promise<void> = Promise.resolve();
+      let toolsChain: Promise<void> = chainsGate;
+      let resourcesChain: Promise<void> = chainsGate;
+      let promptsChain: Promise<void> = chainsGate;
 
       client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
         toolsChain = toolsChain.then(async () => {
@@ -837,6 +869,32 @@ async function connectToUpstreamOnce(
         return promptsChain;
       });
     }
+
+    const tools = await fetchToolsFromUpstream(client, config.namespace);
+    const resources = await fetchResourcesFromUpstream(client, config.namespace);
+    const prompts = await fetchPromptsFromUpstream(client, config.namespace);
+
+    // Client closed while we were still fetching capabilities -- treat it as
+    // a boot failure rather than returning a dead "connected" connection.
+    if (closedBeforeReady) {
+      throw new ActivationError(`Server "${config.namespace}" disconnected during initialization`, "protocol_error");
+    }
+
+    // Populate the connection object (referenced by onclose handler above)
+    Object.assign(connection, {
+      config,
+      client,
+      transport,
+      tools,
+      resources,
+      prompts,
+      health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
+      status: "connected" as const,
+    });
+
+    // Inventory in place and connection.<category> now exists -- release any
+    // refresh that queued during the connect/fetch window.
+    releaseChains();
 
     return connection;
   } catch (err) {
@@ -953,8 +1011,13 @@ export async function fetchResourcesFromUpstream(
       uri: r.uri,
       namespacedUri: `connect://${namespace}/${r.uri}`,
       name: r.name,
+      // title / _meta forwarded for the same reason the tools fetcher below
+      // forwards them (MCP 2025-06-18): the proxied resource must reach the
+      // client with the display name and metadata the upstream published.
+      title: r.title,
       description: r.description,
       mimeType: r.mimeType,
+      _meta: r._meta as Record<string, unknown> | undefined,
     }));
   } catch (err) {
     // Server may not support resources — that's fine at connect time.
@@ -988,8 +1051,11 @@ export async function fetchPromptsFromUpstream(
     return raw.slice(0, MAX_PROMPTS_PER_SERVER).map((p) => ({
       name: p.name,
       namespacedName: `${namespace}_${p.name}`,
+      // Same MCP 2025-06-18 passthrough as the resources fetcher above.
+      title: p.title,
       description: p.description,
       arguments: p.arguments as UpstreamPromptDef["arguments"],
+      _meta: p._meta as Record<string, unknown> | undefined,
     }));
   } catch (err) {
     // Server may not support prompts — that's fine at connect time.

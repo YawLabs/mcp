@@ -326,4 +326,49 @@ describe("PackDetector", () => {
     const sets = chains.map((c) => [...c.namespaces].sort().join("|"));
     expect(sets).toContain("gh|linear|slack");
   });
+
+  it("an out-of-order snapshot is sorted on load instead of welding into one burst", () => {
+    // segmentBursts' boundaries are one-sided comparisons, so a snapshot whose
+    // entries arrive newest-first has every backwards step read as "no gap":
+    // two separate {gh, linear} bursts collapsed into ONE, the set occurred
+    // once, and MIN_RECURRENCES dropped a pack the user really ran.
+    const t0 = 1_000_000;
+    const t1 = t0 + 5 * 60_000; // beyond the 120s idle gap -- a second burst
+    const ordered: PackCall[] = [
+      { namespace: "gh", toolName: "create_issue", at: t0 },
+      { namespace: "linear", toolName: "create_task", at: t0 + 5_000 },
+      { namespace: "gh", toolName: "list_prs", at: t1 },
+      { namespace: "linear", toolName: "list_tasks", at: t1 + 10_000 },
+    ];
+
+    const d = new PackDetector();
+    d.loadSnapshot([...ordered].reverse());
+
+    // History is restored in time order, not the order it was handed to us.
+    expect(d.getHistory().map((c) => c.at)).toEqual(ordered.map((c) => c.at));
+    const chains = d.detectChains();
+    expect(chains).toHaveLength(1);
+    expect(chains[0].frequency).toBe(2);
+    expect(new Set(chains[0].namespaces)).toEqual(new Set(["gh", "linear"]));
+  });
+
+  it("a backwards timestamp starts a new burst instead of welding the rest of the session", () => {
+    // Same hazard on the LIVE path, where loadSnapshot's sort never runs: a
+    // wall-clock step backwards mid-session made both gap and span comparisons
+    // false, so every later call joined the pre-jump burst and the recurrence
+    // was never countable.
+    const d = new PackDetector();
+    const t0 = 1_000_000;
+    d.recordCall("gh", "a", t0);
+    d.recordCall("linear", "b", t0 + 5_000);
+    // Clock steps 10 minutes backwards; the same pair runs again.
+    const back = t0 - 10 * 60_000;
+    d.recordCall("gh", "c", back);
+    d.recordCall("linear", "d", back + 5_000);
+
+    const chains = d.detectChains();
+    expect(chains).toHaveLength(1);
+    expect(chains[0].frequency).toBe(2);
+    expect(new Set(chains[0].namespaces)).toEqual(new Set(["gh", "linear"]));
+  });
 });

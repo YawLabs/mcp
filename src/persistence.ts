@@ -148,18 +148,46 @@ export function emptyState(): PersistedState {
   return { version: STATE_SCHEMA_VERSION, savedAt: 0, learning: {}, packHistory: [], toolCache: {} };
 }
 
+/** loadState's result plus how the file was classified on the way in. */
+export interface ClassifiedState {
+  state: PersistedState;
+  /**
+   * True when the returned state reflects what was actually ON DISK: the file
+   * parsed as an object at a readable version, or there was no file at all
+   * (nothing to misreport). False when the returned state is the empty
+   * fallback standing in for real content we could not use -- an unreadable
+   * file, invalid JSON, a non-object root, or an unreadable schema version.
+   *
+   * Exists so a caller that REPORTS on the file (reset-learning) can tell
+   * "0 entries" from "we could not read it" without a second read+parse of
+   * the same bytes -- the shape that let the peek's parser drift from this
+   * one (a BOM was accepted here and rejected there, so a perfectly good
+   * state file was reported as unreadable).
+   */
+  parsedCleanly: boolean;
+}
+
 // Load persisted state from disk. Always returns a PersistedState
 // object — on any failure (missing file, bad JSON, version mismatch,
 // sanitization drops everything) we silently fall through to empty.
 export async function loadState(filePath: string = statePath()): Promise<PersistedState> {
+  return (await loadStateClassified(filePath)).state;
+}
+
+// loadState plus the parsedCleanly classification. THE single read+parse of
+// the state file: loadState is a thin wrapper over this, so a caller that
+// needs both cannot end up with two parsers that disagree.
+export async function loadStateClassified(filePath: string = statePath()): Promise<ClassifiedState> {
   let raw: string;
   try {
     raw = await readFile(filePath, "utf8");
   } catch (err) {
     // ENOENT: no file. ENOTDIR: a path component is a regular file, so the
     // state file CANNOT exist either -- both mean "nothing to protect",
-    // start empty. Same split as grades-cache/config-loader.
-    if (isFileNotFound(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR") return emptyState();
+    // start empty. Same split as grades-cache/config-loader. Clean, not
+    // failed: with no file on disk the empty state IS what is there.
+    if (isFileNotFound(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR")
+      return { state: emptyState(), parsedCleanly: true };
     // The file EXISTS but we could not read it -- a transient handle error
     // (win32 AV/indexer EBUSY, EACCES) on a presumed-HEALTHY file. Flag it
     // so the caller does not overwrite real learning/packHistory/toolCache
@@ -172,7 +200,7 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
         error: errorMessage(err),
       },
     );
-    return { ...emptyState(), loadFailed: true };
+    return { state: { ...emptyState(), loadFailed: true }, parsedCleanly: false };
   }
   try {
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing -- same strip
@@ -182,24 +210,32 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
     // sanitizeLearning); without the strip, one Notepad save would drop ALL
     // learning, pack history, and tool cache via the empty-state fallback.
     const parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-    if (!parsed || typeof parsed !== "object") return emptyState();
-    if (!isReadableStateVersion((parsed as { version?: unknown }).version)) return emptyState();
+    if (!parsed || typeof parsed !== "object") return { state: emptyState(), parsedCleanly: false };
+    // Any version loadState can READ counts as clean, not just the current
+    // one: v1 MIGRATES (see READABLE_STATE_VERSIONS), so treating it as
+    // unreadable would discard real counts for the one session before the
+    // first save rewrites the file.
+    if (!isReadableStateVersion((parsed as { version?: unknown }).version))
+      return { state: emptyState(), parsedCleanly: false };
     const p = parsed as Record<string, unknown>;
     return {
-      version: STATE_SCHEMA_VERSION,
-      savedAt: typeof p.savedAt === "number" ? p.savedAt : 0,
-      learning: sanitizeLearning(p.learning),
-      packHistory: sanitizePackHistory(p.packHistory),
-      // Absent on a v1 file -> sanitizeToolCache(undefined) -> {}. That IS
-      // the v1 -> v2 migration; no other field changed shape.
-      toolCache: sanitizeToolCache(p.toolCache),
+      state: {
+        version: STATE_SCHEMA_VERSION,
+        savedAt: typeof p.savedAt === "number" ? p.savedAt : 0,
+        learning: sanitizeLearning(p.learning),
+        packHistory: sanitizePackHistory(p.packHistory),
+        // Absent on a v1 file -> sanitizeToolCache(undefined) -> {}. That IS
+        // the v1 -> v2 migration; no other field changed shape.
+        toolCache: sanitizeToolCache(p.toolCache),
+      },
+      parsedCleanly: true,
     };
   } catch (err) {
     // Reached only for a parse failure -- read errors are handled above.
     // The file is genuinely unusable, so starting fresh (and letting the
     // next save replace it) is the intended behavior; no loadFailed flag.
     log("warn", "Failed to load yaw-mcp state, starting fresh", { error: errorMessage(err) });
-    return emptyState();
+    return { state: emptyState(), parsedCleanly: false };
   }
 }
 
@@ -288,11 +324,13 @@ function sanitizePackHistory(input: unknown): PersistedPackCall[] {
  *
  * Drops, in order: non-object input, entries with a blank namespace, a
  * non-object body, or a non-finite/negative `learnedAt`; entries older than
- * TOOLCACHE_TTL_MS; tools without a usable name; entries left with zero
- * tools (an empty cache is indistinguishable from no cache downstream, and
- * persisting one would make pre-warm skip a server forever without ever
- * surfacing its tools). Survivors are then trimmed to the most recently
- * learned TOOLCACHE_MAX_NAMESPACES.
+ * TOOLCACHE_TTL_MS; tools without a usable name; and entries whose tools ALL
+ * failed that name check -- a raw list that collapsed to empty is corruption,
+ * not an observation. A GENUINELY empty `tools: []` is KEPT: a
+ * resources/prompts-only upstream really does expose zero tools, and dropping
+ * that answer is what made pre-warm re-spawn such a server every session (see
+ * the inline note at the length check below). Survivors are then trimmed to
+ * the most recently learned TOOLCACHE_MAX_NAMESPACES.
  *
  * `now` is injectable so tests can pin TTL behavior without faking timers.
  */
@@ -320,7 +358,16 @@ function sanitizeToolCache(input: unknown, now: number = Date.now()): Record<str
         typeof t.description === "string" ? t.description.slice(0, TOOLCACHE_MAX_DESCRIPTION_CHARS) : undefined;
       tools.push(description === undefined ? { name: t.name } : { name: t.name, description });
     }
-    if (tools.length === 0) continue;
+    // A GENUINELY empty list is a known state, not a missing one: an upstream
+    // that exposes only resources/prompts really does have zero tools, and
+    // dropping the entry here (on both the save and the load path) is what
+    // made pre-warm re-spawn such a server on every single session start --
+    // it could never record the answer it had already paid for.
+    //
+    // An entry whose tools were ALL rejected above is a different thing:
+    // that is a corrupt or hand-edited file, not a zero-tool server, so it
+    // is still dropped and re-learned. The raw length is what separates them.
+    if (tools.length === 0 && Array.isArray(entry.tools) && entry.tools.length > 0) continue;
     kept.push([namespace, { tools, learnedAt }]);
   }
 

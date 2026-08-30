@@ -167,7 +167,16 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: [["<namespace>"]],
     flags: ["--json", "--help"],
   },
-  { name: "compliance", description: "Run the compliance suite against a server", flags: ["--help"] },
+  // --strict / --min-grade are forwarded verbatim to the mcp-compliance child
+  // (see npxArgs in compliance-cmd.ts) and are what turn a failing grade into a
+  // non-zero exit, so they are the flags a CI gate is written around -- they
+  // belong in completion even though this command's own parser only inspects
+  // --help/--publish.
+  {
+    name: "compliance",
+    description: "Run the compliance suite against a server",
+    flags: ["--strict", "--min-grade", "--help"],
+  },
   {
     name: "foundry",
     description: "Export the opt-in dispatch-trace corpus",
@@ -209,10 +218,6 @@ export async function runCompletion(opts: CompletionCommandOptions = {}): Promis
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
   const lines: string[] = [];
-  const print = (s: string): void => {
-    lines.push(s);
-    write(`${s}\n`);
-  };
 
   if (!opts.shell) {
     writeErr(`yaw-mcp completion: missing shell argument\n${COMPLETION_USAGE}\n`);
@@ -220,7 +225,15 @@ export async function runCompletion(opts: CompletionCommandOptions = {}): Promis
   }
 
   const script = renderScript(opts.shell);
-  print(script);
+  // Write the script WITHOUT print's trailing newline: every renderScript
+  // branch already ends its last line with "\n", so routing it through print
+  // appended a second one and every generated script ended with a blank line.
+  // Harmless when the script is eval'd, but `completion bash >> ~/.bashrc`
+  // accumulates a blank line per regeneration, and a byte-comparison against a
+  // checked-in copy never matches. `lines` keeps the un-suffixed script so the
+  // transcript callers assert on is unchanged.
+  lines.push(script);
+  write(script);
   return { exitCode: 0, lines };
 }
 

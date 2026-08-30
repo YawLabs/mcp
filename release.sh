@@ -259,8 +259,14 @@ REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
 if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
   if [ "$RESUMING" = true ]; then
     info "Local HEAD differs from origin/main (resuming after a prior push) -- proceeding"
+  elif git merge-base --is-ancestor "$REMOTE_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
+    # Strictly AHEAD: origin/main is an ancestor of HEAD, so there is nothing
+    # to pull. Telling the operator to `git pull --ff-only` here is the wrong
+    # instruction (it is a no-op) and hides the real state -- unpushed commits
+    # that steps 3-5 would publish from a tree the remote has never seen.
+    fail "Local main is AHEAD of origin/main (unpushed commits). Push them first: git push origin main"
   else
-    fail "Local main is not at origin/main. Pull first: git pull --ff-only origin main"
+    fail "Local main is not at origin/main (behind or diverged). Pull first: git pull --ff-only origin main"
   fi
 fi
 
@@ -317,7 +323,31 @@ npm test || fail "Tests failed"
 info "Lint + typecheck + tests passed"
 
 step 2 "Build"
-npm run build || fail "Build failed"
+# This build is deliberately belt-and-braces: package.json's `prepublishOnly`
+# rebuilds again inside step 4's `npm publish`. Keeping it here fails a broken
+# build BEFORE the irreversible commit+tag+push of step 3, which is worth one
+# extra tsup run (a couple of seconds).
+#
+# Same ARM64 tolerance as run_npm_check, applied to the ARTIFACT rather than to
+# a log marker: MINGW64 on Windows ARM64 can segfault (139/134) in npm's exit
+# cleanup AFTER tsup has already written dist/index.js. tsup prints no stable
+# completion marker, so the freshly-rewritten artifact is the evidence -- if
+# dist/index.js is not newer than the moment this step started, the build
+# really did fail.
+BUILD_STARTED_AT=$(date +%s)
+BUILD_RC=0
+npm run build || BUILD_RC=$?
+if [ "$BUILD_RC" -ne 0 ]; then
+  BUILD_TOLERATED=false
+  if [ "$IS_MINGW_ARM64" = true ] && { [ "$BUILD_RC" -eq 139 ] || [ "$BUILD_RC" -eq 134 ]; }; then
+    DIST_MTIME=$(node -e 'try { process.stdout.write(String(Math.floor(require("fs").statSync("dist/index.js").mtimeMs / 1000))); } catch { process.stdout.write("0"); }')
+    if [ "$DIST_MTIME" -ge "$BUILD_STARTED_AT" ]; then
+      warn "Build: npm exited $BUILD_RC (ARM64 npm-run cleanup segfault) but dist/index.js was rewritten during this step -- tolerating"
+      BUILD_TOLERATED=true
+    fi
+  fi
+  [ "$BUILD_TOLERATED" = true ] || fail "Build failed (exit $BUILD_RC)"
+fi
 info "Build complete"
 
 step 3 "Bump version to $VERSION, commit, tag, and push"
@@ -430,127 +460,152 @@ else
 fi
 
 step 5 "Publish server.json to MCP registry"
-# Check the published-npm first; mcp-publisher's `publish` validates that the
-# referenced npm package exists, and the registry mirror can lag the write
-# path by seconds.
-NPM_NOW=""
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  NPM_NOW=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
-  [ "$NPM_NOW" = "$VERSION" ] && break
-  sleep 6
-done
-if [ "$NPM_NOW" != "$VERSION" ]; then
-  fail "npm does not show @yawlabs/mcp@${VERSION} after 60s -- refusing to publish to MCP registry (it would 400)"
+# Idempotence, per the header claim that every step is re-runnable: the
+# registry rejects a duplicate (name, version), so a re-run after a COMPLETED
+# step 5 died here. Ask the registry whether this exact version is already
+# listed and skip the whole step (download, auth, publish) when it is.
+# Probe-only by design: any failure -- offline, API change, unparseable body
+# -- leaves REGISTRY_HAS_VERSION false and falls through to the publish path,
+# which is exactly the pre-probe behavior.
+REGISTRY_JSON=$(curl -fsSL --max-time 20 "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YawLabs/mcp&version=${VERSION}" 2>/dev/null || echo "")
+REGISTRY_HAS_VERSION=false
+if [ -n "$REGISTRY_JSON" ] && printf %s "$REGISTRY_JSON" | node -e '
+  let s = "";
+  process.stdin.on("data", (d) => { s += d; });
+  process.stdin.on("end", () => {
+    try {
+      const j = JSON.parse(s);
+      const hit = (j.servers || []).some((e) => e && e.server && e.server.version === process.argv[1]);
+      process.exit(hit ? 0 : 1);
+    } catch { process.exit(1); }
+  });
+' "$VERSION"; then
+  REGISTRY_HAS_VERSION=true
 fi
 
-# Download + sha256-verify mcp-publisher to a temp dir. Pinned + digest-verified
-# the same way the old CI workflow did.
-WORKDIR=$(mktemp -d)
-# mcp-publisher ships a tarball per (platform, arch). Map the current host to
-# the matching tarball name so this works on a Linux, macOS, or Windows
-# release-driver machine.
-#
-# We use node (already a hard dep) rather than `uname` because MINGW64 on
-# Windows ARM64 reports x86_64 via `uname -m` even when the kernel is arm64,
-# which would pick the wrong Windows binary.
-HOST_INFO=$(node -e 'process.stdout.write(process.platform + " " + process.arch)')
-case "$HOST_INFO" in
-  "linux x64")    GOOS=linux;   GOARCH=amd64 ;;
-  "linux arm64")  GOOS=linux;   GOARCH=arm64 ;;
-  "darwin x64")   GOOS=darwin;  GOARCH=amd64 ;;
-  "darwin arm64") GOOS=darwin;  GOARCH=arm64 ;;
-  "win32 x64")    GOOS=windows; GOARCH=amd64 ;;
-  "win32 arm64")  GOOS=windows; GOARCH=arm64 ;;
-  *) fail "Unsupported host for mcp-publisher: $HOST_INFO" ;;
-esac
-TARBALL="mcp-publisher_${GOOS}_${GOARCH}.tar.gz"
-info "Downloading mcp-publisher ${MCP_PUBLISHER_VERSION} (${GOOS}/${GOARCH})"
-curl -fsSL -o "${WORKDIR}/${TARBALL}" \
-  "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${TARBALL}"
-
-# Verify against the registry's per-release checksums file. This is the
-# source of truth (signed via the release's attestation) and is the only
-# correct sha256 to check against for the per-platform tarball we picked.
-info "Verifying ${TARBALL} against the release's checksums.txt"
-curl -fsSL -o "${WORKDIR}/checksums.txt" \
-  "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
-# sha256sum on Linux/Git-Bash; shasum -a 256 is the macOS stock spelling.
-if command -v sha256sum >/dev/null; then
-  (cd "$WORKDIR" && sha256sum -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+if [ "$REGISTRY_HAS_VERSION" = true ]; then
+  info "io.github.YawLabs/mcp@${VERSION} already on the MCP registry -- skipping publish"
 else
-  (cd "$WORKDIR" && shasum -a 256 -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
-fi
+  # Check the published-npm first; mcp-publisher's `publish` validates that the
+  # referenced npm package exists, and the registry mirror can lag the write
+  # path by seconds.
+  NPM_NOW=""
+  for POLL_TRY in 1 2 3 4 5 6 7 8 9 10; do
+    NPM_NOW=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+    [ "$NPM_NOW" = "$VERSION" ] && break
+    sleep 6
+  done
+  if [ "$NPM_NOW" != "$VERSION" ]; then
+    fail "npm does not show @yawlabs/mcp@${VERSION} after 60s -- refusing to publish to MCP registry (it would 400)"
+  fi
 
-# Windows tarballs extract to mcp-publisher.exe, POSIX ones to mcp-publisher.
-BIN_NAME="mcp-publisher"
-if [ "$GOOS" = "windows" ]; then BIN_NAME="mcp-publisher.exe"; fi
-tar -xzf "${WORKDIR}/${TARBALL}" -C "$WORKDIR" "$BIN_NAME"
-chmod +x "${WORKDIR}/${BIN_NAME}"
-"${WORKDIR}/${BIN_NAME}" --help >/dev/null
-info "mcp-publisher ${MCP_PUBLISHER_VERSION} ready (sha256 verified)"
+  # Download + sha256-verify mcp-publisher to a temp dir. Pinned + digest-verified
+  # the same way the old CI workflow did.
+  WORKDIR=$(mktemp -d)
+  # mcp-publisher ships a tarball per (platform, arch). Map the current host to
+  # the matching tarball name so this works on a Linux, macOS, or Windows
+  # release-driver machine.
+  #
+  # We use node (already a hard dep) rather than `uname` because MINGW64 on
+  # Windows ARM64 reports x86_64 via `uname -m` even when the kernel is arm64,
+  # which would pick the wrong Windows binary.
+  HOST_INFO=$(node -e 'process.stdout.write(process.platform + " " + process.arch)')
+  case "$HOST_INFO" in
+    "linux x64")    GOOS=linux;   GOARCH=amd64 ;;
+    "linux arm64")  GOOS=linux;   GOARCH=arm64 ;;
+    "darwin x64")   GOOS=darwin;  GOARCH=amd64 ;;
+    "darwin arm64") GOOS=darwin;  GOARCH=arm64 ;;
+    "win32 x64")    GOOS=windows; GOARCH=amd64 ;;
+    "win32 arm64")  GOOS=windows; GOARCH=arm64 ;;
+    *) fail "Unsupported host for mcp-publisher: $HOST_INFO" ;;
+  esac
+  TARBALL="mcp-publisher_${GOOS}_${GOARCH}.tar.gz"
+  info "Downloading mcp-publisher ${MCP_PUBLISHER_VERSION} (${GOOS}/${GOARCH})"
+  curl -fsSL -o "${WORKDIR}/${TARBALL}" \
+    "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${TARBALL}"
 
-# Auth: the registry's `login github` accepts a pre-set GitHub token via
-# `MCP_GITHUB_TOKEN` (or `--token`) and skips the OAuth device flow -- it
-# exchanges the GitHub token for a fresh Registry JWT and writes it to
-# ~/.config/mcp-publisher/token.json.
-TOKEN_FILE="${HOME}/.config/mcp-publisher/token.json"
-TOKEN_REFRESHED=false
-# Return 0 (true in shell `if`) iff the persisted token is missing, unparseable,
-# or expired. Reads the JWT's `exp` claim via node so we don't reinvent the
-# JWT parser in bash.
-TOKEN_STATUS=$(mktemp)
-node -e '
-  const fs = require("fs");
-  const path = process.argv[1];
-  if (!fs.existsSync(path)) { process.stdout.write("missing"); process.exit(0); }
-  let t;
-  try { t = JSON.parse(fs.readFileSync(path, "utf-8")); } catch { process.stdout.write("unparseable"); process.exit(0); }
-  const p = (t.token || "").split(".")[1];
-  if (!p) { process.stdout.write("unparseable"); process.exit(0); }
-  let claims;
-  try { claims = JSON.parse(Buffer.from(p, "base64url").toString()); } catch { process.stdout.write("unparseable"); process.exit(0); }
-  if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now()) {
-    process.stdout.write("valid");
-  } else {
-    process.stdout.write("expired");
-  }
-' "$TOKEN_FILE" > "$TOKEN_STATUS" 2>/dev/null || echo "unparseable" > "$TOKEN_STATUS"
-TOKEN_STATE=$(cat "$TOKEN_STATUS")
-rm -f "$TOKEN_STATUS"
-if [ "$TOKEN_STATE" != "valid" ]; then
-  # Token refresh needs a GitHub token with publish rights on
-  # `io.github.YawLabs/*` (per the prior release memory for the parallel
-  # ssh-mcp repo, the MCP Registry `mcp-publisher` auth needs `read:org`).
-  # Resolution order:
-  #   1. $GITHUB_TOKEN (explicit env, takes priority -- the operator's
-  #      workstation with a fine-grained PAT)
-  #   2. $MCP_REGISTRY_TOKEN (an explicit override name some setups use)
-  #   3. `gh auth token` (works on any host that has the `gh` CLI
-  #      authenticated -- the established fallback for the parallel
-  #      ssh-mcp / npmjs-mcp release scripts per their memory)
-  # The mcp-publisher binary only needs a GitHub token at login time; it
-  # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
-  # GitHub token does NOT need to be in env for subsequent releases.
-  REGISTRY_GH_TOKEN="${GITHUB_TOKEN:-${MCP_REGISTRY_TOKEN:-}}"
-  if [ -z "$REGISTRY_GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
-    if REGISTRY_GH_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$REGISTRY_GH_TOKEN" ]; then
-      info "MCP-registry auth: using \`gh auth token\` (fallback)"
-    else
-      REGISTRY_GH_TOKEN=""
+  # Verify against the registry's per-release checksums file. This is the
+  # source of truth (signed via the release's attestation) and is the only
+  # correct sha256 to check against for the per-platform tarball we picked.
+  info "Verifying ${TARBALL} against the release's checksums.txt"
+  curl -fsSL -o "${WORKDIR}/checksums.txt" \
+    "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
+  # sha256sum on Linux/Git-Bash; shasum -a 256 is the macOS stock spelling.
+  if command -v sha256sum >/dev/null; then
+    (cd "$WORKDIR" && sha256sum -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+  else
+    (cd "$WORKDIR" && shasum -a 256 -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+  fi
+
+  # Windows tarballs extract to mcp-publisher.exe, POSIX ones to mcp-publisher.
+  BIN_NAME="mcp-publisher"
+  if [ "$GOOS" = "windows" ]; then BIN_NAME="mcp-publisher.exe"; fi
+  tar -xzf "${WORKDIR}/${TARBALL}" -C "$WORKDIR" "$BIN_NAME"
+  chmod +x "${WORKDIR}/${BIN_NAME}"
+  "${WORKDIR}/${BIN_NAME}" --help >/dev/null
+  info "mcp-publisher ${MCP_PUBLISHER_VERSION} ready (sha256 verified)"
+
+  # Auth: the registry's `login github` accepts a pre-set GitHub token via
+  # `MCP_GITHUB_TOKEN` (or `--token`) and skips the OAuth device flow -- it
+  # exchanges the GitHub token for a fresh Registry JWT and writes it to
+  # ~/.config/mcp-publisher/token.json.
+  TOKEN_FILE="${HOME}/.config/mcp-publisher/token.json"
+  # Return 0 (true in shell `if`) iff the persisted token is missing, unparseable,
+  # or expired. Reads the JWT's `exp` claim via node so we don't reinvent the
+  # JWT parser in bash.
+  TOKEN_STATUS=$(mktemp)
+  node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    if (!fs.existsSync(path)) { process.stdout.write("missing"); process.exit(0); }
+    let t;
+    try { t = JSON.parse(fs.readFileSync(path, "utf-8")); } catch { process.stdout.write("unparseable"); process.exit(0); }
+    const p = (t.token || "").split(".")[1];
+    if (!p) { process.stdout.write("unparseable"); process.exit(0); }
+    let claims;
+    try { claims = JSON.parse(Buffer.from(p, "base64url").toString()); } catch { process.stdout.write("unparseable"); process.exit(0); }
+    if (typeof claims.exp === "number" && claims.exp * 1000 > Date.now()) {
+      process.stdout.write("valid");
+    } else {
+      process.stdout.write("expired");
+    }
+  ' "$TOKEN_FILE" > "$TOKEN_STATUS" 2>/dev/null || echo "unparseable" > "$TOKEN_STATUS"
+  TOKEN_STATE=$(cat "$TOKEN_STATUS")
+  rm -f "$TOKEN_STATUS"
+  if [ "$TOKEN_STATE" != "valid" ]; then
+    # Token refresh needs a GitHub token with publish rights on
+    # `io.github.YawLabs/*` (per the prior release memory for the parallel
+    # ssh-mcp repo, the MCP Registry `mcp-publisher` auth needs `read:org`).
+    # Resolution order:
+    #   1. $GITHUB_TOKEN (explicit env, takes priority -- the operator's
+    #      workstation with a fine-grained PAT)
+    #   2. $MCP_REGISTRY_TOKEN (an explicit override name some setups use)
+    #   3. `gh auth token` (works on any host that has the `gh` CLI
+    #      authenticated -- the established fallback for the parallel
+    #      ssh-mcp / npmjs-mcp release scripts per their memory)
+    # The mcp-publisher binary only needs a GitHub token at login time; it
+    # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
+    # GitHub token does NOT need to be in env for subsequent releases.
+    REGISTRY_GH_TOKEN="${GITHUB_TOKEN:-${MCP_REGISTRY_TOKEN:-}}"
+    if [ -z "$REGISTRY_GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
+      if REGISTRY_GH_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$REGISTRY_GH_TOKEN" ]; then
+        info "MCP-registry auth: using \`gh auth token\` (fallback)"
+      else
+        REGISTRY_GH_TOKEN=""
+      fi
     fi
+    if [ -z "$REGISTRY_GH_TOKEN" ]; then
+      fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
+    fi
+    info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\`"
+    MCP_GITHUB_TOKEN="$REGISTRY_GH_TOKEN" "${WORKDIR}/${BIN_NAME}" login github
+  else
+    info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
   fi
-  if [ -z "$REGISTRY_GH_TOKEN" ]; then
-    fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
-  fi
-  info "MCP-registry token ${TOKEN_STATE} -- refreshing via \`mcp-publisher login github\`"
-  MCP_GITHUB_TOKEN="$REGISTRY_GH_TOKEN" "${WORKDIR}/${BIN_NAME}" login github
-  TOKEN_REFRESHED=true
-else
-  info "Reusing persisted mcp-publisher token at ${TOKEN_FILE}"
-fi
 
-"${WORKDIR}/${BIN_NAME}" publish
-info "Published server.json to MCP registry"
+  "${WORKDIR}/${BIN_NAME}" publish
+  info "Published server.json to MCP registry"
+fi
 
 # Final verification across the channels this script owns: npm, the
 # MCP registry, and the local git tag.

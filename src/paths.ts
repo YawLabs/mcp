@@ -135,6 +135,19 @@ export function isUnderHome(dir: string, homeResolved: string): boolean {
 // (e.g. for a trusted checkout on `D:\`).
 export const ALLOW_UNOWNED_ENV = "YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS";
 
+// Candidate dirs we have already warned about in THIS process. The walk runs
+// once per config load and there are three independent callers (config-loader,
+// guide.ts, local-bundles), so an untrusted `.yaw-mcp/` on the walk-up path --
+// the normal shape for any win32 checkout on a second drive without the env
+// opt-in -- otherwise emits the same warn on every doctor / list / profile
+// refresh. The warning is advice about a static condition, so the first
+// occurrence carries all of its information; the rest are noise that buries
+// real diagnostics. Keyed on the candidate path, so a DIFFERENT untrusted dir
+// still warns. Unbounded by design: the set can only grow with the number of
+// distinct directories walked in one process, which is bounded by the depth of
+// the trees the session actually visits.
+const warnedUntrustedDirs = new Set<string>();
+
 async function ownedByCurrentUser(candidate: string): Promise<boolean> {
   const geteuid = (process as { geteuid?: () => number }).geteuid;
   if (typeof geteuid !== "function") return process.env[ALLOW_UNOWNED_ENV] === "1";
@@ -197,11 +210,16 @@ export async function findProjectConfigDir(start: string, home: string = homedir
       } else {
         // Found but not trusted: skip it and keep walking, mirroring the
         // unreadable-dir trade-off below -- a planted dir shouldn't be able
-        // to mask a legitimate config further up either.
-        log("warn", "Skipping an untrusted .yaw-mcp/ dir outside $HOME", {
-          candidate,
-          hint: `owned by another user, or ownership is unverifiable on this platform (set ${ALLOW_UNOWNED_ENV}=1 to trust it)`,
-        });
+        // to mask a legitimate config further up either. Warn ONCE per
+        // candidate per process (see warnedUntrustedDirs): the skip itself
+        // still happens on every walk, only the log line is deduplicated.
+        if (!warnedUntrustedDirs.has(candidate)) {
+          warnedUntrustedDirs.add(candidate);
+          log("warn", "Skipping an untrusted .yaw-mcp/ dir outside $HOME", {
+            candidate,
+            hint: `owned by another user, or ownership is unverifiable on this platform (set ${ALLOW_UNOWNED_ENV}=1 to trust it)`,
+          });
+        }
       }
     } catch {
       // Accepted trade-off: we treat ALL errors (ENOENT, EPERM, EACCES,

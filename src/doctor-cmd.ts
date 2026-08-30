@@ -9,8 +9,10 @@
 // Side effects: doctor is NOT purely read-only. It runs the expired-trial
 // GC pass (gcExpiredTrials, both the text and --json paths), which is a
 // read-modify-write + unlink on client config files: it peels expired
-// `yaw-mcp-try-*` entries out of each client config, deletes the trial
-// marker, and fires a fire-and-forget expiry-gc telemetry event. There is
+// `yaw-mcp-try-*` entries out of each client config and deletes the trial
+// marker. Nothing is reported anywhere -- the expiry-gc telemetry event this
+// used to fire went with the rest of the postEvent seam (see try-cmd.ts's
+// header). There is
 // no lock around that write, so it carries the same TOCTOU class as any
 // other config mutation. The sweep is best-effort: any failure is swallowed
 // and never aborts the diagnostic.
@@ -30,7 +32,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -92,14 +94,7 @@ import {
   sidecarsRoot,
 } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
-import {
-  formatTtl,
-  gcExpiredTrials,
-  scanTrials,
-  type TrialGcFailure,
-  type TryEventBody,
-  trialGcFailureWarning,
-} from "./try-cmd.js";
+import { formatTtl, gcExpiredTrials, scanTrials, type TrialGcFailure, trialGcFailureWarning } from "./try-cmd.js";
 import {
   BINARY_RETIRED_HINT,
   buildUpgradePlan,
@@ -199,8 +194,6 @@ export interface DoctorOptions {
   sidecarRegistryFetch?: (pkg: string) => Promise<string | null>;
   /** Emit a single JSON blob instead of the human-readable text report. */
   json?: boolean;
-  /** Test hook: replace the fire-and-forget POST for expiry-gc events. */
-  postTryEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   /** Test hook: override Date.now() used by the trial GC pass. */
   now?: () => number;
   /** Test hook: override the current version used for the staleness comparison
@@ -421,6 +414,49 @@ const VERSION = typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev";
 // text and json paths -- go through it, so no section can read state.json while
 // another treats persistence as off.
 
+export const DOCTOR_USAGE = `Usage: yaw-mcp doctor [--json]
+
+  Print a diagnostic of your yaw-mcp setup.
+
+  --json  Emit machine-readable JSON instead of text.`;
+
+/** The subset of DoctorOptions that argv can set. Everything else on
+ *  DoctorOptions is a test seam the CLI never supplies. */
+export interface ParsedDoctorArgs {
+  json: boolean;
+}
+
+/** Parse `yaw-mcp doctor` argv into the same `{ok}` shape every sibling
+ *  subcommand parser returns, so index.ts routes doctor through the shared
+ *  parse-then-dispatch tail instead of open-coding the branch.
+ *
+ *  Doctor's parsing used to live inline in the dispatcher -- the ONE branch
+ *  the completion / help tests could not import, because importing index.ts
+ *  runs the dispatcher's top-level side effects. Here it is testable.
+ *
+ *  Precedence, preserved from the inline version: an explicit --help wins,
+ *  but only when no unknown argument PRECEDES it, matching the parse-first
+ *  siblings (which reject unknown flags before honoring help). Every stray
+ *  arg is collected, not just the first, so `doctor --bad --worse` names
+ *  both in one run. */
+export function parseDoctorArgs(
+  argv: string[],
+): { ok: true; options: ParsedDoctorArgs } | { ok: false; error: string; help?: boolean } {
+  const isHelpArg = (a: string): boolean => a === "--help" || a === "-h";
+  const isUnknown = (a: string): boolean => a !== "--json" && !isHelpArg(a);
+  const firstHelpIdx = argv.findIndex(isHelpArg);
+  const firstUnknownIdx = argv.findIndex(isUnknown);
+  if (firstHelpIdx !== -1 && (firstUnknownIdx === -1 || firstHelpIdx < firstUnknownIdx)) {
+    return { ok: false, error: DOCTOR_USAGE, help: true };
+  }
+  const unknowns = argv.filter(isUnknown);
+  if (unknowns.length > 0) {
+    const quoted = unknowns.map((a) => `"${a}"`).join(", ");
+    return { ok: false, error: `yaw-mcp doctor: unknown argument${unknowns.length > 1 ? "s" : ""} ${quoted}` };
+  }
+  return { ok: true, options: { json: argv.includes("--json") } };
+}
+
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
   if (opts.json) return runDoctorJson(opts);
 
@@ -439,7 +475,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   const os = opts.os ?? CURRENT_OS;
   const env = opts.env ?? process.env;
 
-  print(`yaw-mcp doctor — ${new Date().toISOString()}`);
+  print(`yaw-mcp doctor -- ${new Date().toISOString()}`);
   print(`yaw-mcp version: ${VERSION}`);
   print(`platform: ${os}`);
   print("");
@@ -454,7 +490,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
 
   print("CONFIG FILES");
   if (config.loadedFiles.length === 0) {
-    print("  (none — using defaults + env)");
+    print("  (none -- using defaults + env)");
   } else {
     for (const f of config.loadedFiles) {
       print(`  ${f.scope.padEnd(7)} ${f.path}${schemaSuffix(f)}`);
@@ -529,7 +565,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // config.warnings, so the text path gates exit 2 exactly like --json does
   // for the same state (they used to diverge: text printed the line and
   // exited 0 "All good", json exited 2).
-  const trialWarnings = await renderTrialsSection({ home, env, print, postEvent: opts.postTryEvent, now: opts.now });
+  const trialWarnings = await renderTrialsSection({ home, print, now: opts.now });
   if (trialWarnings.length > 0) config.warnings = [...config.warnings, ...trialWarnings];
 
   // Probe every supported client/scope combo on the current OS. Honor
@@ -566,7 +602,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     print("  activate the server and prefer its tools over the CLI.");
     for (const hit of shadowHits) {
       const pluralHit = hit.count === 1 ? "time" : "times";
-      print(`  ${hit.cli.padEnd(12)} ${hit.count} ${pluralHit} → server(s): ${hit.namespaces.join(", ")}`);
+      print(`  ${hit.cli.padEnd(12)} ${hit.count} ${pluralHit} -> server(s): ${hit.namespaces.join(", ")}`);
     }
     print("");
   }
@@ -576,18 +612,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // stale-version warning that depends on an external service must not
   // block the diagnostic. Times out after DOCTOR_REGISTRY_TIMEOUT_MS to keep
   // doctor snappy -- see that constant for why doctor's budget is shorter than
-  // upgrade's.
-  // Auto-skipped under vitest (check process.env directly since tests
-  // pass a stripped `env: {}`).
-  // skipRegistryCheck=true or VITEST env both suppress the real registry
-  // fetch. But if a registryFetch hook is explicitly provided (test hook
-  // for the upgrade-hint branches), we honour it regardless of VITEST so
-  // the hint branches are actually reachable under vitest.
-  // NOTE: this is the ONE deliberate process.env read in doctor (the rest
-  // route through opts.env). Tests pass a stripped `env: {}`, so VITEST
-  // would never be visible via opts.env; reading process.env directly is
-  // what lets the auto-skip fire under vitest. Kept intentional.
-  const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
+  // upgrade's. The skip rule itself lives in registrySkipCheck (below).
+  const skipCheck = registrySkipCheck(opts, opts.registryFetch);
   const latest = skipCheck
     ? null
     : await fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch });
@@ -605,10 +631,10 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     print("UPGRADE AVAILABLE");
     if (method === "bundled-app") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This copy ships inside`);
-      print("  Yaw Terminal and updates with the app — update Yaw Terminal to get it.");
+      print("  Yaw Terminal and updates with the app -- update Yaw Terminal to get it.");
     } else if (method === "npx") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. npx fetches the latest`);
-      print("  on each spawn — restart your MCP client to pick it up.");
+      print("  on each spawn -- restart your MCP client to pick it up.");
     } else if (method === "binary") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This is a standalone`);
       print(`  binary; ${BINARY_RETIRED_HINT}`);
@@ -681,6 +707,30 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const trustWarning = projectTrustWarning(trustProbe);
   if (trustWarning) config.warnings = [...config.warnings, trustWarning];
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+
+  // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
+  // `doctor` and `doctor --json` have the SAME persistent side effects
+  // (peel expired entries out of client configs, delete markers). Previously
+  // the JSON path returned early and
+  // skipped GC entirely, leaving expired trials wired up. Best-effort:
+  // any sweep failure is swallowed, matching renderTrialsSection.
+  // Scan once, then hand the scan to the GC pass so the trials dir isn't
+  // read twice (GC only unlinks expired markers, so live/malformed in this
+  // pre-sweep scan match the post-sweep readout state).
+  //
+  // Runs BEFORE probeClients, matching the text path (renderTrialsSection GCs
+  // at its own section, then the CLIENTS section probes). gcExpiredTrials
+  // REWRITES client config files to peel expired `yaw-mcp-try-*` entries out,
+  // so probing first would snapshot pre-GC configs and report entries this
+  // same run just deleted -- the "Same data-collection sequence" claim in the
+  // header above is only true with the GC ahead of the probe.
+  const trialScan = await scanTrials({ home, now: opts.now });
+  const trialGc = await gcExpiredTrials({
+    home,
+    now: opts.now,
+    scan: trialScan,
+  }).catch(() => ({ cleared: 0, failed: 0, failures: [] }));
+
   const clients = probeClients({ home, os, cwd, claudeConfigDir, appData });
 
   // Same project-guide probe as the text path's PROJECT GUIDE section.
@@ -774,23 +824,6 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const shellShadows = scanShellHistoryForShadows({ home, env });
 
-  // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
-  // `doctor` and `doctor --json` have the SAME persistent side effects
-  // (peel expired entries out of client configs, delete markers, fire the
-  // expiry-gc telemetry). Previously the JSON path returned early and
-  // skipped GC entirely, leaving expired trials wired up. Best-effort:
-  // any sweep failure is swallowed, matching renderTrialsSection.
-  // Scan once, then hand the scan to the GC pass so the trials dir isn't
-  // read twice (GC only unlinks expired markers, so live/malformed in this
-  // pre-sweep scan match the post-sweep readout state).
-  const trialScan = await scanTrials({ home, now: opts.now });
-  const trialGc = await gcExpiredTrials({
-    home,
-    env,
-    postEvent: opts.postTryEvent,
-    now: opts.now,
-    scan: trialScan,
-  }).catch(() => ({ cleared: 0, failed: 0, failures: [] }));
   const trials: DoctorJsonSnapshot["trials"] = {
     cleared: trialGc.cleared,
     failed: trialGc.failed,
@@ -850,14 +883,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // deprecation window. See DoctorJsonSnapshot.backgroundPosters.
   const backgroundPosters: DoctorJsonSnapshot["backgroundPosters"] = { analytics: null, toolReport: null };
 
-  // Mirrors the text path's hook handling (see runDoctor): an explicit
-  // registryFetch bypasses the VITEST guard, and currentVersion overrides
-  // the build-time VERSION. opts.argvPath is intentionally unused here --
-  // the JSON snapshot's upgrade block carries no install method.
-  // The process.env.VITEST read here is the same deliberate exception
-  // documented on the text path's skipCheck above (opts.env is stripped
-  // to `{}` under vitest, so VITEST is only visible via process.env).
-  const skipCheck = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.registryFetch;
+  // Mirrors the text path's hook handling (see runDoctor and
+  // registrySkipCheck): an explicit registryFetch bypasses the VITEST guard,
+  // and currentVersion overrides the build-time VERSION. opts.argvPath is
+  // intentionally unused here -- the JSON snapshot's upgrade block carries no
+  // install method.
+  const skipCheck = registrySkipCheck(opts, opts.registryFetch);
   const latest = skipCheck
     ? null
     : await fetchLatestVersion({ timeoutMs: DOCTOR_REGISTRY_TIMEOUT_MS, override: opts.registryFetch });
@@ -917,9 +948,6 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
 }
 
-// Prints the STATE section. Broken out so the control flow in
-// runDoctor stays linear — this is already the third file-reading
-// section (config, client probes, history scan).
 // THE single list of behavior-modifier env vars yaw-mcp reads at runtime,
 // shared by the text ENVIRONMENT section and the --json `env` block so a
 // support ticket can paste doctor output and we can tell at a glance
@@ -956,7 +984,7 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
   print("ENVIRONMENT (behavior overrides)");
   for (const v of vars) {
     const raw = env[v.name];
-    const value = raw === undefined || raw === "" ? `(not set — ${v.defaultHint})` : raw;
+    const value = raw === undefined || raw === "" ? `(not set -- ${v.defaultHint})` : raw;
     print(`  ${v.name.padEnd(widest)}  ${value}`);
   }
   print("");
@@ -1019,14 +1047,30 @@ async function fetchSidecarLatest(pkg: string): Promise<string | null> {
   }
 }
 
+/** THE registry-probe gate, in one place. doctor makes three network probes
+ *  (the @yawlabs/mcp freshness check on the text path, the same check on the
+ *  --json path, and the per-sidecar check below) and all three must agree
+ *  about whether the check ran -- this expression used to be copy-pasted at
+ *  each one, so a fourth probe was a coin-flip on whether it inherited the
+ *  VITEST guard.
+ *
+ *  `skipRegistryCheck` or a VITEST env both suppress the real fetch. But an
+ *  explicitly-supplied `override` hook wins over both, so a test can reach
+ *  the stale-version branches that the auto-skip would otherwise hide.
+ *
+ *  NOTE: `process.env.VITEST` here is THE deliberate process.env read in
+ *  doctor (everything else routes through opts.env). Tests pass a stripped
+ *  `env: {}`, so VITEST is never visible via opts.env; reading process.env
+ *  directly is exactly what lets the auto-skip fire under vitest. Kept
+ *  intentional -- do not "fix" it to opts.env. */
+export function registrySkipCheck(opts: DoctorOptions, override: unknown): boolean {
+  return (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !override;
+}
+
 // The gate for the per-sidecar freshness probe, shared by the text and --json
-// paths so the two cannot disagree about whether the check ran. Same shape as
-// the @yawlabs/mcp skipCheck in runDoctor (and the same deliberate
-// process.env.VITEST read -- opts.env is stripped to `{}` under vitest, so
-// the auto-skip is only visible there): an explicit sidecarRegistryFetch hook
-// bypasses the skip so tests can reach the stale branches.
+// paths so the two cannot disagree about whether the check ran.
 function sidecarLatestFetcher(opts: DoctorOptions): ((pkg: string) => Promise<string | null>) | null {
-  const skip = (opts.skipRegistryCheck === true || Boolean(process.env.VITEST)) && !opts.sidecarRegistryFetch;
+  const skip = registrySkipCheck(opts, opts.sidecarRegistryFetch);
   return skip ? null : (opts.sidecarRegistryFetch ?? fetchSidecarLatest);
 }
 
@@ -1109,7 +1153,7 @@ function renderOamRuntimeSection(opts: {
   const { probe, dflt, servers } = status;
   print("OAM RUNTIME");
   if (probe.belowMin) {
-    print(`  binary:  installed (v${probe.version}) — below min ${MIN_OAM_VERSION}; IGNORED, servers run on node`);
+    print(`  binary:  installed (v${probe.version}) -- below min ${MIN_OAM_VERSION}; IGNORED, servers run on node`);
     // The floor tracks the latest oam release, so "below min" is always
     // "out of date" rather than "wrong build" -- and oam updates itself in
     // place. Naming the one command that fixes it beats re-running an
@@ -1124,7 +1168,7 @@ function renderOamRuntimeSection(opts: {
     if (probe.failureDetail !== null) print(`           detail: ${probe.failureDetail}`);
     print("           fix: run `oam --version` by hand; OAM_BIN overrides which binary is probed");
   } else if (probe.bin === null) {
-    print("  binary:  not installed — node/npx spawns are used directly");
+    print("  binary:  not installed -- node/npx spawns are used directly");
     // The one branch a reader can act on and the one that used to end without
     // saying how. Nothing is broken here -- node is a full fallback -- so this
     // is `install:`, not the `fix:` the below-min and unusable branches print.
@@ -1158,7 +1202,7 @@ function renderOamRuntimeSection(opts: {
   const dfltLabel =
     dflt.runtime !== null
       ? `${dflt.runtime} (${dflt.source === "env" ? "env YAW_MCP_DEFAULT_RUNTIME" : `bundles.json defaultRuntime @ ${dflt.path}`})`
-      : `(not set — oam when installed, currently ${probe.bin !== null ? "oam" : "node"})`;
+      : `(not set -- oam when installed, currently ${probe.bin !== null ? "oam" : "node"})`;
   print(`  default runtime: ${dfltLabel}`);
   if (servers.length > 0) {
     print("  servers (local bundles.json):");
@@ -1189,7 +1233,7 @@ function renderOamRuntimeSection(opts: {
   const { managed } = status;
   if (managed.packages.length > 0) {
     const anyInstalled = managed.packages.some((p) => p.version !== null);
-    print(`  managed install: ${anyInstalled ? managed.root : "none — run `yaw-mcp sidecars install`"}`);
+    print(`  managed install: ${anyInstalled ? managed.root : "none -- run `yaw-mcp sidecars install`"}`);
     if (anyInstalled) {
       const widest = managed.packages.reduce((m, p) => Math.max(m, p.pkg.length), 0);
       for (const p of managed.packages) {
@@ -1236,6 +1280,9 @@ function renderProjectGuideSection(opts: { guide: GuideFile | null; print: (s?: 
   opts.print("");
 }
 
+// Prints the STATE section. Broken out so the control flow in
+// runDoctor stays linear — this is already the third file-reading
+// section (config, client probes, history scan).
 function renderStateSection(opts: {
   filePath: string;
   disabled: boolean;
@@ -1274,7 +1321,7 @@ function renderStateSection(opts: {
   // persisted is non-null here: the caller only passes null when
   // persistence is disabled, which the `disabled` branch above handled.
   if (!persisted || persisted.savedAt === 0) {
-    print("  (no persisted state yet — will be created on the first tool call)");
+    print("  (no persisted state yet -- will be created on the first tool call)");
   } else {
     print(`  last saved:           ${formatRelativeAge(Date.now() - persisted.savedAt)} ago`);
     print(`  learning entries:     ${Object.keys(persisted.learning).length}`);
@@ -1356,29 +1403,27 @@ function renderReliabilitySection(opts: {
   for (const { namespace, usage } of flaky) {
     const rate = Math.round((usage.succeeded / usage.dispatched) * 100);
     const age = formatRelativeAge(now - usage.lastUsedAt);
-    print(`  ${namespace} — ${usage.dispatched} calls, ${rate}% success, last used ${age} ago`);
+    print(`  ${namespace} -- ${usage.dispatched} calls, ${rate}% success, last used ${age} ago`);
   }
   print("");
 }
 
 // Trials section — runs the expired-trial GC pass first (peels each
-// expired entry out of its client config + deletes the marker + fires
-// the expiry-gc telemetry event), then renders the still-live trials
+// expired entry out of its client config + deletes the marker), then
+// renders the still-live trials
 // with their countdown. Section is OMITTED when there are no trials
 // at all so healthy installs stay quiet. Mirrors the silence-on-empty
 // convention of the reliability and background-posters sections.
 async function renderTrialsSection(opts: {
   home: string;
-  env: NodeJS.ProcessEnv;
   print: (s?: string) => void;
-  postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   now?: () => number;
 }): Promise<string[]> {
-  const { home, env, print, postEvent, now } = opts;
+  const { home, print, now } = opts;
   // Scan once, then hand the scan to the GC pass (GC only unlinks expired
   // markers, so live/malformed here match the post-sweep readout state).
   const scan = await scanTrials({ home, now });
-  const gc = await gcExpiredTrials({ home, env, postEvent, now, scan }).catch(() => ({
+  const gc = await gcExpiredTrials({ home, now, scan }).catch(() => ({
     cleared: 0,
     failed: 0,
     failures: [],
@@ -1397,7 +1442,7 @@ async function renderTrialsSection(opts: {
   }
   for (const w of warnings) print(`  ! ${w}`);
   for (const { marker, msUntilExpiry } of scan.live) {
-    print(`  ${marker.slug} -> ${marker.clientName} (${marker.clientPath}) — expires in ${formatTtl(msUntilExpiry)}`);
+    print(`  ${marker.slug} -> ${marker.clientName} (${marker.clientPath}) -- expires in ${formatTtl(msUntilExpiry)}`);
   }
   for (const path of scan.malformed) {
     print(`  ! malformed marker at ${path} (delete by hand)`);
@@ -1433,7 +1478,7 @@ function schemaSuffix(f: LoadedConfigFile): string {
  *  doesn't carry a nested ternary tree as more states get added. */
 function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.unavailable) return "unavailable on this OS";
-  if (c.malformed) return "exists but JSON is malformed — fix or rerun `yaw-mcp install`";
+  if (c.malformed) return "exists but JSON is malformed -- fix or rerun `yaw-mcp install`";
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
   // and the combined branch used to swallow it -- a config carrying both a
@@ -1441,32 +1486,38 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // to remove the OTHER entry, leaving only the broken one. When both are true
   // the legacy trim hint is appended rather than dropped, so neither problem
   // goes unnamed.
+  //
+  // Hoisted above all THREE cannot-launch branches, not just the first: a
+  // bare `oam` command (or a rotted oam entry file) plus a legacy entry used
+  // to report only the launch problem, so fixing it took two doctor runs --
+  // the legacy hint only appeared once the first fault was gone. All three
+  // states mean "cannot start", so all three carry the same trim hint.
+  const legacy = c.hasLegacyEntry
+    ? `; legacy "${c.legacyEntryName}" entry also present -- remove it once the working entry is back`
+    : "";
   if (c.launchCommandMissing) {
-    const legacy = c.hasLegacyEntry
-      ? `; legacy "${c.legacyEntryName}" entry also present — remove it once the working entry is back`
-      : "";
-    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} — the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
   }
   // Both oam-specific states below are "the entry looks fine and will not
   // start", so they rank with launchCommandMissing rather than with the OK
   // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
   if (c.launchOamEntryMissing) {
-    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} — oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\``;
+    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}`;
   }
   if (c.launchOamNotAbsolute) {
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command — it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN`;
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}`;
   }
   if (c.hasMcpEntry && c.hasLegacyEntry) {
-    return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present — remove it to avoid running yaw-mcp twice`;
+    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice`;
   }
   if (c.hasMcpEntry) {
-    return `OK — has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
+    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
   }
   if (c.hasLegacyEntry) {
-    return `legacy "${c.legacyEntryName}" entry present — run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
+    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
   }
-  if (c.exists) return `present, no "${ENTRY_NAME}" entry — run \`${installCmd}\``;
-  return `not configured — run \`${installCmd}\``;
+  if (c.exists) return `present, no "${ENTRY_NAME}" entry -- run \`${installCmd}\``;
+  return `not configured -- run \`${installCmd}\``;
 }
 
 interface ProbeOptions {
@@ -1494,16 +1545,23 @@ interface ProbeSlot {
   read: { path: string; containerPath: string[] } | null;
 }
 
-const MALFORMED = {
+// The "nothing found" probe skeleton, in ONE place. classifyProbeContent
+// returns this shape from four separate exits (empty file, non-object JSON,
+// missing container, parse throw); spelled out at each one, a newly-added
+// ClientProbeResult field only had to be forgotten at a single site to read
+// as `undefined` there while every other exit reported it properly.
+const EMPTY_PROBE = {
   hasMcpEntry: false,
   hasLegacyEntry: false,
   legacyEntryName: null,
-  malformed: true,
+  malformed: false,
   launchCommandMissing: null,
   launchRuntime: null,
   launchOamNotAbsolute: null,
   launchOamEntryMissing: null,
 } as const;
+
+const MALFORMED = { ...EMPTY_PROBE, malformed: true } as const;
 
 /** Enumerate every (client, scope) combo for the current OS and resolve its
  *  config path. Shared by the sync and async probe variants so the client
@@ -1688,43 +1746,16 @@ function classifyProbeContent(
   launchOamEntryMissing: string | null;
 } {
   if (raw.trim().length === 0) {
-    return {
-      hasMcpEntry: false,
-      hasLegacyEntry: false,
-      legacyEntryName: null,
-      malformed: false,
-      launchCommandMissing: null,
-      launchRuntime: null,
-      launchOamNotAbsolute: null,
-      launchOamEntryMissing: null,
-    };
+    return { ...EMPTY_PROBE };
   }
   try {
     const parsed = parseJsonc(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return {
-        hasMcpEntry: false,
-        hasLegacyEntry: false,
-        legacyEntryName: null,
-        malformed: true,
-        launchCommandMissing: null,
-        launchRuntime: null,
-        launchOamNotAbsolute: null,
-        launchOamEntryMissing: null,
-      };
+      return { ...EMPTY_PROBE, malformed: true };
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
     if (!container) {
-      return {
-        hasMcpEntry: false,
-        hasLegacyEntry: false,
-        legacyEntryName: null,
-        malformed: false,
-        launchCommandMissing: null,
-        launchRuntime: null,
-        launchOamNotAbsolute: null,
-        launchOamEntryMissing: null,
-      };
+      return { ...EMPTY_PROBE };
     }
     const legacyEntryName = findLegacyEntry(container);
     const entry = container[ENTRY_NAME];
@@ -1775,16 +1806,7 @@ function classifyProbeContent(
       launchOamEntryMissing,
     };
   } catch {
-    return {
-      hasMcpEntry: false,
-      hasLegacyEntry: false,
-      legacyEntryName: null,
-      malformed: true,
-      launchCommandMissing: null,
-      launchRuntime: null,
-      launchOamNotAbsolute: null,
-      launchOamEntryMissing: null,
-    };
+    return { ...EMPTY_PROBE, malformed: true };
   }
 }
 
@@ -1885,7 +1907,13 @@ interface ShellHistorySource {
 
 function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): ShellHistorySource[] {
   const sources: ShellHistorySource[] = [];
-  sources.push({ path: join(opts.home, ".bash_history"), extractCommand: (l) => l.trim() || null });
+  const plain = (l: string): string | null => l.trim() || null;
+  // HISTFILE wins for bash: a user who relocated history (a shared dotfiles
+  // setup, `HISTFILE=~/.cache/bash_history`) has an EMPTY ~/.bash_history, so
+  // hardcoding the default path silently reported zero shadowed commands for
+  // exactly the users who customise their shell the most. opts.env is already
+  // threaded in for APPDATA below; this just uses it.
+  sources.push({ path: opts.env.HISTFILE || join(opts.home, ".bash_history"), extractCommand: plain });
   sources.push({
     path: join(opts.home, ".zsh_history"),
     // Zsh extended-history lines look like `: 1700000000:0;npm audit`.
@@ -1904,10 +1932,51 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
   if (appData) {
     sources.push({
       path: join(appData, "Microsoft", "Windows", "PowerShell", "PSReadLine", "ConsoleHost_history.txt"),
-      extractCommand: (l) => l.trim() || null,
+      extractCommand: plain,
     });
   }
-  return sources;
+  // PowerShell 7+ on macOS / Linux. PSReadLine writes the same
+  // one-command-per-line file, just under the XDG data dir instead of
+  // %APPDATA% -- gating the ONLY pwsh source on APPDATA meant a pwsh-primary
+  // mac or Linux user got an empty SHADOWED CLI USAGE section.
+  const xdgData = opts.env.XDG_DATA_HOME || join(opts.home, ".local", "share");
+  sources.push({
+    path: join(xdgData, "powershell", "PSReadLine", "ConsoleHost_history.txt"),
+    extractCommand: plain,
+  });
+  // fish. Its history is a YAML-ish record per command:
+  //   - cmd: npm audit
+  //     when: 1700000000
+  // Only the `- cmd:` lines carry a command; `when:`/`paths:` continuation
+  // lines are skipped. Escapes inside the value (fish writes `\n` for an
+  // embedded newline) are left alone: extractLeadingBinary only ever looks at
+  // the FIRST word, which is never the escaped part.
+  sources.push({
+    path: join(xdgData, "fish", "fish_history"),
+    extractCommand: (l) => {
+      const trimmed = l.trim();
+      if (!trimmed.startsWith("- cmd:")) return null;
+      return trimmed.slice("- cmd:".length).trim() || null;
+    },
+  });
+  // Dedupe by resolved path. The sources overlap the moment a user points
+  // HISTFILE at a file another entry already names -- `export
+  // HISTFILE=$HOME/.zsh_history` is the canonical case -- and
+  // scanShellHistoryForShadows then counted every command in that file TWICE,
+  // inflating the SHADOWED CLI USAGE counts and pushing a CLI over the
+  // reporting threshold on half the real invocations.
+  //
+  // LAST entry wins, not the first. The duplicate is always HISTFILE (pushed
+  // first, with the line-is-the-command `plain` reader) colliding with a
+  // format-specific entry below it. Keeping the first would dedupe correctly
+  // and then MIS-PARSE the file: zsh writes `: 1700000000:0;npm audit`, whose
+  // leading binary under `plain` is `:`, so the count would silently go to
+  // zero instead of double. The later entry is the one that knows the format.
+  const lastIndex = new Map<string, number>();
+  sources.forEach((s, i) => {
+    lastIndex.set(resolve(s.path), i);
+  });
+  return sources.filter((s, i) => lastIndex.get(resolve(s.path)) === i);
 }
 
 /** Read at most the last `n` lines of a file, reading at most
@@ -1938,6 +2007,12 @@ function readTailLines(path: string, n: number): string[] {
       text = nl === -1 ? "" : text.slice(nl + 1);
     }
     const all = text.split(/\r?\n/);
+    // A newline-TERMINATED file (the normal shape for every history file we
+    // read) makes split() yield a trailing "" that is not a line. Left in, it
+    // consumed one of the n slots, so the documented 500-line window was
+    // really 499 -- the oldest real line in the window was dropped for a
+    // sentinel. Popping it first makes the constant mean what it says.
+    if (all.length > 0 && all[all.length - 1] === "") all.pop();
     return all.length <= n ? all : all.slice(all.length - n);
   } catch {
     return [];
@@ -1953,10 +2028,11 @@ function readTailLines(path: string, n: number): string[] {
 }
 
 // Pull the leading binary out of a shell command, stripping any
-// leading env-var assignments (`FOO=bar CMD=quux cmd arg`), `sudo`,
-// and path-style invocations (`/usr/local/bin/npm` → `npm`). Returns
-// null for lines we can't confidently parse (pipes, command
-// substitution, assignments only).
+// leading env-var assignments (`FOO=bar CMD=quux cmd arg`), launcher
+// wrappers (`sudo` / `env` / `nohup` / `nice` / ...), path-style
+// invocations (`/usr/local/bin/npm` → `npm`) and a Windows executable
+// suffix (`npm.cmd` → `npm`). Returns null for lines we can't
+// confidently parse (pipes, command substitution, assignments only).
 function extractLeadingBinary(command: string): string | null {
   let rest = command.trimStart();
   if (!rest) return null;
@@ -1967,14 +2043,21 @@ function extractLeadingBinary(command: string): string | null {
   // real history lines stack them (`sudo time npm audit`, `sudo FOO=1 npm
   // ci`), and peeling exactly one wrapper left `time` as the "binary".
   // Both classes are handled in ONE loop so any interleaving works.
-  const prefixes = ["sudo", "time", "command", "exec"];
+  // `env` / `nohup` / `nice` join the list for the same reason `sudo` is on
+  // it: they are launchers, so `nohup npm ci` is an npm invocation and
+  // reporting `nohup` (which no server shadows) just loses the hit.
+  const prefixes = ["sudo", "time", "command", "exec", "env", "nohup", "nice"];
   for (;;) {
     const firstWord = rest.split(/\s+/)[0] ?? "";
     const isAssignment = /^[A-Z_][A-Z0-9_]*=/i.test(rest);
     if (!isAssignment && !prefixes.includes(firstWord)) break;
-    const space = rest.indexOf(" ");
-    if (space === -1) return null;
-    const next = rest.slice(space + 1).trimStart();
+    // Advance past the first word by WHITESPACE, not a literal " ": a
+    // tab-separated wrapper (`sudo<TAB>npm audit`) made indexOf(" ") skip
+    // clean past `npm` to the space inside the args and report `audit` as the
+    // binary. `\s` matches the tab the same as the space.
+    const ws = /\s/.exec(rest);
+    if (ws === null) return null;
+    const next = rest.slice(ws.index).trimStart();
     // Defensive: a line of pure separators can't shrink further.
     if (next === rest || next.length === 0) return null;
     rest = next;
@@ -1985,7 +2068,13 @@ function extractLeadingBinary(command: string): string | null {
   if (/[|&;<>()`$]/.test(first)) return null;
   // Strip path prefix — we match on the binary name.
   const slash = Math.max(first.lastIndexOf("/"), first.lastIndexOf("\\"));
-  return slash === -1 ? first : first.slice(slash + 1);
+  const name = slash === -1 ? first : first.slice(slash + 1);
+  // Strip a Windows executable suffix. PowerShell / cmd history records what
+  // the user typed, and on Windows that is routinely `npm.cmd audit` or
+  // `gh.exe pr list` -- neither of which matches the shadow map, whose keys
+  // are bare binary names. Case-insensitive: PATHEXT is upper-case by
+  // convention and `NPM.CMD` is the same program.
+  return name.replace(/\.(exe|cmd|bat)$/i, "");
 }
 
 // Version compare, delegated to oam-spawn's `compareVersions` -- the canonical

@@ -131,7 +131,7 @@ describe("redactIntent", () => {
   });
 
   it("strips an email address before tokenize and increments redactedCount", () => {
-    // The RAW_PII_PATTERNS email regex fires on the raw string before tokenize()
+    // The RAW_PII_RULES email regex fires on the raw string before tokenize()
     // shreds it. The whole address is replaced with a space, so "user",
     // "example", and "com" never reach the token bag.
     const r = redactIntent("send email to user@example.com");
@@ -142,6 +142,48 @@ describe("redactIntent", () => {
     // Ordinary words from the rest of the intent survive.
     expect(r.tokens).toContain("send");
     expect(r.tokens).toContain("email");
+  });
+
+  it("keeps ordinary tech tokens the loose phone / ticket shapes used to swallow", () => {
+    // REGRESSION: the phone shape (`\+?[0-9][0-9\s().-]{8,}`) and the ticket
+    // shape (`[A-Z]+-\d+`) matched dates, IP literals, dotted versions and
+    // standards names, so a routing corpus lost exactly the vocabulary it
+    // exists to score. Each of these must survive with redactedCount 0.
+    const r = redactIntent("on 2024-01-15 ping 192.168.1.100 with 1.2.3.4.5 using UTF-8 GPT-4 SHA-256");
+    expect(r.redactedCount).toBe(0);
+    expect(r.tokens).toEqual(expect.arrayContaining(["2024", "192", "168", "100", "utf", "gpt", "sha", "256"]));
+  });
+
+  it("still redacts a real phone number and a real ticket ref", () => {
+    // The other side of the gate above: 9+ actual digits is a phone, and a
+    // multi-digit suffix on a non-standards prefix is a ticket key.
+    const phone = redactIntent("call +1 (555) 123-4567 today");
+    expect(phone.redactedCount).toBe(1);
+    expect(phone.tokens).toEqual(["call", "today"]);
+
+    const ticket = redactIntent("fix PROJ-1234 before the demo");
+    expect(ticket.redactedCount).toBe(1);
+    expect(ticket.tokens).not.toContain("proj");
+    expect(ticket.tokens).toContain("demo");
+  });
+
+  it("redacts a DOT-separated phone number without re-swallowing dotted IPs and versions", () => {
+    // The IPv4/version exclusion is written as "three or more dots" but the
+    // regex quantifier said {2,}, so a 2-dot 10-digit run -- the ordinary
+    // 555.123.4567 phone format -- matched the exclusion and was persisted
+    // verbatim into the harvest. Digit count alone does not save it: at 10
+    // digits it clears the 9+ phone floor, so the exclusion was the only
+    // thing deciding, and it decided wrong.
+    const phone = redactIntent("call me at 555.123.4567 tomorrow");
+    expect(phone.redactedCount).toBe(1);
+    expect(phone.tokens).not.toContain("555.123.4567");
+
+    // The shapes the exclusion exists for must still survive it. tokenize()
+    // splits on the dots, so the surviving evidence is the digit groups plus
+    // a redactedCount of 0 -- same shape the sibling case above asserts.
+    const kept = redactIntent("ping 192.168.1.100 running 1.2.3.4.5");
+    expect(kept.redactedCount).toBe(0);
+    expect(kept.tokens).toEqual(expect.arrayContaining(["192", "168", "100"]));
   });
 
   it("keeps short identifiers (pg, gh, s3) -- harvest tokenizes at the ranker's 1-char floor", () => {

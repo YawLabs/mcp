@@ -18,8 +18,15 @@
 // explicit `mode` -- a write never loosens perms it did not set. Pass
 // `mode` explicitly when the CONTENT decides the mode (e.g. 0o600 because
 // this write is what puts a secret in the file).
+//
+// SYMLINKS: a symlinked target is written THROUGH, not replaced. rename()
+// publishes at the path it is handed, so renaming onto a link would sever it
+// and leave every later write invisible to whatever the link pointed at (the
+// dotfiles-repo shape: ~/.yaw-mcp/state.json linked into a checkout). We
+// resolve the link first, so both the tmp sibling and the rename land on the
+// real file. See resolveSymlinkTarget.
 
-import { chmod, mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -88,7 +95,21 @@ export async function atomicWriteFile(
   // are left alone (we don't want to tighten the user's $HOME).
   dirMode?: number,
 ): Promise<void> {
-  const dir = path.dirname(filePath);
+  // Write THROUGH a symlinked target rather than replacing it. rename()
+  // publishes a regular file at the path it is handed, so renaming onto a
+  // symlink severs the link: a `~/.yaw-mcp/state.json` symlinked into a
+  // dotfiles checkout (the common way people version these files) silently
+  // detaches on the first save, and every later write lands somewhere the
+  // user's repo no longer sees. Resolving the link first puts the tmp file
+  // next to the REAL file and renames onto the real file, so the link
+  // survives and keeps pointing at the bytes we just wrote -- and the mode
+  // preservation below then reads and restores the real file's mode, which
+  // is the inode rename actually replaces. A dangling link (or any path
+  // realpath cannot resolve) falls back to the literal path: there is no
+  // real file to write through, so publishing at the link path is the only
+  // option left.
+  const target = await resolveSymlinkTarget(filePath);
+  const dir = path.dirname(target);
   // The tmp file is a SIBLING of the target (same directory => same
   // filesystem), so fs.rename is atomic. Atomicity holds ONLY on the same
   // filesystem: a cross-device rename throws EXDEV. We never cross devices
@@ -97,7 +118,7 @@ export async function atomicWriteFile(
   // different fs than where the tmp would be written -- that would surface
   // as an EXDEV throw rather than an atomic swap. (If a real cross-device
   // need ever arises, fall back to writeFile-in-place, losing atomicity.)
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${++tmpSeq}`;
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${++tmpSeq}`;
   await mkdirpWithMode(dir, dirMode);
   // No explicit mode: carry the target's own perms onto the replacement inode
   // so an overwrite cannot widen a file the user (or an earlier secret-bearing
@@ -107,7 +128,7 @@ export async function atomicWriteFile(
   let preserved: number | undefined;
   if (mode === undefined && process.platform !== "win32") {
     try {
-      preserved = (await stat(filePath)).mode & 0o7777;
+      preserved = (await stat(target)).mode & 0o7777;
     } catch {
       // ENOENT (fresh file) or an unstattable target -- nothing to carry.
     }
@@ -127,13 +148,33 @@ export async function atomicWriteFile(
         // Ignored -- the born mode above is already no wider than the target.
       }
     }
-    await renameWithRetry(tmp, filePath);
+    await renameWithRetry(tmp, target);
   } catch (err) {
     // Best-effort cleanup so we don't leak orphan temp files when the
     // write or rename fails. Swallow the unlink error -- the original
     // failure is what the caller cares about.
     await unlink(tmp).catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * The path this write should actually publish at: the symlink's resolved
+ * target when `filePath` is a symlink, the path itself otherwise.
+ *
+ * lstat (not stat) is the probe -- stat follows the link and reports the
+ * target, which is exactly the confusion this function exists to remove.
+ * Every failure degrades to the literal path: a missing file (the fresh-write
+ * case), a dangling link with no real file behind it, an EACCES on the parent,
+ * or a platform that cannot resolve the path. That is the pre-existing
+ * behavior, so nothing regresses when the probe cannot run.
+ */
+async function resolveSymlinkTarget(filePath: string): Promise<string> {
+  try {
+    if (!(await lstat(filePath)).isSymbolicLink()) return filePath;
+    return await realpath(filePath);
+  } catch {
+    return filePath;
   }
 }
 

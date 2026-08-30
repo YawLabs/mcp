@@ -279,9 +279,13 @@ export function oamPublishesBinaryForThisMachine(): boolean {
  * source: doctor's OAM RUNTIME section and `install`'s absent note both reach
  * it, and a second copy is how one surface goes on naming a platform the other
  * has stopped naming.
+ *
+ * ASCII only: doctor prints this verbatim to a terminal, and a legacy Windows
+ * console renders a UTF-8 em-dash as mojibake -- which is then copy-pasted
+ * into the support thread the doctor output exists for.
  */
 export function oamNoBinaryReason(): string {
-  return `no published oam binary for ${process.platform}-${process.arch} yet — build from source at https://oamjs.org`;
+  return `no published oam binary for ${process.platform}-${process.arch} yet -- build from source at https://oamjs.org`;
 }
 
 /**
@@ -582,6 +586,14 @@ export function resolveBinAbsolute(
   platform: NodeJS.Platform = process.platform,
 ): string | null {
   if (isAbsolute(bin)) return isExecutableFile(bin, platform) ? winNormalize(bin, platform) : null;
+  // A RELATIVE name that carries a separator (`./tools/oam`, `tools\oam`) is
+  // NOT a PATH lookup: the OS loader spawns it against the CWD and never
+  // consults PATH at all. Joining it onto every PATH entry can therefore only
+  // produce a coincidence -- some unrelated `<pathdir>/tools/oam` -- which
+  // would be persisted into a client config as "the oam we found". Refuse
+  // instead. `\` counts only on Windows, where it is a separator; off Windows
+  // it is an ordinary (if exotic) filename character.
+  if (bin.includes("/") || (platform === "win32" && bin.includes("\\"))) return null;
   // Windows env vars are case-insensitive but process.env is not, and a
   // sanitized child env can carry either spelling.
   const pathVar = env.PATH ?? env.Path ?? env.path ?? "";
@@ -589,8 +601,18 @@ export function resolveBinAbsolute(
   // An empty PATH entry means "cwd" to the shell; skip it rather than resolve
   // a config-bound absolute path against whatever directory we happen to be in.
   const dirs = pathVar.split(platform === "win32" ? ";" : ":").filter(Boolean);
-  // "" first, so a name that already carries its extension is found as written.
-  const exts = platform === "win32" ? ["", ...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)] : [""];
+  const pathext = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  // On Windows the empty extension is offered ONLY when the name already ends
+  // in a PATHEXT extension. CreateProcess appends an extension to a name that
+  // has none, so an extensionless regular file named `oam` sitting beside
+  // `oam.exe` is a file Windows would never run -- a POSIX shim checked into a
+  // bin dir is the everyday shape. Trying "" first regardless returned that
+  // shim as binPath (isExecutableFile cannot tell them apart: X_OK is a no-op
+  // on Windows), and install then persisted a launch that cannot start.
+  // Keeping "" for an already-extensioned name is what stops `oam.exe` being
+  // searched as `oam.exe.exe`.
+  const carriesExt = pathext.some((e) => bin.toLowerCase().endsWith(e.toLowerCase()));
+  const exts = platform === "win32" ? (carriesExt ? ["", ...pathext] : pathext) : [""];
   for (const dir of dirs) {
     // Windows PATH entries are commonly quoted; the quotes are shell syntax,
     // not part of the directory name.
@@ -683,26 +705,44 @@ export function createProbeCollector(max: number = OAM_PROBE_MAX_OUTPUT) {
   let head = "";
   let carry = "";
   let found: string | null = null;
+  // A match that ended FLUSH with everything seen so far: the next chunk may
+  // still extend it, so it is held rather than latched. See push().
+  let pending: string | null = null;
 
   return {
     push(chunk: string): void {
-      // Once a version is in hand there is nothing left for a further chunk to
-      // do: `found` is monotonic, `carry` is read only on the not-yet-found
-      // branch, and `head` is unreachable through result(). Returning early
-      // matters for the exact case the cap exists for -- a binary that keeps
-      // spewing after printing its version otherwise costs a full-chunk concat
-      // plus a slice on every data event, with nothing retained to show for it.
+      // Once a TERMINATED version is in hand there is nothing left for a
+      // further chunk to do: `found` is monotonic, `carry` is read only on the
+      // not-yet-found branch, and `head` is unreachable through result().
+      // Returning early matters for the exact case the cap exists for -- a
+      // binary that keeps spewing after printing its version otherwise costs a
+      // full-chunk concat plus a slice on every data event, with nothing
+      // retained to show for it.
       if (found !== null) return;
       // Scan across the boundary so a version straddling two chunks is seen.
-      found = parseOamVersion(carry + chunk);
-      carry = (carry + chunk).slice(-VERSION_CARRY);
+      const scan = carry + chunk;
+      const hit = parseOamVersion(scan);
+      if (hit !== null) {
+        // A hit that runs to the very end of what has been seen is only a
+        // PREFIX of the token being printed: stdout split between "oam 0.12.1"
+        // and "-rc.1" would otherwise latch "0.12.1", and a floor-equal
+        // prerelease then compares EQUAL to MIN_OAM_VERSION and is hosted --
+        // exactly the below-min build the gate exists to refuse. Hold it until
+        // a later chunk either extends it or terminates it; result() finalizes
+        // whatever is held when the stream closes without another chunk.
+        if (scan.endsWith(hit)) pending = hit;
+        else found = hit;
+      }
+      carry = scan.slice(-VERSION_CARRY);
       if (head.length >= max) return;
       head += chunk.slice(0, max - head.length); // slice, so the cap is HARD
     },
     /** The version if one appeared anywhere, else the capped head (which
-     *  parses to null either way, so the caller's contract is unchanged). */
+     *  parses to null either way, so the caller's contract is unchanged).
+     *  Called after the stream closes, so a still-pending match is final: no
+     *  further chunk can extend it. */
     result(): string {
-      return found ?? head;
+      return found ?? pending ?? head;
     },
     /** Test hook: bytes actually retained. */
     retainedLength(): number {
@@ -874,6 +914,20 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       });
       return publish({ bin: null, binPath: null, version, belowMin: true, failure: null, failureDetail: null });
     }
+    if (version === null) {
+      // A clean exit with nothing version-shaped in stdout is treated as
+      // usable -- a working --version proves oam exists, and an oam that
+      // prints its version to stderr is the known shape here (the probe only
+      // pipes stdout). But it means the MIN_OAM_VERSION gate above never ran
+      // for this binary, so the "old builds hang in ways that read as server
+      // bugs" class it guards is back on the table with nothing said about it.
+      // Debug rather than warn: the binary works, and this is diagnostic
+      // context for a hang, not something the user must act on.
+      log("debug", "oam --version printed no parsable version; the minimum-version gate did not run for this binary", {
+        bin,
+        minVersion: MIN_OAM_VERSION,
+      });
+    }
     return publish({
       bin,
       // Resolved once, alongside the probe that proved the name spawns, so the
@@ -992,11 +1046,16 @@ export function nodeLaunchKind(command: string): "node" | "npx" | null {
   return null;
 }
 
+/** Entry extensions oam type-checks. `oam run` defaults to `--check warn`, so a
+ *  TypeScript entry spawns tsgo alongside the server. */
+const TS_ENTRY_RE = /\.[mc]?ts$/i;
+
 /**
  * Pure rewrite of a Node-based launch to `oam run`. Returns {command,args}
  * UNCHANGED for the Node-fallback cases described in the module header.
- *   node <entry> [..rest]   -> oam run <entry> [-- ..rest]
- *   npx [-y] <pkg> [..rest] -> oam run <resolved> [-- ..rest]
+ *   node <entry> [..rest]      -> oam run <entry> [-- ..rest]
+ *   node <entry>.ts [..rest]   -> oam run --no-check <entry>.ts [-- ..rest]
+ *   npx [-y] <pkg> [..rest]    -> oam run <resolved> [-- ..rest]
  */
 export function rewriteForOam(
   command: string,
@@ -1006,10 +1065,20 @@ export function rewriteForOam(
   const bin = deps.oamBin;
   if (!bin) return { command, args };
 
-  const toOam = (entry: string, rest: string[]) => ({
-    command: bin,
-    args: rest.length > 0 ? ["run", entry, "--", ...rest] : ["run", entry],
-  });
+  const toOam = (entry: string, rest: string[]) => {
+    // `oam run` type-checks a TypeScript entry concurrently by default
+    // (--check warn), which spawns tsgo beside the sidecar and writes its
+    // diagnostics to the child's stderr -- where, on a boot failure, they are
+    // what lands in the 500-char failure tail instead of the real error. The
+    // rewrite is billed as a pure optimization of a launch node was already
+    // going to run unchecked, so checking is not ours to add: `--no-check`
+    // keeps the hosted launch behaving like the one it replaced.
+    const flags = TS_ENTRY_RE.test(entry) ? ["--no-check"] : [];
+    return {
+      command: bin,
+      args: rest.length > 0 ? ["run", ...flags, entry, "--", ...rest] : ["run", ...flags, entry],
+    };
+  };
 
   const kind = nodeLaunchKind(command);
 
@@ -1193,6 +1262,12 @@ function npmrcValue(raw: string): string {
 /** The `cache=` setting in an npmrc, or null when the file is absent or does
  *  not set one. npmrc is `key=value` per line with `;`/`#` comments.
  *
+ *  The LAST `cache=` wins, because that is what npm's ini parser does: a
+ *  duplicate key overwrites the earlier one as the file is parsed. Taking the
+ *  first match instead resolved to a directory npm has stopped filling, the
+ *  `_npx` readdir under it found nothing, and every npx sidecar quietly stayed
+ *  on npx -- indistinguishable from "no sidecars installed".
+ *
  *  `~/` is expanded, because npm expands it for path-typed config fields
  *  (@npmcli/config's parse-field) and `cache=~/.npm-cache` is a natural thing
  *  to write. Only the `~/` form, which is the only one npm itself expands -- a
@@ -1205,16 +1280,21 @@ function npmrcCache(file: string): string | null {
   } catch {
     return null;
   }
+  // Scan every line and keep the last hit -- see the last-key-wins note above.
+  let last: string | null = null;
   for (const line of text.split(/\r?\n/)) {
     // The anchor is what excludes a whole-line comment: `;cache=/x` does not
     // match `^\s*cache`.
     const m = /^\s*cache\s*=(.*)$/.exec(line);
     if (!m) continue;
     const value = npmrcValue(m[1]);
+    // An empty value is skipped rather than latched as "the last one": it
+    // cannot name a directory, and treating it as the winner would let a
+    // stray `cache=` line erase a real setting above it.
     if (!value) continue;
-    return value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+    last = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
   }
-  return null;
+  return last;
 }
 
 // Memoized PER fromUrl: the answer cannot change within a process, and this
@@ -1457,17 +1537,25 @@ export function resolveNpmEntry(
   // is the only one the user asked yaw-mcp to maintain, so when it and some
   // ambient node_modules both have the package, the managed answer is the one
   // they can actually move forward by re-running the command.
+  // The broker's OWN node_modules sits UNDER _npx whenever yaw-mcp was itself
+  // launched via `npx -y @yawlabs/mcp` -- the common install shape, not an edge
+  // case. Calling that "durable" would advertise `npm install <pkg>@latest`,
+  // which cannot refresh a content-hashed cache directory.
+  // resolveStableNpmEntry draws the same distinction for the same reason.
+  const own = ownNodeModules(fromUrl);
+  const ownCache = own.filter((nodeModules) => nodeModules.includes(NPX_CACHE_MARKER));
+  const ownDurable = own.filter((nodeModules) => !nodeModules.includes(NPX_CACHE_MARKER));
   const durable: Array<{ nodeModules: string; source: PinSource }> = [
     ...(managedRoot ? [{ nodeModules: managedRoot, source: "managed" as const }] : []),
-    // The broker's OWN node_modules sits UNDER _npx whenever yaw-mcp was
-    // itself launched via `npx -y @yawlabs/mcp` -- the common install shape,
-    // not an edge case. Calling that "durable" would advertise `npm install
-    // <pkg>@latest`, which cannot refresh a content-hashed cache directory.
-    // resolveStableNpmEntry draws the same distinction for the same reason.
-    ...ownNodeModules(fromUrl).map((nodeModules) => ({
-      nodeModules,
-      source: (nodeModules.includes(NPX_CACHE_MARKER) ? "npx-cache" : "durable") as PinSource,
-    })),
+    // Only the copies that are genuinely durable take part in the take-outright
+    // loop. A sidecar sitting in the broker's OWN _npx hash dir is a cache copy
+    // like any other, so it belongs in the highest-version scan below -- taking
+    // it outright let an old build in our own hash dir beat a NEWER copy in a
+    // sibling cache dir, which is the opposite of the rule that scan exists to
+    // enforce. (Only the ranking was wrong: the replaced branch already keyed
+    // `source` off NPX_CACHE_MARKER, so an own `_npx` copy was tagged
+    // "npx-cache" and did get the `npx -y <pkg>@latest` refresh advice.)
+    ...ownDurable.map((nodeModules) => ({ nodeModules, source: "durable" as PinSource })),
   ];
   for (const { nodeModules, source } of durable) {
     const hit = packageEntry(join(nodeModules, ...parts), pkg);
@@ -1491,7 +1579,11 @@ export function resolveNpmEntry(
   // the directory listing happened to surface: a config that says `@latest`
   // ran a months-old build with no warning anywhere. Pick the highest version
   // instead, which is the closest on-disk answer to what `@latest` asked for.
-  const roots = new Set([...npxCacheNodeModules(fromUrl), ...npmCacheNpxNodeModules(npmCache)]);
+  // ownCache is folded in explicitly rather than left to npxCacheNodeModules:
+  // that helper enumerates the _npx root by readdir, which yields our own hash
+  // dir too on a good day but nothing at all when the readdir fails. The Set
+  // makes the overlap free.
+  const roots = new Set([...ownCache, ...npxCacheNodeModules(fromUrl), ...npmCacheNpxNodeModules(npmCache)]);
   let best: PackageHit | null = null;
   let bestRoot: string | null = null;
   // The PARSED version of `best`, or null when it has none / declares one that

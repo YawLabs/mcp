@@ -118,6 +118,30 @@ describe("uvTarget", () => {
     // produce a non-null triple on any machine the suite supports.
     expect(uvTarget()).toMatch(/^(x86_64|aarch64|i686)-/);
   });
+
+  it("does not derive a musl target from a NON-linux host's report", () => {
+    // The libc probe reads process.report, which omits glibcVersionRuntime on
+    // win32/darwin exactly as it does on musl. So asking for a linux triple
+    // from a Windows or Mac host used to answer -musl from a libc reading that
+    // machine never had. Both halves are forced here so the assertion means
+    // the same thing on every runner: a non-linux host, and a report that
+    // would read as musl if it were consulted.
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const report = process.report;
+    if (!report) throw new Error("process.report is unavailable; this test cannot force the musl reading");
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    const spy = vi.spyOn(report, "getReport").mockReturnValue({ header: {} });
+    try {
+      expect(uvTarget("linux", "x64")).toBe("x86_64-unknown-linux-gnu");
+      expect(uvTarget("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
+      // An explicit `musl` still wins: a caller who knows the target's libc
+      // is not overridden by the host gate.
+      expect(uvTarget("linux", "x64", true)).toBe("x86_64-unknown-linux-musl");
+    } finally {
+      spy.mockRestore();
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+    }
+  });
 });
 
 describe("UV_VERSION freshness floor", () => {

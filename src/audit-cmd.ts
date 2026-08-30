@@ -54,11 +54,41 @@ export interface AuditCommandOptions {
     args: string[];
     env?: Record<string, string>;
   }) => Promise<{ grade: "A" | "B" | "C" | "D" | "F"; score: number; suiteVersion?: string }>;
+  /**
+   * Test hook: which platform's spawn semantics to apply. Only the cmd.exe
+   * metacharacter gate reads it (the compliance runner uses `shell: true` on
+   * Windows and nowhere else), so pinning it lets that branch be exercised from
+   * a Linux runner. Defaults to the real host.
+   */
+  platform?: NodeJS.Platform;
 }
 
 export interface AuditCommandResult {
   exitCode: number;
   lines: string[];
+}
+
+/** cmd.exe metacharacters that split or redirect an UNQUOTED command line:
+ *  `&` (chain), `|` (pipe), `<` `>` (redirect), `^` (escape), `(` `)`
+ *  (grouping). Same set install-targets.ts refuses/escapes for the `cmd /c`
+ *  launcher entries, and for the same reason -- `%` is excluded there and here
+ *  because cmd expands `%VAR%` BEFORE any escape processing (so nothing short
+ *  of refusing every literal `%` helps) while a bare `%NAME%` for an unset
+ *  variable is passed through literally, which is the common case: refusing it
+ *  would reject ordinary percent-encoded URL args for no gain. */
+const CMD_METACHAR_RE = /[&|<>^()]/;
+
+/**
+ * First token of a stdio spawn config that carries a cmd.exe metacharacter, or
+ * undefined when every token is safe to hand to a `shell: true` spawn on
+ * Windows. The command itself is checked alongside the args: it is joined into
+ * the same command line, so a metacharacter there splits it just as readily.
+ *
+ * Exported for tests -- the caller's branch is win32-only, and this is the part
+ * whose character set has to be asserted directly.
+ */
+export function findCmdMetacharToken(command: string, args: readonly string[]): string | undefined {
+  return [command, ...args].find((t) => CMD_METACHAR_RE.test(t));
 }
 
 // Flags whose VALUE (the very next arg) carries a credential / secret.
@@ -303,6 +333,34 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
       printErr(`yaw-mcp audit: "${namespace}" has no command to spawn -- it can't be audited as a stdio server.`);
     }
     return { exitCode: 2, lines };
+  }
+
+  // Windows only: the compliance runner spawns the audited server with
+  // `shell: true` on win32 (@yawlabs/mcp-compliance, so that `.cmd`/`.bat`
+  // launcher shims resolve). Node's shell path JOINS command + args into one
+  // string with plain spaces and hands it to `cmd.exe /d /s /c`, so an
+  // unquoted `&` / `|` / `<` / `>` / `^` / `(` / `)` anywhere in the spawn
+  // config is parsed by cmd rather than passed through: at best the audited
+  // command is truncated and graded F for a failure yaw-mcp caused, at worst
+  // the tail after an `&` runs as a second command. Refuse BEFORE resolving
+  // vault refs below, so a target we will not spawn never unlocks the vault.
+  //
+  // Refuse rather than escape. install-targets' escapeCmdArg solves the
+  // sibling problem for the `cmd /c` entries yaw-mcp WRITES, but its rules are
+  // calibrated to libuv's argv quoting (an arg containing a space or a quote is
+  // left verbatim because libuv wraps it) -- and the shell:true path does no
+  // such wrapping, so reusing it here would leave the metacharacter live in
+  // exactly the space-plus-metachar case. Nothing is graded, so exit 2 with the
+  // other "nothing to spawn" outcomes.
+  const platform = opts.platform ?? process.platform;
+  if (platform === "win32") {
+    const offender = findCmdMetacharToken(server.command, server.args ?? []);
+    if (offender !== undefined) {
+      printErr(
+        `yaw-mcp audit: "${namespace}" cannot be audited on Windows -- its spawn config contains a cmd.exe metacharacter (& | < > ^ parentheses) in ${JSON.stringify(offender)}. The compliance suite spawns stdio targets through cmd.exe here, which would split the command line at that character. Rework the server's command/args in bundles.json to drop it, or audit this server on macOS/Linux.`,
+      );
+      return { exitCode: 2, lines };
+    }
   }
 
   // Resolve ${secret:NAME} vault refs the same way the real spawn does

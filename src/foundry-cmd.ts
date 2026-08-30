@@ -8,11 +8,14 @@
 // gate measures (a BM25-floor regression check on real intents, NOT a
 // correctness oracle).
 //
-// Exit codes:
+// Exit codes. These follow the CLI-wide convention stated in index.ts: 2 is
+// reserved for an argv/usage error (emitted by the shared parse-then-dispatch
+// tail, never by the runner below), 1 is any runtime failure.
 //   0  corpus written
-//   1  no harvested traces found (nothing to export)
-//   2  no usable entries after folding (every trace's `chosen` is unknown to
-//      the local server catalog, or all tokens were empty)
+//   1  nothing to export -- no harvest file, no parseable traces, or no usable
+//      entries after folding (every trace's `chosen` is unknown to the local
+//      server catalog, or all tokens were empty)
+//   2  bad argv (from parseFoundryArgs, via index.ts)
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -150,10 +153,19 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     printErr(
       `yaw-mcp foundry: ${traces.length} traces but 0 usable entries -- none of the chosen servers are in the local catalog (${servers.length} servers).`,
     );
-    return { exitCode: 2, lines };
+    // 1, not 2: this is a runtime outcome (the harvest and the catalog do not
+    // overlap), and 2 means "you typed the command wrong" everywhere else in
+    // the CLI. A wrapper script keying on 2 to re-print usage was being told
+    // to do that for a perfectly well-formed invocation.
+    return { exitCode: 1, lines };
   }
 
   mkdirSync(path.dirname(path.resolve(opts.out)), { recursive: true });
+  // Indent 2 for a reviewable diff when the fixture is committed. Verified
+  // against biome 2.4.16: `biome check` WOULD reformat this (it collapses the
+  // short `tokens` arrays onto one line), which would red the lint gate the
+  // moment a real corpus lands under src/. biome.json therefore excludes
+  // src/tests/fixtures/*.json -- keep the two in step if either moves.
   writeFileSync(opts.out, `${JSON.stringify(corpus, null, 2)}\n`, "utf8");
 
   const score = scoreCorpus(corpus);

@@ -76,15 +76,28 @@ export interface UpstreamResourceDef {
   uri: string;
   namespacedUri: string;
   name?: string;
+  // Human-readable display name (MCP 2025-06-18), carried for the same
+  // reason UpstreamToolDef carries it: a client rendering the proxied
+  // resource must see the presentation the upstream intended. Dropping it
+  // silently downgraded every titled upstream resource to its raw `name`.
+  title?: string;
   description?: string;
   mimeType?: string;
+  // Passthrough metadata (MCP 2025-06-18). Opaque to yaw-mcp -- forwarded
+  // verbatim so an upstream/client pair that agrees on a _meta convention
+  // keeps working through the proxy.
+  _meta?: Record<string, unknown>;
 }
 
 export interface UpstreamPromptDef {
   name: string;
   namespacedName: string;
+  // Same MCP 2025-06-18 display-name / metadata passthrough as
+  // UpstreamResourceDef above -- prompts carry both fields too.
+  title?: string;
   description?: string;
   arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+  _meta?: Record<string, unknown>;
 }
 
 export interface ConnectionHealth {

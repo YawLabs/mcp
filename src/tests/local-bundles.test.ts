@@ -490,7 +490,9 @@ describe("loadLocalBundles", () => {
   });
 });
 
-// Fix 1: readBundlesAt -- ENOENT/EISDIR -> exists:false; other errors -> exists:true
+// Fix 1: readBundlesAt -- ENOENT -> exists:false; EISDIR and every other
+// read error -> exists:true (a directory in the way is drift to report, not
+// an absent file to fall through)
 describe("readBundlesAt error discrimination (fix 1)", () => {
   it("EPERM/EACCES on an APPROVED project file does NOT fall through to user-global", async () => {
     // Write a valid user-global so a fallthrough would succeed.
@@ -717,6 +719,63 @@ describe("readRawUserBundles error message branching (fix 9)", () => {
       ),
     ).rejects.toThrow(/could not be read.*check file permissions/i);
   });
+
+  // The read-vs-parse decision used to be an /EPERM|EACCES|could not read/i
+  // test over the JOINED warning text -- which begins with the full path. A
+  // home directory whose name merely CONTAINS "eaccess" therefore matched the
+  // errno alternation, and an ordinary JSON syntax error was reported as a
+  // permissions problem: the user goes off to run chmod on a file whose
+  // permissions were fine the whole time.
+  it("reports a syntax error as a PARSE failure even when the path contains an errno-like word", async () => {
+    const trapHome = mkdtempSync(join(tmpdir(), "yaw-mcp-eaccess-"));
+    try {
+      mkdirSync(join(trapHome, CONFIG_DIRNAME), { recursive: true });
+      writeFileSync(localBundlesPath(join(trapHome, CONFIG_DIRNAME)), "{ bad json }");
+      await expect(
+        upsertUserBundle(
+          { namespace: "test", name: "Test", command: "npx", args: [], isActive: true },
+          { home: trapHome },
+        ),
+      ).rejects.toThrow(/could not be parsed.*fix the JSON/i);
+    } finally {
+      rmSync(trapHome, { recursive: true, force: true });
+    }
+  });
+});
+
+// A DIRECTORY at the bundles.json path used to be classified "absent"
+// (readBundlesRawAt folded EISDIR in with ENOENT) -- but existsSync() says
+// true, so the write path committed to the location, found no warnings to
+// explain itself, and fell through to the generic "could not be parsed -- fix
+// the JSON" with an EMPTY detail. The user is then told to fix JSON in
+// something that is not a file.
+describe("a directory at the bundles.json path is reported as itself", () => {
+  /** `mkdir -p <home>/.yaw-mcp/bundles.json` -- readFile on it is EISDIR on
+   *  every platform, so no errno injection is needed. */
+  function directoryAtBundlesPath(dir: string): string {
+    const path = localBundlesPath(join(dir, CONFIG_DIRNAME));
+    mkdirSync(path, { recursive: true });
+    return path;
+  }
+
+  it("the write path names the directory instead of blaming the JSON", async () => {
+    directoryAtBundlesPath(synthHome);
+    await expect(
+      upsertUserBundle(
+        { namespace: "test", name: "Test", command: "npx", args: [], isActive: true },
+        { home: synthHome },
+      ),
+    ).rejects.toThrow(/is a directory, not a file/i);
+  });
+
+  it("the loader warns and stays committed to the path instead of reading it as absent", async () => {
+    const path = directoryAtBundlesPath(synthHome);
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
+    expect(r.config).toBeNull();
+    // exists:true -- the loader commits to the location it found something at.
+    expect(r.path).toBe(path);
+    expect(r.warnings.some((w) => w.includes("the path is a directory, not a file"))).toBe(true);
+  });
 });
 
 // The write path (add/remove) must round-trip the top-level defaultRuntime --
@@ -773,6 +832,34 @@ describe("upsertUserBundle merges onto the stored entry", () => {
     // The result reports what actually landed, so callers can describe the file.
     expect((res.entry.env as Record<string, string>).TOKEN).toBe("secret");
     expect(res.entry.args).toEqual(["-y", "new"]);
+  });
+
+  // The mirror image of the rule above. A BLANK stored value is not data: it
+  // is `add`'s "this key is required, nothing stored" marker. When the catalog
+  // stops requiring the key, the incoming entry stops listing it -- and the
+  // per-key merge used to keep re-copying the stale marker forever, so `list
+  // --json` and the removal preview went on reporting a required var that no
+  // longer exists.
+  it("drops a stale blank seed the incoming entry no longer lists, but never a stored value", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "gh", name: "GH", command: "npx", env: { DROPPED_KEY: "", TOKEN: "secret" } }],
+    });
+    const res = await upsertUserBundle(
+      { namespace: "gh", name: "GH", command: "npx", env: { STILL_REQUIRED: "" } },
+      { home: synthHome },
+    );
+    expect(stored().env).toEqual({ TOKEN: "secret", STILL_REQUIRED: "" });
+    expect(res.entry.env).toEqual({ TOKEN: "secret", STILL_REQUIRED: "" });
+  });
+
+  it("leaves no empty env husk when the last required key is dropped", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "gh", name: "GH", command: "npx", env: { ONLY_KEY: "" } }],
+    });
+    await upsertUserBundle({ namespace: "gh", name: "GH", command: "npx" }, { home: synthHome });
+    expect(stored().env).toBeUndefined();
   });
 
   it("does not re-enable an entry the user explicitly disabled", async () => {

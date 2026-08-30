@@ -249,6 +249,28 @@ describe("runBundlesCommand — match", () => {
     expect(parsed.installed).toEqual([]);
   });
 
+  // The RETURNED transcript has to make the same split the printed output
+  // does. `lines` interleaves both streams, so a programmatic caller holding
+  // only the result could not tell the JSON body from a warning line without
+  // re-parsing it -- exactly what routing warnings to stderr already avoids
+  // for the printed copy.
+  it("returns stdout and stderr separately, not just the interleaved transcript", async () => {
+    writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json", "utf8");
+    const io = captureIO();
+    const r = await run({ json: true, out: io.push, err: io.pushErr });
+    // The JSON body parses straight off the stdout array -- no filtering.
+    const parsed = JSON.parse(r.stdout.join("\n"));
+    expect(parsed.installed).toEqual([]);
+    expect(r.stderr.join("\n")).toMatch(/invalid JSON/);
+    expect(r.stdout.join("\n")).not.toMatch(/invalid JSON/);
+    // Both streams still land in `lines`, in emission order, for callers that
+    // want the transcript as printed.
+    expect(r.lines).toEqual([...r.stderr, ...r.stdout]);
+    // Each returned line is the printed one without the writer's newline.
+    expect(r.stdout).toEqual(io.out.map((s) => s.replace(/\n$/, "")));
+    expect(r.stderr).toEqual(io.err.map((s) => s.replace(/\n$/, "")));
+  });
+
   // The config.json allow/deny profile is what actually gates activation
   // (server.ts refuses `mcp_connect_activate` on a blocked namespace), so a
   // match that ignored it printed bundles as "Ready to activate" with an

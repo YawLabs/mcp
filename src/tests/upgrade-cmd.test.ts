@@ -6,6 +6,7 @@ import {
   detectSea,
   fetchLatestVersion,
   type InstallMethod,
+  killProcessTree,
   localInstallRoot,
   npmGlobalPrefix,
   parseUpgradeArgs,
@@ -1004,9 +1005,12 @@ describe("runUpgrade", () => {
     expect(parsed.stale).toBe(false);
   });
 
-  it("--json --run emits JSON and never calls spawnImpl (report-only snapshot)", async () => {
+  it("--json --run emits JSON, never spawns, and STILL exits 1 on a stale install", async () => {
     // Pins that --json is a report-only snapshot: combining it with --run
-    // must NOT spawn the upgrade.
+    // must NOT spawn the upgrade -- and, because nothing was installed, must
+    // NOT report success either. The old `plan.stale && !opts.run` exit rule
+    // returned 0 here, so a script that added --json purely to parse the
+    // output silently lost both the upgrade and the "you are stale" signal.
     const io = captureIO();
     let didSpawn = false;
     const r = await runUpgrade({
@@ -1023,11 +1027,27 @@ describe("runUpgrade", () => {
       err: io.pushErr,
     });
     expect(didSpawn).toBe(false);
-    // JSON branch emits the plan and exits per upgrade-cmd.ts's
-    // `plan.stale && !opts.run ? 1 : 0`: with opts.run set (but ignored
-    // for spawning), the exit code is 0.
+    // JSON branch emits the plan and exits on staleness ALONE -- --run does
+    // not soften it, because --run never installed anything here.
     const parsed = JSON.parse(io.out.join("\n"));
     expect(parsed.stale).toBe(true);
+    expect(r.exitCode).toBe(1);
+  });
+
+  it("--json --run on an UP-TO-DATE install still exits 0", async () => {
+    // The new rule keys on staleness only, so the not-stale side must stay 0 --
+    // otherwise every scripted `upgrade --json --run` poll reports failure.
+    const io = captureIO();
+    const r = await runUpgrade({
+      json: true,
+      run: true,
+      currentVersion: "0.45.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(JSON.parse(io.out.join("\n")).stale).toBe(false);
     expect(r.exitCode).toBe(0);
   });
 
@@ -1225,5 +1245,63 @@ describe("runUpgrade", () => {
     expect(out).toContain("standalone binary");
     expect(out).toContain("retired in 0.70.3");
     expect(out).not.toContain("npx");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// killProcessTree -- the timeout teardown behind npmGlobalPrefix.
+//
+// The probe spawns with `shell: true` on win32 (npm is npm.cmd and Node
+// refuses to spawn a .cmd without a shell), so the pid we hold belongs to
+// cmd.exe, not npm. A bare child.kill() reaped the wrapper and left the
+// npm -> node grandchild running -- it could outlive the CLI process that
+// started the 3s probe. npmGlobalPrefix itself short-circuits under VITEST,
+// so this helper is the only reachable surface for that path.
+// ---------------------------------------------------------------------------
+
+describe("killProcessTree", () => {
+  it("kills the whole tree via taskkill on win32, then still calls kill()", () => {
+    const kill = vi.fn(() => true);
+    const on = vi.fn();
+    const spawnImpl = vi.fn(() => ({ on }));
+
+    killProcessTree({ pid: 4321, kill }, "win32", spawnImpl);
+
+    expect(spawnImpl).toHaveBeenCalledWith("taskkill", ["/pid", "4321", "/T", "/F"], { stdio: "ignore" });
+    // The error sink is load-bearing: an unhandled 'error' event on a spawned
+    // child takes the process down.
+    expect(on).toHaveBeenCalledWith("error", expect.any(Function));
+    // kill() still runs so the probe's close/error handler resolves.
+    expect(kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a plain kill on POSIX, where there is no shell wrapper to punch through", () => {
+    const kill = vi.fn(() => true);
+    const spawnImpl = vi.fn(() => ({ on: vi.fn() }));
+
+    killProcessTree({ pid: 4321, kill }, "linux", spawnImpl);
+
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the plain kill when taskkill itself cannot be spawned", () => {
+    const kill = vi.fn(() => true);
+    const spawnImpl = vi.fn(() => {
+      throw new Error("taskkill: not found");
+    });
+
+    expect(() => killProcessTree({ pid: 4321, kill }, "win32", spawnImpl)).not.toThrow();
+    expect(kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips taskkill when the child never got a pid", () => {
+    const kill = vi.fn(() => true);
+    const spawnImpl = vi.fn(() => ({ on: vi.fn() }));
+
+    killProcessTree({ pid: undefined, kill }, "win32", spawnImpl);
+
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalledTimes(1);
   });
 });

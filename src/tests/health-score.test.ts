@@ -5,6 +5,7 @@ import {
   errorRateFactor,
   formatHealthWarning,
   healthFactor,
+  scrubForWarning,
 } from "../health-score.js";
 
 describe("errorRateFactor", () => {
@@ -138,5 +139,82 @@ describe("formatHealthWarning", () => {
     expect(w).toContain("5 of last 10 calls failed");
     expect(w!.endsWith("...")).toBe(true);
     expect(w!.length).toBeLessThan("warn: 5 of last 10 calls failed: ".length + 125);
+  });
+});
+
+describe("formatHealthWarning -- credential scrubbing", () => {
+  // error-category.ts refuses to print raw upstream text next to a category
+  // because third-party MCP servers echo secrets in errors. This surface used
+  // to contradict that by pasting up to 120 raw chars into discover output.
+  it("redacts a query-string api_key but keeps the actionable rest", () => {
+    const w = formatHealthWarning(
+      {
+        totalCalls: 10,
+        errorCount: 3,
+        totalLatencyMs: 5,
+        lastErrorMessage: "GET https://api.example.com/v1/x?api_key=abc123secretvalue&page=2 failed",
+      },
+      undefined,
+    );
+    expect(w).not.toContain("abc123secretvalue");
+    expect(w).toContain("<redacted>");
+    expect(w).toContain("api.example.com");
+    expect(w).toContain("3 of last 10 calls failed");
+  });
+
+  it("redacts an Authorization header value, scheme word and all", () => {
+    // Scheme-first ordering matters: with the name/value rule running first,
+    // "Authorization" + ":" + "Bearer" matched, so the WORD Bearer was
+    // redacted and the token itself survived.
+    const w = formatHealthWarning(
+      {
+        totalCalls: 10,
+        errorCount: 5,
+        totalLatencyMs: 5,
+        lastErrorMessage: "401 rejected Authorization: Bearer eyJhbGciOiJIUzI1NiJ9dEADbEEF",
+      },
+      undefined,
+    );
+    expect(w).not.toContain("eyJhbGciOiJIUzI1NiJ9dEADbEEF");
+    expect(w).toContain("401 rejected");
+  });
+
+  it("redacts a bare vendor-prefixed key that carries no name", () => {
+    const w = formatHealthWarning(
+      {
+        totalCalls: 10,
+        errorCount: 5,
+        totalLatencyMs: 5,
+        lastErrorMessage: "config error: ghp_AbCdEf0123456789zzzz is not valid",
+      },
+      undefined,
+    );
+    expect(w).not.toContain("ghp_AbCdEf0123456789zzzz");
+    expect(w).toContain("is not valid");
+  });
+
+  it("scrubs the ACTIVATION-failure excerpt on the same terms", () => {
+    const now = 1_000_000;
+    const w = formatHealthWarning(undefined, { at: now - 60_000, message: "spawn failed: token=hunter2hunter2" }, now);
+    expect(w).not.toContain("hunter2hunter2");
+    expect(w).toContain("last activation failed");
+    expect(w).toContain("<redacted>");
+  });
+
+  it("leaves an ordinary status/errno excerpt untouched", () => {
+    // The excerpt earns its place -- "502 bad gateway" tells the model to try
+    // elsewhere where a bare category would not. Over-scrubbing would be as
+    // bad a regression as leaking.
+    const w = formatHealthWarning(
+      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: "502 bad gateway (upstream unreachable)" },
+      undefined,
+    );
+    expect(w).toBe("warn: 5 of last 10 calls failed: 502 bad gateway (upstream unreachable)");
+  });
+
+  it("does not mistake 'unauthorized' for a credential name", () => {
+    // "auth" is a redacted key name, and "unauthorized: 401" would be gutted
+    // by a rule that ignored word boundaries.
+    expect(scrubForWarning("unauthorized: 401")).toBe("unauthorized: 401");
   });
 });

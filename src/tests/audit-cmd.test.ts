@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AUDIT_USAGE,
+  findCmdMetacharToken,
   parseAuditArgs,
   redactSecretArgs,
   resolveComplianceSuiteVersion,
@@ -537,5 +538,141 @@ describe("grades-cache", () => {
     );
     const cache = await readGradesCache(home);
     expect(Object.keys(cache)).toEqual(["good"]);
+  });
+});
+
+// The compliance runner spawns stdio targets with `shell: true` on win32 (so
+// that .cmd/.bat launcher shims resolve). Node's shell path JOINS command +
+// args into one string and hands it to `cmd.exe /d /s /c`, so an unquoted cmd
+// metacharacter anywhere in the spawn config is parsed by cmd rather than
+// passed through: at best the audited command is truncated and graded F for a
+// failure yaw-mcp caused, at worst the tail after an `&` runs as a second
+// command.
+describe("cmd.exe metacharacter gate", () => {
+  describe("findCmdMetacharToken", () => {
+    it("finds a splitter or redirect in either the command or the args", () => {
+      expect(findCmdMetacharToken("node", ["--url", "https://api/x?a=1&b=2"])).toBe("https://api/x?a=1&b=2");
+      expect(findCmdMetacharToken("node", ["a|b"])).toBe("a|b");
+      expect(findCmdMetacharToken("node", ["a>b"])).toBe("a>b");
+      expect(findCmdMetacharToken("node", ["a<b"])).toBe("a<b");
+      expect(findCmdMetacharToken("node", ["a^b"])).toBe("a^b");
+      expect(findCmdMetacharToken("node", ["(x)"])).toBe("(x)");
+      // The COMMAND shares the joined line, so it is checked too.
+      expect(findCmdMetacharToken("srv&evil", [])).toBe("srv&evil");
+    });
+
+    it("returns the FIRST offending token so the diagnostic names one thing", () => {
+      expect(findCmdMetacharToken("node", ["ok", "a&b", "c|d"])).toBe("a&b");
+    });
+
+    it("passes ordinary spawn configs, percent signs included", () => {
+      expect(findCmdMetacharToken("node", ["x.js", "--mcp-server"])).toBeUndefined();
+      expect(findCmdMetacharToken("npx", ["-y", "@scope/pkg", "/tmp/dir"])).toBeUndefined();
+      expect(findCmdMetacharToken("node", ['--config={"port":1}'])).toBeUndefined();
+      // `%` is deliberately NOT in the set: cmd expands %VAR% before any escape
+      // processing (so refusing is the only lever and it is too blunt), and a
+      // percent-encoded URL arg is the common, harmless case.
+      expect(findCmdMetacharToken("node", ["https://example.com/%7Bid%7D"])).toBeUndefined();
+    });
+  });
+
+  describe("runAudit", () => {
+    let home: string;
+    afterEach(() => {
+      if (home) rmSync(home, { recursive: true, force: true });
+    });
+
+    it("refuses a metacharacter-bearing target on win32 without running the suite", async () => {
+      home = makeHome([
+        { namespace: "ctxlint", type: "local", command: "node", args: ["x.js", "--url", "https://api/x?a=1&b=2"] },
+      ]);
+      const io = captureIO();
+      let ran = false;
+      const r = await runAudit({
+        namespace: "ctxlint",
+        home,
+        cwd: home,
+        platform: "win32",
+        out: io.push,
+        err: io.pushErr,
+        runner: async () => {
+          ran = true;
+          return { grade: "A", score: 100 };
+        },
+      });
+      // Exit 2 is the "nothing was graded" code, alongside the remote-server
+      // and no-command refusals -- never 1 (no such namespace) or 3 (graded
+      // but not cached).
+      expect(r.exitCode).toBe(2);
+      expect(ran).toBe(false);
+      const err = io.err.join("\n");
+      expect(err).toContain("cmd.exe metacharacter");
+      // Names the offending token, so the operator knows which arg to rework.
+      expect(err).toContain("https://api/x?a=1&b=2");
+      // Nothing graded means nothing cached.
+      expect(await readGradesCache(home)).toEqual({});
+    });
+
+    it("refuses a metacharacter in the COMMAND, not just the args", async () => {
+      home = makeHome([{ namespace: "ctxlint", type: "local", command: "srv&calc", args: [] }]);
+      const io = captureIO();
+      let ran = false;
+      const r = await runAudit({
+        namespace: "ctxlint",
+        home,
+        cwd: home,
+        platform: "win32",
+        out: io.push,
+        err: io.pushErr,
+        runner: async () => {
+          ran = true;
+          return { grade: "A", score: 100 };
+        },
+      });
+      expect(r.exitCode).toBe(2);
+      expect(ran).toBe(false);
+      expect(io.err.join("\n")).toContain("srv&calc");
+    });
+
+    it("does NOT refuse the same target off win32, where the runner spawns without a shell", async () => {
+      // The gate is a Windows quoting concern only: everywhere else the
+      // compliance runner passes argv straight through, so `&` is just a
+      // character and refusing would be gratuitous.
+      home = makeHome([
+        { namespace: "ctxlint", type: "local", command: "node", args: ["x.js", "--url", "https://api/x?a=1&b=2"] },
+      ]);
+      const io = captureIO();
+      let seen: string[] | null = null;
+      const r = await runAudit({
+        namespace: "ctxlint",
+        home,
+        cwd: home,
+        platform: "linux",
+        out: io.push,
+        err: io.pushErr,
+        runner: async (target) => {
+          seen = target.args;
+          return { grade: "A", score: 100 };
+        },
+      });
+      expect(r.exitCode).toBe(0);
+      expect(seen).toEqual(["x.js", "--url", "https://api/x?a=1&b=2"]);
+    });
+
+    it("still audits a clean target on win32", async () => {
+      home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: ["x.js"] }]);
+      const io = captureIO();
+      const r = await runAudit({
+        namespace: "ctxlint",
+        home,
+        cwd: home,
+        platform: "win32",
+        out: io.push,
+        err: io.pushErr,
+        runner: async () => ({ grade: "B", score: 80 }),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(io.out.join("\n")).toContain("Grade: B");
+    });
   });
 });

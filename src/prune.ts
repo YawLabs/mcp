@@ -29,6 +29,8 @@
 // Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 to disable entirely and keep
 // the original bytes. In that mode responseBytesPruned == responseBytesRaw.
 
+import { setJsonKey } from "./json-key.js";
+
 const MIN_SAVINGS_RATIO = 0.02;
 
 export interface Content {
@@ -224,16 +226,13 @@ function pruneJson(value: unknown): unknown {
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       const pv = pruneJson(v);
       if (pv !== undefined) {
-        // See resolveArgs in exec-engine.ts: plain assignment to
-        // "__proto__" hits the inherited setter instead of creating an own
-        // key, so the field would be dropped from the pruned result an
-        // upstream server actually returned. defineProperty keeps it a
-        // plain data property.
-        if (k === "__proto__") {
-          Object.defineProperty(out, k, { value: pv, writable: true, enumerable: true, configurable: true });
-        } else {
-          out[k] = pv;
-        }
+        // setJsonKey, not out[k]: `k` came out of an upstream server's JSON,
+        // and plain assignment to "__proto__" hits Object.prototype's
+        // inherited setter instead of creating an own key -- the field
+        // would vanish from the pruned result the server actually returned.
+        // Shared with persistence/grades-cache/trust so the one key that
+        // needs this cannot be handled four subtly different ways.
+        setJsonKey(out, k, pv);
         kept++;
       }
     }

@@ -129,12 +129,33 @@ export interface CatalogFetchDeps {
   now?: () => number;
 }
 
+/**
+ * An EMPTY catalog URL means "not configured", not "fetch the empty string".
+ * `YAW_MCP_CATALOG_URL=""` -- a CI variable declared with no value, an
+ * `export YAW_MCP_CATALOG_URL=` line, a blank .env entry -- is not nullish, so
+ * every `??` fallback upstream of here (add, try) handed "" straight through.
+ * fetch("") then throws a bare `TypeError: Failed to parse URL from`, AND the
+ * unwrapped-rethrow gate in defaultFetchCatalog (`err.message.includes(url)`)
+ * is trivially TRUE for the empty string, so the raw TypeError was rethrown
+ * without even the friendly "could not reach the Yaw MCP catalog" wrapper.
+ *
+ * Normalizing at this boundary (rather than at each call site) is what makes
+ * the rule hold for every caller, including ones outside this repo's CLI.
+ * Whitespace-only is treated the same way: it can never be a URL.
+ */
+function normalizeCatalogUrl(url: string | undefined): string {
+  return url !== undefined && url.trim() !== "" ? url : DEFAULT_CATALOG_URL;
+}
+
 /** Fetch + shape-validate the catalog. Bounded by FETCH_TIMEOUT_MS. Throws a
  *  friendly Error on network / parse / shape failure. Injectable for tests. */
 export async function defaultFetchCatalog(
-  url: string = DEFAULT_CATALOG_URL,
+  catalogUrl: string = DEFAULT_CATALOG_URL,
   deps: CatalogFetchDeps = {},
 ): Promise<CatalogServer[]> {
+  // Every message below names `url`, so normalize before the first use -- an
+  // empty string would otherwise produce "the catalog at  returned HTTP 404".
+  const url = normalizeCatalogUrl(catalogUrl);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
   let body: unknown;
@@ -199,7 +220,10 @@ export async function resolveCatalogSlug(
   slug: string,
   opts: { catalogUrl?: string; fetchCatalog?: FetchCatalog } = {},
 ): Promise<ResolvedCatalogServer> {
-  const url = opts.catalogUrl ?? DEFAULT_CATALOG_URL;
+  // normalizeCatalogUrl, not `??`: an override that is set-but-empty (the
+  // YAW_MCP_CATALOG_URL="" shape the CLI reads into this option) must fall
+  // back to the default instead of being fetched.
+  const url = normalizeCatalogUrl(opts.catalogUrl);
   const fetchCatalog = opts.fetchCatalog ?? defaultFetchCatalog;
   const servers = await fetchCatalog(url);
   const entry = servers.find((s) => s.slug === slug);

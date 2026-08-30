@@ -1,5 +1,15 @@
 import type { Stats } from "node:fs";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -325,5 +335,69 @@ describe("atomicWriteFile", () => {
       await expect(atomicWriteFile(join(dir, "posix.json"), "x")).rejects.toThrow("EPERM");
     });
     expect(vi.mocked(rename)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Regression: rename() publishes at the path it is handed, so renaming the
+// tmp file onto a SYMLINK replaced the link with a regular file. A
+// ~/.yaw-mcp/state.json symlinked into a dotfiles checkout was therefore
+// severed by the first save, and every later write landed somewhere the
+// user's repo no longer saw. atomicWriteFile now resolves the link and
+// writes through it.
+describe("atomicWriteFile with a symlinked target", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-atomic-link-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Create `link` -> `target`, or return false where the platform refuses
+   *  (Windows without Developer Mode / SeCreateSymbolicLink). Nothing to pin
+   *  there, so the caller skips rather than failing on an environment gap. */
+  function trySymlink(target: string, link: string): boolean {
+    try {
+      symlinkSync(target, link, "file");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("writes THROUGH the link and leaves it a symlink", async () => {
+    const realDir = join(dir, "dotfiles");
+    mkdirSync(realDir);
+    const real = join(realDir, "state.json");
+    writeFileSync(real, '{"v":1}', "utf8");
+    const link = join(dir, "state.json");
+    if (!trySymlink(real, link)) return;
+
+    await atomicWriteFile(link, '{"v":2}');
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    // The bytes landed on the REAL file, which is what the dotfiles repo
+    // tracks -- reading either path sees them.
+    expect(readFileSync(real, "utf8")).toBe('{"v":2}');
+    expect(readFileSync(link, "utf8")).toBe('{"v":2}');
+    // The tmp sibling went next to the real file and was renamed away; no
+    // orphan is left in either directory.
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+    expect(readdirSync(realDir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("publishes at the link path when the link dangles (no real file to write through)", async () => {
+    const link = join(dir, "dangling.json");
+    if (!trySymlink(join(dir, "missing", "state.json"), link)) return;
+
+    await atomicWriteFile(link, '{"v":3}');
+
+    // realpath cannot resolve a dangling link, so the write falls back to the
+    // literal path -- the pre-existing behavior, and the only one available.
+    expect(readFileSync(link, "utf8")).toBe('{"v":3}');
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
   });
 });

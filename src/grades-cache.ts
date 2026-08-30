@@ -22,7 +22,7 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { setJsonKey } from "./json-key.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
-import { CONFIG_DIRNAME } from "./paths.js";
+import { userConfigDir } from "./paths.js";
 
 /** Canonical filename for the grade cache. */
 export const GRADES_FILENAME = "grades.json";
@@ -53,7 +53,7 @@ const GRADE_LETTERS = new Set(["A", "B", "C", "D", "F"]);
  *  cache is always user-global -- a grade describes how a server BINARY scored,
  *  not a per-project preference, so there's no project-local variant. */
 export function gradesCachePath(home: string = homedir()): string {
-  return join(home, CONFIG_DIRNAME, GRADES_FILENAME);
+  return join(userConfigDir(home), GRADES_FILENAME);
 }
 
 /** Valid range for a cached score, matching the compliance suite's 0-100

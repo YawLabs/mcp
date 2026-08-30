@@ -72,6 +72,13 @@ export function firstResultText(result: ToolCallResultShape): string {
 // Hard cap on fenced (untrusted) tool-output length sent to the grader.
 // Keeps the prompt cheap AND limits the attack surface for prompt injection
 // payloads that try to outrun an instruction by sheer volume.
+//
+// BACKSTOP, not the live cap: the only production caller (server.ts) builds
+// ctx.resultText with firstResultText(), which already truncates at
+// RESULT_SNIPPET_LEN (600), so this branch never fires today. It stays because
+// GraderContext.resultText is a plain string any future caller can fill from
+// raw upstream output -- the volume guard must not depend on every caller
+// remembering to pre-truncate.
 const FENCED_CONTENT_MAX = 4000;
 
 export function buildGraderPrompt(ctx: GraderContext): string {
@@ -98,17 +105,32 @@ export function buildGraderPrompt(ctx: GraderContext): string {
     "--- END UNTRUSTED TOOL OUTPUT ---",
     "",
     "Did the tool call accomplish the goal / return a useful, on-task result?",
-    "Reply with ONLY one word: YES, PARTIAL, or NO.",
+    // Ask for a LABELLED verdict, not a bare word: parseGrade prefers the
+    // `GRADE:` token precisely because it survives a model that narrates
+    // first ("No results were returned, but the call succeeded. GRADE: YES").
+    // The bare-word instruction stays as the fallback contract for a model
+    // that ignores the label.
+    "Reply with ONLY one word: YES, PARTIAL, or NO, on a final line of the form `GRADE: <word>`.",
   );
   return lines.join("\n");
 }
 
-// Map the LLM's one-word reply to a graded reward. YES -> 1.0, PARTIAL -> 0.5,
+// Map the LLM's reply to a graded reward. YES -> 1.0, PARTIAL -> 0.5,
 // NO -> 0.0. Returns null when no recognizable verdict appears so the caller
-// keeps the heuristic. Scans the FIRST matching token so a little stray prose
-// ("NO, it failed") still resolves.
+// keeps the heuristic.
+//
+// Anchored to the reply's FINAL verdict, in two steps. A labelled
+// `GRADE: <word>` token wins outright (that is what buildGraderPrompt asks
+// for); failing that we take the LAST bare verdict word. Taking the FIRST
+// bare word -- the original rule -- mis-grades any reply that narrates before
+// deciding: "No results were returned, but YES the call succeeded" scored 0.0,
+// wiping out a healthy namespace's success credit on the strength of a word in
+// a subordinate clause. A verdict is a conclusion, so the last one the model
+// wrote is the one it stands behind.
 export function parseGrade(text: string): number | null {
-  const m = /\b(yes|partial|no)\b/i.exec(text);
+  const labelled = [...text.matchAll(/\bGRADE\s*:\s*(yes|partial|no)\b/gi)];
+  const candidates = labelled.length > 0 ? labelled : [...text.matchAll(/\b(yes|partial|no)\b/gi)];
+  const m = candidates[candidates.length - 1];
   if (!m) return null;
   switch (m[1].toLowerCase()) {
     case "yes":

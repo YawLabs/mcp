@@ -544,6 +544,40 @@ describe("fetchToolsFromUpstream metadata and task-required tools", () => {
   });
 });
 
+describe("fetchResourcesFromUpstream / fetchPromptsFromUpstream metadata", () => {
+  // MCP 2025-06-18 gives resources and prompts the same `title` + `_meta`
+  // fields tools already had. Both fetchers used to build their defs field
+  // by field WITHOUT them, so an upstream display name was replaced by the
+  // raw name downstream and _meta never survived the proxy.
+  it("forwards a resource's title and _meta alongside the namespaced URI", async () => {
+    const resources = [
+      { uri: "file:///a", name: "a", title: "Alpha", _meta: { "example.com/kind": "doc" } },
+      { uri: "file:///b", name: "b" },
+    ];
+    const client = makeClient({ listResources: vi.fn().mockResolvedValue({ resources }) });
+
+    const out = await fetchResourcesFromUpstream(client, "ns");
+    expect(out[0].title).toBe("Alpha");
+    expect(out[0]._meta).toEqual({ "example.com/kind": "doc" });
+    expect(out[0].namespacedUri).toBe("connect://ns/file:///a");
+    // Absent upstream fields stay absent -- no title synthesized from `name`.
+    expect(out[1].title).toBeUndefined();
+    expect(out[1]._meta).toBeUndefined();
+  });
+
+  it("forwards a prompt's title and _meta alongside the namespaced name", async () => {
+    const prompts = [{ name: "p", title: "Pretty Prompt", _meta: { "example.com/kind": "helper" } }, { name: "q" }];
+    const client = makeClient({ listPrompts: vi.fn().mockResolvedValue({ prompts }) });
+
+    const out = await fetchPromptsFromUpstream(client, "ns");
+    expect(out[0].title).toBe("Pretty Prompt");
+    expect(out[0]._meta).toEqual({ "example.com/kind": "helper" });
+    expect(out[0].namespacedName).toBe("ns_p");
+    expect(out[1].title).toBeUndefined();
+    expect(out[1]._meta).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Helpers for connectToUpstream-based tests
 // ---------------------------------------------------------------------------
@@ -1441,6 +1475,68 @@ describe("connectToUpstream list-changed chains", () => {
     expect(_sdkBehavior.notificationHandlers).toEqual([]);
   });
 
+  it("queues a list_changed that arrives DURING the initial fetch instead of dropping it", async () => {
+    // The handlers used to be registered AFTER the three initial fetches, so
+    // a notification landing in the connect->fetch window hit the SDK with no
+    // handler and was discarded: the inventory then stayed at whatever the
+    // initial fetch saw until some later list_changed that may never come.
+    const onListChanged = vi.fn();
+    const firstFetch = deferred();
+    let calls = 0;
+    _sdkBehavior.clientListTools = () => {
+      calls += 1;
+      return calls === 1
+        ? firstFetch.promise.then(() => ({ tools: [{ name: "initial", inputSchema: { type: "object" } }] }))
+        : Promise.resolve({ tools: [{ name: "after-notification", inputSchema: { type: "object" } }] });
+    };
+
+    const connectP = connectToUpstream(makeLocalConfig(), undefined, onListChanged);
+    await flush();
+    // Registered already, with the initial fetch still in flight: pre-fix this
+    // line threw "no notification handler was registered for that schema".
+    const refresh = handlerFor(ToolListChangedNotificationSchema)({ method: "notifications/tools/list_changed" });
+
+    // Queued, not raced: the gate holds the refresh until the initial fetch
+    // has landed and the connection object exists.
+    await flush();
+    expect(calls).toBe(1);
+    expect(onListChanged).not.toHaveBeenCalled();
+
+    firstFetch.resolve();
+    const connection = await connectP;
+    await refresh;
+
+    expect(calls).toBe(2);
+    expect(connection.tools.map((t) => t.name)).toEqual(["after-notification"]);
+    expect(onListChanged).toHaveBeenCalledWith("test");
+  });
+
+  it("never runs a queued refresh when the connect ultimately FAILS", async () => {
+    // The gate is only released on the success path, so a notification that
+    // queued during a doomed connect must not fire a fetch against the client
+    // the catch block just closed.
+    const onListChanged = vi.fn();
+    let calls = 0;
+    _sdkBehavior.clientListTools = () => {
+      calls += 1;
+      return Promise.reject(new Error("tools/list exploded"));
+    };
+
+    const connectP = connectToUpstream(makeLocalConfig(), undefined, onListChanged).catch((e) => e);
+    await flush();
+    const refresh = handlerFor(ToolListChangedNotificationSchema)({ method: "notifications/tools/list_changed" });
+
+    const err = await connectP;
+    await flush();
+
+    expect(err).toBeInstanceOf(ActivationError);
+    // Exactly the one initial (failed) fetch -- the queued refresh stayed put.
+    expect(calls).toBe(1);
+    expect(onListChanged).not.toHaveBeenCalled();
+    // The queued chain is deliberately never settled; nothing awaits it.
+    void refresh;
+  });
+
   for (const category of LIST_CHANGED_CATEGORIES) {
     it(`serializes back-to-back ${category.label} notifications so the LAST one wins`, async () => {
       const onListChanged = vi.fn();
@@ -2082,5 +2178,72 @@ describe("connectToUpstream activation failure categories", () => {
       { kind: "sse", url: "https://mcp.example.test/sse" },
       { kind: "http", url: "https://mcp.example.test/mcp" },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Remote-entry diagnostics. bundles.json validation is looser than the remote
+// branch of connectToUpstream: it accepts an `env` map and a "stdio" transport
+// on a remote entry, neither of which the branch can honour. Both used to be
+// dropped in silence, so the operator saw only an unexplained 401 or an
+// HTTP-shaped failure against a URL they thought spoke stdio.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream remote-entry diagnostics", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    // Fail the connect: the diagnostics all fire in the transport-selection
+    // branch, well before the handshake, so the reject keeps the test short.
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("fetch failed"));
+    _sdkBehavior.remoteConstructions = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+    vi.mocked(log).mockClear();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** Warn-level messages emitted during the call, in order. */
+  function warnings(): string[] {
+    return vi
+      .mocked(log)
+      .mock.calls.filter((c) => c[0] === "warn")
+      .map((c) => String(c[1]));
+  }
+
+  it("warns that a remote entry's env (and its ${secret:...} refs) is never sent", async () => {
+    await connectToUpstream(makeRemoteConfig({ env: { TOKEN: "${secret:TOKEN}" } })).catch(() => {});
+
+    const warned = warnings().filter((m) => m.includes("Ignoring env on a remote server"));
+    expect(warned).toHaveLength(1);
+    // The key names go in the structured field so the operator can see WHICH
+    // vars were dropped without the value ever being logged.
+    const call = vi.mocked(log).mock.calls.find((c) => String(c[1]).includes("Ignoring env on a remote server"));
+    expect(call?.[2]).toMatchObject({ namespace: "test", keys: ["TOKEN"] });
+  });
+
+  it("stays quiet for a remote entry with no env, or an empty one", async () => {
+    await connectToUpstream(makeRemoteConfig()).catch(() => {});
+    await connectToUpstream(makeRemoteConfig({ env: {} })).catch(() => {});
+    expect(warnings().filter((m) => m.includes("Ignoring env on a remote server"))).toHaveLength(0);
+  });
+
+  it('warns that transport "stdio" on a remote entry falls through to streamable-http', async () => {
+    await connectToUpstream(makeRemoteConfig({ transport: "stdio" })).catch(() => {});
+
+    expect(warnings().some((m) => m.includes('transport "stdio"') && m.includes("streamable-http"))).toBe(true);
+    // ...and the fallthrough itself is unchanged: still streamable-http.
+    expect(_sdkBehavior.remoteConstructions).toEqual([{ kind: "http", url: "https://mcp.example.test/mcp" }]);
+  });
+
+  it('stays quiet for the honoured remote transports ("sse" and the default)', async () => {
+    await connectToUpstream(makeRemoteConfig({ transport: "sse" })).catch(() => {});
+    await connectToUpstream(makeRemoteConfig({ transport: "streamable-http" })).catch(() => {});
+    await connectToUpstream(makeRemoteConfig()).catch(() => {});
+    expect(warnings().some((m) => m.includes('transport "stdio"'))).toBe(false);
   });
 });

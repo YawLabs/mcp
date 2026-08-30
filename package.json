@@ -11,7 +11,7 @@
   },
   "files": [
     "dist",
-    "!dist/**/*.test.*",
+    "schemas",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -39,7 +39,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
-    "@types/node": "^26.0.0",
+    "@types/node": "^20.19.43",
     "esbuild": "^0.28.1",
     "tsup": "^8.4.0",
     "typescript": "^7.0.2",

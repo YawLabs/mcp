@@ -183,6 +183,20 @@ describe("resolveCatalogSlug", () => {
     await resolveCatalogSlug("s", { fetchCatalog });
     expect(fetchCatalog).toHaveBeenLastCalledWith(DEFAULT_CATALOG_URL);
   });
+
+  // A SET-BUT-EMPTY override is the YAW_MCP_CATALOG_URL="" shape (a CI
+  // variable declared with no value, a bare `export`), and "" is not nullish
+  // -- so the `??` fallbacks in `add` / `try` handed it straight through to
+  // fetch(""). That throws a bare TypeError, and defaultFetchCatalog's
+  // unwrapped-rethrow gate (`err.message.includes(url)`) is trivially true for
+  // the empty string, so even the friendly wrapper was skipped.
+  it("treats a set-but-empty (or whitespace-only) catalogUrl as unset", async () => {
+    const fetchCatalog = vi.fn<FetchCatalog>().mockResolvedValue([{ slug: "s", install: { command: "npx s" } }]);
+    await resolveCatalogSlug("s", { fetchCatalog, catalogUrl: "" });
+    expect(fetchCatalog).toHaveBeenLastCalledWith(DEFAULT_CATALOG_URL);
+    await resolveCatalogSlug("s", { fetchCatalog, catalogUrl: "   " });
+    expect(fetchCatalog).toHaveBeenLastCalledWith(DEFAULT_CATALOG_URL);
+  });
 });
 
 describe("defaultFetchCatalog", () => {
@@ -208,6 +222,16 @@ describe("defaultFetchCatalog", () => {
     expect(url).toBe(DEFAULT_CATALOG_URL);
     expect(init.headers.accept).toBe("application/json");
     expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  // Same empty-is-unset rule at the fetch boundary: the `url` parameter has a
+  // default, but a DEFAULT only fills in for undefined -- an explicit "" would
+  // otherwise be fetched.
+  it("fetches the default catalog when handed an empty URL", async () => {
+    const f = stubFetch(async () => ({ ok: true, status: 200, json: async () => ({ servers: [{ slug: "a" }] }) }));
+    const servers = await defaultFetchCatalog("");
+    expect(servers.map((s) => s.slug)).toEqual(["a"]);
+    expect((f.mock.calls[0] as [string])[0]).toBe(DEFAULT_CATALOG_URL);
   });
 
   it("drops entries that are not objects or carry no string slug", async () => {

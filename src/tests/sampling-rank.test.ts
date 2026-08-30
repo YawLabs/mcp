@@ -115,6 +115,28 @@ describe("parseTiebreakResponse", () => {
     expect(parseTiebreakResponse("aws-s3 beats aws-s3-tools here", hyphenCandidates)).toBe("aws-s3");
   });
 
+  it("resolves a prefix-shaped mention in the CANONICAL underscore namespace shape", () => {
+    // The hyphen test above pins a shape NAMESPACE_RE (local-bundles.ts,
+    // /^[a-z][a-z0-9_]{0,29}$/) currently REJECTS -- '-' is not a legal
+    // namespace character. The shape real namespaces actually take joins with
+    // '_', which is a word character, so `\b` cannot fire between "aws_s3"
+    // and its "_tools" suffix: only the longer namespace matches at all and
+    // the position/length tiebreak never runs. Pinned so that relaxing
+    // NAMESPACE_RE to allow '-' (which would route these mentions through the
+    // tiebreak instead) has to face a test on the shape in production use.
+    const underscoreCandidates = [
+      { namespace: "aws_s3", score: 1.0, tools: [{ name: "list_buckets" }] },
+      { namespace: "aws_s3_tools", score: 0.98, tools: [{ name: "sync_bucket" }] },
+    ];
+    expect(parseTiebreakResponse("use aws_s3_tools for this", underscoreCandidates)).toBe("aws_s3_tools");
+    // Order-independent, exactly as in the hyphen case.
+    expect(parseTiebreakResponse("use aws_s3_tools for this", [...underscoreCandidates].reverse())).toBe(
+      "aws_s3_tools",
+    );
+    // The shorter namespace still wins when it is the one named.
+    expect(parseTiebreakResponse("use aws_s3 for this", underscoreCandidates)).toBe("aws_s3");
+  });
+
   it("handles a namespace containing regex-special characters without throwing", () => {
     // Namespaces like "aws+s3" contain '+', which is a regex quantifier.
     // escapeRegex must neutralize it so the RegExp constructor doesn't throw

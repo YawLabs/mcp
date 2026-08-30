@@ -367,6 +367,43 @@ describe("findProjectConfigDir outside $HOME", () => {
     expect(await findProjectConfigDir(project, home)).toBeNull();
   });
 
+  it("warns about the same untrusted candidate only once per process", async () => {
+    // The walk runs on every config load, and three independent callers
+    // (config-loader, guide.ts, local-bundles) each trigger one -- so a
+    // per-walk warn meant a win32 checkout on a second drive logged the same
+    // untrusted-dir line on every doctor / list / profile refresh. The SKIP
+    // still happens every time (both calls return null); only the log line
+    // is deduplicated.
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    stubGeteuid(999_999_999);
+    const written: string[] = [];
+    const orig = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown): boolean => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      expect(await findProjectConfigDir(project, home)).toBeNull();
+      expect(await findProjectConfigDir(project, home)).toBeNull();
+    } finally {
+      process.stderr.write = orig;
+    }
+    // Filter to THIS test's candidate. The dedupe set is module-level and the
+    // walk can warn about other untrusted candidates in the same pass (the
+    // user-global ~/.yaw-mcp among them), so counting every untrusted-dir line
+    // on stderr made the assertion depend on which sibling tests had already
+    // run and primed that set -- green in file order, red in isolation.
+    // Parse rather than substring-match: the log line is JSON, so a win32
+    // path arrives with its backslashes escaped.
+    const target = realpathSync(cfgDir);
+    const warns = written.filter(
+      (line) =>
+        line.includes("Skipping an untrusted .yaw-mcp/ dir outside $HOME") && JSON.parse(line).candidate === target,
+    );
+    expect(warns).toHaveLength(1);
+  });
+
   it("skips an outside-$HOME .yaw-mcp/ that resolves to the user-global dir and keeps walking", async () => {
     // A symlink inside the project tree pointing at ~/.yaw-mcp must not be
     // claimed as PROJECT config (that would double-load the user-global

@@ -2253,3 +2253,216 @@ describe("readEntryAt", () => {
     expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: [] } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
   });
 });
+
+describe("mergePermissionsAllow — non-string entries", () => {
+  it("keeps non-string elements of a pre-existing allow array", () => {
+    // The filter used to type-narrow to string, so anything else a user (or a
+    // future Claude Code schema) had put in permissions.allow was DELETED on
+    // the next install -- the opposite of what the surrounding code promises.
+    const existing = { permissions: { allow: ["Bash(git *)", { rule: "custom" }, 7, ["nested"]] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    expect((merged.permissions as { allow: unknown[] }).allow).toEqual([
+      "Bash(git *)",
+      { rule: "custom" },
+      7,
+      ["nested"],
+      CLAUDE_CODE_ALLOW_PATTERN,
+    ]);
+  });
+
+  it("still drops a dead legacy pattern sitting beside a non-string element", () => {
+    // Retention must not cost the legacy-wildcard cleanup: only the STRING
+    // elements are eligible for the drop, and they still get dropped.
+    const existing = { permissions: { allow: ["mcp__yaw_mcp__*", { rule: "custom" }] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    expect((merged.permissions as { allow: unknown[] }).allow).toEqual([{ rule: "custom" }, CLAUDE_CODE_ALLOW_PATTERN]);
+  });
+
+  it("a mixed-type allow array survives a real install", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({ permissions: { allow: ["Bash(git *)", { rule: "custom" }] } }),
+    );
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const settings = JSON.parse(readFileSync(join(settingsDir, "settings.json"), "utf8"));
+    expect(settings.permissions.allow).toEqual(["Bash(git *)", { rule: "custom" }, CLAUDE_CODE_ALLOW_PATTERN]);
+  });
+});
+
+describe("runInstall — Runtime line ordering", () => {
+  it("refuses a malformed client config WITHOUT first claiming a runtime", async () => {
+    // The oam probe and its whole Runtime log chain used to run before the
+    // target file was read, so a broken ~/.claude.json produced
+    // "Runtime: node (oam is not installed...)" and THEN "not valid JSON ...
+    // Refusing" -- a runtime claim for a write that never happened.
+    writeFileSync(join(synthHome, ".claude.json"), "{ this is not json");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/not valid JSON/);
+    // Nothing is written, so nothing describes a runtime.
+    expect(r.messages.join("\n")).not.toMatch(/Runtime:/);
+    expect(cap.stdout()).not.toMatch(/Runtime:/);
+  });
+
+  it("still prints the Runtime line on a run that goes on to write", async () => {
+    // The move must not cost the line on the normal path.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toMatch(/Runtime: node \(oam is not installed/);
+  });
+});
+
+describe("runInstall --list — display + flag handling", () => {
+  it("renders the tilde separator of the LISTED os, not the host platform", async () => {
+    // `install --list --os linux` on Windows used to print `~\.claude.json`:
+    // the row's path came from the listed os while its separator came from
+    // process.platform, so one row described two machines.
+    const listedOs = process.platform === "win32" ? "linux" : "windows";
+    const cap = captureIo();
+    const r = await runInstall({
+      os: listedOs,
+      home: synthHome,
+      cwd: synthCwd,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    const expected = listedOs === "windows" ? "~\\" : "~/";
+    const wrong = listedOs === "windows" ? "~/" : "~\\";
+    expect(out).toContain(expected);
+    expect(out).not.toContain(wrong);
+
+    // A MULTI-SEGMENT row, not just the two-char prefix. `absolute` is built
+    // with node:path on the host, so normalizing only the leading separator
+    // still left `~/.cursor\mcp.json` -- which satisfies the prefix
+    // assertions above while being a shape neither OS uses.
+    const cursorRow = listedOs === "windows" ? "~\\.cursor\\mcp.json" : "~/.cursor/mcp.json";
+    expect(out).toContain(cursorRow);
+  });
+});
+
+describe("parseInstallArgs — --list and write-decision flags", () => {
+  it("refuses --list combined with --force or --skip", () => {
+    // Same silent-ignore class as --all --scope: runInstallList never writes a
+    // file, so it never consults either flag, and an accepted-then-dropped flag
+    // reads as honored.
+    for (const flag of ["--force", "--skip"]) {
+      const r = parseInstallArgs(["--list", flag]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain(flag);
+    }
+  });
+
+  it("still accepts --list --dry-run (the documented cross-OS preview spelling)", () => {
+    const r = parseInstallArgs(["--list", "--dry-run"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.listOnly).toBe(true);
+  });
+});
+
+describe("runInstall — --project-dir resolution", () => {
+  it("resolves a RELATIVE --project-dir against opts.cwd, not process.cwd()", async () => {
+    // The one place project resolution ignored the cwd override: `resolve(rel)`
+    // is resolve-against-process.cwd(), so a hermetic caller passing both cwd
+    // and a relative --project-dir got a path in the runner's directory.
+    // --dry-run so the assertion is about the RESOLVED path, with no write.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "vscode",
+      scope: "project",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: "nested-proj",
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.wouldWrite).toContain(join(synthCwd, "nested-proj", ".vscode", "mcp.json"));
+    expect(r.wouldWrite.join("|")).not.toContain(join(process.cwd(), "nested-proj"));
+  });
+});
+
+describe("runInstall --all — an all-refused run", () => {
+  // Both user-scope clients (claude-code, cursor) already carry an entry, and
+  // stdin is not a TTY with no --force/--skip: every sub-install refuses.
+  const seedBothColliding = (): void => {
+    const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(join(synthHome, ".cursor", "mcp.json"), JSON.stringify(seeded), "utf8");
+  };
+
+  it("returns a trail with only the CONSOLIDATED refusal, not the swallowed per-client ones", async () => {
+    // The per-client stderr shim suppresses each sub-install's refusal, but the
+    // sub-install had already pushed it into its own `messages`, and those were
+    // spliced into the parent trail wholesale -- so the returned trail carried N
+    // lines the user never saw, plus the consolidated line, while `messages` is
+    // documented as exactly what was printed.
+    seedBothColliding();
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    const refusals = r.messages.filter((m) => /stdin is not a TTY/.test(m));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toContain("--all --force");
+    // The trail matches the transcript: one refusal on each side.
+    expect(cap.stderr().split("stdin is not a TTY").length - 1).toBe(1);
+  });
+
+  it("does not print the oam-absent runtime tip when nothing was written", async () => {
+    // The note is advice ABOUT the entries a run produced. After an all-refused
+    // run there are none, so it landed directly above the collision hint and the
+    // failure summary as a tip for entries that do not exist.
+    seedBothColliding();
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stdout()).not.toContain(OAM_INSTALL_SH);
+  });
+});

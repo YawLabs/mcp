@@ -1,11 +1,15 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveComplianceSuiteVersion } from "../audit-cmd.js";
 import {
   COMPLIANCE_USAGE,
+  createInterruptHandler,
   formatLaunchFailure,
+  INTERRUPT_EXIT_CODE,
   isRenderableReport,
   PUBLISH_REMOVED_MESSAGE,
+  resolveComplianceSuiteSpec,
   resolveNpxLaunch,
   runComplianceCommand,
 } from "../compliance-cmd.js";
@@ -78,6 +82,68 @@ describe("runComplianceCommand arg handling", () => {
     expect(cap.err()).toBe(PUBLISH_REMOVED_MESSAGE);
   });
 
+  it("--publish=<value> is rejected too, not just the bare flag", async () => {
+    // A removed flag is the one a user is most likely to type with its old
+    // ARGUMENT still attached (the retired backend took `--publish=public`).
+    // An exact-match `argv.includes("--publish")` let that spelling through to
+    // the child as an unrecognized extra arg -- exactly the opaque failure this
+    // branch exists to replace, and only for the spelling people actually used.
+    for (const spelling of ["--publish=public", "--publish=private", "--publish="]) {
+      const cap = captureIo();
+      const code = await runComplianceCommand(["https://example.com/mcp", spelling], cap.io);
+      expect(code).toBe(2);
+      expect(cap.err()).toBe(PUBLISH_REMOVED_MESSAGE);
+      expect(cap.out()).toBe("");
+    }
+  });
+
+  it("does not mistake a different flag that merely starts with --publish", async () => {
+    // The prefix match is anchored on `--publish=`, not on "--publish": a
+    // bare startsWith would swallow a hypothetical `--publisher` and refuse a
+    // flag that was never removed. Spawn is mocked so the forwarding path can
+    // be exercised without launching npx.
+    const report = {
+      grade: "A",
+      score: 100,
+      url: "https://example.com/mcp",
+      summary: { total: 1, passed: 1, failed: 0, required: 1, requiredPassed: 1 },
+      tests: [],
+    };
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const spawn = (_command: string, args: string[]) => {
+        calls.push(args);
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          pid: number;
+          kill: () => boolean;
+        };
+        child.stdout = new EventEmitter();
+        child.pid = 4242;
+        child.kill = () => true;
+        setImmediate(() => {
+          child.stdout.emit("data", Buffer.from(JSON.stringify(report)));
+          child.emit("close", 0);
+        });
+        return child;
+      };
+      return { spawn, default: { spawn } };
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const code = await mod.runComplianceCommand(["https://example.com/mcp", "--publisher"], cap.io);
+      expect(code).toBe(0);
+      expect(cap.err()).not.toContain("--publish was removed");
+      // Forwarded to the child like any other extra arg.
+      expect((calls[0] ?? []).join(" ")).toContain("--publisher");
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
   it("defaults to the real process streams when no io is injected", async () => {
     const out = vi.spyOn(process.stdout, "write").mockReturnValue(true);
     const code = await runComplianceCommand(["--help"]);
@@ -148,6 +214,60 @@ describe("resolveNpxLaunch", () => {
     ).toBeNull();
   });
 
+  // Built from a char code rather than typed as an escape so no editing layer
+  // between here and disk can quietly halve the run -- the whole point of
+  // these cases is the exact number of trailing backslashes.
+  const BS = String.fromCharCode(92);
+
+  it("refuses a win32 argument ending in a backslash (it would escape the closing quote)", () => {
+    // quoteForShell wraps a win32 arg as `"<arg>"`. CommandLineToArgvW -- which
+    // node uses to split the command line back into argv on the receiving side
+    // -- reads a `\"` as a LITERAL quote, so a trailing backslash never closes
+    // the quoted run and the NEXT argument is merged into this one. Before the
+    // refusal this produced a launch whose argv was silently one element short.
+    const target = `C:${BS}Program Files${BS}srv${BS}`;
+    expect(
+      resolveNpxLaunch(["-y", "pkg", target], {
+        execPath: "C:\\nodejs\\node.exe",
+        platform: "win32",
+        exists: () => false,
+      }),
+    ).toBeNull();
+    // A doubled trailing run is the same hazard: cmd hands the text through and
+    // the receiving parser still sees the final `\` against the closing quote.
+    expect(
+      resolveNpxLaunch(["-y", `dir${BS}${BS}`], {
+        execPath: "C:\\nodejs\\node.exe",
+        platform: "win32",
+        exists: () => false,
+      }),
+    ).toBeNull();
+  });
+
+  it("still accepts a win32 argument whose backslashes are interior", () => {
+    // Only the TRAILING position is dangerous -- refusing every Windows path
+    // would make the fallback useless on the platform it exists for.
+    const launch = resolveNpxLaunch(["-y", `C:${BS}srv${BS}main.js`], {
+      execPath: "C:\\nodejs\\node.exe",
+      platform: "win32",
+      exists: () => false,
+    });
+    expect(launch?.shell).toBe(true);
+    expect(launch?.args).toEqual(['"-y"', `"C:${BS}srv${BS}main.js"`]);
+  });
+
+  it("leaves a trailing backslash alone on POSIX, where single quotes are literal", () => {
+    // The refusal is a win32-quoting concern; `'a\'` is a perfectly good POSIX
+    // single-quoted token and must not be collateral damage.
+    const launch = resolveNpxLaunch(["-y", `dir${BS}`], {
+      execPath: "/usr/local/bin/node",
+      platform: "linux",
+      exists: () => false,
+    });
+    expect(launch?.shell).toBe(true);
+    expect(launch?.args).toEqual(["'-y'", `'dir${BS}'`]);
+  });
+
   // Live smoke on THIS machine's node: the resolved launch must actually
   // start (no EINVAL). `npx --version` is offline and prints the npm version.
   it("the resolved launch actually spawns on this host", async () => {
@@ -199,6 +319,19 @@ describe("formatLaunchFailure", () => {
     const msg = formatLaunchFailure(["-y", "pkg"], "linux");
     expect(msg).toContain("Install npm");
     expect(msg).toContain("cannot be safely quoted");
+  });
+
+  it("names the trailing backslash and echoes the offending win32 path", () => {
+    // The character class quoteForShell refuses has to stay in lockstep with
+    // the sentence naming it: a path rejected for its trailing separator used
+    // to be explained by a list that mentioned only quotes, percent signs,
+    // newlines and NUL bytes -- none of which appear in it.
+    const target = `C:${String.fromCharCode(92)}srv${String.fromCharCode(92)}`;
+    const msg = formatLaunchFailure(["-y", "pkg", target], "win32");
+    expect(msg).toContain("trailing backslash");
+    expect(msg).toContain(JSON.stringify(target));
+    // Still a win32-only concern; a POSIX operator must not see it.
+    expect(formatLaunchFailure(["-y", "it's"], "linux")).not.toContain("trailing backslash");
   });
 });
 
@@ -291,6 +424,170 @@ describe("isRenderableReport", () => {
     expect(isRenderableReport({ grade: "A", score: 1 })).toBe(false);
     expect(isRenderableReport(null)).toBe(false);
     expect(isRenderableReport("nope")).toBe(false);
+  });
+
+  it("rejects a non-string grade instead of printing it as a letter", () => {
+    // `grade` was checked for truthiness only, so a suite that switched the
+    // field to a numeric score passed the gate and printSummary interpolated
+    // it: "Compliance: 5 (91.5%)" reads as a letter grade of 5. Every other
+    // rendered field is type-checked; this one was the hole.
+    expect(isRenderableReport({ ...base, grade: 5 })).toBe(false);
+    expect(isRenderableReport({ ...base, grade: true })).toBe(false);
+    expect(isRenderableReport({ ...base, grade: ["A"] })).toBe(false);
+    expect(isRenderableReport({ ...base, grade: { letter: "A" } })).toBe(false);
+    // An empty string renders as "Compliance:  (91.5%)" -- also not a grade.
+    expect(isRenderableReport({ ...base, grade: "" })).toBe(false);
+    // The real shape still passes.
+    expect(isRenderableReport({ ...base, grade: "F" })).toBe(true);
+  });
+});
+
+// `compliance` and `audit` are two front doors onto the same suite. `audit`
+// runs the PINNED dependency and records its version as `suiteVersion` in
+// grades.json; `compliance` shelled out to `npx -y @yawlabs/mcp-compliance`
+// with no pin, so it graded under whatever npm called latest. Once latest moved
+// ahead of the dependency the two could hand the same server different letters
+// with nothing in either output naming the rubric.
+describe("compliance suite version pin", () => {
+  it("pins the spec to the dependency version audit records", async () => {
+    const version = await resolveComplianceSuiteVersion();
+    const spec = await resolveComplianceSuiteSpec();
+    // This repo has the dependency installed, so the pin must resolve here.
+    expect(version).toBeTypeOf("string");
+    expect(spec).toBe(`@yawlabs/mcp-compliance@${version}`);
+    // The unpinned spelling is precisely what regressed.
+    expect(spec).not.toBe("@yawlabs/mcp-compliance");
+  });
+
+  it("hands the pinned spec to npx rather than the bare package name", async () => {
+    const version = await resolveComplianceSuiteVersion();
+    expect(version).toBeTypeOf("string");
+    const report = {
+      grade: "A",
+      score: 100,
+      url: "https://example.com/mcp",
+      summary: { total: 1, passed: 1, failed: 0, required: 1, requiredPassed: 1 },
+      tests: [],
+    };
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const spawn = (_command: string, args: string[]) => {
+        calls.push(args);
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          pid: number;
+          kill: () => boolean;
+        };
+        child.stdout = new EventEmitter();
+        child.pid = 4242;
+        child.kill = () => true;
+        setImmediate(() => {
+          child.stdout.emit("data", Buffer.from(JSON.stringify(report)));
+          child.emit("close", 0);
+        });
+        return child;
+      };
+      return { spawn, default: { spawn } };
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const code = await mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(1);
+      // resolveNpxLaunch may prepend node + npx-cli.js (or shell-quote each
+      // element), so assert on the presence of the spec token rather than a
+      // fixed index.
+      const flat = (calls[0] ?? []).join(" ");
+      expect(flat).toContain(`@yawlabs/mcp-compliance@${version}`);
+      // The bare name must not appear as a standalone spec token any more.
+      expect(flat).not.toMatch(/@yawlabs\/mcp-compliance(?!@)/);
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+});
+
+// Registering a `process.once` SIGINT listener suppresses node's default "die
+// on the signal" behaviour, so the handler owns the promise that the run ends.
+// killTree is best-effort (it shells out to taskkill on Windows and swallows
+// the error), and when it fails to land the first Ctrl-C was consumed for
+// nothing: the CLI sat on a child that would never close until a SECOND
+// interrupt -- the shape a user reads as a hang.
+describe("createInterruptHandler", () => {
+  it("force-exits when the kill did not take the child down within the grace window", () => {
+    vi.useFakeTimers();
+    try {
+      let directKills = 0;
+      const child = {
+        pid: 4242,
+        kill: () => {
+          directKills += 1;
+          return true;
+        },
+      } as unknown as Parameters<typeof createInterruptHandler>[0];
+      const exits: number[] = [];
+      // A killTree that does nothing -- the real win32 failure mode, where
+      // taskkill cannot spawn and the error is deliberately swallowed.
+      const handler = createInterruptHandler(child, {
+        graceMs: 50,
+        exit: (c) => exits.push(c),
+        kill: () => {},
+      });
+      handler.onInterrupt();
+      expect(exits).toEqual([]);
+      vi.advanceTimersByTime(49);
+      expect(exits).toEqual([]);
+      vi.advanceTimersByTime(1);
+      // Direct kill first (it reaches the wrapper even when the tree walk
+      // failed), then the forced exit so ONE Ctrl-C always ends the run.
+      expect(directKills).toBe(1);
+      expect(exits).toEqual([INTERRUPT_EXIT_CODE]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not force-exit when the run settles first", () => {
+    vi.useFakeTimers();
+    try {
+      const child = { pid: 1, kill: () => true } as unknown as Parameters<typeof createInterruptHandler>[0];
+      const exits: number[] = [];
+      const handler = createInterruptHandler(child, { graceMs: 50, exit: (c) => exits.push(c), kill: () => {} });
+      handler.onInterrupt();
+      handler.cancel();
+      vi.advanceTimersByTime(5000);
+      expect(exits).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("arms exactly one fallback no matter how many interrupts arrive", () => {
+    vi.useFakeTimers();
+    try {
+      const child = { pid: 1, kill: () => true } as unknown as Parameters<typeof createInterruptHandler>[0];
+      const exits: number[] = [];
+      let killTreeCalls = 0;
+      const handler = createInterruptHandler(child, {
+        graceMs: 50,
+        exit: (c) => exits.push(c),
+        kill: () => {
+          killTreeCalls += 1;
+        },
+      });
+      handler.onInterrupt();
+      handler.onInterrupt();
+      handler.onInterrupt();
+      // Every interrupt still re-attempts the kill -- only the timer is single.
+      expect(killTreeCalls).toBe(3);
+      vi.advanceTimersByTime(5000);
+      expect(exits).toEqual([INTERRUPT_EXIT_CODE]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

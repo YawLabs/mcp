@@ -9,7 +9,15 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { formatRelativeAge, oamRunEntryPath, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
+import {
+  DOCTOR_USAGE,
+  formatRelativeAge,
+  oamRunEntryPath,
+  parseDoctorArgs,
+  registrySkipCheck,
+  runDoctor,
+  scanShellHistoryForShadows,
+} from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
@@ -507,6 +515,20 @@ describe("scanShellHistoryForShadows", () => {
     expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
   });
 
+  it("counts a file once when HISTFILE points at a source already in the list", () => {
+    // `export HISTFILE=$HOME/.zsh_history` is a normal thing to have in a
+    // dotfiles repo. The HISTFILE entry and the hardcoded ~/.zsh_history entry
+    // then name the SAME file, and the scan counted every command in it twice
+    // -- which inflates SHADOWED CLI USAGE and can push a CLI over the
+    // reporting threshold on a single real invocation.
+    const zsh = join(synthHome, ".zsh_history");
+    writeFileSync(zsh, [": 1700000000:0;npm audit", ": 1700000001:0;npm search lodash"].join("\n"));
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: zsh } });
+    // 2, not 4 (double-counted) and not 0 (deduped down to the `plain`
+    // reader, which sees ':' as the leading binary for a zsh-format line).
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(2);
+  });
+
   it("strips leading env-var assignments and sudo", () => {
     writeFileSync(
       join(synthHome, ".bash_history"),
@@ -757,16 +779,16 @@ describe("runDoctor — RELIABILITY section", () => {
     // Healthy entries must not appear.
     expect(txt).not.toMatch(/ {2}solid /);
     // Ordering: dead (0%) < severe (20%) < zzz (50%) < mild (70%).
-    const deadIdx = txt.indexOf("dead —");
-    const severeIdx = txt.indexOf("severe —");
-    const zzzIdx = txt.indexOf("zzz —");
-    const mildIdx = txt.indexOf("mild —");
+    const deadIdx = txt.indexOf("dead --");
+    const severeIdx = txt.indexOf("severe --");
+    const zzzIdx = txt.indexOf("zzz --");
+    const mildIdx = txt.indexOf("mild --");
     expect(deadIdx).toBeGreaterThan(-1);
     expect(deadIdx).toBeLessThan(severeIdx);
     expect(severeIdx).toBeLessThan(zzzIdx);
     expect(zzzIdx).toBeLessThan(mildIdx);
     // Format carries call counts + rate + relative age.
-    expect(txt).toMatch(/dead — 4 calls, 0% success, last used/);
+    expect(txt).toMatch(/dead -- 4 calls, 0% success, last used/);
   });
 
   it("is skipped when YAW_MCP_DISABLE_PERSISTENCE is set", async () => {
@@ -808,11 +830,11 @@ describe("runDoctor — ENVIRONMENT section", () => {
     expect(txt).toMatch(/ENVIRONMENT \(behavior overrides\)/);
     // Every tracked var must be listed so support can see at a glance
     // whether the user set it. Default-hint strings prove the row is
-    // rendered with the "(not set — …)" form rather than a raw value.
-    expect(txt).toMatch(/YAW_MCP_SERVER_CAP\s+\(not set — default 6\)/);
-    expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+\(not set — filter inactive\)/);
-    expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+\(not set — auto-load inactive\)/);
-    expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set — pruning active\)/);
+    // rendered with the "(not set -- …)" form rather than a raw value.
+    expect(txt).toMatch(/YAW_MCP_SERVER_CAP\s+\(not set -- default 6\)/);
+    expect(txt).toMatch(/YAW_MCP_MIN_COMPLIANCE\s+\(not set -- filter inactive\)/);
+    expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+\(not set -- auto-load inactive\)/);
+    expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set -- pruning active\)/);
   });
 
   it("prints the raw value (not the default hint) when a var is set", async () => {
@@ -1413,7 +1435,6 @@ describe("runDoctor — --json", () => {
       }),
     );
 
-    let postedEvents = 0;
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -1424,9 +1445,6 @@ describe("runDoctor — --json", () => {
       json: true,
       skipRegistryCheck: true,
       now: () => fixedNow,
-      postTryEvent: async () => {
-        postedEvents += 1;
-      },
     });
 
     const parsed = JSON.parse(r.lines[0]);
@@ -1438,8 +1456,6 @@ describe("runDoctor — --json", () => {
     const after = JSON.parse(readFileSync(clientConfigPath, "utf8"));
     expect(after.mcpServers["yaw-mcp-try-foo"]).toBeUndefined();
     expect(after.mcpServers.keep).toBeDefined();
-    // Telemetry fired (fire-and-forget), confirming the full GC side effect.
-    expect(postedEvents).toBe(1);
   });
 
   it("reports a still-live trial in the trials.live array", async () => {
@@ -1470,7 +1486,6 @@ describe("runDoctor — --json", () => {
       json: true,
       skipRegistryCheck: true,
       now: () => fixedNow,
-      postTryEvent: async () => undefined,
     });
 
     const parsed = JSON.parse(r.lines[0]);
@@ -2530,5 +2545,228 @@ describe("oamRunEntryPath", () => {
     expect(oamRunEntryPath("sh", ["-c", "/usr/local/bin/oam run --no-check /b/index.js"])).toBe("/b/index.js");
     // Payload as args[0], the shape isOamLaunch also accepts.
     expect(oamRunEntryPath("bash", ["oam run /b/index.js"])).toBe("/b/index.js");
+  });
+});
+
+describe("scanShellHistoryForShadows -- window size and wrapper parsing", () => {
+  it("keeps the OLDEST line of a newline-terminated 500-line window", () => {
+    // split() on a newline-TERMINATED file yields a trailing "" that is not a
+    // line. It used to consume one of the 500 tail slots, so the documented
+    // 500-line window was really 499 and the oldest real line fell out.
+    const lines = ["npm audit", ...Array.from({ length: 499 }, () => "ls -la")];
+    writeFileSync(join(synthHome, ".bash_history"), `${lines.join("\n")}\n`);
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+  });
+
+  it("strips a Windows executable suffix from the leading binary", () => {
+    // PowerShell / cmd history records what was typed, and on Windows that is
+    // routinely `npm.cmd`. The shadow map is keyed on bare binary names, so
+    // the suffix used to lose the hit on the one platform that produces it.
+    writeFileSync(join(synthHome, ".bash_history"), ["npm.cmd audit", "gh.EXE pr list"].join("\n"));
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
+  });
+
+  it("strips env / nohup / nice launcher wrappers", () => {
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["env npm audit", "nohup kubectl get pods", "nice aws s3 ls"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "kubectl")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "aws")?.count).toBe(1);
+  });
+
+  it("advances past a TAB-separated wrapper, not just the first space", () => {
+    // Built with fromCharCode so the fixture cannot be broken by an escape
+    // level being eaten somewhere between here and disk.
+    const TAB = String.fromCharCode(9);
+    writeFileSync(join(synthHome, ".bash_history"), `sudo${TAB}npm audit\n`);
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    // indexOf(" ") skipped clean past `npm` to the space inside the args and
+    // reported `audit` as the binary, losing the npm hit entirely.
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "audit")).toBeUndefined();
+  });
+
+  it("honors HISTFILE for the bash source", () => {
+    const custom = join(synthHome, "relocated_history");
+    writeFileSync(custom, "npm audit\n");
+    // The default path is deliberately left empty: a user who relocates
+    // history has nothing in ~/.bash_history, which is exactly the case that
+    // used to report zero shadowed commands.
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: custom } });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+  });
+
+  it("reads pwsh PSReadLine history from the XDG data dir (no APPDATA)", () => {
+    const dir = join(synthHome, ".local", "share", "powershell", "PSReadLine");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "ConsoleHost_history.txt"), "tailscale status\n");
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "tailscale")?.count).toBe(1);
+  });
+
+  it("reads fish history, taking only the cmd records", () => {
+    const dir = join(synthHome, ".local", "share", "fish");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "fish_history"),
+      [
+        "- cmd: npm audit",
+        "  when: 1700000000",
+        "- cmd: gh pr list",
+        "  when: 1700000001",
+        "  paths:",
+        "    - foo",
+      ].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
+  });
+});
+
+describe("runDoctor -- legacy-entry hint on every cannot-launch state", () => {
+  // The hint used to hang off the launchCommandMissing branch alone, so a
+  // config with BOTH a broken oam launch and a legacy entry needed two doctor
+  // runs: the legacy line only appeared once the launch fault was gone.
+  it("appends the legacy hint when the oam entry file is missing", async () => {
+    const oamBin = join(synthHome, "oam");
+    writeFileSync(oamBin, "");
+    const gone = join(synthHome, "gone", "broker.js");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", gone] },
+          "mcp.hosting": { command: "npx", args: ["-y", "@yawlabs/mcp"] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(cap.text()).toContain("oam cannot fetch it on demand");
+    expect(cap.text()).toContain('legacy "mcp.hosting" entry also present');
+  });
+
+  it("appends the legacy hint when the oam command is bare", async () => {
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "oam", args: ["run", "--no-check", entryFile] },
+          "mcp.hosting": { command: "npx", args: ["-y", "@yawlabs/mcp"] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(cap.text()).toContain("resolves against the client's PATH");
+    expect(cap.text()).toContain('legacy "mcp.hosting" entry also present');
+  });
+});
+
+describe("runDoctor -- plain-ASCII output", () => {
+  it("emits no non-ASCII character in any printed line", async () => {
+    // The header promises "plain text so it survives Discord / Slack
+    // pasting", but the report carried em-dashes and an arrow -- exactly the
+    // characters a legacy Windows console renders as mojibake in the support
+    // paste this output exists for. Pinned over the WHOLE report, not one
+    // line, so a new section cannot quietly reintroduce one.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } }),
+    );
+    // Shell shadows exercise the SHADOWED CLI USAGE line (which carried the arrow).
+    writeFileSync(join(synthHome, ".bash_history"), ["npm audit", "npm search foo"].join("\n"));
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      // Pinned probe: an ABSENT oam makes doctor print a reason string owned
+      // by oam-spawn.ts, which would make this test about a different file.
+      oamProbe: () => ({
+        bin: "/usr/local/bin/oam",
+        binPath: "/usr/local/bin/oam",
+        version: MIN_OAM_VERSION,
+        belowMin: false,
+        failure: null,
+        failureDetail: null,
+      }),
+    });
+    const offenders = r.lines.filter((l) => [...l].some((ch) => (ch.codePointAt(0) ?? 0) > 127));
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("registrySkipCheck", () => {
+  // Three doctor surfaces probe npm (text freshness, --json freshness,
+  // per-sidecar freshness) and this expression was copy-pasted at each one;
+  // a fourth probe was a coin flip on inheriting the VITEST auto-skip.
+  it("skips when skipRegistryCheck is set and no override hook is supplied", () => {
+    expect(registrySkipCheck({ skipRegistryCheck: true }, undefined)).toBe(true);
+  });
+
+  it("an explicit override hook beats the skip, so test branches stay reachable", () => {
+    expect(registrySkipCheck({ skipRegistryCheck: true }, async () => "9.9.9")).toBe(false);
+  });
+});
+
+describe("parseDoctorArgs", () => {
+  // Doctor's argv parsing used to be open-coded in the index.ts dispatcher --
+  // the one branch no test could import, because importing index.ts runs the
+  // dispatcher's top-level side effects.
+  it("defaults to text output", () => {
+    const r = parseDoctorArgs([]);
+    expect(r).toEqual({ ok: true, options: { json: false } });
+  });
+
+  it("accepts --json", () => {
+    const r = parseDoctorArgs(["--json"]);
+    expect(r.ok && r.options.json).toBe(true);
+  });
+
+  it("treats --help / -h as a help parse carrying the usage body", () => {
+    for (const flag of ["--help", "-h"]) {
+      const r = parseDoctorArgs([flag]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.help).toBe(true);
+        expect(r.error).toBe(DOCTOR_USAGE);
+      }
+    }
+  });
+
+  it("names EVERY stray argument, not just the first", () => {
+    const r = parseDoctorArgs(["--bad", "--worse"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.help).toBeUndefined();
+      expect(r.error).toBe('yaw-mcp doctor: unknown arguments "--bad", "--worse"');
+    }
+  });
+
+  it("an unknown arg BEFORE --help still reports the unknown arg", () => {
+    const r = parseDoctorArgs(["--bad", "--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.help).toBeUndefined();
+      expect(r.error).toContain('unknown argument "--bad"');
+    }
+  });
+
+  it("--help BEFORE an unknown arg wins", () => {
+    const r = parseDoctorArgs(["--help", "--bad"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.help).toBe(true);
   });
 });

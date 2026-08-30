@@ -10,6 +10,7 @@ import {
   isPersistenceDisabled,
   isReadableStateVersion,
   loadState,
+  loadStateClassified,
   STATE_SCHEMA_VERSION,
   saveState,
   TOOLCACHE_MAX_DESCRIPTION_CHARS,
@@ -184,6 +185,77 @@ describe("persistence.loadState", () => {
     expect(s.learning.equal.dispatched).toBe(2);
   });
 
+  // loadStateClassified is the ONE read+parse: loadState is a thin wrapper
+  // over it, and the classification rides along so a reporting caller
+  // (reset-learning) never has to open the file a second time with a
+  // second, drift-prone parser.
+  describe("loadStateClassified", () => {
+    it("classifies a readable file as clean and returns the same state loadState does", async () => {
+      const payload = {
+        version: STATE_SCHEMA_VERSION,
+        savedAt: 5,
+        learning: { gh: { dispatched: 2, succeeded: 1, lastUsedAt: 7 } },
+        packHistory: [],
+        toolCache: {},
+      };
+      writeFileSync(file, JSON.stringify(payload), "utf8");
+      const c = await loadStateClassified(file);
+      expect(c.parsedCleanly).toBe(true);
+      expect(c.state).toEqual(await loadState(file));
+      expect(c.state.learning.gh.dispatched).toBe(2);
+    });
+
+    it("classifies a v1 file as clean (it migrates, so its counts are real)", async () => {
+      writeFileSync(
+        file,
+        JSON.stringify({ version: 1, savedAt: 0, learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } } }),
+        "utf8",
+      );
+      const c = await loadStateClassified(file);
+      expect(c.parsedCleanly).toBe(true);
+      expect(Object.keys(c.state.learning)).toEqual(["gh"]);
+    });
+
+    it("classifies a missing file as clean (empty state IS what is on disk)", async () => {
+      const c = await loadStateClassified(join(dir, "absent.json"));
+      expect(c.parsedCleanly).toBe(true);
+      expect(c.state).toEqual(emptyState());
+    });
+
+    it("classifies malformed JSON, a non-object root, and an unreadable version as NOT clean", async () => {
+      writeFileSync(file, "{ not json", "utf8");
+      expect((await loadStateClassified(file)).parsedCleanly).toBe(false);
+
+      writeFileSync(file, JSON.stringify([1, 2, 3]), "utf8");
+      expect((await loadStateClassified(file)).parsedCleanly).toBe(false);
+
+      writeFileSync(file, JSON.stringify({ version: 99, learning: {}, packHistory: [] }), "utf8");
+      const c = await loadStateClassified(file);
+      expect(c.parsedCleanly).toBe(false);
+      expect(c.state).toEqual(emptyState());
+    });
+
+    it("classifies a BOM-prefixed file as clean, matching loadState's own strip", async () => {
+      // Built, never hand-typed: U+FEFF as a fixture escape is exactly the
+      // shape that drifted the old separate peek away from the loader.
+      const BOM = String.fromCharCode(0xfeff);
+      writeFileSync(
+        file,
+        `${BOM}${JSON.stringify({
+          version: STATE_SCHEMA_VERSION,
+          savedAt: 0,
+          learning: { gh: { dispatched: 3, succeeded: 3, lastUsedAt: 1 } },
+          packHistory: [],
+          toolCache: {},
+        })}`,
+        "utf8",
+      );
+      const c = await loadStateClassified(file);
+      expect(c.parsedCleanly).toBe(true);
+      expect(c.state.learning.gh.dispatched).toBe(3);
+    });
+  });
+
   it("sanitizes invalid pack history entries", async () => {
     const payload = {
       version: STATE_SCHEMA_VERSION,
@@ -320,11 +392,37 @@ describe("persistence tool cache", () => {
       // dropped -- otherwise pre-warm would skip the server forever while
       // never surfacing a single tool.
       allToolsBad: { tools: [{ description: "no name" }, null, 7], learnedAt },
-      emptyTools: { tools: [], learnedAt },
     });
 
     const loaded = await loadState(file);
     expect(Object.keys(loaded.toolCache)).toEqual(["good"]);
+  });
+
+  it("keeps a genuinely empty tool list but still drops one that only collapsed to empty", async () => {
+    // The two are indistinguishable after validation, so the RAW length is
+    // what separates them. A resources/prompts-only upstream really does
+    // expose zero tools, and that is an observation worth persisting -- when
+    // it was dropped, hasKnownTools never saw an answer and pre-warm
+    // re-spawned the server on every session start. A corrupt entry whose
+    // tools all failed validation is not that, and must still be re-learned.
+    const learnedAt = Date.now();
+    writeState({
+      zeroToolServer: { tools: [], learnedAt },
+      corrupt: { tools: [{ description: "no name" }, null, 7], learnedAt },
+    });
+
+    const loaded = await loadState(file);
+    expect(Object.keys(loaded.toolCache)).toEqual(["zeroToolServer"]);
+    expect(loaded.toolCache.zeroToolServer).toEqual({ tools: [], learnedAt });
+  });
+
+  it("round-trips a zero-tool entry through save, not just load", async () => {
+    // The drop used to happen on BOTH paths, so a load-only fix would still
+    // lose the entry on the next flush.
+    const learnedAt = Date.now();
+    await saveState({ learning: {}, packHistory: [], toolCache: { zeroToolServer: { tools: [], learnedAt } } }, file);
+    const loaded = await loadState(file);
+    expect(loaded.toolCache.zeroToolServer).toEqual({ tools: [], learnedAt });
   });
 
   it("expires entries older than the TTL but keeps fresh and future-stamped ones", async () => {

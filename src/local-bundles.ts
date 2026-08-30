@@ -229,6 +229,11 @@ type RawRead =
   | { kind: "absent" }
   | { kind: "error"; message: string; code: string | undefined };
 
+/** Detail text attached when the bundles.json path is a DIRECTORY. Shared with
+ *  readRawUserBundles (never re-spelled there) so the write path can turn the
+ *  warning back into an actionable message. */
+const IS_A_DIRECTORY_DETAIL = "the path is a directory, not a file";
+
 async function readBundlesRawAt(path: string): Promise<RawRead> {
   try {
     // Read BYTES, not utf8 text: the trust hash must cover exactly what is
@@ -237,12 +242,28 @@ async function readBundlesRawAt(path: string): Promise<RawRead> {
     return { kind: "ok", raw: await readFile(path) };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "EISDIR") return { kind: "absent" };
+    if (code === "ENOENT") return { kind: "absent" };
+    // EISDIR is NOT absent. A directory at the bundles.json path is a real,
+    // fixable problem: existsSync() says true, so the write path committed to
+    // the location and -- because "absent" produced no warning at all --
+    // reported it as a phantom parse failure ("could not be parsed -- fix the
+    // JSON") with an EMPTY detail, sending the user to hunt a syntax error in
+    // a file that is not a file. Classify it as the read error it is and name
+    // the shape, so every consumer (loader warning, `add`, doctor) says what
+    // is actually wrong.
+    if (code === "EISDIR") return { kind: "error", message: IS_A_DIRECTORY_DETAIL, code };
     // Any other error (EPERM, EACCES, ...) means the file likely exists but
     // we can't read it.
     return { kind: "error", message: err instanceof Error ? err.message : String(err), code };
   }
 }
+
+/** Marker readBundlesAt puts in EVERY read-failure warning, and in no parse
+ *  warning. Read-vs-parse is told apart by matching this against the warning's
+ *  known `<path>: ` prefix -- NOT by sniffing errno words out of the joined
+ *  text, which embeds the full path and so let a home directory containing
+ *  "eaccess" turn an ordinary JSON syntax error into the permissions message. */
+const READ_FAILURE_MARKER = "could not read file (";
 
 /** Read a bundles.json from `path`. Returns:
  *   - { exists: false, file: null } when the file doesn't exist
@@ -256,7 +277,7 @@ async function readBundlesAt(path: string, warnings: string[]): Promise<ReadResu
   if (r.kind === "error") {
     // Return exists:true so the caller stays committed to this path instead
     // of silently falling through to the user-global file.
-    warnings.push(`${path}: could not read file (${r.message}) -- skipping`);
+    warnings.push(`${path}: ${READ_FAILURE_MARKER}${r.message}) -- skipping`);
     log("warn", "Could not read bundles.json", { path, error: r.message, code: r.code });
     return { exists: true, file: null };
   }
@@ -593,7 +614,7 @@ export async function loadLocalBundles(
   let projectResult: ReadResult = { exists: false, file: null };
   if (projectPath !== null) {
     if (probe.status === "unreadable") {
-      warnings.push(`${projectPath}: could not read file (${probe.error}) -- skipping`);
+      warnings.push(`${projectPath}: ${READ_FAILURE_MARKER}${probe.error}) -- skipping`);
       log("warn", "Could not read bundles.json", { path: projectPath, error: probe.error });
       projectResult = { exists: true, file: null };
     } else {
@@ -741,13 +762,23 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
   const r = await readBundlesAt(path, warnings);
   if (!r.file) {
     // Branch on the warning content to give the user the most actionable
-    // message: a read error (EPERM / EACCES) hints at permissions; a parse
-    // failure hints at invalid JSON. readBundlesAt populates warnings with
-    // the OS error string for read failures and with "invalid JSON" for
-    // parse failures, so we sniff those keywords here.
+    // message: a read error (EPERM / EACCES) hints at permissions; a directory
+    // at the path says so outright; a parse failure hints at invalid JSON.
+    //
+    // The test is the EXACT `<path>: could not read file (` prefix readBundlesAt
+    // emits for read failures, never an errno keyword search over the joined
+    // text: that text embeds the full path, so a home directory containing
+    // "eaccess" (or a project literally named "eperm") matched the
+    // /EPERM|EACCES/i alternation and printed the permissions message for a
+    // plain JSON syntax error.
     const warningText = warnings.join("; ");
-    const isReadError = /EPERM|EACCES|could not read/i.test(warningText);
-    if (isReadError) {
+    const readWarning = warnings.find((w) => w.startsWith(`${path}: ${READ_FAILURE_MARKER}`));
+    if (readWarning) {
+      // A DIRECTORY is not a permissions problem, and telling the user to
+      // check permissions on one sends them nowhere useful.
+      if (readWarning.includes(IS_A_DIRECTORY_DETAIL)) {
+        throw new Error(`${path} is a directory, not a file -- move or remove it before adding servers.`);
+      }
       throw new Error(`${path} could not be read (${warningText}) -- check file permissions before adding servers.`);
     }
     // Default: parse failure or structural mismatch.
@@ -802,7 +833,10 @@ function envStrings(raw: unknown): Record<string, string> | undefined {
  *   2. `env` merges per KEY rather than being swapped wholesale, and an EMPTY
  *      incoming value never blanks a stored one -- `add` seeds every required
  *      key with "" and only fills in what came from an explicit `--env`, so a
- *      wholesale swap is how the stored secret disappeared.
+ *      wholesale swap is how the stored secret disappeared. The one thing a
+ *      merge DOES drop is a stored key that is itself blank and absent from
+ *      the incoming entry: that is a stale requirement marker, not a value
+ *      (see the env block below).
  *   3. An incoming `isActive: true` does NOT re-enable an entry the user
  *      explicitly disabled. `true` is boilerplate every writer stamps;
  *      `"isActive": false` is a deliberate hand-edit, and there is no `enable`
@@ -824,12 +858,27 @@ function mergeServerEntry(
   const storedEnv = envStrings(base.env);
   const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
   if (storedEnv || incomingEnv) {
-    const env: Record<string, string> = { ...storedEnv };
+    const env: Record<string, string> = {};
+    // Carry the stored env forward, MINUS any blank seed the incoming entry no
+    // longer lists. A blank value is not data -- it is `add`'s "this key is
+    // required, nothing stored" marker (validateEntry drops it before spawn),
+    // so once the catalog stops requiring the key the marker documents a
+    // requirement that no longer exists. Without this, a dropped required key
+    // stuck around forever: every later re-add kept re-copying it, and `list
+    // --json` plus the removal preview kept reporting it as a required var.
+    // A NON-EMPTY stored value is never dropped -- that is the user's own
+    // persisted secret, and rule 2 below exists precisely to protect it.
+    for (const [k, v] of Object.entries(storedEnv ?? {})) {
+      if (v.trim() === "" && incomingEnv?.[k] === undefined) continue;
+      env[k] = v;
+    }
     for (const [k, v] of Object.entries(incomingEnv ?? {})) {
       if (v.trim() === "" && (env[k] ?? "").trim() !== "") continue;
       env[k] = v;
     }
-    merged.env = env;
+    // Undefined rather than {} when nothing survives, so a re-add of a server
+    // whose last required key was dropped leaves no empty husk on disk.
+    merged.env = Object.keys(env).length > 0 ? env : undefined;
   }
   return merged as Partial<UpstreamServerConfig>;
 }

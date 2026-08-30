@@ -84,6 +84,20 @@ describe("closestNames", () => {
     expect(r).toEqual(["slack"]);
   });
 
+  it("suppresses every inexact tier for 1-2 char queries (prefix included)", () => {
+    // A single character is never a "clear typo" of anything: ungated, the
+    // prefix tier surfaced every namespace sharing a first letter, so a
+    // one-char activate typo suggested "gh, github, gitlab" at once --
+    // contradicting the header's conservative promise.
+    expect(closestNames("g", ["gh", "github", "gitlab"], 3)).toEqual([]);
+    // Two chars is still below the signal floor: 'gt' is within edit
+    // distance 1 of 'gh', so the Levenshtein tier must be gated too, not
+    // just the prefix tier.
+    expect(closestNames("gt", ["gh", "github", "gitlab"], 3)).toEqual([]);
+    // A case-only mismatch of a short name IS unambiguous and still works.
+    expect(closestNames("GH", ["gh", "github"], 3)).toEqual(["gh"]);
+  });
+
   it("excludes an exact match of the query from results", () => {
     const r = closestNames("github", candidates, 3);
     expect(r).not.toContain("github");

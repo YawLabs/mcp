@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -155,5 +155,91 @@ describe("fail-open behavior", () => {
     expect(existsSync(join(home, CONFIG_DIRNAME))).toBe(false);
     expect(() => recordNudge("tailscale", home, () => 1)).not.toThrow();
     expect(existsSync(installNudgeStatePath(home))).toBe(true);
+  });
+});
+
+describe("clock skew -- a nudgedAt in the future", () => {
+  const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+
+  function seedState(cli: string, nudgedAt: number): void {
+    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(installNudgeStatePath(home), JSON.stringify({ nudges: [{ cli, nudgedAt }] }), "utf8");
+  }
+
+  it("normalises a future timestamp on the next write instead of keeping it forever", () => {
+    // A laptop that syncs its clock BACKWARDS (or a state file copied from a
+    // machine that was ahead) leaves a future nudgedAt behind. The prune
+    // filter kept it -- `at - nudgedAt` is negative, so it never cleared the
+    // cooldown and never aged out of the file either.
+    const t0 = 1_000_000_000;
+    seedState("psql", t0 + YEAR_MS);
+    recordNudge("tailscale", home, () => t0);
+    const state = JSON.parse(readFileSync(installNudgeStatePath(home), "utf8"));
+    const psql = state.nudges.find((n: { cli: string }) => n.cli === "psql");
+    expect(psql?.nudgedAt).toBe(t0);
+  });
+
+  it("lets a clock-skewed entry age out normally once it has been clamped", () => {
+    const t0 = 1_000_000_000;
+    seedState("psql", t0 + YEAR_MS);
+    recordNudge("tailscale", home, () => t0);
+    // Unclamped, psql stayed suppressed until wall-clock time caught up with
+    // a timestamp a YEAR ahead. Clamped, it expires one cooldown from now.
+    expect(shouldNudge("psql", home, () => t0 + INSTALL_NUDGE_COOLDOWN_MS)).toBe(true);
+  });
+
+  it("reads a future timestamp as 'just nudged', not as 'never nudged'", () => {
+    const t0 = 1_000_000_000;
+    seedState("psql", t0 + YEAR_MS);
+    expect(shouldNudge("psql", home, () => t0)).toBe(false);
+  });
+});
+
+describe("state-file read memoization", () => {
+  it("re-reads whenever the file actually changes", () => {
+    // The memo is keyed on the file's identity, not a TTL, so an edit from
+    // any process is picked up on the very next call.
+    const t0 = 1_000_000_000;
+    recordNudge("psql", home, () => t0);
+    expect(shouldNudge("psql", home, () => t0)).toBe(false);
+    writeFileSync(installNudgeStatePath(home), JSON.stringify({ nudges: [] }), "utf8");
+    expect(shouldNudge("psql", home, () => t0)).toBe(true);
+  });
+
+  it("reuses the parse when a rewrite leaves mtime AND size identical", () => {
+    // One discover asks shouldNudge once per candidate and then recordNudge
+    // once per candidate, so this tiny file used to be read 2N times per
+    // discover. Memoizing the parse on (path, mtime, size) collapses the read
+    // side to one. The documented tradeoff is exactly what this pins: a
+    // rewrite that changes neither mtime nor byte length is indistinguishable
+    // from the memoized file, and this module is fail-open by design -- the
+    // worst case is one extra nudge, the same as a lost write.
+    const t0 = 1_000_000_000;
+    const FIXED_MTIME_S = 1_600_000_000;
+    recordNudge("psql", home, () => t0);
+    const path = installNudgeStatePath(home);
+    const raw = readFileSync(path, "utf8");
+    // Both utimesSync calls pass the SAME value, so the two mtimes are byte
+    // identical whatever the filesystem's timestamp resolution rounds to.
+    utimesSync(path, FIXED_MTIME_S, FIXED_MTIME_S);
+    expect(shouldNudge("psql", home, () => t0)).toBe(false);
+    const rewritten = raw.replace(String(t0), String(1_111_111_111));
+    expect(rewritten.length).toBe(raw.length);
+    expect(rewritten).not.toBe(raw);
+    writeFileSync(path, rewritten, "utf8");
+    utimesSync(path, FIXED_MTIME_S, FIXED_MTIME_S);
+    // Memoized parse (nudgedAt = t0) is reused, so the cooldown is measured
+    // from t0; a fresh read would measure it from the rewritten timestamp and
+    // report the CLI as still suppressed.
+    expect(shouldNudge("psql", home, () => t0 + INSTALL_NUDGE_COOLDOWN_MS)).toBe(true);
+  });
+
+  it("a recordNudge write refreshes the memo rather than leaving a stale parse", () => {
+    const t0 = 1_000_000_000;
+    recordNudge("psql", home, () => t0);
+    expect(shouldNudge("psql", home, () => t0)).toBe(false);
+    recordNudge("tailscale", home, () => t0 + 1);
+    expect(shouldNudge("tailscale", home, () => t0 + 2)).toBe(false);
+    expect(shouldNudge("psql", home, () => t0 + 2)).toBe(false);
   });
 });

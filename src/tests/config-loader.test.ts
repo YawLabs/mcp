@@ -1,11 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CONFIG_FILENAME,
   CURRENT_SCHEMA_VERSION,
+  DEPRECATED_KEYS,
   isAllowed,
+  KNOWN_CONFIG_KEYS,
   LOCAL_CONFIG_FILENAME,
   loadYawMcpConfig,
   type Profile,
@@ -13,6 +16,10 @@ import {
   toProfile,
 } from "../config-loader.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+
+// Repo-relative path to the shipped schema: this file lives in src/tests/,
+// the schema in schemas/ at the repo root.
+const SCHEMA_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "schemas");
 
 let synthHome: string;
 let synthCwd: string;
@@ -176,6 +183,54 @@ describe("loadYawMcpConfig — schema versioning", () => {
     writeConfig(synthHome, CONFIG_FILENAME, { servers: ["x"] });
     const r2 = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r2.warnings).toEqual([]);
+  });
+
+  // Regression: a PRESENT but wrong-typed version collapsed to undefined and
+  // skipped the newer-schema check entirely, so `"version": "2"` -- the
+  // likeliest hand-edit typo in a file whose every other value is a string --
+  // produced total silence for the one user who most needed the upgrade hint.
+  it("warns when version is present but not a number", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { version: "2", servers: ["x"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    // Still loads: the rest of the file is usable, same soft-failure stance
+    // as every other malformed field here.
+    expect(r.servers).toEqual(["x"]);
+    const w = r.warnings.find((x) => x.includes("'version' must be a number"));
+    expect(w).toBeDefined();
+    expect(w).toContain("found string");
+    // And it is not ALSO reported as an unknown key.
+    expect(r.warnings.some((x) => x.includes("unknown key"))).toBe(false);
+  });
+
+  it("does not warn about version when the key is absent", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["x"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((x) => x.includes("'version'"))).toBe(false);
+  });
+});
+
+// The shipped JSON schema (schemas/yaw-mcp.config.v1.json) is
+// additionalProperties:false and is fetched by editors over its raw
+// GitHub URL, so it is a second, USER-VISIBLE spelling of the key list this
+// loader enforces. Nothing in the repo referenced it and no test touched it,
+// so a key added on one side only would have shown up as "invalid config" in
+// the user's editor while loading fine -- or the reverse.
+describe("shipped config JSON schema", () => {
+  const schema = JSON.parse(readFileSync(join(SCHEMA_DIR, "yaw-mcp.config.v1.json"), "utf8")) as {
+    additionalProperties?: boolean;
+    properties?: Record<string, unknown>;
+  };
+
+  it("declares exactly the keys the loader knows, plus the deprecated ones it still tolerates", () => {
+    // Deprecated keys stay in the schema on purpose: with
+    // additionalProperties:false, removing them would mark every existing
+    // user config invalid. They are warned about, not rejected, here too.
+    const expected = [...KNOWN_CONFIG_KEYS, ...DEPRECATED_KEYS].sort();
+    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(expected);
+  });
+
+  it("stays additionalProperties:false, which is what makes the key list a contract", () => {
+    expect(schema.additionalProperties).toBe(false);
   });
 });
 

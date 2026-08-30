@@ -1136,3 +1136,100 @@ describe("a __proto__ store key survives the rebuild", () => {
     expect(store.entries.sha256).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// A grant is a read-modify-write across an unbounded pause (trust-cmd renders
+// the argv and waits at a [y/N] prompt in between), so the store has to be
+// re-read at the write boundary or a concurrent grant from another terminal
+// is silently reverted.
+// ---------------------------------------------------------------------------
+
+describe("concurrent grants are merged, not lost", () => {
+  const OTHER_SHA = "b".repeat(64);
+
+  it("keeps a grant written by another process while this one was deciding", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const otherPath = join(synthHome, "other-repo", CONFIG_DIRNAME, "bundles.json");
+
+    // grantTrust calls opts.now() between its read and its write, so the hook
+    // is the injection point for "another terminal granted something here
+    // while we were waiting" -- no production test hook needed.
+    let injected = false;
+    const now = (): number => {
+      if (!injected) {
+        injected = true;
+        mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+        writeFileSync(
+          trustStorePath(synthHome),
+          JSON.stringify({
+            version: TRUST_SCHEMA_VERSION,
+            trusted: {
+              [normalizeTrustKey(otherPath)]: {
+                path: otherPath,
+                sha256: OTHER_SHA,
+                grantedAt: "2026-01-01T00:00:00.000Z",
+              },
+            },
+          }),
+        );
+      }
+      return Date.parse("2026-02-02T00:00:00.000Z");
+    };
+
+    await grantTrust(path, readFileSync(path), { home: synthHome, now });
+
+    const listed = await listTrusted({ home: synthHome });
+    expect(listed.map((r) => r.path).sort()).toEqual([otherPath, path].sort());
+  });
+
+  it("still refuses when the store becomes unreadable between the two reads", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const storePath = trustStorePath(synthHome);
+    const now = (): number => {
+      readFileErrors.set(storePath, "EBUSY");
+      return Date.parse("2026-02-02T00:00:00.000Z");
+    };
+    await expect(grantTrust(path, readFileSync(path), { home: synthHome, now })).rejects.toBeInstanceOf(
+      TrustStoreUnreadableError,
+    );
+    readFileErrors.delete(storePath);
+    expect(existsSync(storePath)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The newer-schema guard reads `version` as a number. A hand-edited string
+// version used to default to "current" and sail straight past it.
+// ---------------------------------------------------------------------------
+
+describe("a non-numeric version is corrupt, not current", () => {
+  const SHA = "c".repeat(64);
+
+  it("denies a store whose version is the STRING '2' instead of assuming v1", async () => {
+    const projectPath = projectBundlesPath(synthCwd);
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      trustStorePath(synthHome),
+      JSON.stringify({
+        version: "2",
+        trusted: { [normalizeTrustKey(projectPath)]: { path: projectPath, sha256: SHA, grantedAt: "" } },
+      }),
+    );
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(true);
+    expect(store.malformedKind).toBe("parse");
+    expect(store.entries).toEqual({});
+    // And the lookup denies rather than reporting the smuggled grant.
+    expect(trustStatusFor(projectPath, "anything", store)).toBe("store-unreadable");
+  });
+
+  it("still treats an ABSENT version as the current schema", async () => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ trusted: {} }));
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(false);
+    expect(store.version).toBe(TRUST_SCHEMA_VERSION);
+  });
+});

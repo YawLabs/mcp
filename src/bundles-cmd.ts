@@ -48,7 +48,18 @@ export interface BundlesCommandOptions {
 
 export interface BundlesCommandResult {
   exitCode: number;
+  /** Everything printed, in emission order, BOTH streams interleaved. Kept for
+   *  callers that just want the transcript; use `stdout` / `stderr` when the
+   *  two have to be told apart. */
   lines: string[];
+  /** Only what went to stdout -- under `--json` that is exactly the JSON body,
+   *  so a programmatic caller can `JSON.parse(result.stdout.join("\n"))`
+   *  without first stripping warning lines out of a mixed transcript. */
+  stdout: string[];
+  /** Only the warnings. Interleaving them into `lines` meant a --json consumer
+   *  could not split the body from the diagnostics without re-parsing the
+   *  transcript -- the one thing the two-stream split exists to avoid. */
+  stderr: string[];
 }
 
 export interface ParsedBundlesArgs {
@@ -95,13 +106,23 @@ export function parseBundlesArgs(
 export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promise<BundlesCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  // Three transcripts, not one: `lines` stays the interleaved emission-order
+  // record every existing caller reads, while `stdout` / `stderr` keep the two
+  // streams separable. A `--json` consumer of the returned result could not
+  // otherwise tell the JSON body from a warning line without re-parsing the
+  // transcript, which is precisely what routing warnings to stderr in the
+  // PRINTED output already avoids.
   const lines: string[] = [];
+  const stdout: string[] = [];
+  const stderr: string[] = [];
   const print = (s = ""): void => {
     lines.push(s);
+    stdout.push(s);
     write(`${s}\n`);
   };
   const printErr = (s: string): void => {
     lines.push(s);
+    stderr.push(s);
     writeErr(`${s}\n`);
   };
 
@@ -113,7 +134,7 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
     } else {
       renderList(print);
     }
-    return { exitCode: 0, lines };
+    return { exitCode: 0, lines, stdout, stderr };
   }
 
   // action === "match" — reads the same local bundles.json server.ts loads at
@@ -144,11 +165,11 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
 
   if (opts.json) {
     print(JSON.stringify({ installed, excluded, ...match }, null, 2));
-    return { exitCode: 0, lines };
+    return { exitCode: 0, lines, stdout, stderr };
   }
 
   renderMatch(match, installed, excluded, print);
-  return { exitCode: 0, lines };
+  return { exitCode: 0, lines, stdout, stderr };
 }
 
 function renderList(print: (s?: string) => void): void {

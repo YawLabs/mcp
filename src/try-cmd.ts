@@ -39,10 +39,13 @@
 //     NOT delete it. Silently removing a file from the user's home dir as a
 //     side effect of an unrelated command is more surprising than leaving 17
 //     dead bytes; `rm ~/.yaw-mcp/trials/.anon` clears it for anyone who cares.
-//   - The postEvent seam itself STAYS -- it is injected by ~15 tests and by
-//     doctor's trial GC, so collapsing it churns more than it cleans. Its
-//     TryEventBody.anonId is now the fixed literal ANON_ID_PLACEHOLDER.
-//     Removing the seam outright is worth its own pass.
+//   - The postEvent seam is GONE too, along with TryEventBody, the
+//     ANON_ID_PLACEHOLDER literal, and doctor's `postTryEvent` option. It
+//     had become an injection point that existed only to be injected: the
+//     default implementation was a no-op, so every test that passed one was
+//     overriding nothing with nothing. `--base` is still PARSED (an existing
+//     script passing it keeps working) but `try-cleanup` and the expiry GC
+//     no longer read it -- there is nothing left to address.
 
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
@@ -81,11 +84,12 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        Required env vars not supplied here AND not in your
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
-  --base <url>         Legacy base URL kept for the trial's internal hooks
-                       (default: $YAW_MCP_BASE_URL or https://yaw.sh/mcp).
-                       No effect on a normal install: the catalog is read
-                       locally and no trial event is reported anywhere. Point
-                       the catalog somewhere else with $YAW_MCP_CATALOG_URL.`;
+  --base <url>         Accepted and ignored (default: $YAW_MCP_BASE_URL or
+                       https://yaw.sh/mcp). Nothing addresses it any more:
+                       the catalog is read locally and no trial event is
+                       reported anywhere. Still parsed so an existing script
+                       passing it keeps working. Point the catalog somewhere
+                       else with $YAW_MCP_CATALOG_URL.`;
 
 export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
@@ -103,12 +107,6 @@ export const TRIALS_DIRNAME = "trials";
  *  don't know, and honoring it would remove an arbitrary key from an
  *  arbitrary JSON file on disk. */
 export const TRIAL_ENTRY_PREFIX = "yaw-mcp-try-";
-
-/** Fixed stand-in for the retired per-machine anon id. `TryEventBody` keeps
- *  the field so the postEvent seam's shape (and doctor's `postTryEvent`
- *  option) don't churn, but nothing derives it from the machine any more --
- *  every event body carries this same literal. */
-export const ANON_ID_PLACEHOLDER = "not-collected";
 
 export interface ExploreServerResponse {
   slug: string;
@@ -158,10 +156,11 @@ export interface TryCommandOptions {
   cwd?: string;
   os?: InstallOS;
   env?: NodeJS.ProcessEnv;
-  /** Override for tests; defaults to the real network fetch. */
-  fetchExplore?: (baseUrl: string, slug: string) => Promise<ExploreServerResponse>;
-  /** Override for tests; defaults to a no-op (see defaultPostEvent). */
-  postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
+  /** Override for tests; defaults to the catalog read in defaultFetchExplore.
+   *  `catalogUrl` carries runTry's resolved $YAW_MCP_CATALOG_URL override
+   *  (undefined when unset or empty) so the seam never has to read
+   *  process.env behind the caller's injected `env`. */
+  fetchExplore?: (baseUrl: string, slug: string, catalogUrl?: string) => Promise<ExploreServerResponse>;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Override for tests; defaults to Date.now(). */
@@ -170,22 +169,13 @@ export interface TryCommandOptions {
 
 export interface TryCleanupOptions {
   slug?: string;
+  /** Parsed from `--base` and then ignored -- see the header note. Kept so
+   *  the flag stays accepted for scripts that still pass it. */
   baseUrl?: string;
   home?: string;
   os?: InstallOS;
-  env?: NodeJS.ProcessEnv;
-  postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   out?: (s: string) => void;
   err?: (s: string) => void;
-}
-
-export interface TryEventBody {
-  slug: string;
-  action: "try" | "cleanup" | "expiry-gc";
-  /** Always ANON_ID_PLACEHOLDER. The per-machine hash this used to carry was
-   *  removed along with the endpoint that consumed it; the field survives
-   *  only so the seam's shape stays stable for its injectors. */
-  anonId: string;
 }
 
 export interface TryCommandResult {
@@ -396,18 +386,27 @@ async function peelTrialEntry(marker: TrialMarker): Promise<"removed" | "absent"
 
 // NOTE: `computeAnonId` / `loadOrCreateAnonId` / `anonIdPath` used to live
 // here. They hashed hostname + username into a durable id under
-// ~/.yaw-mcp/trials/.anon purely to populate TryEventBody.anonId for a poster
-// that no longer posts. Deleted rather than left dead so nothing re-adopts a
-// machine fingerprint by accident; see the .anon note in the file header.
+// ~/.yaw-mcp/trials/.anon purely to populate the anonId of an event body for
+// a poster that no longer posts. Deleted rather than left dead so nothing
+// re-adopts a machine fingerprint by accident; see the .anon note in the
+// file header.
 
 // Resolve the launch shape from the SAME static catalog the website and the
 // Yaw Terminal app read (catalog.ts), so `try <slug>` accepts the exact slug
 // set the catalog shows. (The old /api/explore/:slug endpoint was never
 // deployed -- this is the path that actually works.) `baseUrl` is ignored
-// here and survives only as an injection seam for tests; the catalog URL is
-// overridden via YAW_MCP_CATALOG_URL.
-async function defaultFetchExplore(_baseUrl: string, slug: string): Promise<ExploreServerResponse> {
-  const resolved = await resolveCatalogSlug(slug, { catalogUrl: process.env.YAW_MCP_CATALOG_URL });
+// here and survives only as an injection seam for tests.
+//
+// `catalogUrl` is PASSED IN rather than read from process.env here: runTry
+// resolves every other env lookup through its injectable `opts.env`, and a
+// lone process.env read inside the seam means an embedded caller (or a test)
+// that supplies `env` is silently overridden by the ambient environment.
+async function defaultFetchExplore(
+  _baseUrl: string,
+  slug: string,
+  catalogUrl?: string,
+): Promise<ExploreServerResponse> {
+  const resolved = await resolveCatalogSlug(slug, { catalogUrl });
   const out: ExploreServerResponse = {
     slug: resolved.slug,
     name: resolved.name,
@@ -417,18 +416,6 @@ async function defaultFetchExplore(_baseUrl: string, slug: string): Promise<Expl
   };
   if (resolved.docUrl) out.docUrl = resolved.docUrl;
   return out;
-}
-
-/** No-op. This used to POST to `<baseUrl>/api/try/event`; that endpoint went
- *  away with the hosted backend and now 404s, so the call was doing nothing
- *  but burning a 5s timeout budget on every `try` / `try-cleanup` / expiry-GC.
- *
- *  The `postEvent` seam is deliberately KEPT rather than ripped out: it is an
- *  injection point in ~15 tests and in doctor's trial GC, and collapsing it
- *  would churn far more than it cleans. Removing the seam entirely (along with
- *  TryEventBody and doctor's postTryEvent option) is worth doing on its own. */
-async function defaultPostEvent(_baseUrl: string, _body: TryEventBody): Promise<void> {
-  return;
 }
 
 /** Auto-detect which AI client to install the trial into. Probes in the
@@ -481,9 +468,10 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 2, written: [] };
   }
   const slug = opts.slug;
-  // Slug validation: lowercase + digits + dashes only, matches what the
-  // hosting backend exposes as catalog ids. Keeps the entry-name and
-  // marker-filename free of shell-special chars.
+  // Slug validation: lowercase + digits + dashes only, the shape of the ids
+  // in the static catalog this resolves against (catalog.ts) -- identical to
+  // local-add-cmd.ts's SLUG_RE, which gates the same slug set for `add`.
+  // Keeps the entry-name and marker-filename free of shell-special chars.
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
     printErr(`yaw-mcp try: invalid slug "${slug}" (lowercase letters, digits, and dashes only).`);
     return { exitCode: 2, written: [] };
@@ -509,11 +497,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
 
-  // Step 1: fetch the canonical launch shape.
+  // Step 1: fetch the canonical launch shape. The catalog override comes from
+  // the SAME injectable env every other lookup here uses -- and an EMPTY value
+  // counts as unset: `fetch("")` throws a bare TypeError that catalog.ts's
+  // friendly wrapper cannot recognize as its own URL, so it is rethrown raw.
   const fetchExplore = opts.fetchExplore ?? defaultFetchExplore;
+  const catalogUrl =
+    env.YAW_MCP_CATALOG_URL !== undefined && env.YAW_MCP_CATALOG_URL.length > 0 ? env.YAW_MCP_CATALOG_URL : undefined;
   let server: ExploreServerResponse;
   try {
-    server = await fetchExplore(baseUrl, slug);
+    server = await fetchExplore(baseUrl, slug, catalogUrl);
   } catch (e) {
     printErr((e as Error).message);
     return { exitCode: 1, written: [] };
@@ -599,8 +592,15 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
   // Honor any --env overrides for keys NOT in requiredEnvVars too --
   // some servers have optional env knobs (LOG_LEVEL, DATABASE_URL).
+  // Trimmed and emptiness-gated on the same terms as the required keys above:
+  // `--env LOG_LEVEL=` (or a whitespace-only value) is the user clearing a
+  // knob, not asking for a blank one, and persisting "" into the trial entry
+  // makes the client launch the server with the var explicitly set to empty --
+  // which several upstreams read as "configured" rather than "unset".
   for (const [k, v] of Object.entries(opts.envOverrides ?? {})) {
-    if (!(k in trialEnv)) trialEnv[k] = v;
+    if (k in trialEnv) continue;
+    const trimmed = v.trim();
+    if (trimmed) trialEnv[k] = trimmed;
   }
   // Required keys whose value came from the ambient shell, NOT --env. Unlike
   // `add`, `try` DOES persist these inline (see divergence note above); the
@@ -634,8 +634,8 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   };
 
   // Step 6: read existing client config (if any).
-  // Track whether the client file pre-existed so we know whether to read it
-  // below. (Step 7's perms-tightening keys off entryHasSecrets -- see the
+  // A missing or empty file reads as `null`, which selects the fresh-render
+  // write route below. (Step 7's perms-tightening keys off entryHasSecrets -- see the
   // rationale where tightenPerms is computed: an inline secret must be
   // owner-only whether `try` created the file or merged into the user's
   // pre-existing config. rawClient decides only the write ROUTE:
@@ -645,9 +645,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // JSON.parse + JSON.stringify drops every `//` and `/* */` the user has
   // in their config (~/.claude.json on Claude Code carries user comments
   // routinely; we must not silently strip them on every `try`).
-  const clientPreExisted = existsSync(resolved.absolute);
-  let rawClient: string | null = null;
-  if (clientPreExisted) {
+  //
+  // Broken out into a closure because step 6b's cross-client peel can rewrite
+  // THIS file: when it does, the bytes read here are stale and both the read
+  // and the splice have to be redone against the post-peel file.
+  const readClientRaw = async (): Promise<{ ok: true; raw: string | null } | { ok: false }> => {
+    if (!existsSync(resolved.absolute)) return { ok: true, raw: null };
     // Read and parse are reported SEPARATELY. Folding them into one catch
     // told a user whose ~/.claude.json is root-owned or 0600-another-user
     // that their JSON was invalid ("is not valid JSON (EACCES: permission
@@ -661,26 +664,23 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       printErr(
         `yaw-mcp try: ${resolved.absolute} could not be read (${code ?? (e as Error).message}) -- check its permissions and ownership. Refusing to overwrite.`,
       );
-      return { exitCode: 1, written: [] };
+      return { ok: false };
     }
-    if (raw.trim().length > 0) {
-      let parsed: unknown;
-      try {
-        parsed = parseJsonc(raw);
-      } catch (e) {
-        printErr(
-          `yaw-mcp try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`,
-        );
-        return { exitCode: 1, written: [] };
-      }
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-        rawClient = raw;
-      } else {
-        printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
-        return { exitCode: 1, written: [] };
-      }
+    if (raw.trim().length === 0) return { ok: true, raw: null };
+    let parsed: unknown;
+    try {
+      parsed = parseJsonc(raw);
+    } catch (e) {
+      printErr(`yaw-mcp try: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite.`);
+      return { ok: false };
     }
-  }
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return { ok: true, raw };
+    printErr(`yaw-mcp try: ${resolved.absolute} is not a JSON object — refusing to overwrite.`);
+    return { ok: false };
+  };
+
+  const firstRead = await readClientRaw();
+  if (!firstRead.ok) return { exitCode: 1, written: [] };
 
   // If a previous trial of the same slug is wired, overwrite it (the
   // user is re-running `try`, presumably with a different --ttl or env).
@@ -693,25 +693,50 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   //   - File missing / empty -> no comments to preserve, fall back to the
   //     historical mergeClientConfig + JSON.stringify path (which also
   //     handles the empty container-path materialization for us).
-  let clientJson: string;
-  if (rawClient !== null) {
+  const buildClientJson = (raw: string | null): { ok: true; json: string } | { ok: false } => {
+    if (raw === null) {
+      const merged = mergeClientConfig({}, resolved.containerPath, entry, entryName);
+      return { ok: true, json: `${JSON.stringify(merged, null, 2)}\n` };
+    }
     try {
-      const next = editJsoncEntry(rawClient, resolved.containerPath, entryName, entry);
+      const next = editJsoncEntry(raw, resolved.containerPath, entryName, entry);
       // Preserve the file's existing trailing-newline convention if present;
       // editJsoncEntry returns the user's bytes verbatim outside the edit
       // region, so a file that ended without a newline still won't.
-      clientJson = next.endsWith("\n") ? next : `${next}\n`;
+      return { ok: true, json: next.endsWith("\n") ? next : `${next}\n` };
     } catch (e) {
       printErr(
         `yaw-mcp try: failed to splice entry into ${resolved.absolute} (${(e as Error).message}). Refusing to overwrite.`,
       );
-      return { exitCode: 1, written: [] };
+      return { ok: false };
     }
-  } else {
-    const merged = mergeClientConfig({}, resolved.containerPath, entry, entryName);
-    clientJson = `${JSON.stringify(merged, null, 2)}\n`;
-  }
+  };
+
+  const firstSplice = buildClientJson(firstRead.raw);
+  if (!firstSplice.ok) return { exitCode: 1, written: [] };
+  let clientJson = firstSplice.json;
   const markerJson = `${JSON.stringify(marker, null, 2)}\n`;
+
+  // Step 6b: the marker path is keyed on SLUG alone (trials/<slug>.json), so a
+  // re-run of the same slug against a DIFFERENT --client is about to overwrite
+  // the only record of the previous wiring. Left alone, that entry -- inline
+  // secret and all -- stays in the old client config forever: `try-cleanup`
+  // reads only the current marker and doctor's GC only walks markers, so
+  // nothing would ever name it again. Peel it out first, best-effort.
+  //
+  // The marker is read BEFORE the dry-run return so the preview can name the
+  // removal too: a --dry-run that omits a write the real run performs is
+  // exactly the report a user consults --dry-run to avoid.
+  const previousMarker = await readTrialMarker(trialMarkerPath(slug, home));
+  const peelsPrevious =
+    previousMarker !== null &&
+    (previousMarker.clientPath !== resolved.absolute || previousMarker.entryName !== entryName);
+  // The real peel routes through peelTrialEntry, whose FIRST act is to refuse
+  // an untrusted marker (a non-`yaw-mcp-try-*` entryName, or a schemaVersion
+  // from a newer yaw-mcp). The preview has to consult the same gate or it
+  // promises a removal the real run declines -- which is the one thing a
+  // --dry-run must never do.
+  const previousRefusal = previousMarker === null ? null : rejectUntrustedMarker(previousMarker);
 
   if (opts.dryRun) {
     print(`yaw-mcp try (dry-run): would write ${resolved.absolute}`);
@@ -720,20 +745,35 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     if (entry.env) print(`  env keys:   ${Object.keys(entry.env).join(", ")}`);
     print(`  expires:    ${new Date(expiresAt).toISOString()}`);
     print(`  marker:     ${trialMarkerPath(slug, home)}`);
+    if (previousMarker && peelsPrevious) {
+      if (previousRefusal === null) {
+        print(
+          `  would remove: the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`,
+        );
+      } else {
+        print(
+          `  would NOT remove: the previous ${slug} marker ${previousRefusal} -- remove that entry from ${previousMarker.clientPath} by hand`,
+        );
+      }
+    }
     return { exitCode: 0, written: [], marker };
   }
 
-  // Step 6b: the marker path is keyed on SLUG alone (trials/<slug>.json), so a
-  // re-run of the same slug against a DIFFERENT --client is about to overwrite
-  // the only record of the previous wiring. Left alone, that entry -- inline
-  // secret and all -- stays in the old client config forever: `try-cleanup`
-  // reads only the current marker and doctor's GC only walks markers, so
-  // nothing would ever name it again. Peel it out first, best-effort.
-  const previousMarker = await readTrialMarker(trialMarkerPath(slug, home));
-  if (previousMarker && (previousMarker.clientPath !== resolved.absolute || previousMarker.entryName !== entryName)) {
+  if (previousMarker && peelsPrevious) {
     const outcome = await peelTrialEntry(previousMarker);
     if (outcome === "removed") {
       print(`Removed the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`);
+      if (previousMarker.clientPath === resolved.absolute) {
+        // Same file, different entry name (a hand-edited or renamed marker):
+        // the peel just rewrote the bytes the splice above was built from, so
+        // writing that stale render would re-insert the entry we just removed.
+        // Re-read and re-splice against the post-peel file.
+        const reread = await readClientRaw();
+        if (!reread.ok) return { exitCode: 1, written: [] };
+        const respliced = buildClientJson(reread.raw);
+        if (!respliced.ok) return { exitCode: 1, written: [] };
+        clientJson = respliced.json;
+      }
     } else if (outcome === "failed") {
       printErr(
         `yaw-mcp try: warning -- couldn't remove the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}. Remove that entry by hand; the marker below no longer points at it.`,
@@ -747,7 +787,6 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // behind so doctor's GC can reclaim it. On a CAUGHT client-write failure we
   // do NOT rely on that -- the catch explicitly unlinks the marker (see
   // below) so doctor never sees a trial whose launch entry was never written.
-  // Anon id seeded as a side-effect.
   const written: string[] = [];
   try {
     await mkdir(trialsDir(home), { recursive: true });
@@ -797,10 +836,6 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 1, written: [] };
   }
 
-  // Step 8: fire the lifecycle event through the (no-op) seam.
-  const postEvent = opts.postEvent ?? defaultPostEvent;
-  await postEvent(baseUrl, { slug, action: "try", anonId: ANON_ID_PLACEHOLDER }).catch(() => undefined);
-
   // Step 9: nudge. The keep-it path is local (`add` writes the server into
   // ~/.yaw-mcp/bundles.json) -- there is no account and no signup page.
   const ttlPretty = formatTtl(ttlMs);
@@ -844,9 +879,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 2, written: [] };
   }
 
-  const env = opts.env ?? process.env;
   const home = opts.home ?? homedir();
-  const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   const markerPath = trialMarkerPath(slug, home);
 
   if (!existsSync(markerPath)) {
@@ -858,7 +891,19 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   try {
     const raw = await readFile(markerPath, "utf8");
     const parsed = JSON.parse(raw) as TrialMarker;
-    if (!parsed || typeof parsed !== "object" || typeof parsed.entryName !== "string") {
+    // Validate every field the peel below consumes -- the SAME set
+    // readTrialMarker requires -- not just entryName. Checking one of the
+    // three let a marker with no clientPath through: existsSync(undefined)
+    // is false, so the peel was skipped, the marker was unlinked, and the
+    // user was told the trial was "cleaned up" while its entry (inline secret
+    // and all) stayed wired with nothing left on disk naming it.
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.entryName !== "string" ||
+      typeof parsed.clientPath !== "string" ||
+      !Array.isArray(parsed.containerPath)
+    ) {
       throw new Error("marker is missing required fields");
     }
     marker = parsed;
@@ -916,27 +961,29 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 1, written: [] };
   }
 
-  // Fire the lifecycle event through the (no-op) seam.
-  const postEvent = opts.postEvent ?? defaultPostEvent;
-  await postEvent(baseUrl, { slug, action: "cleanup", anonId: ANON_ID_PLACEHOLDER }).catch(() => undefined);
-
   print(`Trial for "${slug}" cleaned up.`);
   return { exitCode: 0, written };
 }
 
-/** Pretty-print a TTL in ms as `Nh`, `Nm`, or `Nd` for the nudge. */
+/** Pretty-print a TTL in ms as `Nh`, `Nm`, or `Nd` for the nudge.
+ *
+ *  Floor, never round: both surfaces that render this ("Expires in Nh" in the
+ *  try nudge, "expires in Nh" in doctor's TRIALS section) read as a precise
+ *  expiry, and rounding UP overstates the time left -- 90m printed as "2h"
+ *  told the user they had half an hour they did not have. Flooring can only
+ *  understate, which is the safe direction for a deadline. */
 export function formatTtl(ms: number): string {
   const clamped = Math.max(0, ms);
-  if (clamped < 60_000) return `${Math.round(clamped / 1000)}s`;
-  if (clamped < 3_600_000) return `${Math.round(clamped / 60_000)}m`;
-  if (clamped < 86_400_000) return `${Math.round(clamped / 3_600_000)}h`;
-  return `${Math.round(clamped / 86_400_000)}d`;
+  if (clamped < 60_000) return `${Math.floor(clamped / 1000)}s`;
+  if (clamped < 3_600_000) return `${Math.floor(clamped / 60_000)}m`;
+  if (clamped < 86_400_000) return `${Math.floor(clamped / 3_600_000)}h`;
+  return `${Math.floor(clamped / 86_400_000)}d`;
 }
 
-/** Doctor-side: list every trial marker on disk, classify expired vs live,
- *  and (when GC=true) peel expired entries out of their client configs +
- *  delete the markers + fire the expiry-gc event. Returns a structured
- *  summary so doctor can render it inline. */
+/** Doctor-side: list every trial marker on disk and classify expired vs live.
+ *  Returns a structured summary so doctor can render it inline. Sweeping the
+ *  expired ones is gcExpiredTrials' job, not this function's -- scanTrials
+ *  takes no GC flag and has no side effects. */
 export interface TrialScanEntry {
   marker: TrialMarker;
   /** Absolute path of the scanned marker file. GC must unlink THIS path --
@@ -1004,16 +1051,11 @@ export async function scanTrials(opts: { home?: string; now?: () => number } = {
   return result;
 }
 
-/** Sweep expired trials: peel each one out of its client config + delete
- *  the marker + fire an expiry-gc event through the postEvent seam (a no-op
- *  unless a caller injects one). Best-effort — failures
- *  on individual entries don't abort the sweep. Returns the count cleared
- *  so doctor can report it. */
+/** Sweep expired trials: peel each one out of its client config and delete
+ *  the marker. Best-effort — failures on individual entries don't abort the
+ *  sweep. Returns the count cleared so doctor can report it. */
 export async function gcExpiredTrials(opts: {
   home?: string;
-  env?: NodeJS.ProcessEnv;
-  baseUrl?: string;
-  postEvent?: (baseUrl: string, body: TryEventBody) => Promise<void>;
   now?: () => number;
   /** Precomputed scan to sweep. When omitted, gcExpiredTrials scans itself.
    *  doctor passes the scan it already needs for readout so the trials dir
@@ -1021,9 +1063,6 @@ export async function gcExpiredTrials(opts: {
   scan?: TrialScanResult;
 }): Promise<{ cleared: number; failed: number; failures: TrialGcFailure[] }> {
   const home = opts.home ?? homedir();
-  const env = opts.env ?? process.env;
-  const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
-  const postEvent = opts.postEvent ?? defaultPostEvent;
   const scan = opts.scan ?? (await scanTrials({ home, now: opts.now }));
   if (scan.expired.length === 0) return { cleared: 0, failed: 0, failures: [] };
 
@@ -1052,6 +1091,14 @@ export async function gcExpiredTrials(opts: {
               const out = next.endsWith("\n") ? next : `${next}\n`;
               await atomicWriteFile(marker.clientPath, out);
             }
+          } else {
+            // Valid JSON, but not an object (an array, a string, a number):
+            // removeJsoncEntry has no container to name the entry in, so the
+            // peel cannot happen. Fail LOUDLY rather than falling through to
+            // the unlink -- dropping the marker here would leave the trial
+            // entry wired with nothing on disk that could ever name it again.
+            // Throwing keeps stage "peel", which is what the user needs told.
+            throw new Error(`${marker.clientPath} is not a JSON object`);
           }
         }
       }
@@ -1059,9 +1106,6 @@ export async function gcExpiredTrials(opts: {
       // marker.slug would orphan a marker whose filename mismatches its slug.
       stage = "unlink";
       await unlink(path);
-      await postEvent(baseUrl, { slug: marker.slug, action: "expiry-gc", anonId: ANON_ID_PLACEHOLDER }).catch(
-        () => undefined,
-      );
       cleared++;
     } catch (e) {
       const error = (e as Error).message;

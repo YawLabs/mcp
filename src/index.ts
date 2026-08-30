@@ -3,7 +3,7 @@ import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
-import { runDoctor } from "./doctor-cmd.js";
+import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
@@ -35,8 +35,8 @@ declare const __VERSION__: string;
 function dispatch(cmd: string, p: Promise<{ exitCode: number } | number>): void {
   // IMPORTANT: do NOT call process.exit() synchronously here. A bare
   // process.exit() force-flushes the event loop and can TRUNCATE buffered
-  // stdout when the consumer is a slow pipe (e.g. `yaw-mcp servers --json
-  // | jq ...` with a large bundle list, or `yaw-mcp audit --json | tee
+  // stdout when the consumer is a slow pipe (e.g. `yaw-mcp doctor --json
+  // | jq ...` on a large bundle, or `yaw-mcp audit --json | tee
   // ...`). Setting process.exitCode and returning lets Node drain
   // pending writes on its own; once the runner promise settles AND
   // stdout/stderr finish flushing, the process exits naturally with the
@@ -84,9 +84,11 @@ function run<T>(
 }
 
 // Subcommand dispatcher. `yaw-mcp` with no args (or with flags only) runs as
-// the MCP server that talks to Yaw MCP. Known subcommands branch off
-// before the YAW_MCP_TOKEN check so local-only commands like `compliance`,
-// `install`, and `doctor` don't require an account.
+// the MCP server. Known subcommands branch off before the server is ever
+// constructed, so `compliance`, `install`, and `doctor` never open a stdio
+// transport. There is no auth gate to branch around: the hosted backend is
+// retired, YAW_MCP_TOKEN is a dead legacy key (see upstream.ts), and every
+// subcommand here is local-only.
 const subcommand = process.argv[2];
 
 if (subcommand === "compliance") {
@@ -118,29 +120,11 @@ if (subcommand === "compliance") {
     run("install", parsed, (options) => runInstall({ ...options, claudeConfigDir }));
   }
 } else if (subcommand === "doctor") {
-  const doctorArgs = process.argv.slice(3);
-  const doctorJson = doctorArgs.includes("--json");
-  const isHelpArg = (a: string): boolean => a === "--help" || a === "-h";
-  // Collect ALL stray args (not just the first) so `doctor --bad --worse`
-  // reports both. An explicit --help still wins, but only when no unknown
-  // PRECEDES it -- `doctor --bad --help` must report --bad, matching the
-  // parse-first siblings (which reject unknown flags before honoring help).
-  const doctorUnknowns = doctorArgs.filter((a) => a !== "--json" && !isHelpArg(a));
-  const firstHelpIdx = doctorArgs.findIndex(isHelpArg);
-  const firstUnknownIdx = doctorArgs.findIndex((a) => a !== "--json" && !isHelpArg(a));
-  const helpWins = firstHelpIdx !== -1 && (firstUnknownIdx === -1 || firstHelpIdx < firstUnknownIdx);
-  if (helpWins) {
-    process.stdout.write(
-      "Usage: yaw-mcp doctor [--json]\n\n  Print a diagnostic of your yaw-mcp setup.\n\n  --json  Emit machine-readable JSON instead of text.\n",
-    );
-    process.exitCode = 0;
-  } else if (doctorUnknowns.length > 0) {
-    const quoted = doctorUnknowns.map((a) => `"${a}"`).join(", ");
-    process.stderr.write(`yaw-mcp doctor: unknown argument${doctorUnknowns.length > 1 ? "s" : ""} ${quoted}\n`);
-    process.exitCode = 2;
-  } else {
-    dispatch("doctor", runDoctor({ json: doctorJson }));
-  }
+  // Argv parsing lives in doctor-cmd.ts (parseDoctorArgs) like every sibling
+  // subcommand's, so the completion / help tests can import it -- importing
+  // THIS file to test the branch is impossible, since the dispatcher runs at
+  // import time. The branch is now just the shared parse-then-dispatch tail.
+  run("doctor", parseDoctorArgs(process.argv.slice(3)), runDoctor);
 } else if (subcommand === "reset-learning") {
   const parsed = parseResetLearningArgs(process.argv.slice(3));
   if (parsed.kind === "help") {

@@ -270,6 +270,17 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
   // Version FIRST, before the `trusted` shape check: a future schema may not
   // spell the entry map `trusted` at all, and misreporting that as "parse"
   // would let grantTrust rebuild over a store full of real grants.
+  //
+  // A PRESENT but non-numeric version is a corrupt file, never "assume
+  // current": defaulting it to TRUST_SCHEMA_VERSION let a hand edit of
+  // `"version": 2` to `"version": "2"` walk straight past the newer-schema
+  // guard below and be reinterpreted under v1 semantics -- the one thing that
+  // guard exists to prevent. Absent stays "assume current" (v1 stores were
+  // written without the field).
+  if (obj.version !== undefined && typeof obj.version !== "number") {
+    log("warn", "Trust store has a non-numeric version; nothing is trusted", { path });
+    return emptyStore("parse", `${path} has a non-numeric "version" field; the store is corrupt`);
+  }
   const version = typeof obj.version === "number" ? obj.version : TRUST_SCHEMA_VERSION;
   if (version > TRUST_SCHEMA_VERSION) {
     log("warn", "Trust store was written by a newer yaw-mcp; nothing is trusted", { path, version });
@@ -385,6 +396,14 @@ async function writeTrustStore(home: string, entries: Record<string, TrustRecord
  * approved project because an antivirus scanner happened to hold the file
  * open. A newer-schema store is the same situation with a different cause:
  * its grants are real, so an older binary must not stamp a v1 file over them.
+ *
+ * The store is read TWICE: once up front so an unusable store is refused
+ * before any work, and again immediately before the write so this grant is
+ * merged onto whatever is on disk NOW. Without the second read the whole
+ * operation was a read-modify-write across an unbounded gap (trust-cmd renders
+ * the argv and waits at a [y/N] prompt in between), so two `yaw-mcp trust`
+ * runs in different repos silently lost one grant -- last writer wins with a
+ * snapshot taken minutes earlier.
  */
 export async function grantTrust(
   path: string,
@@ -393,26 +412,39 @@ export async function grantTrust(
 ): Promise<{ storePath: string; record: TrustRecord; storeWasMalformed: boolean }> {
   const home = opts.home ?? homedir();
   const store = await readTrustStore(home);
-  const kind = store.malformedKind;
-  if (kind === "io" || kind === "schema") {
-    throw new TrustStoreUnreadableError(
-      trustStorePath(home),
-      store.malformedReason ?? `could not use ${trustStorePath(home)}`,
-      store.errorCode,
-      kind,
-    );
-  }
-  // Only the "parse" case reaches here, where there is nothing to preserve.
-  const entries = store.malformed ? {} : { ...store.entries };
+  refuseUnusableStore(home, store);
   const record: TrustRecord = {
     path: resolve(path),
     sha256: hashTrustContent(contents),
     grantedAt: new Date(opts.now ? opts.now() : Date.now()).toISOString(),
   };
+  // Re-read and merge. The refusal is repeated on the fresh read: a store that
+  // became unreadable (or was replaced by a newer-schema one) while we were
+  // deciding must not be stamped over either.
+  const fresh = await readTrustStore(home);
+  refuseUnusableStore(home, fresh);
+  // Only the "parse" case reaches here, where there is nothing to preserve.
+  const entries = fresh.malformed ? {} : { ...fresh.entries };
   entries[normalizeTrustKey(path)] = record;
   const storePath = await writeTrustStore(home, entries);
   log("info", "Granted project bundles.json trust", { path: record.path, sha256: record.sha256 });
-  return { storePath, record, storeWasMalformed: store.malformed };
+  // Either read seeing garbage means grants were dropped, so the caller's
+  // "your other approvals are gone" note must fire for both.
+  return { storePath, record, storeWasMalformed: store.malformed || fresh.malformed };
+}
+
+/** Throw TrustStoreUnreadableError when `store` holds real grants this build
+ *  must not replace (unreadable, or written by a newer schema). Shared by the
+ *  pre-check and the pre-write re-check so both refuse identically. */
+function refuseUnusableStore(home: string, store: TrustStore): void {
+  const kind = store.malformedKind;
+  if (kind !== "io" && kind !== "schema") return;
+  throw new TrustStoreUnreadableError(
+    trustStorePath(home),
+    store.malformedReason ?? `could not use ${trustStorePath(home)}`,
+    store.errorCode,
+    kind,
+  );
 }
 
 /**
@@ -420,6 +452,10 @@ export async function grantTrust(
  * the store (a no-op revoke is a success -- "make it absent" happened) or
  * when the store is malformed (nothing is trusted anyway, and rewriting it
  * would destroy evidence the user may want to inspect).
+ *
+ * Like grantTrust, the store is re-read immediately before the write so a
+ * concurrent grant from another terminal is preserved instead of being
+ * reverted by this command's older snapshot.
  */
 export async function revokeTrust(
   path: string,
@@ -430,8 +466,15 @@ export async function revokeTrust(
   const storePath = trustStorePath(home);
   if (store.malformed) return { storePath, removed: false, storeWasMalformed: true };
   const key = normalizeTrustKey(path);
-  if (!(key in store.entries)) return { storePath, removed: false, storeWasMalformed: false };
-  const entries = { ...store.entries };
+  // Object.hasOwn, not `in`: entries comes from JSON.parse and carries
+  // Object.prototype, so `"toString" in entries` is true for every store.
+  // normalizeTrustKey yields an absolute path today, which is why this was
+  // never reachable -- the guard must not depend on that staying true.
+  if (!Object.hasOwn(store.entries, key)) return { storePath, removed: false, storeWasMalformed: false };
+  const fresh = await readTrustStore(home);
+  if (fresh.malformed) return { storePath, removed: false, storeWasMalformed: true };
+  if (!Object.hasOwn(fresh.entries, key)) return { storePath, removed: false, storeWasMalformed: false };
+  const entries = { ...fresh.entries };
   delete entries[key];
   await writeTrustStore(home, entries);
   log("info", "Revoked project bundles.json trust", { path: resolve(path) });

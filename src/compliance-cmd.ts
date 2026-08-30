@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { posix as posixPath, win32 as winPath } from "node:path";
+import { resolveComplianceSuiteVersion } from "./audit-cmd.js";
 
 interface ComplianceReport {
   grade: string;
@@ -58,7 +59,13 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
   // unrecognized extra arg it reaches the mcp-compliance child, which fails
   // with its own opaque child-process error instead of telling the user the
   // flag is gone. Exit 2 -- same arg-error convention as a missing <target>.
-  if (argv.includes("--publish")) {
+  //
+  // Both spellings, because a removed flag is exactly the one a user is most
+  // likely to type with its old ARGUMENT still attached (`--publish=public`,
+  // the value the retired backend took). An exact-match check let that form
+  // through to the child as an unrecognized extra arg, which is precisely the
+  // opaque failure this branch exists to replace.
+  if (argv.some((a) => a === "--publish" || a.startsWith("--publish="))) {
     err(PUBLISH_REMOVED_MESSAGE);
     return 2;
   }
@@ -70,7 +77,7 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
     return 2;
   }
 
-  const run = await runTest(argv, err);
+  const run = await runTest(argv, err, await resolveComplianceSuiteSpec());
   if (!run) return 1;
 
   printSummary(run.report, out);
@@ -90,6 +97,36 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
 // runaway/garbage child can stream unbounded stdout into memory. Cap both.
 const MAX_STDOUT_BYTES = 16 * 1024 * 1024; // 16 MB
 const CHILD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes wall-clock
+
+/** npm package the compliance suite ships as. One constant so the pinned and
+ *  unpinned spellings cannot drift apart. */
+const COMPLIANCE_PKG = "@yawlabs/mcp-compliance";
+
+/**
+ * The npx spec for the compliance suite: `<pkg>@<version>` pinned to the copy
+ * this build depends on, or the bare package name when that cannot be read.
+ *
+ * `compliance` and `audit` are two front doors onto the same suite, and they
+ * must grade under ONE rubric. `audit` imports the pinned dependency and
+ * records the version it graded under as `suiteVersion` in grades.json;
+ * `compliance` used to shell out to `npx -y @yawlabs/mcp-compliance` with no
+ * pin at all, so it ran whatever npm called `latest`. The moment latest moved
+ * ahead of the dependency the two commands could hand the same server different
+ * letters, with nothing in either output naming which rubric produced them.
+ *
+ * The version comes from the same manifest audit reads (resolveComplianceSuiteVersion:
+ * the nearest installed node_modules/@yawlabs/mcp-compliance/package.json), so
+ * there is one source of truth rather than a hard-coded string to forget.
+ *
+ * Falls back to the unpinned name when the dependency is not installed beside
+ * this build -- a global install whose node_modules was pruned, or a bundled
+ * single-file build. npx then fetches `latest`, which is exactly the old
+ * behaviour: degraded to what shipped before, never broken.
+ */
+export async function resolveComplianceSuiteSpec(): Promise<string> {
+  const version = await resolveComplianceSuiteVersion();
+  return version ? `${COMPLIANCE_PKG}@${version}` : COMPLIANCE_PKG;
+}
 
 /** How to launch npx: either node + the npx JS entry (preferred), or a
  *  shell-quoted command line (last resort, only when the JS entry can't be
@@ -132,6 +169,17 @@ function quoteForShell(arg: string, platform: NodeJS.Platform): string | null {
     // cmd.exe still expands %VAR% inside double quotes, and a literal quote
     // terminates the quoted run. Everything else (& | < > ^) is inert there.
     if (/["%]/.test(arg)) return null;
+    // A TRAILING backslash escapes the closing quote for the receiving
+    // program's parser. cmd.exe passes the wrapped run through as text, but
+    // CommandLineToArgvW (which every Windows runtime, node's included, uses to
+    // split the command line back into argv) reads the `\"` as a LITERAL quote,
+    // so the quoted run never closes and the next argument is merged into this
+    // one: `"C:\dir\" "next"` arrives as the single argv element
+    // `C:\dir" next`. Doubling the run would encode it correctly, but this
+    // fallback is deliberately strict (see the header) -- a Windows path with a
+    // trailing separator is trivially respellable by the operator, and refusing
+    // routes into formatLaunchFailure, which names the offending argument.
+    if (arg.endsWith("\\")) return null;
     return `"${arg}"`;
   }
   // POSIX single quotes are fully literal -- the only unquotable char is `'`.
@@ -143,7 +191,7 @@ function quoteForShell(arg: string, platform: NodeJS.Platform): string | null {
  *  platform. Lives beside quoteForShell so the two cannot drift. */
 function unquotableCharsFor(platform: NodeJS.Platform): string {
   return platform === "win32"
-    ? "double quotes, percent signs, newlines or NUL bytes"
+    ? "double quotes, percent signs, newlines, NUL bytes or a trailing backslash"
     : "single quotes, newlines or NUL bytes";
 }
 
@@ -218,10 +266,12 @@ function isFiniteNumber(v: unknown): boolean {
 
 /**
  * Is a parsed report safe to render? Everything printSummary FORMATS is
- * checked here rather than at print time, because the child is spawned as
- * `npx -y @yawlabs/mcp-compliance` with no version pin -- every user runs
- * whatever npm calls latest, so a renamed or restructured field is a live
- * possibility rather than a hypothetical.
+ * checked here rather than at print time. The child is now spawned at the
+ * PINNED suite version (see resolveComplianceSuiteSpec), which makes a
+ * restructured field far less likely -- but the pin degrades to the bare
+ * package name whenever the dependency cannot be read off disk, and the child
+ * is a separate process whose output this one does not control either way, so
+ * the gate stays.
  *
  * `score` is the crash case: printSummary calls `score.toFixed(1)`, so a
  * missing / non-numeric / NaN score would take the CLI down with a raw
@@ -237,7 +287,12 @@ function isFiniteNumber(v: unknown): boolean {
 export function isRenderableReport(parsed: unknown): boolean {
   if (!parsed || typeof parsed !== "object") return false;
   const r = parsed as Partial<ComplianceReport>;
-  if (!r.grade || !r.summary) return false;
+  // `grade` is interpolated into the summary line, so it must be a non-empty
+  // STRING, not merely truthy: a numeric grade (a suite that switched the field
+  // to a 0-100 score) passed a truthiness-only check and printed
+  // "Compliance: 5 (91.5%)" as if 5 were a letter.
+  if (typeof r.grade !== "string" || r.grade.length === 0) return false;
+  if (!r.summary) return false;
   if (!isFiniteNumber(r.score)) return false;
   if (typeof r.url !== "string") return false;
   if (typeof r.summary !== "object" || Array.isArray(r.summary)) return false;
@@ -286,6 +341,78 @@ function killTree(child: ChildProcess): void {
   }
 }
 
+/** How long one Ctrl-C waits for killTree to actually take the child down
+ *  before the CLI stops waiting and exits itself. Long enough for taskkill to
+ *  spawn and walk a small tree, short enough that a stuck run does not read as
+ *  a hang. */
+export const INTERRUPT_GRACE_MS = 3000;
+
+/** Exit status for a run the operator interrupted: the POSIX 128 + SIGINT(2)
+ *  convention, so a shell / CI wrapper can tell "user cancelled" from a real
+ *  compliance failure. */
+export const INTERRUPT_EXIT_CODE = 130;
+
+/**
+ * Ctrl-C handling for one spawned child, as a cancellable pair.
+ *
+ * Registering a `process.once` SIGINT listener SUPPRESSES node's default
+ * behaviour (die on the signal) for that one signal, so the handler now owns
+ * the promise that the run ends. killTree is best-effort by construction --
+ * on Windows it shells out to taskkill and deliberately swallows the error, on
+ * POSIX the process-group kill can throw -- and when it fails to land, the
+ * handler consumed the only listener, nothing killed the child, and the CLI sat
+ * waiting on a child that will never close until a SECOND Ctrl-C. Requiring two
+ * interrupts to cancel is exactly the shape a user reads as "hung".
+ *
+ * So the first interrupt arms a bounded fallback: direct `child.kill()` (which
+ * at least reaches the wrapper even when the tree walk failed) and then a
+ * forced exit, so ONE Ctrl-C always ends the run. `cancel()` disarms it, and is
+ * called from every path that settles the run -- a child that dies promptly, the
+ * normal case, never reaches the fallback.
+ *
+ * Exported (with injectable clock/exit/kill seams) because the failure it
+ * guards against is a killTree that does nothing, which cannot be provoked
+ * through the real process signal path in a test.
+ */
+export function createInterruptHandler(
+  child: ChildProcess,
+  opts: {
+    graceMs?: number;
+    exit?: (code: number) => void;
+    kill?: (c: ChildProcess) => void;
+  } = {},
+): { onInterrupt: () => void; cancel: () => void } {
+  const graceMs = opts.graceMs ?? INTERRUPT_GRACE_MS;
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  const kill = opts.kill ?? killTree;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return {
+    onInterrupt: (): void => {
+      kill(child);
+      // A repeat interrupt must not stack a second fallback timer; the first
+      // one is already counting down against the same child.
+      if (timer !== undefined) return;
+      timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          // already exited, or never started -- the exit below is the point
+        }
+        exit(INTERRUPT_EXIT_CODE);
+      }, graceMs);
+      // The fallback must not be the reason the process stays alive: if
+      // everything else has finished, node should exit on its own.
+      timer.unref?.();
+    },
+    cancel: (): void => {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    },
+  };
+}
+
 /** A completed child run: the parsed report plus the exit status that carries
  *  the `--strict` / `--min-grade` verdict. `code` is null when the child died
  *  on a signal. */
@@ -294,7 +421,7 @@ interface ComplianceRun {
   code: number | null;
 }
 
-function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRun | null> {
+function runTest(args: string[], err: (s: string) => void, suiteSpec: string): Promise<ComplianceRun | null> {
   return new Promise((resolve) => {
     let settled = false;
     const fail = (message: string): void => {
@@ -304,7 +431,9 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRu
       resolve(null);
     };
 
-    const npxArgs = ["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", ...args];
+    // suiteSpec carries the version pin (see resolveComplianceSuiteSpec) so
+    // this run grades under the same rubric `yaw-mcp audit` records.
+    const npxArgs = ["-y", suiteSpec, "test", "--format", "json", ...args];
     const launch = resolveNpxLaunch(npxArgs);
     if (!launch) {
       fail(formatLaunchFailure(npxArgs));
@@ -332,15 +461,17 @@ function runTest(args: string[], err: (s: string) => void): Promise<ComplianceRu
     // Ctrl-C: on POSIX the child now leads its OWN process group, so the
     // terminal's SIGINT no longer reaches it -- take the tree down by hand
     // rather than orphaning an MCP server. Listeners are removed as soon as
-    // the promise settles so nothing leaks into the rest of the CLI.
-    const onInterrupt = (): void => {
-      killTree(child);
-    };
+    // the promise settles so nothing leaks into the rest of the CLI, and the
+    // handler's bounded fallback (see createInterruptHandler) is disarmed with
+    // them so a run that ended normally never force-exits.
+    const interrupt = createInterruptHandler(child);
+    const onInterrupt = interrupt.onInterrupt;
     process.once("SIGINT", onInterrupt);
     process.once("SIGTERM", onInterrupt);
     const releaseSignals = (): void => {
       process.off("SIGINT", onInterrupt);
       process.off("SIGTERM", onInterrupt);
+      interrupt.cancel();
     };
 
     // Accumulate raw Buffers and decode ONCE at close: decoding each chunk

@@ -27,7 +27,9 @@
 //     file the app will never read.
 //   • On Windows, `npx` is a `.cmd` shim; MCP clients that spawn it
 //     directly get ENOENT. The launch entry must be
-//     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp"] }`.
+//     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp@latest"] }`.
+//     (`@latest` is what buildLaunchEntry actually writes -- see the `pkg`
+//     default there; the unpinned spelling here read as a second, wrong shape.)
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -385,7 +387,9 @@ export interface BuildLaunchEntryOptions {
   oamEntry?: string | null;
 }
 
-/** The MCP client `mcpServers["yaw-mcp"]` entry — what `install` writes. */
+/** The MCP client `mcpServers["mcp"]` entry — what `install` writes. The key
+ *  is ENTRY_NAME (`mcp`); `yaw-mcp` is a LEGACY_ENTRY_NAME nothing writes any
+ *  more, so naming it here sent readers looking for the wrong key. */
 export interface LaunchEntry {
   command: string;
   args: string[];

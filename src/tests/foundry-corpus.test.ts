@@ -142,6 +142,23 @@ describe("validateCorpus / loadFoundryCorpus", () => {
     expect(wrap({ tokens: ["a"], chosen: "github", weight: Number.NaN })).toBeNull();
   });
 
+  it("rejects an entry whose chosen namespace is not in the snapshot catalog", () => {
+    // A hand-edited fixture (or a trimmed servers array) used to validate and
+    // then score as a silent top-3 miss -- rankServers cannot return a
+    // namespace it was never given -- so a bad fixture read as a ranker
+    // regression instead of a broken corpus.
+    expect(
+      validateCorpus({
+        version: 1,
+        servers: SERVERS,
+        entries: [
+          { tokens: ["issue"], chosen: "github", weight: 1 },
+          { tokens: ["deploy"], chosen: "not_a_server", weight: 1 },
+        ],
+      }),
+    ).toBeNull();
+  });
+
   it("still accepts what buildCorpusFromTraces actually produces", () => {
     const c = buildCorpusFromTraces([{ tokens: ["issue", "repo"], chosen: "github" }], SERVERS);
     expect(validateCorpus(JSON.parse(JSON.stringify(c)))).not.toBeNull();

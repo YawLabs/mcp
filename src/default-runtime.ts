@@ -25,11 +25,17 @@
 //
 // The bundles.json read is cached after the first call -- the connect path must
 // not re-read the file per spawn. ONE shape is exempt: a bundles.json that
-// exists but yielded no config (a degraded read with nothing configured) is
-// deliberately left uncached and therefore re-reads on every connect. See the
-// inline note in defaultRuntime below for why that exemption exists.
+// exists but yielded no config (a degraded read with nothing configured) does
+// not cache its verdict, so a file that gets FIXED is picked up by the next
+// connect. It is negative-cached on the stat signature of EVERY file the
+// verdict read instead, so a tree that stays broken costs a couple of stats
+// per connect rather than a full read-hash-parse. See the inline note in
+// defaultRuntime below.
 
-import { type LoadLocalBundlesResult, loadLocalBundles } from "./local-bundles.js";
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
 import { log } from "./logger.js";
 import {
   isRegistrySpec,
@@ -40,6 +46,7 @@ import {
   oamFailureLabel,
   specConstraint,
 } from "./oam-spawn.js";
+import { CONFIG_DIRNAME } from "./paths.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 export type RuntimeChoice = "oam" | "node";
@@ -48,10 +55,43 @@ export type RuntimeChoice = "oam" | "node";
 let bundlesDefaultCache: RuntimeChoice | null | undefined;
 let warnedInvalidEnv = false;
 
+/** Every file the previous degraded verdict depended on, with the stat
+ *  signature each had at the time. While they ALL still carry those
+ *  signatures the verdict cannot have changed, so the re-read is skipped --
+ *  see defaultRuntime. Null once any call reaches a usable answer.
+ *
+ *  Plural because the verdict is not a function of one file. A broken
+ *  PROJECT bundles.json still falls back to the user-global file for
+ *  `defaultRuntime` (local-bundles.ts, LoadLocalBundlesResult), so keying
+ *  only on the broken project file meant an explicit user-global
+ *  `defaultRuntime: "node"` written afterwards was never picked up -- the
+ *  exact silent inversion this exemption exists to prevent. A `null`
+ *  signature records "absent", so CREATING a file invalidates too. */
+let degradedProbe: Array<{ path: string; signature: string | null }> | null = null;
+let warnedDegradedBundles = false;
+
+/** mtime + size of a file, or null when it cannot be stat'ed (deleted, or the
+ *  directory became unreadable) -- null forces the full re-read, which is the
+ *  right answer for a file that is no longer the one we looked at.
+ *
+ *  Size rides along with mtime because filesystem timestamp granularity is
+ *  coarse (~15ms on NTFS): two writes inside one tick can share an mtime, and
+ *  the pair is far less likely to collide than mtime alone. */
+function statSignature(path: string): string | null {
+  try {
+    const s = statSync(path);
+    return `${s.mtimeMs}:${s.size}`;
+  } catch {
+    return null;
+  }
+}
+
 /** Reset the cached bundles.json default (test hook). */
 export function resetDefaultRuntimeCache(): void {
   bundlesDefaultCache = undefined;
   warnedInvalidEnv = false;
+  degradedProbe = null;
+  warnedDegradedBundles = false;
 }
 
 /**
@@ -145,21 +185,62 @@ export async function defaultRuntime(opts: { cwd?: string; home?: string } = {})
   const fromEnv = readEnvChoice(process.env);
   if (fromEnv !== null) return fromEnv;
   if (bundlesDefaultCache === undefined) {
+    // A degraded read is not cached as an ANSWER (see below), which used to
+    // mean the whole load -- read, project-trust hash, parse -- ran again on
+    // every connect for as long as the file stayed broken. One stat says
+    // whether it is still the same file; if it is, so is the verdict.
+    if (degradedProbe?.every((f) => statSignature(f.path) === f.signature)) return null;
     const bundles = await loadLocalBundles({ cwd: opts.cwd ?? process.cwd(), home: opts.home }).catch(() => null);
     // A bundles.json that EXISTS but yielded no config (unreadable, or JSON
     // that will not parse) is a degraded read, not an answer -- and it is
     // indistinguishable from "nothing configured" once it reaches the cache.
     // That matters now that unset means oam-when-installed: caching it would
     // silently INVERT an explicit `defaultRuntime: "node"` for the rest of
-    // the process. Return the fallback for this call and let the next connect
-    // re-read instead.
+    // the process. Return the fallback for this call, and let a connect that
+    // sees a CHANGED file re-read it (the stat gate above is what keeps an
+    // unchanged broken file from costing a read per connect).
     //
     // Only the degraded-AND-empty pair is left uncached. The healthy shapes
     // all still cache on the first call, including "no bundles.json anywhere"
     // (path null), so the connect path does not re-read per spawn.
     const degraded = bundles === null || (bundles.config === null && bundles.path !== null);
     const resolved = bundles?.defaultRuntime ?? null;
-    if (degraded && resolved === null) return null;
+    if (degraded && resolved === null) {
+      // Remember WHICH file was broken and how it looked, so the next connect
+      // can answer with a stat. A signature taken after the read can, in the
+      // narrow case of the file being fixed mid-read, describe content this
+      // call never saw -- the fix is then picked up on the following edit or
+      // restart rather than the next connect. That is a strictly smaller
+      // staleness window than the positive cache, which holds for the process
+      // lifetime. `bundles === null` (the loader itself threw) leaves no path
+      // to stat, so that shape keeps re-reading as before.
+      const path = bundles?.path ?? null;
+      const signature = path === null ? null : statSignature(path);
+      if (path === null || signature === null) {
+        degradedProbe = null;
+      } else {
+        // The broken file plus the user-global file it falls back to. Same
+        // construction local-bundles uses, so the two cannot disagree about
+        // which path that is. Deduped for the case where the broken file IS
+        // the user-global one.
+        const globalPath = localBundlesPath(join(opts.home ?? homedir(), CONFIG_DIRNAME));
+        const watched = path === globalPath ? [path] : [path, globalPath];
+        degradedProbe = watched.map((f) => ({ path: f, signature: statSignature(f) }));
+      }
+      if (!warnedDegradedBundles) {
+        warnedDegradedBundles = true;
+        // Once, not per connect: the loader's own parse diagnostic stops
+        // firing as soon as the re-read stops, so without this line the last
+        // word on a broken bundles.json would be a single startup warning.
+        log(
+          "warn",
+          "bundles.json could not be read for the default runtime; using the fallback until the file changes",
+          { path: path ?? "(unknown)" },
+        );
+      }
+      return null;
+    }
+    degradedProbe = null;
     bundlesDefaultCache = resolved;
   }
   return bundlesDefaultCache;

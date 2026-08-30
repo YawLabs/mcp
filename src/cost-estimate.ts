@@ -1,10 +1,12 @@
 // Rough "how many tokens will this server add to your context" estimate
 // for the discover() meta-tool. Helps the LLM budget before activating.
 //
-// We take the approach the mcp-hosting backend's `estimateTokens` uses —
-// ~4 bytes/token averages close enough to both OpenAI's BPE and
-// Anthropic's tokenizer for the coarse "this is a 300-token server vs.
-// a 3,000-token server" signal discover() surfaces.
+// The estimate is bytes/BYTES_PER_TOKEN, nothing cleverer: ~4 bytes per
+// token averages close enough to both OpenAI's BPE and Anthropic's
+// tokenizer for the coarse "this is a 300-token server vs. a 3,000-token
+// server" signal discover() surfaces. Running a real tokenizer here would
+// cost a dependency and per-call CPU to sharpen a number the UI already
+// prints with a leading tilde.
 //
 // Connected servers: measure the actual tool definitions the LLM would
 // see — name + description + inputSchema, serialized as JSON.

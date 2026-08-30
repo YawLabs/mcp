@@ -24,6 +24,16 @@ export const SAMPLING_TIMEOUT_MS = 2000;
 // this -- it delegates to shouldTiebreak (the exact pre-dial 0.9 top-2 ratio)
 // so the default path's sampling frequency is unchanged. Only "aggressive"
 // samples on the broader entropy-aware ambiguity signal, at a lower bar.
+//
+// NOT a fixed top-2 ratio: computeAmbiguity returns max(inverse margin,
+// normalized entropy), and the entropy half is normalized by
+// Math.log(topK.length) -- so the number of candidates in the top-K moves the
+// effective bar. Worked example at this 0.6 setting: with exactly TWO
+// candidates a runner-up scoring ~20% of the leader already yields ~0.65 and
+// samples; add a third candidate (even one scoring 0, since the normalizer
+// counts slots and not positive mass) and the same top-2 shape divides by
+// log(3) instead of log(2), lands at ~0.41, and does not. Read this constant
+// as "how flat the top-K is", not "how close the runner-up is".
 export const AGGRESSIVE_AMBIGUITY_THRESHOLD = 0.6;
 
 export interface TiebreakCandidate {
@@ -102,6 +112,16 @@ export function parseTiebreakResponse(response: string, candidates: TiebreakCand
     // length tiebreak the winner would be whichever happened to be
     // iterated first, silently misparsing the LLM's pick as the shorter
     // namespace. Longest-match-wins makes the exact mention win.
+    //
+    // Reachability note: today's NAMESPACE_RE (local-bundles.ts) is
+    // /^[a-z][a-z0-9_]{0,29}$/ -- '-' is NOT a legal namespace character, and
+    // '_' IS a word character, so in the canonical shape ("aws_s3" vs
+    // "aws_s3_tools") `\b` cannot fire mid-name and only the longer namespace
+    // matches at all. The tie this branch resolves therefore needs a
+    // separator NAMESPACE_RE currently forbids; it is kept because relaxing
+    // that regex to allow '-' would otherwise silently change which
+    // namespace an inline mention resolves to. Both shapes are pinned in
+    // sampling-rank.test.ts so an edit to either side has to face a test.
     let bestNs: string | null = null;
     let bestPos = Number.POSITIVE_INFINITY;
     for (const ns of namespaces) {

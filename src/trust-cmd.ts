@@ -19,12 +19,15 @@
 // Exit codes: 0 success, 1 refused / aborted / nothing to approve,
 // 2 argv error (matching the sibling subcommands).
 
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
-import { createInterface } from "node:readline/promises";
-import { previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
 import { specConstraint } from "./oam-spawn.js";
+import { CONFIG_DIRNAME } from "./paths.js";
+// One prompt reader for the whole product -- see askYesNo at the bottom of
+// this file for why this crosses a command boundary.
+import { readAnswerFromTTY } from "./secrets-cmd.js";
 import {
   grantTrust,
   hashTrustContent,
@@ -143,6 +146,20 @@ export function parseTrustArgs(
     opts.path = positional[0];
   }
   opts.mode = opts.mode ?? "grant";
+  // Cross-action flags are REFUSED, not silently dropped (the discipline
+  // secrets-cmd already applies to --value/--stdin/--secret/--server).
+  // runTrustGrant never reads opts.json and runTrustList/Revoke never read
+  // opts.yes, so `trust --yes --json` used to promise machine-readable output
+  // and print prose at a script that was parsing it.
+  if (opts.json && opts.mode === "grant") {
+    return { ok: false, error: `yaw-mcp trust: --json applies to --list and --revoke only\n\n${TRUST_USAGE}` };
+  }
+  if (opts.yes && opts.mode !== "grant") {
+    return {
+      ok: false,
+      error: `yaw-mcp trust: --yes applies to the approval prompt only, not --${opts.mode}\n\n${TRUST_USAGE}`,
+    };
+  }
   return { ok: true, options: opts };
 }
 
@@ -189,6 +206,28 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     print(`Already approved: ${displaySafe(path)}`);
     print(`  contents unchanged since approval (sha256 ${probe.sha256}) -- nothing to do.`);
     return { exitCode: 0 };
+  }
+
+  // A store this build must not write over is refused HERE, next to the
+  // already-approved short-circuit, rather than after the review. grantTrust
+  // throws for the "io" and "schema" kinds no matter what the user answers, so
+  // rendering every argv line and asking them to confirm only collects a
+  // decision we are about to discard -- and it teaches them the prompt is
+  // theatre. The "parse" kind is deliberately NOT short-circuited: grantTrust
+  // rebuilds over an unparseable store, so that grant can still succeed and
+  // the review is still the thing being approved. probe.status collapses all
+  // three into "store-unreadable", so the kind has to come from the store.
+  if (probe.status === "store-unreadable") {
+    const store = await readTrustStore(home);
+    if (store.malformedKind === "io" || store.malformedKind === "schema") {
+      printStoreRefusal(printErr, {
+        storePath: probe.storePath,
+        reason: store.malformedReason ?? `could not use ${probe.storePath}`,
+        code: store.errorCode,
+        kind: store.malformedKind,
+      });
+      return { exitCode: 1 };
+    }
   }
 
   // Refuse to approve a file we cannot show the user. Trusting an
@@ -301,19 +340,9 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     granted = await grantTrust(path, raw, { home, now: opts.now });
   } catch (e) {
     if (e instanceof TrustStoreUnreadableError) {
-      if (e.kind === "schema") {
-        printErr(`yaw-mcp trust: ${displaySafe(e.reason)}.`);
-        printErr(
-          "Nothing was approved and the store was NOT touched: your existing approvals are still in that file, in a format this build would have to guess at. Upgrade with `npm i -g @yawlabs/mcp@latest`, then re-run `yaw-mcp trust`.",
-        );
-        return { exitCode: 1 };
-      }
-      printErr(
-        `yaw-mcp trust: cannot read the trust store at ${displaySafe(e.storePath)}${e.code ? ` (${e.code})` : ""} -- ${e.reason}.`,
-      );
-      printErr(
-        "Nothing was approved and the store was NOT touched: your existing approvals are still in that file. Fix its permissions (or close whatever is holding it open), then re-run `yaw-mcp trust`.",
-      );
+      // The store can also become unusable BETWEEN the pre-review check above
+      // and this write, so both sites render the refusal through one helper.
+      printStoreRefusal(printErr, { storePath: e.storePath, reason: e.reason, code: e.code, kind: e.kind });
       return { exitCode: 1 };
     }
     throw e;
@@ -341,6 +370,31 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
     print("Restart your MCP client (or yaw-mcp) to load it.");
   }
   return { exitCode: 0 };
+}
+
+/** The refusal for a trust store this build must not write over. Two callers:
+ *  the pre-review short-circuit (so the user is never asked to confirm a grant
+ *  that cannot land) and the grantTrust catch (the store can go unreadable
+ *  while the prompt is open). The remedy differs by kind -- "fix the
+ *  permissions" would send a user with a newer-schema store to chmod a file
+ *  that reads perfectly. */
+function printStoreRefusal(
+  printErr: (s: string) => void,
+  e: { storePath: string; reason: string; code: string | null; kind: "io" | "schema" },
+): void {
+  if (e.kind === "schema") {
+    printErr(`yaw-mcp trust: ${displaySafe(e.reason)}.`);
+    printErr(
+      "Nothing was approved and the store was NOT touched: your existing approvals are still in that file, in a format this build would have to guess at. Upgrade with `npm i -g @yawlabs/mcp@latest`, then re-run `yaw-mcp trust`.",
+    );
+    return;
+  }
+  printErr(
+    `yaw-mcp trust: cannot read the trust store at ${displaySafe(e.storePath)}${e.code ? ` (${e.code})` : ""} -- ${e.reason}.`,
+  );
+  printErr(
+    "Nothing was approved and the store was NOT touched: your existing approvals are still in that file. Fix its permissions (or close whatever is holding it open), then re-run `yaw-mcp trust`.",
+  );
 }
 
 /** How a server would be launched, as one reviewable line. Args containing
@@ -658,6 +712,32 @@ async function classifyRecord(path: string, sha256: string): Promise<ListStatus>
 
 // --- revoke -----------------------------------------------------------------
 
+/** Map a user-supplied `--revoke` target onto the key the store actually
+ *  holds -- the project's `.yaw-mcp/bundles.json`.
+ *
+ *  `yaw-mcp trust --revoke .` is the spelling a user reaches for (it mirrors
+ *  the grant, which takes no path at all and works on the project you are
+ *  standing in), but the store is keyed by the FILE. Resolving the directory
+ *  verbatim therefore matched nothing and exited 0 with "was not approved
+ *  (nothing to do)" -- a silent no-op that reads as a successful revoke.
+ *
+ *  A path that does not exist is passed through unchanged: there is nothing to
+ *  probe, and revokeTrust's not-approved branch is the right answer for it. */
+async function resolveRevokeTarget(target: string): Promise<string> {
+  let isDir: boolean;
+  try {
+    isDir = (await stat(target)).isDirectory();
+  } catch {
+    return target;
+  }
+  if (!isDir) return target;
+  // <project>/.yaw-mcp -> that directory's bundles.json; anything else is
+  // treated as the project root, which owns a .yaw-mcp/ of its own.
+  return basename(target) === CONFIG_DIRNAME
+    ? localBundlesPath(target)
+    : localBundlesPath(join(target, CONFIG_DIRNAME));
+}
+
 async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandResult> {
   const out = opts.out ?? ((s: string) => process.stdout.write(s));
   const err = opts.err ?? ((s: string) => process.stderr.write(s));
@@ -670,7 +750,7 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
 
   let target: string;
   if (opts.path) {
-    target = resolve(cwd, opts.path);
+    target = await resolveRevokeTarget(resolve(cwd, opts.path));
   } else {
     const probe = await probeProjectTrust({ cwd, home, env });
     if (probe.path === null) {
@@ -719,15 +799,21 @@ function isInteractive(opts: TrustCommandOptions): boolean {
 }
 
 /** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds,
- *  so a bare Enter (or ^D, or a stray keystroke) leaves the file unapproved. */
+ *  so a bare Enter (or ^D, or a stray keystroke) leaves the file unapproved.
+ *
+ *  Routed through secrets-cmd's reader rather than node:readline so both of
+ *  the product's confirmation prompts behave identically: control bytes are
+ *  dropped instead of buffered and echoed, which is what stops an arrow key
+ *  at this prompt from repainting the screen AND leaving an invisible byte in
+ *  the answer ("\x1by" is not "y", so the approval silently flipped to a
+ *  decline). Two implementations of "read one confirmation" drift; there is
+ *  now one. */
 async function askYesNo(opts: TrustCommandOptions, question: string): Promise<string> {
   if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
   const input = opts.io?.stdin ?? process.stdin;
   const output = opts.io?.stdout ?? process.stdout;
-  const rl = createInterface({ input, output });
-  try {
-    return (await rl.question(question)).trim().toLowerCase();
-  } finally {
-    rl.close();
-  }
+  // null = ^C. The prompt already defaults to NO, so a cancel lands on the
+  // same "Aborted. Nothing was approved." path as any other non-y answer.
+  const answer = await readAnswerFromTTY(input, output, question);
+  return (answer ?? "").trim().toLowerCase();
 }

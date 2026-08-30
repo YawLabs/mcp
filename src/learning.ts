@@ -152,8 +152,16 @@ export class LearningStore {
     u.lastUsedAt = Date.now();
   }
 
-  get(namespace: string): NamespaceUsage | undefined {
-    return this.usage.get(namespace);
+  // Read a namespace's counters. Returns a COPY, and types it readonly:
+  // handing out the live object let any caller write straight past the
+  // clamps the recorders maintain (recordOutcome banks at most 1.0 of credit
+  // per dispatch, adjustSucceeded clamps succeeded to [0, dispatched]), which
+  // would then flow into boostFactor and, via exportSnapshot, onto disk.
+  // entries() and exportSnapshot() already copy; this closes the one reader
+  // that did not.
+  get(namespace: string): Readonly<NamespaceUsage> | undefined {
+    const u = this.usage.get(namespace);
+    return u === undefined ? undefined : { ...u };
   }
 
   // Boost factor in [LEARNING_MIN_BOOST, LEARNING_MAX_BOOST]. Penalty

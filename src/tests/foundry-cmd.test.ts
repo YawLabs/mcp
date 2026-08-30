@@ -122,7 +122,9 @@ describe("runFoundryExport", () => {
     expect(r.exitCode).toBe(1);
   });
 
-  it("exits 2 when no chosen server is in the local catalog", async () => {
+  it("exits 1 (runtime failure, not a usage error) when no chosen server is in the local catalog", async () => {
+    // Used to be 2, which the rest of the CLI reserves for an argv error --
+    // a well-formed invocation must never claim the user mistyped it.
     const r = await runFoundryExport({
       out: join(dir, "c.json"),
       cap: 500,
@@ -131,6 +133,6 @@ describe("runFoundryExport", () => {
       loadServers: async () => SERVERS,
       ...silent,
     });
-    expect(r.exitCode).toBe(2);
+    expect(r.exitCode).toBe(1);
   });
 });

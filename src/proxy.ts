@@ -276,6 +276,18 @@ export function buildToolRoutes(
 // always present regardless of which servers are activated, so clients
 // that scan the list top-down (Claude Code does) see the guide before
 // the upstream noise.
+/** One resources/list entry as this proxy publishes it. `title` and `_meta`
+ *  are MCP 2025-06-18 passthrough fields -- see the forwarding note in the
+ *  upstream loop below. */
+export interface ProxiedResourceEntry {
+  uri: string;
+  name?: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  _meta?: Record<string, unknown>;
+}
+
 export function buildResourceList(
   activeConnections: Map<string, UpstreamConnection>,
   builtins: BuiltinResource[] = [],
@@ -284,19 +296,25 @@ export function buildResourceList(
   // Builtins are always listed -- they are yaw-mcp's own, not an upstream's.
   exposure: ToolExposure = "full",
   exposedNamespaces?: ReadonlySet<string>,
-): Array<{ uri: string; name?: string; description?: string; mimeType?: string }> {
-  const resources: Array<{ uri: string; name?: string; description?: string; mimeType?: string }> = [];
+): Array<ProxiedResourceEntry> {
+  const resources: ProxiedResourceEntry[] = [];
   for (const b of builtins) {
     resources.push({ uri: b.uri, name: b.name, description: b.description, mimeType: b.mimeType });
   }
   for (const conn of activeConnections.values()) {
     if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const r of conn.resources) {
+      // title / _meta ride along, same as buildToolList: an upstream that
+      // published a display name or a metadata convention must reach the
+      // client with both intact (MCP 2025-06-18). Builtins above set
+      // neither -- yaw-mcp's own resources have no upstream to forward.
       resources.push({
         uri: r.namespacedUri,
         name: r.name,
+        title: r.title,
         description: r.description,
         mimeType: r.mimeType,
+        _meta: r._meta,
       });
     }
   }
@@ -313,20 +331,22 @@ export function buildResourceRoutes(activeConnections: Map<string, UpstreamConne
   return routes;
 }
 
+/** One prompts/list entry as this proxy publishes it. Same MCP 2025-06-18
+ *  `title` / `_meta` passthrough as ProxiedResourceEntry. */
+export interface ProxiedPromptEntry {
+  name: string;
+  title?: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+  _meta?: Record<string, unknown>;
+}
+
 export function buildPromptList(
   activeConnections: Map<string, UpstreamConnection>,
   exposure: ToolExposure = "full",
   exposedNamespaces?: ReadonlySet<string>,
-): Array<{
-  name: string;
-  description?: string;
-  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
-}> {
-  const prompts: Array<{
-    name: string;
-    description?: string;
-    arguments?: Array<{ name: string; description?: string; required?: boolean }>;
-  }> = [];
+): Array<ProxiedPromptEntry> {
+  const prompts: ProxiedPromptEntry[] = [];
   // Same `seen` guard, and for the same reason, as buildToolList: prompts
   // flatten to `${namespace}_${prompt}` too, so (ns=`gh`, prompt=`review_pr`)
   // and (ns=`gh_review`, prompt=`pr`) both render as `gh_review_pr`. MCP
@@ -338,10 +358,13 @@ export function buildPromptList(
     if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const p of conn.prompts) {
       if (seen.has(p.namespacedName)) continue;
+      // title / _meta forwarded, same rationale as buildResourceList.
       prompts.push({
         name: p.namespacedName,
+        title: p.title,
         description: p.description,
         arguments: p.arguments,
+        _meta: p._meta,
       });
       seen.add(p.namespacedName);
     }

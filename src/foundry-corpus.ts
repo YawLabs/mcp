@@ -34,7 +34,7 @@ export const FOUNDRY_TOP3_FLOOR = 0.7;
 
 // One harvested trace as written by foundry.ts/appendFoundryTrace.
 //
-// `candidates` is ns-only ON DISK: appendFoundryTrace (foundry.ts:199)
+// `candidates` is ns-only ON DISK: appendFoundryTrace in foundry.ts
 // deliberately strips the per-candidate `score` before writing, because a
 // score reflects the ranker's live health/learning state at decision time
 // and would bias an eval replay against that same state. The in-memory
@@ -227,6 +227,14 @@ export function validateCorpus(obj: unknown): FoundryCorpus | null {
   if (c.entries.length === 0) return null;
   if (!c.servers.every(isRankableServerShape)) return null;
   if (!c.entries.every(isCorpusEntryShape)) return null;
+  // Cross-check `chosen` against the snapshot catalog. buildCorpusFromTraces
+  // already drops an unknown `chosen` at export time, so one here means the
+  // fixture was hand-edited or the servers array was trimmed. Left unchecked
+  // it is INVISIBLE: rankServers can never return a namespace it was not
+  // given, so the entry scores as a silent top-3 miss and drags the gate
+  // toward FOUNDRY_TOP3_FLOOR as if the ranker had regressed.
+  const known = new Set(c.servers.map((s) => s.namespace));
+  if (!c.entries.every((e) => known.has(e.chosen))) return null;
   return c as FoundryCorpus;
 }
 

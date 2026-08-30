@@ -79,19 +79,40 @@ export interface LoadConfigOptions {
    *  this loader ever consulted were YAW_MCP_TOKEN / YAW_MCP_URL, both
    *  retired with the hosted backend. Kept on the options type so the many
    *  existing call sites (server boot, doctor, every CLI subcommand) keep
-   *  compiling through the deprecation window. */
+   *  compiling through the deprecation window.
+   *
+   *  REMOVAL TARGET: delete this field, the two doctor-cmd.ts call sites
+   *  that still thread it (runDoctor / runDoctorJson), and the `env: {}`
+   *  arguments in config-loader.test.ts together, in one change. It is kept
+   *  ONLY to avoid a cross-file churn commit; nothing reads it, so no
+   *  behavior depends on the removal date. If a future config key does need
+   *  an env override, wire that key up explicitly rather than reviving this
+   *  as a general escape hatch. */
   env?: NodeJS.ProcessEnv;
 }
 
 /** Config keys that used to drive the hosted backend and are now inert.
- *  Detected (not consumed) so the loader can tell the user to clean up. */
-const DEPRECATED_KEYS = ["token", "apiBase"] as const;
+ *  Detected (not consumed) so the loader can tell the user to clean up.
+ *  Exported alongside KNOWN_CONFIG_KEYS for the schema drift test. */
+export const DEPRECATED_KEYS = ["token", "apiBase"] as const;
 
 /** Every top-level key the loader reads. Mirrors the shipped JSON schema
  *  (schemas/yaw-mcp.config.v1.json, additionalProperties:false) so an
  *  unrecognized key gets a warning instead of being a silent no-op --
- *  `$schema` is the editor-autocomplete pointer the schema itself allows. */
-const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set(["$schema", "version", "servers", "blocked", "installNudge"]);
+ *  `$schema` is the editor-autocomplete pointer the schema itself allows.
+ *
+ *  Exported so config-loader.test.ts can diff it against that schema's
+ *  `properties`: the two are the same contract written twice (the schema
+ *  refuses an unknown key in the editor, this set warns about it at load),
+ *  and the schema is shipped to users by URL, so a key added here and not
+ *  there would be flagged invalid in their editor while working fine. */
+export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "$schema",
+  "version",
+  "servers",
+  "blocked",
+  "installNudge",
+]);
 
 /** Build the soft-deprecation warning for a file that still carries
  *  `token` / `apiBase`. Named separately so the exact wording is
@@ -175,6 +196,18 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   const obj = parsed as Record<string, unknown>;
 
   const version = typeof obj.version === "number" ? obj.version : undefined;
+  // A PRESENT but wrong-typed version (`"version": "2"` -- the likeliest
+  // hand-edit typo, since every other value in the file is a string or an
+  // array of them) used to collapse to undefined and skip the newer-schema
+  // warning below, so the one user who most needs to be told their file is
+  // from a newer yaw-mcp got silence. Warn instead of coercing: guessing a
+  // schema version from a string is exactly the kind of leniency that makes
+  // the "loading best-effort" claim untrue.
+  if ("version" in obj && version === undefined) {
+    warnings.push(
+      `${path}: 'version' must be a number (found ${obj.version === null ? "null" : typeof obj.version}) -- ignored; schema-version checks are skipped for this file.`,
+    );
+  }
   if (version !== undefined && version > CURRENT_SCHEMA_VERSION) {
     warnings.push(
       `${path}: schema version ${version} is newer than this yaw-mcp (${CURRENT_SCHEMA_VERSION}); upgrade with \`npm i -g @yawlabs/mcp@latest\`. Loading best-effort.`,

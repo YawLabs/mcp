@@ -830,3 +830,54 @@ describe("gateway exposure covers resources and prompts too", () => {
     expect(buildPromptList(connections, "full", new Set())).toHaveLength(1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// MCP 2025-06-18 passthrough for RESOURCES and PROMPTS.
+//
+// buildToolList has forwarded `title` / `_meta` for a while; the resource
+// and prompt builders dropped both, so an upstream that published a
+// display name saw it silently replaced by the raw `name` downstream and a
+// _meta convention the upstream/client pair agreed on never arrived.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("buildResourceList / buildPromptList — title + _meta passthrough", () => {
+  /** A connection whose single resource and single prompt both carry the
+   *  optional presentation fields, which the plain makeConnection helper
+   *  above deliberately leaves unset. */
+  function titledConnection(): UpstreamConnection {
+    const conn = makeConnection("db", [], ["db://tables"], ["explain"]);
+    conn.resources[0].title = "Database Tables";
+    conn.resources[0]._meta = { "vendor/kind": "table-index" };
+    conn.prompts[0].title = "Explain a query";
+    conn.prompts[0]._meta = { "vendor/kind": "sql-helper" };
+    return conn;
+  }
+
+  it("forwards an upstream resource's title and _meta", () => {
+    const connections = new Map<string, UpstreamConnection>([["db", titledConnection()]]);
+    const [resource] = buildResourceList(connections);
+    expect(resource.title).toBe("Database Tables");
+    expect(resource._meta).toEqual({ "vendor/kind": "table-index" });
+    // The namespaced URI still wins over the upstream's raw one.
+    expect(resource.uri).toBe("connect://db/db://tables");
+  });
+
+  it("forwards an upstream prompt's title and _meta", () => {
+    const connections = new Map<string, UpstreamConnection>([["db", titledConnection()]]);
+    const [prompt] = buildPromptList(connections);
+    expect(prompt.title).toBe("Explain a query");
+    expect(prompt._meta).toEqual({ "vendor/kind": "sql-helper" });
+    expect(prompt.name).toBe("db_explain");
+  });
+
+  it("leaves both fields undefined when the upstream published neither", () => {
+    // The common case: forwarding must not invent a title out of `name`.
+    const connections = new Map<string, UpstreamConnection>([
+      ["db", makeConnection("db", [], ["db://tables"], ["explain"])],
+    ]);
+    expect(buildResourceList(connections)[0].title).toBeUndefined();
+    expect(buildResourceList(connections)[0]._meta).toBeUndefined();
+    expect(buildPromptList(connections)[0].title).toBeUndefined();
+    expect(buildPromptList(connections)[0]._meta).toBeUndefined();
+  });
+});

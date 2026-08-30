@@ -127,9 +127,14 @@ export function stripTrailingCommas(src: string): string {
   return out;
 }
 
-// Parse JSONC → unknown. Throws SyntaxError with the original source line
-// context when JSON.parse fails (so "bad JSON on line 7" works even after
-// we strip comments).
+// Parse JSONC -> unknown. On malformed input it rethrows JSON.parse's own
+// SyntaxError, raised against the comment-STRIPPED text -- there is no
+// re-mapping step and no excerpt of the user's original source in the
+// message beyond whatever JSON.parse itself includes. What the strippers
+// DO preserve is newlines (a swallowed comment keeps its line breaks, a
+// trailing comma becomes a space), so a reported LINE number still matches
+// the user's file; a character offset can be short by the width of any
+// block comment earlier on that same line.
 export function parseJsonc(src: string): unknown {
   // Strip a leading UTF-8 BOM (U+FEFF). Notepad on Windows defaults to
   // BOM-prefixed UTF-8, so a user who hand-edits ~/.claude.json there and

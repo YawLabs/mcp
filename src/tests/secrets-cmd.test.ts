@@ -2451,3 +2451,137 @@ describe("runSecrets -- concurrent-writer guard", () => {
     expect(parsed.error).toMatch(/EISDIR/);
   });
 });
+
+// -----------------------------------------------------------------------
+// The value prompt needs BOTH ends of the terminal.
+//
+// `yaw-mcp secrets set GH > out.json` has a TTY stdin and a redirected
+// stdout. Gating the prompt on stdin alone wrote "Secret value: " into the
+// redirect target, put the terminal into raw no-echo mode, and then waited
+// on a prompt the user could not see.
+// -----------------------------------------------------------------------
+
+describe("runSecrets set -- the value prompt refuses a redirected stdout", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
+  let home: string;
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("refuses (naming --value / --stdin) instead of prompting into the redirect", async () => {
+    // stdin has a value queued: without the stdout check the command happily
+    // reads it, stores the secret and exits 0 -- having written the prompt
+    // into the file the user was redirecting into.
+    const stdin = new FakeTTYStdin(["typed-value\n"]);
+    const stdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "GH",
+        passphrase: "a-long-passphrase",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(1);
+    const errOutput = io.err.mock.calls.map((c) => c[0] as string).join("");
+    expect(errOutput).toMatch(/cannot prompt for the value/);
+    expect(errOutput).toMatch(/--value/);
+    expect(errOutput).toMatch(/--stdin/);
+    // Nothing was written, and no prompt leaked into the redirected stream.
+    expect(existsSync(vaultPath(home))).toBe(false);
+    const promptText = (stdout.write as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .map((c) => c[0] as string)
+      .join("");
+    expect(promptText).not.toContain("Secret value:");
+  });
+
+  it("still prompts when both ends are a TTY", async () => {
+    const stdin = new FakeTTYStdin(["typed-value\n"]);
+    const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "GH",
+        passphrase: "a-long-passphrase",
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+      },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("still reads piped stdin when stdout is redirected (the scripted path)", async () => {
+    // Not a TTY at either end: this is `echo v | yaw-mcp secrets set GH > f`,
+    // which must keep working.
+    const { Readable } = await import("node:stream");
+    const stdin = Readable.from(["piped-value\n"]) as unknown as NodeJS.ReadableStream;
+    (stdin as { isTTY?: boolean }).isTTY = false;
+    const stdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
+    const r = await runSecrets(
+      { action: "set", name: "GH", passphrase: "a-long-passphrase", home, io: { stdin, stdout, stderr } },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+  });
+});
+
+// -----------------------------------------------------------------------
+// The corrupt-entry hint is derived from the ERROR TYPE, not from a regex
+// over its message: an entry name holding a newline defeats /(.+)$/ and used
+// to drop the only actionable half of the message.
+// -----------------------------------------------------------------------
+
+describe("runSecrets -- corrupt-entry hint survives an awkward entry name", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  let home: string;
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("still names the entry and how to delete it when the name contains a newline", async () => {
+    const badName = `BAD${String.fromCharCode(10)}NAME`;
+    const corrupt = {
+      version: 1,
+      salt: Buffer.alloc(16, 7).toString("base64"),
+      entries: { [badName]: { iv: "x", ciphertext: 123, authTag: "y" } },
+    };
+    writeFileSync(vaultPath(home), `${JSON.stringify(corrupt)}\n`);
+    const r = await runSecrets({ action: "list", home, json: true }, io);
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(
+      io.err.mock.calls
+        .map((c) => c[0] as string)
+        .join("")
+        .trim(),
+    );
+    expect(parsed.error).toContain("is corrupt, and every secrets command fails");
+    expect(parsed.error).toContain(badName);
+    expect(parsed.error).toContain(vaultPath(home));
+  });
+});

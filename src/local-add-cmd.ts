@@ -184,6 +184,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   let server: Awaited<ReturnType<typeof resolveCatalogSlug>>;
   try {
     server = await resolveCatalogSlug(slug, {
+      // A set-but-EMPTY YAW_MCP_CATALOG_URL survives this `??` (it is not
+      // nullish) -- resolveCatalogSlug normalizes empty/whitespace-only back to
+      // the default catalog so it can never reach fetch(""). See
+      // normalizeCatalogUrl in catalog.ts for why that guard lives there.
       catalogUrl: opts.catalogUrl ?? env.YAW_MCP_CATALOG_URL,
       fetchCatalog: opts.fetchCatalog,
     });
@@ -204,7 +208,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
   // Trim before the emptiness test so a whitespace-only value (FOO=" ") counts
   // as missing instead of slipping through and persisting a blank-ish secret to
-  // bundles.json -- matching try-cmd.ts:465.
+  // bundles.json -- matching the required-env gate in runTry (try-cmd.ts).
+  // Named by FUNCTION, not line: the line number this used to cite drifted into
+  // an unrelated helper two refactors later.
   const missing = server.requiredEnvKeys.filter((k) => (supplied[k] ?? "").trim() === "");
   if (missing.length > 0) {
     printErr(`yaw-mcp add: ${server.name} needs the following env var(s) before it can run:`);
@@ -287,8 +293,27 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     if (opts.json) {
       // Same wrapper shape as the real add below, with dryRun:true, so a
       // script parsing `add --json` sees one consistent shape either way --
-      // including the env redaction (see jsonEntry).
-      print(JSON.stringify({ ok: true, dryRun: true, namespace: previewNamespace, entry: jsonEntry(entry) }, null, 2));
+      // including the env redaction (see jsonEntry). `path` and `replaced`
+      // are part of that shape: the claim used to be made while the dry-run
+      // omitted both, so a consumer reading `replaced` to decide "new install
+      // vs update" silently saw undefined on every dry run. previewUpsert-
+      // UserBundle already computes `replaced` from the same resolution the
+      // real write uses, and the target path is the user-global file the write
+      // would touch (a dry run never writes it, so naming it costs nothing).
+      print(
+        JSON.stringify(
+          {
+            ok: true,
+            dryRun: true,
+            namespace: previewNamespace,
+            path: localBundlesPath(userConfigDir(home)),
+            replaced: preview.replaced,
+            entry: jsonEntry(entry),
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       const nsNote =
         previewNamespace === namespace
@@ -381,7 +406,13 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // Honest warning: a project-local bundles.json shadows the user-global file.
   // Goes to stderr, so it surfaces even under --json without corrupting the
   // JSON on stdout that a script is parsing.
-  const shadow = await findShadowingProjectBundles(cwd, home).catch(() => null);
+  //
+  // `env` is passed explicitly: the shadow verdict is trust-aware, and
+  // YAW_MCP_TRUST_PROJECT is the documented opt-out. Defaulting it to
+  // process.env read a DIFFERENT environment than the one this command was
+  // told to run under, so an embedded/test caller that injected the bypass got
+  // the un-bypassed answer.
+  const shadow = await findShadowingProjectBundles(cwd, home, env).catch(() => null);
   if (shadow) {
     printErr(
       `Note: ${shadow} overrides your user-global bundles.json, so this entry won't load until you add it there or remove that file.`,
@@ -407,7 +438,15 @@ export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
 
 // slug (dashes) or namespace (underscores) shape -- the two forms a user might
 // pass to remove.
-const REMOVE_TARGET_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+//
+// Deliberately NOT case-insensitive. Both lookups downstream are exact and
+// case-sensitive (namespacesForStoredSlug compares `slug === target`,
+// removeUserBundle filters on the exact namespace) and both stored forms are
+// lowercase by construction (SLUG_RE is lowercase-only; deriveNamespace
+// lowercases). An /i here therefore accepted `remove GA`, matched nothing, and
+// exited 0 with "nothing to do" -- while `add GA` is rejected at the gate. Same
+// input, opposite verdicts. Reject it here so the two verbs agree.
+const REMOVE_TARGET_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 export interface RemoveCommandOptions {
   target?: string;
@@ -415,6 +454,12 @@ export interface RemoveCommandOptions {
   force?: boolean;
   home?: string;
   cwd?: string;
+  /** Environment the command runs under. Only the project-shadow check reads
+   *  it (YAW_MCP_TRUST_PROJECT decides whether a project bundles.json is
+   *  honoured at all), but it must be threaded rather than defaulted inside
+   *  findShadowingProjectBundles: an embedded or test caller that injects an
+   *  env expects THAT env to decide, not the real process's. */
+  env?: NodeJS.ProcessEnv;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Test hook: override the TTY verdict instead of reading process.std*. */
@@ -478,36 +523,27 @@ interface RemovalTarget {
 }
 
 /**
- * Which candidate namespace is really present in the user-global bundles.json,
- * plus the fields the preview renders. Null when there is nothing to confirm:
- * no file, no match, or a file this lookup could not read or parse.
+ * The RAW `servers` array of a bundles.json, or null when this read cannot
+ * say: no file, an unreadable file, a parse failure, or a root / `servers`
+ * field that isn't the expected shape. Every raw lookup in this file goes
+ * through here -- three copies of this preamble is how they drifted apart.
  *
  * PARSE WITH THE WRITE PATH'S PARSER. parseJsonc is what readBundlesAt (and so
  * removeUserBundle) uses, and it accepts `//` comments and trailing commas.
  * Gating on the stricter JSON.parse instead meant a bundles.json carrying one
  * hand-added `// prod token lives in 1Password` line looked malformed HERE
- * while the write path parsed and deleted from it happily -- so the preview,
- * the off-TTY refusal AND the [y/N] prompt were all skipped on exactly the
- * hand-edited files most likely to hold a stored secret. The two parsers must
- * see the same set of files or the gate does not cover the write.
+ * while the write path parsed and deleted from it happily -- so the removal
+ * preview, the off-TTY refusal AND the [y/N] prompt were all skipped on
+ * exactly the hand-edited files most likely to hold a stored secret. The two
+ * parsers must see the same set of files or the gate does not cover the write.
  *
- * A null return skips the gate, which is safe because the two shapes behind it
- * end differently in runRemove: a genuine miss stays the exit-0 "nothing to do"
- * no-op it has always been, while an unreadable / malformed file reaches
- * removeUserBundle, whose readRawUserBundles THROWS rather than clobber a file
- * it could not parse -- surfacing the same error `remove` has always printed
- * instead of a bogus "nothing to remove". There is deliberately no
- * found/uncertain distinction in the return value: nothing ever consumed it,
- * and a flag no caller reads documents an invariant nothing enforces.
- *
- * Matching is done on the RAW parsed servers, deliberately NOT through
- * previewBundlesContent: that runs validateEntry, which DROPS malformed
- * entries, while removeUserBundle filters raw entries by namespace string. An
- * entry validateEntry rejects is still one removeUserBundle deletes, so a
- * validated lookup would let it be deleted with no confirmation at all.
+ * RAW, deliberately NOT through previewBundlesContent: that runs validateEntry,
+ * which DROPS malformed entries, while removeUserBundle filters raw entries by
+ * namespace string. An entry validateEntry rejects is still one
+ * removeUserBundle deletes, so a validated lookup would let it be deleted with
+ * no confirmation at all.
  */
-async function findRemovalTarget(candidates: string[], home: string): Promise<RemovalTarget | null> {
-  const path = localBundlesPath(userConfigDir(home));
+async function readRawServers(path: string): Promise<unknown[] | null> {
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
@@ -522,8 +558,25 @@ async function findRemovalTarget(candidates: string[], home: string): Promise<Re
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const servers = (parsed as { servers?: unknown }).servers;
-  if (!Array.isArray(servers)) return null;
+  return Array.isArray(servers) ? servers : null;
+}
 
+/**
+ * Which candidate namespace is really present in the user-global bundles.json,
+ * plus the fields the preview renders. Null when there is nothing to confirm:
+ * no match, or a file readRawServers could not read or parse (null `servers`).
+ *
+ * A null return skips the gate, which is safe because the two shapes behind it
+ * end differently in runRemove: a genuine miss stays the exit-0 "nothing to do"
+ * no-op it has always been, while an unreadable / malformed file reaches
+ * removeUserBundle, whose readRawUserBundles THROWS rather than clobber a file
+ * it could not parse -- surfacing the same error `remove` has always printed
+ * instead of a bogus "nothing to remove". There is deliberately no
+ * found/uncertain distinction in the return value: nothing ever consumed it,
+ * and a flag no caller reads documents an invariant nothing enforces.
+ */
+function findRemovalTarget(candidates: string[], servers: unknown[] | null): RemovalTarget | null {
+  if (servers === null) return null;
   for (const ns of candidates) {
     // Same predicate as doRemoveUserBundle's filter (s?.namespace !== ns), so
     // the preview can never disagree with what the write actually deletes.
@@ -544,30 +597,15 @@ async function findRemovalTarget(candidates: string[], home: string): Promise<Re
  * resolved slug on the entry (see runAdd) precisely because the namespace
  * derives from the catalog display NAME, not the slug -- "ga" ("Google
  * Analytics") lands as namespace "googleanalytics", so neither the literal
- * target nor deriveNamespace(target) can reach it. Parsed with the write
- * path's JSONC parser for the same reason findRemovalTarget is; an absent,
- * unreadable, or malformed file yields [] and leaves the existing miss /
- * parse-error paths to report themselves. Entries written before the slug
- * was recorded simply never match here (their namespace, as shown by
- * `yaw-mcp list`, still works as the removal target).
+ * target nor deriveNamespace(target) can reach it. Reads the same raw servers
+ * array the removal preview does (readRawServers); an absent, unreadable, or
+ * malformed file yields [] and leaves the existing miss / parse-error paths to
+ * report themselves. Entries written before the slug was recorded simply never
+ * match here (their namespace, as shown by `yaw-mcp list`, still works as the
+ * removal target).
  */
-async function namespacesForStoredSlug(target: string, home: string): Promise<string[]> {
-  const path = localBundlesPath(userConfigDir(home));
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch {
-    return [];
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseJsonc(raw);
-  } catch {
-    return [];
-  }
-  if (typeof parsed !== "object" || parsed === null) return [];
-  const servers = (parsed as { servers?: unknown }).servers;
-  if (!Array.isArray(servers)) return [];
+function namespacesForStoredSlug(target: string, servers: unknown[] | null): string[] {
+  if (servers === null) return [];
   const out: string[] = [];
   for (const s of servers) {
     const e = s as { slug?: unknown; namespace?: unknown } | null;
@@ -640,11 +678,14 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     return { exitCode: 2, written: [] };
   }
   if (!REMOVE_TARGET_RE.test(opts.target)) {
-    printErr(`yaw-mcp remove: "${opts.target}" isn't a valid slug or namespace.`);
+    printErr(
+      `yaw-mcp remove: "${opts.target}" isn't a valid slug or namespace (lowercase letters, digits, dashes and underscores only).`,
+    );
     return { exitCode: 2, written: [] };
   }
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env ?? process.env;
 
   // Try the literal target first -- covers a namespace copied from `list`
   // (including legacy underscore namespaces from older `add` versions). Then
@@ -654,7 +695,17 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // name agree ("brave-search" -> "bravesearch"). deriveNamespace strips
   // non-alphanumerics, so it would mangle an underscore namespace; that's why
   // the literal goes first.
-  const bySlug = await namespacesForStoredSlug(opts.target, home);
+  //
+  // ONE read for both raw lookups (the slug map and the removal preview).
+  // They used to read and parse the same file independently, before
+  // removeUserBundle read it a third time -- and two reads of one file are two
+  // chances to disagree about its contents. A concurrent edit can still land
+  // between this read and the write, which is why the write path re-reads and
+  // re-matches; this snapshot only decides what to SHOW and which namespaces
+  // to try.
+  const path = localBundlesPath(userConfigDir(home));
+  const rawServers = await readRawServers(path);
+  const bySlug = namespacesForStoredSlug(opts.target, rawServers);
   const candidates = [...new Set([opts.target, ...bySlug, deriveNamespace(opts.target)])];
 
   // ----- destructive-action confirmation --------------------------------
@@ -668,9 +719,9 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // user's own, the write below re-reads it anyway, and the worst case of a
   // concurrent edit is an entry `yaw-mcp add` puts straight back.
   if (!opts.force) {
-    const doomed = await findRemovalTarget(candidates, home);
+    const doomed = findRemovalTarget(candidates, rawServers);
     if (doomed) {
-      printRemovalPreview(print, localBundlesPath(userConfigDir(home)), doomed);
+      printRemovalPreview(print, path, doomed);
       if (!isInteractive(opts)) {
         // Exit 2, matching `secrets remove`'s off-TTY refusal: a required flag
         // is missing, which is this CLI's usage-error code. (A DECLINED prompt
@@ -710,7 +761,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     // `list` reads the project-local bundles.json when present (it overrides
     // user-global), but `remove` only manages user-global -- so a server the
     // user just saw in `list` can be "not found" here. Explain when that's why.
-    const shadow = await findShadowingProjectBundles(cwd, home).catch(() => null);
+    const shadow = await findShadowingProjectBundles(cwd, home, env).catch(() => null);
     if (shadow) {
       printErr(
         `Note: a project-local ${shadow} is in effect; \`remove\` only manages your user-global bundles.json, so a server defined there must be removed from that file directly.`,
@@ -722,7 +773,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
 
   // Honest warning: a project-local bundles.json shadows the user-global file,
   // so the server may keep loading from there even after this removal.
-  const shadow = await findShadowingProjectBundles(cwd, home).catch(() => null);
+  const shadow = await findShadowingProjectBundles(cwd, home, env).catch(() => null);
   if (shadow) {
     printErr(
       `Note: ${shadow} shadows your user-global bundles.json; a server defined there is unaffected by this removal.`,
@@ -768,21 +819,10 @@ export interface ListCommandOptions {
 async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, string[]>> {
   const out = new Map<string, string[]>();
   if (!path) return out;
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch {
-    return out;
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseJsonc(raw);
-  } catch {
-    return out;
-  }
-  if (typeof parsed !== "object" || parsed === null) return out;
-  const servers = (parsed as { servers?: unknown }).servers;
-  if (!Array.isArray(servers)) return out;
+  // Note the path is whichever file the LOADER won with (project-local can
+  // beat user-global), unlike the removal lookups which are user-global only.
+  const servers = await readRawServers(path);
+  if (servers === null) return out;
   for (const s of servers) {
     const e = s as { namespace?: unknown; env?: unknown } | null;
     if (!e || typeof e.namespace !== "string" || out.has(e.namespace)) continue;
@@ -874,15 +914,30 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   }
 
   const rows = [...graded].sort((a, b) => a.namespace.localeCompare(b.namespace));
+  // NAME and LAUNCH come STRAIGHT out of bundles.json, which is a file a repo
+  // can ship (project-local) or a badge can write -- so they get the same
+  // control-byte neutering the removal preview and the trust gate already
+  // apply. Without it, an entry whose name carries ANSI or a bidi override
+  // repainted this table in the user's terminal, and a `sh -c "a | b"` arg
+  // joined by a bare space read as separate tokens. NAMESPACE is skipped on
+  // purpose: NAMESPACE_RE (local-bundles.ts) already restricts it to
+  // [a-z0-9_], and GRADE is a validated A-F letter from grades.json.
   const cols: Array<[string, (s: UpstreamServerConfig) => string]> = [
     ["NAMESPACE", (s) => s.namespace],
-    ["NAME", (s) => s.name],
+    ["NAME", (s) => displaySafe(s.name)],
     ["STATUS", (s) => (s.isActive ? "active" : "disabled")],
     // "-" for never-audited, matching the GRADE column this ported from.
     // LAUNCH stays last: it's the only variable-width cell, so anything after
     // it would be ragged.
     ["GRADE", (s) => s.complianceGrade ?? "-"],
-    ["LAUNCH", (s) => [s.command, ...(s.args ?? [])].filter(Boolean).join(" ") || s.url || ""],
+    [
+      "LAUNCH",
+      (s) =>
+        [s.command, ...(s.args ?? [])]
+          .filter((t): t is string => typeof t === "string" && t.length > 0)
+          .map((t) => displayArg(t))
+          .join(" ") || (s.url ? displaySafe(s.url) : ""),
+    ],
   ];
   const widths = cols.map(([h, get]) => Math.max(h.length, ...rows.map((r) => get(r).length)));
   const fmt = (cells: string[]): string =>

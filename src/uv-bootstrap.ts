@@ -42,12 +42,20 @@ const RELEASE_BASE = `https://github.com/astral-sh/uv/releases/download/${UV_VER
 
 // glibc vs musl. Node's diagnostic report carries `glibcVersionRuntime` on
 // every glibc build and omits it on musl (this is the same probe detect-libc
-// and esbuild use). Only meaningful when platform === "linux" -- the caller
-// guards that, because on win32/darwin the field is absent too and would
-// misread as musl. On any error, default to glibc: that keeps the common case
+// and esbuild use). On any error, default to glibc: that keeps the common case
 // working, and a wrong guess on actual musl fails exactly as loudly as the
 // pre-detection behavior did.
+//
+// The probe answers for the HOST, so it is gated on the host actually BEING
+// linux rather than on uvTarget's platform PARAMETER. On win32/darwin the
+// field is absent too, which the report cannot distinguish from musl -- so
+// uvTarget("linux", "x64") called from a Windows or Mac host (a cross-platform
+// caller, or doctor describing another OS) came back with the -musl triple,
+// derived from a libc reading that machine never had. Refusing to answer off
+// linux keeps the default meaning "a real libc reading", and a caller who
+// genuinely knows the target's libc still passes `musl` explicitly.
 function isMuslLibc(): boolean {
+  if (process.platform !== "linux") return false;
   try {
     const raw: unknown = process.report?.getReport();
     const report = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;

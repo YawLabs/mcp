@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { rankServers, relevanceCacheStats, resetRelevanceCache } from "../relevance.js";
+import { rankServers, relevanceCacheKeyBytes, relevanceCacheStats, resetRelevanceCache } from "../relevance.js";
 
 // Single-server score. A `scoreRelevance` export used to do exactly this,
 // documented as being "kept for legacy callers" that never existed outside
@@ -547,5 +547,38 @@ describe("ranking index cache", () => {
     ]);
     expect(many[0].score).toBeGreaterThan(once[0].score);
     expect(many[0].score).toBeLessThan(once[0].score * 5);
+  });
+
+  it("keys both caches on a fixed-size digest, not on the corpus text", () => {
+    // A large upstream's signature is every tool name and description it
+    // publishes. Keyed on that raw text, MAX_CACHED_DOCS (512) doc entries
+    // pin 512 multi-KB strings plus whole-corpus index keys, resident for the
+    // life of the process purely as Map keys nothing reads back.
+    const bulky = (ns: string) => ({
+      namespace: ns,
+      name: `${ns} server`,
+      description: "x".repeat(4000),
+      tools: Array.from({ length: 40 }, (_, i) => ({
+        name: `${ns}_tool_${i}`,
+        description: `y${i} `.repeat(200),
+      })),
+    });
+    const corpus = [bulky("alpha"), bulky("bravo")];
+    rankServers("alpha tool", corpus);
+
+    const bytes = relevanceCacheKeyBytes();
+    // Every key is one base64url sha256 digest (43 chars). Keyed on the raw
+    // signature the longest key here would be tens of thousands of chars.
+    expect(bytes.longestKey).toBeLessThanOrEqual(64);
+    expect(bytes.docKeyBytes).toBeLessThanOrEqual(2 * 64);
+    expect(bytes.indexKeyBytes).toBeLessThanOrEqual(64);
+    // Digesting must not cost the staleness-proofing the content key exists
+    // for: edit one description and the index has to rebuild.
+    const edited = [bulky("alpha"), bulky("bravo")];
+    edited[1].description = `${edited[1].description}z`;
+    rankServers("alpha tool", edited);
+    expect(relevanceCacheStats().indexBuilds).toBe(2);
+    // ...and the untouched server's fields still come from the cache.
+    expect(relevanceCacheStats().docBuilds).toBe(3);
   });
 });

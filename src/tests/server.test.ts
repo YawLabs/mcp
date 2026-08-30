@@ -977,6 +977,43 @@ describe("ConnectServer", () => {
       expect(connectToUpstream).toHaveBeenCalledTimes(1);
     });
 
+    // A resources/prompts-only upstream answers "zero tools", and that IS an
+    // answer. It used to be thrown away at three separate points (the
+    // persistence sanitizer, hydrateToolCache, exportToolCache) and rejected
+    // by hasKnownTools, so such a server was dormant forever and paid a
+    // full `npx -y <pkg>@latest` resolve on every single client start.
+    it("prewarm skips a server whose learned tool list is legitimately empty", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "docs", name: "Docs" })]);
+      priv.hydrateToolCache({ docs: { tools: [], learnedAt: Date.now() } });
+
+      await priv.prewarmDormantServers();
+
+      expect(connectToUpstream).not.toHaveBeenCalled();
+    });
+
+    it("an empty learned list still ages out on the weekly refresh cadence", async () => {
+      // Trusting the empty answer must not pin it forever: if the upstream
+      // later grows tools, the weekly re-learn is the only thing that finds
+      // out. Same cadence every other learned list gets.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "docs", name: "Docs" })]);
+      priv.hydrateToolCache({ docs: { tools: [], learnedAt: Date.now() - 8 * 24 * 60 * 60 * 1000 } });
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("docs", ["search"]));
+
+      await priv.prewarmDormantServers();
+
+      expect(connectToUpstream).toHaveBeenCalledTimes(1);
+    });
+
+    it("exports a zero-tool namespace so the next session can skip it", () => {
+      const priv = getPrivate(server);
+      priv.toolCache.set("docs", []);
+      priv.toolCacheLearnedAt.set("docs", 4_000);
+
+      expect(priv.exportToolCache()).toEqual({ docs: { tools: [], learnedAt: 4_000 } });
+    });
+
     it("hydrated tools make an inactive server deferred on the first tools/list", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
@@ -4412,5 +4449,414 @@ describe("downstream client bridge", () => {
 
     expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(connectToUpstream).mock.calls[0][3]).toBe(priv.clientBridge);
+  });
+});
+
+describe("resolveIdleThreshold strict parse + clamp notice", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it("rejects a prefix-parsable value instead of silently shrinking the threshold", () => {
+    // Number.parseInt("1e2", 10) is 1 -- one non-matching call would have
+    // reaped every other server. server-cap.ts was hardened to a strict
+    // digit run for the same reason; this is the matching guard.
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "1e2");
+    expect(resolveIdleThreshold()).toBe(DEFAULT_IDLE_CALL_THRESHOLD);
+  });
+
+  it("rejects a trailing-garbage value rather than honoring its numeric prefix", () => {
+    // parseInt("20abc") === 20, which is NOT the default -- so this case
+    // pins the strict parse rather than coinciding with the fallback.
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "20abc");
+    expect(resolveIdleThreshold()).toBe(DEFAULT_IDLE_CALL_THRESHOLD);
+  });
+
+  it("still honors a clean digit run, with surrounding whitespace trimmed", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", " 25 ");
+    expect(resolveIdleThreshold()).toBe(25);
+  });
+
+  it("warns that a baseline above the adaptive ceiling will be clamped", () => {
+    const writes: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") writes.push(chunk);
+      return true;
+    });
+    // 137 is deliberately a value no other case in this file uses: the warn
+    // latch is keyed on the configured value, so a fresh number always
+    // produces the line regardless of test order.
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "137");
+
+    expect(resolveIdleThreshold()).toBe(137);
+    const warned = writes.filter((w) => w.includes("above the adaptive ceiling"));
+    expect(warned.length).toBe(1);
+    expect(JSON.parse(warned[0].trim()).effectiveMax).toBe(50);
+
+    // Same value again: latched, so the reaper's per-call resolution cannot
+    // turn this into per-call log spam.
+    resolveIdleThreshold();
+    expect(writes.filter((w) => w.includes("above the adaptive ceiling")).length).toBe(1);
+  });
+});
+
+describe("failed prewarm releases its namespace claim", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("removes the namespace from prewarmNamespaces when the activation fails", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    // Persistent rejection: runActivateOne retries once internally.
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
+
+    await priv.prewarmDormantServers();
+
+    // The claim exists to stop prewarm tearing down a connection an explicit
+    // activate took over. A FAILED prewarm owns no connection, so leaving the
+    // claim behind tells any later reader (a second prewarm pass) that
+    // prewarm still holds this namespace.
+    expect(priv.prewarmNamespaces.has("gh")).toBe(false);
+  });
+});
+
+describe("discover cache key covers tool filters", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("re-renders discover after a filter is installed on an already-connected server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar", "baz"]));
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    // Memoize the unfiltered body.
+    expect(priv.handleDiscover().content[0].text).toContain("loaded (3 tools)");
+
+    // Filter-only activate on an ALREADY-connected server: configVersion,
+    // context, warmedNamespace and the connected set are all unchanged, so
+    // before the fix the 3s memo replayed the unfiltered line -- telling the
+    // model about tools that tools/list no longer advertises.
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
+
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("filtered: 1 of 3");
+    expect(text).toContain("loaded (1 tools)");
+  });
+});
+
+describe("discover summary counts only connected servers", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("excludes an error-state connection from the 'loaded in this session' count", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "slack", name: "Slack" }),
+    ]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+    // Dead slot: the cap logic (evaluateCapFor) does not count it, so the
+    // summary must not either.
+    priv.connections.set("slack", makeConnection("slack", [], "error"));
+
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("1 loaded in this session, 2 tools in context");
+  });
+});
+
+describe("auto-warm failure reaches the discover output", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("names the cap refusal that stopped the auto-warm", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+    // A cap refusal never reaches activationFailures, so formatHealthWarning
+    // renders nothing for it: without this banner line the model cannot tell
+    // "refused" from "no clear winner" and re-runs the same discover.
+    vi.spyOn(priv, "activateOne").mockResolvedValue({
+      ok: false,
+      isChanged: false,
+      capped: true,
+      message: "Concurrent server cap reached (6 loaded).",
+    });
+
+    const result = await priv.handleDiscoverWithAutoWarm("github issue");
+    const text = result.content.map((c: { text: string }) => c.text).join("\n");
+    expect(text).toContain('Could not auto-load "gh"');
+    expect(text).toContain("Concurrent server cap reached (6 loaded).");
+  });
+
+  it("names the spawn failure that stopped the auto-warm, without poisoning the memo", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT npx"));
+
+    const result = await priv.handleDiscoverWithAutoWarm("github issue");
+    const text = result.content.map((c: { text: string }) => c.text).join("\n");
+    expect(text).toContain('Could not auto-load "gh"');
+    expect(text).toContain("spawn ENOENT npx");
+
+    // The failure line is appended to a COPY: a memoized body must never
+    // carry this one attempt's failure into later cache hits.
+    if (priv.discoverCache) {
+      const cachedText = priv.discoverCache.result.content.map((c: { text: string }) => c.text).join("\n");
+      expect(cachedText).not.toContain("Could not auto-load");
+    }
+  });
+});
+
+describe("handleReadTool refusals", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("refuses to spawn a transient child while shutting down", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("gh", ["create_issue"]));
+    priv.shuttingDown = true;
+
+    const result = await priv.handleReadTool("gh", "create_issue");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("shutting down");
+    // The point of the latch: a child spawned after the teardown snapshot is
+    // outside this.connections, so nothing ever reaps it.
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("tells the user a server is disabled rather than claiming it is not installed", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
+
+    const result = await priv.handleReadTool("gh", "create_issue");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("installed but disabled");
+    expect(result.content[0].text).toContain('"isActive": true');
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("offers a fuzzy suggestion for a near-miss namespace, like activate does", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "github", name: "GitHub" })]);
+
+    const result = await priv.handleReadTool("guthub", "create_issue");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("is not in ~/.yaw-mcp/bundles.json");
+    expect(result.content[0].text).toContain("Did you mean: github?");
+  });
+});
+
+describe("exec pipeline idle tracking and meta-tool refusal ordering", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("ticks other namespaces once for the whole pipeline, not once per step", async () => {
+    const priv = getPrivate(server);
+    const aConn = makeConnection("alpha", ["work"]);
+    aConn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+    const bConn = makeConnection("bravo", ["idle"]);
+
+    priv.connections.set("alpha", aConn);
+    priv.connections.set("bravo", bConn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "alpha" }), makeServerConfig({ namespace: "bravo" })]);
+    priv.rebuildRoutes();
+    priv.idleCallCounts.set("alpha", 0);
+    priv.idleCallCounts.set("bravo", 0);
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [
+        { id: "s1", tool: "alpha_work", args: {} },
+        { id: "s2", tool: "alpha_work", args: {} },
+        { id: "s3", tool: "alpha_work", args: {} },
+        { id: "s4", tool: "alpha_work", args: {} },
+      ],
+      return: "s4",
+    });
+    expect(JSON.parse(result.content[0].text).ok).toBe(true);
+
+    // Per-step ticking aged bravo by one call PER STEP, which on a long
+    // pipeline can evict a server a later step still needs. One exec is one
+    // unit of work for the reaper.
+    expect(priv.idleCallCounts.get("bravo")).toBe(1);
+    expect(priv.idleCallCounts.get("alpha")).toBe(0);
+  });
+
+  it("counts a multi-namespace pipeline as usage of every namespace it touched", async () => {
+    const priv = getPrivate(server);
+    const aConn = makeConnection("alpha", ["work"]);
+    aConn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "a" }] });
+    const bConn = makeConnection("bravo", ["work"]);
+    bConn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "b" }] });
+    const cConn = makeConnection("charlie", ["untouched"]);
+
+    priv.connections.set("alpha", aConn);
+    priv.connections.set("bravo", bConn);
+    priv.connections.set("charlie", cConn);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "alpha" }),
+      makeServerConfig({ namespace: "bravo" }),
+      makeServerConfig({ namespace: "charlie" }),
+    ]);
+    priv.rebuildRoutes();
+    priv.idleCallCounts.set("alpha", 4);
+    priv.idleCallCounts.set("bravo", 4);
+    priv.idleCallCounts.set("charlie", 0);
+
+    await priv.handleToolCall("mcp_connect_exec", {
+      steps: [
+        { id: "s1", tool: "alpha_work", args: {} },
+        { id: "s2", tool: "bravo_work", args: {} },
+      ],
+      return: "s2",
+    });
+
+    // Both steps' namespaces were used, so neither may be left aging.
+    expect(priv.idleCallCounts.get("alpha")).toBe(0);
+    expect(priv.idleCallCounts.get("bravo")).toBe(0);
+    expect(priv.idleCallCounts.get("charlie")).toBe(1);
+  });
+
+  it("drops the discover memo after an exec step's learning write", async () => {
+    const priv = getPrivate(server);
+    const aConn = makeConnection("alpha", ["work"]);
+    aConn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+    priv.connections.set("alpha", aConn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "alpha" })]);
+    priv.rebuildRoutes();
+
+    priv.handleDiscover();
+    expect(priv.discoverCache).not.toBeNull();
+
+    await priv.handleToolCall("mcp_connect_exec", {
+      steps: [{ id: "s1", tool: "alpha_work", args: {} }],
+      return: "s1",
+    });
+
+    // exec books its own per-step recordOutcome, and discover renders those
+    // counters as usage / reliability lines the cache key cannot see.
+    expect(priv.discoverCache).toBeNull();
+  });
+
+  it("refuses a meta-tool step before resolving its $refs", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "alpha" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [{ id: "m", tool: "mcp_connect_exec", args: { x: { $ref: "nonexistent" } } }],
+    });
+
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    // What makes the step illegal is the tool it names, not its args -- a
+    // ref error here sent the model off fixing arguments for a call exec was
+    // never going to make.
+    expect(parsed.error).toContain("meta-tool");
+    expect(parsed.error).not.toContain("ref");
+  });
+});
+
+describe("response pruning respects structuredContent", () => {
+  let server: ConnectServer;
+
+  const prunableText = JSON.stringify({
+    keep: "x".repeat(60),
+    droppedNull: null,
+    droppedEmptyList: [],
+    droppedEmptyObject: {},
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("prunes the text body when there is no structured payload", async () => {
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh", ["report"]);
+    conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: prunableText }] });
+    priv.connections.set("gh", conn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("gh_report", {});
+    expect(result.content[0].text).not.toContain("droppedNull");
+  });
+
+  it("leaves the text body verbatim when the tool also returned structuredContent", async () => {
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh", ["report"]);
+    // MCP 2025-06-18: an outputSchema tool returns the structured payload AND
+    // a text fallback that mirrors it. Pruning only the text makes the two
+    // representations of one result disagree on a null-valued field.
+    conn.client.callTool = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: prunableText }],
+      structuredContent: { keep: "x".repeat(60), droppedNull: null, droppedEmptyList: [], droppedEmptyObject: {} },
+    });
+    priv.connections.set("gh", conn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("gh_report", {});
+    expect(result.content[0].text).toBe(prunableText);
   });
 });

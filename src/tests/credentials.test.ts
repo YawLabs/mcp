@@ -43,3 +43,30 @@ describe("detectMissingCredentials", () => {
     expect(detectMissingCredentials("X is required")).toEqual([]);
   });
 });
+
+// A failing server's stderr decides which names the user is elicited for, so
+// a name has to READ as a credential -- not merely be ALL_CAPS. Before this,
+// any capitalised word in a failure line produced a secret prompt.
+describe("detectMissingCredentials -- only credential-shaped names elicit", () => {
+  it("ignores infrastructure variables that merely contain AUTH", () => {
+    expect(detectMissingCredentials("SSH_AUTH_SOCK is not set")).toEqual([]);
+  });
+
+  it("ignores English words shouted in a failure line", () => {
+    expect(detectMissingCredentials("ERROR is undefined")).toEqual([]);
+    expect(detectMissingCredentials("CONFIG is required")).toEqual([]);
+    expect(detectMissingCredentials("Missing env var VALUE")).toEqual([]);
+  });
+
+  it("still elicits for the real credential shapes", () => {
+    expect(detectMissingCredentials("GITHUB_TOKEN is required")).toEqual(["GITHUB_TOKEN"]);
+    expect(detectMissingCredentials("AWS_SECRET_ACCESS_KEY must be set")).toEqual(["AWS_SECRET_ACCESS_KEY"]);
+    expect(detectMissingCredentials("Missing env var GITHUBTOKEN")).toEqual(["GITHUBTOKEN"]);
+    expect(detectMissingCredentials("STRIPE_API_KEY is empty")).toEqual(["STRIPE_API_KEY"]);
+  });
+
+  it("does not match a credential word buried inside a longer segment", () => {
+    // MONKEY_CAGE contains "KEY" as a substring but not as a segment.
+    expect(detectMissingCredentials("MONKEY_CAGE is not set")).toEqual([]);
+  });
+});

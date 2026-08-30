@@ -62,6 +62,31 @@ describe("loadUserGuide", () => {
     expect(g?.content).toContain("use gh for github.");
   });
 
+  it("caps an oversized guide, warns, and serves only the leading portion", async () => {
+    // The whole file lands in the model's context via yaw-mcp://guide, so a
+    // wrong file at this path (a vendored dataset, a log, a renamed binary)
+    // was read whole into memory and forwarded whole. 300 KB against a
+    // 256 KB cap: the guide still loads, truncated, with a warn.
+    const cap = 256 * 1024;
+    writeGuide(join(home, CONFIG_DIRNAME), `# Big guide\n${"x".repeat(300 * 1024)}\n`);
+    const warned: string[] = [];
+    const orig = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown): boolean => {
+      warned.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    let g: Awaited<ReturnType<typeof loadUserGuide>>;
+    try {
+      g = await loadUserGuide(home);
+    } finally {
+      process.stderr.write = orig;
+    }
+    expect(g).not.toBeNull();
+    expect(g?.content.startsWith("# Big guide")).toBe(true);
+    expect(Buffer.byteLength(g?.content ?? "", "utf8")).toBeLessThanOrEqual(cap);
+    expect(warned.join("")).toContain("larger than the size cap");
+  });
+
   it("returns null for an empty file", async () => {
     // Empty guide is treated as "no guidance" — the user created the
     // file but hasn't filled it in. Surfacing an empty resource would

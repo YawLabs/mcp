@@ -962,3 +962,224 @@ describe("the approval is byte-pinned end to end", () => {
     expect(listed[0].sha256).toBe(hashTrustContent(shown));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cross-action flags are refused, not silently dropped.
+// ---------------------------------------------------------------------------
+
+describe("parseTrustArgs rejects flags the chosen action never reads", () => {
+  it("refuses --json in grant mode (runTrustGrant only ever prints prose)", () => {
+    const r = parseTrustArgs(["--yes", "--json"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("--json applies to --list and --revoke only");
+  });
+
+  it("refuses --yes with --list and with --revoke", () => {
+    for (const argv of [
+      ["--list", "--yes"],
+      ["--revoke", "-y"],
+    ]) {
+      const r = parseTrustArgs(argv);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain("--yes applies to the approval prompt only");
+    }
+  });
+
+  it("still accepts every legitimate combination", () => {
+    for (const argv of [["--yes"], ["--list"], ["--list", "--json"], ["--revoke", "--json"], []]) {
+      expect(parseTrustArgs(argv).ok).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A store this build must not write over is refused BEFORE the review, not
+// after the user has read every argv line and confirmed.
+// ---------------------------------------------------------------------------
+
+describe("an unusable trust store short-circuits the grant", () => {
+  it("does not render the review for a newer-schema store", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), JSON.stringify({ version: 99, trusted: {} }, null, 2));
+    const io = captureIO();
+    const r = await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      promptAnswer: "y",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    // The refusal wording is unchanged; what changed is that it arrives
+    // INSTEAD of the review rather than after it.
+    expect(io.errText()).toContain("written by a newer yaw-mcp");
+    expect(io.text()).not.toContain("Project file:");
+    expect(io.text()).not.toContain("pwn");
+  });
+
+  it("does not render the review for an unreadable store", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    mkdirSync(trustStorePath(synthHome), { recursive: true });
+    const io = captureIO();
+    const r = await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      promptAnswer: "y",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toContain("cannot read the trust store");
+    expect(io.text()).not.toContain("Project file:");
+  });
+
+  it("STILL reviews (and grants over) a merely unparseable store", async () => {
+    // The parse case is rebuildable, so the review is the thing being
+    // approved and must not be short-circuited away.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(trustStorePath(synthHome), "{{{");
+    writeBundles(synthCwd, HOSTILE);
+    const io = captureIO();
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("Project file:");
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `trust --revoke .` -- the store is keyed by the FILE, so resolving the
+// project DIRECTORY verbatim matched nothing and exited 0 having done nothing.
+// ---------------------------------------------------------------------------
+
+describe("trust --revoke accepts a project directory", () => {
+  async function grantHere(): Promise<void> {
+    writeBundles(synthCwd, HOSTILE);
+    const r = await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: () => {}, err: () => {} });
+    expect(r.exitCode).toBe(0);
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  }
+
+  it("revokes when handed the project root", async () => {
+    await grantHere();
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: ".",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("Revoked ");
+    expect(io.text()).not.toContain("nothing to do");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("revokes when handed the .yaw-mcp directory itself", async () => {
+    await grantHere();
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: join(synthCwd, CONFIG_DIRNAME),
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("still revokes when handed the bundles.json path directly", async () => {
+    await grantHere();
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: projectBundlesPath(synthCwd),
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+
+  it("reports nothing-to-do for a path that was never approved", async () => {
+    const io = captureIO();
+    const r = await runTrust({
+      mode: "revoke",
+      path: join(synthHome, "no-such-project"),
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("was not approved");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One prompt reader for the product: an ESC (or any other control byte) at
+// the [y/N] prompt is dropped, not buffered into the answer. The readline
+// version answered with the ESC still attached, which does not equal "y", so
+// the approval silently flipped to a decline.
+// ---------------------------------------------------------------------------
+
+describe("the approval prompt survives a stray control byte", () => {
+  // Built from a code point: a literal ESC in a fixture is invisible in an
+  // editor and gets mangled by tooling on the way in.
+  const ESC = String.fromCharCode(27);
+
+  it("treats ESC-then-y as y", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const stdin = new PassThrough();
+    stdin.write(`${ESC}y\n`);
+    const stdout = new PassThrough();
+    stdout.resume();
+    const io = captureIO();
+    const r = await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      isTTY: true,
+      io: { stdin, stdout },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("Approved ");
+    expect(await listTrusted({ home: synthHome })).toHaveLength(1);
+  });
+
+  it("still declines on a bare Enter", async () => {
+    writeBundles(synthCwd, HOSTILE);
+    const stdin = new PassThrough();
+    stdin.write("\n");
+    const stdout = new PassThrough();
+    stdout.resume();
+    const io = captureIO();
+    const r = await runTrust({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      isTTY: true,
+      io: { stdin, stdout },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toContain("Aborted");
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+  });
+});

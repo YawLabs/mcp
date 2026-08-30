@@ -1,6 +1,7 @@
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  acquireUpgradeLock,
   detectRunningInstallPrefix,
   maybeAutoUpgrade,
   quoteArgForDisplay,
@@ -28,6 +29,11 @@ const GLOBAL_NPM_PREFIX = join(sep, "usr", "local");
 const GLOBAL_NPM_PATH = join(GLOBAL_NPM_PREFIX, "lib", "node_modules", "@yawlabs", "mcp", "dist", "index.js");
 /** What maybeAutoUpgrade spawns for a global-npm install whose prefix resolves. */
 const GLOBAL_NPM_ARGS = ["install", "-g", "--prefix", GLOBAL_NPM_PREFIX, "@yawlabs/mcp@latest"];
+/** maybeAutoUpgrade now hands the spawn a third argument -- the callback that
+ *  releases the prefix lockfile once the install settles. Every spawn
+ *  assertion has to account for it; the identity of the function is an
+ *  implementation detail, its PRESENCE is the contract. */
+const RELEASE_LOCK = expect.any(Function);
 const NPX_PATH = "/home/u/.npm/_npx/abc123/node_modules/@yawlabs/mcp/dist/index.js";
 const LOCAL_NODE_MODULES_PATH = "/home/u/myproject/node_modules/@yawlabs/mcp/dist/index.js";
 const UNKNOWN_PATH = "/tmp/some/random/launch/path.js";
@@ -107,7 +113,11 @@ describe("maybeAutoUpgrade", () => {
           fetchLatestImpl: async () => "0.47.8",
           spawnImpl,
         });
-        expect(spawnImpl, `value=${value} should NOT opt out`).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS);
+        expect(spawnImpl, `value=${value} should NOT opt out`).toHaveBeenCalledWith(
+          "npm",
+          GLOBAL_NPM_ARGS,
+          RELEASE_LOCK,
+        );
       } finally {
         if (prev === undefined) delete process.env.YAW_MCP_AUTO_UPGRADE;
         else process.env.YAW_MCP_AUTO_UPGRADE = prev;
@@ -154,7 +164,7 @@ describe("maybeAutoUpgrade", () => {
       spawnImpl,
     });
     expect(spawnImpl).toHaveBeenCalledTimes(1);
-    expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS);
+    expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS, RELEASE_LOCK);
   });
 
   it("background-upgrades stale pnpm/bun globals with their owning tool", async () => {
@@ -165,7 +175,7 @@ describe("maybeAutoUpgrade", () => {
       fetchLatestImpl: async () => "0.47.8",
       spawnImpl: pnpmSpawn,
     });
-    expect(pnpmSpawn).toHaveBeenCalledWith("pnpm", ["add", "-g", "@yawlabs/mcp@latest"]);
+    expect(pnpmSpawn).toHaveBeenCalledWith("pnpm", ["add", "-g", "@yawlabs/mcp@latest"], RELEASE_LOCK);
 
     const bunSpawn = vi.fn();
     await maybeAutoUpgrade({
@@ -174,7 +184,7 @@ describe("maybeAutoUpgrade", () => {
       fetchLatestImpl: async () => "0.47.8",
       spawnImpl: bunSpawn,
     });
-    expect(bunSpawn).toHaveBeenCalledWith("bun", ["add", "-g", "@yawlabs/mcp@latest"]);
+    expect(bunSpawn).toHaveBeenCalledWith("bun", ["add", "-g", "@yawlabs/mcp@latest"], RELEASE_LOCK);
   });
 
   it("does NOT spawn for a stale npx install (npx self-heals via the @latest config)", async () => {
@@ -263,20 +273,23 @@ describe("maybeAutoUpgrade", () => {
 // ═══════════════════════════════════════════════════════════════════════
 // detectRunningInstallPrefix
 //
-// The function calls realpathSync(argvPath) then walks dirname() up the
-// tree looking for a `<sep>node_modules<sep>` segment (a bare node_modules
+// The function calls realpathSync(argvPath) then takes the LAST
+// `<sep>node_modules<sep>` segment of its dirname (a bare node_modules
 // segment -- no `.bin` directory is involved). We mock
 // realpathSync so the tests control exactly what "resolved" path is
 // seen, and build all fixture paths with path.join / sep so the
 // assertions hold on both Windows (\) and POSIX (/) runners.
 // ═══════════════════════════════════════════════════════════════════════
 
+// Only realpathSync is stubbed -- the rest of node:fs stays real, which is
+// what lets the lockfile suite below run against a genuine temp directory.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, realpathSync: vi.fn((p: string) => p) };
 });
 
-import { realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, utimesSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const mockRealpathSync = vi.mocked(realpathSync);
 
@@ -331,16 +344,26 @@ describe("detectRunningInstallPrefix", () => {
     expect(detectRunningInstallPrefix(undefined)).toBeNull();
   });
 
-  it("returns null when the path has more than 24 segments (safety cap)", () => {
-    // The cap is a bound, not a symlink-loop guard (realpathSync already
-    // resolved symlinks and the `dir !== prev` check terminates the walk). Its
-    // only observable effect is this one: a legitimately deep install resolves
-    // no prefix, so the background upgrade runs without `--prefix`.
-    // Build a 26-segment path with no node_modules to exhaust the cap.
+  it("returns null for a path with no node_modules segment, however deep", () => {
+    // This replaces a test that claimed to pin a 24-segment "safety cap". The
+    // cap never had an observable effect -- lastIndexOf scans the whole string,
+    // so depth cannot hide a node_modules segment -- and the old fixture had no
+    // node_modules in it at all, so it pinned the plain not-found null it still
+    // pins here. The cap is gone; this is the behavior that was actually real.
     const deepSegments = Array.from({ length: 26 }, (_, i) => `dir${i}`);
     const argv1 = join(sep, ...deepSegments, "index.js");
     mockRealpathSync.mockReturnValueOnce(argv1);
     expect(detectRunningInstallPrefix(argv1)).toBeNull();
+  });
+
+  it("resolves the prefix of an install nested far deeper than the old 24-segment cap", () => {
+    // The counterpart the old cap test could never express: a REAL deep
+    // install still resolves, because the match is on the segment, not depth.
+    const deep = Array.from({ length: 30 }, (_, i) => `d${i}`);
+    const prefix = join(sep, ...deep);
+    const argv1 = join(prefix, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+    mockRealpathSync.mockReturnValueOnce(argv1);
+    expect(detectRunningInstallPrefix(argv1)).toBe(prefix);
   });
 
   it("returns null when realpathSync throws (e.g. path does not exist)", () => {
@@ -707,6 +730,10 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
   afterEach(() => {
     stderrSpy.mockRestore();
     resetSpawnRecorder();
+    // Put the realpath mock back to the file-level factory default (identity)
+    // so a per-test mapping installed by runWithProbe cannot leak into the
+    // suites below.
+    mockRealpathSync.mockImplementation((p) => String(p));
   });
 
   const stderrText = (): string => (stderrSpy.mock.calls as unknown[][]).map((c) => String(c[0])).join("");
@@ -721,7 +748,11 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
    *  injected `npm prefix -g` answer -- the shared probe short-circuits to null
    *  under vitest, so the real one can never answer here. */
   async function runWithProbe(npmPrefixImpl: () => Promise<string | null>, realpath = PREFIXED_REALPATH) {
-    mockRealpathSync.mockReturnValue(realpath);
+    // Map ONLY argv[1] to its resolved install path; every other path resolves
+    // to itself. compareWithNpmPrefix now realpaths BOTH sides through
+    // upgrade-cmd's comparablePath, so a blanket mockReturnValue would collapse
+    // the two prefixes onto one string and no comparison could ever differ.
+    mockRealpathSync.mockImplementation((p) => (p === GLOBAL_NPM_PATH ? realpath : String(p)));
     const probe = vi.fn(npmPrefixImpl);
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
@@ -792,6 +823,55 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     } else {
       expect(stderrText()).toContain("detected running prefix differs");
     }
+  });
+
+  it("treats a junction/symlink prefix and its target as the SAME prefix", async () => {
+    // The regression this exists for: the comparator used to trim+lowercase
+    // only, while the detected prefix comes from a REALPATH-resolved argv[1].
+    // On a scoop-style layout (`.../current` is a junction into `.../1.2.3`)
+    // npm reports the junction name and the walk reports the target, so the
+    // two names for ONE directory read as two prefixes and every stale startup
+    // warned about a multi-prefix setup the user does not have. Both sides now
+    // go through upgrade-cmd's comparablePath, which realpaths first.
+    const junction = join(sep, "scoop", "apps", "nodejs", "current");
+    const target = join(sep, "scoop", "apps", "nodejs", "22.1.0");
+    const realpath = join(target, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
+    mockRealpathSync.mockImplementation((p) => {
+      if (p === GLOBAL_NPM_PATH) return realpath;
+      if (p === junction) return target; // the junction resolves to its target
+      return String(p);
+    });
+    const probe = vi.fn(async () => junction);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+      npmPrefixImpl: probe,
+    });
+    await settle();
+
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(stderrText()).not.toContain("detected running prefix differs");
+  });
+
+  it("still warns when two prefixes resolve to genuinely different directories", async () => {
+    // The other half of the realpath change: resolving must not swallow a
+    // REAL multi-prefix setup, which is the whole point of the warning.
+    // Not DETECTED_PREFIX, and not a junction into it -- a second real tree.
+    const other = join(sep, "usr", "local");
+    mockRealpathSync.mockImplementation((p) => (p === GLOBAL_NPM_PATH ? PREFIXED_REALPATH : String(p)));
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+      npmPrefixImpl: async () => other,
+    });
+    await settle();
+
+    expect(stderrText()).toContain("detected running prefix differs");
+    expect(stderrText()).toContain(other);
   });
 
   it("never probes when the prefix could not be quoted (no --prefix was passed)", async () => {
@@ -914,7 +994,7 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
     // The 3s AbortController is what keeps a hung registry off the serve
     // hot path; without a signal the check could stall startup indefinitely.
     expect(init.signal).toBeInstanceOf(AbortSignal);
-    expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcp@latest"]);
+    expect(spawnImpl).toHaveBeenCalledWith("npm", ["install", "-g", "@yawlabs/mcp@latest"], RELEASE_LOCK);
   });
 
   it.each([
@@ -986,5 +1066,134 @@ describe("fetchLatestVersion -- the built-in registry probe", () => {
     await maybeAutoUpgrade({ currentVersion: "dev", argvPath: GLOBAL_NPM_PATH });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(cp.calls).toHaveLength(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// acquireUpgradeLock -- the prefix lockfile that serializes concurrent
+// background installs.
+//
+// The realistic trigger is N Claude Code panes starting at once: each serve
+// process independently detects the same staleness and, before the lock,
+// each fired its own `npm install -g` into the same prefix. npm's cache lock
+// made that slow rather than corrupting, but nothing made it SAFE.
+//
+// These run against a real temp directory (node:fs is only stubbed for
+// realpathSync), because the whole primitive is openSync(path, "wx") and a
+// mocked fs would test the mock.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("acquireUpgradeLock", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-lock-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const lockFile = (): string => join(dir, ".yaw-mcp-upgrade.lock");
+
+  it("hands the first caller a release and refuses the second", () => {
+    const first = acquireUpgradeLock(dir);
+    expect(first).toBeTypeOf("function");
+    expect(existsSync(lockFile())).toBe(true);
+
+    // The second serve process starting against the same prefix.
+    expect(acquireUpgradeLock(dir)).toBeNull();
+  });
+
+  it("frees the lock on release so the next process can take it", () => {
+    const release = acquireUpgradeLock(dir);
+    release?.();
+    expect(existsSync(lockFile())).toBe(false);
+    expect(acquireUpgradeLock(dir)).toBeTypeOf("function");
+  });
+
+  it("releases idempotently, so a double release cannot unlink someone else's lock", () => {
+    const release = acquireUpgradeLock(dir);
+    release?.();
+    const second = acquireUpgradeLock(dir);
+    // The first holder's release fires again (both spawn handlers can call it).
+    release?.();
+    // The SECOND holder still owns a live lock file.
+    expect(second).toBeTypeOf("function");
+    expect(existsSync(lockFile())).toBe(true);
+  });
+
+  it("steals a lock left behind by a killed process once it goes stale", () => {
+    acquireUpgradeLock(dir);
+    // Backdate the file rather than advancing `now`: mtimeMs carries
+    // sub-millisecond precision while Date.now() is truncated, so a fixture
+    // built as `Date.now() + STALE + 1` sits a fraction of a millisecond
+    // INSIDE the threshold often enough to flake.
+    const stale = new Date(Date.now() - 11 * 60 * 1000);
+    utimesSync(lockFile(), stale, stale);
+    expect(acquireUpgradeLock(dir)).toBeTypeOf("function");
+
+    // ...and still refuses while the lock is merely OLD, not stale.
+    const recent = new Date(Date.now() - 60 * 1000);
+    utimesSync(lockFile(), recent, recent);
+    expect(acquireUpgradeLock(dir)).toBeNull();
+  });
+
+  it("steals a lock stamped in the FUTURE (clock stepped backwards)", () => {
+    acquireUpgradeLock(dir);
+    // A future mtime cannot belong to a live process on this clock; honouring
+    // it would suppress every upgrade until wall-clock caught up.
+    const future = new Date(Date.now() + 60 * 60 * 1000);
+    utimesSync(lockFile(), future, future);
+    expect(acquireUpgradeLock(dir)).toBeTypeOf("function");
+  });
+
+  it("does NOT block the upgrade when the lock cannot be created at all", () => {
+    // Read-only prefix, EACCES, a prefix that does not exist: locking is
+    // best-effort, so an un-lockable directory yields a no-op release and the
+    // caller proceeds exactly as it did before the lock existed. Only a live
+    // EEXIST means "someone else has this".
+    const release = acquireUpgradeLock(join(dir, "does", "not", "exist"));
+    expect(release).toBeTypeOf("function");
+    expect(() => release?.()).not.toThrow();
+  });
+});
+
+describe("maybeAutoUpgrade -- lock contention", () => {
+  beforeEach(resetSpawnRecorder);
+  afterEach(resetSpawnRecorder);
+
+  it("skips the background install entirely when another process holds the lock", async () => {
+    const spawnImpl = vi.fn();
+    const acquireLockImpl = vi.fn(() => null);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+      acquireLockImpl,
+    });
+
+    expect(acquireLockImpl).toHaveBeenCalledTimes(1);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    // The skip is logged, and deliberately does NOT claim an upgrade is running.
+    const skips = mockLog.mock.calls.filter((c) => String(c[1]).includes("already upgrading this install"));
+    expect(skips).toHaveLength(1);
+    expect(mockLog.mock.calls.some((c) => String(c[1]).includes("upgrading the global install"))).toBe(false);
+  });
+
+  it("locks the DETECTED running prefix, not npm's configured one", async () => {
+    // The lock has to live where the install actually lands, or two processes
+    // installing into the same tree through different prefix names miss it.
+    const acquireLockImpl = vi.fn(() => () => {});
+    mockRealpathSync.mockReturnValueOnce(GLOBAL_NPM_PATH);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+      acquireLockImpl,
+    });
+    expect(acquireLockImpl).toHaveBeenCalledWith(GLOBAL_NPM_PREFIX);
   });
 });

@@ -35,6 +35,7 @@ import {
   setSecret,
   unlock,
   VAULT_CHECK_CORRUPT_ERROR,
+  VaultEntryCorruptError,
   type VaultFile,
   vaultPath,
 } from "./secrets-vault.js";
@@ -279,11 +280,15 @@ async function safeLoadVault(
     return { ok: true, vault: await loadVault(path) };
   } catch (err) {
     const raw = err instanceof Error ? err.message : String(err);
-    // Detect the corrupt-entry case and emit an actionable hint. NOTE:
-    // loadVault validates EVERY entry, so `secrets remove <name>` cannot
-    // clear it either -- the fix has to happen in the file itself.
-    const corruptMatch = /vault corrupt at entry (.+)$/.exec(raw);
-    const name = corruptMatch?.[1];
+    // Branch on the ERROR TYPE, not on the message text. The old
+    // /vault corrupt at entry (.+)$/ sniff is the discipline
+    // unlockErrorMessage was fixed to avoid, and it failed for exactly the
+    // input it most needed to handle: a legacy entry name containing a
+    // newline defeats `.+$` (which cannot cross one), so the actionable hint
+    // silently degraded to the raw message. NOTE: loadVault validates EVERY
+    // entry, so `secrets remove <name>` cannot clear it either -- the fix has
+    // to happen in the file itself.
+    const name = err instanceof VaultEntryCorruptError ? err.entryName : undefined;
     const msg = name
       ? `secret entry ${name} is corrupt, and every secrets command fails until it is gone. Delete the "${name}" key from ${path} by hand (or delete that file to start the vault over), then re-add it with \`yaw-mcp secrets set ${name}\`.`
       : raw;
@@ -353,6 +358,36 @@ function vaultUnreadableResult(
   if (json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
   else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
   return { exitCode: 1 };
+}
+
+/** Persist the vault, turning a write failure into this command's normal
+ *  error envelope instead of an escaping rejection.
+ *
+ *  saveVault can reject for reasons that have nothing to do with the vault's
+ *  contents -- EACCES on the config dir, ENOSPC, EXDEV on the atomic rename
+ *  across a mount boundary. Awaited bare, that rejection unwound all the way
+ *  to the CLI entry point, which prints prose (`yaw-mcp secrets: <msg>`) --
+ *  so a `--json` caller that had received clean JSON envelopes for every
+ *  other failure got a bare prose line on stderr for this one and its parse
+ *  broke. Returns null on success, or the result the caller must return. */
+async function saveVaultOrReport(
+  path: string,
+  vault: VaultFile,
+  io: { out: (s: string) => void; err: (s: string) => void },
+  json: boolean | undefined,
+  action: string,
+): Promise<SecretsCommandResult | null> {
+  try {
+    await saveVault(path, vault);
+    return null;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    const cause = e.code ?? (err instanceof Error ? err.message : String(err));
+    const msg = `could not write the vault file at ${path} (${cause}) -- nothing was saved.`;
+    if (json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+    else io.err(`yaw-mcp secrets${action ? ` ${action}` : ""}: ${msg}\n`);
+    return { exitCode: 1 };
+  }
 }
 
 /** Standard refusal for a vault that changed under a prompt. */
@@ -622,9 +657,11 @@ const CTRL_D = "\x04"; // EOT -- cancel this entry (caller re-prompts)
 const DEL = "\x7f"; // what most terminals send for Backspace
 
 /** Raw-mode line reader for the controlling TTY. Shared by the passphrase
- *  prompts (echo OFF -- the default) and the destructive-action
- *  confirmation (echo ON, so the user can see the y/n they typed). One
- *  reader means ^C / ^D / Backspace behave identically at every prompt. */
+ *  prompts (echo OFF -- the default), the destructive-action confirmation
+ *  (echo ON, so the user can see the y/n they typed), and -- via
+ *  readAnswerFromTTY below -- `yaw-mcp trust`'s approval prompt. One reader
+ *  means ^C / ^D / Backspace / a stray ESC behave identically at every
+ *  prompt in the product. */
 function readLineFromTTY(
   stdin: NodeJS.ReadStream,
   stdout: NodeJS.WritableStream,
@@ -717,11 +754,55 @@ function readLineFromTTY(
   });
 }
 
-async function readStdinValue(io?: SecretsCommandOptions["io"], forceRaw?: boolean): Promise<string | Cancelled> {
+/**
+ * Ask a one-line question on the terminal and hand back what was typed
+ * (trimmed, lowercased by the caller). Returns null when the user hit ^C.
+ *
+ * Exists so `yaw-mcp trust` and `yaw-mcp secrets` share ONE prompt reader
+ * instead of two. trust-cmd used node:readline, this file uses the raw-mode
+ * reader above, and the fix for an ESC/arrow key at a [y/N] prompt (a raw ESC
+ * echoed back is EXECUTED by the terminal, and "\x1by" is not "y", so the
+ * answer silently flipped) landed in only one of them. Two implementations of
+ * "read one confirmation" drift; this is the one.
+ *
+ * Echo is ON: a y/n answer is not a secret, and the user has to see it.
+ */
+export async function readAnswerFromTTY(
+  stdin: NodeJS.ReadableStream,
+  stdout: NodeJS.WritableStream,
+  question: string,
+): Promise<string | null> {
+  const answer = await readLineFromTTY(stdin as NodeJS.ReadStream, stdout, question, true);
+  return answer === CANCELLED ? null : answer;
+}
+
+/** Returned by readStdinValue when stdin is a TTY (so there is nothing piped
+ *  to read) but stdout is not (so the prompt cannot be shown). Distinct from
+ *  CANCELLED: the user did not decline anything, the command simply has no
+ *  way to ask. */
+const PROMPT_IMPOSSIBLE: unique symbol = Symbol("yaw-mcp:value-prompt-impossible");
+type PromptImpossible = typeof PROMPT_IMPOSSIBLE;
+
+/** Read the secret VALUE: the interactive no-echo prompt, or raw stdin when
+ *  it is piped (or --stdin forces it).
+ *
+ *  The interactive branch needs BOTH ends of the terminal, the same rule
+ *  isInteractiveTTY applies to every other prompt in this file. Gating on
+ *  stdin.isTTY alone meant `yaw-mcp secrets set GH > out.json` -- TTY stdin,
+ *  redirected stdout -- wrote "Secret value: " INTO the redirect target,
+ *  switched the terminal to raw no-echo mode, and then sat there waiting on
+ *  a prompt the user could not see. Refusing is the honest answer; --value
+ *  and --stdin are the scripted paths. */
+async function readStdinValue(
+  io?: SecretsCommandOptions["io"],
+  forceRaw?: boolean,
+): Promise<string | Cancelled | PromptImpossible> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
-  const isTTY = (stdin as { isTTY?: boolean }).isTTY === true;
-  if (isTTY && !forceRaw) {
+  const stdinIsTTY = (stdin as { isTTY?: boolean }).isTTY === true;
+  const stdoutIsTTY = (stdout as { isTTY?: boolean }).isTTY === true;
+  if (stdinIsTTY && !forceRaw) {
+    if (!stdoutIsTTY) return PROMPT_IMPOSSIBLE;
     // Pass the label as the reader's PROMPT rather than writing it first:
     // the reader writes its own prompt, so pre-writing one printed
     // "Secret value: Vault passphrase: " and asked the user for the wrong
@@ -906,6 +987,13 @@ export async function runSecrets(
     else {
       const entered = await readStdinValue(opts.io, opts.fromStdin);
       if (entered === CANCELLED) return cancelledResult(io, opts.json);
+      if (entered === PROMPT_IMPOSSIBLE) {
+        const msg =
+          "cannot prompt for the value: stdin is a TTY but stdout is not, so the prompt would be written into the redirect instead of shown. Pass --value <v>, or pipe the value in with --stdin.";
+        if (opts.json) io.err(`${JSON.stringify({ ok: false, error: msg })}\n`);
+        else io.err(`yaw-mcp secrets set: ${msg}\n`);
+        return { exitCode: 1 };
+      }
       value = entered;
     }
     if (!value) {
@@ -929,7 +1017,8 @@ export async function runSecrets(
     }
     if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "set");
     // atomicWriteFile mkdirs the target dir, so no ensureVaultDir needed.
-    await saveVault(path, vault);
+    const failed = await saveVaultOrReport(path, vault, io, opts.json, "set");
+    if (failed) return failed;
     // "Replaced" vs "Stored" is the only signal a scripted run gets that it
     // just destroyed a previous value (the non-TTY path proceeds without a
     // confirmation), so the two cases must never print the same line.
@@ -984,7 +1073,8 @@ export async function runSecrets(
     // the not-found message), so removeSecret always has something to drop.
     if (await vaultChangedSinceLoad(path, baseline)) return vaultChangedResult(io, opts.json, "remove");
     vault = removeSecret(vault, name);
-    await saveVault(path, vault);
+    const failed = await saveVaultOrReport(path, vault, io, opts.json, "remove");
+    if (failed) return failed;
     if (opts.json) io.out(`${JSON.stringify({ ok: true, removed: name })}\n`);
     else io.out(`Removed "${name}".\n`);
     return { exitCode: 0 };
@@ -1092,7 +1182,14 @@ async function runSecretsRotate(
     lock();
     return vaultChangedResult(io, opts.json, "rotate");
   }
-  await saveVault(path, rotated);
+  const failed = await saveVaultOrReport(path, rotated, io, opts.json, "rotate");
+  if (failed) {
+    // The on-disk vault is still the pre-rotation one, and the cached key was
+    // derived against it -- but the caller was just told nothing was saved,
+    // so drop it and let the next command re-derive from what is on disk.
+    lock();
+    return failed;
+  }
   // Drop the stale key derived from the OLD passphrase. The salt changed,
   // so the next secrets command must re-derive against the new passphrase.
   lock();

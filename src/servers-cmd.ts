@@ -3,15 +3,23 @@
 // This used to list the servers configured for a Yaw MCP *account* (what
 // `/api/connect/config` returned). Account mode is gone — the hosted backend
 // is decommissioned and every endpoint 404s — so there is nothing left to
-// list. The command is retained for one release as a signpost rather than
-// disappearing into "unknown subcommand".
+// list. The stub is kept as a signpost -- rather than disappearing into
+// "unknown subcommand" -- until yaw-mcp-sidecar.ts stops calling it. It is
+// NOT waiting on a version bump: index.ts exits 2 for an unknown subcommand,
+// so the panel's non-zero contract below survives deleting this file, and the
+// only thing holding it here is the app-side spawn. (The original note said
+// "retained for one release"; that was written for 0.74.0 and the tree has
+// moved on twice since, so the release count was never the real gate.)
 //
 // The non-zero exit is deliberate, not an oversight. Yaw Terminal's MCP panel
-// spawns `yaw-mcp servers --json` and derives "signed in" from a CLEAN exit
-// with parseable JSON (yaw-mcp-sidecar.ts); on a non-zero exit it silently
-// falls back to local-bundles mode. Exiting 0 here would either fake an
-// account or trip the panel's "exited 0 but returned no parseable config"
-// warning. Failing is what routes it to the only mode that still exists.
+// spawns `yaw-mcp servers --json` on every panel open and derives "signed in"
+// from a CLEAN exit with parseable JSON (yaw-mcp-sidecar.ts). A non-zero exit
+// routes it to local-bundles mode -- but NOT silently: it logs
+// `[yaw-mcp] servers --json exited N; treating as signed-out:` plus the stderr
+// tail, so every panel open costs one warn line until the app-side spawn is
+// removed. Exiting 0 here would either fake an account or trip the panel's
+// "exited 0 but returned no parseable config" warning, so failing is still
+// right; the log noise is the cost of the app still asking.
 //
 // The local equivalent is `yaw-mcp list`, which reads bundles.json.
 //

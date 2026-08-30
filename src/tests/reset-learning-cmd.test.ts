@@ -109,6 +109,43 @@ describe("runResetLearning", () => {
     expect(combined).toContain("pack history entries removed: 1");
   });
 
+  // Regression: the report accounted for two of the v2 file's three
+  // sections. The tool cache was deleted in silence, and every namespace
+  // whose learned tool list went with it costs an extra upstream handshake
+  // on the next session -- a consequence the person running the reset ought
+  // to see before it surprises them.
+  it("reports the tool-cache namespaces it deleted", async () => {
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: Date.now(),
+      learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } },
+      packHistory: [],
+      toolCache: {
+        gh: { tools: [{ name: "list_prs" }, { name: "create_issue" }], learnedAt: Date.now() },
+        linear: { tools: [{ name: "list_issues" }], learnedAt: Date.now() },
+      },
+    };
+    writeFileSync(stateFile, JSON.stringify(payload), "utf8");
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    const combined = io.out.join("");
+    // Namespaces, not tools: the cache is keyed per server.
+    expect(combined).toContain("tool caches removed:          2");
+    expect(combined).toContain("learning entries removed:     1");
+  });
+
+  it("reports a concrete 0 for a clean file with no tool cache at all (a v1 file)", async () => {
+    writeFileSync(stateFile, JSON.stringify({ version: 1, savedAt: 1, learning: {}, packHistory: [] }), "utf8");
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    expect(r.removed).toBe(true);
+    const combined = io.out.join("");
+    expect(combined).not.toContain("contents unreadable");
+    expect(combined).toContain("tool caches removed:          0");
+  });
+
   it("removes a malformed state file and reports it as unreadable (not 0 counts)", async () => {
     // loadState is tolerant and returns emptyState here; the unlink
     // still deletes the file, which is what we want — a corrupt state

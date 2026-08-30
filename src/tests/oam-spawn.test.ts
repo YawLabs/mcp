@@ -352,6 +352,50 @@ describe("resolveBinAbsolute", () => {
     }
   });
 
+  it("skips the EXTENSIONLESS candidate on Windows, which CreateProcess would never run", () => {
+    // A POSIX shim named `oam` checked into a bin dir beside the real
+    // `oam.exe` is an everyday shape. Windows appends an extension to a name
+    // that carries none, so spawning `oam` runs oam.exe -- but the search
+    // tried "" first and answered with the shim, and install then persisted a
+    // launch that cannot start. isExecutableFile cannot tell them apart: X_OK
+    // is a no-op on Windows, where executability IS the extension.
+    const { dir, cleanup } = binDir("oam", "oam.exe");
+    try {
+      expect(resolveBinAbsolute("oam", { PATH: dir, PATHEXT: ".exe" }, "win32")).toBe(
+        winNormalize(join(dir, "oam.exe"), "win32"),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses a RELATIVE bin that carries a separator instead of PATH-joining it", () => {
+    // `./tools/oam` is spawned against the CWD; the loader never consults PATH
+    // for a name with a separator in it. Joining it onto each PATH entry could
+    // only hit by coincidence -- and that coincidence would be written into a
+    // client's config as "the oam we found".
+    const dir = mkdtempSync(join(tmpdir(), "resolvebin-rel-"));
+    mkdirSync(join(dir, "tools"));
+    for (const name of ["oam", "oam.exe"]) {
+      writeFileSync(join(dir, "tools", name), "");
+      chmodSync(join(dir, "tools", name), 0o755);
+    }
+    try {
+      // join(dir, "./tools/oam") really does land on the file, which is
+      // exactly why the PATH loop used to return it.
+      expect(resolveBinAbsolute("./tools/oam", { PATH: dir }, "linux")).toBeNull();
+      expect(resolveBinAbsolute("tools/oam", { PATH: dir, PATHEXT: ".exe" }, "win32")).toBeNull();
+      // The control, asserted through the win32 delimiter so a drive-lettered
+      // fixture path is not split at its colon: the bare name in that same
+      // directory is an ordinary PATH lookup and still resolves.
+      expect(resolveBinAbsolute("oam", { PATH: join(dir, "tools"), PATHEXT: ".exe" }, "win32")).toBe(
+        winNormalize(join(dir, "tools", "oam.exe"), "win32"),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("strips quotes from a PATH entry -- they are shell syntax, not the directory name", () => {
     // Windows PATH entries are commonly quoted; keeping the quote makes every
     // join miss, so an install silently declines to write an oam launch.
@@ -576,6 +620,31 @@ describe("rewriteForOam", () => {
     expect(rewriteForOam("node", ["/srv/index.js", "--port", "1"], oam)).toEqual({
       command: "oam",
       args: ["run", "/srv/index.js", "--", "--port", "1"],
+    });
+  });
+
+  it("turns oam's concurrent type-checker off for a TypeScript entry", async () => {
+    // `oam run` defaults to `--check warn`, so a rewritten `node server.ts`
+    // spawns tsgo alongside the sidecar and writes its diagnostics to the
+    // child's stderr -- which is what lands in the 500-char failure tail when
+    // a boot fails, in place of the real error. node ran the file unchecked;
+    // the rewrite is billed as a pure optimization, so it must not add a
+    // checker the original launch never had.
+    expect(rewriteForOam("node", ["/srv/server.ts"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "--no-check", "/srv/server.ts"],
+    });
+    // The flag goes before the entry, and the server's own args still ride
+    // after the `--` separator.
+    expect(rewriteForOam("node", ["/srv/server.mts", "--port", "1"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "--no-check", "/srv/server.mts", "--", "--port", "1"],
+    });
+    // A JavaScript entry is not type-checked in the first place: no flag, so
+    // the everyday launch keeps the argv it always had.
+    expect(rewriteForOam("node", ["/srv/index.js"], oam)).toEqual({
+      command: "oam",
+      args: ["run", "/srv/index.js"],
     });
   });
 
@@ -849,6 +918,23 @@ describe("npmCacheDir", () => {
     } finally {
       a.cleanup();
       b.cleanup();
+    }
+  });
+
+  it("takes the LAST cache= line, the way npm's ini parser does", () => {
+    // npm parses an npmrc as ini: a duplicate key overwrites the earlier one,
+    // so the LAST `cache=` is the directory npm is actually filling. Taking
+    // the first one resolved to a stale directory whose `_npx` readdir finds
+    // nothing, and every npx sidecar then quietly stayed on npx -- a silent
+    // no-op indistinguishable from "no sidecars installed".
+    const stale = join(tmpdir(), "cache-STALE");
+    const live = join(tmpdir(), "cache-LIVE");
+    // brokerWithNpmrc interpolates raw, so this writes two `cache=` lines.
+    const a = brokerWithNpmrc(`${stale}\ncache=${live}`);
+    try {
+      expect(npmCacheDir(a.url)).toBe(live);
+    } finally {
+      a.cleanup();
     }
   });
 
@@ -1167,6 +1253,24 @@ describe("resolveNpmEntry", () => {
     const newest = mk("zzz9", "0.3.6");
     try {
       expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, root, null)).toBe(join(newest, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("lets a higher version in a sibling cache beat a copy in the broker's OWN _npx dir", async () => {
+    // The broker's own node_modules is authoritative only when it is DURABLE.
+    // Under _npx it is a cache copy like any other, so taking it outright let
+    // a stale sidecar sitting in our own content-hashed dir preempt a newer
+    // copy the highest-version scan exists to find -- and it carried the
+    // "npm install" refresh advice, which cannot refresh a hashed dir anyway.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const own = join(npx, "aaa", "node_modules", "@yawlabs", "fetch-mcp");
+    writeManifest(own, { name: "@yawlabs/fetch-mcp", version: "0.1.0", bin: { "fetch-mcp": "./dist/index.js" } });
+    const sibling = join(npx, "bbb", "node_modules", "@yawlabs", "fetch-mcp");
+    writeManifest(sibling, { name: "@yawlabs/fetch-mcp", version: "0.9.0", bin: { "fetch-mcp": "./dist/index.js" } });
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null)).toBe(join(sibling, "dist", "index.js"));
     } finally {
       cleanup();
     }
@@ -1687,6 +1791,29 @@ describe("probeOam hardening", () => {
     expect(parseOamVersion(c.result())).toBe("1.2.3");
   });
 
+  it("lets the NEXT chunk extend a version that ended flush with the buffer", () => {
+    // stdout is a byte stream: "oam 0.12.1" and "-rc.1" can arrive as separate
+    // chunks. Latching on the first parse hit dropped the prerelease suffix,
+    // and a floor-equal rc then compares EQUAL to MIN_OAM_VERSION instead of
+    // below it -- so the exact build the gate exists to refuse gets hosted.
+    // A match that runs to the very end of what has been seen is only a
+    // PREFIX, so it is held until a later chunk settles it.
+    const c = createProbeCollector();
+    c.push("oam 0.12.1");
+    c.push("-rc.1\n");
+    expect(c.result()).toBe("0.12.1-rc.1");
+  });
+
+  it("still reports a flush version when the stream closes without another chunk", () => {
+    // The other half of holding it: `oam 0.12.1` with no trailing newline is
+    // the whole output, so result() has to finalize what is held rather than
+    // fall through to the capped head (which parses to null and skips the
+    // gate entirely).
+    const c = createProbeCollector();
+    c.push("oam 0.12.1");
+    expect(c.result()).toBe("0.12.1");
+  });
+
   it("returns capped text (which parses to null) when no version appears", () => {
     const c = createProbeCollector(32);
     c.push("no version here at all, and quite a lot of it".repeat(10));
@@ -2029,6 +2156,19 @@ describe("oamInstallAdvice", () => {
 
   it("names the platform it could not find a binary for", () => {
     expect(oamNoBinaryReason()).toContain(`${process.platform}-${process.arch}`);
+  });
+
+  it("stays ASCII, because doctor prints it verbatim to a terminal", () => {
+    // A legacy Windows console renders a UTF-8 em-dash as mojibake, and this
+    // line is written to be pasted into a support thread -- where the mangled
+    // bytes then spread. Built with fromCharCode so this test cannot itself
+    // be the thing that reintroduces the character.
+    const emDash = String.fromCharCode(0x2014);
+    expect(oamNoBinaryReason()).not.toContain(emDash);
+    // Space through tilde: the printable ASCII range, written literally so the
+    // assertion is about bytes rather than about one character.
+    expect(oamNoBinaryReason()).toMatch(/^[ -~]+$/);
+    expect(oamNoBinaryReason()).toContain(" -- build from source");
   });
 });
 

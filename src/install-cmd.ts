@@ -14,11 +14,16 @@
 // detected only to nudge the user into deleting it. Anything keying off this
 // file's behaviour (a migration, an external doctor check) must read `mcp`.
 //
-// ~/.yaw-mcp/config.json is NO LONGER written. It existed to carry the
-// account token across clients, and yaw-mcp is local-only now — servers
+// ~/.yaw-mcp/config.json is NO LONGER written by install. It existed to carry
+// the account token across clients, and yaw-mcp is local-only now — servers
 // come from ~/.yaw-mcp/bundles.json. `--token` and `--no-yaw-mcp-config`
 // are still ACCEPTED so scripted installs keep exiting 0, but they are
 // inert and print a deprecation warning to stderr.
+//
+// WRITING is what stopped, not reading: config-loader.ts still READS that file
+// (servers / blocked / installNudge), and migrate.ts still hoists a 0.11.x
+// legacy dotfile into it on upgrade. A file present there is live config, not
+// a leftover -- deleting it changes behaviour.
 //
 // Failure semantics:
 //   - Existing client file with malformed JSON  → refuse, point at the file.
@@ -276,7 +281,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // and writes .vscode/mcp.json into whatever directory the runner happens to
   // be in. It also kept `--list` and `install --scope project` reporting two
   // different directories.
-  const projectDir = scopeSpec.requiresProjectDir ? resolve(opts.projectDir ?? opts.cwd ?? process.cwd()) : undefined;
+  // `opts.cwd` is the BASE, not just the fallback: a RELATIVE --project-dir
+  // used to be resolved against the real process.cwd() even when the caller
+  // had overridden cwd, making this the one place project resolution ignored
+  // the override.
+  const projectDir = scopeSpec.requiresProjectDir
+    ? resolve(opts.cwd ?? process.cwd(), opts.projectDir ?? ".")
+    : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
   try {
     resolved = resolveInstallPath({
@@ -297,6 +308,63 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   log(`File:   ${resolved.absolute}`);
 
   // Read + merge existing client config.
+  const containerPath = resolved.containerPath;
+  let existing: Record<string, unknown> = {};
+  // RAW bytes of a pre-existing, non-empty, object-shaped client config. Kept
+  // so the write below can go through the comment-preserving `editJsoncEntry`
+  // instead of JSON.parse + JSON.stringify, which silently deletes every `//`
+  // and `/* */` in the user's file. `.vscode/mcp.json` is documented JSONC and
+  // its `inputs` array is routinely commented; ~/.claude.json carries user
+  // comments too. `yaw-mcp try` already writes these same files this way --
+  // install was the one path that still flattened them.
+  let rawClient: string | null = null;
+  let existingHasEntry = false;
+  let legacyEntry: string | null = null;
+  // EVERY legacy entry key still in the container, not just the first one
+  // findLegacyEntry reports -- the settings.json patch needs the full set to
+  // decide which legacy allow-patterns are still load-bearing.
+  let legacyEntriesPresent: string[] = [];
+  if (existsSync(resolved.absolute)) {
+    let raw: string;
+    try {
+      raw = await readFile(resolved.absolute, "utf8");
+    } catch (e) {
+      err(`yaw-mcp install: cannot read ${resolved.absolute}: ${(e as Error).message}`);
+      return { written: [], wouldWrite: [], messages, exitCode: 1 };
+    }
+    if (raw.trim().length > 0) {
+      try {
+        const parsed = parseJsonc(raw);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          err(
+            `yaw-mcp install: ${resolved.absolute} is not a JSON object — refusing to overwrite. Edit by hand or rename the file and re-run.`,
+          );
+          return { written: [], wouldWrite: [], messages, exitCode: 1 };
+        }
+        existing = parsed as Record<string, unknown>;
+        rawClient = raw;
+      } catch (e) {
+        err(
+          `yaw-mcp install: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite. Fix the file or rename it and re-run.`,
+        );
+        return { written: [], wouldWrite: [], messages, exitCode: 1 };
+      }
+    }
+    const container = readNested(existing, containerPath);
+    if (typeof container === "object" && container !== null && !Array.isArray(container)) {
+      const c = container as Record<string, unknown>;
+      existingHasEntry = ENTRY_NAME in c;
+      legacyEntry = findLegacyEntry(c);
+      legacyEntriesPresent = LEGACY_ENTRY_NAMES.filter((n) => n in c);
+    }
+  }
+
+  // Probed AFTER the target file is read and validated, not before it: every
+  // line below claims a runtime for an entry this run is about to write, and
+  // the refusals above return without writing anything. Ordered the other way,
+  // a malformed ~/.claude.json printed `Runtime: will run on oam ...` and then
+  // `not valid JSON ... Refusing` -- a runtime claim for a write that never
+  // happened, in that order, in the transcript the user pastes into a bug report.
   //
   // Host the broker itself on oam when this machine can do it durably: a
   // version-gated oam, resolvable to an ABSOLUTE path, AND a non-npx-cache
@@ -396,56 +464,6 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // absence is a MACHINE-level fact and the common case, so repeating it
     // across every client is the same noise the collision refusal consolidates.
     log(oamAbsentNote(os));
-  }
-  const containerPath = resolved.containerPath;
-  let existing: Record<string, unknown> = {};
-  // RAW bytes of a pre-existing, non-empty, object-shaped client config. Kept
-  // so the write below can go through the comment-preserving `editJsoncEntry`
-  // instead of JSON.parse + JSON.stringify, which silently deletes every `//`
-  // and `/* */` in the user's file. `.vscode/mcp.json` is documented JSONC and
-  // its `inputs` array is routinely commented; ~/.claude.json carries user
-  // comments too. `yaw-mcp try` already writes these same files this way --
-  // install was the one path that still flattened them.
-  let rawClient: string | null = null;
-  let existingHasEntry = false;
-  let legacyEntry: string | null = null;
-  // EVERY legacy entry key still in the container, not just the first one
-  // findLegacyEntry reports -- the settings.json patch needs the full set to
-  // decide which legacy allow-patterns are still load-bearing.
-  let legacyEntriesPresent: string[] = [];
-  if (existsSync(resolved.absolute)) {
-    let raw: string;
-    try {
-      raw = await readFile(resolved.absolute, "utf8");
-    } catch (e) {
-      err(`yaw-mcp install: cannot read ${resolved.absolute}: ${(e as Error).message}`);
-      return { written: [], wouldWrite: [], messages, exitCode: 1 };
-    }
-    if (raw.trim().length > 0) {
-      try {
-        const parsed = parseJsonc(raw);
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-          err(
-            `yaw-mcp install: ${resolved.absolute} is not a JSON object — refusing to overwrite. Edit by hand or rename the file and re-run.`,
-          );
-          return { written: [], wouldWrite: [], messages, exitCode: 1 };
-        }
-        existing = parsed as Record<string, unknown>;
-        rawClient = raw;
-      } catch (e) {
-        err(
-          `yaw-mcp install: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite. Fix the file or rename it and re-run.`,
-        );
-        return { written: [], wouldWrite: [], messages, exitCode: 1 };
-      }
-    }
-    const container = readNested(existing, containerPath);
-    if (typeof container === "object" && container !== null && !Array.isArray(container)) {
-      const c = container as Record<string, unknown>;
-      existingHasEntry = ENTRY_NAME in c;
-      legacyEntry = findLegacyEntry(c);
-      legacyEntriesPresent = LEGACY_ENTRY_NAMES.filter((n) => n in c);
-    }
   }
 
   if (existingHasEntry) {
@@ -779,10 +797,15 @@ export function mergePermissionsAllow(
   const perms: Record<string, unknown> =
     typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
   const prevAllow = perms.allow;
-  const allow: string[] = Array.isArray(prevAllow)
+  // Non-string elements are carried through VERBATIM. The legacy-pattern drop
+  // and the dedupe below are string-only concepts, so a filter that narrowed to
+  // string silently DELETED anything else the user (or a future Claude Code
+  // schema) had put in `permissions.allow` -- an object rule, a nested array --
+  // on the next install, contradicting this function's own promise to preserve
+  // everything it does not manage.
+  const allow: unknown[] = Array.isArray(prevAllow)
     ? (prevAllow as unknown[]).filter(
-        (x): x is string =>
-          typeof x === "string" && (retain.includes(x) || !LEGACY_CLAUDE_CODE_ALLOW_PATTERNS.includes(x)),
+        (x) => typeof x !== "string" || retain.includes(x) || !LEGACY_CLAUDE_CODE_ALLOW_PATTERNS.includes(x),
       )
     : [];
   for (const p of patterns) {
@@ -887,14 +910,6 @@ function describeJsonShape(value: unknown): string {
   return `a ${typeof value}`;
 }
 
-/** Merge `entry` into the container at `existing[...containerPath][entryName]`,
- *  preserving every sibling at every level of the path. Returns a new object;
- *  does not mutate. For Claude Code local scope, containerPath is
- *  ["projects", <absDir>, "mcpServers"] and this preserves every other
- *  project's settings + every other top-level key in ~/.claude.json.
- *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp entry);
- *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
- *  next to a real yaw-mcp install without colliding. */
 /** Read the existing launch entry at `containerPath`, or null when the path or
  *  the entry is absent. Mirrors mergeClientConfig's walk so the two agree on
  *  where the entry lives. */
@@ -934,6 +949,14 @@ export function readEntryAt(
   return result;
 }
 
+/** Merge `entry` into the container at `existing[...containerPath][entryName]`,
+ *  preserving every sibling at every level of the path. Returns a new object;
+ *  does not mutate. For Claude Code local scope, containerPath is
+ *  ["projects", <absDir>, "mcpServers"] and this preserves every other
+ *  project's settings + every other top-level key in ~/.claude.json.
+ *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp entry);
+ *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
+ *  next to a real yaw-mcp install without colliding. */
 export function mergeClientConfig(
   existing: Record<string, unknown>,
   containerPath: string[],
@@ -1103,6 +1126,19 @@ export function parseInstallArgs(argv: string[]):
         error: `yaw-mcp install: ${opts.listOnly ? "--list" : "--all"} does not take a client argument.\n${USAGE}`,
       };
     }
+    // --list never writes, so a write-decision flag passed with it is an
+    // intent that gets silently dropped -- the same class as --all --scope
+    // below. --dry-run is deliberately still ACCEPTED: --list is already
+    // read-only, and the cross-OS guard above documents `--os <other>
+    // --dry-run` as the preview spelling, so refusing it would break a
+    // combination this parser advertises.
+    if (opts.listOnly && (opts.force || opts.skip)) {
+      const flag = opts.force ? "--force" : "--skip";
+      return {
+        ok: false,
+        error: `yaw-mcp install: --list never writes a file, so it cannot honor ${flag}. Drop ${flag}, or install the client you want.\n${USAGE}`,
+      };
+    }
     // --all plans its own scope per client (user where available), so an
     // explicit --scope would be silently discarded for every client but
     // the project-only ones. Refuse instead of ignoring: a flag that is
@@ -1148,7 +1184,10 @@ async function runInstallList(
   // --list --project-dir /repo` reports the same files `install vscode
   // --project-dir /repo` would write -- accepting the flag and probing
   // process.cwd() instead made the two surfaces disagree.
-  const cwd = opts.projectDir ?? opts.cwd ?? process.cwd();
+  // Resolved exactly like the write path above: a relative --project-dir is
+  // taken against the cwd override, not the real process.cwd(), so `--list`
+  // and `install <client> --project-dir <rel>` name the same directory.
+  const cwd = resolve(opts.cwd ?? process.cwd(), opts.projectDir ?? ".");
   const os = opts.os ?? CURRENT_OS;
   const probes = await probeClientsAsync({
     home,
@@ -1161,7 +1200,7 @@ async function runInstallList(
   const rows = probes.map((p) => ({
     client: INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId,
     scope: p.scope,
-    path: displayPath(p.path, home),
+    path: displayPath(p.path, home, os),
     status: statusFor(p),
   }));
 
@@ -1204,11 +1243,27 @@ function statusFor(p: ClientProbeResult): string {
   return "not installed";
 }
 
-function displayPath(abs: string, home: string): string {
+// `os` is the os being LISTED, not process.platform: --list is the one install
+// surface that reports another machine's layout (the cross-OS refusal in
+// parseInstallArgs exempts it), and keying the separator on the host made
+// `--list --os linux` on Windows print a backslash-joined `~` path -- a shape
+// the listed os never uses.
+//
+// EVERY separator is rewritten, not just the leading one. resolveInstallPath
+// builds `absolute` with node:path on the HOST (only its sibling `display`
+// string is target-shaped), so fixing the head alone printed `~/.cursor\mcp.json`
+// -- mixed, and still a shape neither OS uses. Presentation only: the row is
+// rooted in THIS machine's home dir either way, which is why a cross-OS write
+// is refused and only --list / --dry-run ever reach here.
+function displayPath(abs: string, home: string, os: InstallOS): string {
   if (abs === "(n/a)") return abs;
   if (home && abs.startsWith(home)) {
-    const tail = abs.slice(home.length).replace(/^[\\/]/, "");
-    return `~${process.platform === "win32" ? "\\" : "/"}${tail}`;
+    const sep = os === "windows" ? "\\" : "/";
+    const tail = abs
+      .slice(home.length)
+      .replace(/^[\\/]/, "")
+      .replace(/[\\/]/g, sep);
+    return `~${sep}${tail}`;
   }
   return abs;
 }
@@ -1319,8 +1374,12 @@ async function runInstallAll(
     aggregateWritten.push(...result.written);
     aggregateWouldWrite.push(...result.wouldWrite);
     // Splice each sub-install's trail in right where it printed, between this
-    // client's header and the blank line that closes it.
-    messages.push(...result.messages);
+    // client's header and the blank line that closes it -- MINUS the collision
+    // refusals the shim above swallowed. `messages` is documented as exactly
+    // what was printed, so splicing an unprinted refusal in (once per colliding
+    // client, on top of the consolidated line below) made the returned trail
+    // disagree with the transcript the user saw.
+    messages.push(...result.messages.filter((m) => !isCollisionRefusal(m)));
     if (result.exitCode === 0) succeeded += 1;
     else failed += 1;
     log("");
@@ -1332,7 +1391,18 @@ async function runInstallAll(
   // honoured on this path too or a fixture-driven --all run would consult the
   // real machine. Only the ABSENT case: every other Runtime reason still prints
   // per client, where it belongs.
-  if (oamIsAbsent(await (opts.oamProbe ?? probeOam)())) log(oamAbsentNote(os));
+  // Gated on the run leaving at least one entry in place: the note is a
+  // runtime tip ABOUT the entries yaw-mcp is wired into, so on an
+  // all-refused / all-failed run it printed advice for entries that do not
+  // exist -- immediately above the collision hint and the failure summary.
+  //
+  // `succeeded > 0` is part of the test, not just the written/would-write
+  // lists. Under `--all --skip` a client that ALREADY has an entry is a
+  // success that writes nothing, so a fully-successful all-skip run has both
+  // lists empty -- and gating on those alone made the tip vanish from exactly
+  // the run where every entry it describes is present and about to be used.
+  const runLeftAnEntry = aggregateWritten.length > 0 || aggregateWouldWrite.length > 0 || succeeded > 0;
+  if (runLeftAnEntry && oamIsAbsent(await (opts.oamProbe ?? probeOam)())) log(oamAbsentNote(os));
 
   if (collisionClients.length > 0) {
     err(

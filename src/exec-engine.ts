@@ -169,6 +169,28 @@ export function resolveRef(refRaw: string, bindings: Record<string, unknown>): u
   return cursor;
 }
 
+// Maximum nesting depth either args walker will descend. The tree comes from
+// client-supplied JSON, and JSON.parse happily accepts nesting far deeper
+// than the JS stack can recurse over -- so without a cap a
+// `{"a":{"a":{"a": ...}}}` args blob turns into a RangeError thrown from
+// inside the walker, which reads as an internal crash rather than as bad
+// input. 64 is orders of magnitude past any real tool's args shape (the
+// deepest thing exec is meant to carry is a step output nested a few levels
+// in), so the cap only ever fires on input that was never going to work.
+export const MAX_REF_DEPTH = 64;
+
+/** Thrown when args nest deeper than MAX_REF_DEPTH. Separate from RefError
+ *  because the failure is about the args TREE, not about any one `$ref`:
+ *  blaming a ref string that may not even exist at that depth would send the
+ *  reader looking for a ref bug. handleExec reports it the same way -- the
+ *  step fails with this message and the pipeline stops. */
+export class ExecDepthError extends Error {
+  constructor(public readonly limit: number) {
+    super(`args nested deeper than the ${limit}-level exec limit`);
+    this.name = "ExecDepthError";
+  }
+}
+
 // Walk the args tree and replace every `{"$ref": "..."}` leaf with the
 // resolved value from `bindings`. Returns a NEW tree — the input is not
 // mutated — so callers can safely reuse the original args shape across
@@ -178,18 +200,26 @@ export function resolveRef(refRaw: string, bindings: Record<string, unknown>): u
 // through unchanged. Arrays are walked element-by-element. Objects are
 // walked key-by-key, preserving insertion order. The recursion has no
 // cycle guard because the caller constructs args from JSON that the
-// LLM produced — it cannot contain cycles.
+// LLM produced — it cannot contain cycles. It DOES have a depth cap: a
+// non-cyclic tree can still be deep enough to blow the stack, and
+// MAX_REF_DEPTH turns that into a loud, attributable step failure.
 export function resolveArgs(args: unknown, bindings: Record<string, unknown>): unknown {
+  return resolveArgsAt(args, bindings, 0);
+}
+
+// `depth` counts containers entered: the root value is 0, its members are 1.
+function resolveArgsAt(args: unknown, bindings: Record<string, unknown>, depth: number): unknown {
+  if (depth > MAX_REF_DEPTH) throw new ExecDepthError(MAX_REF_DEPTH);
   if (isRefNode(args)) {
     return resolveRef(args.$ref, bindings);
   }
   if (Array.isArray(args)) {
-    return args.map((v) => resolveArgs(v, bindings));
+    return args.map((v) => resolveArgsAt(v, bindings, depth + 1));
   }
   if (args !== null && typeof args === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(args as Record<string, unknown>)) {
-      const resolved = resolveArgs(v, bindings);
+      const resolved = resolveArgsAt(v, bindings, depth + 1);
       // `out[k] = v` is wrong for k === "__proto__". JSON.parse produces
       // __proto__ as an OWN property, but plain assignment hits
       // Object.prototype's __proto__ setter instead of creating an own key,
@@ -217,10 +247,20 @@ export function resolveArgs(args: unknown, bindings: Record<string, unknown>): u
 // Used for cascading-blame attribution in exec: if a step fails on bad input
 // it consumed via $ref, the upstream producer shares the blame. Pure; never
 // throws (a malformed ref simply contributes no dep).
+//
+// Same MAX_REF_DEPTH bound as resolveArgs, but it STOPS rather than throws.
+// Two reasons: this runs inside exec's failure-reporting path (server.ts
+// blames the producers of a failed step), where an exception would replace a
+// structured `{ok:false, failedStep, partial}` report with a raw error; and
+// it is only ever called on args resolveArgs already walked successfully, so
+// anything past the cap belongs to a tree that could never have reached a
+// tools/call in the first place. Refusing to descend loses no real dep and
+// keeps the "never throws" contract this function is called under.
 export function collectRefDeps(args: unknown): string[] {
   const deps = new Set<string>();
 
-  const walk = (node: unknown): void => {
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > MAX_REF_DEPTH) return;
     if (isRefNode(node)) {
       const tokens = parseRefPath(node.$ref);
       // A malformed ref (parseRefPath -> null) contributes no dep. The
@@ -233,17 +273,17 @@ export function collectRefDeps(args: unknown): string[] {
       return;
     }
     if (Array.isArray(node)) {
-      for (const v of node) walk(v);
+      for (const v of node) walk(v, depth + 1);
       return;
     }
     if (node !== null && typeof node === "object") {
-      for (const v of Object.values(node as Record<string, unknown>)) walk(v);
+      for (const v of Object.values(node as Record<string, unknown>)) walk(v, depth + 1);
       return;
     }
     // Primitives contribute nothing.
   };
 
-  walk(args);
+  walk(args, 0);
   return Array.from(deps);
 }
 

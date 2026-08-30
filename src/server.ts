@@ -32,7 +32,7 @@ import { closestNames } from "./fuzzy.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
 import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
-import { adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
+import { ADAPTIVE_MAX, adaptiveThreshold, HISTORY_LIMIT, pushToolCall, type ToolCallRecord } from "./idle-ttl.js";
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
 import { setJsonKey } from "./json-key.js";
 import { LearningStore } from "./learning.js";
@@ -152,6 +152,12 @@ export function resolveToolExposure(): ToolExposure {
 // per-namespace bonus on top of this and clamps the result to [5, 50].
 export const DEFAULT_IDLE_CALL_THRESHOLD = 10;
 
+// Last baseline the clamp warning in resolveIdleThreshold fired for. Keyed on
+// the VALUE, not a boolean, so a session (or a test) that changes the env to a
+// different over-ceiling value is told again, while a steady over-ceiling value
+// logs once instead of once per tool call.
+let idleThresholdClampWarnedFor: number | null = null;
+
 // Live idle-threshold baseline. YAW_MCP_IDLE_THRESHOLD is the current
 // name; MCP_CONNECT_IDLE_THRESHOLD is the pre-rename spelling and stays
 // honored as a fallback so existing setups keep working. Re-read on every
@@ -166,8 +172,29 @@ export function resolveIdleThreshold(): number {
   const current = process.env.YAW_MCP_IDLE_THRESHOLD;
   const raw = current !== undefined && current !== "" ? current : process.env.MCP_CONNECT_IDLE_THRESHOLD;
   if (!raw) return DEFAULT_IDLE_CALL_THRESHOLD;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n >= 1 ? n : DEFAULT_IDLE_CALL_THRESHOLD;
+  // Strict digit-run parse, the same shape resolveServerCap (server-cap.ts)
+  // was hardened to. Number.parseInt's PREFIX parsing turns "1e2" into 1 and
+  // "10abc" into 10, so a malformed value silently made the reaper far more
+  // aggressive than the operator asked for instead of falling back to the
+  // documented default.
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_IDLE_CALL_THRESHOLD;
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_IDLE_CALL_THRESHOLD;
+  // adaptiveThreshold() clamps its computed result to ADAPTIVE_MAX, so a
+  // baseline above that ceiling is silently capped -- YAW_MCP_IDLE_THRESHOLD=100
+  // behaves exactly like 50. Say so once per distinct configured value
+  // (this function runs on every tool call, so an unconditional log would
+  // be per-call spam) rather than letting the operator believe the number
+  // they set is in effect.
+  if (n > ADAPTIVE_MAX && idleThresholdClampWarnedFor !== n) {
+    idleThresholdClampWarnedFor = n;
+    log("warn", "Idle threshold above the adaptive ceiling; it will be clamped", {
+      configured: n,
+      effectiveMax: ADAPTIVE_MAX,
+    });
+  }
+  return n;
 }
 
 // Auto-warm gate for discover(context): when one candidate clearly wins,
@@ -710,10 +737,17 @@ export class ConnectServer {
   // toolCache shipped in bundles.json, or the one we learned in a previous
   // session and hydrated from state.json? Gates pre-warm: a `false` here
   // means the only way to find out what the server offers is to spawn it.
+  //
+  // A LEARNED entry counts as known even when it is empty. "We spawned this
+  // server and it offered zero tools" is an answer, and a resources/prompts-
+  // only upstream is a real shape; requiring length > 0 here meant that
+  // answer was never trusted, so pre-warm spawned such a server every
+  // session forever. A CURATED empty list in bundles.json is still treated
+  // as absent -- validation drops the field, so an empty one there is a
+  // config artifact rather than an observation.
   private hasKnownTools(server: UpstreamServerConfig): boolean {
     if (server.toolCache && server.toolCache.length > 0) return true;
-    const cached = this.toolCache.get(server.namespace);
-    return cached !== undefined && cached.length > 0;
+    return this.toolCache.get(server.namespace) !== undefined;
   }
 
   // How long a LEARNED tool list stays trusted before the next pre-warm
@@ -735,7 +769,11 @@ export class ConnectServer {
   // activation, so a server in actual use never looks stale.
   private isLearnedCacheStale(namespace: string): boolean {
     const cached = this.toolCache.get(namespace);
-    if (cached === undefined || cached.length === 0) return false;
+    // An empty learned list ages on the same weekly cadence as any other.
+    // Now that hasKnownTools trusts it, exempting it here would pin a
+    // zero-tool server as permanently known -- if the upstream later grew
+    // tools, nothing would ever re-spawn it to find out.
+    if (cached === undefined) return false;
     const learnedAt = this.toolCacheLearnedAt.get(namespace);
     if (learnedAt === undefined) return false;
     return Date.now() - learnedAt > ConnectServer.TOOLCACHE_REFRESH_MS;
@@ -749,7 +787,9 @@ export class ConnectServer {
   private hydrateToolCache(persisted: Record<string, PersistedToolCacheEntry>): void {
     let restored = 0;
     for (const [namespace, entry] of Object.entries(persisted)) {
-      if (entry.tools.length === 0) continue;
+      // Empty lists are restored too -- see hasKnownTools. The persistence
+      // layer has already dropped the corrupt-entry case, so anything that
+      // arrives empty here is a real zero-tool observation.
       this.toolCache.set(namespace, entry.tools);
       this.toolCacheLearnedAt.set(namespace, entry.learnedAt);
       restored++;
@@ -764,7 +804,8 @@ export class ConnectServer {
   private exportToolCache(): Record<string, PersistedToolCacheEntry> {
     const out: Record<string, PersistedToolCacheEntry> = {};
     for (const [namespace, tools] of this.toolCache) {
-      if (tools.length === 0) continue;
+      // Zero-length lists are exported, not skipped: that is the observation
+      // pre-warm needs next session (see hasKnownTools).
       // setJsonKey, not out[namespace]: sanitizeToolCache preserves a
       // "__proto__" namespace on LOAD (Object.fromEntries makes it an own
       // property) and hydrateToolCache copies it into the Map; plain
@@ -1101,6 +1142,15 @@ export class ConnectServer {
           try {
             const result = await this.activateOne(server.namespace, undefined, /* fromPrewarm */ true);
             if (!result.ok) {
+              // Release the claim activateOne(fromPrewarm) took. Prewarm owns
+              // nothing here -- the activation failed, so there is no
+              // connection to protect from a later explicit activate -- and a
+              // claim left behind outlives this pass: a second prewarm sweep
+              // (or any future reader of prewarmNamespaces) would read the
+              // namespace as "currently claimed by prewarm" for the rest of
+              // the session. Cheap now, and it stops the stale entry becoming
+              // load-bearing later.
+              this.prewarmNamespaces.delete(server.namespace);
               // A failed prewarm means the namespace gets no toolCache
               // entry and stays invisible in tools/list for the session --
               // the exact UX prewarm exists to prevent. Never silent.
@@ -1202,7 +1252,13 @@ export class ConnectServer {
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
     // sink the upstream that fed it.
-    opts?: { deferLearning?: boolean },
+    //
+    // deferIdleTracking is the same idea for the idle reaper: an exec step
+    // must not tick every OTHER namespace's idle counter, or a 10-step
+    // pipeline on A ages B by 10 calls and can evict B mid-pipeline (the
+    // step after next may be routed to it). handleExec ticks ONCE for the
+    // whole pipeline instead — see the trackUsageForNamespaces call there.
+    opts?: { deferLearning?: boolean; deferIdleTracking?: boolean },
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const progress = createProgressReporter(extra);
     if (name === META_TOOLS.discover.name) {
@@ -1505,7 +1561,19 @@ export class ConnectServer {
       // Error responses skip pruning entirely — the text IS the error
       // message, and stripping nulls or collapsing whitespace could
       // obscure it.
-      if (!result.isError && Array.isArray(result.content)) {
+      //
+      // A result carrying `structuredContent` skips pruning too. Per MCP
+      // 2025-06-18 a tool with an outputSchema returns BOTH the structured
+      // payload and a text fallback that is supposed to mirror it, and the
+      // proxy passes structuredContent through verbatim (types.ts). Pruning
+      // only the text side makes the two representations of one result
+      // disagree -- a required field whose value is null survives in
+      // structuredContent and vanishes from the text -- which is worse for a
+      // reader than the bytes the prune would have saved. The cast is because
+      // handleToolCall's local result type names only content/isError; the
+      // field rides along at runtime from the upstream body.
+      const hasStructuredContent = (result as { structuredContent?: unknown }).structuredContent !== undefined;
+      if (!result.isError && !hasStructuredContent && Array.isArray(result.content)) {
         try {
           const pr = pruneContent(result.content as Content[]);
           // Only swap in the pruned body when it's actually smaller,
@@ -1575,7 +1643,9 @@ export class ConnectServer {
       if (!result.isError) {
         this.packDetector.recordCall(route.namespace, route.originalName, Date.now());
       }
-      await this.trackUsageAndAutoDeactivate(route.namespace);
+      if (!opts?.deferIdleTracking) {
+        await this.trackUsageAndAutoDeactivate(route.namespace);
+      }
     }
 
     return result;
@@ -1731,11 +1801,36 @@ export class ConnectServer {
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
     // banner below must name the server twoStageRank picked, which is
     // not necessarily the head of the list the output renders.
-    return this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
+    const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
+    if (result.ok) return output;
+
+    // Auto-warm failed. Say WHY, in the same response: result.message carries
+    // the refusal (cap reached, compliance floor, profile, spawn error) and
+    // was previously dropped on the floor. formatHealthWarning only renders
+    // failures runActivateOne recorded in activationFailures, which a cap or
+    // policy refusal never reaches -- so without this line a refused
+    // auto-warm looks identical to a query that simply had no clear winner,
+    // and the model retries the same discover.
+    //
+    // Appended as its OWN content block over a COPY of the output (the same
+    // discipline attachGuideNudge documents): buildDiscoverOutput hands back
+    // the object it memoized in discoverCache, so mutating it would bake this
+    // one attempt's failure into every cache hit for the rest of the TTL.
+    return {
+      ...output,
+      content: [
+        ...output.content,
+        {
+          type: "text",
+          text: `Could not auto-load "${top.namespace}" (top match for your query): ${result.message}`,
+        },
+      ],
+    };
   }
 
   // Drop the memoized discover body. The cache key only covers
-  // (configVersion, context, warmedNamespace, connected set), so state that
+  // (configVersion, context, warmedNamespace, connected set, tool filters),
+  // so state that
   // discover RENDERS but the key does not see -- activation failures
   // (formatHealthWarning) and learning counters (usage:/reliability: lines)
   // -- has to invalidate explicitly. Without this the exact case the cache
@@ -1751,7 +1846,19 @@ export class ConnectServer {
       .map(([ns]) => ns)
       .sort()
       .join(",");
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}`;
+    // Tool filters are part of the RENDERED body -- they drive the per-server
+    // `loaded (N tools)` count, the `(filtered: K of N)` suffix, and the
+    // session tool total. Installing a filter on an ALREADY-connected server
+    // (activate with `tools`) changes none of the other key components, so
+    // without this signature a discover inside the 3s TTL replayed the
+    // unfiltered line and told the model tools were in context that tools/list
+    // no longer advertises. Sorted on both axes so an identical filter set
+    // always produces an identical key.
+    const filterSignature = [...this.toolFilters.entries()]
+      .map(([ns, names]) => `${ns}:${[...names].sort().join("+")}`)
+      .sort()
+      .join(";");
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}`;
   }
 
   private buildDiscoverOutput(
@@ -2037,7 +2144,12 @@ export class ConnectServer {
     // buildInstallCandidatesLines + install-nudge.ts.
     lines.push(...this.buildInstallCandidatesLines(activeServers));
 
-    const activeCount = this.connections.size;
+    // Count CONNECTED connections only, the same slot definition the
+    // concurrent-load cap uses (evaluateCapFor). An error-state entry
+    // contributes no tools to the model's context, so counting it here made
+    // the summary claim a server was "loaded in this session" that the cap
+    // treats as an empty slot -- two different answers to one question.
+    const activeCount = Array.from(this.connections.values()).filter((c) => c.status === "connected").length;
     // Count EXPOSED tools (post-filter) so the summary matches what
     // tools/list actually hands the client — hidden tools don't spend
     // context even though the upstream exposes them.
@@ -2853,6 +2965,11 @@ export class ConnectServer {
       if (miss) {
         this.learning.recordMiss(miss.loser);
         this.scheduleStateSave();
+        // recordMiss moves the loser's `usage:` / `reliability:` numbers,
+        // which discover renders and the cache key does not cover -- drop
+        // the memo so the next discover inside the TTL shows the penalty
+        // instead of the pre-miss text.
+        this.invalidateDiscoverCache();
       }
       this.redispatch.push(primary, intentTokens, now);
       // Privacy-safe, opt-in routing-eval harvest (the "environment foundry").
@@ -2975,20 +3092,33 @@ export class ConnectServer {
   }
 
   private async trackUsageAndAutoDeactivate(calledNamespace: string): Promise<void> {
-    // Record this call in the rolling history BEFORE computing per-ns
+    await this.trackUsageForNamespaces([calledNamespace]);
+  }
+
+  // Idle bookkeeping for one logical unit of work. A direct tool call names
+  // exactly one namespace; an exec pipeline names every namespace its steps
+  // touched and ticks the rest ONCE, so a long pipeline can't age (and evict)
+  // a server a later step still needs. Every namespace in `calledNamespaces`
+  // is treated as freshly used; everything else connected ages by one.
+  private async trackUsageForNamespaces(calledNamespaces: string[]): Promise<void> {
+    const called = new Set(calledNamespaces);
+    // Record the call(s) in the rolling history BEFORE computing per-ns
     // thresholds — so adaptive bonuses reflect the fact we just called
-    // this namespace (protects it from deactivation on a back-to-back
+    // these namespaces (protects them from deactivation on a back-to-back
     // burst where another ns happens to tick over the baseline).
-    pushToolCall(this.recentToolCalls, { namespace: calledNamespace, at: Date.now() }, HISTORY_LIMIT);
-    // Reset idle count for the server that was just called, and forget
-    // any previous "we already logged the patience message for you"
-    // marker — the next time it goes idle we want a fresh log.
-    this.idleCallCounts.set(calledNamespace, 0);
-    this.adaptiveSkipLogged.delete(calledNamespace);
+    const at = Date.now();
+    for (const ns of calledNamespaces) {
+      pushToolCall(this.recentToolCalls, { namespace: ns, at }, HISTORY_LIMIT);
+      // Reset idle count for the server that was just called, and forget
+      // any previous "we already logged the patience message for you"
+      // marker — the next time it goes idle we want a fresh log.
+      this.idleCallCounts.set(ns, 0);
+      this.adaptiveSkipLogged.delete(ns);
+    }
 
     // Increment idle count for all OTHER active servers
     for (const ns of this.connections.keys()) {
-      if (ns !== calledNamespace) {
+      if (!called.has(ns)) {
         this.idleCallCounts.set(ns, (this.idleCallCounts.get(ns) ?? 0) + 1);
       }
     }
@@ -3093,13 +3223,49 @@ export class ConnectServer {
       return { content: [{ type: "text", text: "`tool` is required (name of the tool to inspect)." }], isError: true };
     }
 
-    const serverConfig = this.config?.servers.find((s) => s.namespace === serverArg && s.isActive);
+    // Refuse once shutdown() has latched, for the same reason activateOne
+    // does: the transient connect below SPAWNS a child, and one spawned
+    // after the teardown snapshot is outside this.connections -- nothing
+    // reaps it, so it survives until index.ts force-exits the process.
+    // activateOne was the only caller checking the latch; read_tool spawns
+    // through connectToUpstream directly and slipped past it.
+    if (this.shuttingDown) {
+      return {
+        content: [{ type: "text", text: `"${serverArg}" was not inspected — yaw-mcp is shutting down.` }],
+        isError: true,
+      };
+    }
+
+    // Look up WITHOUT the isActive filter, then split "not installed" from
+    // "installed but disabled" exactly as runActivateOne does (fuzzy hint
+    // included). Filtering on isActive in the find collapsed both cases into
+    // "not in ~/.yaw-mcp/bundles.json", which is a lie for a server that IS
+    // in the file with "isActive": false -- and it pointed the model at
+    // installing something it already has instead of flipping the toggle.
+    const serverConfig = this.config?.servers.find((s) => s.namespace === serverArg);
     if (!serverConfig) {
+      const allNamespaces = this.config?.servers.map((s) => s.namespace) ?? [];
+      const suggestions = closestNames(serverArg, allNamespaces, 3);
+      const hint =
+        suggestions.length > 0
+          ? ` Did you mean: ${suggestions.join(", ")}?`
+          : " Call mcp_connect_discover to list available servers.";
       return {
         content: [
           {
             type: "text",
-            text: `"${serverArg}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover to list available servers.`,
+            text: `"${serverArg}" is not in ~/.yaw-mcp/bundles.json.${hint}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (!serverConfig.isActive) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `"${serverArg}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and restart this MCP client to inspect its tools.`,
           },
         ],
         isError: true,
@@ -3528,11 +3694,59 @@ export class ConnectServer {
     // stepKey -> namespace, built as steps run, so a failing step can
     // attribute cascading blame to the upstream steps it consumed via $ref.
     const stepNamespaces = new Map<string, string>();
+    // Every namespace this pipeline actually dispatched to. The steps run
+    // with deferIdleTracking, so the idle reaper is fed ONCE for the whole
+    // exec (below) instead of once per step -- otherwise a 10-step pipeline
+    // on A ages every other connected server by 10 calls and can evict one
+    // a later step in this same pipeline was about to use.
+    const touchedNamespaces = new Set<string>();
+    const settleIdleTracking = async (): Promise<void> => {
+      if (touchedNamespaces.size === 0) return;
+      const used = [...touchedNamespaces];
+      touchedNamespaces.clear();
+      await this.trackUsageForNamespaces(used);
+    };
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       const key = stepBindingKey(step, i);
       stepKeys.push(key);
+
+      // Meta-tools are callable by the client directly; routing them
+      // through exec would let a step, say, deactivate the server
+      // another step is about to use. Keep exec's surface narrowly
+      // proxy-only.
+      //
+      // Checked BEFORE $ref resolution: what makes this step illegal is the
+      // tool it names, not its arguments, so a meta-tool step carrying a bad
+      // $ref must report the meta-tool refusal rather than a ref error that
+      // sends the model off fixing arguments for a call exec will never make.
+      //
+      // Cast: META_TOOL_NAMES is a Set typed over the literal meta-tool
+      // names, but step.tool is a user-supplied string. The cast widens
+      // `.has()` to accept arbitrary strings without losing the runtime
+      // check.
+      if ((META_TOOL_NAMES as Set<string>).has(step.tool)) {
+        await settleIdleTracking();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: false,
+                  failedStep: key,
+                  error: `step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
+                  partial: bindings,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
 
       // Resolve $ref markers against the running bindings map BEFORE the
       // tool call goes out, so the upstream sees a concrete args object.
@@ -3544,6 +3758,7 @@ export class ConnectServer {
         // args is itself a $ref node — which is legal (a step can take
         // its full args from a prior step) but must still be an object.
         if (resolved === null || typeof resolved !== "object" || Array.isArray(resolved)) {
+          await settleIdleTracking();
           return {
             content: [
               {
@@ -3566,6 +3781,7 @@ export class ConnectServer {
         resolvedArgs = resolved as Record<string, unknown>;
       } catch (err) {
         const msg = err instanceof RefError ? err.message : err instanceof Error ? err.message : String(err);
+        await settleIdleTracking();
         return {
           content: [
             {
@@ -3575,35 +3791,6 @@ export class ConnectServer {
                   ok: false,
                   failedStep: key,
                   error: `step "${key}": ${msg}`,
-                  partial: bindings,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Meta-tools are callable by the client directly; routing them
-      // through exec would let a step, say, deactivate the server
-      // another step is about to use. Keep exec's surface narrowly
-      // proxy-only.
-      // Cast: META_TOOL_NAMES is a Set typed over the literal meta-tool
-      // names, but step.tool is a user-supplied string. The cast widens
-      // `.has()` to accept arbitrary strings without losing the runtime
-      // check.
-      if ((META_TOOL_NAMES as Set<string>).has(step.tool)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  ok: false,
-                  failedStep: key,
-                  error: `step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
                   partial: bindings,
                 },
                 null,
@@ -3634,8 +3821,14 @@ export class ConnectServer {
       // rather than reuse a map captured before the pipeline started.
       const routes = this.toolRoutes;
       const stepNs = routes.get(step.tool)?.namespace;
-      if (stepNs) stepNamespaces.set(key, stepNs);
-      const stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, { deferLearning: true });
+      if (stepNs) {
+        stepNamespaces.set(key, stepNs);
+        touchedNamespaces.add(stepNs);
+      }
+      const stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, {
+        deferLearning: true,
+        deferIdleTracking: true,
+      });
 
       if (stepResult.isError) {
         const errText = stepResult.content?.[0]?.text ?? "unknown error";
@@ -3672,7 +3865,14 @@ export class ConnectServer {
             this.learning.recordOutcome(stepNs, 0);
           }
           this.scheduleStateSave();
+          // Same reason the proxy path invalidates after its own
+          // recordOutcome: discover renders `usage:` / `reliability:` lines
+          // straight off these counters, and the discover cache key doesn't
+          // see them -- so without this a discover inside the 3s TTL replays
+          // the pre-failure numbers for the server that just failed.
+          this.invalidateDiscoverCache();
         }
+        await settleIdleTracking();
         return {
           content: [
             {
@@ -3699,12 +3899,19 @@ export class ConnectServer {
         // wasn't flagged isError.
         this.learning.recordOutcome(stepNs, computeOutcomeReward(stepResult));
         this.scheduleStateSave();
+        // The counters discover renders moved; drop the memo (see the
+        // failure branch above and the proxy path's own invalidation).
+        this.invalidateDiscoverCache();
       }
       bindings[key] = ConnectServer.parseStepPayload(stepResult);
     }
 
     const returnKey = explicitReturn ?? stepKeys[stepKeys.length - 1];
     const finalResult = bindings[returnKey];
+
+    // One idle tick for the whole pipeline, after the last step -- so the
+    // reaper can never unload a server between two steps of the same exec.
+    await settleIdleTracking();
 
     return {
       content: [
@@ -3788,9 +3995,19 @@ export class ConnectServer {
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));
     await Promise.allSettled(disconnects);
     this.connections.clear();
-    // Drop session-elicited credentials, as the field's contract promises.
-    // Plaintext values the user typed must not survive a shutdown into an
-    // embedded/test host that reuses the instance.
+    // Drop session-elicited credentials, as the field's contract promises:
+    // plaintext the user typed must not sit in this process's memory past the
+    // session it was typed for.
+    //
+    // This is hygiene, NOT a reset for reuse -- a ConnectServer is
+    // single-use. `shuttingDown` is latched above and nothing ever clears it
+    // (activateOne refuses from here on, permanently), and `this.server` is
+    // closed below. The other session-lifecycle fields (sessionActivated,
+    // toolFilters, idleCallCounts, toolCache) are deliberately left as they
+    // are: clearing them would advertise a second-session path that the
+    // permanent latch and the closed transport cannot actually deliver. An
+    // embedded or test host that wants another session constructs another
+    // ConnectServer.
     this.elicitedEnv.clear();
     this.inflightCalls.clear();
 

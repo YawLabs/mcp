@@ -26,11 +26,10 @@
 //   0  normal: file removed, nothing to remove, or persistence disabled
 //   1  I/O error: file existed but couldn't be removed (permissions, etc.)
 
-import { readFile, unlink } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { userConfigDir } from "./paths.js";
-import { isPersistenceDisabled, isReadableStateVersion, loadState, STATE_FILENAME } from "./persistence.js";
+import { isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -118,7 +117,11 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
     writeErr(`${s}\n`);
   };
 
-  const filePath = join(userConfigDir(home), STATE_FILENAME);
+  // statePath(), not a hand-rolled join: the canonical builder lives in
+  // persistence.ts next to the writer, and a second spelling here is a
+  // path this command could delete while a running broker kept saving to
+  // another.
+  const filePath = statePath(userConfigDir(home));
 
   // When persistence is disabled, the running yaw-mcp session isn't
   // reading or writing state.json anyway. A stale file on disk could
@@ -141,10 +144,12 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // Peek before deleting so we can report what was cleared. loadState
   // is tolerant — missing file, malformed JSON, and version mismatch
   // all collapse to emptyState (0/0), so its counts alone can't tell a
-  // genuinely-empty file from an unreadable one. We separately classify
-  // the file as "parsed cleanly" vs "present but unreadable" so the
-  // report doesn't claim "0 entries removed" when a non-trivial file was
-  // actually deleted.
+  // genuinely-empty file from an unreadable one. loadStateClassified
+  // returns that classification from the SAME read+parse, so the report
+  // doesn't claim "0 entries removed" when a non-trivial file was
+  // actually deleted -- and the classifier cannot drift from the loader
+  // the way a separate peek did (it hand-rolled its own JSON.parse and
+  // rejected the BOM loadState strips).
   //
   // This is a peek/delete TOCTOU by nature: the counts come from the
   // pre-delete read, so a concurrent serve-write between the peek and the
@@ -152,10 +157,15 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // is correct regardless, and reset-learning is a manual, one-shot admin
   // command, not something racing a live writer in practice. The counts
   // are advisory reporting, not a contract.
-  const persisted = await loadState(filePath);
+  const { state: persisted, parsedCleanly } = await loadStateClassified(filePath);
   const learningCount = Object.keys(persisted.learning).length;
   const packCount = persisted.packHistory.length;
-  const parsedCleanly = await peekParsedCleanly(filePath);
+  // The v2 file's third section. Deleting it silently was the report
+  // claiming to account for the file while omitting a whole category:
+  // every namespace whose learned tool list is dropped costs one extra
+  // upstream handshake on the next session, which is exactly the kind of
+  // consequence someone running a reset wants to see up front.
+  const toolCacheCount = Object.keys(persisted.toolCache).length;
 
   try {
     await unlink(filePath);
@@ -185,42 +195,9 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   print(`  path: ${filePath}`);
   print(`  learning entries removed:     ${learningCount}`);
   print(`  pack history entries removed: ${packCount}`);
+  print(`  tool caches removed:          ${toolCacheCount}`);
   for (const line of RUNNING_SERVE_NOTE) print(line);
   return { exitCode: 0, lines, removed: true, path: filePath };
-}
-
-// Did the state file parse into a current-version state object? This
-// mirrors loadState's own accept conditions (valid JSON, an object, the
-// expected schema version) so a `true` here means the learning/pack
-// counts loadState returned are real, and a `false` means loadState fell
-// through to emptyState because the file was malformed or version-stale.
-// A missing file (ENOENT) returns true — its absence is reported via the
-// unlink ENOENT path, never the "unreadable" branch.
-async function peekParsedCleanly(filePath: string): Promise<boolean> {
-  let raw: string;
-  try {
-    raw = await readFile(filePath, "utf8");
-  } catch (err) {
-    if (isFileNotFound(err)) return true;
-    // Couldn't read for another reason (permissions, etc.) — treat as
-    // unreadable so we don't claim a concrete entry count we never got.
-    return false;
-  }
-  try {
-    // Same BOM strip loadState applies (persistence.ts): a Notepad-saved,
-    // BOM-prefixed state.json loads fine there, so this peek must not
-    // report it as "contents unreadable" and discard the real counts.
-    const parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-    if (!parsed || typeof parsed !== "object") return false;
-    // Any version loadState can READ counts as parsed-cleanly, not just the
-    // current one. STATE_SCHEMA_VERSION went 1 -> 2 for the additive
-    // toolCache field and loadState MIGRATES v1 rather than dropping it, so
-    // an exact-equality check here would report a perfectly good v1 file as
-    // unreadable for the one session before its first save rewrites it.
-    return isReadableStateVersion((parsed as { version?: unknown }).version);
-  } catch {
-    return false;
-  }
 }
 
 function isFileNotFound(err: unknown): boolean {

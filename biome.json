@@ -31,10 +31,6 @@
     "lineWidth": 120
   },
   "files": {
-    "includes": [
-      "**",
-      "!**/dist/",
-      "!**/node_modules/"
-    ]
+    "includes": ["src/**", "!src/tests/fixtures/*.json"]
   }
 }

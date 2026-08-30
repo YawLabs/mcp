@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   collectRefDeps,
+  ExecDepthError,
   isRefNode,
   MAX_EXEC_STEPS,
+  MAX_REF_DEPTH,
   parseRefPath,
   RefError,
   resolveArgs,
@@ -431,6 +433,55 @@ describe("exec-engine: collectRefDeps", () => {
     // isRefNode requires $ref to be the ONLY key; with extras it is a plain
     // object and contributes no dep (and its nested $ref string is just a value).
     expect(collectRefDeps({ $ref: "a.b", default: 0 })).toEqual([]);
+  });
+});
+
+describe("exec-engine: args depth cap", () => {
+  // Build `{a: {a: ... {leaf}}}` nested `levels` deep. Client args arrive as
+  // JSON, and JSON.parse accepts nesting far past what the walkers can
+  // recurse over -- so the cap has to fail loudly before the stack does.
+  const nest = (levels: number, leaf: unknown): unknown => {
+    let node: unknown = leaf;
+    for (let i = 0; i < levels; i++) node = { a: node };
+    return node;
+  };
+
+  it("resolves a tree right at the depth cap", () => {
+    // MAX_REF_DEPTH counts containers entered, so MAX_REF_DEPTH wrappers put
+    // the leaf exactly at the limit and must still resolve.
+    const args = nest(MAX_REF_DEPTH, { $ref: "s.value" }) as Record<string, unknown>;
+    const out = resolveArgs(args, { s: { value: "ok" } });
+    let cursor: unknown = out;
+    for (let i = 0; i < MAX_REF_DEPTH; i++) cursor = (cursor as Record<string, unknown>).a;
+    expect(cursor).toBe("ok");
+  });
+
+  it("throws ExecDepthError past the cap instead of overflowing the stack", () => {
+    const args = nest(MAX_REF_DEPTH + 1, { $ref: "s.value" }) as Record<string, unknown>;
+    expect(() => resolveArgs(args, { s: { value: "ok" } })).toThrow(ExecDepthError);
+    // The message names the limit so the exec failure report is actionable.
+    expect(() => resolveArgs(args, { s: { value: "ok" } })).toThrow(String(MAX_REF_DEPTH));
+  });
+
+  it("fails on depth even when the deep tree contains no refs at all", () => {
+    // The stack hazard is the WALK, not ref resolution -- a ref-free blob is
+    // just as deep.
+    expect(() => resolveArgs(nest(5000, "leaf"), {})).toThrow(ExecDepthError);
+  });
+
+  it("stops collectRefDeps at the cap without throwing", () => {
+    // collectRefDeps runs inside exec's failure-reporting path, where an
+    // exception would replace the structured failure report. It bounds the
+    // same walk by refusing to descend -- and only ever sees trees resolveArgs
+    // already accepted, so nothing real is lost.
+    const shallow = { near: { $ref: "producer.value" } };
+    const deep = { far: nest(MAX_REF_DEPTH + 5, { $ref: "buried.value" }) };
+    expect(collectRefDeps(shallow)).toEqual(["producer"]);
+    let deps: string[] = [];
+    expect(() => {
+      deps = collectRefDeps(deep);
+    }).not.toThrow();
+    expect(deps).toEqual([]);
   });
 });
 

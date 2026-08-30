@@ -245,6 +245,27 @@ describe("LearningStore", () => {
     });
   });
 
+  describe("get", () => {
+    // Regression: get() handed back the LIVE NamespaceUsage object, so a
+    // caller could write straight past the clamps every recorder maintains
+    // (and, via exportSnapshot, put the out-of-range shape on disk).
+    // entries() and exportSnapshot() already copied; this reader did not.
+    it("returns a copy, so mutating the result cannot bypass the recorder clamps", () => {
+      const store = new LearningStore();
+      store.recordOutcome("gh", 1.0); // dispatched 1, succeeded 1
+      const u = store.get("gh") as { dispatched: number; succeeded: number; lastUsedAt: number };
+      u.dispatched = 999;
+      u.succeeded = -50;
+      const fresh = store.get("gh");
+      expect(fresh?.dispatched).toBe(1);
+      expect(fresh?.succeeded).toBe(1);
+      // The store's own derived signal is unmoved too -- a succeeded of -50
+      // over 999 dispatches would have fired the penalty branch.
+      expect(store.boostFactor("gh")).toBe(1.0);
+      expect(store.exportSnapshot().gh).toEqual({ dispatched: 1, succeeded: 1, lastUsedAt: expect.any(Number) });
+    });
+  });
+
   describe("recordMiss", () => {
     it("increments dispatched without incrementing succeeded", () => {
       const store = new LearningStore();

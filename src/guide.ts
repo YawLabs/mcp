@@ -25,7 +25,7 @@
 // `yaw-mcp doctor`. Readers of the guide should treat its text as untrusted
 // input either way — it is prose, not instructions yaw-mcp acts on.
 
-import { readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { formatShadowLine, resolveShadowedClis } from "./cli-shadows.js";
 import { probeProjectTrust } from "./local-bundles.js";
 import { log } from "./logger.js";
@@ -54,17 +54,50 @@ export interface LoadedGuides {
 
 const GUIDE_READ_TIMEOUT_MS = 1000;
 
+/** Hard cap on the bytes served from a YAW-MCP.md. The guide is prose a human
+ *  wrote for the model, and its whole content lands in the model's context
+ *  through `yaw-mcp://guide` -- so a wrong file at this path (a vendored
+ *  dataset, a log, a binary someone renamed) is both a memory cost here and a
+ *  context cost there. 256 KB is far above any real guide and far below the
+ *  sizes that hurt. Oversized files are warned about and TRUNCATED rather than
+ *  dropped: the first 256 KB of a real guide is still useful guidance. */
+const MAX_GUIDE_BYTES = 256 * 1024;
+
+/** Read at most MAX_GUIDE_BYTES + 1 bytes of `path`. The extra byte is the
+ *  oversize probe: reading exactly one past the cap is what tells us the file
+ *  was longer without reading the rest of it. */
+async function readCapped(path: string, signal: AbortSignal): Promise<{ text: string; truncated: boolean }> {
+  // `end` is INCLUSIVE, so this reads bytes [0, MAX_GUIDE_BYTES] = cap + 1.
+  const stream = createReadStream(path, { start: 0, end: MAX_GUIDE_BYTES, signal });
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    const buf = chunk as Buffer;
+    chunks.push(buf);
+    total += buf.length;
+  }
+  // Decode only the capped prefix. A truncation can land mid-codepoint; the
+  // trailing replacement char is noise in prose we are already cutting short.
+  return {
+    text: Buffer.concat(chunks, total).subarray(0, MAX_GUIDE_BYTES).toString("utf8"),
+    truncated: total > MAX_GUIDE_BYTES,
+  };
+}
+
 async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | null> {
-  let raw: string;
+  let read: { text: string; truncated: boolean };
   // A stuck NFS mount or a large accidental binary at this path should
   // never hang the yaw-mcp://guide resource — the client is usually the
-  // model, waiting on a prompt. Use AbortController so the readFile fd
+  // model, waiting on a prompt. Use AbortController so the read fd
   // is not leaked when the timeout fires (unlike Promise.race which
-  // leaves the readFile promise — and its fd — alive in the background).
+  // leaves the read promise — and its fd — alive in the background).
+  // The stream carries the same errno codes readFile did (ENOENT, ENOTDIR,
+  // EISDIR, EACCES) and ABORT_ERR on the timeout, so the branches below are
+  // unchanged by the switch away from readFile.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new Error("guide read timeout")), GUIDE_READ_TIMEOUT_MS);
   try {
-    raw = await readFile(path, { encoding: "utf8", signal: ac.signal });
+    read = await readCapped(path, ac.signal);
   } catch (err) {
     // Missing file is the common case and stays silent (ENOENT, and ENOTDIR
     // for a path component that is a regular file -- both mean "no guide").
@@ -86,7 +119,13 @@ async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | n
   } finally {
     clearTimeout(timer);
   }
-  const content = raw.trim();
+  if (read.truncated) {
+    log("warn", "Guide is larger than the size cap; serving the leading portion only", {
+      path,
+      maxBytes: MAX_GUIDE_BYTES,
+    });
+  }
+  const content = read.text.trim();
   if (content.length === 0) {
     // Empty file treated as "no guide" — caller decides whether to
     // surface this (e.g. yaw-mcp doctor notes it; proxy skips it).

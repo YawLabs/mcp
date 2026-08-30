@@ -7,9 +7,18 @@
 // scores over weighted fields. The corpus is tiny (<100s of servers per
 // account), so the O(N*M) prep cost is negligible.
 //
-// We deliberately skip stemming / synonyms / embeddings here — BM25 with
-// good field weights captures the 80% case, and a semantic Stage 2 (on
-// the server side) will handle semantic matches when it lands.
+// We deliberately skip stemming / synonyms / embeddings here -- BM25 with
+// good field weights captures the 80% case. This used to promise "a semantic
+// Stage 2 (on the server side) will handle semantic matches when it lands";
+// the hosted backend that Stage 2 would have run on is retired, so there is
+// no second stage to land and this file is the whole ranker. (server.ts's
+// twoStageRank keeps a name left over from that plan -- it calls rankServers
+// once and slices the top K; the optional LLM tiebreak that follows in
+// dispatch is a disambiguator over those candidates, not a ranking stage.)
+// If semantic matching is ever wanted it has to be built here, locally, not
+// waited for.
+
+import { createHash } from "node:crypto";
 
 export interface RankableTool {
   name: string;
@@ -98,10 +107,10 @@ function tokenizeIdent(text: string | undefined): string[] {
 // under toolName (weight 2.0), and a function word inside a corpus of
 // identifiers is RARE, so its IDF is high rather than low. The result was
 // invented relevance: "convert the spreadsheet to a chart" scored a Postgres
-// server ~1.5 on `to` alone, which clears dispatch (no score floor,
-// server.ts:2384) and discover's auto-warm gate (1.0 with no runner-up,
-// server.ts:1372), so an unrelated intent spawned Postgres and was told
-// "loaded top 1 of 1 matching servers".
+// server ~1.5 on `to` alone, which clears dispatch (no score floor, in
+// ConnectServer.handleDispatch) and discover's auto-warm gate (1.0 with no
+// runner-up, in ConnectServer.handleDiscoverWithAutoWarm), so an unrelated
+// intent spawned Postgres and was told "loaded top 1 of 1 matching servers".
 //
 // So: keep the 1-char floor on the document side and on the query, and
 // subtract exactly the words that are never content terms. Entries are all
@@ -226,7 +235,16 @@ function bm25Score(
     seen.add(term);
 
     const termIdf = idfValues.get(term);
-    if (termIdf === undefined || termIdf <= 0) continue; // term missing or appears in every doc
+    // `undefined` is the live case: the term appears in no document, so it
+    // has no IDF entry. The `<= 0` arm is DEFENSIVE ONLY and unreachable
+    // under the formula this file uses: buildIndex computes
+    // log((N - d + 0.5) / (d + 0.5) + 1), whose argument exceeds 1 for every
+    // d in [1, N], so a term present in every document still scores a small
+    // positive IDF rather than zero or negative. It is kept for the
+    // un-shifted textbook BM25 IDF -- log((N - d + 0.5) / (d + 0.5)), which
+    // DOES go negative once a term is in more than about half the corpus --
+    // so swapping the formula back cannot silently start subtracting score.
+    if (termIdf === undefined || termIdf <= 0) continue;
 
     for (const [fieldName, weight] of Object.entries(FIELD_WEIGHTS) as Array<[keyof DocFields, number]>) {
       const field = fields[fieldName];
@@ -259,16 +277,37 @@ function bm25Score(
 // content key makes stale results impossible by construction -- if any
 // name, description, or tool text changes, the key changes with it.
 // Building the key costs ~3% of what tokenizing the same text costs.
+//
+// The key is a DIGEST of that content, not the content itself. Keyed on the
+// raw signature, a 512-entry doc cache pins 512 copies of every tool name and
+// description its servers ever published (multi-KB apiece for a large
+// upstream) plus four whole-corpus keys that each concatenate the entire
+// corpus -- resident for the life of the process, purely as Map keys nothing
+// ever reads back. Hashing keeps every correctness property (same content ->
+// same key, any edit -> a different key) and drops the retained text to a
+// fixed 43 bytes per entry.
 
-/** Per-server DocFields, keyed by that server's content signature. Sized to
- *  outlive a corpus edit: when one server activates, the other N-1 keys are
- *  unchanged and their fields are reused. */
+/** Content digest used for both cache keys. sha256 rather than a cheap
+ *  32-bit hash because a collision here does not degrade a lookup, it serves
+ *  one corpus another corpus's index: wrong N, wrong IDF, and a ranked
+ *  namespace the caller never passed in. At 512 doc entries a 32-bit FNV
+ *  carries a ~3e-5 birthday chance of exactly that; sha256 puts it below any
+ *  rate worth reasoning about, and hashing a few KB costs microseconds
+ *  against the tokenization this cache exists to skip. base64url keeps the
+ *  key to 43 chars with no padding. */
+function digest(text: string): string {
+  return createHash("sha256").update(text).digest("base64url");
+}
+
+/** Per-server DocFields, keyed by the digest of that server's content
+ *  signature. Sized to outlive a corpus edit: when one server activates, the
+ *  other N-1 keys are unchanged and their fields are reused. */
 const MAX_CACHED_DOCS = 512;
 const docCache = new Map<string, DocFields>();
 
-/** Whole-corpus index, keyed by the joined per-server signatures. A handful
- *  of entries covers the alternation between discover's corpus (all profiled
- *  servers) and dispatch's (a caller-supplied subset). */
+/** Whole-corpus index, keyed by the digest of the joined per-server digests.
+ *  A handful of entries covers the alternation between discover's corpus (all
+ *  profiled servers) and dispatch's (a caller-supplied subset). */
 const MAX_CACHED_INDEXES = 4;
 const indexCache = new Map<string, RankingIndex>();
 
@@ -294,6 +333,26 @@ export function resetRelevanceCache(): void {
 /** Test hook: how many times an index / document has actually been built. */
 export function relevanceCacheStats(): { indexBuilds: number; docBuilds: number } {
   return { indexBuilds, docBuilds };
+}
+
+/** Test hook: total bytes of KEY text currently resident in each cache, plus
+ *  the longest single key. Exists so the "keys are digests, not corpus text"
+ *  property is pinned by a test rather than by a comment -- keyed on the raw
+ *  signature these numbers grow with the corpus, which is the leak the digest
+ *  fixes. */
+export function relevanceCacheKeyBytes(): { docKeyBytes: number; indexKeyBytes: number; longestKey: number } {
+  let docKeyBytes = 0;
+  let indexKeyBytes = 0;
+  let longestKey = 0;
+  for (const key of docCache.keys()) {
+    docKeyBytes += key.length;
+    longestKey = Math.max(longestKey, key.length);
+  }
+  for (const key of indexCache.keys()) {
+    indexKeyBytes += key.length;
+    longestKey = Math.max(longestKey, key.length);
+  }
+  return { docKeyBytes, indexKeyBytes, longestKey };
 }
 
 /** Insert into a bounded, LRU-ordered cache, evicting the least recently used
@@ -348,34 +407,35 @@ function serverSignature(server: RankableServer): string {
   return sig;
 }
 
-/** Whole-corpus key. The per-server signature lengths go in front so the
- *  concatenation that follows parses unambiguously without a third separator
- *  level -- there are only as many numbers here as there are servers, so this
- *  costs nothing next to the corpus text itself. Without the lengths a single
- *  server whose text embeds the join separator signs identically to a
- *  two-server corpus, and a 1-doc corpus gets served a 2-doc index: wrong N,
- *  wrong IDF, and a ranked namespace the caller never passed in. */
-function indexKeyFor(signatures: string[]): string {
-  let lens = "";
-  for (const sig of signatures) lens += `${sig.length},`;
-  return `${lens}|${signatures.join("")}`;
+/** Whole-corpus key: the digest of the per-server digests, joined. The old
+ *  scheme prefixed the raw signature LENGTHS so the concatenation that
+ *  followed parsed unambiguously; fixed-width digests make that unnecessary
+ *  by construction -- every element is exactly as long as every other, so no
+ *  two different corpora can produce the same join. (The hazard the lengths
+ *  guarded against is real and unchanged: a single server whose text embeds
+ *  the join separator must not sign identically to a two-server corpus, or a
+ *  1-doc corpus gets served a 2-doc index -- wrong N, wrong IDF, and a ranked
+ *  namespace the caller never passed in.) Hashing the join keeps the resident
+ *  key at 43 bytes instead of 43*N. */
+function indexKeyFor(docKeys: string[]): string {
+  return digest(docKeys.join(""));
 }
 
-function docFieldsFor(signature: string, server: RankableServer): DocFields {
-  const cached = docCache.get(signature);
+function docFieldsFor(docKey: string, server: RankableServer): DocFields {
+  const cached = docCache.get(docKey);
   if (cached) {
-    touch(docCache, signature, cached);
+    touch(docCache, docKey, cached);
     return cached;
   }
   docBuilds++;
   const fields = buildDocFields(server);
-  putBounded(docCache, signature, fields, MAX_CACHED_DOCS);
+  putBounded(docCache, docKey, fields, MAX_CACHED_DOCS);
   return fields;
 }
 
-function buildIndex(servers: RankableServer[], signatures: string[]): RankingIndex {
+function buildIndex(servers: RankableServer[], docKeys: string[]): RankingIndex {
   indexBuilds++;
-  const docs = servers.map((s, i) => ({ namespace: s.namespace, fields: docFieldsFor(signatures[i], s) }));
+  const docs = servers.map((s, i) => ({ namespace: s.namespace, fields: docFieldsFor(docKeys[i], s) }));
   const N = docs.length;
 
   // Document frequency — how many servers contain the term in ANY field.
@@ -461,11 +521,14 @@ export function rankServers(context: string, servers: RankableServer[]): RankedR
   const queryTerms = tokenizeQuery(context);
   if (queryTerms.length === 0 || servers.length === 0) return [];
 
-  const signatures = servers.map(serverSignature);
-  const indexKey = indexKeyFor(signatures);
+  // The raw signatures are transient -- only their digests are held, and only
+  // as Map keys -- so a corpus of large upstreams does not park its whole text
+  // in the cache for the life of the process.
+  const docKeys = servers.map((s) => digest(serverSignature(s)));
+  const indexKey = indexKeyFor(docKeys);
   let index = indexCache.get(indexKey);
   if (index === undefined) {
-    index = buildIndex(servers, signatures);
+    index = buildIndex(servers, docKeys);
     putBounded(indexCache, indexKey, index, MAX_CACHED_INDEXES);
   } else {
     touch(indexCache, indexKey, index);

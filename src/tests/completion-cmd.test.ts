@@ -382,6 +382,28 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     expect(missing).toEqual([]);
   });
 
+  it("keeps the compliance entry in sync with the flags that drive its exit code", () => {
+    // --strict and --min-grade are forwarded verbatim to the mcp-compliance
+    // child, and their ONLY effect is turning a failing grade into a non-zero
+    // exit -- they are the whole reason to script this subcommand. Completing
+    // --help alone meant `yaw-mcp compliance --<TAB>` hid the CI gate.
+    const compliance = SUBCOMMAND_SPEC.find((s) => s.name === "compliance");
+    expect(compliance).toBeDefined();
+    expect(compliance?.flags).toEqual(expect.arrayContaining(["--strict", "--min-grade", "--help"]));
+  });
+
+  it("surfaces the compliance flags in every generated script", () => {
+    // The spec is only useful if the generators pick it up -- assert through
+    // the rendered output, not just the table.
+    for (const shell of ["bash", "zsh", "fish", "powershell"] as const) {
+      const s = renderScript(shell);
+      // fish spells a long flag as `-l min-grade` (leading dashes stripped),
+      // so match the flag NAME rather than the dashed form.
+      expect(s).toContain("min-grade");
+      expect(s).toContain("strict");
+    }
+  });
+
   it("keeps the remove entry in sync with parseRemoveArgs (--force / --yes completable)", () => {
     const remove = SUBCOMMAND_SPEC.find((s) => s.name === "remove");
     expect(remove).toBeDefined();
@@ -405,6 +427,30 @@ describe("runCompletion", () => {
     const r = await runCompletion({ out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(2);
     expect(io.err.join("")).toContain("missing shell argument");
+  });
+
+  it("writes the script byte-for-byte, without appending a second newline", async () => {
+    // Every renderScript branch already terminates its last line, so routing
+    // the script through a println-style helper appended a second newline and
+    // the generated script ended with a blank line. Harmless when eval'd, but
+    // `yaw-mcp completion bash >> ~/.bashrc` accumulates one blank line per
+    // regeneration and a byte-comparison against a checked-in copy never
+    // matches.
+    for (const shell of ["bash", "zsh", "fish", "powershell"] as const) {
+      const io = capture();
+      const r = await runCompletion({ shell, out: io.push, err: io.pushErr });
+      const script = renderScript(shell);
+      expect(r.exitCode).toBe(0);
+      // Precondition: the script really does end in exactly one newline, so
+      // the assertion below is about the writer and not about renderScript.
+      expect(script.endsWith("\n")).toBe(true);
+      expect(script.endsWith("\n\n")).toBe(false);
+      expect(io.out.join("")).toBe(script);
+      expect(io.out.join("").endsWith("\n\n")).toBe(false);
+      // The transcript keeps the un-suffixed script for callers that assert
+      // on `lines` rather than on the sink.
+      expect(r.lines).toEqual([script]);
+    }
   });
 
   it("writes distinct scripts for each shell", async () => {

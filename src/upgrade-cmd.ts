@@ -20,7 +20,10 @@
 // Exit codes:
 //   0  already on the latest version, there is nothing to run (npx /
 //      bundled-app), OR the registry was unreachable (see OFFLINE below)
-//   1  upgrade available but --run was not passed (human-interactive mode)
+//   1  upgrade available but nothing was installed -- either --run was not
+//      passed (human-interactive mode), or --json was, which is a report-only
+//      snapshot that never spawns. `--json --run` on a stale install is
+//      therefore still 1: the flag combination reports, it does not upgrade.
 //   2  usage error (unknown flag), OR --run on an install method that
 //      can't be auto-upgraded (binary / dev-checkout / unknown)
 //   3  --run attempted the upgrade and the child process failed
@@ -171,8 +174,8 @@ export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
   --json    Emit a machine-readable snapshot ({ current, latest, stale,
             method, command }) instead of prose.
             NOTE: --json is a report-only snapshot; it never spawns an upgrade
-            even when combined with --run. Use --run without --json to
-            actually perform the upgrade.`;
+            even when combined with --run, and exits 1 whenever "stale" is
+            true. Use --run without --json to actually perform the upgrade.`;
 
 export function parseUpgradeArgs(
   argv: string[],
@@ -274,6 +277,51 @@ export function localInstallRoot(argvPath: string | undefined): string | null {
  *  no VITEST guard, so a hung `npm prefix -g` left an unresolved promise and a
  *  live child handle for the broker's lifetime. One helper, one timeout, one
  *  test short-circuit. */
+/** Minimal shape of the child npmGlobalPrefix's timeout has to tear down. */
+interface KillableChild {
+  pid?: number;
+  kill: () => boolean;
+}
+
+/** Spawn shape used only for the taskkill escape hatch below. */
+type TreeKillSpawn = (
+  cmd: string,
+  args: string[],
+  opts: { stdio: "ignore" },
+) => { on(event: string, listener: (...args: any[]) => void): unknown };
+
+/** Kill a probe child and, on win32, everything it spawned.
+ *
+ *  The probe spawns with `shell: true` on win32 because npm is npm.cmd and
+ *  Node refuses to spawn a .cmd without a shell. A bare `child.kill()` then
+ *  signals only the cmd.exe WRAPPER -- the npm -> node grandchild doing the
+ *  actual work survives it and can outlive the CLI process that started the
+ *  probe. `taskkill /T` walks the tree from the wrapper's pid instead.
+ *
+ *  Best-effort by design: taskkill is fired and forgotten (an error there is
+ *  not actionable from here, and swallowing it is why the `on("error")` sink
+ *  exists -- an unhandled 'error' event would take the process down), and
+ *  child.kill() still runs afterwards so the probe's close/error handler
+ *  resolves either way.
+ *
+ *  Exported for tests: npmGlobalPrefix short-circuits under VITEST, so this is
+ *  the only reachable surface for the timeout path. */
+export function killProcessTree(
+  child: KillableChild,
+  platform: NodeJS.Platform = process.platform,
+  spawnImpl: TreeKillSpawn = spawn as unknown as TreeKillSpawn,
+): void {
+  if (platform === "win32" && child.pid !== undefined) {
+    try {
+      // /T walks the process tree, /F forces termination of each node.
+      spawnImpl("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {});
+    } catch {
+      // taskkill missing or unspawnable -- fall through to the plain kill.
+    }
+  }
+  child.kill();
+}
+
 export async function npmGlobalPrefix(): Promise<string | null> {
   // Auto-skip under vitest (mirrors doctor-cmd's registry probe) so unit
   // tests never spawn a real npm; tests exercising refinement inject
@@ -286,7 +334,9 @@ export async function npmGlobalPrefix(): Promise<string | null> {
     });
     let out = "";
     const timer = setTimeout(() => {
-      child.kill();
+      // Tree kill, not child.kill(): see killProcessTree -- the shell:true
+      // spawn means the pid we hold is cmd.exe, not npm.
+      killProcessTree(child);
       resolve(null);
     }, 3000);
     child.stdout?.on("data", (d) => {
@@ -306,8 +356,15 @@ export async function npmGlobalPrefix(): Promise<string | null> {
 /** Resolve symlinks/junctions and normalize a path for comparison.
  *  realpath matters on Windows tool managers (scoop's `current` is a
  *  junction into a versioned dir) where the literal argv path and the
- *  npm prefix point at the same files through different names. */
-function comparablePath(p: string): string {
+ *  npm prefix point at the same files through different names.
+ *
+ *  Exported because auto-upgrade's multi-prefix warning compares the SAME two
+ *  values (running-install prefix vs `npm prefix -g`) and kept its own
+ *  trim+lowercase comparator, which sees a junction and its target as two
+ *  different prefixes -- so every stale startup under scoop's `current`
+ *  junction printed a "your prefixes differ" warning about a setup the user
+ *  does not have. One comparator, one answer. */
+export function comparablePath(p: string): string {
   let real = p;
   try {
     real = realpathSync(p);
@@ -662,7 +719,13 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     // humans both act on it, and a bare `-g` would promise a different
     // install than `--run` performs (see the pinning note above).
     print(JSON.stringify({ ...plan, command: suggestedCommand }, null, 2));
-    return { exitCode: plan.stale && !opts.run ? 1 : 0, lines };
+    // --json is a REPORT-ONLY snapshot: it never spawns, even with --run. The
+    // exit code therefore keys on staleness alone. It used to key on
+    // `plan.stale && !opts.run`, which made `--json --run` on a stale install
+    // exit 0 having installed nothing -- so a script that added --json purely
+    // to parse the output lost BOTH the upgrade and the non-zero signal that
+    // one was needed. Stale is stale regardless of --run.
+    return { exitCode: plan.stale ? 1 : 0, lines };
   }
 
   // Offline or registry unreachable — still useful to print the method +
@@ -737,7 +800,14 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
         ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
         : method === "bun-global"
           ? { cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"] }
-          : method === "local-node-modules" && installRoot !== null
+          : // The `installRoot !== null` arm is defensive-dead, kept only so a
+            // future localInstallRoot change cannot produce `cwd: undefined`
+            // and silently install into the process cwd: localInstallRoot
+            // returns null exactly when `/node_modules/` sits at index 0, i.e.
+            // a node_modules directory at the filesystem root, which no real
+            // classification produces (detectInstallMethod only labels a path
+            // local-node-modules when there is a tree above it).
+            method === "local-node-modules" && installRoot !== null
             ? { cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: installRoot }
             : null;
   // Print the line we actually spawn, in its paste-safe display form: once

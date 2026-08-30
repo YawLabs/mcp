@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { atomicWriteFile } from "../atomic-write.js";
 import { buildLaunchEntry, ENTRY_NAME } from "../install-targets.js";
 import {
-  ANON_ID_PLACEHOLDER,
   type ExploreServerResponse,
   formatTtl,
   gcExpiredTrials,
@@ -17,7 +16,6 @@ import {
   runTryCleanup,
   scanTrials,
   type TrialMarker,
-  type TryEventBody,
   trialMarkerPath,
   trialsDir,
 } from "../try-cmd.js";
@@ -203,6 +201,15 @@ describe("formatTtl", () => {
     expect(formatTtl(7_200_000)).toBe("2h");
     expect(formatTtl(2 * 86_400_000)).toBe("2d");
   });
+
+  it("floors rather than rounds so the nudge never overstates the time left", () => {
+    // Rounding printed 90m as "2h" and 36h as "2d" -- half an hour and half a
+    // day the user did not have, on a line that reads as a precise expiry.
+    expect(formatTtl(90 * 60_000)).toBe("1h");
+    expect(formatTtl(36 * 3_600_000)).toBe("1d");
+    expect(formatTtl(5_700)).toBe("5s");
+    expect(formatTtl(59_999)).toBe("59s");
+  });
 });
 
 describe("anon-id retirement", () => {
@@ -214,7 +221,6 @@ describe("anon-id retirement", () => {
     writeFileSync(legacyAnonPath(synthHome), "deadbeefdeadbeef\n");
 
     const cap = captureIO();
-    const events: TryEventBody[] = [];
     const r = await runTry({
       slug: "demo",
       clientId: "claude-code",
@@ -225,23 +231,20 @@ describe("anon-id retirement", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async (_url, body) => {
-        events.push(body);
-      },
     });
     expect(r.exitCode).toBe(0);
-    // Untouched on disk...
+    // Untouched on disk, byte for byte...
     expect(readFileSync(legacyAnonPath(synthHome), "utf8")).toBe("deadbeefdeadbeef\n");
-    // ...and never fed into the event body.
-    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
-    expect(events[0].anonId).not.toContain("deadbeef");
+    // ...and absent from everything the run emitted. There is no event body
+    // to leak it into any more -- the reporting seam is gone outright -- so
+    // the command's own output is the surface left worth checking.
+    expect(cap.text()).not.toContain("deadbeef");
   });
 });
 
 describe("runTry — happy path", () => {
   it("writes the trial entry + marker, fires the lifecycle event, prints the 3-line nudge", async () => {
     const cap = captureIO();
-    const events: TryEventBody[] = [];
     const r = await runTry({
       slug: "demo",
       clientId: "claude-code",
@@ -254,9 +257,6 @@ describe("runTry — happy path", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async (_url, body) => {
-        events.push(body);
-      },
     });
     expect(r.exitCode).toBe(0);
 
@@ -283,13 +283,6 @@ describe("runTry — happy path", () => {
     // No machine fingerprint persisted -- the .anon file is never created.
     expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
 
-    // Lifecycle event fired through the seam, carrying the fixed placeholder
-    // rather than a per-machine id.
-    expect(events).toHaveLength(1);
-    expect(events[0].slug).toBe("demo");
-    expect(events[0].action).toBe("try");
-    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
-
     // 3-line nudge. The keep-it CTA points at the local `add` path -- the
     // hosted signup page it used to advertise is gone (404s).
     const text = cap.text();
@@ -314,7 +307,6 @@ describe("runTry — happy path", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
 
@@ -351,7 +343,6 @@ describe("runTry — happy path", () => {
         ...SAMPLE,
         args: ["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2"],
       }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
 
@@ -376,7 +367,6 @@ describe("runTry — missing env vars", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/needs the following env var/);
@@ -399,7 +389,6 @@ describe("runTry — missing env vars", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -421,7 +410,6 @@ describe("runTry — missing env vars", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     // `try` (unlike `add`) copies the resolved value inline so the directly-
@@ -504,7 +492,6 @@ describe("runTry — client config perms", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     // Born owner-only rather than chmodded after the rename: there is no
@@ -538,7 +525,6 @@ describe("runTry — client config perms", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBe(0o600);
@@ -570,7 +556,6 @@ describe("runTry — client config perms", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBe(0o600);
@@ -596,7 +581,6 @@ describe("runTry — client config perms", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBeUndefined();
@@ -617,7 +601,6 @@ describe("runTry — client config perms", () => {
       out: cap1.pushOut,
       err: cap1.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     // Spy only around the cleanup, so the write under test is unambiguous.
     const spy = await spyOnWrites();
@@ -625,10 +608,8 @@ describe("runTry — client config perms", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
-      env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(modeAskedFor(spy, clientPath())).toBeUndefined();
@@ -655,7 +636,6 @@ describe("runTry — client config perms", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(existsSync(clientPath())).toBe(true);
@@ -677,7 +657,6 @@ describe("runTry — unparseable ttl (programmatic callers)", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(2);
     expect(cap.errText()).toMatch(/invalid ttl "later"/);
@@ -701,7 +680,6 @@ describe("runTry — dry-run", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(r.marker).toBeDefined();
@@ -725,7 +703,6 @@ describe("runTry — slug validation", () => {
         out: cap.pushOut,
         err: cap.pushErr,
         fetchExplore: async () => SAMPLE,
-        postEvent: async () => undefined,
       });
       expect(r.exitCode).toBe(2);
     }
@@ -747,7 +724,6 @@ describe("runTry — fetch failure", () => {
       fetchExplore: async () => {
         throw new Error('yaw-mcp try: no server with slug "demo"');
       },
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/no server with slug/);
@@ -780,7 +756,6 @@ describe("runTry — preserves existing client config siblings", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -810,7 +785,6 @@ describe("runTry — unreadable vs invalid client config", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/could not be read/);
@@ -831,7 +805,6 @@ describe("runTry — unreadable vs invalid client config", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/is not valid JSON/);
@@ -856,7 +829,6 @@ describe("runTry — re-run against a different client", () => {
       out: cap1.pushOut,
       err: cap1.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     const cursorPath = join(synthHome, ".cursor", "mcp.json");
     expect(JSON.parse(readFileSync(cursorPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
@@ -873,7 +845,6 @@ describe("runTry — re-run against a different client", () => {
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     // Old client's entry is gone (and the user was told).
@@ -895,7 +866,6 @@ describe("runTry — re-run against a different client", () => {
       os: "linux" as const,
       env: {},
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     };
     const cap1 = captureIO();
     await runTry({ ...common, out: cap1.pushOut, err: cap1.pushErr });
@@ -943,10 +913,8 @@ describe("marker trust guards", () => {
     const r = await runTryCleanup({
       slug: "evil",
       home: synthHome,
-      env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(1);
     expect(cap.errText()).toMatch(/non-trial entry/);
@@ -975,7 +943,7 @@ describe("marker trust guards", () => {
 
   it("GC leaves a future-schema marker on disk for the user to deal with", async () => {
     const path = writeMarker("future", { schemaVersion: 99 });
-    const result = await gcExpiredTrials({ home: synthHome, env: {}, postEvent: async () => undefined });
+    const result = await gcExpiredTrials({ home: synthHome });
     expect(result.cleared).toBe(0);
     expect(existsSync(path)).toBe(true);
   });
@@ -1007,10 +975,8 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
-      env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
@@ -1031,29 +997,20 @@ describe("runTryCleanup", () => {
       out: cap1.pushOut,
       err: cap1.pushErr,
       fetchExplore: async () => SAMPLE,
-      postEvent: async () => undefined,
     });
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
 
     const cap = captureIO();
-    const events: TryEventBody[] = [];
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
-      env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      postEvent: async (_url, body) => {
-        events.push(body);
-      },
     });
     expect(r.exitCode).toBe(0);
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
-    expect(events).toHaveLength(1);
-    expect(events[0].action).toBe("cleanup");
-    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
     // Cleanup must not seed a machine fingerprint either.
     expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
     // written must contain the client path because the entry was actually removed.
@@ -1081,10 +1038,8 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
-      env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     // Nothing was written because the entry was already absent.
@@ -1096,10 +1051,8 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
-      env: {},
       out: cap.pushOut,
       err: cap.pushErr,
-      postEvent: async () => undefined,
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/nothing to do/);
@@ -1170,14 +1123,9 @@ describe("scanTrials + gcExpiredTrials", () => {
     };
     writeFileSync(trialMarkerPath("old", synthHome), JSON.stringify(expiredMarker));
 
-    const events: TryEventBody[] = [];
     const result = await gcExpiredTrials({
       home: synthHome,
-      env: {},
       now: () => baseNow,
-      postEvent: async (_url, body) => {
-        events.push(body);
-      },
     });
     expect(result.cleared).toBe(1);
     expect(result.failed).toBe(0);
@@ -1189,17 +1137,12 @@ describe("scanTrials + gcExpiredTrials", () => {
     expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
     // Marker file deleted.
     expect(existsSync(trialMarkerPath("old", synthHome))).toBe(false);
-    // Event fired.
-    expect(events).toHaveLength(1);
-    expect(events[0].action).toBe("expiry-gc");
-    expect(events[0].slug).toBe("old");
-    expect(events[0].anonId).toBe(ANON_ID_PLACEHOLDER);
     // The GC sweep no longer seeds a machine fingerprint on its way through.
     expect(existsSync(legacyAnonPath(synthHome))).toBe(false);
   });
 
   it("GC is a no-op when no expired trials exist", async () => {
-    const result = await gcExpiredTrials({ home: synthHome, env: {} });
+    const result = await gcExpiredTrials({ home: synthHome });
     expect(result.cleared).toBe(0);
   });
 
@@ -1225,12 +1168,284 @@ describe("scanTrials + gcExpiredTrials", () => {
 
     const result = await gcExpiredTrials({
       home: synthHome,
-      env: {},
       now: () => baseNow,
-      postEvent: async () => undefined,
     });
     expect(result.cleared).toBe(1);
     expect(result.failed).toBe(0);
     expect(existsSync(mismatchedPath)).toBe(false);
+  });
+
+  it("keeps the marker and reports a peel failure when the client file is valid JSON but not an object", async () => {
+    // A JSON array throws nothing, so the peel was silently skipped and the
+    // marker unlinked anyway -- orphaning a still-wired trial entry with
+    // nothing left on disk that could ever name it again.
+    const baseNow = 1_700_000_000_000;
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, "[]\n");
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const expiredMarker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "old",
+      name: "Old MCP",
+      expiresAt: baseNow - 1,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-old",
+      createdAt: baseNow - 3_600_000,
+    };
+    const markerPath = trialMarkerPath("old", synthHome);
+    writeFileSync(markerPath, JSON.stringify(expiredMarker));
+
+    const result = await gcExpiredTrials({
+      home: synthHome,
+      now: () => baseNow,
+    });
+    expect(result.cleared).toBe(0);
+    expect(result.failed).toBe(1);
+    expect(result.failures[0].stage).toBe("peel");
+    expect(result.failures[0].slug).toBe("old");
+    // Marker survives so doctor keeps surfacing the still-wired trial.
+    expect(existsSync(markerPath)).toBe(true);
+  });
+});
+
+describe("runTryCleanup — marker field validation", () => {
+  const baseMarker = (): Record<string, unknown> => ({
+    schemaVersion: 1,
+    slug: "demo",
+    name: "Demo MCP",
+    expiresAt: Date.now() + 3_600_000,
+    clientPath: join(synthHome, ".claude.json"),
+    clientName: "claude-code",
+    containerPath: ["mcpServers"],
+    entryName: "yaw-mcp-try-demo",
+    createdAt: Date.now(),
+  });
+
+  function wireTrial(marker: Record<string, unknown>): { clientPath: string; markerPath: string } {
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, JSON.stringify({ mcpServers: { "yaw-mcp-try-demo": { command: "npx" } } }));
+    const markerPath = trialMarkerPath("demo", synthHome);
+    writeFileSync(markerPath, JSON.stringify(marker));
+    return { clientPath, markerPath };
+  }
+
+  it("refuses a marker with no clientPath instead of dropping it and printing 'cleaned up'", async () => {
+    // The gate checked entryName only. existsSync(undefined) is false, so the
+    // peel was skipped, the marker was unlinked, and the user was told the
+    // trial was cleaned up -- while the entry stayed wired in the client
+    // config with nothing left on disk naming it.
+    const { clientPath, markerPath } = wireTrial({ ...baseMarker(), clientPath: undefined });
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/is unreadable/);
+    expect(cap.text()).not.toMatch(/cleaned up/);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(JSON.parse(readFileSync(clientPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+  });
+
+  it("refuses a marker whose containerPath is not an array", async () => {
+    const { markerPath } = wireTrial({ ...baseMarker(), containerPath: "mcpServers" });
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/is unreadable/);
+    expect(existsSync(markerPath)).toBe(true);
+  });
+});
+
+describe("runTry — previous marker naming the SAME client file", () => {
+  it("does not re-insert the entry the step-6b peel just removed", async () => {
+    const common = {
+      slug: "demo",
+      clientId: "claude-code" as const,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux" as const,
+      env: {},
+      fetchExplore: async (): Promise<ExploreServerResponse> => SAMPLE,
+    };
+    const cap1 = captureIO();
+    await runTry({ ...common, out: cap1.pushOut, err: cap1.pushErr });
+    const clientPath = join(synthHome, ".claude.json");
+
+    // A previous trial of the same slug wired under a DIFFERENT entry name in
+    // the SAME file (a renamed / hand-edited marker). Step 6b peels it out of
+    // the file, but the splice was built from the bytes read BEFORE the peel,
+    // so writing that render put the peeled entry straight back.
+    const client = JSON.parse(readFileSync(clientPath, "utf8"));
+    client.mcpServers["yaw-mcp-try-demo-old"] = { command: "npx", args: ["-y", "@old/mcp"] };
+    writeFileSync(clientPath, JSON.stringify(client, null, 2));
+    const markerPath = trialMarkerPath("demo", synthHome);
+    const marker = JSON.parse(readFileSync(markerPath, "utf8")) as TrialMarker;
+    writeFileSync(markerPath, JSON.stringify({ ...marker, entryName: "yaw-mcp-try-demo-old" }));
+
+    const cap = captureIO();
+    const r = await runTry({ ...common, out: cap.pushOut, err: cap.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/Removed the previous demo trial/);
+    const after = JSON.parse(readFileSync(clientPath, "utf8"));
+    expect(after.mcpServers["yaw-mcp-try-demo-old"]).toBeUndefined();
+    expect(after.mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+  });
+});
+
+describe("runTry — catalog URL threading", () => {
+  async function runWithCatalogEnv(catalogEnv: Record<string, string>): Promise<Array<string | undefined>> {
+    const seen: Array<string | undefined> = [];
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: catalogEnv,
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async (_base, _slug, catalogUrl) => {
+        seen.push(catalogUrl);
+        return SAMPLE;
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    return seen;
+  }
+
+  it("threads $YAW_MCP_CATALOG_URL from the injected env into the fetch seam", async () => {
+    // Read from process.env inside the seam, an injected `env` was silently
+    // overridden by the ambient environment -- the one lookup in runTry that
+    // did not honor its own injection point.
+    expect(await runWithCatalogEnv({ YAW_MCP_CATALOG_URL: "https://example.test/catalog.json" })).toEqual([
+      "https://example.test/catalog.json",
+    ]);
+  });
+
+  it("treats an EMPTY $YAW_MCP_CATALOG_URL as unset", async () => {
+    // "" is not nullish, so it sailed past `??` into fetch(""), which throws a
+    // bare TypeError the catalog's friendly wrapper cannot recognize.
+    expect(await runWithCatalogEnv({ YAW_MCP_CATALOG_URL: "" })).toEqual([undefined]);
+  });
+});
+
+describe("runTry — optional --env overrides", () => {
+  it("trims override values and drops empty ones instead of persisting a blank var", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { LOG_LEVEL: "", BLANK: "   ", DATABASE_URL: "  postgres://x  " },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    const entry = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8")).mcpServers["yaw-mcp-try-demo"];
+    // `--env LOG_LEVEL=` is the user clearing a knob, not asking for a blank
+    // one; several upstreams read a set-but-empty var as "configured".
+    expect(entry.env).toEqual({ DATABASE_URL: "postgres://x" });
+  });
+});
+
+describe("runTry — dry-run names the cross-client removal", () => {
+  it("says a real run would peel the previous trial out of the other client's config", async () => {
+    const cap1 = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "cursor",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap1.pushOut,
+      err: cap1.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    const cursorPath = join(synthHome, ".cursor", "mcp.json");
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    // The preview must name every write the real run performs -- a removal it
+    // omits is exactly what --dry-run is consulted to catch.
+    expect(cap.text()).toMatch(/would remove: the previous demo trial/);
+    expect(cap.text()).toContain(cursorPath);
+    // ...and dry-run still wrote nothing.
+    expect(JSON.parse(readFileSync(cursorPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+  });
+
+  it("does NOT promise to peel a previous marker the real run would refuse", async () => {
+    // peelTrialEntry refuses an untrusted marker before touching anything, so
+    // a preview built from the clientPath/entryName comparison ALONE printed
+    // "would remove: ..." for a removal the real run declines with a warning.
+    // A --dry-run that over-promises is worse than one that under-reports:
+    // the user reads it as the plan and never checks the real output.
+    const otherClient = join(synthHome, ".cursor", "mcp.json");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(otherClient, JSON.stringify({ mcpServers: { "not-a-trial-entry": { command: "x", args: [] } } }));
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    writeFileSync(
+      trialMarkerPath("demo", synthHome),
+      JSON.stringify({
+        schemaVersion: 1,
+        slug: "demo",
+        name: "Demo",
+        expiresAt: Date.now() + 3_600_000,
+        clientPath: otherClient,
+        clientName: "cursor",
+        containerPath: ["mcpServers"],
+        // Not a `yaw-mcp-try-*` name: rejectUntrustedMarker refuses it.
+        entryName: "not-a-trial-entry",
+        createdAt: Date.now(),
+      }),
+    );
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toMatch(/would remove: the previous demo trial/);
+    expect(cap.text()).toMatch(/would NOT remove: the previous demo marker names a non-trial entry/);
   });
 });

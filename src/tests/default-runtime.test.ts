@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -174,6 +174,34 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
   });
 
+  it("does not re-read a bundles.json that is still the same broken file", async () => {
+    // The degraded read is deliberately not cached as an ANSWER (above), which
+    // used to mean the whole load -- read, project-trust hash, parse -- ran
+    // again on EVERY connect for as long as the file stayed broken. It is
+    // negative-cached on the file's stat signature instead: one stat per
+    // connect, and a CHANGED file still gets re-read (pinned by the test
+    // above).
+    //
+    // Holding the signature fixed across a content change is the only way to
+    // observe the skipped read from outside the module: the replacement is
+    // written at the same byte length and stamped with the same mtime, so a
+    // call that re-read the file would answer "node" here.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    const file = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+    const valid = JSON.stringify({ version: 1, servers: [], defaultRuntime: "node" });
+    const broken = "{ not json at all".padEnd(valid.length, " ");
+    expect(broken.length).toBe(valid.length);
+    const stamp = new Date(2020, 0, 1);
+
+    writeFileSync(file, broken);
+    utimesSync(file, stamp, stamp);
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    writeFileSync(file, valid);
+    utimesSync(file, stamp, stamp);
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+  });
+
   it("caches a degraded read that still resolved a value", async () => {
     // The other half of the exemption, and the shape the whole fix is about:
     // an approved-but-unparseable PROJECT file leaves config null while the
@@ -191,6 +219,30 @@ describe("defaultRuntime (cached hot-path variant)", () => {
 
     // Cached: a later change to the global file must NOT be picked up.
     writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
+  });
+
+  it("picks up a user-global defaultRuntime written after a broken PROJECT file armed the cache", async () => {
+    // The degraded verdict is a function of TWO files: a broken-but-honoured
+    // project bundles.json still falls back to the user-global file for the
+    // machine-level knob. Keying the negative cache on the project file alone
+    // meant this sequence answered null forever -- the connect path then
+    // resolves oam, silently inverting the explicit "node" the user just
+    // wrote. That is the precise inversion the degraded exemption exists to
+    // prevent, so it must not survive in the two-file subcase.
+    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
+    const projectFile = localBundlesPath(join(synthCwd, CONFIG_DIRNAME));
+    writeFileSync(projectFile, "{ not json at all");
+    const { grantTrust } = await import("../trust.js");
+    await grantTrust(projectFile, readFileSync(projectFile), { home: synthHome });
+
+    // Global has nothing yet -> degraded AND empty -> negative cache armed.
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+
+    // User sets the knob in the user-global file. The project file is
+    // untouched, so a project-only stat gate sees no change and skips the
+    // re-read.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBe("node");
   });
 

@@ -2,7 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { decryptEntry, deriveKey, type EncryptedEntry, encryptEntry, generateSalt } from "../secrets-crypto.js";
+import {
+  DEFAULT_KDF,
+  decryptEntry,
+  deriveKey,
+  type EncryptedEntry,
+  encryptEntry,
+  generateSalt,
+} from "../secrets-crypto.js";
 import {
   getSecret,
   hasSecretRefs,
@@ -14,11 +21,14 @@ import {
   resolveSecretRefs,
   rotateVault,
   SECRET_REF_RE,
+  SECRETS_SCHEMA_VERSION,
   saveVault,
   setSecret,
   unlock,
+  VAULT_CHECK_AAD,
   VAULT_CHECK_CORRUPT_ERROR,
   VAULT_CHECK_PLAINTEXT,
+  VaultEntryCorruptError,
   type VaultFile,
   vaultPath,
 } from "../secrets-vault.js";
@@ -93,7 +103,10 @@ describe("secrets-vault: set/get/list/remove", () => {
     const v = newVault();
     expect(v.salt).toBeTruthy();
     expect(v.entries).toEqual({});
-    expect(v.version).toBe(1);
+    expect(v.version).toBe(SECRETS_SCHEMA_VERSION);
+    // The scrypt parameters are recorded in the file, not assumed by the
+    // reader, so a later cost bump cannot orphan this vault.
+    expect(v.kdf).toEqual(DEFAULT_KDF);
   });
 
   it("set + get round-trips a single secret", async () => {
@@ -202,7 +215,7 @@ describe("secrets-vault: set/get/list/remove", () => {
     vault = setSecret(vault, key, "github", "ghp_abc");
     expect(vault.check).toBeDefined();
     // The check decrypts to the fixed constant under the correct key.
-    expect(decryptEntry(vault.check as EncryptedEntry, key)).toBe(VAULT_CHECK_PLAINTEXT);
+    expect(decryptEntry(vault.check as EncryptedEntry, key, VAULT_CHECK_AAD)).toBe(VAULT_CHECK_PLAINTEXT);
   });
 
   it("unlock on a fresh/empty vault accepts any passphrase (nothing to verify)", async () => {
@@ -367,7 +380,7 @@ describe("rotateVault", () => {
 
     // The new check marker verifies under the new key, and a wrong
     // passphrase is rejected at unlock.
-    expect(decryptEntry(rotated.check as EncryptedEntry, newKey)).toBe(VAULT_CHECK_PLAINTEXT);
+    expect(decryptEntry(rotated.check as EncryptedEntry, newKey, VAULT_CHECK_AAD)).toBe(VAULT_CHECK_PLAINTEXT);
     lock();
     await expect(unlock(rotated, "old-passphrase")).rejects.toThrow(/wrong passphrase/i);
   });
@@ -460,5 +473,227 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     expect(resolved.A).toBe("value-x");
     expect(resolved.B).toBe("prefix-value-x-suffix");
     expect(resolved.C).toBe("value-x");
+  });
+});
+
+// ---------------------------------------------------------------------
+// Schema v2: the scrypt parameters live IN the file, and every ciphertext
+// is bound to the entry name it is stored under.
+// ---------------------------------------------------------------------
+
+describe("secrets-vault v2: recorded KDF parameters", () => {
+  /** Write a vault file by hand under the given parameters. */
+  async function writeVaultWithKdf(params: { N: number; r: number; p: number }): Promise<string> {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    const salt = generateSalt();
+    const key = await deriveKey("hunter2", salt, params);
+    const file = {
+      version: 2,
+      salt: salt.toString("base64"),
+      kdf: params,
+      entries: { github: encryptEntry("ghp_abc", key, "github") },
+      check: encryptEntry(VAULT_CHECK_PLAINTEXT, key, VAULT_CHECK_AAD),
+    };
+    writeFileSync(path, `${JSON.stringify(file)}\n`);
+    return path;
+  }
+
+  it("derives under the vault's OWN cost factor, not this build's default", async () => {
+    // N here is deliberately NOT DEFAULT_KDF.N: a reader that assumes the
+    // compile-time constant derives a different key and reports a wrong
+    // passphrase for a vault whose passphrase is perfectly correct.
+    const params = { N: 1 << 14, r: 8, p: 1 };
+    expect(params.N).not.toBe(DEFAULT_KDF.N);
+    const path = await writeVaultWithKdf(params);
+    lock();
+    const loaded = (await loadVault(path)) as VaultFile;
+    expect(loaded.kdf).toEqual(params);
+    const key = await unlock(loaded, "hunter2");
+    expect(getSecret(loaded, key, "github")).toBe("ghp_abc");
+  });
+
+  it("a saved vault records its parameters on disk", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    const path = vaultPath(synthHome);
+    await saveVault(path, vault);
+    const { readFileSync } = await import("node:fs");
+    expect(JSON.parse(readFileSync(path, "utf8")).kdf).toEqual(DEFAULT_KDF);
+  });
+
+  it("refuses a vault whose kdf is nonsense rather than falling back to the default", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    // N is not a power of two, and a bogus N means a wrong key (or a memory
+    // bomb), not something to silently paper over.
+    const bad = { version: 2, salt: generateSalt().toString("base64"), kdf: { N: 3, r: 8, p: 1 }, entries: {} };
+    writeFileSync(path, `${JSON.stringify(bad)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/invalid kdf/i);
+  });
+
+  it("refuses an N/r PAIR whose working set busts the memory bound, not just each field", async () => {
+    // The per-field caps (N <= 2^18, r <= 32) are individually satisfiable at
+    // values that multiply out to 128 * 2^18 * 32 = 1 GiB -- four times the
+    // 256MB the guard documents. Bounding the fields separately is not the
+    // same as bounding what they cost together, and scryptCallWithMaxmem
+    // hands node a maxmem derived from the same params, so it would not stop
+    // the allocation either.
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    const bomb = {
+      version: 2,
+      salt: generateSalt().toString("base64"),
+      kdf: { N: 1 << 18, r: 32, p: 1 },
+      entries: {},
+    };
+    writeFileSync(path, `${JSON.stringify(bomb)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/invalid kdf/i);
+
+    // The documented worst case (2^18 at the default r=8 = exactly 256MB) is
+    // still accepted, so the bound rejects the bomb without shrinking the
+    // headroom the per-field caps were chosen to leave.
+    const atCap = {
+      version: 2,
+      salt: generateSalt().toString("base64"),
+      kdf: { N: 1 << 18, r: 8, p: 1 },
+      entries: {},
+    };
+    writeFileSync(path, `${JSON.stringify(atCap)}\n`);
+    await expect(loadVault(path)).resolves.toBeDefined();
+  });
+});
+
+describe("secrets-vault v2: ciphertexts are bound to their entry name", () => {
+  it("a blob moved to another entry no longer decrypts", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "PROD", "prod-token");
+    vault = setSecret(vault, key, "DEV", "dev-token");
+    // Exactly what an attacker with write access to secrets.json does: swap
+    // the two ciphertext blobs so the server spawned for PROD gets DEV's
+    // token. Both blobs are intact and the key is right.
+    const swapped: VaultFile = {
+      ...vault,
+      entries: { PROD: vault.entries.DEV, DEV: vault.entries.PROD },
+    };
+    expect(() => getSecret(swapped, key, "PROD")).toThrow();
+    expect(() => getSecret(swapped, key, "DEV")).toThrow();
+  });
+
+  it("still reads a v1 vault, whose entries were written unbound", async () => {
+    const salt = generateSalt();
+    const key = await deriveKey("hunter2", salt);
+    const legacy: VaultFile = {
+      version: 1,
+      salt: salt.toString("base64"),
+      entries: { github: encryptEntry("ghp_legacy", key) },
+    };
+    lock();
+    const unlocked = await unlock(legacy, "hunter2");
+    expect(getSecret(legacy, unlocked, "github")).toBe("ghp_legacy");
+  });
+
+  it("does NOT accept an unbound blob in a v2 vault", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    // A v2 vault carrying an entry written the old way is a downgrade
+    // attempt: accepting it would let an attacker strip the binding.
+    const downgraded: VaultFile = { ...vault, entries: { github: encryptEntry("ghp_swapped", key) } };
+    expect(() => getSecret(downgraded, key, "github")).toThrow();
+  });
+});
+
+describe("secrets-vault: passphrase normalization", () => {
+  // Built from code points, never typed: the two forms are visually identical
+  // in an editor, so a literal fixture would silently be the same string.
+  const COMPOSED = `caf${String.fromCharCode(0xe9)}-passphrase`;
+  const DECOMPOSED = `cafe${String.fromCharCode(0x301)}-passphrase`;
+
+  it("opens a vault created with the composed form using the decomposed one", async () => {
+    expect(COMPOSED).not.toBe(DECOMPOSED);
+    let vault = newVault();
+    const key = await unlock(vault, COMPOSED);
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    lock();
+    // Same passphrase to a human; different UTF-8 bytes. Without NFC the
+    // second form reports "wrong passphrase for this vault".
+    const reopened = await unlock(vault, DECOMPOSED);
+    expect(getSecret(vault, reopened, "github")).toBe("ghp_abc");
+  });
+
+  it("still opens a legacy vault keyed on the UN-normalized bytes", async () => {
+    // What a vault created before normalization looks like: the key came from
+    // the decomposed bytes exactly as typed.
+    const salt = generateSalt();
+    const legacyKey = await deriveKey(DECOMPOSED, salt, DEFAULT_KDF, false);
+    const vault: VaultFile = {
+      version: 1,
+      salt: salt.toString("base64"),
+      entries: { github: encryptEntry("ghp_legacy", legacyKey) },
+    };
+    lock();
+    const key = await unlock(vault, DECOMPOSED);
+    expect(getSecret(vault, key, "github")).toBe("ghp_legacy");
+  });
+
+  it("a genuinely wrong passphrase is still rejected", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, COMPOSED);
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    lock();
+    await expect(unlock(vault, "not-the-passphrase")).rejects.toThrow(/wrong passphrase/i);
+  });
+});
+
+describe("secrets-vault: the check marker is compared, not merely decrypted", () => {
+  it("treats a marker holding the WRONG plaintext as corrupt", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    // Decrypts cleanly under the right key, but is not the expected constant.
+    // verifyKey used to accept on "it decrypted" alone, so this vault
+    // unlocked while rotateVault -- which compares -- refused it.
+    const wrongMarker: VaultFile = {
+      ...vault,
+      check: encryptEntry("some-other-plaintext", key, VAULT_CHECK_AAD),
+    };
+    lock();
+    await expect(unlock(wrongMarker, "hunter2")).rejects.toThrow(VAULT_CHECK_CORRUPT_ERROR);
+  });
+});
+
+describe("secrets-vault: loadVault error shapes", () => {
+  it("throws a typed error carrying the corrupt entry NAME, newlines and all", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    // A legacy vault could store a name with a newline in it; sniffing the
+    // name back out of the message text with /(.+)$/ silently lost it.
+    const badName = `BAD${String.fromCharCode(10)}NAME`;
+    const corrupt = {
+      version: 1,
+      salt: generateSalt().toString("base64"),
+      entries: { [badName]: { iv: "x", ciphertext: 123, authTag: "y" } },
+    };
+    writeFileSync(path, `${JSON.stringify(corrupt)}\n`);
+    const err = await loadVault(path).catch((e) => e);
+    expect(err).toBeInstanceOf(VaultEntryCorruptError);
+    expect((err as VaultEntryCorruptError).entryName).toBe(badName);
+  });
+
+  it("refuses a vault whose version is a STRING instead of assuming it is current", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    const path = vaultPath(synthHome);
+    // "99" as a string used to sail past the newer-schema guard entirely.
+    const bad = { version: "99", salt: generateSalt().toString("base64"), entries: {} };
+    writeFileSync(path, `${JSON.stringify(bad)}\n`);
+    await expect(loadVault(path)).rejects.toThrow(/"version" must be a number/);
   });
 });
