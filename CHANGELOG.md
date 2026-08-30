@@ -2,6 +2,76 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.77.0 -- the learning signal stops recording things it did not observe, the silent failures get loud, and the dead ends are retired
+
+Seven commits of full-pass review work, taken through repeated adversarial rounds. The two user-visible contract changes are first; the rest are fixes.
+
+**Changed (BREAKING) -- `try`'s event-reporting seam is gone**
+
+`try` stopped POSTing anything when the hosted backend was retired, but the seam it posted through stayed: a `postEvent` option on `runTry` / `runTryCleanup` / `gcExpiredTrials`, a `TryEventBody` type, an `ANON_ID_PLACEHOLDER` constant, `doctor`'s `postTryEvent`, and roughly thirty test injectors. The default implementation was a no-op, so every one of those tests was overriding nothing with nothing. All of it is removed, along with the now-unread `env` option on `gcExpiredTrials`. `TryEventBody` and `ANON_ID_PLACEHOLDER` were exported, so this is a breaking change for anyone importing them -- nothing in the CLI surface moves. `try --base` is still PARSED, so an existing script passing it keeps working, but nothing addresses it any more and the help text now says so.
+
+**Changed -- `doctor`'s text path exits 2 where it used to exit 0**
+
+An expired trial the sweep could not finish (its client config unreadable, or rewritten to a shape the peel refuses) was reported on both surfaces but only `--json` treated it as a warning. The text path printed the line and then exited 0 under "All good". Those warnings now fold into the same `config.warnings` list both paths read, so the two agree. A script keying on `doctor`'s text exit code will see a 2 it did not see before -- that is the point: the condition always warranted one.
+
+**Fixed -- the learning signal recorded outcomes it had not observed**
+
+A routing fault -- the broker failing to reach a server at all -- was being booked as evidence ABOUT that server. It was detected by matching prose in the error string, so the classification drifted the moment any message was reworded. Faults now carry a non-enumerable structural brand applied at the point they are constructed, and every one of the six emitters sets it; the health block is skipped entirely on a fault rather than recording a non-observation. `markReply` moved out from behind the deferred-learning guard, and a new `redispatch.markUse` flips further-use only when a reply was actually seen, so a redispatch miss can no longer be inferred from a call that never returned.
+
+`classifyError`'s HTTP-status matcher was rewritten to require status context rather than a bare three-digit number, which had been matching counts ("returned 429 rows"), version fragments and URL ports. Added word-level checks for the quota, bad-credentials and access-denied phrasings that real upstreams return.
+
+**Fixed -- three data-write paths could destroy what they were writing**
+
+The secrets vault took its change-detection baseline AFTER loading, so a concurrent edit between load and save was invisible; the baseline is now taken before the load and re-checked before every write. `state.json` read failures (EACCES, EBUSY, EISDIR) were indistinguishable from a missing file, so a transient read error caused the empty fallback to be saved over healthy state -- reads now carry a `loadFailed` flag and the session leaves persistence disabled rather than overwriting. And three writers building JSON objects by plain assignment could have a `__proto__` key silently vanish on the next flush, undoing load-side hardening one save later.
+
+**Fixed -- auto-reconnect bypassed the activation path it was supposed to share**
+
+A dropped connection was re-established by an inline loop that skipped the cap check, the in-flight join, the elicitation retry and the route refresh. It now routes through `activateOne` like every other activation. The stale connection stays in the map during the attempt (disconnected afterwards, identity-guarded) so a concurrent caller cannot observe a hole, and only the initiating call refreshes routes -- joiners rebuild locally. Cap accounting was rebuilt around a single `evaluateCapFor`, so pending reservations and prewarm claims occupy slots consistently, and a candidate's own error-state entry no longer counts against it. The dead `reconcileConfig` path was deleted rather than left as a second, diverging activation route. Best-of-N sampling now aborts its outstanding request instead of leaking it past the timeout.
+
+**Fixed -- `add`, `install` and `migrate` previewed one thing and did another**
+
+`add --dry-run` predicted an outcome the real run could refuse: the upsert decision is now a pure function both paths call, so a cross-slug refusal, a kept namespace or an unreadable file shows up in the preview. `install` evaluated `--dry-run` before `--skip`, so a skip that should have short-circuited still previewed a write; `--all` with `--scope` is now rejected at parse time rather than silently ignored; and the Windows `%APPDATA%` root is threaded through the probe instead of being read from the live environment, so an injected home is honoured end to end. `migrate` realpaths both sides before comparing, so a symlinked home no longer hides the legacy directory it was asked to find.
+
+**Fixed -- the failure paths that failed silently**
+
+`audit` resolved `${secret:...}` references only after handing the spawn to the runner, so a missing vault passphrase surfaced as an upstream error rather than a refusal; it now fails closed, exit 2, naming the unresolved refs. It also scrubs the broker's own internal secrets from the environment before spawning the target. Trial-GC failures were counted and discarded -- they now carry the slug, the client path and which stage failed, and reach both doctor surfaces. Guarded the sidecar manifest and marker writes (an unwritable directory reported success), gave `guide.ts` an errno split so a real read error warns instead of reading as "no guide", and raised the `uv` download budget to 20 minutes after measuring the actual artifacts at 18.5-23.0 MB -- the previous ceiling demanded roughly 0.6 Mbit/s. Unknown `config.json` keys and a below-floor foundry corpus now warn instead of passing quietly.
+
+**Changed -- the dead ends are retired and every surface is made to tell the truth**
+
+The standalone-binary track ended at 0.70.2, older than npm, so `upgrade` pointed at a release that could only move users backwards; it now says to install from npm and delete the executable. A bare leading-dash argument exits 2 instead of starting the MCP server on a typo. `doctor`'s environment section lists all thirteen behaviour overrides rather than six. `release.sh` preflights its own tooling and no longer trusts a `SKIP_CONFIRM` value it never validated. `MIN_OAM_VERSION` moves to 0.12.1, with the re-verified mechanism separated in-source from the older per-server matrix so the two cannot be mistaken for one measurement.
+
+**Fixed -- a zero-tool upstream was re-spawned on every session start, forever**
+
+A resources/prompts-only server answers "zero tools", and that answer was discarded at four separate points, so pre-warm could never record what it had already paid to learn. Empty tool lists now persist as a known state. An entry whose tools ALL failed validation is still dropped and re-learned -- the raw list length is what separates a real empty answer from a corrupt file.
+
+**Fixed -- `foundry` stopped redacting dot-separated phone numbers**
+
+The IPv4-and-version exclusion was written as "three or more dots" but quantified at two, so `555.123.4567` cleared the nine-digit phone floor, matched the exclusion, and was persisted verbatim into the harvest. The quantifier now matches the comment, and dotted IPs and versions still fall through it.
+
+**Fixed -- `doctor` counted shell history twice for anyone who relocates `HISTFILE`**
+
+`export HISTFILE=$HOME/.zsh_history` made the HISTFILE entry and the hardcoded zsh entry name the same file, and every command in it was counted once per source -- inflating SHADOWED CLI USAGE and pushing a CLI over the reporting threshold on a single real invocation. Sources are deduped by resolved path, keeping the LAST match so the format-aware reader wins; keeping the first would dedupe correctly and then mis-parse the file.
+
+**Fixed -- the degraded-runtime cache could invert an explicit `defaultRuntime`**
+
+The negative cache that avoids re-reading a broken `bundles.json` was keyed on one file's stat signature while the verdict is computed from two, so an explicit user-global `defaultRuntime: "node"` written after a broken project file was never picked up. `loadLocalBundles` now reports every path it consulted, and the watch set is built from that rather than re-derived. Reuse is also bounded in time: stat signatures catch content edits immediately, but a project `.yaw-mcp/` that does not exist yet is an absence no stat can watch, and only a time bound makes that input converge.
+
+**Fixed -- the KDF guard did not enforce the bound its own comment claimed**
+
+`N` and `r` were bounded independently at values that multiply out to a 1 GiB working set, four times the documented 256MB ceiling, and the derived `maxmem` was large enough to let the allocation through. The product is bounded now; the per-field caps remain as sanity limits, and the documented worst case is still accepted.
+
+**Fixed -- `try --dry-run` promised a removal the real run refuses**
+
+The preview compared the previous marker's client path and entry name but never consulted the trust check that `peelTrialEntry` runs first, so it printed "would remove" for a marker the real run declines with a warning. The preview consults the same gate and names the refusal reason.
+
+**Fixed -- `install --list` printed paths in a shape neither OS uses**
+
+Only the leading separator was keyed to the listed OS, leaving the rest host-shaped, so `--list --os linux` on Windows rendered `~/.cursor\mcp.json`. Every separator the host could have produced is now rewritten. The oam-absent tip also stopped appearing on a fully successful `--all --skip` run -- where every entry it describes is present and about to be used -- because a skip is a success that writes nothing.
+
+**Changed -- packaging: `schemas/` ships, and the `@types/node` floor matches `engines`**
+
+The config JSON schema was referenced by `$id` and reachable only through a raw GitHub URL; it is in the `files` array now. `@types/node` moved from `^26` to `^20` to match `engines: >=20` and the `node20` build target -- the type surface had been admitting APIs that compile clean and throw on the oldest Node the package claims to support. It type-checks clean at the lower floor, so nothing was relying on them.
+
 ## 0.75.5 -- the oam floor moves to 0.11.0, and three oam facts get re-measured
 
 **Changed -- the oam floor moves to 0.11.0**
