@@ -19,8 +19,12 @@
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// MEASURED against oam 0.11.0 on 2026-08-22 (first measured against 0.9.0 on
-// 2026-08-08; re-run for the floor move), so nobody re-derives it: the
+// MEASURED: the SDK-hosting mechanism re-verified against oam 0.12.1 on
+// 2026-08-29 (a stdio @modelcontextprotocol/sdk server completes
+// initialize + tools/list + tools/call hosted on `oam run`); the full
+// per-server matrix below was last run against 0.11.0 on 2026-08-22
+// (first 0.9.0 on 2026-08-08). Re-run at least the mechanism check for
+// each floor move, so nobody re-derives it: the
 // pure-JS/SDK tier (memory, tailscale, lemonsqueezy, redis, postgres, ctxlint)
 // completes an MCP initialize handshake hosted on oam, AND so do both
 // bundled-browser servers -- @modelcontextprotocol/server-puppeteer and
@@ -146,11 +150,8 @@ export function specConstraint(spec: string): SpecConstraint {
  * A git or path spec is legitimate configuration, so callers skip rather than
  * error: those servers keep resolving through npx exactly as before.
  *
- * NOTE: sidecars-cmd.ts carries a copy of this predicate, which it needs for a
- * different reason (a git/path spec cannot be a dependency KEY in a generated
- * manifest). A follow-up dedupes that copy against this one; the direction is
- * sidecars-cmd -> oam-spawn, since sidecars-cmd already imports packageName
- * from here.
+ * sidecars-cmd.ts consumes this export too (a git/path spec cannot be a
+ * dependency KEY in a generated manifest).
  */
 export function isRegistrySpec(spec: string): boolean {
   // A protocol (github:, file:, git+ssh:, http:) or a filesystem path.
@@ -214,7 +215,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.11.0";
+export const MIN_OAM_VERSION = "0.12.1";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */

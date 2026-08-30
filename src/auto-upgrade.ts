@@ -357,9 +357,14 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   }
 
   if (method === "binary") {
-    // A standalone binary has no package manager to self-upgrade -- the user
-    // replaces the executable. Nothing safe to spawn; log it and move on.
-    log("info", "yaw-mcp (standalone binary) is behind npm; download the latest build to update", { current, latest });
+    // A standalone binary has no package manager to self-upgrade -- and the
+    // binary track was retired in 0.70.3, so the only way forward is the
+    // npm install. Nothing safe to spawn; log it and move on.
+    log(
+      "info",
+      "yaw-mcp (standalone binary) is behind npm; the binary track was retired -- npm install -g @yawlabs/mcp@latest, then delete the old executable",
+      { current, latest },
+    );
     return;
   }
 

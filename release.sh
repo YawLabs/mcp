@@ -27,7 +27,7 @@
 #   SKIP_CONFIRM=1                   skip the y/N confirm prompt
 #   NO_COLOR=1                       disable ANSI colors
 #
-# Required tools on PATH: node, npm, curl, tar, sha256sum, openssl, git.
+# Required tools on PATH: node, npm, git, curl, tar, sha256sum (or shasum).
 # The first run also needs `mcp-publisher` (downloaded to a temp dir on
 # demand, sha256-verified against the registry's per-release
 # `registry_<ver>_checksums.txt`) and a one-time `mcp-publisher login
@@ -160,7 +160,13 @@ run_npm_check() {
 # story now; see docs/v0.70.3-binary-track-decision.md.)
 # Env may pre-set SKIP_CONFIRM=1 to skip the y/N prompt (e.g. CI, scripted
 # release). Default off. The -y/--yes arg below overrides the env to true.
-SKIP_CONFIRM="${SKIP_CONFIRM:-false}"
+# Normalized here because the gate below compares against the literal
+# "true" -- without this, the documented SKIP_CONFIRM=1 spelling still
+# prompted (commit 3cbe778 changed only the default line, not the gate).
+case "${SKIP_CONFIRM:-}" in
+  1|true|yes|TRUE|YES) SKIP_CONFIRM=true ;;
+  *) SKIP_CONFIRM=false ;;
+esac
 REMAINING=()
 i=0
 while [ $i -lt $# ]; do
@@ -198,6 +204,14 @@ cd "$SCRIPT_DIR"
 command -v node >/dev/null || fail "node not installed"
 command -v npm  >/dev/null || fail "npm not installed"
 command -v git  >/dev/null || fail "git not installed"
+# Step-5 tools (MCP registry publish), preflighted HERE: their first use is
+# AFTER the tag push and the irreversible npm publish, so discovering one
+# missing there strands the release at the registry step. sha256 accepts
+# either binary -- macOS ships shasum, not sha256sum.
+command -v curl >/dev/null || fail "curl not installed (needed for step 5, the MCP registry publish)"
+command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MCP registry publish)"
+{ command -v sha256sum >/dev/null || command -v shasum >/dev/null; } \
+  || fail "sha256sum/shasum not installed (needed for step 5, the MCP registry publish)"
 
 # Re-read state from disk at every step boundary (per project rule: release
 # scripts must not cache at script-start). Functions call these helpers to
@@ -460,7 +474,12 @@ curl -fsSL -o "${WORKDIR}/${TARBALL}" \
 info "Verifying ${TARBALL} against the release's checksums.txt"
 curl -fsSL -o "${WORKDIR}/checksums.txt" \
   "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
-(cd "$WORKDIR" && sha256sum -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+# sha256sum on Linux/Git-Bash; shasum -a 256 is the macOS stock spelling.
+if command -v sha256sum >/dev/null; then
+  (cd "$WORKDIR" && sha256sum -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+else
+  (cd "$WORKDIR" && shasum -a 256 -c --ignore-missing < checksums.txt) || fail "sha256 verification failed for ${TARBALL} -- refusing to run an unverified binary"
+fi
 
 # Windows tarballs extract to mcp-publisher.exe, POSIX ones to mcp-publisher.
 BIN_NAME="mcp-publisher"

@@ -79,14 +79,17 @@ describe("suggestFlag", () => {
     }
   });
 
-  it("passes through short single-letter flags (no hijack of -v as -V)", () => {
-    // A genuine server flag `-v` must NOT be intercepted by a case-only
-    // match against `-V`; length-gating keeps short flags falling through.
+  it("returns [] for short single-letter flags (no case-only hijack of -v as -V)", () => {
+    // Length-gating keeps a lowercase `-v` from being suggested as `-V` by
+    // a case-only match. [] no longer means "boot the server": index.ts
+    // rejects EVERY unknown leading-dash arg with exit 2 -- an empty
+    // suggestion list just yields the generic --help hint instead of a
+    // did-you-mean.
     expect(suggestFlag("-v")).toEqual([]);
     expect(suggestFlag("-x")).toEqual([]);
   });
 
-  it("passes through genuine long server flags with no close match", () => {
+  it("returns [] for long flags with no close alias match", () => {
     expect(suggestFlag("--verbose")).toEqual([]);
     expect(suggestFlag("--config")).toEqual([]);
   });
@@ -281,6 +284,20 @@ describe("runServer startup failure", () => {
     expect(stderr).toContain("--help");
     // Warm by now (the bundle has been executed once), but kept above the
     // guard for the same reason -- test order is not a contract.
+  }, 120_000);
+
+  it("exits 2 on ANY unknown flag instead of booting a stdio server", async () => {
+    // The pass-through defended "genuine server flags", but runServer reads
+    // no argv and the installers write none -- so `yaw-mcp --verbose` (and
+    // any `-x`) silently booted a stdio MCP server on a dead prompt: the
+    // same ship-blocker shape as --HELP, minus the did-you-mean.
+    const verbose = await runEntry({}, ["--verbose"]);
+    expect(verbose.code).toBe(2);
+    expect(verbose.stderr).toContain('unknown flag "--verbose"');
+    expect(verbose.stderr).toContain("--help");
+    const shortFlag = await runEntry({}, ["-x"]);
+    expect(shortFlag.code).toBe(2);
+    expect(shortFlag.stderr).toContain('unknown flag "-x"');
   }, 120_000);
 
   it("still registers the last-resort handlers before the first await", async () => {

@@ -635,11 +635,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
 
   // Step 6: read existing client config (if any).
   // Track whether the client file pre-existed so we know whether to read it
-  // below. NOTE: step 7's perms-tightening keys off whether the file had
-  // CONTENT (`rawClient`), not mere existence -- an empty-but-existing file
-  // is materialized fresh here, so it should be born 0600 like a created
-  // file rather than left at the user's 0644. A pre-existing file WITH
-  // content is the user's own and its perms are left untouched.
+  // below. (Step 7's perms-tightening keys off entryHasSecrets -- see the
+  // rationale where tightenPerms is computed: an inline secret must be
+  // owner-only whether `try` created the file or merged into the user's
+  // pre-existing config. rawClient decides only the write ROUTE:
+  // comment-preserving splice vs fresh render.)
   // We also retain the RAW text so the write below can route through the
   // comment-preserving `editJsoncEntry` -- a read-modify-write through
   // JSON.parse + JSON.stringify drops every `//` and `/* */` the user has

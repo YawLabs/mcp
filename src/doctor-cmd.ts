@@ -101,7 +101,7 @@ import {
   trialGcFailureWarning,
 } from "./try-cmd.js";
 import {
-  BINARY_DOWNLOAD_URL,
+  BINARY_RETIRED_HINT,
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
@@ -611,8 +611,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
       print("  on each spawn — restart your MCP client to pick it up.");
     } else if (method === "binary") {
       print(`  Running ${effectiveVersion}; npm latest is ${staleHint}. This is a standalone`);
-      print("  binary — download the latest build and replace the executable:");
-      print(`    ${BINARY_DOWNLOAD_URL}`);
+      print(`  binary; ${BINARY_RETIRED_HINT}`);
     } else if (
       method === "global-npm" ||
       method === "pnpm-global" ||
@@ -690,14 +689,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     ? { path: guide.path, unapproved: guide.unapproved === true }
     : null;
 
-  const envVarNames = [
-    "YAW_MCP_SERVER_CAP",
-    "YAW_MCP_MIN_COMPLIANCE",
-    "YAW_MCP_AUTO_LOAD",
-    "YAW_MCP_AUTO_ACTIVATE",
-    "YAW_MCP_PRUNE_RESPONSES",
-    "YAW_MCP_DEFAULT_RUNTIME",
-  ] as const;
+  const envVarNames = DOCTOR_ENV_VARS.map((v) => v.name);
   // DEPRECATED key, seeded first so it keeps its position in the emitted
   // object. YAW_MCP_POLL_INTERVAL configured the remote config poll loop,
   // which went with the hosted backend; nothing reads the var any more, so
@@ -928,23 +920,38 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // Prints the STATE section. Broken out so the control flow in
 // runDoctor stays linear — this is already the third file-reading
 // section (config, client probes, history scan).
-// Enumerates the behavior-modifier env vars yaw-mcp actually reads so a
+// THE single list of behavior-modifier env vars yaw-mcp reads at runtime,
+// shared by the text ENVIRONMENT section and the --json `env` block so a
 // support ticket can paste doctor output and we can tell at a glance
-// which knobs are turned on. Leaves TOKEN / URL / DISABLE_PERSISTENCE
-// to their dedicated sections (they have richer context there).
+// which knobs are turned on. Keep it in lockstep with the env table in
+// `yaw-mcp --help` (index.ts) -- the two drifted apart by SEVEN variables
+// once, which is exactly where the drift hurts: doctor is the
+// paste-into-a-ticket surface. Deliberate exclusions when diffing against
+// --help: DISABLE_PERSISTENCE stays in the STATE section (richer context
+// there); YAW_MCP_TRUST_PROJECT in the trust gate; YAW_MCP_CATALOG_URL
+// and YAW_MCP_BASE_URL are endpoint overrides, not behavior toggles, and
+// stay out.
 //
 // The "default when unset" hint next to each unset value is the most
 // useful bit — without it users don't know what the omission means.
+const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string }> = [
+  { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
+  { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
+  { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
+  { name: "YAW_MCP_AUTO_ACTIVATE", defaultHint: "default on" },
+  { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
+  { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
+  { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
+  { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
+  { name: "YAW_MCP_IDLE_THRESHOLD", defaultHint: "adaptive, base 10" },
+  { name: "YAW_MCP_ROUTE_EFFORT", defaultHint: "auto" },
+  { name: "YAW_MCP_REWARD_GRADER", defaultHint: "off" },
+  { name: "YAW_MCP_FOUNDRY", defaultHint: "harvest off" },
+  { name: "YAW_MCP_INSTALL_NUDGE", defaultHint: "nudge off" },
+];
 function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) => void }): void {
   const { env, print } = opts;
-  const vars: Array<{ name: string; defaultHint: string }> = [
-    { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
-    { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
-    { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
-    { name: "YAW_MCP_AUTO_ACTIVATE", defaultHint: "default on" },
-    { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
-    { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
-  ];
+  const vars = DOCTOR_ENV_VARS;
   const widest = vars.reduce((m, v) => Math.max(m, v.name.length), 0);
   print("ENVIRONMENT (behavior overrides)");
   for (const v of vars) {

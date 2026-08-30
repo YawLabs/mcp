@@ -203,13 +203,15 @@ yaw-mcp keeps its config under a `.yaw-mcp/` directory (mirroring `.git/`, `.vsc
 | **project** | `<project>/.yaw-mcp/config.json` | Shared via git with the repo. |
 | **global** | `~/.yaw-mcp/config.json` | Personal default for every project. |
 
-The project `.yaw-mcp/` is found by walking up from the cwd, stopping just before `$HOME` so a `.yaw-mcp/` at `$HOME` is treated as global only. Files may contain `//` and `/* */` comments. Full schema:
+The project `.yaw-mcp/` is found by walking up from the cwd -- stopping just before `$HOME` when started under it (so a `.yaw-mcp/` at `$HOME` is treated as global only); a cwd outside `$HOME` walks to the filesystem root with an ownership check. Files may contain `//` and `/* */` comments. Full schema:
 
 ```jsonc
 {
   "version": 1,                          // schema version; newer versions log a warning
   "servers": ["gh", "pg", "linear"],     // allow-list of namespaces (most-specific scope wins)
-  "blocked": ["prod-db"]                 // deny-list (UNION across all scopes -- fail-safe on deny)
+  "blocked": ["prod-db"],                // deny-list (UNION across all scopes -- fail-safe on deny)
+  "installNudge": true                   // opt-in: discover may suggest installing MCP servers for
+                                         // CLIs found in your recent shell history (off by default)
 }
 ```
 

@@ -7,8 +7,10 @@
 //   3. ~/.yaw-mcp/config.json                — user-global default
 //
 // The project `.yaw-mcp/` directory is discovered by walking up from cwd
-// (see paths.ts findProjectConfigDir), stopping exclusively before $HOME
-// so a `.yaw-mcp/` sitting at $HOME is treated as user-global only.
+// (see paths.ts findProjectConfigDir) -- stopping before $HOME when the
+// walk started under it, so a `.yaw-mcp/` sitting at $HOME is treated as
+// user-global only; a cwd OUTSIDE $HOME walks to the filesystem root with
+// a per-directory ownership check instead.
 //
 // DEPRECATED KEYS: `token` and `apiBase` are no longer read by anything --
 // yaw-mcp is local-only and never contacts a hosted API. A file carrying

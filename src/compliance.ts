@@ -1,9 +1,10 @@
-// Compliance-aware routing helpers. Phase 3 client-side filter keyed on
-// the optional `complianceGrade` field on UpstreamServerConfig (see
-// types.ts). The backend's /api/connect/config doesn't emit grades
-// today -- this code is forward-compatible: once the field starts
-// flowing, the filter kicks in automatically; until then every server
-// is "ungraded" and passes.
+// Compliance-aware routing helpers, keyed on the optional
+// `complianceGrade` field on UpstreamServerConfig (see types.ts). Grades
+// come from the LOCAL grades cache: `yaw-mcp audit <namespace>` writes
+// ~/.yaw-mcp/grades.json, and hydrateComplianceGrades (server.ts) /
+// runList (local-add-cmd.ts) overlay those letters onto the loaded config
+// -- so the YAW_MCP_MIN_COMPLIANCE filter is LIVE for any audited server.
+// A server never audited stays "ungraded" and passes.
 //
 // Policy (matches README + activate tool description):
 //   - Graded server:   must be >= the configured YAW_MCP_MIN_COMPLIANCE.
@@ -51,7 +52,8 @@ export function classifyGrade(grade: string | undefined | null): GradeClassifica
 /**
  * Integer rank for a grade letter (A=4 ... F=0). Case-insensitive.
  * Returns -1 for ungraded AND unrecognized; callers wanting the three-
- * way distinction (ungraded vs garbage) should use passesMinCompliance.
+ * way distinction (graded vs ungraded vs garbage) should use
+ * classifyGrade -- passesMinCompliance collapses it back to a boolean.
  */
 export function gradeRank(grade: string | undefined | null): number {
   const c = classifyGrade(grade);

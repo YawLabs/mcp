@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json",
   "title": "Yaw MCP CLI configuration (.yaw-mcp/config.json)",
-  "description": "Configuration file for the @yawlabs/mcp CLI (bin `yaw-mcp`), which loads MCP servers from your local ~/.yaw-mcp/bundles.json. Resolved in precedence order (most-specific to least-specific): <project>/.yaw-mcp/config.local.json  >  <project>/.yaw-mcp/config.json  >  ~/.yaw-mcp/config.json. The project `.yaw-mcp/` directory is found by walking up from the current directory, stopping just before $HOME. JSONC (comments) is permitted.",
+  "description": "Configuration file for the @yawlabs/mcp CLI (bin `yaw-mcp`), which loads MCP servers from your local ~/.yaw-mcp/bundles.json. Resolved in precedence order (most-specific to least-specific): <project>/.yaw-mcp/config.local.json  >  <project>/.yaw-mcp/config.json  >  ~/.yaw-mcp/config.json. The project `.yaw-mcp/` directory is found by walking up from the current directory -- stopping just before $HOME when started under it; a directory outside $HOME walks to the filesystem root with an ownership check. JSONC (comments) is permitted.",
   "type": "object",
   "additionalProperties": false,
   "properties": {

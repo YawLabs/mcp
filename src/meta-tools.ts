@@ -90,7 +90,7 @@ export const META_TOOLS = {
   health: {
     name: "mcp_connect_health",
     description:
-      "Show health stats for MCP servers loaded in the current session: total calls, error count, average latency, and last error. Installed-but-unloaded servers aren't included — load them first if you need their stats.",
+      "Show health stats for MCP servers loaded in the current session: total calls, error count, average latency, and last error. Per-call telemetry covers LOADED servers only; installed-but-unloaded servers with a poor persisted success rate (<80% across sessions) are listed in a separate cross-session reliability block — do NOT load a server just to see its history, loading it resets the in-session counters to zero.",
     inputSchema: {
       type: "object" as const,
       properties: {},

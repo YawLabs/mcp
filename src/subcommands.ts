@@ -72,14 +72,17 @@ export function suggestSubcommand(input: string, limit = 3): string[] {
  * `-V` -- that gate is what keeps case-insensitive matching safe here.
  *
  * Uses pure levenshtein distance <= 2 (without the prefix/substring tiers
- * that closestNames adds). Prefix matching is unsafe here: `--vers` is a
- * prefix of `--version` but could equally be the start of a genuine server
- * flag; intercepting it as a "did you mean?" would swallow a valid flag
- * before it reaches the server. Edit-distance only gives the same typo
- * coverage without that false-positive surface.
+ * that closestNames adds). Prefix matching would over-trigger: `--vers`
+ * is 3+ edits from nothing, but a prefix tier would "suggest" for any
+ * head-fragment of an alias. Edit-distance only keeps the did-you-mean
+ * to genuine typos.
  *
- * Returns up to `limit` aliases, best first; [] when nothing is close (so
- * genuine long server flags fall through to the server untouched).
+ * Returns up to `limit` aliases, best first; [] when nothing is close.
+ * The CALLER (index.ts) rejects every unknown leading-dash arg with exit
+ * 2 either way -- [] just selects the generic "--help" hint over a
+ * did-you-mean. (runServer reads no argv, so there is no server flag for
+ * an unknown flag to fall through TO; the old pass-through booted a
+ * stdio server on a dead prompt.)
  */
 export function suggestFlag(input: string, limit = 2): string[] {
   if (input.length <= 2) return [];

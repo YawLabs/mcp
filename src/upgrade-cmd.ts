@@ -7,7 +7,7 @@
 //   - local node_modules                           → `npm install @yawlabs/mcp@latest` in that tree's root
 //   - npx cache                                    → restart the MCP client; `npx -y` always pulls the latest
 //   - bundled inside Yaw Terminal (asar.unpacked)  → nothing to run; it updates with the app
-//   - standalone SEA binary                        → download the latest build; replace the executable
+//   - standalone SEA binary (track retired 0.70.3) → `npm install -g @yawlabs/mcp@latest`; delete the old executable
 //   - unknown / dev checkout                       → print the command and let the user decide
 //
 // The --run flag spawns the owning tool for the global-npm, pnpm-global,
@@ -43,7 +43,8 @@
 // be auto-run, so the advertised `--run` deterministically returns 2,
 // not 0. A script that treats 1 as "retry with --run" will always then
 // hit exit 2. This is intentional: these methods require a MANUAL
-// upgrade (download a build / `git pull` / inspect the tree), so the
+// upgrade (the retired-binary npm reinstall / `git pull` / inspect the
+// tree), so the
 // human-facing message says "manual upgrade required" rather than
 // promising --run will fix it. Branch on the `method` field of the
 // --json snapshot (or on exit 2) instead of blindly chaining --run.
@@ -58,10 +59,15 @@ import { realpathSync } from "node:fs";
 
 declare const __VERSION__: string;
 
-/** Where standalone-binary users get a newer build. Single source of truth so
- *  upgrade and doctor point at the same place; confirm the real distribution
- *  channel before the binary install method ships. */
-export const BINARY_DOWNLOAD_URL = "https://github.com/YawLabs/mcp/releases/latest";
+/** The SEA binary track was RETIRED in 0.70.3 (docs/v0.70.3-binary-track-
+ *  decision.md); the last binaries live on the frozen v0.70.2 release --
+ *  OLDER than npm, so pointing users at "releases/latest" was a dead end.
+ *  A binary install still gets detected (real v0.70.2 downloads exist),
+ *  and its upgrade path is: install from npm, delete the old executable.
+ *  Single source of truth for that message so upgrade / auto-upgrade /
+ *  doctor all say the same thing. */
+export const BINARY_RETIRED_HINT =
+  "the standalone-binary track was retired in 0.70.3. Install from npm instead -- `npm install -g @yawlabs/mcp@latest` -- then delete this executable.";
 
 export interface UpgradeCommandOptions {
   /** When true, actually spawn the upgrade command (only for global-npm mode). */
@@ -235,9 +241,14 @@ export function detectInstallMethod(argvPath: string | undefined): InstallMethod
   if (/\/\.bun\/install\/global\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "bun-global";
   if (/\/node_modules\/@yawlabs\/mcp\//.test(normalized)) return "local-node-modules";
   // `npm run dev` or direct `node ./dist/index.js` from a checkout --
-  // not installed at all. Match either yaw-mcp (renamed dir) or mcph
-  // (legacy on-disk dir name, repo at github.com/YawLabs/mcp (renamed from /mcph 2026-05-25)).
-  if (/\/(yaw-mcp|mcph)\/(dist|src)\//.test(normalized)) return "dev-checkout";
+  // not installed at all. `mcp` is the canonical clone dir (`git clone
+  // git@github.com:YawLabs/mcp.git` lands in mcp/); yaw-mcp and mcph are
+  // older on-disk names (repo renamed from /mcph 2026-05-25). Safe to
+  // match the generic `mcp` here: every node_modules-shaped install was
+  // classified above, so a path reaching this test is not inside any
+  // package tree -- without it, the repo's own working tree classified as
+  // "unknown" and was told to `npm install -g` a second global copy.
+  if (/\/(yaw-mcp|mcph|mcp)\/(dist|src)\//.test(normalized)) return "dev-checkout";
   return "unknown";
 }
 
@@ -665,8 +676,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     } else if (method === "bundled-app") {
       print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app — nothing to run.");
     } else if (method === "binary") {
-      print("yaw-mcp is a standalone binary — download the latest build and replace");
-      print(`this executable: ${BINARY_DOWNLOAD_URL}`);
+      print(`yaw-mcp is a standalone binary; ${BINARY_RETIRED_HINT}`);
     } else {
       print("Your install uses `npx -y` — just restart the MCP client when you're back online.");
     }
@@ -700,10 +710,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
 
   if (method === "binary") {
     print("yaw-mcp is running as a standalone binary — manual upgrade required.");
-    print("There's no package manager to upgrade it, and `--run` can't automate");
-    print("this: download the latest build and replace this executable:");
-    print("");
-    print(`  ${BINARY_DOWNLOAD_URL}`);
+    print(`There's no package manager to upgrade it, and \`--run\` can't automate this: ${BINARY_RETIRED_HINT}`);
     // 1→2 scripting trap (see the "SCRIPTING TRAP" note in the file header):
     // plain `upgrade` returns 1, but `--run` returns 2 because a binary can
     // never be auto-run. The message above states "manual upgrade required"

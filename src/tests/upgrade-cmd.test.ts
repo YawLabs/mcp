@@ -204,6 +204,18 @@ describe("detectInstallMethod", () => {
   it("detects dev checkout (dist/)", () => {
     expect(detectInstallMethod("/home/jeff/yaw/yaw-mcp/dist/index.js")).toBe("dev-checkout");
   });
+
+  it("detects the canonical clone dir `mcp/` as a dev checkout", () => {
+    // `git clone git@github.com:YawLabs/mcp.git` lands in mcp/ -- the
+    // repo's own working tree used to classify as "unknown" and get told
+    // to `npm install -g` a second global copy. Every node_modules-shaped
+    // install is classified before this test, so bare `mcp` is safe here:
+    // an install under node_modules/@yawlabs/mcp/ never reaches it.
+    expect(detectInstallMethod("C:/Users/jeff/yaw/yaw_terminal/mcp/dist/index.js")).toBe("dev-checkout");
+    expect(detectInstallMethod("/home/x/mcp/src/index.ts")).toBe("dev-checkout");
+    // ...and the node_modules shape still wins.
+    expect(detectInstallMethod("/usr/lib/node_modules/@yawlabs/mcp/dist/index.js")).not.toBe("dev-checkout");
+  });
 });
 
 describe("detectSea", () => {
@@ -1065,7 +1077,11 @@ describe("runUpgrade", () => {
     expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
   });
 
-  it("tells a standalone-binary user to download the latest build (exit 1, no npm)", async () => {
+  it("tells a standalone-binary user the track was retired: install from npm (exit 1)", async () => {
+    // The SEA binary track was retired in 0.70.3 and the releases page is
+    // frozen at v0.70.2 -- OLDER than npm -- so pointing binary users at
+    // "releases/latest" was a dead end. The path forward is the npm
+    // install plus deleting the old executable.
     const io = captureIO();
     const r = await runUpgrade({
       isSea: () => true,
@@ -1079,8 +1095,10 @@ describe("runUpgrade", () => {
     const out = io.out.join("\n");
     expect(out).toContain("Install: binary");
     expect(out).toContain("standalone binary");
-    expect(out).toContain("github.com/YawLabs/mcp/releases");
-    expect(out).not.toContain("npm install");
+    expect(out).toContain("retired in 0.70.3");
+    expect(out).toContain("npm install -g @yawlabs/mcp@latest");
+    expect(out).toContain("delete this executable");
+    expect(out).not.toContain("releases/latest");
   });
 
   it("with --run on a binary, refuses with exit 2 (no package manager to run)", async () => {
@@ -1101,7 +1119,9 @@ describe("runUpgrade", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(didSpawn).toBe(false);
-    expect(io.out.join("\n")).not.toContain("npm install");
+    // The retired-track hint NAMES the npm command, but only as something
+    // the USER runs manually -- --run must still refuse to spawn anything.
+    expect(io.out.join("\n")).toContain("manual upgrade required");
   });
 
   it("--json reports method: binary with a null command", async () => {
@@ -1190,7 +1210,7 @@ describe("runUpgrade", () => {
     expect(io.out.join("\n")).toContain("nothing to do");
   });
 
-  it("offline + binary points at the release page, not the npx restart message", async () => {
+  it("offline + binary says the track was retired, not the npx restart message", async () => {
     const io = captureIO();
     const r = await runUpgrade({
       isSea: () => true,
@@ -1203,7 +1223,7 @@ describe("runUpgrade", () => {
     expect(r.exitCode).toBe(0);
     const out = io.out.join("\n");
     expect(out).toContain("standalone binary");
-    expect(out).toContain("releases/latest");
+    expect(out).toContain("retired in 0.70.3");
     expect(out).not.toContain("npx");
   });
 });

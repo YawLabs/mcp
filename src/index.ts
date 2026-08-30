@@ -251,7 +251,7 @@ if (subcommand === "compliance") {
                              server and print the grade.
     audit <namespace>        Run the compliance suite against a stdio server
                              from your bundles.json and cache its A-F grade in
-                             ~/.yaw-mcp/grades.json (shown in \`servers\` + the
+                             ~/.yaw-mcp/grades.json (shown in \`list\` + the
                              Yaw Terminal MCP panel).
     foundry export           MAINTAINER. Fold the opt-in dispatch harvest
                              (~/.yaw-mcp/foundry.jsonl, written only while
@@ -391,17 +391,21 @@ if (subcommand === "compliance") {
   process.stderr.write(`yaw-mcp: unknown subcommand "${subcommand}".${hint}\n`);
   process.exitCode = 2;
 } else {
-  // Long-form leading-dash near-miss of a known flag alias (e.g.
-  // `--versionn`, `--hepl`). Without this it would fall through to
-  // runServer and hang as a stdio MCP server with no diagnostic.
-  // suggestFlag returns [] for short single-letter flags and for genuine
-  // long server flags with no close match, so those still pass through to
-  // runServer below — this only catches typos of the dispatcher's own flags.
-  // Computed ONCE here (it used to run in both the branch condition and
-  // the body) and reused for the message.
-  const flagSuggestions = subcommand ? suggestFlag(subcommand) : [];
-  if (flagSuggestions.length > 0) {
-    process.stderr.write(`yaw-mcp: unknown flag "${subcommand}". Did you mean: ${flagSuggestions.join(", ")}?\n`);
+  // ANY leading-dash argument is an unknown flag: reject with exit 2 (plus
+  // a did-you-mean when suggestFlag has a close match) instead of booting
+  // the stdio server. The old pass-through defended "genuine long server
+  // flags" -- but runServer reads no argv and the installers write none, so
+  // the protected surface never existed, and `yaw-mcp --verbose` / `-x`
+  // silently hung as an MCP server on a dead prompt (the exact
+  // ship-blocker the --HELP test calls out). A bare `yaw-mcp` (subcommand
+  // undefined) still starts the server -- that IS the server launch.
+  if (subcommand !== undefined) {
+    const flagSuggestions = suggestFlag(subcommand);
+    const hint =
+      flagSuggestions.length > 0
+        ? ` Did you mean: ${flagSuggestions.join(", ")}?`
+        : " Run `yaw-mcp --help` for the list of subcommands and flags.";
+    process.stderr.write(`yaw-mcp: unknown flag "${subcommand}".${hint}\n`);
     process.exitCode = 2;
   } else {
     // Startup failure path. runServer() registers a last-resort

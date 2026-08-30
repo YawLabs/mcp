@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_OS } from "../install-targets.js";
 import {
+  compareVersions,
   createProbeCollector,
   isOamCommand,
   isOamLaunch,
@@ -1761,6 +1762,23 @@ describe("probeOam hardening", () => {
     expect(freshCalls, "stale probe's cleanup released the live probe's slot").toHaveLength(1);
     expect(a).toEqual(b);
     expect(a.version).toBe("1.2.3");
+  });
+});
+
+describe("MIN_OAM_VERSION freshness floor", () => {
+  it("is at least 0.12.1 (bump this literal when you bump the floor)", () => {
+    // POLICY (see the constant's doc): the floor tracks the LATEST oam
+    // release, bumped with every release. This literal-floor pin mirrors
+    // the UV_VERSION freshness test in uv-bootstrap.test.ts: every other
+    // MIN_OAM_VERSION assertion derives its fixture FROM the constant, so
+    // without this a stale floor was invisible to the suite. The contract
+    // is ONE-directional: the constant can never drop below this literal
+    // (a revert fails here); raising the constant without the literal
+    // passes and merely leaves this pin weak, so bump BOTH together.
+    // Catching a NEW upstream release still takes the release checklist --
+    // a network-dependent freshness gate is deliberately out (see the
+    // doctor-cmd stance on network in tests).
+    expect(compareVersions(MIN_OAM_VERSION, "0.12.1")).toBeGreaterThanOrEqual(0);
   });
 });
 
