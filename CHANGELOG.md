@@ -2,7 +2,17 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased
+## 0.78.0 -- the vault passphrase prompt reaches the code that needed it, and sidecars stop drifting
+
+**Added -- sidecars stopped moving, and nothing said so**
+
+`sidecars install` exists to pin: it trades npx's per-spawn `@latest` re-resolution for a tree that runs the same bytes every time, and `sidecars-cmd.ts` says so outright ("The version pins itself"). What it never had was anything to move the pin afterward, so a sidecar sat on whatever version the last manual install happened to fetch, indefinitely and silently. Found the obvious way: a machine running `@yawlabs/tailscale-mcp` 0.13.3 against a published 0.18.0, five minor versions behind, with `doctor` reporting the installed version and no indication it was stale.
+
+`serve` now checks staleness in the background on the same fire-and-forget footing as `maybeAutoUpgrade`, and refreshes so the NEXT spawn picks it up. The running session's pin is never swapped underneath it -- that is the property sidecars were bought for, and an "auto-update" that broke it would be worse than the staleness.
+
+Four things keep the pinning intact. Only `@latest` / unpinned specs are eligible: an explicit `@0.13.3` is the user's stated intent and is never auto-moved, it lands in `skipped` with that reason. It never downgrades -- installed ahead of the registry (a linked dev build, a release yanked after we fetched it) is not stale -- and the comparison is semver via `oam-spawn`'s `compareVersions`, never a string compare, because "0.9.0" against "0.10.0" is exactly the pair a lexicographic compare gets backwards. The 24h throttle records a timestamp only when a check actually ran, so losing the lock to another pane retries next startup instead of sitting out a day on a refresh that never happened. And the background npm runner is injected with `stdio: "ignore"`: the default routes npm's stdout to fd 2 and inherits stderr, which from inside `serve` would put install progress into the served MCP stream.
+
+`doctor` marks a stale package inline and says WHY it will not be picked up when the reason is a deliberate pin rather than a missed check -- "re-run `yaw-mcp sidecars install`" is advice that cannot succeed against an explicit pin. Opt out with `YAW_MCP_SIDECAR_REFRESH=0`.
 
 **Fixed -- the vault passphrase prompt asked the user, then threw the answer away**
 
@@ -11,6 +21,18 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 The refusal is now a typed `VaultPassphraseRequiredError` carrying the namespace and the referencing env keys, and the activation path routes it to a dedicated prompt that stores the answer in a module-level session value `resolveServerEnv` actually reads. Deliberately not `process.env`: every local spawn builds its child env from `stripInternalSecretsFromEnv(process.env)`, so a passphrase parked there would be one strip-list bug away from every upstream. Asked at most once per session (one vault, one passphrase) and latched when asked, not when answered, so a decline is honoured rather than re-prompted on the next server that touches the vault.
 
 Matching by error TYPE rather than by message text also closes a phishing shape the generic path allowed: the credential haystack includes a child's stderr, so a server that printed "YAW_MCP_VAULT_PASSPHRASE is not set" could be handed the vault passphrase, through a prompt naming the server rather than yaw-mcp, and the value would then be merged into that same server's env on retry. The generic elicitation path now filters out `INTERNAL_SECRET_ENV_KEYS` entirely.
+
+**Fixed -- a wrong vault passphrase was a dead end, and a typed one was unrecoverable**
+
+Three defects found reviewing the above. A WRONG `YAW_MCP_VAULT_PASSPHRASE` threw a raw unlock error, which reached the generic missing-credential path where the internal-key filter (correctly) refuses to elicit yaw-mcp's own secrets -- so nothing offered a correction and every vault-backed server failed for the life of the process. An unlock failure now throws the same typed error tagged `reason: "invalid"`, with wording that does not tell a user who set the variable that it is unset. That also makes the session-over-env precedence reachable for the first time; while the only prompt fired on a wholly absent passphrase, a session value could never coexist with an env one and the ordering decided nothing.
+
+The elicited value was stored in module-global state BEFORE anything checked it, and the ask-once latch then made a single transposed character cost the session. It is verified against the vault before it is stored, the budget is two prompts rather than one, and a rejected typo no longer latches -- while an explicit decline still ends it immediately. A corrupt check marker (the passphrase is right, the marker is damaged) is deliberately re-thrown untouched rather than turned into a prompt for a passphrase that was never wrong.
+
+The passphrase also outlived the server that collected it: it lives in a module variable so no child env can inherit it, which meant a second `ConnectServer` in one process inherited plaintext its own user never typed. `shutdown()` now clears it, making its lifetime the server's -- what the prompt ("for this session") told the user. Separately, a vault refusal is decided before any child spawns, so it no longer burns the 1s retry and the warn-level "retrying" line that read like a transient spawn failure.
+
+**Fixed -- `doctor` told remote servers they would fail to start over a locked vault**
+
+The new SECRET VAULT section listed every server whose configured env carried `${secret:...}`, including remote entries. A remote entry's env is never sent anywhere -- `resolveServerEnv` never runs for one, and the connect logs "Ignoring env on a remote server" and proceeds unauthenticated -- so the section reported a cause that did not exist and sent the reader to unlock a vault that was never in the path. It now considers local servers only.
 
 **Added -- `doctor` gained a SECRET VAULT section, and `--help` finally lists the passphrase**
 
