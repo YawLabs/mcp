@@ -81,8 +81,19 @@ import {
 } from "./sampling-rank.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 import { type CapDecision, evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
+import { maybeRefreshSidecars } from "./sidecar-refresh.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
-import { ActivationError, connectToUpstream, type DownstreamClientBridge, disconnectFromUpstream } from "./upstream.js";
+import {
+  ActivationError,
+  clearSessionVaultPassphrase,
+  connectToUpstream,
+  type DownstreamClientBridge,
+  disconnectFromUpstream,
+  INTERNAL_SECRET_ENV_KEYS,
+  setSessionVaultPassphrase,
+  VaultPassphraseRequiredError,
+  verifyVaultPassphrase,
+} from "./upstream.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
 import { ensureUv, uvLaunchKind } from "./uv-bootstrap.js";
 
@@ -151,6 +162,17 @@ export function resolveToolExposure(): ToolExposure {
 // the idle reaper unloads it. adaptiveThreshold() (idle-ttl.ts) stacks a
 // per-namespace bonus on top of this and clamps the result to [5, 50].
 export const DEFAULT_IDLE_CALL_THRESHOLD = 10;
+
+/** How many times one session may ask for the vault passphrase, across every
+ *  namespace. Two, not one: the value is typed by a human into a no-echo
+ *  field, and each entry is verified before it is stored, so the second ask
+ *  exists purely to make a transposed character cost a retry instead of the
+ *  session. Not higher -- an elicitation is a modal interruption in the
+ *  user's client, and someone who does not know the passphrase is not going
+ *  to recall it on the third prompt. Mirrors secrets-cmd's
+ *  MAX_PASSPHRASE_PROMPTS, which bounds the CLI's TTY re-prompts the same
+ *  way and for the same reason. */
+export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
 
 // Last baseline the clamp warning in resolveIdleThreshold fired for. Keyed on
 // the VALUE, not a boolean, so a session (or a test) that changes the env to a
@@ -416,6 +438,18 @@ export class ConnectServer {
   // Cleared on shutdown — persistence belongs in the Yaw MCP
   // bundles.json, these are a "get me running now" shortcut.
   private elicitedEnv = new Map<string, Record<string, string>>();
+  // Stop-asking latch for the VAULT PASSPHRASE elicitation. Not keyed by
+  // namespace like elicitedEnv, because the passphrase is not per-server --
+  // one vault, one passphrase, and every server with `${secret:...}` refs
+  // needs the same one. Set by a VERIFIED passphrase, an explicit decline, or
+  // exhausting MAX_VAULT_PASSPHRASE_PROMPTS. A rejected typo deliberately
+  // does NOT set it: the value is verified before it is stored, so a slip
+  // costs one retry instead of every vault-backed server for the session.
+  private vaultPassphraseElicited = false;
+  // How many times we have ASKED this session, across every namespace.
+  // Separate from the latch so a wrong entry stays re-askable while still
+  // being bounded -- the pestering maybeElicitAndRetry exists to avoid.
+  private vaultPassphrasePrompts = 0;
   // In-flight activation promises, keyed by namespace. Dedupes
   // concurrent activation attempts for the same namespace so that two
   // tool calls landing on a disconnected upstream don't each spawn
@@ -1028,6 +1062,22 @@ export class ConnectServer {
     // Not handshake-gated: it spawns no upstream, so the capability
     // snapshot is irrelevant to it.
     maybeAutoUpgrade().catch((err: Error) => log("warn", "Auto-upgrade check failed", { error: err?.message }));
+
+    // The same check one level down: maybeAutoUpgrade above refreshes yaw-mcp
+    // itself, this refreshes the managed SIDECAR tree it spawns servers from.
+    // Needed because `sidecars install` trades npx's per-spawn re-resolution
+    // for a copy on disk -- an oam-hosted server runs that copy and cannot
+    // re-resolve "@latest", so without this the tree sits at whatever version
+    // the last manual `yaw-mcp sidecars install` happened to fetch, forever.
+    // No-op for npx users (nothing managed to refresh) and for explicitly
+    // pinned specs, which are the user's stated version and never auto-moved.
+    //
+    // Fire-and-forget for its sibling's reasons, and emphatically not awaited:
+    // the work it can trigger is an `npm install` that runs for tens of
+    // seconds. Ordering against maybeAutoUpgrade does not matter -- they touch
+    // different trees (the global prefix vs ~/.yaw-mcp/sidecars) and each
+    // serializes itself with its own lockfile.
+    maybeRefreshSidecars().catch((err: Error) => log("warn", "Sidecar refresh check failed", { error: err?.message }));
 
     log("info", "yaw-mcp started", {
       servers: this.config?.servers.length ?? 0,
@@ -2525,6 +2575,14 @@ export class ConnectServer {
           };
         } catch (err) {
           lastError = err;
+          // A locked or wrong-passphrase vault is decided BEFORE any child is
+          // spawned, from state that cannot change in a second. Retrying it
+          // buys nothing and costs the fixed 1s sleep plus a warn-level
+          // "retrying" line that reads like a transient spawn failure -- on a
+          // startup prewarming several vault-backed servers that is seconds of
+          // dead time on the connect path. Go straight to the elicitation
+          // branch below, which is the only thing that CAN change the outcome.
+          if (err instanceof VaultPassphraseRequiredError) break;
           if (attempt === 0) {
             const msg = err instanceof Error ? err.message : String(err);
             log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
@@ -2585,10 +2643,26 @@ export class ConnectServer {
     progress?: ProgressReporter,
     fromPrewarm = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
+    // yaw-mcp's OWN vault passphrase is a separate path, matched by ERROR
+    // TYPE rather than by pattern-matching text. resolveServerEnv throws
+    // before any child is spawned, so there is no child stderr in play and no
+    // way for an upstream to induce this prompt by printing the right words.
+    if (lastError instanceof VaultPassphraseRequiredError) {
+      return this.elicitVaultPassphraseAndRetry(namespace, lastError, progress, fromPrewarm);
+    }
+
     const stderr = lastError instanceof ActivationError ? lastError.stderrTail : undefined;
     const errMessage = lastError instanceof Error ? lastError.message : String(lastError);
     const haystack = [stderr, errMessage].filter(Boolean).join("\n");
-    const missing = detectMissingCredentials(haystack);
+    // Never elicit yaw-mcp's own secrets on this path. The haystack includes
+    // a CHILD's stderr, and detectMissingCredentials happily matches
+    // "YAW_MCP_VAULT_PASSPHRASE is not set" in it -- so without this filter a
+    // server could print that line and be handed the vault passphrase, via a
+    // prompt that names the server rather than yaw-mcp. Worse, the accepted
+    // value lands in elicitedEnv and is merged into that same child's env on
+    // retry, walking straight past stripInternalSecretsFromEnv. The genuine
+    // case is the typed branch above.
+    const missing = detectMissingCredentials(haystack).filter((k) => !INTERNAL_SECRET_ENV_KEYS.has(k.toUpperCase()));
     if (missing.length === 0) return null;
 
     // Skip if we've already elicited these exact values — that means we
@@ -2661,6 +2735,112 @@ export class ConnectServer {
     // runActivateOne as a REAL activation, so a prewarm spawn that elicited
     // credentials could be refused by the cap prewarm is exempt from --
     // resurrecting the silent-invisibility UX the exemption exists to stop.
+    return this.runActivateOne(namespace, progress, fromPrewarm);
+  }
+
+  // The vault-passphrase counterpart to maybeElicitAndRetry. Split out
+  // rather than folded in because almost nothing about the generic path
+  // transfers: there is exactly one value, its name is fixed, it must NOT be
+  // remembered in elicitedEnv (that map is merged into the CHILD's env), and
+  // the retry hinges on a process-wide session value instead of a per-server
+  // override.
+  //
+  // Bounded by attempts rather than latched after one ask, because the value
+  // is typed by a human into a no-echo field: a single transposed character
+  // otherwise cost the entire session. Each entry is VERIFIED against the
+  // vault before it is stored (see verifyVaultPassphrase), so a wrong one is
+  // rejected without ever becoming the session passphrase, and the user gets
+  // MAX_VAULT_PASSPHRASE_PROMPTS tries in total across every server. A
+  // decline still ends it immediately -- that is an answer, not a typo.
+  private async elicitVaultPassphraseAndRetry(
+    namespace: string,
+    lastError: VaultPassphraseRequiredError,
+    progress?: ProgressReporter,
+    fromPrewarm = false,
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
+    if (this.vaultPassphraseElicited) return null;
+
+    const caps = this.server.getClientCapabilities();
+    if (!caps?.elicitation) {
+      log("info", "Vault is locked but client does not support elicitation", {
+        namespace,
+        refKeys: lastError.refKeys,
+        reason: lastError.reason,
+      });
+      return null;
+    }
+
+    // Count the ask BEFORE the round-trip: an elicitInput that throws must
+    // still consume an attempt, or a client failing that request in a loop
+    // would re-prompt on every server with vault refs, forever.
+    this.vaultPassphrasePrompts++;
+    if (this.vaultPassphrasePrompts >= MAX_VAULT_PASSPHRASE_PROMPTS) this.vaultPassphraseElicited = true;
+    progress?.("Vault is locked -- asking for the passphrase");
+
+    // The two reasons need different words. "invalid" means a passphrase IS
+    // configured and does not work; telling that user the vault is merely
+    // "locked" reads as though they forgot to set something they did set.
+    const why =
+      lastError.reason === "invalid"
+        ? `the vault passphrase yaw-mcp has does not unlock your local secret vault (${lastError.refKeys.join(", ")} reference it). Enter the correct passphrase to use for this session, or decline to cancel. The value in YAW_MCP_VAULT_PASSPHRASE is wrong or belongs to a different vault -- fix it there to stop this recurring.`
+        : `its env (${lastError.refKeys.join(", ")}) references your local secret vault, which is locked. Enter your vault passphrase to unlock it for this session, or decline to cancel. Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env to skip this prompt in future sessions.`;
+
+    let result: Awaited<ReturnType<Server["elicitInput"]>>;
+    try {
+      result = await this.server.elicitInput({
+        message: `"${namespace}" cannot start: ${why}`,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            YAW_MCP_VAULT_PASSPHRASE: {
+              type: "string",
+              title: "Vault passphrase",
+              description:
+                "Unlocks ~/.yaw-mcp/secrets.json. Kept in memory for this session only -- never written to disk, and never passed to the server being started.",
+            },
+          },
+          required: ["YAW_MCP_VAULT_PASSPHRASE"],
+        },
+      });
+    } catch (err) {
+      log("warn", "Vault passphrase elicitation failed", {
+        namespace,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+
+    if (result.action !== "accept" || !result.content) {
+      // An explicit decline is a decision, not a slip -- stop asking.
+      this.vaultPassphraseElicited = true;
+      log("info", "User declined vault passphrase elicitation", { namespace, action: result.action });
+      return null;
+    }
+
+    const value = result.content.YAW_MCP_VAULT_PASSPHRASE;
+    if (typeof value !== "string" || value.length === 0) return null;
+
+    // VERIFY before storing. setSessionVaultPassphrase writes module-global
+    // state that shadows the env var for every later resolve, so an unverified
+    // value does not merely fail once -- it replaces a possibly-correct
+    // YAW_MCP_VAULT_PASSPHRASE with a typo for the rest of the process.
+    if (!(await verifyVaultPassphrase(value))) {
+      log("info", "Elicited vault passphrase did not unlock the vault", {
+        namespace,
+        attempt: this.vaultPassphrasePrompts,
+      });
+      progress?.("That passphrase did not unlock the vault");
+      return null;
+    }
+
+    // Into the module-level session slot, deliberately NOT into elicitedEnv:
+    // runActivateOne merges that map over the server's configured env, so
+    // storing it there would hand the vault passphrase to the very child we
+    // are unlocking the vault FOR.
+    setSessionVaultPassphrase(value);
+    // Verified, so no further asking is warranted whatever happens next.
+    this.vaultPassphraseElicited = true;
+    progress?.("Got the passphrase -- retrying load");
     return this.runActivateOne(namespace, progress, fromPrewarm);
   }
 
@@ -4009,6 +4189,16 @@ export class ConnectServer {
     // embedded or test host that wants another session constructs another
     // ConnectServer.
     this.elicitedEnv.clear();
+    // Same contract, one scope wider. The vault passphrase lives in a MODULE
+    // variable in upstream.ts (so no child env can ever inherit it), which
+    // means it outlives this instance rather than being collected with it --
+    // "session-scoped by construction" only holds when the process lifetime
+    // equals the server lifetime. Two ConnectServers in one process would
+    // otherwise share a passphrase while owning independent ask-latches, so
+    // the second inherits plaintext its own user never typed. Clearing here
+    // makes the passphrase's lifetime the SERVER's, which is what the prompt
+    // that collected it ("for this session") told the user.
+    clearSessionVaultPassphrase();
     this.inflightCalls.clear();
 
     await this.server.close();

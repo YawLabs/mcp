@@ -22,7 +22,15 @@ import { defaultRuntime } from "./default-runtime.js";
 import { log } from "./logger.js";
 import { oamHeapOomHint, probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
-import { hasSecretRefs, loadVault, resolveSecretRefs, SECRET_REF_RE, unlock, vaultPath } from "./secrets-vault.js";
+import {
+  hasSecretRefs,
+  loadVault,
+  resolveSecretRefs,
+  SECRET_REF_RE,
+  unlock,
+  VAULT_CHECK_CORRUPT_ERROR,
+  vaultPath,
+} from "./secrets-vault.js";
 import type {
   UpstreamConnection,
   UpstreamPromptDef,
@@ -33,6 +41,130 @@ import type {
 import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 /**
+ * Thrown when a server's env carries `${secret:...}` refs and NO passphrase
+ * is available to unlock the vault with.
+ *
+ * Typed rather than a bare Error so the activation path can tell the two
+ * "missing credential" cases apart. They must never be conflated: this one
+ * means YAW-MCP ITSELF needs its vault passphrase, and is the only case that
+ * may be answered by prompting for `YAW_MCP_VAULT_PASSPHRASE`. The other --
+ * a CHILD server writing "SOME_TOKEN is required" to stderr -- is the child's
+ * own missing credential, and a child must never be able to talk the user
+ * into typing the vault passphrase into a prompt attributed to it.
+ *
+ * Deliberately NOT an ActivationError: that type carries a stderr tail from a
+ * process that actually ran, and drives the spawn-failure categorisation. The
+ * vault refusal happens BEFORE any child is spawned.
+ *
+ * The "missing" message is byte-identical to the plain Error this replaced --
+ * callers, logs, and tests match on its text.
+ */
+export class VaultPassphraseRequiredError extends Error {
+  constructor(
+    message: string,
+    public readonly namespace: string,
+    public readonly refKeys: readonly string[],
+    /** Which way the passphrase failed:
+     *    "missing" -- none was available at all.
+     *    "invalid" -- one WAS available and did not open the vault.
+     *
+     *  Both are answerable by asking the user, which is the whole reason
+     *  "invalid" throws this type rather than falling through as a bare
+     *  unlock error. Without it a WRONG `YAW_MCP_VAULT_PASSPHRASE` was a
+     *  dead end: the unlock error went to the generic missing-credential
+     *  path, where the INTERNAL_SECRET_ENV_KEYS filter (correctly) refuses
+     *  to elicit yaw-mcp's own secrets, so nothing offered a correction and
+     *  every vault-backed server failed for the life of the process. It is
+     *  also what makes vaultPassphrase()'s session-over-env precedence
+     *  reachable: only an "invalid" throw can produce a prompt while an env
+     *  var is set, and the answer to it has to win over the value that just
+     *  failed. */
+    public readonly reason: "missing" | "invalid" = "missing",
+  ) {
+    super(message);
+    this.name = "VaultPassphraseRequiredError";
+  }
+}
+
+/** Vault passphrase captured from an in-session MCP elicitation.
+ *
+ *  Held in a module variable and NOT written back to `process.env`, which is
+ *  load-bearing rather than stylistic: every local spawn builds its child env
+ *  from `stripInternalSecretsFromEnv(process.env)`, so a passphrase parked in
+ *  `process.env` would be one strip-list bug away from every upstream child.
+ *  Keeping it here means the child env physically cannot carry it, whatever
+ *  the strip list says. Session-scoped by construction -- the process exits,
+ *  it is gone; nothing writes it to disk. */
+let sessionVaultPassphrase: string | null = null;
+
+/** Record a passphrase supplied by the user this session. Empty clears, so a
+ *  declined or blank elicitation cannot install "" as the vault passphrase
+ *  (deriving a key from "" is exactly what secrets-cmd refuses too). */
+export function setSessionVaultPassphrase(passphrase: string): void {
+  sessionVaultPassphrase = passphrase.length > 0 ? passphrase : null;
+}
+
+/** Drop the session passphrase. Exported for tests, which must not leak one
+ *  case's passphrase into the next, and called from ConnectServer.shutdown so
+ *  a second server in the same process does not inherit the first's. */
+export function clearSessionVaultPassphrase(): void {
+  sessionVaultPassphrase = null;
+}
+
+/** Does `passphrase` actually open the vault?
+ *
+ *  Exists so a passphrase typed at an elicitation prompt can be checked BEFORE
+ *  setSessionVaultPassphrase commits it to module-global state that shadows
+ *  the env var for the rest of the process. Verifying afterwards is not
+ *  equivalent: by then a typo has already displaced a possibly-correct
+ *  YAW_MCP_VAULT_PASSPHRASE.
+ *
+ *  Returns true when there is NO vault yet -- there is nothing to verify
+ *  against, unlock() accepts any passphrase for an empty vault, and the real
+ *  refusal for that case ("no vault exists yet") belongs to resolveServerEnv.
+ *  Never throws: an unreadable or corrupt vault is not the typed passphrase's
+ *  fault, so it verifies as true and lets the resolve path report the real
+ *  error with its own wording. */
+export async function verifyVaultPassphrase(passphrase: string): Promise<boolean> {
+  if (passphrase.length === 0) return false;
+  let vault: Awaited<ReturnType<typeof loadVault>>;
+  try {
+    vault = await loadVault(vaultPath());
+  } catch {
+    return true;
+  }
+  if (!vault) return true;
+  try {
+    await unlock(vault, passphrase);
+    return true;
+  } catch (err) {
+    // The passphrase is right; the check marker is damaged. Not a reason to
+    // reject what the user typed.
+    return (err instanceof Error ? err.message : String(err)) === VAULT_CHECK_CORRUPT_ERROR;
+  }
+}
+
+/** The passphrase to unlock the vault with, or undefined when there is none.
+ *
+ *  The session value wins over the env var, and the ordering matters in
+ *  exactly one case: the env var is set but WRONG. The operator answers the
+ *  "invalid" prompt with the right passphrase, and preferring the stale env
+ *  value would make that correction unreachable for the rest of the session.
+ *  That case is only REACHABLE because an unlock failure throws
+ *  VaultPassphraseRequiredError with reason "invalid" -- see the throw in
+ *  resolveServerEnv. While the only prompt fired on a wholly absent
+ *  passphrase, a session value could never coexist with an env one and this
+ *  ordering decided nothing.
+ *
+ *  An empty/absent session value falls through, so the plain env path is
+ *  untouched. Case-insensitive on Windows via process.env's own lookup
+ *  semantics -- the same property stripInternalSecretsFromEnv relies on. */
+export function vaultPassphrase(): string | undefined {
+  if (sessionVaultPassphrase !== null) return sessionVaultPassphrase;
+  return process.env.YAW_MCP_VAULT_PASSPHRASE;
+}
+
+/**
  * Resolve `${secret:NAME}` references in an upstream server's env
  * against the local secret vault. Fail-closed:
  *   - No refs in env: pass through unchanged (free path, no vault load).
@@ -41,12 +173,12 @@ import { resolveUvSpawn } from "./uv-bootstrap.js";
  *     leak the placeholder into logs or be interpreted as a real token
  *     by some servers, which is worse than refusing to spawn.
  *
- * Phase 6c ships passphrase-from-env only (YAW_MCP_VAULT_PASSPHRASE)
- * because the spawn happens in a non-interactive MCP-server context
- * where prompting on stdin would corrupt the parent's transport.
- * Per-server prompting would require a separate `yaw-mcp unlock`
- * step that pre-seeds the derived key into a session file -- that
- * is deferred to a follow-up.
+ * The spawn happens in a non-interactive MCP-server context, so there is
+ * no stdin to prompt on -- writing one would corrupt the parent's JSON-RPC
+ * transport. The passphrase therefore comes from the env, or from an
+ * in-session MCP elicitation the server layer answers on our behalf when
+ * the client supports one (see VaultPassphraseRequiredError and
+ * setSessionVaultPassphrase below).
  */
 export async function resolveServerEnv(
   env: Record<string, string>,
@@ -56,10 +188,15 @@ export async function resolveServerEnv(
   const refKeys = Object.entries(env)
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
     .map(([k]) => k);
-  const passphrase = process.env.YAW_MCP_VAULT_PASSPHRASE;
+  const passphrase = vaultPassphrase();
   if (typeof passphrase !== "string" || passphrase.length === 0) {
     log("warn", "Server env carries ${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set", { keys: refKeys });
-    throw new Error("vault locked: server env references ${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set");
+    throw new VaultPassphraseRequiredError(
+      "vault locked: server env references ${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set",
+      namespace,
+      refKeys,
+      "missing",
+    );
   }
   const vault = await loadVault(vaultPath()).catch((err) => {
     log("warn", "Failed to load vault for env resolution", {
@@ -70,7 +207,32 @@ export async function resolveServerEnv(
   if (!vault) {
     throw new Error("vault locked: server env references ${secret:...} but no vault exists yet");
   }
-  const key = await unlock(vault, passphrase);
+  // A passphrase that does not open the vault is a question for the user, not
+  // a dead end -- so it throws the SAME typed error as no passphrase at all,
+  // tagged "invalid". Without this a wrong YAW_MCP_VAULT_PASSPHRASE was
+  // unrecoverable in-session: the raw unlock error fell through to the generic
+  // missing-credential path, which (correctly) refuses to elicit yaw-mcp's own
+  // secrets, so nothing could offer the correction.
+  //
+  // VAULT_CHECK_CORRUPT_ERROR is deliberately re-thrown untouched: that error
+  // means the passphrase IS correct and the check marker is damaged, so a
+  // prompt would ask the user to re-type a passphrase that was never wrong and
+  // then fail identically. Anything else here is a decrypt failure, which is
+  // what a wrong passphrase looks like.
+  let key: Buffer;
+  try {
+    key = await unlock(vault, passphrase);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === VAULT_CHECK_CORRUPT_ERROR) throw err;
+    log("warn", "Vault passphrase did not unlock the vault", { namespace, keys: refKeys });
+    throw new VaultPassphraseRequiredError(
+      `vault locked: the passphrase available to yaw-mcp does not unlock the vault (${msg})`,
+      namespace,
+      refKeys,
+      "invalid",
+    );
+  }
   const { resolved, missing } = resolveSecretRefs(env, vault, key);
   // Audit which secrets were consumed for this spawn -- NAME + namespace
   // only, never a value. Wrapped in try/catch (and each append is itself

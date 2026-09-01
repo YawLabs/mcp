@@ -4,7 +4,7 @@
 
 Yaw MCP (the `yaw-mcp` CLI) is an MCP server that fronts every other MCP server you use. Point each AI client (Claude Code, Claude Desktop, Cursor, VS Code) at it once, and your servers load lazily from a single connection instead of a hand-edited `mcpServers` block per client.
 
-It runs entirely on your machine. No account, no sign-in, no telemetry -- your servers live in a local `bundles.json` and your credentials in a local encrypted vault. Running as an MCP server, its only outbound call is a background npm check for its own updates (`YAW_MCP_AUTO_UPGRADE=0` to disable); `yaw-mcp add` fetches the public server catalog on demand.
+It runs entirely on your machine. No account, no sign-in, no telemetry -- your servers live in a local `bundles.json` and your credentials in a local encrypted vault. Running as an MCP server, its only outbound calls are two background npm checks: one for its own updates (`YAW_MCP_AUTO_UPGRADE=0` to disable), and, if you have run `yaw-mcp sidecars install`, a once-a-day check that the managed sidecar packages are current (`YAW_MCP_SIDECAR_REFRESH=0` to disable). `yaw-mcp add` fetches the public server catalog on demand. Nothing else leaves your machine.
 
 It earns its keep when you hit any of these:
 
@@ -232,7 +232,15 @@ Rather than putting credentials in a client config, keep a value in an encrypted
 }
 ```
 
-At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env. If the passphrase is absent or a name isn't stored, the literal `${secret:NAME}` passes through unchanged, so the child surfaces its own "missing credential" error rather than an empty string. The value never leaves your machine.
+At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env. If the passphrase is absent or a name isn't stored, the spawn is **refused** -- the literal `${secret:NAME}` is never passed through, since some servers would treat the placeholder as a real token. The value never leaves your machine.
+
+**Where the passphrase comes from.** Three ways, in the order you'll meet them:
+
+1. **`YAW_MCP_VAULT_PASSPHRASE` in yaw-mcp's own env** -- the `env` block of the *yaw-mcp* entry in your MCP client config, not the upstream server's (yaw-mcp strips its own secrets from every child env). This is the only option for a spawn, which happens over stdio with no terminal to prompt on.
+2. **An in-session prompt.** If your client supports MCP [elicitation](https://modelcontextprotocol.io/specification/server/elicitation), a locked vault asks for the passphrase once per session and retries the server. It's held in memory for that session only -- never written to disk, and never handed to the server being started.
+3. **The CLI prompt**, for `yaw-mcp secrets` runs: no-echo on a real TTY. Note that Git Bash/MSYS can't offer one (Node sees pipes, not a TTY) -- use PowerShell, `winpty`, or the env var there.
+
+`yaw-mcp doctor` has a **SECRET VAULT** section showing what's stored, which servers reference it, and whether a passphrase is available -- start there when a server won't load. It reports names and a yes/no, never a value.
 
 ```bash
 yaw-mcp secrets set <name>      # store a value (no-echo prompt, or --value/--stdin)
@@ -278,9 +286,10 @@ Common ones (run `yaw-mcp --help` for the full list):
 |----------|-------------|
 | `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. |
 | `YAW_MCP_MIN_COMPLIANCE` | Minimum grade (`A`-`F`) an installed server must report before `activate` loads it. |
-| `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution. |
+| `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution -- set it in yaw-mcp's own env, not the upstream server's. Clients supporting elicitation prompt for it instead. |
 | `YAW_MCP_AUTO_ACTIVATE` | `0` disables discover auto-loading a clearly-winning server. Default on. |
 | `YAW_MCP_AUTO_UPGRADE` | `0` disables the background self-upgrade check at startup. Default on. |
+| `YAW_MCP_SIDECAR_REFRESH` | `0` disables the daily background check that keeps managed sidecars current. Only ever runs if you have run `yaw-mcp sidecars install`; explicit pins and semver ranges are never moved. Default on. |
 | `YAW_MCP_AUTO_LOAD` | `1` pre-activates the top recurring pack at startup (needs persistence). Default off. |
 | `YAW_MCP_PRUNE_RESPONSES` | `0` disables response pruning. Default on. |
 | `YAW_MCP_IDLE_THRESHOLD` | Non-matching tool calls a loaded server tolerates before it is unloaded. Default `10`; bursty servers earn more patience automatically. The older name `MCP_CONNECT_IDLE_THRESHOLD` still works as a fallback. |

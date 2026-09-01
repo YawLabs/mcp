@@ -1851,12 +1851,44 @@ describe("runDoctor — OAM RUNTIME section", () => {
       },
     });
 
-    expect(cap.text()).toContain("0.3.6  (latest 0.9.9 -- re-run `yaw-mcp sidecars install`)");
+    // `@latest` is ELIGIBLE and the refresher is on (env: {}), so the honest
+    // remedy is "nothing -- it moves on its own". Telling this user to re-run
+    // `sidecars install` was busywork: an eligible package is absent from
+    // refreshSkips and used to fall through to the generic manual advice.
+    expect(cap.text()).toContain("0.3.6  (latest 0.9.9 -- the daily background refresh will update it)");
     expect(r.exitCode, "staleness is advisory, never a warning").toBe(0);
     // A package that is not installed has no version to be stale AGAINST --
     // its problem is "not in the managed tree", and probing the registry for
     // it would spend network on a question doctor cannot use the answer to.
     expect(probed).toEqual(["@yawlabs/fetch-mcp"]);
+  });
+
+  it("names the MANUAL remedy when the background refresh is switched off", async () => {
+    // The reader who turned the refresher off is exactly the one who must be
+    // told to run it by hand -- promising an automatic update that will never
+    // arrive is the same class of error as the eligible/skipped mix-up above.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_SIDECAR_REFRESH: "0" },
+      os: "linux",
+      out: cap.out,
+      oamProbe: oamOk,
+      sidecarRegistryFetch: async () => "0.9.9",
+    });
+
+    const txt = cap.text();
+    expect(txt).toContain("re-run `yaw-mcp sidecars install` (background refresh is off)");
+    expect(txt).not.toContain("the daily background refresh will update it");
   });
 
   it("stays quiet about freshness when the managed version IS the latest", async () => {
@@ -2774,5 +2806,234 @@ describe("parseDoctorArgs", () => {
     const r = parseDoctorArgs(["--help", "--bad"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.help).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SECRET VAULT section. Before this existed, nothing in doctor connected a
+// `${secret:NAME}` in bundles.json to YAW_MCP_VAULT_PASSPHRASE -- the var was
+// absent from doctor AND from `yaw-mcp --help`, so a user whose server refused
+// to spawn had no surface that named the cause. It stays INFORMATIONAL: an
+// unset passphrase is the normal state for a terminal run (it belongs in the
+// env the MCP client spawns yaw-mcp with, which doctor cannot see), so it must
+// never move the exit code.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — SECRET VAULT", () => {
+  const SALT_B64 = Buffer.alloc(16, 7).toString("base64");
+
+  function writeVault(entries: Record<string, unknown>): void {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "secrets.json"),
+      JSON.stringify({ version: 2, salt: SALT_B64, kdf: { N: 16384, r: 8, p: 1 }, entries }),
+    );
+  }
+
+  function writeBundlesWithRef(): void {
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [
+        {
+          id: "gh-id",
+          name: "GitHub",
+          namespace: "gh",
+          type: "local",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-github"],
+          env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${secret:gh}", AUTH: "Bearer ${secret:gh}" },
+        },
+      ],
+    });
+  }
+
+  it("is omitted entirely when there is no vault and nothing references one", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(cap.text()).not.toContain("SECRET VAULT");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("lists entry NAMES and reports the passphrase as a boolean, never a value", async () => {
+    // The vault stores names as plaintext object keys (only values are
+    // ciphertext), so this needs no passphrase -- same as `secrets list`.
+    writeVault({
+      gh: { iv: "x", ciphertext: "y", authTag: "z" },
+      tailscale: { iv: "x", ciphertext: "y", authTag: "z" },
+    });
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2-do-not-leak" },
+      os: "linux",
+      out: cap.out,
+    });
+    const txt = cap.text();
+    expect(txt).toContain("SECRET VAULT");
+    expect(txt).toContain("2 -- gh, tailscale");
+    expect(txt).toContain("passphrase: set in this environment");
+    // The passphrase is itself a credential and doctor output is the
+    // paste-into-a-ticket surface. It must NEVER be echoed.
+    expect(txt).not.toContain("hunter2-do-not-leak");
+  });
+
+  it("names the servers whose env references the vault", async () => {
+    writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeBundlesWithRef();
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    // Deduped across two env values that reference the same name.
+    expect(txt).toContain("gh: ${secret:gh}");
+  });
+
+  it("ignores a REMOTE server's secret refs, which the vault never serves", async () => {
+    // A remote entry's env is never sent anywhere -- upstream.ts logs
+    // "Ignoring env on a remote server" and connects unauthenticated, so
+    // resolveServerEnv never runs for one. Listing it would put it under the
+    // "these servers FAIL TO START while the vault is locked" note, which is
+    // false: it starts fine and gets a 401 from the far end. A diagnostic that
+    // invents a cause sends the user to unlock a vault that was never in the
+    // path.
+    writeVault({ tok: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [
+        {
+          id: "remote-id",
+          name: "Remote",
+          namespace: "remote",
+          type: "remote",
+          url: "https://example.invalid/mcp",
+          env: { AUTH: "${secret:tok}" },
+        },
+      ],
+    });
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("refs:       no server env references ${secret:NAME}");
+    expect(txt).not.toContain("FAIL TO START");
+    // And it is not counted as a missing secret either -- nothing consumes it.
+    expect(txt).not.toContain("referenced but not stored");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("explains the locked-vault failure without moving the exit code", async () => {
+    // The whole point of the section: refs present, no passphrase in this env
+    // -- those servers WILL fail to spawn, and the fix has to be spelled out.
+    writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeBundlesWithRef();
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("passphrase: not set in this environment");
+    expect(txt).toContain("FAIL TO START");
+    expect(txt).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    // Names WHERE to set it -- the trap is putting it in the upstream
+    // server's env, where it is stripped before the child ever sees it.
+    expect(txt).toContain("yaw-mcp's OWN env");
+    // Informational only. A healthy machine whose client env doctor cannot
+    // see must not be dragged to exit 2.
+    expect(r.exitCode).toBe(0);
+    expect(txt).not.toMatch(/WARNINGS/);
+  });
+
+  it("flags a referenced name that is not stored, with the command to fix it", async () => {
+    writeVault({ other: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeBundlesWithRef();
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("missing:    referenced but not stored -- gh");
+    expect(txt).toContain("yaw-mcp secrets set <name>");
+  });
+
+  it("reports an unreadable vault instead of claiming it is empty", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "secrets.json"), "{ not json at all");
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("entries:    unreadable");
+    // "(none)" here would read as a healthy empty vault and send the user
+    // looking in the wrong place.
+    expect(txt).not.toContain("entries:    (none)");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("does not claim missing names when the vault could not be read", async () => {
+    // We cannot tell what is stored, so every referenced name would look
+    // missing -- a false alarm on top of a real problem already reported.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "secrets.json"), "{ not json at all");
+    writeBundlesWithRef();
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(cap.text()).not.toContain("referenced but not stored");
+  });
+
+  it("mirrors the vault block into --json, with no value and no passphrase", async () => {
+    writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeBundlesWithRef();
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2-do-not-leak" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.vault).toMatchObject({
+      exists: true,
+      entries: ["gh"],
+      unreadable: null,
+      passphraseSet: true,
+      refs: [{ namespace: "gh", secretNames: ["gh"] }],
+      missing: [],
+    });
+    // Boolean, not the value -- and nowhere else in the blob either.
+    expect(r.lines[0]).not.toContain("hunter2-do-not-leak");
+  });
+
+  it("emits the vault block in --json even when no vault exists", async () => {
+    // The text section hides itself; the JSON block is unconditional so a
+    // consumer can read `.vault` without a presence check.
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed).toHaveProperty("vault");
+    expect(parsed.vault).toMatchObject({ exists: false, entries: [], passphraseSet: false, refs: [], missing: [] });
+  });
+
+  it("keeps YAW_MCP_VAULT_PASSPHRASE out of the raw-value env block", async () => {
+    // DOCTOR_ENV_VARS prints raw values. The one env var that is itself a
+    // credential must never be added to it -- that would paste the user's
+    // vault passphrase into every support ticket.
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2-do-not-leak" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+    expect(r.lines[0]).not.toContain("hunter2-do-not-leak");
   });
 });

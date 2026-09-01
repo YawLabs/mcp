@@ -4,12 +4,29 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock external dependencies before importing the module under test
+// start() fires maybeRefreshSidecars() with no injectable seam, so without
+// this every test that starts a ConnectServer runs the real gate ladder --
+// against the developer's own ~/.yaw-mcp and cwd, not CI's. Its defaults are
+// VITEST-gated (sidecar-refresh.ts), but that guard is the module's to keep,
+// not this suite's to depend on: a future ungated default (a network probe, a
+// real npm spawn) would otherwise land in every server test unnoticed.
+vi.mock("../sidecar-refresh.js", () => ({
+  maybeRefreshSidecars: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../upstream.js", async (importOriginal) => {
   const actual = (await importOriginal()) as any;
   return {
     ...actual,
     connectToUpstream: vi.fn(),
     disconnectFromUpstream: vi.fn().mockResolvedValue(undefined),
+    // Mocked because the real one reads the DEVELOPER's ~/.yaw-mcp/secrets.json
+    // via vaultPath()/homedir(). Unmocked, every elicitation test would be
+    // graded against whatever vault the machine running the suite happens to
+    // have -- green on a machine with no vault, red on one with a real vault
+    // whose passphrase is not the test string. Its own behaviour is covered in
+    // upstream.test.ts, where secrets-vault is mocked.
+    verifyVaultPassphrase: vi.fn().mockResolvedValue(true),
   };
 });
 
@@ -22,13 +39,23 @@ import {
   isAutoActivateEnabled,
   isAutoLoadEnabled,
   isRoutingFaultText,
+  MAX_VAULT_PASSPHRASE_PROMPTS,
   ROUTING_FAULT_DISCONNECTED,
   ROUTING_FAULT_UNKNOWN_TOOL,
   resolveIdleThreshold,
   resolveToolExposure,
 } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
-import { connectToUpstream, type DownstreamClientBridge, disconnectFromUpstream } from "../upstream.js";
+import {
+  ActivationError,
+  clearSessionVaultPassphrase,
+  connectToUpstream,
+  type DownstreamClientBridge,
+  disconnectFromUpstream,
+  VaultPassphraseRequiredError,
+  vaultPassphrase,
+  verifyVaultPassphrase,
+} from "../upstream.js";
 
 function makeConfig(servers: UpstreamServerConfig[]) {
   return { servers, configVersion: "v1" };
@@ -4858,5 +4885,284 @@ describe("response pruning respects structuredContent", () => {
 
     const result = await priv.handleToolCall("gh_report", {});
     expect(result.content[0].text).toBe(prunableText);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Vault passphrase elicitation. resolveServerEnv fails CLOSED when a server's
+// env carries ${secret:...} refs and the vault is locked, and the error text
+// ("YAW_MCP_VAULT_PASSPHRASE is not set") already matched
+// detectMissingCredentials -- so the user WAS prompted, but the answer went
+// into elicitedEnv, which is merged into the CHILD's env, while
+// resolveServerEnv reads yaw-mcp's own. The prompt appeared, the user typed
+// the right passphrase, and the spawn failed identically. These cover the
+// routing fix and the phishing/leak guard that comes with it.
+// ---------------------------------------------------------------------------
+
+describe("vault passphrase elicitation", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    // mockReset, not just clearAllMocks: clear wipes call history but LEAVES
+    // implementations, so a persistent mockRejectedValue set by one case
+    // survives into the next -- and into any describe appended after this
+    // one, where it surfaces as an unrelated flake on the first call past
+    // that test's own ...Once queue.
+    vi.mocked(connectToUpstream).mockReset();
+    // Same reason, and the default has to be re-established: a case that sets
+    // a persistent `false` here (the attempt-budget one) would otherwise make
+    // every later case's passphrase fail verification.
+    vi.mocked(verifyVaultPassphrase).mockReset().mockResolvedValue(true);
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    // shutdown() clears the module-level passphrase itself; this is belt and
+    // braces for a case that throws before reaching it.
+    await server.shutdown();
+    clearSessionVaultPassphrase();
+  });
+
+  function lockedVaultError(namespace: string, reason: "missing" | "invalid" = "missing") {
+    return new VaultPassphraseRequiredError(
+      "vault locked: server env references ${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set",
+      namespace,
+      ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+      reason,
+    );
+  }
+
+  it("prompts for the passphrase, installs it, and the retry succeeds", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { YAW_MCP_VAULT_PASSPHRASE: "correct-horse-battery-staple" },
+    });
+    // ONE rejection: a vault refusal short-circuits the retry loop, so the
+    // second connect is the post-elicitation retry, not attempt 2.
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(true);
+    // The value reached the module-level session slot -- which is what
+    // resolveServerEnv actually reads.
+    expect(vaultPassphrase()).toBe("correct-horse-battery-staple");
+  });
+
+  it("does not burn a retry on a refusal that cannot change in a second", async () => {
+    // The vault verdict is reached before any child spawns, from state a 1s
+    // sleep cannot alter. Retrying it costs that sleep plus a warn line that
+    // reads like a transient spawn failure.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({});
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    await priv.activateOne("gh");
+
+    // Exactly one attempt -- not the two a generic spawn failure would get.
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-asks after a wrong passphrase instead of spending the session on a typo", async () => {
+    // The value is typed into a no-echo field. Before verification it was
+    // stored unverified AND latched, so one transposed character meant every
+    // vault-backed server failed until the client restarted.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi
+      .fn()
+      .mockResolvedValueOnce({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "typo" } })
+      .mockResolvedValueOnce({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "the-right-one" } });
+    vi.mocked(verifyVaultPassphrase).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const first = await priv.activateOne("gh");
+    expect(first.ok).toBe(false);
+    // The typo was REJECTED, not stored -- it must not shadow the env var.
+    expect(vaultPassphrase()).toBeUndefined();
+
+    const second = await priv.activateOne("gh");
+    expect(second.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("the-right-one");
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops asking after the attempt budget, however wrong the entries are", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi
+      .fn()
+      .mockResolvedValue({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "still-wrong" } });
+    vi.mocked(verifyVaultPassphrase).mockResolvedValue(false);
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    await priv.activateOne("gh");
+    await priv.activateOne("gh");
+    await priv.activateOne("gh");
+
+    // An elicitation is a modal interruption; bounded, not endless.
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(MAX_VAULT_PASSPHRASE_PROMPTS);
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("offers a correction when the configured passphrase is WRONG, not just absent", async () => {
+    // reason "invalid" is the case that had no recovery at all: the unlock
+    // error went to the generic path, where the internal-key filter refuses
+    // to elicit yaw-mcp's own secrets, so nothing could offer a fix.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { YAW_MCP_VAULT_PASSPHRASE: "the-real-passphrase" },
+    });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh", "invalid"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("the-real-passphrase");
+    // The prompt must not tell a user who DID set the var that it is unset.
+    const msg = vi.mocked(priv.server.elicitInput).mock.calls[0][0].message as string;
+    expect(msg).toContain("does not unlock");
+    expect(msg).not.toContain("which is locked");
+  });
+
+  it("clears the module-level passphrase on shutdown", async () => {
+    // It lives in upstream.ts module state so no child env can inherit it,
+    // which also means it outlives the instance unless shutdown clears it --
+    // a second ConnectServer would inherit plaintext its user never typed.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { YAW_MCP_VAULT_PASSPHRASE: "session-only" },
+    });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    await priv.activateOne("gh");
+    expect(vaultPassphrase()).toBe("session-only");
+
+    await server.shutdown();
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("keeps the passphrase OUT of elicitedEnv, so it never reaches the child", async () => {
+    // elicitedEnv is merged over the server's configured env on retry. Storing
+    // the passphrase there would hand it to the very child we are unlocking
+    // the vault FOR, walking straight past stripInternalSecretsFromEnv.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { YAW_MCP_VAULT_PASSPHRASE: "s3kr1t" },
+    });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(lockedVaultError("gh"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    await priv.activateOne("gh");
+
+    expect(priv.elicitedEnv.get("gh")).toBeUndefined();
+    // Belt and braces: whatever env the retry spawned with, it is not in it.
+    const spawnedEnv = vi.mocked(connectToUpstream).mock.calls.at(-1)?.[0].env ?? {};
+    expect(spawnedEnv).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+  });
+
+  it("treats a decline as final, across different servers", async () => {
+    // One vault, one passphrase. A decline is a decision, not a slip, so it
+    // must not re-prompt on the next server that touches the vault -- unlike
+    // a rejected typo, which gets one more try.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "slack", name: "Slack" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({ action: "decline" });
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    await priv.activateOne("gh");
+    await priv.activateOne("slack");
+
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not prompt when the client cannot elicit", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({});
+    priv.server.elicitInput = vi.fn();
+    vi.mocked(connectToUpstream).mockRejectedValue(lockedVaultError("gh"));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(false);
+    expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("refuses to elicit yaw-mcp's own secrets from a CHILD's stderr", async () => {
+    // The phishing shape: detectMissingCredentials matches
+    // "YAW_MCP_VAULT_PASSPHRASE is not set" anywhere in the haystack, and the
+    // haystack includes the child's stderr. Without the internal-key filter a
+    // server could print that line and be handed the vault passphrase, via a
+    // prompt naming the SERVER rather than yaw-mcp -- and the value would then
+    // be merged into that same server's env on retry.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "evil", name: "Evil" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn();
+    vi.mocked(connectToUpstream).mockRejectedValue(
+      new ActivationError("spawn failed", "unknown", "YAW_MCP_VAULT_PASSPHRASE is not set\n"),
+    );
+
+    const result = await priv.activateOne("evil");
+
+    expect(result.ok).toBe(false);
+    expect(priv.server.elicitInput).not.toHaveBeenCalled();
+    expect(priv.elicitedEnv.get("evil")).toBeUndefined();
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("still elicits a genuine child credential alongside the filter", async () => {
+    // The filter must remove ONLY yaw-mcp's own keys -- a real missing child
+    // credential still gets the generic prompt.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { GITHUB_TOKEN: "ghp_x" },
+    });
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"))
+      .mockRejectedValueOnce(new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await priv.activateOne("gh");
+
+    expect(result.ok).toBe(true);
+    expect(priv.elicitedEnv.get("gh")).toEqual({ GITHUB_TOKEN: "ghp_x" });
+    // The child credential goes to the child, NOT to the vault.
+    expect(vaultPassphrase()).toBeUndefined();
   });
 });

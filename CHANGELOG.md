@@ -2,6 +2,20 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## Unreleased
+
+**Fixed -- the vault passphrase prompt asked the user, then threw the answer away**
+
+`resolveServerEnv` fails closed when a server's env carries `${secret:...}` refs and the vault is locked, and its error text ("YAW_MCP_VAULT_PASSPHRASE is not set") already matched `detectMissingCredentials`. So on an elicitation-capable client the user WAS prompted for the vault passphrase by name -- and the accepted value went into `elicitedEnv`, which is merged into the CHILD's env, while `resolveServerEnv` reads yaw-mcp's own. The prompt appeared, the user typed the right passphrase, and the spawn failed with the identical error; the already-elicited guard then suppressed a second ask. Everything needed was wired except the destination.
+
+The refusal is now a typed `VaultPassphraseRequiredError` carrying the namespace and the referencing env keys, and the activation path routes it to a dedicated prompt that stores the answer in a module-level session value `resolveServerEnv` actually reads. Deliberately not `process.env`: every local spawn builds its child env from `stripInternalSecretsFromEnv(process.env)`, so a passphrase parked there would be one strip-list bug away from every upstream. Asked at most once per session (one vault, one passphrase) and latched when asked, not when answered, so a decline is honoured rather than re-prompted on the next server that touches the vault.
+
+Matching by error TYPE rather than by message text also closes a phishing shape the generic path allowed: the credential haystack includes a child's stderr, so a server that printed "YAW_MCP_VAULT_PASSPHRASE is not set" could be handed the vault passphrase, through a prompt naming the server rather than yaw-mcp, and the value would then be merged into that same server's env on retry. The generic elicitation path now filters out `INTERNAL_SECRET_ENV_KEYS` entirely.
+
+**Added -- `doctor` gained a SECRET VAULT section, and `--help` finally lists the passphrase**
+
+`YAW_MCP_VAULT_PASSPHRASE` was absent from `yaw-mcp --help`'s environment table while the README pointed at that table for "the full list", and `doctor` said nothing about the vault at all. A user whose server refused to spawn had no surface connecting a `${secret:NAME}` in bundles.json to the variable that makes it work. The var is now in `--help`, and `doctor` reports the vault file, its entry NAMES, which servers reference which names, whether a passphrase is present, and any referenced name that is not stored -- mirrored into `--json` as `.vault`. Names and booleans only: no secret value, and no passphrase, appears in either surface, which is also why the passphrase stays out of `DOCTOR_ENV_VARS` (that block prints raw values). The section is informational and never moves the exit code -- an unset passphrase is the normal state for a terminal run, since it belongs in the env your MCP client spawns yaw-mcp with, which doctor cannot see.
+
 ## 0.77.0 -- the learning signal stops recording things it did not observe, the silent failures get loud, and the dead ends are retired
 
 Seven commits of full-pass review work, taken through repeated adversarial rounds. The two user-visible contract changes are first; the rest are fixes.

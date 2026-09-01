@@ -86,6 +86,8 @@ import {
   STATE_FILENAME,
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
+import { listKeys, loadVault, SECRET_REF_RE, vaultPath } from "./secrets-vault.js";
+import { buildRefreshPlan } from "./sidecar-refresh.js";
 import {
   collectSidecarSpecs,
   hasManagedSidecars,
@@ -244,6 +246,21 @@ export interface DoctorJsonSnapshot {
   // backgroundPosters below) so consumers reading it keep working through
   // the deprecation window.
   env: Record<string, string | null>;
+  /** Local secret vault: entry NAMES, which servers reference them, and
+   *  whether a passphrase is available. `passphraseSet` is a boolean and
+   *  `entries` holds names only -- no secret value, and no passphrase, ever
+   *  appears in this snapshot. Mirrors the text path's SECRET VAULT section
+   *  (which is omitted when there is no vault and no refs; the JSON block is
+   *  always present so consumers can read it unconditionally). */
+  vault: {
+    path: string;
+    exists: boolean;
+    entries: string[] | null;
+    unreadable: string | null;
+    passphraseSet: boolean;
+    refs: Array<{ namespace: string; secretNames: string[] }>;
+    missing: string[];
+  };
   state: {
     disabled: boolean;
     /** Result of pre-parsing state.json, mirroring the text path's STATE
@@ -530,6 +547,14 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // "All good" and exited 0. See foldBundleWarnings.
   config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
   renderOamRuntimeSection({ status: oamStatus, print, os });
+
+  // Secret vault: what is stored, which servers reference it, and whether a
+  // passphrase is available to unlock it. This is the only surface that
+  // connects a `${secret:NAME}` in bundles.json to the env var that makes it
+  // work -- without it, "my server won't start" has no visible cause short of
+  // reading the spawn error. Informational; see renderVaultSection for why it
+  // never becomes a warning.
+  renderVaultSection({ status: await collectVaultStatus({ home, env, servers: oamStatus.servers }), print });
 
   // Load state.json ONCE for both the STATE and RELIABILITY sections.
   // Previously each section re-read the file (peek + loadState in STATE,
@@ -850,6 +875,11 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // Identical fold to the text path -- a malformed bundles.json must reach
   // `.warnings` and exit 2 on both surfaces.
   config.warnings = [...config.warnings, ...foldBundleWarnings(oamStatus.bundleWarnings, trustProbe)];
+  // Same collector as the text path's SECRET VAULT section. Emitted
+  // unconditionally here (the text section hides itself when there is no
+  // vault and no refs) so a consumer can read `.vault` without a presence
+  // check. Names and booleans only -- never a value, never the passphrase.
+  const vault = await collectVaultStatus({ home, env, servers: oamStatus.servers });
   // Trial-GC failures fold AFTER the bundle warnings, matching the text
   // path's order (trust -> bundle -> trials) so the two surfaces emit the
   // same warning list in the same order. Same per-failure wording helper
@@ -931,6 +961,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     projectGuide,
     warnings: config.warnings,
     env: envOverrides,
+    vault,
     state,
     reliability,
     clients,
@@ -959,7 +990,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // --help: DISABLE_PERSISTENCE stays in the STATE section (richer context
 // there); YAW_MCP_TRUST_PROJECT in the trust gate; YAW_MCP_CATALOG_URL
 // and YAW_MCP_BASE_URL are endpoint overrides, not behavior toggles, and
-// stay out.
+// stay out. YAW_MCP_VAULT_PASSPHRASE is excluded for a stronger reason than
+// any of those: this list prints RAW VALUES, and that one is itself a
+// credential -- putting it here would paste the user's vault passphrase into
+// every support ticket. It is reported as a boolean by the SECRET VAULT
+// section instead (see VaultStatus.passphraseSet), so the drift check above
+// should read it as covered, not missing.
 //
 // The "default when unset" hint next to each unset value is the most
 // useful bit — without it users don't know what the omission means.
@@ -972,6 +1008,7 @@ const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string }> = [
   { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
   { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
   { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
+  { name: "YAW_MCP_SIDECAR_REFRESH", defaultHint: "default on" },
   { name: "YAW_MCP_IDLE_THRESHOLD", defaultHint: "adaptive, base 10" },
   { name: "YAW_MCP_ROUTE_EFFORT", defaultHint: "auto" },
   { name: "YAW_MCP_REWARD_GRADER", defaultHint: "off" },
@@ -991,6 +1028,136 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
   print("");
 }
 
+/** Everything the SECRET VAULT section (text) / `vault` block (json) needs.
+ *
+ *  Secret VALUES are never read, decrypted, or reported -- entry NAMES only,
+ *  which is exactly what `yaw-mcp secrets list` already prints without a
+ *  passphrase (the vault stores them as plaintext object keys; only the
+ *  values are ciphertext). `passphraseSet` is a boolean for the same reason
+ *  YAW_MCP_VAULT_PASSPHRASE is deliberately absent from DOCTOR_ENV_VARS,
+ *  which prints raw values: doctor output is the paste-into-a-ticket surface,
+ *  and the one env var here that is itself a credential must never be in it. */
+interface VaultStatus {
+  path: string;
+  exists: boolean;
+  /** Entry names, or null when the file exists but could not be read/parsed. */
+  entries: string[] | null;
+  /** Why the vault could not be read. Non-null only when `entries` is null. */
+  unreadable: string | null;
+  /** Whether a passphrase is present in this process's env. NEVER the value. */
+  passphraseSet: boolean;
+  /** Servers whose configured env carries `${secret:NAME}` refs. */
+  refs: Array<{ namespace: string; secretNames: string[] }>;
+  /** Referenced names that are NOT in the vault. Empty when the vault is
+   *  unreadable -- we cannot tell, and guessing would invent a false alarm. */
+  missing: string[];
+}
+
+async function collectVaultStatus(opts: {
+  home: string;
+  env: NodeJS.ProcessEnv;
+  servers: OamRuntimeStatus["servers"];
+}): Promise<VaultStatus> {
+  const path = vaultPath(opts.home);
+  const exists = existsSync(path);
+  let entries: string[] | null = exists ? null : [];
+  let unreadable: string | null = null;
+  if (exists) {
+    try {
+      const vault = await loadVault(path);
+      // loadVault returns null only for ENOENT, which existsSync just ruled
+      // out -- but a race between the two is possible, and "no entries" is
+      // the honest reading of a vault file that vanished mid-run.
+      entries = vault ? listKeys(vault) : [];
+    } catch (err) {
+      unreadable = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  const refs: VaultStatus["refs"] = [];
+  for (const s of opts.servers) {
+    // LOCAL servers only. A remote entry's env is never sent anywhere --
+    // upstream.ts logs "Ignoring env on a remote server" and connects
+    // unauthenticated -- so resolveServerEnv never runs for one and no
+    // passphrase changes its outcome. Listing it here would put it under the
+    // "these servers FAIL TO START while the vault is locked" note, which is
+    // simply untrue of a remote: it starts fine and gets a 401 from the far
+    // end. A diagnostic that invents a cause is worse than one that says
+    // nothing, so the vault section stays silent about remotes rather than
+    // sending the user to unlock a vault that was never in the path.
+    if (s.type === "remote") continue;
+    const names = new Set<string>();
+    for (const value of Object.values(s.env ?? {})) {
+      if (typeof value !== "string") continue;
+      // SECRET_REF_RE carries /g and is module-shared, so matchAll against it
+      // directly would leave a lastIndex other callers trip over. Own copy per
+      // value, same as meta-tools.ts and upstream.ts do.
+      const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
+      for (const m of value.matchAll(re)) if (m[1]) names.add(m[1]);
+    }
+    if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
+  }
+
+  const known = entries;
+  const referenced = new Set(refs.flatMap((r) => r.secretNames));
+  const missing = known === null ? [] : [...referenced].filter((n) => !known.includes(n)).sort();
+
+  return {
+    path,
+    exists,
+    entries,
+    unreadable,
+    passphraseSet: (opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "") !== "",
+    refs,
+    missing,
+  };
+}
+
+/** SECRET VAULT section.
+ *
+ *  Informational, and deliberately NOT folded into config.warnings (same call
+ *  as renderProjectGuideSection). An unset passphrase is the NORMAL state for
+ *  a terminal run: it belongs in the env your MCP client spawns yaw-mcp with,
+ *  which doctor -- running as its own process from a shell -- cannot see. A
+ *  warning would take a perfectly healthy machine to exit 2.
+ *
+ *  Omitted entirely when there is no vault and nothing references one. */
+function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => void }): void {
+  const { status, print } = opts;
+  if (!status.exists && status.refs.length === 0) return;
+  print("SECRET VAULT");
+  print(`  file:       ${status.path}${status.exists ? "" : " (does not exist yet)"}`);
+  if (status.unreadable !== null) {
+    print(`  entries:    unreadable -- ${status.unreadable}`);
+  } else {
+    const entries = status.entries ?? [];
+    print(`  entries:    ${entries.length === 0 ? "(none)" : `${entries.length} -- ${entries.join(", ")}`}`);
+  }
+  print(`  passphrase: ${status.passphraseSet ? "set in this environment" : "not set in this environment"}`);
+  if (status.refs.length === 0) {
+    print("  refs:       no server env references ${secret:NAME}");
+  } else {
+    print("  refs:");
+    for (const r of status.refs) {
+      print(`    ${r.namespace}: ${r.secretNames.map((n) => `\${secret:${n}}`).join(", ")}`);
+    }
+  }
+  if (status.refs.length > 0 && !status.passphraseSet) {
+    print("  note:       the servers above FAIL TO START while the vault is locked -- yaw-mcp");
+    print("              refuses the spawn rather than passing the literal placeholder through.");
+    print("              Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's OWN env (the `env` block of");
+    print("              the yaw-mcp entry in your MCP client config), NOT in the upstream");
+    print("              server's -- it is stripped from every child env. A client that");
+    print("              supports MCP elicitation prompts for it instead, for that session.");
+    print("              Unset HERE is expected: doctor cannot see your client's env.");
+  }
+  if (status.missing.length > 0) {
+    print(`  missing:    referenced but not stored -- ${status.missing.join(", ")}`);
+    print("              store each with `yaw-mcp secrets set <name>`");
+  }
+  print("");
+}
+
 // Everything the OAM RUNTIME section (text) / oamRuntime block (json) needs,
 // collected once so the two paths can't drift: the binary probe, the
 // config-level default (+ provenance), and a per-server verdict for every
@@ -1005,7 +1172,19 @@ interface OamRuntimeStatus {
    *  `npx` server: describeServerRuntime deliberately does not probe package
    *  resolution (it would make doctor flap), but rewriteForOam DOES, and keeps
    *  npx when the package is on disk nowhere. */
-  servers: Array<{ namespace: string; command: string | undefined; info: ServerRuntimeInfo }>;
+  /** `env` and `type` ride along for the SECRET VAULT section, which needs to
+   *  know which servers carry `${secret:...}` refs AND which of them the vault
+   *  can actually serve. Threaded through here rather than loaded again:
+   *  loadLocalBundles warns on a file it cannot parse, and a second read would
+   *  print every bundles.json diagnostic twice per run (the same trap
+   *  described on the `bundles` load below). */
+  servers: Array<{
+    namespace: string;
+    command: string | undefined;
+    env: Record<string, string> | undefined;
+    type: "local" | "remote";
+    info: ServerRuntimeInfo;
+  }>;
   /** The managed install (`yaw-mcp sidecars install`): where it is, the
    *  version + registry freshness of each package in it, and which
    *  platform/arch filled it. Empty when it has never been run. Field
@@ -1017,6 +1196,22 @@ interface OamRuntimeStatus {
     installedFor: SidecarsPlatform | null;
     platformMismatch: boolean;
   };
+  /** Why the background sidecar refresh (sidecar-refresh.ts) will pass a
+   *  package OVER, keyed by package name -- buildRefreshPlan's `skipped`
+   *  reasons, verbatim. Rendered only beside a package doctor has
+   *  independently found stale, so the ordinary "nothing to do" skips (not
+   *  installed, already current) never reach the report.
+   *
+   *  Deliberately a sibling of `managed` rather than a field on its
+   *  packages: `managed` is mirrored verbatim into --json (see
+   *  DoctorJsonSnapshot.oamRuntime.managed), and this is a text-report hint
+   *  whose wording belongs to another module. Keeping it out holds the --json
+   *  package shape byte-identical -- consumers deep-compare that array. */
+  refreshSkips: Map<string, string>;
+  /** True when YAW_MCP_SIDECAR_REFRESH turns the background refresher off, so
+   *  the stale-package hint names the manual remedy instead of promising an
+   *  automatic one that will never run. */
+  refreshDisabled: boolean;
   /** Diagnostics from the bundles.json read (unparseable file, schema ahead,
    *  invalid defaultRuntime, skipped entries). The caller folds these into
    *  config.warnings -- see foldBundleWarnings. */
@@ -1103,6 +1298,8 @@ async function collectOamRuntimeStatus(opts: {
   const servers = (bundles?.config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
     command: s.command,
+    env: s.env,
+    type: s.type,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));
   // Report the version actually installed for each package the config asks
@@ -1128,6 +1325,42 @@ async function collectOamRuntimeStatus(opts: {
       return { pkg: s.pkg, version, latest, stale };
     }),
   );
+  // Why a stale package will NOT be picked up by the background refresh.
+  // Asked of buildRefreshPlan rather than re-derived here, because the rule is
+  // subtle enough that a second copy would drift: the refresher moves only
+  // specs configured "@latest" or unpinned, since an explicit `pkg@0.13.3` is
+  // the user's stated version and auto-moving it would defeat the reason
+  // sidecars exist (sidecars-cmd.ts: "The version pins itself"). A doctor that
+  // decided that separately could advise a refresh the refresher will never
+  // perform. Pure and local -- specs, installed versions and latest versions
+  // are all already in hand, so this adds no I/O and no network to the report.
+  //
+  // Guarded because doctor is the command people run WHEN things are broken: a
+  // diagnostic that throws while composing a HINT is strictly worse than one
+  // that omits the hint. buildRefreshPlan is pure, so this should never fire;
+  // if it does, every stale line falls back to the generic suffix.
+  const refreshSkips = new Map<string, string>();
+  try {
+    const plan = buildRefreshPlan({
+      specs,
+      // Explicit tuple returns: without them TS widens the callback's result
+      // to (string | null)[] and the Map constructor rejects it, and relying
+      // on contextual typing from another module's parameter type is a
+      // needless coupling for two characters of annotation.
+      installed: new Map(packages.map((p): [string, string | null] => [p.pkg, p.version])),
+      latest: new Map(packages.map((p): [string, string | null] => [p.pkg, p.latest])),
+    });
+    for (const skip of plan.skipped) refreshSkips.set(skip.pkg, skip.reason);
+  } catch {
+    // Intentionally empty -- see above.
+  }
+  // Same opt-out parse as maybeRefreshSidecars'. Without it every eligible
+  // stale package is described as one the background refresher will carry
+  // forward, which is simply false on a machine where the user turned the
+  // refresher off -- exactly the reader who most needs to be told to run
+  // `sidecars install` by hand.
+  const refreshOptOut = opts.env.YAW_MCP_SIDECAR_REFRESH;
+  const refreshDisabled = refreshOptOut === "0" || refreshOptOut?.toLowerCase() === "false";
   // Who filled the tree vs who is asking. npm resolves native bindings for the
   // node that RUNS the install, so a marker from another platform/arch means
   // the versions above can be present, current, and still fail at spawn here.
@@ -1139,7 +1372,7 @@ async function collectOamRuntimeStatus(opts: {
     platformMismatch:
       installedFor !== null && (installedFor.platform !== process.platform || installedFor.arch !== process.arch),
   };
-  return { probe, dflt, servers, managed, bundleWarnings: bundles?.warnings ?? [] };
+  return { probe, dflt, servers, managed, refreshSkips, refreshDisabled, bundleWarnings: bundles?.warnings ?? [] };
 }
 
 function renderOamRuntimeSection(opts: {
@@ -1247,8 +1480,32 @@ function renderOamRuntimeSection(opts: {
         // "@latest", so a pin only moves when `sidecars install` is re-run --
         // without this, "0.3.6" reads identically whether that is current or a
         // year old. Advisory like the UPGRADE AVAILABLE hint, never a warning.
-        const staleNote =
-          p.stale && p.latest !== null ? `  (latest ${p.latest} -- re-run \`yaw-mcp sidecars install\`)` : "";
+        //
+        // WHICH remedy the suffix names is conditional, because only one of
+        // them can work, and there are three cases -- not two.
+        //
+        //   1. Skipped by the plan (an explicit pin or range). "re-run
+        //      `yaw-mcp sidecars install`" is advice that cannot succeed: the
+        //      generated manifest carries the same pin, npm reinstalls the
+        //      same version, and the line reads identical next run. Name the
+        //      plan's own reason instead.
+        //   2. Eligible, refresher ON. The background check will move it
+        //      unattended, so telling the user to run anything is busywork --
+        //      and the previous wording did exactly that, because an eligible
+        //      package is absent from refreshSkips and fell through to the
+        //      generic manual remedy.
+        //   3. Eligible, refresher OFF. Nothing automatic is coming, so the
+        //      manual remedy is the true one.
+        //
+        // The skip reason comes from buildRefreshPlan so this report and the
+        // refresher cannot disagree about what is going to happen.
+        const refreshSkip = status.refreshSkips.get(p.pkg);
+        const remedy =
+          refreshSkip ??
+          (status.refreshDisabled
+            ? "re-run `yaw-mcp sidecars install` (background refresh is off)"
+            : "the daily background refresh will update it");
+        const staleNote = p.stale && p.latest !== null ? `  (latest ${p.latest} -- ${remedy})` : "";
         print(`    ${p.pkg.padEnd(widest)}  ${p.version ?? "not in the managed tree"}${staleNote}`);
       }
       // The versions above can all be present and current and the tree still

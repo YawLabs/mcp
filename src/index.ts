@@ -264,6 +264,16 @@ if (subcommand === "compliance") {
                                self-upgrade check at server startup (default:
                                stale global installs are upgraded in the
                                background -- npm, pnpm, and bun globals alike).
+    YAW_MCP_SIDECAR_REFRESH       Set to \`0\` to disable the background check
+                               that keeps managed sidecars (\`yaw-mcp sidecars
+                               install\`) current. When a managed tree exists,
+                               each serve start may probe the npm registry for
+                               the packages configured to float (\`@latest\` or
+                               no version) and, at most once a day, run an
+                               \`npm install\`/\`npm update\` in the sidecars
+                               root in the background. Never runs without a
+                               managed tree; explicit pins and ranges are
+                               never moved (default: on).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
     YAW_MCP_TOOL_EXPOSURE         How much of the catalog tools/list advertises.
                                \`gateway\` (default) exposes the meta-tools
@@ -298,6 +308,19 @@ if (subcommand === "compliance") {
                                a first-party server for a CLI you use heavily
                                (default: off; config \`installNudge: true\` is
                                the other switch -- either one enables it).
+    YAW_MCP_VAULT_PASSPHRASE      Unlocks the local secret vault
+                               (~/.yaw-mcp/secrets.json). REQUIRED for
+                               spawn-time \${secret:NAME} substitution: a
+                               server whose env references a secret fails to
+                               start without it, rather than passing the
+                               literal placeholder through. Set it in
+                               yaw-mcp's OWN env (the \`env\` block of the
+                               yaw-mcp entry in your MCP client config), not
+                               in the upstream server's -- it is stripped
+                               from every child env. A client that supports
+                               MCP elicitation prompts for it instead, for
+                               that session only. Manage entries with
+                               \`yaw-mcp secrets\`.
     YAW_MCP_TRUST_PROJECT         Set to \`1\` to skip the consent check on a
                                project-local .yaw-mcp/bundles.json and load
                                it unconditionally. FOR CI/AUTOMATION ONLY --

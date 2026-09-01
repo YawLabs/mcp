@@ -10,6 +10,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ActivationError,
+  clearSessionVaultPassphrase,
   connectToUpstream,
   type DownstreamClientBridge,
   disconnectFromUpstream,
@@ -21,7 +22,11 @@ import {
   MAX_RESOURCES_PER_SERVER,
   MAX_TOOLS_PER_SERVER,
   resetOamDowngrades,
+  setSessionVaultPassphrase,
   stripInternalSecretsFromEnv,
+  VaultPassphraseRequiredError,
+  vaultPassphrase,
+  verifyVaultPassphrase,
 } from "../upstream.js";
 
 // ---------------------------------------------------------------------------
@@ -39,6 +44,12 @@ vi.mock("../secrets-vault.js", () => ({
   // regex from this (single source of truth for the `${secret:NAME}` shape),
   // so a mocked-away export would break audit-name collection.
   SECRET_REF_RE: /\$\{secret:([a-zA-Z0-9_.-]+)\}/g,
+  // Real value for the same reason: resolveServerEnv and verifyVaultPassphrase
+  // both compare an unlock failure's message against it to tell "the vault is
+  // damaged, the passphrase is fine" from "wrong passphrase". A stub would
+  // make those two branches indistinguishable.
+  VAULT_CHECK_CORRUPT_ERROR:
+    'vault verification token ("check") is corrupt -- the passphrase is correct, but the check marker does not decrypt',
 }));
 
 // Mock the audit appender: the real one writes to ~/.yaw-mcp/secrets-audit.log,
@@ -196,7 +207,7 @@ import { log } from "../logger.js";
 import { resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
-import { hasSecretRefs, loadVault, resolveSecretRefs, unlock } from "../secrets-vault.js";
+import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, VAULT_CHECK_CORRUPT_ERROR } from "../secrets-vault.js";
 // Mocked uv resolver -- a test makes it THROW to exercise the resolver-failure
 // wrap (a checksum/download failure inside ensureUv reaches connectToUpstream
 // this way).
@@ -725,6 +736,9 @@ describe("resolveServerEnv", () => {
   afterEach(() => {
     vi.clearAllMocks();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    // The session passphrase is module state: one case's value would silently
+    // unlock the next case's vault and hide a regression in the env path.
+    clearSessionVaultPassphrase();
   });
 
   it("returns env unchanged when it contains no ${secret:} refs", async () => {
@@ -870,6 +884,94 @@ describe("resolveServerEnv", () => {
     const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
 
     await expect(connectToUpstream(config)).rejects.toThrow(/vault locked.*YAW_MCP_VAULT_PASSPHRASE/);
+  });
+
+  it("throws a TYPED VaultPassphraseRequiredError carrying the namespace and ref keys", async () => {
+    // The type is what lets the activation path tell "yaw-mcp needs its vault
+    // passphrase" apart from "the child says a credential is missing". Matching
+    // on message text instead would let any upstream induce the vault prompt by
+    // printing the right words to stderr.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}", PLAIN: "literal" } });
+
+    let err: unknown;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e;
+    }
+
+    expect(err).toBeInstanceOf(VaultPassphraseRequiredError);
+    const vaultErr = err as VaultPassphraseRequiredError;
+    expect(vaultErr.namespace).toBe("test");
+    // Only the env keys that actually carry a ref -- PLAIN is a literal.
+    expect(vaultErr.refKeys).toEqual(["TOKEN"]);
+    // NOT an ActivationError: no child ever ran, and the oam boot-probe
+    // downgrade keys off that type to decide what is worth retrying.
+    expect(err).not.toBeInstanceOf(ActivationError);
+  });
+
+  it("unlocks with a session passphrase when the env var is absent", async () => {
+    // The elicitation path's whole point: a user who answered the prompt gets
+    // a working spawn without YAW_MCP_VAULT_PASSPHRASE ever being set.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    setSessionVaultPassphrase("from-elicitation");
+
+    const fakeVault = { version: 1, salt: "abc", entries: { MY_TOKEN: {} } } as any;
+    const fakeKey = Buffer.from("fakekey");
+    vi.mocked(loadVault).mockResolvedValue(fakeVault);
+    vi.mocked(unlock).mockResolvedValue(fakeKey);
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [] });
+
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
+    await connectToUpstream(config).catch(() => {});
+
+    expect(vi.mocked(unlock)).toHaveBeenCalledWith(fakeVault, "from-elicitation");
+  });
+
+  it("prefers the session passphrase over a stale env var", async () => {
+    // Ordering matters in exactly one case -- the env var is set but WRONG.
+    // Preferring it would make the correction the user just typed unreachable
+    // for the rest of the session.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "stale-and-wrong";
+    setSessionVaultPassphrase("the-real-one");
+
+    const fakeVault = { version: 1, salt: "abc", entries: { MY_TOKEN: {} } } as any;
+    vi.mocked(loadVault).mockResolvedValue(fakeVault);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [] });
+
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
+    await connectToUpstream(config).catch(() => {});
+
+    expect(vi.mocked(unlock)).toHaveBeenCalledWith(fakeVault, "the-real-one");
+  });
+
+  it("keeps the session passphrase OUT of process.env, so no child can inherit it", async () => {
+    // Every local spawn builds its child env from
+    // stripInternalSecretsFromEnv(process.env). Parking the passphrase in
+    // process.env would put it one strip-list bug away from every upstream;
+    // keeping it in module state means the child env physically cannot carry
+    // it, whatever the strip list says.
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    setSessionVaultPassphrase("never-in-the-environment");
+
+    expect(process.env.YAW_MCP_VAULT_PASSPHRASE).toBeUndefined();
+    expect(vaultPassphrase()).toBe("never-in-the-environment");
+    expect(stripInternalSecretsFromEnv(process.env)).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+  });
+
+  it('treats an empty session passphrase as absent rather than installing ""', async () => {
+    // A declined or blank elicitation must not become the passphrase: deriving
+    // a key from "" is precisely what secrets-cmd refuses on the CLI side.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "from-env";
+    setSessionVaultPassphrase("");
+
+    expect(vaultPassphrase()).toBe("from-env");
   });
 });
 
@@ -2245,5 +2347,141 @@ describe("connectToUpstream remote-entry diagnostics", () => {
     await connectToUpstream(makeRemoteConfig({ transport: "streamable-http" })).catch(() => {});
     await connectToUpstream(makeRemoteConfig()).catch(() => {});
     expect(warnings().some((m) => m.includes('transport "stdio"'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyVaultPassphrase -- the pre-flight check that keeps an unverified
+// passphrase out of module-global state. Storing first and discovering the
+// typo later is not equivalent: by then the bad value already shadows a
+// possibly-correct YAW_MCP_VAULT_PASSPHRASE for every later resolve.
+// ---------------------------------------------------------------------------
+
+describe("verifyVaultPassphrase", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    clearSessionVaultPassphrase();
+  });
+
+  it("returns true when the passphrase unlocks the vault", async () => {
+    const fakeVault = { version: 1, salt: "abc", entries: { A: {} } } as any;
+    vi.mocked(loadVault).mockResolvedValue(fakeVault);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("k"));
+
+    await expect(verifyVaultPassphrase("right")).resolves.toBe(true);
+    expect(vi.mocked(unlock)).toHaveBeenCalledWith(fakeVault, "right");
+  });
+
+  it("returns false when the passphrase does not unlock the vault", async () => {
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
+    vi.mocked(unlock).mockRejectedValue(new Error("wrong passphrase for this vault (decryption failed)"));
+
+    await expect(verifyVaultPassphrase("wrong")).resolves.toBe(false);
+  });
+
+  it("returns false for an empty passphrase without touching the vault", async () => {
+    await expect(verifyVaultPassphrase("")).resolves.toBe(false);
+    expect(vi.mocked(loadVault)).not.toHaveBeenCalled();
+  });
+
+  it("accepts the passphrase when the vault's CHECK MARKER is corrupt", async () => {
+    // That error means the passphrase is RIGHT and the marker is damaged.
+    // Rejecting it would ask the user to re-type something that was never
+    // wrong, and the retype would fail identically.
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
+    vi.mocked(unlock).mockRejectedValue(new Error(VAULT_CHECK_CORRUPT_ERROR));
+
+    await expect(verifyVaultPassphrase("actually-correct")).resolves.toBe(true);
+  });
+
+  it("does not reject a passphrase when there is no vault to verify against", async () => {
+    // unlock() accepts anything for an absent/empty vault, and the real
+    // refusal for that case ("no vault exists yet") is resolveServerEnv's to
+    // report -- with wording that tells the user to create one.
+    vi.mocked(loadVault).mockResolvedValue(null);
+
+    await expect(verifyVaultPassphrase("anything")).resolves.toBe(true);
+  });
+
+  it("does not blame the passphrase for an unreadable vault", async () => {
+    vi.mocked(loadVault).mockRejectedValue(new Error("EACCES: permission denied"));
+
+    await expect(verifyVaultPassphrase("fine")).resolves.toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A WRONG passphrase has to be answerable, not a dead end. Before this it
+// threw a raw unlock error, which reached the generic missing-credential path
+// where the internal-key filter (correctly) refuses to elicit yaw-mcp's own
+// secrets -- so nothing could offer a correction and every vault-backed
+// server failed for the life of the process.
+// ---------------------------------------------------------------------------
+
+describe("resolveServerEnv -- wrong passphrase", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    clearSessionVaultPassphrase();
+  });
+
+  it('throws VaultPassphraseRequiredError with reason "invalid" when unlock fails', async () => {
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "wrong";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { MY_TOKEN: {} } } as any);
+    vi.mocked(unlock).mockRejectedValue(new Error("wrong passphrase for this vault (decryption failed)"));
+
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
+
+    let err: unknown;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e;
+    }
+
+    expect(err).toBeInstanceOf(VaultPassphraseRequiredError);
+    const vaultErr = err as VaultPassphraseRequiredError;
+    expect(vaultErr.reason).toBe("invalid");
+    expect(vaultErr.refKeys).toEqual(["TOKEN"]);
+    // Must not claim the var is unset -- it is set, and wrong.
+    expect(vaultErr.message).toContain("does not unlock the vault");
+  });
+
+  it("re-throws a CORRUPT CHECK MARKER untouched rather than blaming the passphrase", async () => {
+    // Here the passphrase is correct and the vault is damaged. Turning this
+    // into a prompt would ask for a passphrase that was never wrong.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "correct";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { MY_TOKEN: {} } } as any);
+    vi.mocked(unlock).mockRejectedValue(new Error(VAULT_CHECK_CORRUPT_ERROR));
+
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
+
+    let err: unknown;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e;
+    }
+
+    expect(err).not.toBeInstanceOf(VaultPassphraseRequiredError);
+    expect((err as Error).message).toContain(VAULT_CHECK_CORRUPT_ERROR);
+  });
+
+  it('still reports reason "missing" when no passphrase exists at all', async () => {
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
+
+    let err: unknown;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e;
+    }
+
+    expect((err as VaultPassphraseRequiredError).reason).toBe("missing");
   });
 });

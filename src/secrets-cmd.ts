@@ -536,6 +536,49 @@ function warnIfShortPassphrase(opts: SecretsCommandOptions, passphrase: string, 
   );
 }
 
+/** One-time guidance printed when `set` CREATES the vault.
+ *
+ *  The gap this closes: STORING a secret and USING one happen in two
+ *  different processes. `secrets set` runs in the user's own shell, where
+ *  the passphrase was just supplied. The "${secret:NAME}" substitution runs
+ *  inside the yaw-mcp that the MCP CLIENT spawns (upstream.ts's
+ *  resolveServerEnv), which has its own environment and cannot prompt for
+ *  anything. Set the passphrase only in the shell you typed this command
+ *  in and you get a vault that works perfectly from the CLI and a server
+ *  that refuses to start, with nothing on either surface connecting the
+ *  two. No SUCCESS path in the CLI mentioned the env var at all before
+ *  this -- it was discoverable by reading the README, or by hitting the
+ *  failure and reading the error.
+ *
+ *  Fires on vault CREATION only: once per vault, at the one moment the
+ *  user has just proven they intend to use secrets, and never again on the
+ *  second or the hundredth `set`. doctor carries the standing check from
+ *  there on, including for vaults created before this nudge existed.
+ *
+ *  Always stderr, even under --json: stdout carries the JSON envelope and
+ *  `get`'s cleartext, and neither may be polluted. Same rule as
+ *  warnIfShortPassphrase. Reports only WHETHER the env var is set, never
+ *  its value -- CLI output gets pasted into bug reports. */
+function freshVaultNudge(io: { out: (s: string) => void; err: (s: string) => void }, path: string): void {
+  const envSet = (process.env.YAW_MCP_VAULT_PASSPHRASE ?? "").length > 0;
+  // Plain quoted strings, not template literals: every line below carries a
+  // literal "${secret:...}" that a template literal would try to interpolate.
+  const lines = envSet
+    ? [
+        "  YAW_MCP_VAULT_PASSPHRASE is set in THIS shell, but ${secret:NAME} refs are resolved",
+        "  by the yaw-mcp your MCP client launches, which has its own environment -- set it",
+        "  there too, or that process starts locked. `yaw-mcp doctor` reports whether it is set.",
+      ]
+    : [
+        "  yaw-mcp resolves ${secret:NAME} refs at server-spawn time and needs this passphrase",
+        "  to do it. Set YAW_MCP_VAULT_PASSPHRASE in the environment your MCP client launches",
+        "  yaw-mcp from. Without it, a server whose env references ${secret:...} asks for the",
+        "  passphrase in-session (on clients that support elicitation) or fails to start.",
+        "  `yaw-mcp doctor` reports whether it is set.",
+      ];
+  io.err(`yaw-mcp secrets: created the vault at ${path}.\n${lines.join("\n")}\n`);
+}
+
 /** Read the passphrase. Env var wins; falls back to a stdin prompt
  *  that disables terminal echo via raw mode. Returns null when no
  *  passphrase can be obtained (non-TTY + no env), or CANCELLED when the
@@ -1025,6 +1068,10 @@ export async function runSecrets(
     if (opts.json) io.out(`${JSON.stringify({ ok: true, name, fresh_vault: isFresh, replaced: replacing })}\n`);
     else if (replacing) io.out(`Replaced secret "${name}".\n`);
     else io.out(`${isFresh ? "Created vault and " : ""}Stored secret "${name}".\n`);
+    // Creating the vault is the one moment the CLI can tell the user that
+    // the passphrase has to reach the yaw-mcp their CLIENT spawns, not just
+    // the shell they typed this in. See freshVaultNudge.
+    if (isFresh) freshVaultNudge(io, path);
     return { exitCode: 0 };
   }
 

@@ -2585,3 +2585,120 @@ describe("runSecrets -- corrupt-entry hint survives an awkward entry name", () =
     expect(parsed.error).toContain(vaultPath(home));
   });
 });
+
+// -----------------------------------------------------------------------
+// runSecrets set -- the fresh-vault nudge.
+//
+// Storing a secret and USING one happen in different processes: `set` runs
+// in the user's shell, the ${secret:NAME} substitution runs inside the
+// yaw-mcp the MCP client spawns. Nothing on a SUCCESS path used to connect
+// the two, so a user could store a secret, see "Stored secret", and have
+// every server that references it refuse to start. The nudge fires once,
+// on vault CREATION, and says where the passphrase actually has to live.
+// -----------------------------------------------------------------------
+
+describe("runSecrets set -- the fresh-vault nudge", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  let home: string;
+  let savedEnv: string | undefined;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+
+  beforeEach(() => {
+    io.out.mockReset();
+    io.err.mockReset();
+    home = makeHome();
+    savedEnv = process.env.YAW_MCP_VAULT_PASSPHRASE;
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    else process.env.YAW_MCP_VAULT_PASSPHRASE = savedEnv;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("fires on vault creation and names the env var, the client environment, and doctor", async () => {
+    const r = await runSecrets(
+      { action: "set", name: "tailscale", value: "tskey-abc", passphrase: "correct-horse-battery", home },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // stdout is unchanged -- the nudge must not disturb the scripted signal.
+    expect(outText()).toBe('Created vault and Stored secret "tailscale".\n');
+
+    const err = errText();
+    expect(err).toContain("YAW_MCP_VAULT_PASSPHRASE");
+    // The whole point: the passphrase has to reach the CLIENT's process,
+    // not merely the shell that ran `set`.
+    expect(err).toContain("MCP client launches");
+    expect(err).toContain("${secret:NAME}");
+    expect(err).toContain("yaw-mcp doctor");
+    // The vault path, so the user can see what was just created and where.
+    expect(err).toContain(nodePath.join(home, ".yaw-mcp", "secrets.json"));
+  });
+
+  it("does NOT fire on a later set into an existing vault", async () => {
+    const first = await runSecrets(
+      { action: "set", name: "tailscale", value: "tskey-abc", passphrase: "correct-horse-battery", home },
+      io,
+    );
+    expect(first.exitCode).toBe(0);
+    expect(errText()).not.toBe("");
+
+    io.out.mockReset();
+    io.err.mockReset();
+
+    const second = await runSecrets(
+      { action: "set", name: "github", value: "ghp_xyz", passphrase: "correct-horse-battery", home },
+      io,
+    );
+    expect(second.exitCode).toBe(0);
+    expect(outText()).toBe('Stored secret "github".\n');
+    // Once per vault. A nudge on every `set` is noise a scripted caller
+    // cannot turn off.
+    expect(errText()).toBe("");
+  });
+
+  it("tells a user who already exported the var that the client env is a separate one", async () => {
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "correct-horse-battery";
+    const r = await runSecrets({ action: "set", name: "tailscale", value: "tskey-abc", home }, io);
+    expect(r.exitCode).toBe(0);
+
+    const err = errText();
+    expect(err).toContain("set in THIS shell");
+    expect(err).toContain("its own environment");
+    // The other branch's copy must not leak into this one: telling someone
+    // who HAS set the var to "set YAW_MCP_VAULT_PASSPHRASE" reads as a
+    // failure and sends them to re-do what they already did.
+    expect(err).not.toContain("needs this passphrase");
+  });
+
+  it("never prints the passphrase value on either stream", async () => {
+    const secretish = "hunter2-hunter2-hunter2";
+    process.env.YAW_MCP_VAULT_PASSPHRASE = secretish;
+    const r = await runSecrets({ action: "set", name: "tailscale", value: "tskey-abc", home }, io);
+    expect(r.exitCode).toBe(0);
+    // Anchor the negatives to a nudge that ACTUALLY fired: "the output does
+    // not contain the passphrase" is trivially true of no output at all, so
+    // without this line the test still passes with the feature deleted.
+    expect(errText()).toContain("set in THIS shell");
+    // CLI output gets pasted into bug reports. The nudge reports only
+    // WHETHER the var is set.
+    expect(errText()).not.toContain(secretish);
+    expect(outText()).not.toContain(secretish);
+  });
+
+  it("keeps --json stdout a single parseable envelope, with the nudge on stderr", async () => {
+    const r = await runSecrets(
+      { action: "set", name: "tailscale", value: "tskey-abc", passphrase: "correct-horse-battery", home, json: true },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // One line, still valid JSON -- a nudge written to stdout would break
+    // every `| jq` consumer.
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, name: "tailscale", fresh_vault: true });
+    expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE");
+  });
+});
