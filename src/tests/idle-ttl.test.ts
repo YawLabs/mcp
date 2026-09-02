@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ADAPTIVE_BONUS_CAP,
   ADAPTIVE_LOOKBACK,
@@ -115,69 +115,40 @@ describe("adaptiveThreshold", () => {
     }
   });
 
-  it("only considers the last ADAPTIVE_LOOKBACK same-namespace entries (cap)", () => {
-    // Build a history with ADAPTIVE_LOOKBACK + 5 recent gh entries. All are
-    // within the time window, but only ADAPTIVE_LOOKBACK of them should be
-    // examined. Each counts as +2 bonus; capping at ADAPTIVE_LOOKBACK entries
-    // means the bonus is min(ADAPTIVE_LOOKBACK * 2, ADAPTIVE_BONUS_CAP).
-    // ADAPTIVE_LOOKBACK=20, ADAPTIVE_BONUS_CAP=20 -> bonus=20 regardless of
-    // whether we examine 20 or 25 entries (both saturate the cap at 20).
-    // To make the cap *observable*, we need a history where beyond-cap entries
-    // would change the result if they were counted. We do that by mixing
-    // "far future" timestamps (would count as extra recent hits if examined)
-    // past the cap position, and OLD timestamps (outside the window) at the
-    // cap boundary.
+  it("stops the scan after ADAPTIVE_LOOKBACK same-namespace entries", () => {
+    // The stop is a WORK bound, not a scoring rule, and this test has to be
+    // read that way. On a chronologically-ordered history -- the only kind
+    // pushToolCall and server.ts produce -- it cannot change the answer: the
+    // entries it drops are always older than the 20th-most-recent hit, so
+    // dropping them matters only when 20+ hits sit inside the window, and 10
+    // in-window hits already saturate ADAPTIVE_BONUS_CAP. Making the stop
+    // OBSERVABLE therefore takes an out-of-order history, built here by hand.
     //
-    // Strategy: place ADAPTIVE_LOOKBACK entries outside the window (old) and
-    // then 5 entries inside the window. The cap stops the walk at the 20th
-    // same-ns entry, which is one of the old ones. Only the 5 recent inner
-    // entries are within the window, contributing 5*2=10 bonus, not 20.
-    // If the cap were absent the walk would continue and find all old entries
-    // too (but they're outside the window so bonus stays 10 either way --
-    // we need a different arrangement).
-    //
-    // Actually simpler arrangement: 5 recent "inner" entries PLUS
-    // ADAPTIVE_LOOKBACK entries that are ALSO recent but interleaved with
-    // OTHER-namespace entries so they appear beyond the cap. After walking
-    // back ADAPTIVE_LOOKBACK same-ns hits (the 5 + 15 from the deep set),
-    // any remaining recent same-ns entries should be ignored.
-    //
-    // Clearest proof: build a history of exactly ADAPTIVE_LOOKBACK + 10
-    // recent same-ns entries (all within the window). Without the cap all
-    // 30 would be counted but the bonus is already capped at ADAPTIVE_BONUS_CAP
-    // so we can't distinguish 20 vs 30 that way. Instead use a low-enough
-    // count so that "first ADAPTIVE_LOOKBACK" vs "all entries" produces a
-    // different bonus when the cap fires.
-    //
-    // Use ADAPTIVE_LOOKBACK=20 entries: the first (newest) 5 are WITHIN the
-    // window, the next 15 are OUTSIDE the window. Then add 5 more entries
-    // that are within the window but should be skipped by the cap (they are
-    // beyond the 20th same-ns entry from the tail). The expected bonus
-    // is 5*2=10 (only the first 5 recent entries count before the cap halts
-    // the walk at the 20th same-ns entry which is outside the window).
+    // The 20 entries the backwards walk reaches FIRST are 5 recent + 15 old,
+    // so the walk halts while still outside the window; 5 more recent entries
+    // sit beyond the stop and must not be counted. Bonus = 5 * 2 = 10, not
+    // 10 * 2 = 20. Reddens if `sameNsSeen < ADAPTIVE_LOOKBACK` leaves the loop.
     const history: ToolCallRecord[] = [];
-    // 5 extra entries that are INSIDE the window but appear BEFORE the cap
-    // group in the array (so they are walked AFTER the cap group when
-    // iterating backwards -- i.e. they would be examined beyond position 20).
-    for (let i = 0; i < 5; i++) {
-      history.push({ namespace: "gh", at: NOW - (i + 1) * 1000 }); // recent, should be capped out
-    }
-    // ADAPTIVE_LOOKBACK entries: the first 5 are recent, the remaining 15
-    // are outside the window. These appear AFTER the extra 5 in the array
-    // so they are seen first when walking backwards.
+    // Pushed first => walked LAST, beyond the stop. Recent, and ignored.
+    for (let i = 0; i < 5; i++) history.push(record("gh", (i + 1) * 1000));
+    // Pushed last => walked FIRST: 5 inside the window, then 15 outside it.
     for (let i = 0; i < ADAPTIVE_LOOKBACK; i++) {
-      const offsetMs =
-        i < 5
-          ? (i + 6) * 1000 // recent (inside window)
-          : ADAPTIVE_WINDOW_MS + (i + 1) * 1000; // old (outside window)
-      history.push({ namespace: "gh", at: NOW - offsetMs });
+      history.push(record("gh", i < 5 ? (i + 6) * 1000 : ADAPTIVE_WINDOW_MS + (i + 1) * 1000));
     }
-    // Walking backwards: the last ADAPTIVE_LOOKBACK entries (oldest 20 in the
-    // push order) are encountered first. Those 20 constitute the cap group:
-    // 5 recent + 15 old -> sameNsSeen reaches ADAPTIVE_LOOKBACK, loop stops.
-    // The 5 extra entries prepended earlier are never examined.
-    // Bonus = 5 * 2 = 10 -> threshold = 10 + 10 = 20.
     expect(adaptiveThreshold("gh", history, 10, NOW)).toBe(20);
+  });
+
+  it("scores the same set identically once it is in chronological order", () => {
+    // The other half of the claim above, pinned so the comment on
+    // ADAPTIVE_LOOKBACK cannot quietly become false: sorted oldest-first (what
+    // pushToolCall produces), the very same 25 entries score the saturated
+    // 10 + ADAPTIVE_BONUS_CAP, which is what they would score with no stop at
+    // all. The stop buys bounded work here, not a different threshold.
+    const history: ToolCallRecord[] = [];
+    for (let i = 0; i < 10; i++) history.push(record("gh", (i + 1) * 1000));
+    for (let i = 0; i < 15; i++) history.push(record("gh", ADAPTIVE_WINDOW_MS + (i + 1) * 1000));
+    history.sort((a, b) => a.at - b.at);
+    expect(adaptiveThreshold("gh", history, 10, NOW)).toBe(10 + ADAPTIVE_BONUS_CAP);
   });
 });
 
@@ -206,45 +177,33 @@ describe("pushToolCall", () => {
   });
 });
 
-describe("MCP_CONNECT_IDLE_THRESHOLD env var override", () => {
-  // The env var is consumed by server.ts to pick the baseline; this
-  // test exercises the shape of that contract: adaptiveThreshold must
-  // treat the passed-in base as the true baseline regardless of what
-  // the env var was. The override behavior itself lives in server.ts
-  // (static class init) but the guarantee we care about here is that
-  // the adaptive function never ignores the baseline it's handed.
-  const ORIGINAL_ENV = process.env.MCP_CONNECT_IDLE_THRESHOLD;
-
-  beforeEach(() => {
-    delete process.env.MCP_CONNECT_IDLE_THRESHOLD;
-  });
-
+describe("the baseline is an argument, not an env read", () => {
+  // server.ts's resolveIdleThreshold owns the env vars (YAW_MCP_IDLE_THRESHOLD,
+  // with MCP_CONNECT_IDLE_THRESHOLD as the pre-rename fallback), parses them
+  // strictly, warns about an over-ceiling value, and hands the RESULT here.
+  //
+  // This block used to set those vars and then assert on a hand-passed base --
+  // three assertions that could not fail, because adaptiveThreshold never read
+  // the environment. Assert the contract that actually exists instead.
   afterEach(() => {
-    if (ORIGINAL_ENV === undefined) {
-      delete process.env.MCP_CONNECT_IDLE_THRESHOLD;
-    } else {
-      process.env.MCP_CONNECT_IDLE_THRESHOLD = ORIGINAL_ENV;
-    }
+    vi.unstubAllEnvs();
   });
 
-  it("respects a high base even with no activity", () => {
-    process.env.MCP_CONNECT_IDLE_THRESHOLD = "25";
-    // Simulate the server's resolution — adaptiveThreshold should use
-    // the caller-supplied baseline, not the env var directly.
-    expect(adaptiveThreshold("gh", [], 25, NOW)).toBe(25);
-  });
-
-  it("respects a low base and keeps clamping to ADAPTIVE_MIN", () => {
-    process.env.MCP_CONNECT_IDLE_THRESHOLD = "2";
-    // Even with base=2 and no activity, the floor holds at 5.
-    expect(adaptiveThreshold("gh", [], 2, NOW)).toBe(ADAPTIVE_MIN);
+  it("ignores both idle-threshold env vars", () => {
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "25");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "40");
+    // Reddens if the env read is ever duplicated into this module, which would
+    // apply the override twice and skip resolveIdleThreshold's strict parse,
+    // its <1 fallback and its over-ceiling warning.
+    expect(adaptiveThreshold("gh", [], 10, NOW)).toBe(10);
   });
 
   it("lets a high base stack with the adaptive bonus up to the hard cap", () => {
-    process.env.MCP_CONNECT_IDLE_THRESHOLD = "25";
     const history: ToolCallRecord[] = [];
     for (let i = 0; i < 15; i++) history.push(record("gh", i * 1000));
-    // 25 + 20 = 45, still under ADAPTIVE_MAX (50).
+    // 25 + 20 = 45, still under ADAPTIVE_MAX (50) -- the one case the clamp
+    // tests above leave open, where a raised baseline and a full bonus stack
+    // without either bound firing.
     expect(adaptiveThreshold("gh", history, 25, NOW)).toBe(45);
   });
 });

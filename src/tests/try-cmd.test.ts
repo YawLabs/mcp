@@ -16,6 +16,7 @@ import {
   runTryCleanup,
   scanTrials,
   type TrialMarker,
+  trialGcFailureWarning,
   trialMarkerPath,
   trialsDir,
 } from "../try-cmd.js";
@@ -107,10 +108,41 @@ describe("parseTryArgs", () => {
     expect(bad.ok).toBe(false);
   });
 
+  it("rejects a --ttl far enough out to overflow the expiry Date", () => {
+    // "100000000d" is a fine digit run, so it used to parse -- and then
+    // `new Date(now + ttl).toISOString()` in the --dry-run preview threw a
+    // bare RangeError ("Invalid time value") that surfaced as an opaque
+    // error, while the real run persisted the absurd marker in silence.
+    const r = parseTryArgs(["demo", "--ttl", "100000000d"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--ttl: cannot parse/);
+  });
+
   it("parses repeated --env KEY=val", () => {
     const r = parseTryArgs(["demo", "--env", "FOO=bar", "--env", "BAZ=qux"]);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.options.envOverrides).toEqual({ FOO: "bar", BAZ: "qux" });
+  });
+
+  it("splits --env on the FIRST = so the value may contain more", () => {
+    // Connection strings and base64 secrets carry `=`; splitting on the last
+    // (or on every) `=` would truncate them.
+    const r = parseTryArgs(["demo", "--env", "FOO=a=b"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.envOverrides).toEqual({ FOO: "a=b" });
+  });
+
+  it("returns usage flagged as help for -h / --help", () => {
+    // help:true is what lets the dispatcher print usage on stdout and exit 0
+    // instead of treating it as a parse error.
+    for (const flag of ["-h", "--help"]) {
+      const r = parseTryArgs(["demo", flag]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.help).toBe(true);
+        expect(r.error).toMatch(/Usage: yaw-mcp try/);
+      }
+    }
   });
 
   it("rejects --env without =", () => {
@@ -192,6 +224,16 @@ describe("parseDurationMs", () => {
     expect(parseDurationMs("0h")).toBeNull();
     expect(parseDurationMs("-5m")).toBeNull();
   });
+
+  it("returns null past the 100-year ceiling, which is what keeps the expiry a valid Date", () => {
+    // Anything beyond the cap pushes `now + ttl` out of the Date range, where
+    // toISOString() throws RangeError in the dry-run preview and the real run
+    // writes a nonsense marker. The boundary itself still parses.
+    expect(parseDurationMs("36500d")).toBe(36500 * 86_400_000);
+    expect(parseDurationMs("36501d")).toBeNull();
+    expect(parseDurationMs("100000000d")).toBeNull();
+    expect(parseDurationMs("999999999h")).toBeNull();
+  });
 });
 
 describe("formatTtl", () => {
@@ -243,7 +285,7 @@ describe("anon-id retirement", () => {
 });
 
 describe("runTry — happy path", () => {
-  it("writes the trial entry + marker, fires the lifecycle event, prints the 3-line nudge", async () => {
+  it("writes the trial entry + marker and prints the 3-line nudge", async () => {
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
@@ -432,24 +474,19 @@ describe("runTry — missing env vars", () => {
 // 0o666), so the old stat().mode assertions ran on no machine -- this suite
 // only ever runs on Windows.
 //
-// process.platform is reported as POSIX throughout for the same reason:
-// `tightenPerms = entryHasSecrets && process.platform !== "win32"`, so without
-// it the 0o600 arm is unreachable AND the negative arms would pass for the
-// platform's reason instead of the no-secret reason they exist to pin.
+// A POSIX platform is reported throughout for the same reason:
+// `tightenPerms = entryHasSecrets && platform !== "win32"`, so without it the
+// 0o600 arm is unreachable AND the negative arms would pass for the platform's
+// reason instead of the no-secret reason they exist to pin.
+//
+// It arrives through runTry's own `platform` option rather than a
+// defineProperty over the global. Redefining process.platform for the whole
+// block also flipped atomicWriteFile into its POSIX single-attempt rename
+// branch, so these six cases lost the EPERM/EBUSY/EACCES retry that exists for
+// AV-scanner and indexer handle races -- on the very Windows machine this suite
+// runs on, which is the only place that retry does anything.
 describe("runTry — client config perms", () => {
-  let restorePlatform: (() => void) | null = null;
-
-  beforeEach(() => {
-    const original = Object.getOwnPropertyDescriptor(process, "platform");
-    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-    restorePlatform = (): void => {
-      if (original) Object.defineProperty(process, "platform", original);
-    };
-  });
-
   afterEach(() => {
-    restorePlatform?.();
-    restorePlatform = null;
     vi.restoreAllMocks();
   });
 
@@ -482,6 +519,7 @@ describe("runTry — client config perms", () => {
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
+      platform: "linux",
       // An EMPTY ambient env, not the process's: runTry reads CLAUDE_CONFIG_DIR
       // out of it, so inheriting process.env resolves the "claude-code" target
       // to the real config dir of whoever runs the suite instead of to
@@ -515,6 +553,7 @@ describe("runTry — client config perms", () => {
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
+      platform: "linux",
       // An EMPTY ambient env, not the process's: runTry reads CLAUDE_CONFIG_DIR
       // out of it, so inheriting process.env resolves the "claude-code" target
       // to the real config dir of whoever runs the suite instead of to
@@ -546,6 +585,7 @@ describe("runTry — client config perms", () => {
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
+      platform: "linux",
       // An EMPTY ambient env, not the process's: runTry reads CLAUDE_CONFIG_DIR
       // out of it, so inheriting process.env resolves the "claude-code" target
       // to the real config dir of whoever runs the suite instead of to
@@ -577,6 +617,7 @@ describe("runTry — client config perms", () => {
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
+      platform: "linux",
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
@@ -597,6 +638,7 @@ describe("runTry — client config perms", () => {
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
+      platform: "linux",
       env: {},
       out: cap1.pushOut,
       err: cap1.pushErr,
@@ -632,6 +674,7 @@ describe("runTry — client config perms", () => {
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
+      platform: "linux",
       env: {},
       out: cap.pushOut,
       err: cap.pushErr,
@@ -929,6 +972,45 @@ describe("marker trust guards", () => {
     expect(scan.malformed).toHaveLength(1);
   });
 
+  it("scanTrials classifies a marker with no clientName as malformed rather than printing 'undefined'", async () => {
+    // clientName is not consumed by the peel, so it went unvalidated -- but
+    // doctor renders it verbatim in the TRIALS section, so a hand-rolled
+    // marker without it read out as `demo -> undefined (expires in 42m)`.
+    writeMarker("nameless", { clientName: undefined as unknown as TrialMarker["clientName"] });
+    const scan = await scanTrials({ home: synthHome });
+    expect(scan.expired).toHaveLength(0);
+    expect(scan.live).toHaveLength(0);
+    expect(scan.malformed).toHaveLength(1);
+    expect(scan.malformed[0]).toContain("nameless");
+  });
+
+  it("try-cleanup refuses a marker written by a NEWER yaw-mcp instead of peeling it", async () => {
+    // The schemaVersion guard exists because a newer writer may mean something
+    // different by containerPath/entryName; acting on it would delete a key we
+    // do not understand. Refuse and leave both the marker and the entry alone.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "yaw-mcp-try-future": { command: "npx" } } }),
+    );
+    const markerPath = writeMarker("future", { schemaVersion: 2 });
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "future",
+      home: synthHome,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/newer yaw-mcp \(schemaVersion 2 > 1\)/);
+    expect(cap.errText()).toMatch(/Delete it by hand if it is stale/);
+    expect(cap.text()).not.toMatch(/cleaned up/);
+    // Nothing touched: the marker survives for the user, the entry stays wired.
+    expect(existsSync(markerPath)).toBe(true);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-future"]).toBeDefined();
+  });
+
   it("scanTrials refuses a marker from a NEWER schema, but accepts one with the field absent", async () => {
     // Above our version = semantics we cannot know, so the GC does not guess.
     // Absent = older / hand-rolled marker, read as v1; rejecting those would
@@ -984,7 +1066,7 @@ describe("runTryCleanup", () => {
     expect(cap.text()).not.toMatch(/Removed yaw-mcp-try-demo/);
   });
 
-  it("removes the entry + marker + fires cleanup event, written contains client path", async () => {
+  it("removes the entry + marker, written contains client path", async () => {
     // Wire a trial first.
     const cap1 = captureIO();
     await runTry({
@@ -1056,6 +1138,46 @@ describe("runTryCleanup", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(cap.text()).toMatch(/nothing to do/);
+  });
+
+  it("warns rather than silently skipping the peel when the client file is valid JSON but not an object", async () => {
+    // Mirror of the GC case: a JSON array has no container for removeJsoncEntry
+    // to name the entry in, so no peel is possible. Skipping that in SILENCE
+    // and then printing "cleaned up" is the false all-clear over a plaintext
+    // credential that gcExpiredTrials was fixed to refuse.
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, "[]\n");
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "demo",
+      name: "Demo MCP",
+      expiresAt: Date.now() + 3_600_000,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-demo",
+      createdAt: Date.now(),
+    };
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(marker));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toMatch(/couldn't strip yaw-mcp-try-demo/);
+    expect(cap.errText()).toContain("is not a JSON object");
+    // Nothing to peel means nothing written -- the file is left as found.
+    expect(readFileSync(clientPath, "utf8")).toBe("[]\n");
+    // Unlike doctor's GC (which keeps the marker so the next sweep retries),
+    // the user-initiated cleanup still drops it -- the warning above is what
+    // stops that from reading as a clean sweep.
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
   });
 });
 
@@ -1207,6 +1329,59 @@ describe("scanTrials + gcExpiredTrials", () => {
     expect(result.failures[0].slug).toBe("old");
     // Marker survives so doctor keeps surfacing the still-wired trial.
     expect(existsSync(markerPath)).toBe(true);
+  });
+
+  it("reports stage 'unlink' when the entry peeled but the marker file could not be deleted", async () => {
+    // The other half of the stage split, and the only path that produces the
+    // "config is clean, only the marker lingers" wording. A DIRECTORY standing
+    // where the marker file should be makes unlink fail on every platform; it
+    // reaches the sweep through the `scan` seam because scanTrials would --
+    // rightly -- call an unreadable marker malformed and never queue it.
+    const baseNow = 1_700_000_000_000;
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(
+      clientPath,
+      JSON.stringify({ mcpServers: { "yaw-mcp-try-old": { command: "npx" }, keep: { command: "y" } } }),
+    );
+    const stuckMarkerPath = join(trialsDir(synthHome), "old.json");
+    mkdirSync(stuckMarkerPath, { recursive: true });
+    writeFileSync(join(stuckMarkerPath, "not-empty"), "x");
+    const expiredMarker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "old",
+      name: "Old MCP",
+      expiresAt: baseNow - 1,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-old",
+      createdAt: baseNow - 3_600_000,
+    };
+
+    const result = await gcExpiredTrials({
+      home: synthHome,
+      scan: {
+        live: [],
+        expired: [{ marker: expiredMarker, path: stuckMarkerPath, msUntilExpiry: -1, expired: true }],
+        malformed: [],
+      },
+    });
+    expect(result.cleared).toBe(0);
+    expect(result.failed).toBe(1);
+    expect(result.failures[0].stage).toBe("unlink");
+    expect(result.failures[0].markerPath).toBe(stuckMarkerPath);
+    // The peel really did land -- that is what makes "unlink" the honest stage.
+    const client = JSON.parse(readFileSync(clientPath, "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-old"]).toBeUndefined();
+    expect(client.mcpServers.keep).toBeDefined();
+    // The unlink wording sends the user at the marker. The peel wording
+    // ("still wired in", "run yaw-mcp try-cleanup") would send them at the
+    // client config, which is already clean.
+    const warning = trialGcFailureWarning(result.failures[0]);
+    expect(warning).toContain("its entry was removed from");
+    expect(warning).toContain(stuckMarkerPath);
+    expect(warning).toContain("delete that marker by hand");
+    expect(warning).not.toContain("still wired in");
   });
 });
 
@@ -1447,5 +1622,393 @@ describe("runTry — dry-run names the cross-client removal", () => {
     expect(r.exitCode).toBe(0);
     expect(cap.text()).not.toMatch(/would remove: the previous demo trial/);
     expect(cap.text()).toMatch(/would NOT remove: the previous demo marker names a non-trial entry/);
+  });
+
+  it("does NOT promise to peel an entry that is already gone from the other client's config", async () => {
+    // Same over-promise from the other direction: the marker is perfectly
+    // trustworthy, but the entry it names has already been removed from that
+    // file by hand. The real run's peel returns "absent" and prints NOTHING,
+    // so a preview that announces the removal describes a run that never
+    // happens -- and the user reads the preview as the plan.
+    const otherClient = join(synthHome, ".cursor", "mcp.json");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(otherClient, JSON.stringify({ mcpServers: { unrelated: { command: "x", args: [] } } }));
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    writeFileSync(
+      trialMarkerPath("demo", synthHome),
+      JSON.stringify({
+        schemaVersion: 1,
+        slug: "demo",
+        name: "Demo",
+        expiresAt: Date.now() + 3_600_000,
+        clientPath: otherClient,
+        clientName: "cursor",
+        containerPath: ["mcpServers"],
+        entryName: "yaw-mcp-try-demo",
+        createdAt: Date.now(),
+      }),
+    );
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toMatch(/would remove/);
+    expect(cap.text()).not.toMatch(/would NOT remove/);
+    // The preview's own no-op contract still holds: the other config is
+    // untouched by the probe that decided not to promise anything.
+    expect(JSON.parse(readFileSync(otherClient, "utf8")).mcpServers.unrelated).toBeDefined();
+  });
+});
+
+describe("runTry — auto-detected client (no --client)", () => {
+  // The CLI's DEFAULT invocation. Every other runTry test pins clientId, so
+  // the branch that decides WHERE a secret-bearing entry gets written had no
+  // coverage at all -- an INSTALL_TARGETS reorder could silently retarget it.
+  //
+  // `env: {}` is load-bearing here, not boilerplate: runTry reads
+  // CLAUDE_CONFIG_DIR out of it and hands it to the probes, so an ambient one
+  // (this dev shell sets it) would move claude-code's probe path outside
+  // synthHome and make the result machine-dependent. `os` is pinned for the
+  // same reason -- claude-desktop is unavailable on linux but available on
+  // macos/windows, so the probe list itself differs by runner.
+
+  it("picks the one client whose config already exists", async () => {
+    // Only ~/.cursor/mcp.json is on disk, and synthCwd is empty, so
+    // claude-code's user/project/local slots all miss and cursor is the first
+    // existing slot in INSTALL_TARGETS order.
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    const cursorPath = join(synthHome, ".cursor", "mcp.json");
+    writeFileSync(cursorPath, JSON.stringify({ mcpServers: { existing: { command: "x" } } }));
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.marker?.clientName).toBe("cursor");
+    expect(r.marker?.clientPath).toBe(cursorPath);
+    const cursor = JSON.parse(readFileSync(cursorPath, "utf8"));
+    expect(cursor.mcpServers["yaw-mcp-try-demo"].command).toBe("npx");
+    expect(cursor.mcpServers.existing).toBeDefined();
+    // Nothing was created for the client that merely COULD have been used.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+  });
+
+  it("falls back to claude-code when no client config exists at all", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    // claude-code is first in INSTALL_TARGETS and available on every OS, so
+    // the "first merely AVAILABLE client" loop always lands here.
+    expect(r.marker?.clientName).toBe("claude-code");
+    const clientPath = join(synthHome, ".claude.json");
+    expect(r.marker?.clientPath).toBe(clientPath);
+    expect(JSON.parse(readFileSync(clientPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+  });
+});
+
+describe("runTry — vscode has no user scope", () => {
+  it("writes the trial into .vscode/mcp.json under the cwd, keyed on `servers`", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "vscode",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    // vscode flips the scope to "project", so the trial -- and any inline
+    // secret with it -- lands in a WORKSPACE file that is routinely committed.
+    const workspacePath = join(synthCwd, ".vscode", "mcp.json");
+    expect(existsSync(workspacePath)).toBe(true);
+    const config = JSON.parse(readFileSync(workspacePath, "utf8"));
+    // VS Code's top-level key is `servers`, not `mcpServers`.
+    expect(config.servers["yaw-mcp-try-demo"].command).toBe("npx");
+    expect(config.mcpServers).toBeUndefined();
+    const marker = JSON.parse(readFileSync(trialMarkerPath("demo", synthHome), "utf8")) as TrialMarker;
+    expect(marker.clientName).toBe("vscode");
+    expect(marker.clientPath).toBe(workspacePath);
+    expect(marker.containerPath).toEqual(["servers"]);
+  });
+});
+
+describe("runTry — previous marker the real peel refuses", () => {
+  it("warns on stderr, leaves the other file untouched, and still wires the new trial", async () => {
+    // The dry-run twin of this is covered above; this is the REAL run, whose
+    // warning is the only thing telling the user an entry is being left behind
+    // ("the marker below no longer points at it").
+    const otherClient = join(synthHome, ".cursor", "mcp.json");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    const untouched = JSON.stringify({ mcpServers: { "not-a-trial-entry": { command: "x", args: [] } } });
+    writeFileSync(otherClient, untouched);
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    writeFileSync(
+      trialMarkerPath("demo", synthHome),
+      JSON.stringify({
+        schemaVersion: 1,
+        slug: "demo",
+        name: "Demo",
+        expiresAt: Date.now() + 3_600_000,
+        clientPath: otherClient,
+        clientName: "cursor",
+        containerPath: ["mcpServers"],
+        // Not a `yaw-mcp-try-*` name: rejectUntrustedMarker refuses it.
+        entryName: "not-a-trial-entry",
+        createdAt: Date.now(),
+      }),
+    );
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).toMatch(/couldn't remove the previous demo trial \(not-a-trial-entry\)/);
+    expect(cap.errText()).toMatch(/the marker below no longer points at it/);
+    // The refusal is the whole point: that key is NOT ours to delete.
+    expect(readFileSync(otherClient, "utf8")).toBe(untouched);
+    // ...and the run still completed, wiring the new trial.
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeDefined();
+  });
+});
+
+describe("runTry — env objects with their own lookup semantics", () => {
+  it("resolves a required var through the injected env rather than a flattened copy", async () => {
+    // Node's process.env is case-INSENSITIVE on Windows: a var the user stores
+    // as `Github_Token` answers to process.env.GITHUB_TOKEN. Spreading it into
+    // a plain object threw that away, so `try` reported a required var missing
+    // that was sitting right there in the shell. This Proxy stands in for that
+    // object; reading THROUGH it is the fix.
+    const backing: Record<string, string> = { Github_Token: "ambient-secret" };
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, prop): string | undefined => {
+        if (typeof prop !== "string") return undefined;
+        const hit = Object.keys(backing).find((k) => k.toLowerCase() === prop.toLowerCase());
+        return hit === undefined ? undefined : backing[hit];
+      },
+    });
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env,
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["GITHUB_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/needs the following env var/);
+    const entry = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8")).mcpServers["yaw-mcp-try-demo"];
+    // Written under the name the catalog asked for, with the shell's value.
+    expect(entry.env).toEqual({ GITHUB_TOKEN: "ambient-secret" });
+    // And it still counts as ambient-sourced, so the user is told it landed
+    // inline on disk.
+    expect(cap.errText()).toMatch(/read from your shell env/);
+  });
+
+  it("still lets an explicit --env override shadow the shell value", async () => {
+    // The old spread gave overrides precedence; the lookup must too, including
+    // the case where the shell has the var under a different spelling.
+    const backing: Record<string, string> = { Github_Token: "ambient-secret" };
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, prop): string | undefined => {
+        if (typeof prop !== "string") return undefined;
+        const hit = Object.keys(backing).find((k) => k.toLowerCase() === prop.toLowerCase());
+        return hit === undefined ? undefined : backing[hit];
+      },
+    });
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env,
+      envOverrides: { GITHUB_TOKEN: "explicit" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["GITHUB_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    const entry = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8")).mcpServers["yaw-mcp-try-demo"];
+    expect(entry.env).toEqual({ GITHUB_TOKEN: "explicit" });
+    // Supplied via --env, so no ambient-source note.
+    expect(cap.errText()).not.toMatch(/read from your shell env/);
+  });
+});
+
+describe("runTry — trial marker write failure", () => {
+  it("reports it and wires nothing, rather than writing a client entry no marker names", async () => {
+    // The marker is written FIRST precisely so a crash can't leave an
+    // unsweepable entry. If that write fails, the run has to stop there: going
+    // on to write the client config would put a trial entry (inline secret and
+    // all) on disk with nothing able to reclaim it. A plain FILE where
+    // ~/.yaw-mcp should be makes the trials-dir mkdir fail with no mocking.
+    writeFileSync(join(synthHome, ".yaw-mcp"), "not a directory");
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { D_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toMatch(/failed to write trial marker/);
+    // Crucially, the client config was never touched.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+  });
+});
+
+describe("runTry — client-config write failure on a re-run", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("restores the previous marker instead of orphaning the entry it still names", async () => {
+    // The marker is written BEFORE the client config, and the catch used to
+    // unlink it unconditionally. On a re-run that is the wrong rollback: the
+    // marker just overwritten named the PREVIOUS run's entry, which is still
+    // live in the file this write failed on -- inline secret and all -- and
+    // that marker was the only thing on disk naming it. Deleting it puts the
+    // entry out of reach of both `try-cleanup` ("nothing to do") and doctor's
+    // GC, over a plaintext credential, while the user reads "failed to write"
+    // and concludes nothing was wired.
+    const common = {
+      slug: "demo",
+      clientId: "claude-code" as const,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux" as const,
+      env: {},
+      envOverrides: { D_TOKEN: "secret" },
+      fetchExplore: async (): Promise<ExploreServerResponse> => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+    };
+    const cap1 = captureIO();
+    const first = await runTry({
+      ...common,
+      now: () => 1_700_000_000_000,
+      out: cap1.pushOut,
+      err: cap1.pushErr,
+    });
+    expect(first.exitCode).toBe(0);
+    const markerPath = trialMarkerPath("demo", synthHome);
+    const clientPath = join(synthHome, ".claude.json");
+    const markerAfterFirstRun = readFileSync(markerPath, "utf8");
+    const clientAfterFirstRun = readFileSync(clientPath, "utf8");
+
+    // Fail only the client-config write; the marker write must still land so
+    // the rollback has something to roll back.
+    const atomic = await import("../atomic-write.js");
+    const realWrite = atomic.atomicWriteFile;
+    vi.spyOn(atomic, "atomicWriteFile").mockImplementation(async (path, contents, encoding, mode, dirMode) => {
+      if (path === clientPath) throw new Error("EACCES: permission denied");
+      await realWrite(path, contents, encoding, mode, dirMode);
+    });
+
+    const cap = captureIO();
+    const r = await runTry({
+      ...common,
+      ttl: "2h",
+      now: () => 1_700_000_777_000,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toMatch(/failed to write .*EACCES/);
+    // The marker is back to the FIRST run's bytes, byte for byte -- so it
+    // still names the entry that is still wired, and both try-cleanup and
+    // doctor's GC can reclaim it.
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf8")).toBe(markerAfterFirstRun);
+    const restored = JSON.parse(readFileSync(markerPath, "utf8")) as TrialMarker;
+    expect(restored.createdAt).toBe(1_700_000_000_000);
+    expect(restored.entryName).toBe("yaw-mcp-try-demo");
+    // ...and the entry it names really is still there, untouched.
+    expect(readFileSync(clientPath, "utf8")).toBe(clientAfterFirstRun);
+    expect(JSON.parse(clientAfterFirstRun).mcpServers["yaw-mcp-try-demo"].env).toEqual({ D_TOKEN: "secret" });
+  });
+
+  it("still unlinks the marker on a FIRST run, where nothing was wired before", async () => {
+    // The other half of the gate: with no previous marker there is no entry to
+    // keep reachable, and leaving a marker behind would have doctor report a
+    // trial whose launch entry was never written.
+    const clientPath = join(synthHome, ".claude.json");
+    const atomic = await import("../atomic-write.js");
+    const realWrite = atomic.atomicWriteFile;
+    vi.spyOn(atomic, "atomicWriteFile").mockImplementation(async (path, contents, encoding, mode, dirMode) => {
+      if (path === clientPath) throw new Error("EACCES: permission denied");
+      await realWrite(path, contents, encoding, mode, dirMode);
+    });
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
   });
 });

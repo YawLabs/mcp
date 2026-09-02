@@ -82,6 +82,12 @@ describe("closestNames", () => {
     // "sla" prefix-matches slack (tier 1). Nothing else is within threshold.
     const r = closestNames("sla", candidates, 1);
     expect(r).toEqual(["slack"]);
+    // Four tier-1 prefix hits with room for two: pins BOTH the alphabetical
+    // ordering inside a tier (declaration order would give github, gitlab) and
+    // the slice(0, limit) truncation. Without this the "sla" case above stays
+    // green with either one deleted, and a namespace typo answers with an
+    // unbounded "Did you mean: ..." list in registry order.
+    expect(closestNames("git", ["github", "gitlab", "gitea", "gitops"], 2)).toEqual(["gitea", "github"]);
   });
 
   it("suppresses every inexact tier for 1-2 char queries (prefix included)", () => {

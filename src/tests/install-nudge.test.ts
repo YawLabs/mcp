@@ -9,6 +9,7 @@ import {
   installNudgeEnabled,
   installNudgeStatePath,
   recordNudge,
+  recordNudges,
   shouldNudge,
 } from "../install-nudge.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -113,6 +114,66 @@ describe("shouldNudge / recordNudge cadence", () => {
     const state = JSON.parse(readFileSync(installNudgeStatePath(home), "utf8"));
     const clis = state.nudges.map((n: { cli: string }) => n.cli);
     expect(clis).toEqual(["tailscale"]);
+  });
+});
+
+describe("recordNudges -- one write for a whole discover", () => {
+  it("records every CLI in the batch", () => {
+    const t0 = 1_000_000_000;
+    recordNudges(["tailscale", "psql", "gh"], home, () => t0);
+    const state = JSON.parse(readFileSync(installNudgeStatePath(home), "utf8"));
+    const clis = state.nudges.map((n: { cli: string }) => n.cli).sort();
+    expect(clis).toEqual(["gh", "psql", "tailscale"]);
+    expect(shouldNudge("psql", home, () => t0)).toBe(false);
+    expect(shouldNudge("gh", home, () => t0)).toBe(false);
+  });
+
+  it("stamps the whole batch with ONE timestamp (a single read-modify-write)", () => {
+    // The per-candidate loop this replaces re-read and rewrote the file once
+    // per CLI, and each record landed at its own Date.now() -- so the set of
+    // timestamps is the observable difference between N writes and one.
+    const t0 = 1_000_000_000;
+    recordNudges(["tailscale", "psql", "gh"], home, () => t0);
+    const state = JSON.parse(readFileSync(installNudgeStatePath(home), "utf8"));
+    const stamps = new Set(state.nudges.map((n: { nudgedAt: number }) => n.nudgedAt));
+    expect([...stamps]).toEqual([t0]);
+  });
+
+  it("collapses a repeated CLI in the batch into one record", () => {
+    const t0 = 1_000_000_000;
+    recordNudges(["psql", "psql"], home, () => t0);
+    const state = JSON.parse(readFileSync(installNudgeStatePath(home), "utf8"));
+    expect(state.nudges).toHaveLength(1);
+    expect(state.nudges[0].cli).toBe("psql");
+  });
+
+  it("replaces existing records and prunes lapsed ones, like the single-CLI path", () => {
+    const t0 = 1_000_000_000;
+    recordNudge("psql", home, () => t0);
+    recordNudge("tailscale", home, () => t0);
+    // Well past both cooldowns: tailscale is re-recorded by the batch, psql is
+    // pruned because it is neither named nor still inside its cooldown.
+    const later = t0 + INSTALL_NUDGE_COOLDOWN_MS + 1;
+    recordNudges(["tailscale", "gh"], home, () => later);
+    const state = JSON.parse(readFileSync(installNudgeStatePath(home), "utf8"));
+    const clis = state.nudges.map((n: { cli: string }) => n.cli).sort();
+    expect(clis).toEqual(["gh", "tailscale"]);
+    expect(state.nudges.every((n: { nudgedAt: number }) => n.nudgedAt === later)).toBe(true);
+  });
+
+  it("writes nothing for an empty batch", () => {
+    // No candidates is the common discover outcome; it must not create (or
+    // rewrite) the state file just to prune it.
+    recordNudges([], home, () => 1);
+    expect(existsSync(installNudgeStatePath(home))).toBe(false);
+  });
+
+  it("refreshes the read memo, so a later shouldNudge sees the batch", () => {
+    const t0 = 1_000_000_000;
+    // Seed the memo with a parse that predates the batch.
+    expect(shouldNudge("psql", home, () => t0)).toBe(true);
+    recordNudges(["psql"], home, () => t0);
+    expect(shouldNudge("psql", home, () => t0)).toBe(false);
   });
 });
 

@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ═══════════════════════════════════════════════════════════════════════
-// Dispatch + auto-warm discover coverage
+// mcp_connect_dispatch + auto-warm discover coverage — server.ts
 //
-// Exercises the new BM25-ranked routing surface:
+// NOT the CLI dispatcher, despite the file name. This sits between
+// cli-dispatch.test.ts and index-dispatch.test.ts, which both cover argv
+// routing in src/index.ts; the shared "dispatch" across the three names is
+// a collision, not a family. What this file exercises is the MCP TOOL
+// `mcp_connect_dispatch` and its sibling `mcp_connect_discover` — two
+// handlers on ConnectServer in server.ts. Nothing below touches argv,
+// process.exit, a subcommand, or the built CLI.
+//
+// Exercises the BM25-ranked routing surface:
 //   mcp_connect_dispatch(intent, budget) — rank + activate top-N
 //   mcp_connect_discover(context)        — auto-warm a decisive winner
 // ═══════════════════════════════════════════════════════════════════════
@@ -19,7 +27,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 
 import { ConnectServer } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
-import { ActivationError, connectToUpstream } from "../upstream.js";
+import { ActivationError, connectToUpstream, disconnectFromUpstream } from "../upstream.js";
 
 function makeServerConfig(overrides: Partial<UpstreamServerConfig> = {}): UpstreamServerConfig {
   return {
@@ -63,7 +71,16 @@ describe("handleDispatch", () => {
   let server: ConnectServer;
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    // reset, not clear. clearAllMocks wipes call records but LEAVES
+    // implementations in place, so the mockRejectedValue set in "surfaces
+    // the ActivationError message" survived into every later test that did
+    // not overwrite connectToUpstream itself -- a latent order dependence
+    // that only stays green because the tests after it happen to set their
+    // own. Reset also drops the mockResolvedValue the vi.mock factory gave
+    // disconnectFromUpstream, so re-arm it here: afterEach's
+    // server.shutdown() awaits it.
+    vi.resetAllMocks();
+    vi.mocked(disconnectFromUpstream).mockResolvedValue(undefined);
     server = new ConnectServer();
   });
 
@@ -303,7 +320,9 @@ describe("handleDiscoverWithAutoWarm", () => {
   let server: ConnectServer;
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    // Same reset-not-clear reasoning as handleDispatch above.
+    vi.resetAllMocks();
+    vi.mocked(disconnectFromUpstream).mockResolvedValue(undefined);
     server = new ConnectServer();
   });
 

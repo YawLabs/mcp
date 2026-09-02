@@ -14,15 +14,31 @@
 // of that snapshot", and re-check it against the live catalog before relying
 // on it. Namespace keys are lowercased at lookup time.
 //
-// A multi-word catalog slug needs TWO keys, and both are registered below.
-// The forward lookup is keyed on a real namespace, and every namespace that
-// reaches it passed NAMESPACE_RE (^[a-z][a-z0-9_]{0,29}$) -- so a hyphen or a
-// leading digit is impossible there. deriveNamespace (local-bundles.ts) is what
-// an import actually lands on, and it strips non-alphanumerics: "AWS API" ->
-// `awsapi`, "1Password" -> `s1password`. The hyphenated/leading-digit form is
-// still the CATALOG SLUG the user types into `yaw-mcp add`, and it is what
-// cliToNamespaces reports back through doctor, so it stays; the derived form is
-// what makes the shadow hint actually fire.
+// CLI-name lookups are NOT case-normalized. Both CLI-keyed tables below (the
+// cliToNamespaces reverse index and SHADOW_INSTALL_TARGETS) are keyed by bare,
+// already-lowercase binary names and matched exactly, so the CALLER lowercases
+// before it looks up. doctor's extractLeadingBinary is that caller: it already
+// strips path, wrapper and `.exe`/`.cmd` decoration, and the lowercase belongs
+// in the same place -- a PowerShell history line reading `NPM audit` matches
+// nothing without it.
+//
+// A multi-word catalog slug needs TWO keys when it actually shadows something,
+// and both are registered below. The forward lookup is keyed on a real
+// namespace, and every namespace that reaches it passed NAMESPACE_RE
+// (^[a-z][a-z0-9_]{0,29}$) -- so a hyphen or a leading digit is impossible
+// there. deriveNamespace (local-bundles.ts) is what an import actually lands
+// on, and it strips non-alphanumerics: "AWS API" -> `awsapi`, "1Password" ->
+// `s1password`. The hyphenated/leading-digit form is still the CATALOG SLUG the
+// user types into `yaw-mcp add`, and it is what cliToNamespaces reports back
+// through doctor, so it stays; the derived form is what makes the shadow hint
+// actually fire.
+//
+// An EMPTY entry gets only ONE key, the derived form. The hyphenated twin of an
+// EMPTY entry is dead on both paths -- resolveShadowedClis can never be handed a
+// hyphen, and an empty shadow list contributes nothing to the reverse index --
+// so `aws-knowledge`, `aws-pricing`, `google-workspace`, `google-maps`,
+// `brave-search` and `sequential-thinking` are registered under their derived
+// spelling alone. Don't add a hyphenated twin for a new EMPTY entry.
 //
 // Well-known alias namespaces (gh, k8s, pg, …) are also registered so
 // a user who renamed the server on import still matches. A custom
@@ -97,9 +113,7 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   "aws-api": [{ cli: "aws" }],
   awsapi: [{ cli: "aws" }],
   aws: [{ cli: "aws" }],
-  "aws-knowledge": EMPTY,
   awsknowledge: EMPTY,
-  "aws-pricing": EMPTY,
   awspricing: EMPTY,
   grafana: EMPTY,
 
@@ -129,13 +143,10 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   atlassian: EMPTY,
   airtable: EMPTY,
   obsidian: EMPTY,
-  "google-workspace": EMPTY,
   googleworkspace: EMPTY,
-  "google-maps": EMPTY,
   googlemaps: EMPTY,
 
   // —— Search / web —————————————————————————————————————————————
-  "brave-search": EMPTY,
   bravesearch: EMPTY,
   firecrawl: EMPTY,
   exa: EMPTY,
@@ -144,7 +155,6 @@ const NAMESPACE_REGISTRY: Record<string, readonly CliShadow[]> = {
   // —— Filesystem / local tools ——————————————————————————————————
   filesystem: EMPTY,
   memory: EMPTY,
-  "sequential-thinking": EMPTY,
   sequentialthinking: EMPTY,
   time: EMPTY,
   context7: EMPTY,
@@ -199,13 +209,21 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
   // Object.hasOwn, not a bare index: `namespace` comes from bundles.json and
   // NAMESPACE_RE (local-bundles.ts) accepts `constructor`, `toString`,
   // `valueOf` -- all real inherited properties. A bare lookup returned
-  // Object.prototype.constructor (a function, not undefined), so `[...direct]`
-  // threw "direct is not iterable" inside discover's output builder
-  // (server.ts formatShadowLine, no try/catch) and took the whole tool call
-  // down instead of degrading to "shadows nothing".
+  // Object.prototype.constructor (a function, not undefined), so the copy below
+  // threw ("direct is not iterable", back when it was a spread) inside
+  // discover's output builder (server.ts formatShadowLine, no try/catch) and
+  // took the whole tool call down instead of degrading to "shadows nothing".
   const key = server.namespace.toLowerCase();
   const direct = Object.hasOwn(NAMESPACE_REGISTRY, key) ? NAMESPACE_REGISTRY[key] : undefined;
-  if (direct !== undefined) return [...direct];
+  // DEEP copy, not `[...direct]`: a shallow spread hands out the registry's own
+  // CliShadow objects and their `subcommands` arrays, so a caller that sorted or
+  // pushed onto `shadows[0].subcommands` (formatShadowLine's callers own the
+  // value they get back) would edit process-wide module state for every later
+  // lookup. Fresh objects and fresh subcommand arrays give the isolation the
+  // cliToNamespaces docblock below claims for its own copy.
+  if (direct !== undefined) {
+    return direct.map((s) => (s.subcommands ? { ...s, subcommands: [...s.subcommands] } : { ...s }));
+  }
 
   // Heuristic fallback — look for a single common lowercase prefix
   // across the tool cache. Needs at least three tools to trust it; a
@@ -256,7 +274,7 @@ export function resolveShadowedClis(server: Pick<UpstreamServerConfig, "namespac
  *  per-call copy is noise. Deliberately still a mutable `Map<string,
  *  string[]>` rather than a ReadonlyMap: callers do their own sorting, and
  *  the copy protects the cache without pushing `readonly` through them.
- *  Sibling note: resolveShadowedClis returns a copy for the same reason. */
+ *  Sibling note: resolveShadowedClis deep-copies for the same reason. */
 let reverseIndexCache: Map<string, string[]> | null = null;
 export function cliToNamespaces(): Map<string, string[]> {
   if (reverseIndexCache === null) {
@@ -264,7 +282,13 @@ export function cliToNamespaces(): Map<string, string[]> {
     for (const [namespace, shadows] of Object.entries(NAMESPACE_REGISTRY)) {
       for (const s of shadows) {
         const list = map.get(s.cli) ?? [];
-        if (!list.includes(namespace)) list.push(namespace);
+        // No dedup guard: object keys are unique, so each namespace is visited
+        // once, and no registry entry names the same CLI twice within one
+        // namespace (`ssh: [{ ssh }, { scp }]` is the shape -- distinct CLIs).
+        // A `!list.includes(namespace)` test could therefore never be false.
+        // The invariant it stood in for is asserted in cli-shadows.test.ts
+        // ("never lists a namespace twice for one CLI").
+        list.push(namespace);
         map.set(s.cli, list);
       }
     }
@@ -304,8 +328,10 @@ export const SHADOW_INSTALL_TARGETS: Record<string, { package: string; namespace
 
 /** Look up the first-party install target for a CLI binary name, or
  *  undefined if no first-party server covers it. Pure lookup over
- *  SHADOW_INSTALL_TARGETS; the CLI name is matched exactly (the caller
- *  already strips path/sudo prefixes via extractLeadingBinary). */
+ *  SHADOW_INSTALL_TARGETS; the CLI name is matched EXACTLY and every key here
+ *  is lowercase, so normalizing is the caller's job -- the same caller that
+ *  already strips path/sudo prefixes via extractLeadingBinary, and for the same
+ *  reason (see the CLI-name note at the top of this file). */
 export function installTargetForCli(cli: string): { package: string; namespace: string; name: string } | undefined {
   // Same own-property guard as resolveShadowedClis. The CLI name comes from
   // a shell-history line, so `constructor` would otherwise resolve to a

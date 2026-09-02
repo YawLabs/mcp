@@ -1,8 +1,18 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "../foundry.js";
+import { appendFoundryTrace, FOUNDRY_FILENAME, isFoundryEnabled, MAX_FOUNDRY_BYTES, redactIntent } from "../foundry.js";
+import { userConfigDir } from "../paths.js";
 
 describe("isFoundryEnabled", () => {
   const orig = process.env.YAW_MCP_FOUNDRY;
@@ -190,6 +200,32 @@ describe("redactIntent", () => {
     expect(kept.tokens).toEqual(expect.arrayContaining(["192", "168", "100"]));
   });
 
+  it("keeps TWO whitespace-adjacent IP literals, which arrive as one phone-shape match", () => {
+    // Whitespace is inside the nominating character class, so the pair is ONE
+    // match -- and the exclusion, anchored on the whole match, recognized
+    // neither literal. Their digits also sum past the 9-digit phone floor
+    // that a single IP never reaches, so nothing else caught it: two IPs in a
+    // row were redacted while one was kept.
+    const r = redactIntent("route 192.168.1.100 10.0.0.1 both ways");
+    expect(r.redactedCount).toBe(0);
+    expect(r.tokens).toEqual(expect.arrayContaining(["192", "168", "100", "10"]));
+  });
+
+  it("applies the same 2-digit floor to #N that the ticket rule applies to PROJ-N", () => {
+    // "#1" is a priority marker or a list index, not an issue ref, and the
+    // sibling rule already keeps "PROJ-1" for exactly that reason. The two
+    // rules disagreeing about one digit cost the corpus ordinary vocabulary.
+    const kept = redactIntent("bump the docs task to priority #1");
+    expect(kept.redactedCount).toBe(0);
+    expect(kept.tokens).toEqual(expect.arrayContaining(["priority", "1"]));
+
+    // A real issue ref still goes.
+    const dropped = redactIntent("close issue #1234 after the release");
+    expect(dropped.redactedCount).toBe(1);
+    expect(dropped.tokens).not.toContain("1234");
+    expect(dropped.tokens).toContain("issue");
+  });
+
   it("keeps short identifiers (pg, gh, s3) -- harvest tokenizes at the ranker's 1-char floor", () => {
     // Harvesting with the 3-char prose tokenizer deleted every short
     // identifier from the corpus, so rankServers (which tokenizes queries at
@@ -228,7 +264,11 @@ describe("appendFoundryTrace", () => {
   it("is a no-op when disabled (no file written)", async () => {
     delete process.env.YAW_MCP_FOUNDRY;
     await expect(appendFoundryTrace(trace, home)).resolves.toBeUndefined();
-    expect(() => readFileSync(join(home, ".yaw-mcp", "foundry.jsonl"), "utf8")).toThrow();
+    // Path derived from the SOURCE (userConfigDir + FOUNDRY_FILENAME) and
+    // asserted ABSENT. A hardcoded ".yaw-mcp" plus a throwing read passes for
+    // the wrong reason the moment the config dirname moves: the read throws
+    // at a path nothing would ever have written to either.
+    expect(existsSync(join(userConfigDir(home), FOUNDRY_FILENAME))).toBe(false);
   });
 
   it("writes one JSON line when enabled, with no raw intent", async () => {
@@ -239,11 +279,15 @@ describe("appendFoundryTrace", () => {
     const lines = contents.trim().split("\n");
     expect(lines).toHaveLength(1);
     const parsed = JSON.parse(lines[0]);
-    // Scores are stripped on write to avoid stale-state replay bias on traces.
+    // The candidate shortlist is accepted from the caller but NOT persisted:
+    // nothing ever read it back, and it only ate into the 5 MiB cap. The
+    // written line is the redacted bag plus the routing decision, nothing else.
     expect(parsed).toEqual({
-      ...trace,
-      candidates: trace.candidates.map((c) => ({ ns: c.ns })),
+      tokens: trace.tokens,
+      chosen: trace.chosen,
+      redactedCount: trace.redactedCount,
     });
+    expect(contents).not.toContain("gitlab");
   });
 
   it("appends additional lines on repeat calls", async () => {
@@ -266,12 +310,16 @@ describe("appendFoundryTrace", () => {
     const dir = join(home, ".yaw-mcp");
     mkdirSync(dir, { recursive: true });
     const file = join(dir, "foundry.jsonl");
-    // Write exactly MAX_FOUNDRY_BYTES (5 MiB) of content so stat().size >= cap.
-    const MAX_FOUNDRY_BYTES = 5 * 1024 * 1024;
-    writeFileSync(file, Buffer.alloc(MAX_FOUNDRY_BYTES, "x"));
-    const sizeBefore = MAX_FOUNDRY_BYTES;
+    // Grow the file to exactly MAX_FOUNDRY_BYTES with truncate (sparse on most
+    // filesystems) instead of allocating and writing 5 MiB of real bytes, and
+    // measure with stat so the cap's worth of content is never pulled into the
+    // heap. The cap is IMPORTED, not re-declared: a local copy meant lowering
+    // MAX_FOUNDRY_BYTES in the source left this test staging a file at the old
+    // size and passing vacuously.
+    writeFileSync(file, "");
+    truncateSync(file, MAX_FOUNDRY_BYTES);
+    expect(statSync(file).size).toBe(MAX_FOUNDRY_BYTES);
     await appendFoundryTrace(trace, home);
-    const sizeAfter = readFileSync(file).length;
-    expect(sizeAfter).toBe(sizeBefore);
+    expect(statSync(file).size).toBe(MAX_FOUNDRY_BYTES);
   });
 });

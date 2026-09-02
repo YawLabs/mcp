@@ -22,7 +22,7 @@
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { log } from "./logger.js";
-import type { ToolCallResultShape } from "./reward.js";
+import { REWARD_EMPTY_BODY, REWARD_ERROR_SHAPED, type ToolCallResultShape } from "./reward.js";
 
 // Opt-in ONLY. True when YAW_MCP_REWARD_GRADER is exactly "1" or "true"
 // (case-insensitive, whitespace-trimmed). Anything else is disabled.
@@ -35,16 +35,39 @@ export function isRewardGraderEnabled(): boolean {
 
 // Which heuristic rewards are worth a second opinion. 0.0 (hard isError) and
 // 1.0 (clean, non-empty, non-error-shaped) are confident; the soft-failure
-// (0.2) and empty-body (0.3) bands are where the keyword heuristic is most
-// likely wrong in EITHER direction, so those are the only ones we grade.
+// (REWARD_ERROR_SHAPED) and empty-body (REWARD_EMPTY_BODY) bands are where the
+// keyword heuristic is most likely wrong in EITHER direction, so those are the
+// only ones we grade.
+//
+// The bands are IMPORTED from reward.ts and tested by equality, not written
+// here as a bare 0.2..0.3 numeric range: this module is the only reader of
+// those two grades, nothing type-checks the coupling, and a range spelled in
+// literals would have gone on matching nothing (or everything) if a band moved
+// -- silently switching the grader off with a green suite.
 export function isUncertainReward(heuristic: number): boolean {
-  return heuristic >= 0.2 && heuristic <= 0.3;
+  return heuristic === REWARD_ERROR_SHAPED || heuristic === REWARD_EMPTY_BODY;
 }
 
-// Keep the grader cheap: one word out, a short slice of the result in.
-const GRADER_MAX_TOKENS = 8;
+// Keep the grader cheap: a short labelled verdict out, a short slice of the
+// result in.
+//
+// The budget is 64 tokens, not the 8 it started at. buildGraderPrompt asks for
+// a final `GRADE: <word>` line precisely because a model narrates before it
+// decides, and parseGrade takes the LAST verdict for the same reason -- but 8
+// tokens truncates the reply mid-narration, before the labelled line can land,
+// which re-creates the exact mis-grade (a verdict read off a subordinate
+// clause) that the last-verdict rule exists to prevent. 64 tokens leaves room
+// for a sentence plus the label, and is negligible next to the sampling
+// round-trip it rides on.
+const GRADER_MAX_TOKENS = 64;
 const GRADER_TIMEOUT_MS = 4000;
 const RESULT_SNIPPET_LEN = 600;
+// Hard cap on the caller-supplied intent interpolated into the prompt. The
+// result text is both fenced and length-capped; the intent was neither, so the
+// one field with no bound was the one that skipped every guard. GraderContext
+// is a plain interface any caller can fill, so the cap belongs here rather than
+// in a caller's discipline.
+const INTENT_MAX = 200;
 
 export interface GraderContext {
   // The dispatch intent the server was routed for, if known. Best-effort:
@@ -83,8 +106,10 @@ const FENCED_CONTENT_MAX = 4000;
 
 export function buildGraderPrompt(ctx: GraderContext): string {
   const lines = ["You are grading whether an MCP tool call accomplished its goal."];
-  if (ctx.intent && ctx.intent.trim().length > 0) {
-    lines.push("", `Goal: ${ctx.intent.trim()}`);
+  const intent = ctx.intent?.trim() ?? "";
+  if (intent.length > 0) {
+    const goal = intent.length > INTENT_MAX ? `${intent.slice(0, INTENT_MAX)}...` : intent;
+    lines.push("", `Goal: ${goal}`);
   }
   // Wrap the THIRD-PARTY tool output in a fenced delimiter and instruct the
   // grader to treat its contents as data, not instructions. An upstream MCP

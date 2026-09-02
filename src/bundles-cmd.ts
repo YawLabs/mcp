@@ -17,19 +17,30 @@
 //           installed" vs "ignored" (zero overlap). Also local: no network, no
 //           token needed.
 //
+//           NOT side-effect-free, though: `match` calls loadYawMcpConfig,
+//           which runs the pre-0.12 legacy-path migration before resolving
+//           any file (migrate.ts). That RENAMES a `~/.yaw-mcp.json` into
+//           `~/.yaw-mcp/config.json`, and a project `.yaw-mcp.json` /
+//           `.yaw-mcp.local.json` into `<project>/.yaw-mcp/`, on the way
+//           through. One-shot, idempotent (an existing target is never
+//           overwritten) and fail-open, but a real write -- so `match` is a
+//           read of the CONFIG, not a read-only command on the filesystem.
+//
 // Output is human-readable text by default. `--json` on either action
 // emits a machine-readable shape for pipeline use.
 //
 // Exit codes:
-//   0  always -- both actions are local reads with no failure mode. A
-//      malformed bundles.json degrades to "no servers" plus a warning on
-//      stderr rather than an error exit.
+//   0  always -- neither action has a failure mode that surfaces as an exit
+//      code. A malformed bundles.json degrades to "no servers" plus a warning
+//      on stderr rather than an error exit, and the legacy migration above
+//      absorbs its own errors.
 
 import {
   type BundleMatchResult,
   bundleActivateHint,
   CURATED_BUNDLES,
   type CuratedBundle,
+  comparePartialBundles,
   matchBundles,
 } from "./bundles.js";
 import { isAllowed, loadYawMcpConfig } from "./config-loader.js";
@@ -233,14 +244,11 @@ function renderMatch(
   }
 
   if (match.partial.length > 0) {
-    // Same sort as topPartialBundles: fewest missing first, then most
-    // have, then id. Matches the inline discover hint ranking so users
-    // see the same priority in both surfaces.
-    const sorted = match.partial.slice().sort((a, b) => {
-      if (a.missing.length !== b.missing.length) return a.missing.length - b.missing.length;
-      if (a.have.length !== b.have.length) return b.have.length - a.have.length;
-      return a.bundle.id.localeCompare(b.bundle.id);
-    });
+    // THE shared comparator bundles.ts owns (comparePartialBundles), not a
+    // copy of it: topPartialBundles ranks the inline discover hint with the
+    // same function, so the CLI's ordering cannot desync from the server's the
+    // next time someone tweaks a tie-break.
+    const sorted = match.partial.slice().sort(comparePartialBundles);
     print("Partially installed (install more to complete):");
     for (const entry of sorted) {
       const have = entry.have.join(", ");

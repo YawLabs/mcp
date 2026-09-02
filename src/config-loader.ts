@@ -28,6 +28,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseJsonc } from "./jsonc.js";
+import { NAMESPACE_RE } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { migrateLegacyConfigPaths } from "./migrate.js";
 import { findProjectConfigDir, userConfigDir } from "./paths.js";
@@ -114,6 +115,15 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "installNudge",
 ]);
 
+/** Public URL of the shipped JSON Schema (schemas/yaw-mcp.config.v1.json).
+ *  It is the only place a user can see the whole key list WITH its types and
+ *  constraints, and nothing in the product pointed at it -- so it went
+ *  undiscovered. Named in the unknown-key warning below (the one moment a
+ *  user is demonstrably looking for the key list) and in the README's
+ *  Configuration section. Same URL as the schema's own `$id`; dropping it
+ *  into a config as `"$schema"` turns on editor completion. */
+const CONFIG_SCHEMA_URL = "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json";
+
 /** Build the soft-deprecation warning for a file that still carries
  *  `token` / `apiBase`. Named separately so the exact wording is
  *  assertable from tests and identical on every surface (startup log,
@@ -131,9 +141,10 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
   );
 }
 
-/** Filter a config array field down to its string entries. Warns when
- *  non-string entries are dropped (mirroring the apiBase field, which warns
- *  rather than silently swallowing an unusable value). Returns undefined
+/** Filter a config array field down to its usable string entries. Warns when
+ *  entries are dropped, when the field isn't an array at all, and when a
+ *  surviving entry can't be a namespace (mirroring the apiBase field, which
+ *  warns rather than silently swallowing an unusable value). Returns undefined
  *  when the field isn't an array OR when every entry was invalid: a
  *  non-empty array that filters to [] must fall THROUGH to the parent scope
  *  rather than resolve to [] -- an empty allow-list means allow-all in
@@ -141,16 +152,48 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
  *  silently shadow a valid parent scope's allow-list with allow-all. A
  *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
 function filterStringArray(raw: unknown, field: string, path: string, warnings: string[]): string[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
+  if (!Array.isArray(raw)) {
+    // A PRESENT but non-array value (`"servers": "github"` -- the plausible
+    // hand-edit for "lock this session to one server") used to be dropped in
+    // silence, so the field failed OPEN to allow-all while `doctor` reported
+    // an empty warnings array. Absence is the normal case for every scope the
+    // user hasn't configured and stays silent. Only the FIELD is dropped here
+    // -- the rest of the file still loads.
+    if (raw !== undefined) {
+      warnings.push(
+        `${path}: '${field}' must be an array of namespace strings (found ${raw === null ? "null" : typeof raw}) -- ignored.`,
+      );
+    }
+    return undefined;
+  }
   // Non-strings AND blank strings are dropped (the shipped schema says
   // minLength 1). A kept "" was a silent deny-everything: isAllowed then
   // required namespace === "", which NAMESPACE_RE makes unreachable.
-  const strings = raw.filter((v): v is string => typeof v === "string" && v.trim() !== "");
+  // Survivors are kept TRIMMED: validating `" github".trim()` while KEEPING
+  // the untrimmed spelling produced an allow-list no installed namespace can
+  // ever match -- a silent deny-all that also shadows a valid parent scope.
+  // On `blocked` the same trim turns an inert `" slack"` into a real deny,
+  // which is the honest reading of what the user wrote.
+  const strings = raw
+    .map((v) => (typeof v === "string" ? v.trim() : v))
+    .filter((v): v is string => typeof v === "string" && v !== "");
   const dropped = raw.length - strings.length;
   if (dropped > 0) {
     warnings.push(
       `${path}: '${field}' dropped ${dropped} non-string or empty ${dropped === 1 ? "entry" : "entries"} -- only non-empty string namespaces are honored.`,
     );
+  }
+  // Namespace-shape check is a WARNING, never a drop: dropping would empty the
+  // array, hit the fall-through below, and silently promote a specific scope's
+  // deny-all into the parent scope's allow-all -- the exact bug this function
+  // exists to prevent. NAMESPACE_RE is imported from local-bundles.ts rather
+  // than re-spelled so the validator and the installer pin one definition.
+  for (const s of strings) {
+    if (!NAMESPACE_RE.test(s)) {
+      warnings.push(
+        `${path}: '${field}' entry '${s}' is not a valid namespace (a lowercase letter followed by [a-z0-9_]) -- it can never match an installed server.`,
+      );
+    }
   }
   // All entries invalid (non-empty array that filtered to []): treat as
   // unset so the resolver falls through to the parent scope instead of
@@ -234,7 +277,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   );
   if (unknownKeys.length > 0) {
     warnings.push(
-      `${path}: unknown ${unknownKeys.length === 1 ? "key" : "keys"} ${unknownKeys.map((k) => `'${k}'`).join(", ")} ignored -- known keys: ${[...KNOWN_CONFIG_KEYS].join(", ")}.`,
+      `${path}: unknown ${unknownKeys.length === 1 ? "key" : "keys"} ${unknownKeys.map((k) => `'${k}'`).join(", ")} ignored -- known keys: ${[...KNOWN_CONFIG_KEYS].join(", ")}. Full schema: ${CONFIG_SCHEMA_URL}`,
     );
   }
 
@@ -244,6 +287,15 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   // number 1) is ignored rather than coerced, so a typo can't silently
   // flip on a privacy-sensitive nudge.
   const installNudge = typeof obj.installNudge === "boolean" ? obj.installNudge : undefined;
+  // ...but the discard is announced, exactly like the wrong-typed `version`
+  // above. `"installNudge": "true"` used to be swallowed with no diagnostic
+  // on any surface, so a user who opted in read their own config as enabled
+  // while the nudge stayed off.
+  if ("installNudge" in obj && installNudge === undefined) {
+    warnings.push(
+      `${path}: 'installNudge' must be a boolean (found ${obj.installNudge === null ? "null" : typeof obj.installNudge}) -- ignored; the nudge stays off for this file.`,
+    );
+  }
 
   return { path, scope, version, servers, blocked, installNudge };
 }
@@ -392,6 +444,12 @@ export function toProfile(config: ResolvedConfig): Profile | null {
   const global = byScope.get("global");
 
   const primary = local ?? project ?? global;
+  // Unreachable at runtime, and deliberately kept: `config.servers` /
+  // `config.blocked` are only ever populated FROM a loadedFiles entry, so the
+  // guard above already implies at least one scope is present here. What this
+  // line does is narrow `primary` for the compiler (Map.get is optional) --
+  // and it degrades a hypothetical future resolver that synthesizes rules
+  // with no backing file to "no profile" instead of a TypeError on `.path`.
   if (!primary) return null;
 
   const result: Profile = {

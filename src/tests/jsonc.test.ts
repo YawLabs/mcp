@@ -46,9 +46,12 @@ describe("stripJsoncComments", () => {
   });
 
   it("honors // and /* inside single-quoted strings too (defensive, even though JSON disallows)", () => {
-    // parseJsonc will fail on single-quoted strings at JSON.parse time,
-    // but stripJsoncComments must not treat // inside them as comments,
-    // else an error-path fallback that re-emits the source would be wrong.
+    // parseJsonc will fail on single-quoted strings at JSON.parse time, but
+    // the stripper runs BEFORE that and is exported in its own right: its
+    // contract is "removes comments, touches nothing else", so a // inside any
+    // quoted run has to survive. It also keeps the text JSON.parse raises its
+    // SyntaxError against a faithful copy of the user's source, so the position
+    // it reports points at the real problem and not at a span the stripper ate.
     const src = "{'s': 'a // b'}";
     expect(stripJsoncComments(src)).toBe(src);
   });
@@ -104,6 +107,17 @@ describe("stripTrailingCommas", () => {
     const src = '{"url":"https://example.com/api,"}';
     expect(stripTrailingCommas(src)).toBe(src);
   });
+
+  it("does not close a string on an escaped quote, so a comma inside it is not treated as trailing", () => {
+    // stripTrailingCommas carries its OWN copy of the backslash-escape branch
+    // (it does not reuse stripJsoncComments'), and nothing exercised it. Value
+    // here is the four characters `x",}` -- if the escape branch is dropped,
+    // the \" closes the string early, the comma reads as trailing, and this
+    // legitimate config is rewritten into `{"a":"x\" }"}`, a parse error.
+    const src = '{"a":"x\\",}"}';
+    expect(stripTrailingCommas(src)).toBe(src);
+    expect(parseJsonc(src)).toEqual({ a: 'x",}' });
+  });
 });
 
 describe("editJsoncEntry", () => {
@@ -151,6 +165,38 @@ describe("removeJsoncEntry", () => {
     const parsed = parseJsonc(result);
     expect((parsed as Record<string, unknown>).keep).toBe("yes");
     expect((parsed as Record<string, unknown>).remove).toBeUndefined();
+  });
+
+  it("drops the BOM on a REAL removal -- the byte-for-byte promise covers the no-op path only", () => {
+    // Pinning the asymmetry rather than fixing it: jsonc-parser's edit offsets
+    // are computed against the de-BOM'd text, so a genuine removal returns a
+    // string starting at `{`. Harmless where the no-op case was not -- the
+    // caller asked for this change and is writing the file back regardless --
+    // but it is silent, so a caller that must keep a Notepad-saved BOM has to
+    // re-prepend it. This test is what makes that visible.
+    const bom = "﻿";
+    const src = `${bom}{\n  "keep": "yes",\n  "remove": "gone"\n}`;
+    const result = removeJsoncEntry(src, [], "remove");
+    expect(result).not.toBe(src);
+    expect(result.charCodeAt(0)).not.toBe(0xfeff);
+    expect((parseJsonc(result) as Record<string, unknown>).keep).toBe("yes");
+  });
+});
+
+describe("editJsoncEntry / removeJsoncEntry — empty entryName guard", () => {
+  // The guard used to fire only when containerPath was ALSO empty, and its
+  // message ("must specify at least one path segment") described a condition
+  // it never actually checked: [...containerPath, entryName] always has at
+  // least one segment. What it means to reject is an empty KEY, at any depth
+  // -- `(["a"], "")` previously wrote a literal `"": value` into the config.
+  it("rejects an empty entryName at the root", () => {
+    expect(() => editJsoncEntry('{"a":1}', [], "", 2)).toThrow(/non-empty key/);
+    expect(() => removeJsoncEntry('{"a":1}', [], "")).toThrow(/non-empty key/);
+  });
+
+  it("rejects an empty entryName nested under a container path too", () => {
+    expect(() => editJsoncEntry('{"a":{}}', ["a"], "", 2)).toThrow(/non-empty key/);
+    expect(() => removeJsoncEntry('{"a":{}}', ["a"], "")).toThrow(/non-empty key/);
   });
 });
 

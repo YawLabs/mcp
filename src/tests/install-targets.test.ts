@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   buildLaunchEntry,
   claudeCodeProjectKey,
@@ -134,14 +134,22 @@ describe("resolveInstallPath — Claude Code", () => {
     // The common case: callers pass process.cwd() / path.resolve(...),
     // which must pass through verbatim (including POSIX-rooted fixtures
     // on a Windows runner, where isAbsolute('/...') is true).
+    //
+    // The un-normalized `nested/..` segment is what makes this case
+    // independently falsifiable -- with a plain `/home/alice/repo` fixture it
+    // was byte-for-byte the case above and could never fail on its own.
+    // Dropping the isAbsolute guard would send this through resolve(), which
+    // collapses the `..` (and, on a Windows runner, re-roots it on the current
+    // drive), so the key would no longer match what Claude Code wrote.
     const r = resolveInstallPath({
       clientId: "claude-code",
       scope: "local",
       os: "linux",
       home: "/home/alice",
-      projectDir: "/home/alice/repo",
+      projectDir: "/home/alice/nested/../repo",
     });
-    expect(r.containerPath).toEqual(["projects", "/home/alice/repo", "mcpServers"]);
+    expect(r.containerPath).toEqual(["projects", "/home/alice/nested/../repo", "mcpServers"]);
+    expect(r.containerPath[1]).not.toBe(resolve("/home/alice/nested/../repo"));
   });
 
   it("project scope without projectDir throws", () => {
@@ -259,8 +267,12 @@ describe("resolveInstallPath — Claude Code with CLAUDE_CONFIG_DIR override", (
 });
 
 describe("resolveClaudeCodeSettingsPath", () => {
+  // No `os` in any of these calls: the option is declared but never read (every
+  // path here is node:path.join against the runner's platform), so passing it
+  // only made the dead parameter look load-bearing. It stays optional in the
+  // signature purely so the remaining production call sites keep compiling.
   it("user scope without override resolves to ~/.claude/settings.json", () => {
-    const p = resolveClaudeCodeSettingsPath("user", { home: "/home/alice", os: "linux" });
+    const p = resolveClaudeCodeSettingsPath("user", { home: "/home/alice" });
     expect(p).toBe(join("/home/alice", ".claude", "settings.json"));
   });
 
@@ -269,7 +281,6 @@ describe("resolveClaudeCodeSettingsPath", () => {
     // absorbed by the env redirect (the dir IS the .claude equivalent).
     const p = resolveClaudeCodeSettingsPath("user", {
       home: "/home/alice",
-      os: "linux",
       claudeConfigDir: "/tmp/wrapper-session",
     });
     expect(p).toBe(join("/tmp/wrapper-session", "settings.json"));
@@ -279,7 +290,6 @@ describe("resolveClaudeCodeSettingsPath", () => {
     const p = resolveClaudeCodeSettingsPath("project", {
       home: "/home/alice",
       projectDir: "/home/alice/repo",
-      os: "linux",
       claudeConfigDir: "/tmp/wrapper-session",
     });
     expect(p).toBe(join("/home/alice/repo", ".claude", "settings.json"));
@@ -289,7 +299,6 @@ describe("resolveClaudeCodeSettingsPath", () => {
     const p = resolveClaudeCodeSettingsPath("local", {
       home: "/home/alice",
       projectDir: "/home/alice/repo",
-      os: "linux",
       claudeConfigDir: "/tmp/wrapper-session",
     });
     expect(p).toBe(join("/home/alice/repo", ".claude", "settings.local.json"));
@@ -298,10 +307,19 @@ describe("resolveClaudeCodeSettingsPath", () => {
   it("empty claudeConfigDir falls back to home (treated as unset)", () => {
     const p = resolveClaudeCodeSettingsPath("user", {
       home: "/home/alice",
-      os: "linux",
       claudeConfigDir: "",
     });
     expect(p).toBe(join("/home/alice", ".claude", "settings.json"));
+  });
+
+  it("ignores `os` entirely -- every os spelling resolves to the same path", () => {
+    // Pins the dead parameter as dead: if a future change starts reading it,
+    // this case fails instead of the option quietly becoming load-bearing.
+    const expected = join("/home/alice", ".claude", "settings.json");
+    for (const os of ["macos", "linux", "windows"] as const) {
+      expect(resolveClaudeCodeSettingsPath("user", { home: "/home/alice", os }), os).toBe(expected);
+    }
+    expect(resolveClaudeCodeSettingsPath("user", { home: "/home/alice" })).toBe(expected);
   });
 });
 
@@ -313,6 +331,15 @@ describe("resolveInstallPath — Claude Desktop", () => {
       os: "macos",
       home: "/Users/alice",
     });
+    // `absolute` is the path install actually WRITES; `display` is cosmetic.
+    // Pinning only the display string left the write path unpinned anywhere in
+    // the suite -- a refactor that dropped a segment here would stay green while
+    // install wrote to a file Claude Desktop never reads and doctor/--list
+    // agreed it was "installed" (they share this resolver). That is the exact
+    // v0.11.0-0.11.1 failure class the file header records.
+    expect(r.absolute).toBe(
+      join("/Users/alice", "Library", "Application Support", "Claude", "claude_desktop_config.json"),
+    );
     expect(r.display).toBe("~/Library/Application Support/Claude/claude_desktop_config.json");
   });
 
@@ -327,6 +354,37 @@ describe("resolveInstallPath — Claude Desktop", () => {
     expect(r.display).toBe("%APPDATA%\\Claude\\claude_desktop_config.json");
   });
 
+  it("a supplied home beats the ambient process.env.APPDATA", () => {
+    // claude-desktop is the one client that lives under %APPDATA%, so the
+    // resolver preferring the ambient env over an explicit `home` meant a
+    // hermetic run (tests, `--home` overrides) resolved to -- and install would
+    // have written -- the DEVELOPER's real claude_desktop_config.json. Every
+    // caller re-derived `<home>/AppData/Roaming` by hand to dodge that; the
+    // resolver owns the rule now, so the caller that forgets is hermetic too.
+    vi.stubEnv("APPDATA", "C:\\Users\\REAL-DEVELOPER\\AppData\\Roaming");
+    try {
+      const r = resolveInstallPath({
+        clientId: "claude-desktop",
+        scope: "user",
+        os: "windows",
+        home: "C:\\synth-home",
+      });
+      expect(r.absolute).toBe(join("C:\\synth-home", "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
+      expect(r.absolute).not.toContain("REAL-DEVELOPER");
+      // An explicit appData still wins over both.
+      const explicit = resolveInstallPath({
+        clientId: "claude-desktop",
+        scope: "user",
+        os: "windows",
+        home: "C:\\synth-home",
+        appData: "C:\\explicit\\Roaming",
+      });
+      expect(explicit.absolute).toBe(join("C:\\explicit\\Roaming", "Claude", "claude_desktop_config.json"));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("Linux is refused (no Linux build)", () => {
     expect(() =>
       resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "linux", home: "/home/alice" }),
@@ -337,6 +395,9 @@ describe("resolveInstallPath — Claude Desktop", () => {
 describe("resolveInstallPath — Cursor", () => {
   it("user scope uses ~/.cursor/mcp.json", () => {
     const r = resolveInstallPath({ clientId: "cursor", scope: "user", os: "macos", home: "/Users/alice" });
+    // Same reason as the Claude Desktop case: pin the path install writes, not
+    // just the cosmetic display string.
+    expect(r.absolute).toBe(join("/Users/alice", ".cursor", "mcp.json"));
     expect(r.display).toBe("~/.cursor/mcp.json");
   });
 
@@ -513,6 +574,41 @@ describe("buildLaunchEntry", () => {
     expect(e.args).toEqual(["/c", "node", "server.js", "--url", "https://api/x?a=1^&b=2"]);
   });
 
+  it("single-caret-escapes for a uvx-hosted server (uvx.exe is direct, not a .cmd shim)", () => {
+    // uv ships `uvx.exe`, so a uvx-hosted upstream is reached after ONE cmd
+    // parse. Classifying uvx as a shim triple-caret escaped the arg and the
+    // server received the corrupted `^&` instead of `&` -- the query string it
+    // was handed silently carried a stray caret.
+    const e = buildLaunchEntry({
+      os: "windows",
+      upstream: { command: "uvx", args: ["mcp-server-x", "--url", "https://api/x?a=1&b=2"] },
+    });
+    expect(e.command).toBe("cmd");
+    expect(e.args).toEqual(["/c", "uvx", "mcp-server-x", "--url", "https://api/x?a=1^&b=2"]);
+  });
+
+  it("refuses an upstream command containing whitespace on Windows", () => {
+    // `command` goes into the `cmd /c` wrap verbatim (escapeCmdArg shape 3:
+    // libuv quote-wraps a space-bearing token). But `cmd /c` strips the FIRST
+    // and LAST quote of the line whenever a second token is quoted too, so the
+    // command loses its opening quote and the client's spawn dies with
+    // `'C:\Program' is not recognized`. Refuse at write time instead of
+    // persisting an entry that fails later, in someone else's process.
+    expect(() =>
+      buildLaunchEntry({
+        os: "windows",
+        upstream: { command: "C:\\Program Files\\demo\\srv.cmd", args: ["--flag=a b"] },
+      }),
+    ).toThrow(/launcher command that contains whitespace/);
+    // Non-Windows has no cmd.exe in the spawn path -- the same command is fine.
+    const posix = buildLaunchEntry({
+      os: "linux",
+      upstream: { command: "/opt/demo dir/srv", args: ["--flag=a b"] },
+    });
+    expect(posix.command).toBe("/opt/demo dir/srv");
+    expect(posix.args).toEqual(["--flag=a b"]);
+  });
+
   it("refuses an upstream arg that combines a quote and a cmd metacharacter", () => {
     // The exact hostile-catalog injection escapeCmdArg's own comment closes:
     // `a"&echo X` breaks out of libuv's quoting under cmd.exe's quote-counting
@@ -548,22 +644,33 @@ describe("buildLaunchEntry", () => {
 
 describe("isCmdShimLauncher", () => {
   it("classifies known .cmd/.bat shim launchers as shims", () => {
-    for (const c of ["npx", "uvx", "pipx", "npm", "pnpm", "yarn", "bunx"]) {
+    // npm-generated wrappers: every global npm bin and every node_modules/.bin
+    // entry is a `.cmd` on Windows.
+    for (const c of ["npx", "npm", "pnpm", "yarn", "bunx"]) {
       expect(isCmdShimLauncher(c), c).toBe(true);
     }
     // Explicit extension and a full path both resolve by basename.
     expect(isCmdShimLauncher("npx.cmd")).toBe(true);
     expect(isCmdShimLauncher("C:\\Users\\me\\AppData\\Roaming\\npm\\npx.cmd")).toBe(true);
     expect(isCmdShimLauncher("some-tool.bat")).toBe(true);
+    // A hand-rolled `uvx.cmd` is still caught by the extension test, even
+    // though the bare `uvx` stem is classified direct below.
+    expect(isCmdShimLauncher("uvx.cmd")).toBe(true);
   });
 
   it("classifies real executables as direct (not shims)", () => {
-    for (const c of ["node", "deno", "bun", "python", "python3", "docker", "dotnet", "java", "go"]) {
+    // uvx/pipx are in this list, not the shim list: uv ships `uvx.exe` beside
+    // `uv.exe` (yaw-mcp's own uv bootstrap installs exactly that native binary)
+    // and pipx installs `pipx.exe`. Calling them shims charged their args a
+    // caret level they never spend -- a no-space metachar arg was triple-caret
+    // escaped and arrived at uvx.exe as the corrupted `^&` instead of `&`.
+    for (const c of ["node", "deno", "bun", "python", "python3", "uvx", "pipx", "docker", "dotnet", "java", "go"]) {
       expect(isCmdShimLauncher(c), c).toBe(false);
     }
     expect(isCmdShimLauncher("node.exe")).toBe(false);
     expect(isCmdShimLauncher("C:\\Program Files\\nodejs\\node.exe")).toBe(false);
     expect(isCmdShimLauncher("foo.com")).toBe(false);
+    expect(isCmdShimLauncher("uvx.exe")).toBe(false);
   });
 
   it("fails SAFE for an unknown bare name (treated as a shim)", () => {

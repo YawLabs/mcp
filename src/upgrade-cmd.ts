@@ -59,6 +59,7 @@
 
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { compareVersions, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 
 declare const __VERSION__: string;
 
@@ -73,7 +74,10 @@ export const BINARY_RETIRED_HINT =
   "the standalone-binary track was retired in 0.70.3. Install from npm instead -- `npm install -g @yawlabs/mcp@latest` -- then delete this executable.";
 
 export interface UpgradeCommandOptions {
-  /** When true, actually spawn the upgrade command (only for global-npm mode). */
+  /** When true, actually spawn the upgrade command. Runnable methods only --
+   *  global-npm, pnpm-global, bun-global and local-node-modules each spawn
+   *  their OWNING tool; every other method (npx / bundled-app are no-ops,
+   *  binary / dev-checkout / unknown are manual) refuses without spawning. */
   run?: boolean;
   /** Emit a machine-readable JSON snapshot instead of prose. */
   json?: boolean;
@@ -95,19 +99,15 @@ export interface UpgradeCommandOptions {
   /** Test hook: replace the running-install prefix walk behind the
    *  `--prefix` a global-npm upgrade passes (see defaultRunningPrefix). */
   runningPrefix?: (argvPath: string | undefined) => string | null | Promise<string | null>;
+  /** Test hook: override the platform the `--prefix` quoting decides against.
+   *  Both quoters take it, so a POSIX runner can exercise the win32-only
+   *  unquotable-prefix fallback (the branch that drops `--prefix` from the
+   *  spawn argv AND from every printed suggestion). */
+  platform?: NodeJS.Platform;
   /** Test hook: force single-executable (SEA binary) detection. */
   isSea?: () => boolean;
   /** Test hook: replace the `oam --version` probe behind the oam-floor note. */
-  oamProbe?: () => OamFloorProbe | Promise<OamFloorProbe>;
-}
-
-/** The two fields the oam-floor note reads out of an `oam --version` probe.
- *  Declared structurally (rather than reusing oam-spawn's OamProbe) so
- *  upgrade-cmd keeps oam-spawn out of its static import graph -- see
- *  oamFloorLines for why that matters on the serve startup path. */
-export interface OamFloorProbe {
-  version: string | null;
-  belowMin: boolean;
+  oamProbe?: () => OamProbe | Promise<OamProbe>;
 }
 
 export interface UpgradeCommandResult {
@@ -149,12 +149,28 @@ export type InstallMethod =
 const POSIX_GLOBAL_LIB_PREFIX = /^(?:[A-Za-z]:)?(?:\/usr(?:\/local)?|\/opt\/[^/]+)\/lib\/node_modules\/@yawlabs\/mcp\//;
 
 /** Version-manager and rootless-user Node roots, which also keep globals at
- *  `<root>/lib/node_modules` but sit at an arbitrary depth under the manager's
- *  own directory (`~/.nvm/versions/node/v22.11.0/lib/node_modules/...`). Same
- *  anchoring rationale as POSIX_GLOBAL_LIB_PREFIX: the manager segment is what
- *  distinguishes a Node root from a project directory named `lib`. */
+ *  `<root>/lib/node_modules`. Same anchoring rationale as
+ *  POSIX_GLOBAL_LIB_PREFIX -- and the anchor has to be each manager's REAL
+ *  layout. The marker used to allow any number of free segments between the
+ *  manager directory and `lib`, which re-opened the exact false positive the
+ *  anchoring exists to close: any repo under an ancestor named `.local`, `n`,
+ *  `fnm`, ... satisfied it (`~/.local/share/myrepo/packages/lib/node_modules/
+ *  @yawlabs/mcp/...`) and landed back on the unrecoverable
+ *  `npm install -g --prefix <repo>/packages`. Each alternative below is one
+ *  manager's fixed shape, version segment included:
+ *    ~/.nvm/versions/node/v22.11.0/lib/node_modules
+ *    ~/.volta/tools/image/node/22.11.0/lib/node_modules
+ *    ~/.asdf/installs/nodejs/22.11.0/lib/node_modules
+ *    ~/.fnm/node-versions/v22.11.0/installation/lib/node_modules
+ *    ~/.local/share/fnm/node-versions/v22.11.0/installation/lib/node_modules
+ *    ~/.nodenv/versions/22.11.0/lib/node_modules
+ *    ~/.nvs/node/22.11.0/x64/lib/node_modules
+ *    <N_PREFIX>/n/versions/node/22.11.0/lib/node_modules
+ *    ~/.local/lib/node_modules            (rootless `npm -g --prefix ~/.local`)
+ *  Anything else degrades safely to local-node-modules, exactly as documented
+ *  on POSIX_GLOBAL_LIB_PREFIX. */
 const MANAGED_NODE_LIB_PREFIX =
-  /\/(?:\.local|\.nvm|\.fnm|fnm|\.asdf|\.volta|\.nodenv|\.nvs|n)\/(?:[^/]+\/)*lib\/node_modules\/@yawlabs\/mcp\//;
+  /\/(?:\.nvm\/versions\/node\/[^/]+|\.volta\/tools\/image\/node\/[^/]+|\.asdf\/installs\/nodejs\/[^/]+|(?:\.local\/share\/)?\.?fnm\/node-versions\/[^/]+\/installation|\.nodenv\/versions\/[^/]+|\.nvs\/[^/]+\/[^/]+\/[^/]+|n\/versions\/node\/[^/]+|\.local)\/lib\/node_modules\/@yawlabs\/mcp\//;
 
 export interface UpgradePlan {
   current: string;
@@ -163,6 +179,16 @@ export interface UpgradePlan {
   method: InstallMethod;
   /** Command to run to move to the latest version. Null when method=npx (nothing to do). */
   command: string | null;
+  /** Directory `command` must run IN, or null when it can run anywhere.
+   *  Only local-node-modules installs need one -- the package-tree root, i.e.
+   *  everything above the first `node_modules` segment. `npm install
+   *  @yawlabs/mcp@latest` run from any other directory does not upgrade that
+   *  tree: it creates a stray package.json + node_modules wherever it landed
+   *  and leaves the stale copy in place.
+   *
+   *  Present on the --json snapshot only. buildUpgradePlan has no argv[1] to
+   *  walk, so it leaves the field absent; runUpgrade fills it in. */
+  cwd?: string | null;
 }
 
 export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
@@ -172,7 +198,12 @@ export const UPGRADE_USAGE = `Usage: yaw-mcp upgrade [--run] [--json]
   --run     Run the upgrade in place (global npm, pnpm, bun, and local npm
             installs). No-op for npx installs -- they always fetch the latest.
   --json    Emit a machine-readable snapshot ({ current, latest, stale,
-            method, command }) instead of prose.
+            method, command, cwd }) instead of prose. "cwd" is the directory
+            "command" must run IN -- the package-tree root for a
+            local-node-modules install, null for every other method (the
+            command can run anywhere). Running a local install's command from
+            the wrong directory creates a stray package.json + node_modules
+            there instead of upgrading the tree.
             NOTE: --json is a report-only snapshot; it never spawns an upgrade
             even when combined with --run, and exits 1 whenever "stale" is
             true. Use --run without --json to actually perform the upgrade.`;
@@ -193,9 +224,59 @@ export function parseUpgradeArgs(
 /** Classify how yaw-mcp is being invoked. The argv[1] path is the most
  *  reliable signal — npm/npx land it in distinct directories. Falls
  *  through to `unknown` rather than guessing, which lets --json
- *  consumers branch without false positives.  */
-export function detectInstallMethod(argvPath: string | undefined): InstallMethod {
+ *  consumers branch without false positives.
+ *
+ *  Two passes, and the ORDER is load-bearing. Pass 1 classifies the literal
+ *  argv path. Only when that yields `unknown` does pass 2 realpath the path and
+ *  re-classify, which is what rescues the canonical POSIX invocation: `yaw-mcp
+ *  upgrade` arrives through npm's bin SYMLINK (`<prefix>/bin/yaw-mcp`,
+ *  `node_modules/.bin/yaw-mcp`, `_npx/<hex>/node_modules/.bin/yaw-mcp`), which
+ *  matches none of the markers below and used to classify `unknown` -- so an
+ *  ordinary global install paid a real `npm prefix -g` subprocess, then printed
+ *  "Install: unknown" and refused `--run`.
+ *
+ *  Resolving FIRST would regress pnpm-global: `<pnpm-home>/global/<n>/
+ *  node_modules/@yawlabs/mcp` is itself a symlink into
+ *  `.pnpm/@yawlabs+mcp@<ver>/node_modules/@yawlabs/mcp`, whose resolved path
+ *  misses the pnpm marker and falls through to `local-node-modules` -- i.e.
+ *  `--run` would `npm install` inside the pnpm store, the precise hazard the
+ *  pnpm/bun markers were written to prevent. A literal that already classifies
+ *  is therefore never second-guessed.
+ *
+ *  `realpath` is injectable because unit tests work in fake paths that cannot
+ *  be resolved on any real filesystem. In production a nonexistent or
+ *  unreadable path throws and the literal answer stands, exactly as
+ *  comparablePath degrades.
+ *
+ *  auto-upgrade's background upgrader shares this classifier, so it inherits
+ *  the second chance too. That widens the set of installs it will
+ *  `npm install -g --prefix` for -- deliberately, and only in the safe
+ *  direction: the second pass can turn `unknown` into a marker match, never a
+ *  marker match into something else, so a project tree (which classifies
+ *  `local-node-modules` on the literal pass and is therefore never resolved)
+ *  cannot become the `-g`-into-a-repo false positive the marker comments above
+ *  warn about. The paths it newly reaches are genuine globals invoked through
+ *  their bin shim -- for which detectRunningInstallPrefix already realpathed
+ *  and already had the right `--prefix`; only the classification was missing. */
+export function detectInstallMethod(
+  argvPath: string | undefined,
+  realpath: (p: string) => string = realpathSync,
+): InstallMethod {
   if (!argvPath) return "unknown";
+  const literal = classifyEntrypoint(argvPath);
+  if (literal !== "unknown") return literal;
+  let resolved: string;
+  try {
+    resolved = realpath(argvPath);
+  } catch {
+    return literal;
+  }
+  return resolved === argvPath ? literal : classifyEntrypoint(resolved);
+}
+
+/** The path-marker pass behind detectInstallMethod, run once on the literal
+ *  argv path and (only when that says `unknown`) once on its realpath. */
+function classifyEntrypoint(argvPath: string): InstallMethod {
   const normalized = argvPath.replace(/\\/g, "/");
   // `npx -y @yawlabs/mcp` stages packages under ~/.npm/_npx/<hex>/
   // node_modules/@yawlabs/mcp/ (or platform equivalent; on Windows the
@@ -407,7 +488,14 @@ export function buildUpgradePlan(input: {
   method: InstallMethod;
 }): UpgradePlan {
   const { current, latest, method } = input;
-  const stale = latest !== null && current !== "dev" && compareSemverLocal(current, latest) < 0;
+  // oam-spawn's compareVersions is THE semver comparator for the package (it
+  // implements real prerelease precedence, so 0.45.0-rc.1 ranks below 0.45.0).
+  // It is anchored and does not accept a leading "v", so strip one first --
+  // the same normalization doctor-cmd's compareSemver does, and for the same
+  // reason: a git-tag-shaped "v0.45.0" would otherwise fail to parse, compare
+  // equal, and silently report a stale install as current.
+  const stripV = (s: string): string => (s.startsWith("v") ? s.slice(1) : s);
+  const stale = latest !== null && current !== "dev" && compareVersions(stripV(current), stripV(latest)) < 0;
 
   let command: string | null;
   switch (method) {
@@ -440,66 +528,6 @@ export function buildUpgradePlan(input: {
       break;
   }
   return { current, latest, stale, method, command };
-}
-
-/** Copy of compareSemver kept local so upgrade-cmd doesn't drag
- *  doctor-cmd into its import graph (keeps the CLI startup fast).
- *
- *  Implements semver.org precedence: split major.minor.patch-prerelease,
- *  compare release fields numerically, then prerelease identifiers per
- *  the spec:
- *    - A version with a prerelease tag has LOWER precedence than the same
- *      release without one (1.2.3-beta < 1.2.3).
- *    - Prerelease identifiers are compared dot-by-dot: numeric identifiers
- *      compare numerically, alphanumerics lexically, numeric < alphanumeric,
- *      a shorter run of identifiers loses to a longer one when all earlier
- *      ones are equal.
- *  Build metadata (`+...`) is ignored per spec. */
-function compareSemverLocal(a: string, b: string): number {
-  const parse = (s: string): { release: [number, number, number]; prerelease: string[] } | null => {
-    // Strip any build-metadata suffix (semver.org §10) before splitting.
-    const cleaned = s.replace(/\+.*$/, "");
-    const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(cleaned);
-    if (!m) return null;
-    const release: [number, number, number] = [Number(m[1]), Number(m[2]), Number(m[3])];
-    const prerelease = m[4] ? m[4].split(".") : [];
-    return { release, prerelease };
-  };
-  const pa = parse(a);
-  const pb = parse(b);
-  if (!pa || !pb) return 0;
-  for (let i = 0; i < 3; i++) {
-    if (pa.release[i] < pb.release[i]) return -1;
-    if (pa.release[i] > pb.release[i]) return 1;
-  }
-  // Release fields equal -- compare prerelease per semver.org §11.
-  // A version WITHOUT prerelease beats a version WITH one.
-  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0;
-  if (pa.prerelease.length === 0) return 1;
-  if (pb.prerelease.length === 0) return -1;
-  const len = Math.min(pa.prerelease.length, pb.prerelease.length);
-  for (let i = 0; i < len; i++) {
-    const ai = pa.prerelease[i];
-    const bi = pb.prerelease[i];
-    const aNum = /^\d+$/.test(ai);
-    const bNum = /^\d+$/.test(bi);
-    if (aNum && bNum) {
-      const na = Number(ai);
-      const nb = Number(bi);
-      if (na < nb) return -1;
-      if (na > nb) return 1;
-    } else if (aNum !== bNum) {
-      // Numeric identifiers always have lower precedence than alphanumerics.
-      return aNum ? -1 : 1;
-    } else {
-      if (ai < bi) return -1;
-      if (ai > bi) return 1;
-    }
-  }
-  // All compared identifiers equal -- longer prerelease wins (1.2.3-alpha.1 > 1.2.3-alpha).
-  if (pa.prerelease.length < pb.prerelease.length) return -1;
-  if (pa.prerelease.length > pb.prerelease.length) return 1;
-  return 0;
 }
 
 /** Abort budget for the registry probe when a caller names none. Three seconds
@@ -561,6 +589,26 @@ export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): 
   }
 }
 
+/** probeOam's below-floor branch emits a broker-flavoured JSON warn on stderr
+ *  ("oam is installed but below the minimum supported version..."). That is the
+ *  right and only report under `serve`, where nothing else is printing — but in
+ *  `upgrade` the prose note below already says the same thing in the shape a
+ *  human reads, so the warn is a second, uglier copy of one advisory landing on
+ *  the same terminal. Raise the logger threshold for the duration of the probe
+ *  and no longer: logger.ts resolves LOG_LEVEL per call rather than latching it
+ *  at import, so this is a scoped mute, and the restore runs in a `finally` so a
+ *  throwing probe cannot leave the process silent. */
+async function probeOamQuietly(): Promise<OamProbe> {
+  const prev = process.env.LOG_LEVEL;
+  process.env.LOG_LEVEL = "error";
+  try {
+    return await probeOam();
+  } finally {
+    if (prev === undefined) delete process.env.LOG_LEVEL;
+    else process.env.LOG_LEVEL = prev;
+  }
+}
+
 /** Advisory lines for the case where the oam runtime is installed but BELOW the
  *  floor yaw-mcp hosts sidecars on. Empty when oam is absent (node is the
  *  baseline, nothing to say), current, or unprobeable.
@@ -573,18 +621,15 @@ export async function fetchLatestVersion(opts: FetchLatestVersionOptions = {}): 
  *  `upgrade`, the command a user runs precisely to "get current", printed
  *  "nothing to do".
  *
- *  The oam-spawn import is dynamic on purpose: upgrade-cmd sits on the serve
- *  startup path (auto-upgrade.ts imports it), and this probe only matters in the
- *  prose CLI path. The try/catch makes the note strictly advisory — a probe that
- *  throws must never fail `upgrade`. */
+ *  The try/catch makes the note strictly advisory — a probe that throws must
+ *  never fail `upgrade`. */
 async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise<string[]> {
   // Auto-skip under vitest when no probe was injected (mirrors npmGlobalPrefix):
   // an un-injected unit test must never spawn a real `oam --version`, whose
   // answer varies per machine.
   if (!probe && process.env.VITEST) return [];
   try {
-    const { MIN_OAM_VERSION, probeOam } = await import("./oam-spawn.js");
-    const oam: OamFloorProbe = probe ? await probe() : await probeOam();
+    const oam = probe ? await probe() : await probeOamQuietly();
     if (!oam.belowMin) return [];
     return [
       "",
@@ -602,8 +647,9 @@ async function oamFloorLines(probe?: UpgradeCommandOptions["oamProbe"]): Promise
  *  up to its node_modules parent) so a global-npm upgrade can pass `--prefix`.
  *  Delegates to auto-upgrade's detectRunningInstallPrefix via dynamic import:
  *  auto-upgrade.ts statically imports this module, so a static back-import
- *  would create a cycle (same pattern as the oam-spawn import in
- *  oamFloorLines). Auto-skips under vitest (mirrors npmGlobalPrefix): the
+ *  would create a cycle. (oam-spawn, by contrast, imports nothing from here,
+ *  which is why THAT one is a plain static import at the top of the file.)
+ *  Auto-skips under vitest (mirrors npmGlobalPrefix): the
  *  walk realpaths argv[1], so on a machine that really has a global install
  *  an un-injected unit test's spawn args would flip from bare `-g` to
  *  `--prefix` depending on the machine. Tests exercising the prefix path
@@ -702,8 +748,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     const rawPrefix = await (opts.runningPrefix ?? defaultRunningPrefix)(argvPath);
     if (rawPrefix !== null) {
       const { quoteArgForDisplay, quoteShellArgIfNeeded } = await import("./auto-upgrade.js");
-      const spawnForm = quoteShellArgIfNeeded(rawPrefix);
-      const displayForm = quoteArgForDisplay(rawPrefix);
+      // opts.platform threads through to BOTH quoters: only win32 can refuse a
+      // prefix, so a POSIX test runner has no other way to reach the
+      // drop-the-prefix branch below.
+      const spawnForm = quoteShellArgIfNeeded(rawPrefix, opts.platform);
+      const displayForm = quoteArgForDisplay(rawPrefix, opts.platform);
       // The two fail together today (win32 shares one implementation; POSIX
       // display quoting is total) -- requiring both keeps the spawned argv
       // and every printed suggestion from ever disagreeing.
@@ -714,11 +763,22 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     }
   }
 
+  // The directory a local-node-modules command has to run IN. Computed here,
+  // above the --json and offline returns, for the same reason globalPrefixArg
+  // is: the walk is a pure string operation on argv[1], and every one of those
+  // paths hands the user a command to run LATER. A cwd-less
+  // `npm install @yawlabs/mcp@latest` run from the wrong directory does not
+  // upgrade the tree -- it writes a stray package.json + node_modules wherever
+  // it landed and leaves the stale copy in place.
+  const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath) : null;
+
   if (opts.json) {
     // The snapshot's command is the paste-safe prefixed form: scripts and
     // humans both act on it, and a bare `-g` would promise a different
-    // install than `--run` performs (see the pinning note above).
-    print(JSON.stringify({ ...plan, command: suggestedCommand }, null, 2));
+    // install than `--run` performs (see the pinning note above). `cwd` is the
+    // other half of that promise for local installs -- a script that runs
+    // `command` from its own working directory needs to be told it must chdir.
+    print(JSON.stringify({ ...plan, command: suggestedCommand, cwd: installRoot }, null, 2));
     // --json is a REPORT-ONLY snapshot: it never spawns, even with --run. The
     // exit code therefore keys on staleness alone. It used to key on
     // `plan.stale && !opts.run`, which made `--json --run` on a stale install
@@ -735,6 +795,12 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     if (suggestedCommand) {
       print("When you're back online, run:");
       print("");
+      // Same `in <root>:` header the online exit-1 path prints: the command is
+      // the one the user will paste later, and for a local install it is only
+      // correct from the tree root.
+      if (installRoot) {
+        print(`in ${installRoot}:`);
+      }
       print(`  ${suggestedCommand}`);
     } else if (method === "bundled-app") {
       print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app — nothing to run.");
@@ -743,6 +809,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     } else {
       print("Your install uses `npx -y` — just restart the MCP client when you're back online.");
     }
+    // The oam floor probe is LOCAL (`oam --version`); an unreachable npm
+    // registry says nothing about it. Skipping the note here used to hide the
+    // below-floor state from precisely the user who cannot fix the other half
+    // right now -- and their sidecars are already falling back to node.
+    for (const line of await oamFloorLines(opts.oamProbe)) print(line);
     return { exitCode: 0, lines };
   }
 
@@ -772,8 +843,15 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
 
   if (method === "binary") {
-    print("yaw-mcp is running as a standalone binary — manual upgrade required.");
-    print(`There's no package manager to upgrade it, and \`--run\` can't automate this: ${BINARY_RETIRED_HINT}`);
+    // One stream per exit code, matching the dev-checkout / unknown refusal
+    // below: a --run that REFUSES (exit 2) reports on stderr, while the
+    // informational exit-1 listing stays on stdout. These are the same
+    // documented exit-2 class, and a script redirecting one stream to catch the
+    // refusal must not have to know which non-runnable method it happened to
+    // hit.
+    const emit = opts.run ? printErr : print;
+    emit("yaw-mcp is running as a standalone binary — manual upgrade required.");
+    emit(`There's no package manager to upgrade it, and \`--run\` can't automate this: ${BINARY_RETIRED_HINT}`);
     // 1→2 scripting trap (see the "SCRIPTING TRAP" note in the file header):
     // plain `upgrade` returns 1, but `--run` returns 2 because a binary can
     // never be auto-run. The message above states "manual upgrade required"
@@ -787,7 +865,6 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // their global stores. dev-checkout stays manual — the user owns that
   // tree and the right command depends on their setup. unknown stays
   // manual because we don't know which install we'd be mutating.
-  const installRoot = method === "local-node-modules" ? localInstallRoot(argvPath) : null;
   const runSpec: { cmd: string; args: string[]; cwd?: string } | null =
     method === "global-npm"
       ? {
@@ -868,6 +945,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
   printErr(`yaw-mcp upgrade: ${runSpec.cmd} exited ${code}. Try running the command yourself:`);
   printErr("");
+  // The child ran with cwd=installRoot; a retry the user types by hand has to
+  // start from the same directory or it installs into whatever they were in.
+  if (installRoot) {
+    printErr(`in ${installRoot}:`);
+  }
   printErr(`  ${commandLine}`);
   return { exitCode: 3, lines };
 }

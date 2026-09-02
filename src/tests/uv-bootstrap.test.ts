@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ═══════════════════════════════════════════════════════════════════════
 // uv bootstrap — covers the spawn-rewrite path that runs on every
-// upstream activation. The actual network download is out of scope
-// here (it's exercised by the integration test gated on
-// MCPH_TEST_UV_DOWNLOAD=1) because pulling a 20MB binary over
-// GitHub during CI is noisy and slow.
+// upstream activation. The download itself is out of scope here: the
+// MOCKED download/checksum/extract path is covered by
+// uv-bootstrap-network.test.ts and uv-bootstrap-extract.test.ts, and a
+// REAL fetch of Astral's ~20MB release asset is deliberately exercised
+// by nothing — there is no integration test and no env-gated escape
+// hatch, because a live github.com dependency inside a unit suite is
+// slow, flaky, and pinned to whatever assets UV_VERSION still has.
 //
 // NOTE: fix-1 (shell:true on win32) and fix-2 (memo clear on rejection)
 // are pinned in uv-bootstrap-fixes.test.ts, which mocks node:child_process
@@ -30,7 +33,17 @@ import {
 // test: the previous shape returned early when uv was absent, so the test
 // reported GREEN while asserting nothing. `it.skipIf` makes the skip show up
 // in the runner output, which is the honest signal.
-const UV_PRESENT = spawnSync("uv", ["--version"], { stdio: "ignore" }).status === 0;
+//
+// The spawn options MATCH onPath's (uv-bootstrap.ts): win32 needs shell:true
+// so a PATHEXT shim (uv.cmd / uv.bat) resolves. A shell-less probe here
+// false-NEGATIVES on exactly such a host and silently skips all five tests
+// below -- on the Windows shim shape they exist to protect.
+const UV_PRESENT =
+  spawnSync("uv", ["--version"], {
+    stdio: "ignore",
+    shell: process.platform === "win32",
+    windowsHide: process.platform === "win32",
+  }).status === 0;
 
 describe("resolveUvSpawn", () => {
   beforeEach(() => {

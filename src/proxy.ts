@@ -272,10 +272,6 @@ export function buildToolRoutes(
   return routes;
 }
 
-// Builtins come FIRST in the list — they come from yaw-mcp itself and are
-// always present regardless of which servers are activated, so clients
-// that scan the list top-down (Claude Code does) see the guide before
-// the upstream noise.
 /** One resources/list entry as this proxy publishes it. `title` and `_meta`
  *  are MCP 2025-06-18 passthrough fields -- see the forwarding note in the
  *  upstream loop below. */
@@ -288,6 +284,10 @@ export interface ProxiedResourceEntry {
   _meta?: Record<string, unknown>;
 }
 
+// Builtins come FIRST in the list — they come from yaw-mcp itself and are
+// always present regardless of which servers are activated, so clients
+// that scan the list top-down (Claude Code does) see the guide before
+// the upstream noise.
 export function buildResourceList(
   activeConnections: Map<string, UpstreamConnection>,
   builtins: BuiltinResource[] = [],
@@ -298,12 +298,24 @@ export function buildResourceList(
   exposedNamespaces?: ReadonlySet<string>,
 ): Array<ProxiedResourceEntry> {
   const resources: ProxiedResourceEntry[] = [];
+  // Same `seen` guard, and for the same reason, as buildToolList and
+  // buildPromptList: a resources/list reply must not carry one uri twice.
+  // An upstream that lists the same uri in two entries is enough to produce
+  // that (so is a `connect://${namespace}/${uri}` pair that flattens to one
+  // string), and clients then dedupe arbitrarily or error. Builtins seed the
+  // set so a builtin SHADOWS an upstream uri here exactly as it does in
+  // routeResourceRead — one winner on both surfaces. First writer wins, and
+  // buildResourceRoutes agrees on that winner.
+  const seen = new Set<string>();
   for (const b of builtins) {
+    if (seen.has(b.uri)) continue;
     resources.push({ uri: b.uri, name: b.name, description: b.description, mimeType: b.mimeType });
+    seen.add(b.uri);
   }
   for (const conn of activeConnections.values()) {
     if (exposure === "gateway" && !exposedNamespaces?.has(conn.config.namespace)) continue;
     for (const r of conn.resources) {
+      if (seen.has(r.namespacedUri)) continue;
       // title / _meta ride along, same as buildToolList: an upstream that
       // published a display name or a metadata convention must reach the
       // client with both intact (MCP 2025-06-18). Builtins above set
@@ -316,6 +328,7 @@ export function buildResourceList(
         mimeType: r.mimeType,
         _meta: r._meta,
       });
+      seen.add(r.namespacedUri);
     }
   }
   return resources;
@@ -325,6 +338,25 @@ export function buildResourceRoutes(activeConnections: Map<string, UpstreamConne
   const routes = new Map<string, ResourceRoute>();
   for (const conn of activeConnections.values()) {
     for (const r of conn.resources) {
+      const existing = routes.get(r.namespacedUri);
+      if (existing) {
+        // FIRST writer wins, mirroring buildToolRoutes / buildPromptRoutes,
+        // and the `continue` is load-bearing for the same reason:
+        // buildResourceList skips a duplicate namespacedUri, so the entry the
+        // client was shown belongs to the FIRST writer. Last-writer-wins here
+        // meant resources/read fetched a DIFFERENT resource than the one
+        // advertised under that uri. Warn only when a SECOND namespace is
+        // involved -- one upstream repeating its own uri is not an
+        // operator-fixable collision, there is no other server to rename.
+        if (existing.namespace !== conn.config.namespace) {
+          log("warn", "Resource route collision; keeping the first upstream, ignoring the later one", {
+            uri: r.namespacedUri,
+            keptNamespace: existing.namespace,
+            ignoredNamespace: conn.config.namespace,
+          });
+        }
+        continue;
+      }
       routes.set(r.namespacedUri, { namespace: conn.config.namespace, originalUri: r.uri });
     }
   }
@@ -432,8 +464,19 @@ export async function routeResourceRead(
   }
 
   try {
-    const result = await connection.client.readResource({ uri: route.originalUri });
-    return result as ResourceContents;
+    const result = (await connection.client.readResource({ uri: route.originalUri })) as ResourceContents;
+    // Re-namespace every uri on the way out. resources/list, the route table
+    // and this function's own error arms all speak the `connect://<ns>/<uri>`
+    // form, so returning the upstream's raw uri handed the client back a
+    // string it cannot read again -- the one surface that leaked the
+    // un-namespaced form. Namespaced PER ENTRY rather than rewritten to the
+    // requested uri: a single read may legitimately return several
+    // sub-resources, and collapsing them onto the requested uri would lose
+    // which is which.
+    return {
+      ...result,
+      contents: (result.contents ?? []).map((c) => ({ ...c, uri: `connect://${route.namespace}/${c.uri}` })),
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log("error", "Resource read failed", { uri, namespace: route.namespace, error: message });
@@ -498,12 +541,45 @@ export function isRoutingFaultResult(result: unknown): boolean {
   );
 }
 
+// Bound on a single proxied tools/call. The SDK applies 60s of its own if no
+// options object is passed; naming the number here turns it into an operator
+// knob (MCP_CALL_TIMEOUT) instead of an SDK constant nobody can reach, matching
+// MCP_CONNECT_TIMEOUT on the handshake and MCP_LIST_TIMEOUT on the inventory
+// calls -- previously the only leg of a request with no override.
+//
+// The DEFAULT deliberately stays at the SDK's 60s. Raising it is an operator
+// decision because a wedged upstream holds the namespace's inflightCalls marker
+// (server.ts) for the whole ceiling and stalls the model that much longer
+// before erroring.
+//
+// Why it needs to be tunable at all: a timeout is not a routing fault, so
+// server.ts books it as a genuine upstream error (error rate up, outcome reward
+// down) and a slow-but-HEALTHY server -- browser automation, a large query or
+// repo index, a cold oam-hosted first call -- gets progressively down-ranked in
+// the reliability/usage lines discover renders. This knob is how an operator
+// says "that one is legitimately slow" instead of watching a working server be
+// described as flaky.
+const CALL_TIMEOUT = (() => {
+  const env = process.env.MCP_CALL_TIMEOUT;
+  if (!env) return 60_000;
+  const n = Number.parseInt(env, 10);
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
+})();
+
+// `text` is OPTIONAL on the items this returns, and that is not pedantry: on
+// the success path the body is whatever the upstream sent, and MCP content
+// blocks include image / audio / resource_link / embedded-resource shapes that
+// carry no `text` at all. Declaring `text: string` told every consumer
+// (server.ts books health, prunes, grades and $ref-binds off these) that a
+// string was always there, so `content[0].text` type-checked and handed them
+// `undefined` at runtime on any non-text tool result. The two fault paths and
+// the catch below do always produce text; the union is what the union has.
 export async function routeToolCall(
   toolName: string,
   args: Record<string, unknown>,
   toolRoutes: Map<string, ToolRoute>,
   activeConnections: Map<string, UpstreamConnection>,
-): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
   const route = toolRoutes.get(toolName);
 
   if (!route) {
@@ -533,12 +609,20 @@ export async function routeToolCall(
   }
 
   try {
-    const result = await connection.client.callTool({
-      name: route.originalName,
-      arguments: args,
-    });
+    const result = await connection.client.callTool(
+      {
+        name: route.originalName,
+        arguments: args,
+      },
+      // The second argument is the RESULT SCHEMA, not the options: passing the
+      // options object there would silently replace CallToolResultSchema and
+      // take the SDK's structured-output validation with it. `undefined` keeps
+      // the SDK default; the request options belong in the third slot.
+      undefined,
+      { timeout: CALL_TIMEOUT },
+    );
 
-    return result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    return result as { content: Array<{ type: string; text?: string }>; isError?: boolean };
   } catch (err) {
     // Transport-level errors (timeouts, JSON-RPC errors, disconnects)
     // come through here; structured upstream errors (`isError: true` in

@@ -2,8 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   AUDIT_USAGE,
   findCmdMetacharToken,
@@ -12,7 +12,7 @@ import {
   resolveComplianceSuiteVersion,
   runAudit,
 } from "../audit-cmd.js";
-import { gradesCachePath, readGradesCache, writeGrade } from "../grades-cache.js";
+import { readGradesCache } from "../grades-cache.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
 function captureIO() {
@@ -209,6 +209,39 @@ describe("runAudit", () => {
     expect(cache.ctxlint.suiteVersion).toBe("0.17.1");
   });
 
+  it("reports suiteVersion in the --json payload, and omits the key when there is none", async () => {
+    // The rubric identifier is persisted to grades.json, so a --json consumer
+    // (the Yaw MCP panel) that never saw it could not tell an "A" graded under
+    // an older rubric from a current one -- the field's whole purpose.
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: [] }]);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 99, suiteVersion: "0.17.1" }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(io.out.join("\n")).suiteVersion).toBe("0.17.1");
+
+    // A runner that reports no rubric leaves the key ABSENT rather than null,
+    // matching the cache entry a pre-field audit wrote.
+    const io2 = captureIO();
+    await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      json: true,
+      out: io2.push,
+      err: io2.pushErr,
+      runner: async () => ({ grade: "A", score: 99 }),
+    });
+    expect("suiteVersion" in JSON.parse(io2.out.join("\n"))).toBe(false);
+  });
+
   it("emits PURE JSON with --json (no human preamble)", async () => {
     // The Yaw MCP panel parses this stdout directly, so in --json mode the
     // ENTIRE output must be the JSON object -- no "Auditing..." preamble. A
@@ -321,12 +354,44 @@ describe("runAudit", () => {
     expect(io.err.join("\n")).toContain("yaw-mcp compliance https://example.com/mcp");
   });
 
+  it("exit 2 for a server carrying NEITHER a command nor a url", async () => {
+    // The bundles.json validator enforces shape, not semantics: it requires a
+    // valid namespace and nothing else, so an entry with no command and no url
+    // loads fine and reaches the sibling of the remote-url branch above. That
+    // branch can't point at `yaw-mcp compliance <url>` -- there is no url --
+    // so it says what IS wrong instead. Exit 2 with the other nothing-to-spawn
+    // refusals; the suite never runs.
+    home = makeHome([{ namespace: "hollow", name: "hollow", type: "local" }]);
+    const io = captureIO();
+    let ran = false;
+    const r = await runAudit({
+      namespace: "hollow",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => {
+        ran = true;
+        return { grade: "A", score: 100 };
+      },
+    });
+    expect(r.exitCode).toBe(2);
+    expect(ran).toBe(false);
+    const stderr = io.err.join("\n");
+    expect(stderr).toContain("has no command to spawn");
+    // Not the remote-server message: there is no url to point the user at.
+    expect(stderr).not.toContain("yaw-mcp compliance");
+    expect(await readGradesCache(home)).toEqual({});
+  });
+
   // A cache-write failure used to throw straight out of runAudit: the grade
   // the suite just spent minutes computing was never printed, and index.ts's
   // dispatch catch exited 1 -- the code this command documents as "no server
   // with that namespace". A read-only $HOME is the real-world shape; a
-  // DIRECTORY where grades.json belongs reproduces it on every platform
-  // (readGradesCache degrades to {}, then the rename onto it throws).
+  // DIRECTORY where grades.json belongs reproduces it on every platform --
+  // writeGrade's read-modify-write reads STRICTLY (grades-cache.ts
+  // readGradesCacheImpl), so the EISDIR is rethrown before any write is
+  // attempted rather than being degraded to an empty cache and clobbering it.
   function wedgeGradesCache(root: string): void {
     mkdirSync(join(root, CONFIG_DIRNAME, "grades.json"), { recursive: true });
     writeFileSync(join(root, CONFIG_DIRNAME, "grades.json", "occupied"), "x");
@@ -410,8 +475,33 @@ describe("redactSecretArgs", () => {
     expect(redactSecretArgs(["serve", "--token"])).toEqual(["serve", "--token"]);
   });
 
+  it("redacts secret-bearing flags outside the exact name set", () => {
+    // The set is 8 names; the spellings below are all ordinary and all used to
+    // print their value in the clear in the interactive preamble. Matching is
+    // on the flag NAME pattern, so both shapes are covered.
+    expect(redactSecretArgs(["--access-token", "abc"])).toEqual(["--access-token", "<redacted>"]);
+    expect(redactSecretArgs(["--client_secret=abc"])).toEqual(["--client_secret=<redacted>"]);
+    expect(redactSecretArgs(["--api_key", "abc"])).toEqual(["--api_key", "<redacted>"]);
+    expect(redactSecretArgs(["--bearer", "abc"])).toEqual(["--bearer", "<redacted>"]);
+    expect(redactSecretArgs(["--passwd", "abc"])).toEqual(["--passwd", "<redacted>"]);
+  });
+
+  it("keeps the =value shape on the =value branch (the name pattern must not swallow the next arg)", () => {
+    // The name pattern is anchored at both ends on purpose. Unanchored it also
+    // matches "--token=abc" whole, which sends it down the `--flag value`
+    // branch: the flag is echoed with its secret intact and the INNOCENT next
+    // arg is redacted instead -- strictly worse than the bug it was fixing.
+    expect(redactSecretArgs(["--access-token=abc", "--port", "3000"])).toEqual([
+      "--access-token=<redacted>",
+      "--port",
+      "3000",
+    ]);
+  });
+
   it("does not touch non-secret args", () => {
     expect(redactSecretArgs(["x.js", "--mcp-server", "--verbose"])).toEqual(["x.js", "--mcp-server", "--verbose"]);
+    // A bare value that merely CONTAINS a secret-ish word is not a flag.
+    expect(redactSecretArgs(["tokenizer.js", "--port", "3000"])).toEqual(["tokenizer.js", "--port", "3000"]);
   });
 });
 
@@ -493,53 +583,59 @@ describe("resolveComplianceSuiteVersion", () => {
   it("returns undefined (never throws) for an unresolvable fromUrl", async () => {
     expect(await resolveComplianceSuiteVersion("not-a-file-url")).toBeUndefined();
   });
+
+  // The two cases below are what `fromUrl` is injectable FOR. The walk mirrors
+  // Node's own node_modules lookup, and both of its rules are silent when
+  // wrong: a wrong copy still yields a plausible semver, so nothing downstream
+  // ever notices that grades.json is labelled with a rubric that never ran.
+  /** Plant a fake @yawlabs/mcp-compliance install under `root`. A null version
+   *  writes an unparseable manifest. */
+  function plantInstall(root: string, version: string | null): void {
+    const dir = join(root, "node_modules", "@yawlabs", "mcp-compliance");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), version === null ? "{ not json" : JSON.stringify({ version }));
+  }
+
+  it("resolves the NEAREST installed copy, not an ancestor's", async () => {
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-version-"));
+    try {
+      const inner = join(root, "apps", "web");
+      mkdirSync(inner, { recursive: true });
+      plantInstall(root, "9.9.9");
+      plantInstall(inner, "1.2.3");
+      // The nested copy is the one `import()` from inner would load, so it is
+      // the one whose version describes the rubric that actually ran.
+      expect(await resolveComplianceSuiteVersion(pathToFileURL(join(inner, "audit-cmd.js")).href)).toBe("1.2.3");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined on a bad manifest rather than walking on to an ancestor's copy", async () => {
+    // Continuing the walk would find a DIFFERENT install and attribute ITS
+    // version to this one -- a mislabelled rubric is worse than no rubric,
+    // which the cache already handles by omitting the field.
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-version-"));
+    try {
+      const inner = join(root, "apps", "web");
+      mkdirSync(inner, { recursive: true });
+      plantInstall(root, "9.9.9");
+      plantInstall(inner, null);
+      expect(await resolveComplianceSuiteVersion(pathToFileURL(join(inner, "audit-cmd.js")).href)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
-describe("grades-cache", () => {
-  let home: string;
-  beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "yaw-grades-"));
-    mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
-  });
-  afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
-  });
-
-  it("round-trips a written grade", async () => {
-    await writeGrade("ctxlint", { grade: "A", score: 100, gradedAt: "2026-06-11T00:00:00.000Z" }, home);
-    const cache = await readGradesCache(home);
-    expect(cache.ctxlint).toEqual({ grade: "A", score: 100, gradedAt: "2026-06-11T00:00:00.000Z" });
-  });
-
-  it("preserves existing entries on a new write", async () => {
-    await writeGrade("a", { grade: "A", score: 100, gradedAt: "t1" }, home);
-    await writeGrade("b", { grade: "C", score: 60, gradedAt: "t2" }, home);
-    const cache = await readGradesCache(home);
-    expect(Object.keys(cache).sort()).toEqual(["a", "b"]);
-  });
-
-  it("returns {} for a missing cache", async () => {
-    expect(await readGradesCache(home)).toEqual({});
-  });
-
-  it("ignores a malformed cache file", async () => {
-    writeFileSync(gradesCachePath(home), "{ not json");
-    expect(await readGradesCache(home)).toEqual({});
-  });
-
-  it("drops malformed entries but keeps valid ones", async () => {
-    writeFileSync(
-      gradesCachePath(home),
-      JSON.stringify({
-        good: { grade: "A", score: 100, gradedAt: "t" },
-        badGrade: { grade: "Z", score: 100, gradedAt: "t" },
-        noScore: { grade: "B", gradedAt: "t" },
-      }),
-    );
-    const cache = await readGradesCache(home);
-    expect(Object.keys(cache)).toEqual(["good"]);
-  });
-});
+// There is deliberately NO `describe("grades-cache")` block here. One existed
+// -- round-trip, preserve-existing-entries, missing -> {}, malformed -> {},
+// drop-malformed-entries -- and every case of it duplicated one already in
+// grades-cache.test.ts (plus that file's concurrency, __proto__, score-range and
+// strict-read coverage), while touching no line of audit-cmd.ts. Grade-cache
+// behaviour belongs to its own suite; what audit-cmd.test.ts pins about the
+// cache is what runAudit DOES with it -- the write on success, and the exit-3
+// path when the write fails.
 
 // The compliance runner spawns stdio targets with `shell: true` on win32 (so
 // that .cmd/.bat launcher shims resolve). Node's shell path JOINS command +
@@ -632,6 +728,50 @@ describe("cmd.exe metacharacter gate", () => {
       expect(r.exitCode).toBe(2);
       expect(ran).toBe(false);
       expect(io.err.join("\n")).toContain("srv&calc");
+    });
+
+    it("refuses BEFORE resolving vault refs, so a target it will not spawn never unlocks the vault", async () => {
+      // runAudit's ordering is a security property, not an accident: the
+      // metachar gate sits ABOVE the ${secret:} resolution so a spawn config
+      // that is never going to run cannot make yaw-mcp open the vault (and, on
+      // the documented vault-audit path, hand the passphrase to the process
+      // env). Without a target carrying BOTH, swapping the two blocks passes
+      // the whole suite -- the vault test has no metachar and the metachar
+      // tests have no refs.
+      delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+      home = makeHome([
+        {
+          namespace: "gh",
+          name: "gh",
+          type: "local",
+          command: "node",
+          args: ["a&b"],
+          env: { GITHUB_TOKEN: "${secret:gh}" },
+        },
+      ]);
+      const io = captureIO();
+      let ran = false;
+      const r = await runAudit({
+        namespace: "gh",
+        home,
+        cwd: home,
+        platform: "win32",
+        out: io.push,
+        err: io.pushErr,
+        runner: async () => {
+          ran = true;
+          return { grade: "A", score: 100 };
+        },
+      });
+      expect(r.exitCode).toBe(2);
+      expect(ran).toBe(false);
+      const err = io.err.join("\n");
+      expect(err).toContain("cmd.exe metacharacter");
+      expect(err).toContain("a&b");
+      // The vault was never consulted: reversed, this run would report the
+      // unresolvable ${secret:} ref instead.
+      expect(err).not.toMatch(/vault/i);
+      expect(await readGradesCache(home)).toEqual({});
     });
 
     it("does NOT refuse the same target off win32, where the runner spawns without a shell", async () => {

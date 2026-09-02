@@ -1,4 +1,5 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { CreateMessageRequestParamsBase } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./logger.js";
 import type { UpstreamServerConfig } from "./types.js";
 
@@ -20,6 +21,15 @@ export const MAX_SAMPLES = 5;
 // we fall back to the ranker's order.
 export const SAMPLING_TIMEOUT_MS = 2000;
 
+// Temperature asked for on a best-of-N fan-out (n > 1) only. N byte-identical
+// requests to a deterministic client come back N identical answers, so the
+// majority vote is unanimous by construction and "aggressive" pays N times the
+// cost for exactly the information one sample already had. A non-zero
+// temperature is what gives the samples a reason to differ. Deliberately NOT
+// sent at n=1: the "auto" path keeps the client's own default, so the default
+// dispatch path is unchanged by the dial.
+export const BEST_OF_N_TEMPERATURE = 0.7;
+
 // Ambiguity threshold for the "aggressive" effort gate. "auto" does NOT use
 // this -- it delegates to shouldTiebreak (the exact pre-dial 0.9 top-2 ratio)
 // so the default path's sampling frequency is unchanged. Only "aggressive"
@@ -28,12 +38,14 @@ export const SAMPLING_TIMEOUT_MS = 2000;
 // NOT a fixed top-2 ratio: computeAmbiguity returns max(inverse margin,
 // normalized entropy), and the entropy half is normalized by
 // Math.log(topK.length) -- so the number of candidates in the top-K moves the
-// effective bar. Worked example at this 0.6 setting: with exactly TWO
-// candidates a runner-up scoring ~20% of the leader already yields ~0.65 and
-// samples; add a third candidate (even one scoring 0, since the normalizer
-// counts slots and not positive mass) and the same top-2 shape divides by
-// log(3) instead of log(2), lands at ~0.41, and does not. Read this constant
-// as "how flat the top-K is", not "how close the runner-up is".
+// effective bar. Worked example at this 0.6 setting, on shapes the sole
+// production caller can actually produce (rankServers drops every zero-scored
+// server, so a ranked list reaching here carries only positive scores): with
+// exactly TWO candidates a runner-up scoring ~20% of the leader already yields
+// ~0.65 and samples; add a THIRD candidate at ~5% of the leader and the same
+// top-2 shape divides by log(3) instead of log(2), lands at ~0.55, and does
+// not. Read this constant as "how flat the top-K is", not "how close the
+// runner-up is". Both shapes are pinned by value in sampling-rank.test.ts.
 export const AGGRESSIVE_AMBIGUITY_THRESHOLD = 0.6;
 
 export interface TiebreakCandidate {
@@ -46,6 +58,12 @@ export interface TiebreakCandidate {
 // Decide whether the ranked list is close enough at the top to warrant
 // consulting the LLM. Single-candidate and wide-margin cases skip the
 // round-trip — sampling isn't free.
+//
+// `ratio` has no production caller: server.ts reaches this through
+// shouldSample, which always takes the SAMPLING_TIEBREAK_RATIO default. It is
+// a tuning seam -- a threshold sweep can vary it without editing this module
+// -- and sampling-rank.test.ts exercises it explicitly so the parameter is not
+// silently dead weight.
 export function shouldTiebreak(
   ranked: Array<{ namespace: string; score: number }>,
   ratio: number = SAMPLING_TIEBREAK_RATIO,
@@ -194,18 +212,49 @@ export function buildCandidates(
 
 export type RouteEffort = "off" | "auto" | "aggressive";
 
-// Parse YAW_MCP_ROUTE_EFFORT. Default "auto". Unknown values fall back to
-// "auto" so a typo never silently disables routing or burns compute.
-export function parseRouteEffort(raw: string | undefined): RouteEffort {
-  if (raw === undefined) return "auto";
+// Parse YAW_MCP_ROUTE_EFFORT, or dispatch's per-call `routeEffort` argument.
+// Default "auto". Unknown values fall back to "auto" so a typo never silently
+// disables routing or burns compute.
+//
+// Precedence: the sole production caller (server.ts) passes the per-call
+// argument first and only falls back to the env var when the argument is
+// ABSENT. An unrecognized argument used to land in the "auto" default here,
+// so a typo'd `routeEffort: "aggresive"` silently downgraded a deliberate
+// YAW_MCP_ROUTE_EFFORT=aggressive deployment for that call. `fallbackRaw`
+// closes that: a present-but-unrecognized `raw` is re-resolved against the
+// environment before defaulting. An absent or empty `raw` is NOT re-resolved
+// -- the caller has already collapsed that case into `raw` -- so
+// parseRouteEffort(undefined) stays environment-independent.
+export function parseRouteEffort(
+  raw: string | undefined,
+  fallbackRaw: string | undefined = process.env.YAW_MCP_ROUTE_EFFORT,
+): RouteEffort {
+  const direct = matchRouteEffort(raw);
+  if (direct) return direct;
+  if (raw !== undefined && raw.trim() !== "") {
+    // Present but unrecognized -> a typo, not a choice. Prefer the
+    // environment's setting over the "auto" default.
+    const fromEnv = matchRouteEffort(fallbackRaw);
+    if (fromEnv) return fromEnv;
+  }
+  return "auto";
+}
+
+// Match one effort spelling, case- and whitespace-insensitively. Returns null
+// (rather than "auto") for anything unrecognized, so the caller can tell an
+// explicit "auto" from a value it failed to understand.
+function matchRouteEffort(raw: string | undefined): RouteEffort | null {
+  if (raw === undefined) return null;
   switch (raw.trim().toLowerCase()) {
     case "off":
       return "off";
+    case "auto":
+      return "auto";
     case "aggressive":
       return "aggressive";
     default:
-      // Includes "auto", empty string, and anything unrecognized.
-      return "auto";
+      // Includes the empty string and anything unrecognized.
+      return null;
   }
 }
 
@@ -222,6 +271,12 @@ export function parseRouteEffort(raw: string | undefined): RouteEffort {
 // 0 means one clear winner; 1 means flat/ambiguous. Degenerate inputs
 // (fewer than 2 candidates, non-positive leader score) return 0 — nothing to
 // disambiguate.
+//
+// `k` has no production caller (shouldSample takes the default), but it is
+// load-bearing: log(topK.length) is the entropy normalizer, so the default
+// decides how often "aggressive" spends a best-of-N fan-out. Kept as a tuning
+// seam and pinned by value in sampling-rank.test.ts, since a silent 3 -> 2
+// change here is invisible to every other assertion in the suite.
 export function computeAmbiguity(ranked: Array<{ namespace: string; score: number }>, k = 3): number {
   if (ranked.length < 2) return 0;
   const top = ranked[0];
@@ -305,6 +360,16 @@ export async function bestOfNViaSampling(
   const samples = Math.min(MAX_SAMPLES, Math.max(1, Math.floor(n)));
   const prompt = buildTiebreakPrompt(intent, candidates);
 
+  // Identical for every sample, so build it once. temperature rides along only
+  // when we actually fan out -- see BEST_OF_N_TEMPERATURE for why an
+  // unanimous-by-construction vote is not worth N round-trips.
+  const params: CreateMessageRequestParamsBase = {
+    messages: [{ role: "user", content: { type: "text", text: prompt } }],
+    maxTokens: SAMPLING_MAX_TOKENS,
+    includeContext: "none",
+  };
+  if (samples > 1) params.temperature = BEST_OF_N_TEMPERATURE;
+
   // One controller for the whole call: aborted in the finally below, so
   // when the race resolves -- by timeout OR by the aggregate winning --
   // any still-in-flight createMessage requests are torn down with it.
@@ -317,14 +382,7 @@ export async function bestOfNViaSampling(
   // One sampling call -> parsed namespace or null. Never throws.
   const sampleOnce = async (): Promise<string | null> => {
     try {
-      const result = await server.createMessage(
-        {
-          messages: [{ role: "user", content: { type: "text", text: prompt } }],
-          maxTokens: SAMPLING_MAX_TOKENS,
-          includeContext: "none",
-        },
-        { signal: controller.signal, timeout: SAMPLING_TIMEOUT_MS },
-      );
+      const result = await server.createMessage(params, { signal: controller.signal, timeout: SAMPLING_TIMEOUT_MS });
       const text =
         result && typeof result === "object" && "content" in result && result.content
           ? extractText(result.content)
@@ -332,6 +390,12 @@ export async function bestOfNViaSampling(
       if (!text) return null;
       return parseTiebreakResponse(text, candidates);
     } catch (err) {
+      // Our own teardown, not a client-LLM failure: the finally below aborts
+      // every still-in-flight sample once the race resolves, so on the timeout
+      // path each pending request rejects AFTER bestOfNViaSampling has already
+      // returned -- up to MAX_SAMPLES warn lines blaming the client LLM for
+      // yaw-mcp cancelling it. The vote is over either way; drop it quietly.
+      if (controller.signal.aborted) return null;
       log("warn", "Best-of-N sample failed", { error: err instanceof Error ? err.message : String(err) });
       return null;
     }

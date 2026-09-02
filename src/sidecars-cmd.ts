@@ -44,14 +44,22 @@
 // of the two that can move an already-locked `@latest` forward on a re-run. See
 // the note at the update call for the measurement behind that.
 
-import { spawn } from "node:child_process";
+import { type StdioOptions, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
-import { loadLocalBundles, localBundlesPath } from "./local-bundles.js";
-import { isRegistrySpec, nodeLaunchKind, npxSpec, type OamProbe, packageName, probeOam } from "./oam-spawn.js";
+import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
+import {
+  isRegistrySpec,
+  nodeLaunchKind,
+  npxSpec,
+  type OamProbe,
+  packageName,
+  probeOam,
+  specConstraint,
+} from "./oam-spawn.js";
 import { sidecarsNodeModules, sidecarsRoot, userConfigDir } from "./paths.js";
 import type { UpstreamServerConfig } from "./types.js";
 
@@ -99,12 +107,15 @@ export interface SidecarSpec {
 }
 
 /**
- * The npx-launched packages in a server list, de-duplicated by package name.
+ * The servers this command means by "an npx server": a LOCAL server whose
+ * command classifies as an npx launch.
  *
- * Only `npx` servers are candidates. `node <abs>` already points at a real
- * file, and docker/uvx/native commands are not npm packages at all. An npx
- * launch carrying flags yaw-mcp does not parse is skipped for the same reason
- * rewriteForOam skips it: the first positional is not reliably the package.
+ * ONE predicate, not one per caller. Three sites have to answer this
+ * identically -- collectSidecarSpecs and the two skip collectors, which
+ * PARTITION the same server set into "installed" and "passed over", and
+ * unhostedReasons, which decides whether the question of who reads the tree
+ * arises at all. It was written out three times, kept in step only by comments
+ * saying it must be, and a fourth copy would have drifted silently.
  *
  * "npx" is recognised via nodeLaunchKind, NOT string equality: `npx.cmd` and
  * an absolute `/usr/local/bin/npx` are the same launch, and rewriteForOam
@@ -113,6 +124,25 @@ export interface SidecarSpec {
  * happily reads the (empty) managed tree for it -- the server silently keeps
  * resolving out of the npx cache, which is the failure this module exists to
  * prevent.
+ */
+function isLocalNpxServer(s: Partial<UpstreamServerConfig>): boolean {
+  return s.type === "local" && s.command !== undefined && nodeLaunchKind(s.command) === "npx";
+}
+
+/**
+ * The npx-launched packages in a server list, de-duplicated by package name.
+ *
+ * Only `npx` servers are candidates (isLocalNpxServer). `node <abs>` already
+ * points at a real file, and docker/uvx/native commands are not npm packages
+ * at all. An npx launch carrying flags yaw-mcp does not parse is skipped for
+ * the same reason rewriteForOam skips it: the first positional is not reliably
+ * the package.
+ *
+ * Two further shapes are passed over because rewriteForOam refuses them on
+ * EVERY machine, so installing them would fill the managed tree with copies
+ * nothing can ever read: a git or path target (collectNonRegistrySpecs) and a
+ * version range (collectRangeSpecs). Both are reported by the runner rather
+ * than dropped silently.
  *
  * When the same package is configured twice at DIFFERENT versions, the first
  * spec wins and the rest are recorded in `conflicting`. One flat node_modules
@@ -123,9 +153,9 @@ export interface SidecarSpec {
 export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>>): SidecarSpec[] {
   const byPkg = new Map<string, SidecarSpec>();
   for (const s of servers) {
-    if (s.type !== "local" || s.command === undefined || nodeLaunchKind(s.command) !== "npx") continue;
+    if (!isLocalNpxServer(s)) continue;
     // Which argument is the package spec is oam-spawn's rule, not a second copy
-    // of it: this collector and collectNonRegistrySpecs PARTITION the same
+    // of it: this collector and the two skip collectors PARTITION the same
     // server set into "installed" and "skipped", so a rule that lives in two
     // places can drop a server out of both reports with nothing to say why.
     const spec = npxSpec(s.args ?? []);
@@ -134,6 +164,14 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
     // npm reject the manifest and fail the install for every other package
     // too. See isRegistrySpec.
     if (!isRegistrySpec(spec)) continue;
+    // A version RANGE (`^1.2.3`, `1.x`) is refused by rewriteForOam everywhere
+    // -- honouring it needs a semver resolver oam-spawn deliberately does not
+    // carry -- so the server spawns through npx and never looks at the managed
+    // tree. Installing it anyway put a package in a tree nothing reads while
+    // "These versions are now fixed" claimed the opposite for it, which is the
+    // install/spawn drift this module's header says must not happen.
+    // collectRangeSpecs reports it instead.
+    if (specConstraint(spec).kind === "range") continue;
     const pkg = packageName(spec);
     if (!pkg) continue;
     const existing = byPkg.get(pkg);
@@ -160,13 +198,68 @@ export function collectNonRegistrySpecs(
 ): Array<{ namespace: string; spec: string }> {
   const out: Array<{ namespace: string; spec: string }> = [];
   for (const s of servers) {
-    if (s.type !== "local" || s.command === undefined || nodeLaunchKind(s.command) !== "npx") continue;
+    if (!isLocalNpxServer(s)) continue;
     // Same shared rule as collectSidecarSpecs -- see the note there.
     const spec = npxSpec(s.args ?? []);
     if (spec === null || isRegistrySpec(spec)) continue;
     out.push({ namespace: s.namespace ?? "(unnamed)", spec });
   }
   return out;
+}
+
+/**
+ * npx servers whose spec pins a version RANGE (`pkg@^1.2.3`, `pkg@1.x`),
+ * paired with the namespace that configured them.
+ *
+ * The other half of the same partition collectNonRegistrySpecs reports:
+ * rewriteForOam refuses a range on every machine (specConstraint -> "range"),
+ * so those servers keep spawning through npx and never read the managed tree.
+ * Installing one therefore put a package in a tree nothing reads while the
+ * command still printed "These versions are now fixed" for it. Reported so the
+ * skip is visible -- a server missing from the install list with no
+ * explanation reads as a bug.
+ *
+ * An exact pin is NOT in here: the rewrite honours it whenever the on-disk copy
+ * declares that version, so the managed copy IS read for it.
+ */
+export function collectRangeSpecs(
+  servers: Array<Partial<UpstreamServerConfig>>,
+): Array<{ namespace: string; spec: string }> {
+  const out: Array<{ namespace: string; spec: string }> = [];
+  for (const s of servers) {
+    if (!isLocalNpxServer(s)) continue;
+    const spec = npxSpec(s.args ?? []);
+    if (spec === null || !isRegistrySpec(spec) || specConstraint(spec).kind !== "range") continue;
+    out.push({ namespace: s.namespace ?? "(unnamed)", spec });
+  }
+  return out;
+}
+
+/**
+ * The configured version range for a spec: everything after the package name,
+ * with the `@` separator stripped, and a bare name reading as `latest` (which
+ * is what npx would have resolved).
+ *
+ * ONE derivation, exported, because two callers have to agree on it exactly.
+ * sidecarsManifest writes it into the managed package.json as the dependency
+ * value npm then acts on; sidecar-refresh asks whether a spec ASKED to float
+ * before it will schedule a background refresh for it. A refresher that read
+ * `pkg@^1.0.0` as floating while the manifest wrote `^1.0.0` would schedule a
+ * refresh npm then refuses to perform, and re-schedule it every day forever.
+ *
+ * It lives HERE rather than beside its other caller because sidecar-refresh
+ * already imports this module -- the other direction would close a cycle.
+ */
+export function configuredRange(spec: SidecarSpec): string {
+  // collectSidecarSpecs derives `pkg` FROM `spec` via packageName, so the name
+  // is always a prefix -- but a caller constructing a SidecarSpec by hand (or a
+  // future collector) could break that, and slicing by a length that does not
+  // correspond to a prefix yields a nonsense range. Report the whole spec as
+  // the range: it will not equal "latest", so the package is left alone, which
+  // is the safe direction for an input we do not understand.
+  if (!spec.spec.startsWith(spec.pkg)) return spec.spec;
+  const raw = spec.spec.slice(spec.pkg.length).replace(/^@/, "");
+  return raw === "" ? "latest" : raw;
 }
 
 /**
@@ -179,10 +272,11 @@ export function collectNonRegistrySpecs(
  */
 export function sidecarsManifest(specs: SidecarSpec[]): string {
   const dependencies: Record<string, string> = {};
-  for (const { pkg, spec } of specs.slice().sort((a, b) => a.pkg.localeCompare(b.pkg))) {
-    // Everything after the name's version separator; "" when none was given.
-    const range = spec.slice(pkg.length).replace(/^@/, "");
-    dependencies[pkg] = range === "" ? "latest" : range;
+  for (const spec of specs.slice().sort((a, b) => a.pkg.localeCompare(b.pkg))) {
+    // The same derivation sidecar-refresh measures staleness against, called
+    // rather than re-inlined -- see configuredRange on why the two must not
+    // drift.
+    dependencies[spec.pkg] = configuredRange(spec);
   }
   return `${JSON.stringify(
     {
@@ -259,6 +353,14 @@ export interface SidecarsInstallOptions {
   err?: (s: string) => void;
   /** Injected in tests. Resolves to the child's exit code. */
   runNpm?: (args: string[], cwd: string) => Promise<number>;
+  /** Platform the npm spawn shape is decided for; defaults to the running one.
+   *  Injected so a test can exercise the Windows shell branch and the POSIX one
+   *  wherever the suite runs, WITHOUT redefining `process.platform` for the
+   *  whole call -- doing that also takes atomicWriteFile's Windows-only rename
+   *  retry away from the very host that needs it (AV / indexer EPERM), which
+   *  made a test about spawn options flaky under Defender. Ignored when
+   *  `runNpm` is injected: that runner does its own spawning, if any. */
+  platform?: NodeJS.Platform;
   /** Injected in tests. Answers "can oam host these servers", which decides
    *  whether anything will READ the tree this command fills. Defaults to the
    *  real (process-cached) probe. */
@@ -302,8 +404,11 @@ interface SidecarsJson {
   /** Packages configured at two different versions; the winner is the version
    *  reported in `installed`. Empty in the ordinary case. */
   conflicts: Array<{ pkg: string; used: string; ignored: string[] }>;
-  /** npx servers passed over because their spec is a git or path target, not
-   *  a registry package. They keep resolving through npx. */
+  /** npx servers passed over because the managed tree cannot serve them: their
+   *  spec is a git or path target rather than a registry package, or it pins a
+   *  version range the oam rewrite refuses on every machine. Both classes mean
+   *  the same thing to a consumer -- that server keeps resolving through npx --
+   *  so they share one field; the human notes name which is which. */
   skipped: Array<{ namespace: string; spec: string }>;
 }
 
@@ -333,8 +438,61 @@ function jsonDocument(root: string, over: Partial<SidecarsJson> = {}): string {
   return `${JSON.stringify(doc, null, 2)}\n`;
 }
 
-/** Spawn npm so the user sees progress on a long install. */
-function defaultRunNpm(args: string[], cwd: string): Promise<number> {
+/**
+ * The npm to spawn, preferring the one installed BESIDE the running node.
+ *
+ * npm resolves native bindings (platform-specific optional deps, node-gyp
+ * builds) for whichever node RUNS it, and the platform marker written after a
+ * successful install records THIS process's platform/arch. A bare `npm` off
+ * PATH need not be the same node -- a mixed-arch machine (an x64 node under
+ * Rosetta, two installs on one PATH, an arm64 shell calling an x64 shim) is
+ * exactly the case the marker exists for -- so a marker written from here would
+ * certify an arch the tree was not built for. Taking the sibling keeps the two
+ * describing the same node. Residual assumption when there is NO sibling (a
+ * standalone node build, a container image with npm elsewhere): the PATH shim's
+ * node is this one.
+ *
+ * On Windows the command line goes through cmd.exe (see defaultRunNpm), so an
+ * absolute path has to carry its own quotes -- the default install location is
+ * `C:\Program Files\nodejs`, which would otherwise split at the space. Still no
+ * user-controlled string in the command line: this path comes from
+ * process.execPath.
+ *
+ * `platform` and `nodeDir` are injectable so both branches are exercisable on
+ * one machine.
+ */
+export function npmBin(
+  platform: NodeJS.Platform = process.platform,
+  nodeDir: string = dirname(process.execPath),
+): string {
+  const name = platform === "win32" ? "npm.cmd" : "npm";
+  const sibling = join(nodeDir, name);
+  if (!existsSync(sibling)) return name;
+  return platform === "win32" ? `"${sibling}"` : sibling;
+}
+
+/** What a caller of {@link defaultRunNpm} may need to differ on. Everything
+ *  else about the spawn is fixed, and deliberately so. */
+export interface RunNpmOptions {
+  /** Platform whose spawn shape to use; defaults to the running one. See
+   *  SidecarsInstallOptions.platform for why this is a parameter rather than a
+   *  `process.platform` a test redefines. */
+  platform?: NodeJS.Platform;
+  /** The child's stdio. Defaults to the CLI shape (see below). Pass "ignore"
+   *  for a BACKGROUND install: from inside `serve` the default sprays npm's
+   *  progress into the stream the MCP client reads diagnostics from. */
+  stdio?: StdioOptions;
+}
+
+/** Spawn npm so the user sees progress on a long install.
+ *
+ *  Exported because this is the one spawn shape in the package that must not be
+ *  re-derived by hand: the Windows-shell concession below is safe only under
+ *  conditions a second copy cannot be trusted to keep. sidecar-refresh's
+ *  background install needs the same shape with silent stdio, which is what
+ *  `stdio` is for -- a caller differing on output must not have to restate the
+ *  security-sensitive part. */
+export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions = {}): Promise<number> {
   return new Promise((resolve) => {
     // npm on Windows is a .cmd shim, and since the CVE-2024-27980 fix Node
     // REFUSES to spawn .cmd/.bat without a shell -- it fails EINVAL before the
@@ -342,20 +500,22 @@ function defaultRunNpm(args: string[], cwd: string): Promise<number> {
     // only because every argument is a fixed literal: `cwd` travels as a spawn
     // option rather than in the command line, so no user-controlled path is
     // ever parsed by cmd. Do not interpolate a package name into these args.
-    const isWindows = process.platform === "win32";
+    const platform = opts.platform ?? process.platform;
+    const isWindows = platform === "win32";
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(isWindows ? "npm.cmd" : "npm", args, {
+      child = spawn(npmBin(platform), args, {
         cwd,
         // npm's own progress ("added 220 packages in 12s") goes to its STDOUT,
         // and inheriting that put it ahead of the JSON document under --json --
         // enough to make `yaw-mcp sidecars install --json | jq` fail outright.
         // Routing the child's stdout to fd 2 keeps the progress visible while
         // leaving OUR stdout carrying only the result, which is what a caller
-        // parses. Unconditional rather than --json-only: progress belongs on
-        // stderr in both modes, and a mode-dependent stdio is a second shape to
-        // get wrong.
-        stdio: ["ignore", 2, "inherit"],
+        // parses. The DEFAULT for every mode rather than a --json-only shape:
+        // progress belongs on stderr in both, and a mode-dependent stdio is a
+        // second shape to get wrong. Only a caller with nowhere to PUT the
+        // progress overrides it (see RunNpmOptions.stdio).
+        stdio: opts.stdio ?? ["ignore", 2, "inherit"],
         shell: isWindows,
       });
     } catch {
@@ -436,21 +596,25 @@ export function parseSidecarsArgs(
  * with `error: null` as a healthy install on a machine where every server still
  * resolves through the npx cache. probeOam is process-cached, so the cost is one
  * `oam --version` per run.
+ *
+ * `bundles` is the load the runner ALREADY did. describeDefaultRuntime reads the
+ * same file, so letting it do its own read meant bundles.json parsed twice per
+ * run -- and the project-trust walk with it, which is a directory walk plus a
+ * hash, and which logs the loader's read-time diagnostics a second time.
  */
 async function unhostedReasons(
   servers: Array<Partial<UpstreamServerConfig>>,
   opts: SidecarsInstallOptions,
   home: string,
+  bundles: Pick<LoadLocalBundlesResult, "defaultRuntime" | "defaultRuntimePath">,
 ): Promise<string[]> {
-  // nodeLaunchKind, not `=== "npx"` -- the same classifier the collectors and
-  // rewriteForOam use, so `npx.cmd` / an absolute npx path gets the same
-  // hosted-or-not verdict here as everywhere else.
-  const npx = servers.filter(
-    (s) => s.type === "local" && s.command !== undefined && nodeLaunchKind(s.command) === "npx",
-  );
+  // isLocalNpxServer, not a fourth copy of the same test -- the same classifier
+  // the collectors and rewriteForOam use, so `npx.cmd` / an absolute npx path
+  // gets the same hosted-or-not verdict here as everywhere else.
+  const npx = servers.filter(isLocalNpxServer);
   if (npx.length === 0) return [];
   const probe = await (opts.oamProbe ?? probeOam)();
-  const { runtime: configDefault } = await describeDefaultRuntime({ cwd: opts.cwd, home });
+  const { runtime: configDefault } = await describeDefaultRuntime({ cwd: opts.cwd, home, bundles });
   const verdicts = npx.map((s) =>
     // `args` rides along because describeServerRuntime now mirrors
     // rewriteForOam's launch-shape gates too: a spec it refuses (a git/path
@@ -488,20 +652,30 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
 
   const servers = bundles.config?.servers ?? [];
   const specs = collectSidecarSpecs(servers);
-  const skipped = collectNonRegistrySpecs(servers);
+  // The two classes of npx server the managed tree cannot serve, kept apart for
+  // the notes and merged for the report: a git/path target (not a dependency
+  // key) and a version range (refused by rewriteForOam on every machine). What a
+  // consumer needs from `skipped` is the same for both -- that server was passed
+  // over and keeps resolving through npx.
+  const nonRegistry = collectNonRegistrySpecs(servers);
+  const ranges = collectRangeSpecs(servers);
+  const skipped = [...nonRegistry, ...ranges];
   const root = sidecarsRoot(home);
   const conflicts = specs
     .filter((s) => s.conflicting.length > 0)
     .map((s) => ({ pkg: s.pkg, used: s.spec, ignored: s.conflicting }));
 
   // Printed on every path INCLUDING the nothing-to-do one: a config whose only
-  // npx servers are git targets would otherwise report "nothing to install"
-  // and leave the reason to be guessed at.
+  // npx servers are git targets (or version ranges) would otherwise report
+  // "nothing to install" and leave the reason to be guessed at.
   const printSkipped = () => {
     if (skipped.length === 0) return;
     print();
-    for (const k of skipped) {
+    for (const k of nonRegistry) {
       print(`  note: ${k.namespace} launches ${k.spec}, not a registry package; it keeps using npx`);
+    }
+    for (const k of ranges) {
+      print(`  note: ${k.namespace} launches ${k.spec}, a version range oam cannot resolve; it keeps using npx`);
     }
   };
 
@@ -536,12 +710,26 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
       return { exitCode: 0, installed: [], lines };
     }
     if (skipped.length > 0) {
-      // Every npx server was a git or path target. Saying "no npx-launched
-      // servers" here would flatly contradict the config the user is looking
-      // at, so lead with the skips instead of appending them as a footnote.
-      print("Nothing to install -- every npx server points at a git or path target.");
+      // Every npx server was passed over. Saying "no npx-launched servers" here
+      // would flatly contradict the config the user is looking at, so lead with
+      // the skips instead of appending them as a footnote. The headline names
+      // the git/path case only when that IS the whole story -- a config whose
+      // only npx server pins a range would otherwise be described as something
+      // it is not.
+      print(
+        ranges.length === 0
+          ? "Nothing to install -- every npx server points at a git or path target."
+          : "Nothing to install -- no npx server names a package this command can install.",
+      );
       printSkipped();
-      if (opts.json) write(jsonDocument(root, { reason: "only-non-registry-specs", skipped }));
+      if (opts.json) {
+        write(
+          jsonDocument(root, {
+            reason: ranges.length === 0 ? "only-non-registry-specs" : "only-skipped-specs",
+            skipped,
+          }),
+        );
+      }
       return { exitCode: 0, installed: [], lines };
     }
     print("No npx-launched servers in bundles.json -- nothing to install.");
@@ -593,7 +781,8 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   }
   print();
 
-  const runNpm = opts.runNpm ?? defaultRunNpm;
+  const runNpm =
+    opts.runNpm ?? ((args: string[], cwd: string) => defaultRunNpm(args, cwd, { platform: opts.platform }));
   // `--no-audit --no-fund` keep the output about the install; `--install-
   // strategy=nested` is NOT used -- a flat tree is what resolveNpmEntry walks.
   const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
@@ -607,12 +796,14 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   // why). AFTER the install-succeeded gate, so a failed install leaves the
   // marker describing whatever tree is actually still on disk -- and this
   // process's own platform/arch, because that is the node npm resolved native
-  // bindings for. Guarded like the manifest write: the tree itself is
-  // installed at this point, so a marker-write failure does not undo the
-  // install (exit 0) -- but it is reported on stderr (visible under --json,
-  // where `print` is suppressed) AND carried as `markerError` in the --json
-  // document, so the panel never reads a clean install that doctor will
-  // later call pre-marker with no trail to why.
+  // bindings for. That last claim holds only because npmBin prefers the npm
+  // beside THIS node over whatever `npm` PATH resolves to; where there is no
+  // such sibling it stays an assumption, documented there. Guarded like the
+  // manifest write: the tree itself is installed at this point, so a
+  // marker-write failure does not undo the install (exit 0) -- but it is
+  // reported on stderr (visible under --json, where `print` is suppressed) AND
+  // carried as `markerError` in the --json document, so the panel never reads a
+  // clean install that doctor will later call pre-marker with no trail to why.
   let markerError: string | null = null;
   try {
     await atomicWriteFile(
@@ -661,7 +852,7 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   }
   print();
   print("These versions are now fixed. Re-run this command to move them forward.");
-  const unhosted = await unhostedReasons(servers, opts, home);
+  const unhosted = await unhostedReasons(servers, opts, home, bundles);
   if (unhosted.length > 0) {
     print();
     print("Nothing reads these copies yet:");

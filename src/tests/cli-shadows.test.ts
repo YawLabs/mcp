@@ -113,7 +113,7 @@ describe("resolveShadowedClis", () => {
   it("infers the shadow from a single-segment cache (no separator)", () => {
     // Real upstream servers sometimes expose tools named exactly the CLI
     // word (no `_` / `.` / `-` separator). The split pattern at
-    // cli-shadows.ts:220 (`split(/[_.-]/)`) yields `["npm"]` for that input,
+    // cli-shadows.ts:243 (`split(/[_.-]/)`) yields `["npm"]` for that input,
     // so `prefixes` is `{ "npm" }`, `size === 1`, and the heuristic fires.
     // Pin the shape so a regression that swaps `split` for `match` (returns
     // null on no match) or filters falsy first-segments in a way that drops
@@ -126,7 +126,7 @@ describe("resolveShadowedClis", () => {
   });
 
   it("skips tools with empty names and falls through to [] when every entry is empty", () => {
-    // The `if (first)` guard at cli-shadows.ts:221 keeps a degenerate empty
+    // The `if (first)` guard at cli-shadows.ts:244 keeps a degenerate empty
     // name (`""`, from upstream tools/list with a sloppy entry) out of the
     // prefix set. When EVERY entry is empty, `prefixes` is empty, `size !== 1`
     // at the size-0 boundary, and the heuristic returns []. (This boundary
@@ -142,7 +142,7 @@ describe("resolveShadowedClis", () => {
 
   it("still infers the shadow when degenerate entries ride along with real prefixes", () => {
     // THE case the `if (first)` guard exists for (per the comment at
-    // cli-shadows.ts:214-218): a sloppy empty name or a separator-leading
+    // cli-shadows.ts:237-241): a sloppy empty name or a separator-leading
     // one (`_meta`) in an otherwise consistent cache. Without the guard,
     // `""` joins `"npm"` in the prefix set, `size !== 1` fails, and the
     // shadow hint silently disappears for a server that should match.
@@ -154,7 +154,7 @@ describe("resolveShadowedClis", () => {
   });
 
   it("lowercases the tool-name first segment so mixed-case upstreams still match", () => {
-    // The `.toLowerCase()` at cli-shadows.ts:221 normalizes before the
+    // The `.toLowerCase()` at cli-shadows.ts:244 normalizes before the
     // KNOWN_CLI_PREFIXES membership check. MCP servers expose tool names as
     // their upstream chooses -- many don't lowercase (a server may forward
     // `NPM_search` directly from a Go or Rust binary that emits PascalCase).
@@ -169,7 +169,7 @@ describe("resolveShadowedClis", () => {
   });
 
   it("splits tool names on '.' and '-' in addition to '_'", () => {
-    // The split regex at cli-shadows.ts:220 is `/[_.-]/` -- three separators,
+    // The split regex at cli-shadows.ts:243 is `/[_.-]/` -- three separators,
     // not one. Existing tests exercise only `_` (the most common shape); a
     // regression that narrows the regex to `/[_]/` silently kills shadow
     // detection for any server using dot or dash separators. Real upstream
@@ -186,6 +186,25 @@ describe("resolveShadowedClis", () => {
       toolCache: [{ name: "npm-search" }, { name: "npm-audit" }, { name: "npm-view" }],
     });
     expect(dashes).toEqual([{ cli: "npm" }]);
+  });
+
+  it("does not let a caller mutate the shared registry", () => {
+    // Mirrors the cliToNamespaces isolation test below. The returned array used
+    // to be a SHALLOW copy, so the CliShadow objects and their `subcommands`
+    // arrays were still live references into module state -- a caller that
+    // sorted or pushed onto `shadows[0].subcommands` rewrote the registry for
+    // every later lookup in the process.
+    const first = resolveShadowedClis({ namespace: "npmjs" });
+    first.push({ cli: "bogus_cli" });
+    first[0].cli = "bogus_cli";
+    first[0].subcommands?.push("install");
+
+    const second = resolveShadowedClis({ namespace: "npmjs" });
+    expect(second).toHaveLength(1);
+    expect(second[0].cli).toBe("npm");
+    expect(second[0].subcommands).not.toContain("install");
+    // The shadow LINE is what discover prints, so pin the user-visible side too.
+    expect(formatShadowLine({ namespace: "npmjs" })).not.toContain("bogus_cli");
   });
 });
 
@@ -293,6 +312,41 @@ describe("cliToNamespaces", () => {
     // returned reference; the leak is fixed, but sorting the copy keeps this
     // assertion from depending on the isolation it isn't testing.
     expect([...namespaces].sort()).toEqual(["k8s", "kubectl", "kubernetes"]);
+  });
+
+  it("never lists a namespace twice for one CLI", () => {
+    // The builder pushes unconditionally -- the old `!list.includes(namespace)`
+    // dedup guard could never be false (object keys are unique, and no registry
+    // entry names the same CLI twice within one namespace). This asserts the
+    // invariant that made the guard dead, so a registry entry that broke it
+    // (`ssh: [{ cli: "ssh" }, { cli: "ssh" }]`) fails here instead of silently
+    // printing a duplicated namespace in doctor's shadow rows.
+    for (const [cli, namespaces] of cliToNamespaces()) {
+      expect(new Set(namespaces).size, `duplicate namespace in the reverse index for ${cli}`).toBe(namespaces.length);
+    }
+  });
+
+  it("matches the CLI name exactly -- keys are bare, already-lowercase binaries", () => {
+    // The header note in cli-shadows.ts and the installTargetForCli docblock
+    // say BOTH CLI-keyed tables are matched exactly, so the CALLER lowercases;
+    // only that prose landed. installTargetForCli's half is pinned by "matches
+    // the CLI name exactly (no path/case fuzzing here)" above -- this is the
+    // reverse index's half. doctor's extractLeadingBinary is the caller that
+    // owes the normalization: it already strips path, wrapper and `.exe`/`.cmd`
+    // decoration, and a PowerShell history line reading `NPM audit` matches
+    // nothing unless it lowercases in the same place.
+    const reverse = cliToNamespaces();
+    for (const decorated of ["NPM", "Npm", "KUBECTL", "npm.exe", "/usr/bin/npm", "C:\\bin\\npm.exe", " npm"]) {
+      expect(reverse.get(decorated), `${decorated} must not resolve -- the caller normalizes`).toBeUndefined();
+    }
+    // The bare spelling is the one that does resolve, so the misses above are
+    // the contract rather than an empty index.
+    expect(reverse.get("npm")).toContain("npmjs");
+    // ...and neither table carries a key that could match a decorated name in
+    // the first place: no uppercase, no path separator, no extension.
+    for (const cli of [...reverse.keys(), ...Object.keys(SHADOW_INSTALL_TARGETS)]) {
+      expect(cli, "CLI keys are bare lowercase binary names").toMatch(/^[a-z0-9_-]+$/);
+    }
   });
 
   it("returns an equal-but-independent Map on repeat calls", () => {

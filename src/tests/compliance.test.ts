@@ -1,5 +1,10 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { __resetComplianceWarningLatch, gradeRank, parseMinCompliance, passesMinCompliance } from "../compliance.js";
+import { log } from "../logger.js";
+
+// Hoisted file-wide, which also silences the warn lines every other case in
+// this file provokes. Harmless: logger.ts exports nothing but `log`.
+vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
 describe("gradeRank", () => {
   it("maps A-F to descending ranks", () => {
@@ -120,5 +125,84 @@ describe("passesMinCompliance", () => {
   it("is case-insensitive on the server-reported grade", () => {
     expect(passesMinCompliance("a", "B")).toBe(true);
     expect(passesMinCompliance("d", "B")).toBe(false);
+  });
+});
+
+// The two warn lines are the ONLY signal for a fail-open and a fail-closed
+// decision, and nothing in the suite watched the logger: both branches and
+// both one-shot latches could be deleted wholesale with every case above
+// still green. Assertions are on the message AND the data payload, so a bare
+// log() left behind after deleting a branch still fails.
+//
+// The latch cases live in their own describe on purpose: the beforeEach in
+// `parseMinCompliance` above clears the latch before EVERY case, which would
+// turn "a second call stays quiet" into an assertion of the opposite.
+describe("compliance warning logging", () => {
+  const logged = vi.mocked(log);
+
+  beforeEach(() => {
+    logged.mockClear();
+    __resetComplianceWarningLatch();
+  });
+
+  it("warns once when YAW_MCP_MIN_COMPLIANCE is invalid, naming the value", () => {
+    // Without this line an operator who typos the env var gets no refusals and
+    // no clue why: the filter is silently OFF.
+    expect(parseMinCompliance("b1")).toBeNull();
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith("warn", "Invalid YAW_MCP_MIN_COMPLIANCE; filter disabled", { value: "b1" });
+  });
+
+  it("stays quiet on a later invalid value in the same process", () => {
+    // The latch is per-process, not per-value -- and it is NOT reset between
+    // the two calls here, which is the behaviour under test.
+    parseMinCompliance("Z");
+    expect(logged).toHaveBeenCalledTimes(1);
+    logged.mockClear();
+    parseMinCompliance("Q");
+    expect(logged).not.toHaveBeenCalled();
+  });
+
+  it("never warns for a valid, empty or unset min", () => {
+    expect(parseMinCompliance("a")).toBe("A");
+    expect(parseMinCompliance(" b ")).toBe("B");
+    expect(parseMinCompliance("")).toBeNull();
+    expect(parseMinCompliance(undefined)).toBeNull();
+    expect(logged).not.toHaveBeenCalled();
+  });
+
+  it("warns once per unrecognized server grade, naming the grade and the min", () => {
+    // The only structured record of WHY a server was refused.
+    expect(passesMinCompliance("Pass", "B")).toBe(false);
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith(
+      "warn",
+      "Unrecognized server compliance grade; failing closed under YAW_MCP_MIN_COMPLIANCE",
+      { grade: "Pass", min: "B" },
+    );
+
+    // Same garbled grade again: one warn per value, not one per activate call.
+    logged.mockClear();
+    expect(passesMinCompliance("Pass", "B")).toBe(false);
+    expect(logged).not.toHaveBeenCalled();
+
+    // A DIFFERENT garbled grade is a different misconfiguration and gets its
+    // own line -- the latch is a Set keyed on the raw string, not a boolean.
+    expect(passesMinCompliance("AAA", "B")).toBe(false);
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith(
+      "warn",
+      "Unrecognized server compliance grade; failing closed under YAW_MCP_MIN_COMPLIANCE",
+      { grade: "AAA", min: "B" },
+    );
+  });
+
+  it("stays quiet when there is no gate to apply or the grade is fine", () => {
+    expect(passesMinCompliance("Pass", null)).toBe(true); // no min -> no refusal to explain
+    expect(passesMinCompliance(undefined, "A")).toBe(true); // ungraded passes
+    expect(passesMinCompliance("   ", "A")).toBe(true);
+    expect(passesMinCompliance("A", "B")).toBe(true);
+    expect(passesMinCompliance("F", "A")).toBe(false); // a recognized grade below min is not a warn
+    expect(logged).not.toHaveBeenCalled();
   });
 });

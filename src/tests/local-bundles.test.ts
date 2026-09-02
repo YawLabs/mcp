@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import {
   loadLocalBundles,
   localBundlesPath,
   NAMESPACE_RE,
+  previewUpsertUserBundle,
   probeProjectTrust,
   projectFileIsHonoured,
   removeUserBundle,
@@ -50,7 +51,12 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-"));
+  // realpathSync the root: the SUT resolves paths physically (trust grants are
+  // keyed on the real path, and the injected readFile errnos are keyed on the
+  // path the SUT actually opens), so on a platform where tmpdir() is a symlink
+  // (macOS /var -> /private/var) a raw mkdtemp path silently misses every one
+  // of them. Same convention as config-loader.test.ts / paths.test.ts.
+  synthHome = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-")));
   // synthCwd lives INSIDE synthHome so findProjectConfigDir's walk-up stops at
   // the synthetic home boundary and never reaches the real ~/.yaw-mcp/ on the
   // developer's machine -- matching the isolation pattern in config-loader.test.ts.
@@ -512,7 +518,12 @@ describe("readBundlesAt error discrimination (fix 1)", () => {
     // exists:true committed to project path -- config is null (unreadable),
     // but the global file must NOT have been loaded.
     expect(r.config).toBeNull();
-    expect(r.config?.servers?.some((s) => s.namespace === "global")).toBeFalsy();
+    // `path` is what proves the no-fallthrough half. Probing the null config
+    // for the global's server cannot: the optional chain yields undefined and
+    // the assertion passes no matter which file won. On a fallthrough `path`
+    // would be the user-global file (whose one server is `global`); here it
+    // must still name the project file the loader committed to.
+    expect(r.path).toBe(projectBundlesPath(synthCwd));
     // A warning must be present for the unreadable file.
     expect(r.warnings.some((w) => w.includes("could not read"))).toBe(true);
   });
@@ -870,6 +881,39 @@ describe("upsertUserBundle merges onto the stored entry", () => {
     writeBundles(synthHome, { version: 1, servers: [{ namespace: "x", name: "X", isActive: true }] });
     await upsertUserBundle({ namespace: "x", name: "X", isActive: false }, { home: synthHome });
     expect(stored().isActive).toBe(false);
+  });
+
+  // `add --dry-run` renders previewUpsertUserBundle's entry, so it has to be
+  // the MERGED one. Built from the incoming entry instead, the preview told a
+  // user who hand-disabled a server that the add would make it loadable --
+  // while the write keeps `isActive: false` (the rule above) -- and showed a
+  // stored --env value as absent.
+  it("previewUpsertUserBundle returns the MERGED entry the write would land", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "gh", name: "GH", command: "old", args: ["stale"], isActive: false, env: { TOKEN: "secret" } },
+      ],
+    });
+    const incoming = { namespace: "gh", name: "GH", command: "npx", args: ["-y", "gh"], isActive: true };
+    const preview = await previewUpsertUserBundle(incoming, { home: synthHome });
+    expect(preview.replaced).toBe(true);
+    expect(preview.entry.isActive).toBe(false);
+    expect(preview.entry.env).toEqual({ TOKEN: "secret" });
+    // ...while what a re-add is FOR is still previewed as refreshed.
+    expect(preview.entry.args).toEqual(["-y", "gh"]);
+    // A preview writes nothing.
+    expect(stored().command).toBe("old");
+    // ...and the real run lands exactly what it showed.
+    const res = await upsertUserBundle(incoming, { home: synthHome });
+    expect(res.entry).toEqual(preview.entry);
+  });
+
+  it("previewUpsertUserBundle passes a FRESH add's entry through untouched", async () => {
+    const incoming = { namespace: "solo", name: "Solo", command: "npx", isActive: true };
+    const preview = await previewUpsertUserBundle(incoming, { home: synthHome });
+    expect(preview.replaced).toBe(false);
+    expect(preview.entry).toEqual(incoming);
   });
 
   it("keeps fields the incoming entry says nothing about, and reports a fresh add", async () => {

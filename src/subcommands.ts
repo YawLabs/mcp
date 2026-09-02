@@ -27,6 +27,12 @@ export const FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 // 45a3462 removed the Yaw Team surface: login/logout/sync/stats/token/
 // set-active lingered here). When you add or remove an index.ts branch,
 // update this list in the same commit.
+//
+// That last sentence is enforced now, not merely requested: the test
+// "lists exactly the subcommands index.ts dispatches" (index-dispatch.
+// test.ts) scrapes every `subcommand === "..."` literal out of index.ts
+// and requires the two sets to be equal, in both directions. A branch
+// added without an entry here, or an entry outliving its branch, goes red.
 export const KNOWN_SUBCOMMANDS = [
   "compliance",
   "audit",

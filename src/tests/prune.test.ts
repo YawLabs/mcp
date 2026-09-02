@@ -122,11 +122,17 @@ describe("pruneContent", () => {
     expect(r.content[0].text).toBe("a\n\nb");
   });
 
-  it("returns original content when savings are below 2%", () => {
-    const raw = JSON.stringify({ a: 1, b: 2, c: 3 });
+  it("returns original content when a REAL prune saves less than 2%", () => {
+    // The gate is about savings, not about there being nothing to prune: a
+    // 2 KB string next to one droppable null prunes by ~9 bytes, which is a
+    // genuine prune and still far under MIN_SAVINGS_RATIO, so the original
+    // comes back with the null intact. Input with nothing prunable at all
+    // (the previous shape of this test) passes identically with the gate
+    // deleted, so it pinned nothing.
+    const raw = JSON.stringify({ pad: "x".repeat(2000), dropMe: null });
     const r = pruneContent([{ type: "text", text: raw }]);
-    // Nothing to prune — original should come back unchanged.
     expect(r.content[0].text).toBe(raw);
+    expect(JSON.parse(r.content[0].text).dropMe).toBeNull();
     expect(r.bytesPruned).toBe(r.bytesRaw);
   });
 
@@ -145,8 +151,11 @@ describe("pruneContent", () => {
   it("survives malformed JSON (falls back to text-mode pruning)", () => {
     const raw = "{ not, actually: json;;;\n\n\n\ntrailing    ";
     const r = pruneContent([{ type: "text", text: raw }]);
-    // Not JSON — text-mode runs without throwing.
-    expect(typeof r.content[0].text).toBe("string");
+    // Not JSON — and text-mode cleanup actually RAN on it: the trailing run of
+    // spaces is gone and the four-newline run collapsed to two. Asserting only
+    // `typeof === "string"` also passed when the fallback did nothing at all.
+    expect(r.content[0].text).toBe("{ not, actually: json;;;\n\ntrailing");
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
   });
 
   it("skips non-text content entries untouched", () => {
@@ -166,12 +175,23 @@ describe("pruneContent", () => {
     expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
   });
 
-  it("bails safely on 3MB+ text blocks without parsing them as JSON", () => {
-    const huge = `{"big": "${"x".repeat(3_000_000)}"}`;
+  it("bails safely past the 2MB parse threshold without parsing as JSON", () => {
+    // The droppable nulls are what make this pin the SIZE GUARD rather than
+    // the savings gate: ~100 KB of them against a ~2.1 MB document is 4.8%, so
+    // with the guard deleted the JSON path would prune them and clear
+    // MIN_SAVINGS_RATIO. They survive only because JSON mode was skipped
+    // outright. (A lone 3 MB string prunes to a 1-byte-shorter string that the
+    // gate then rejects, which looks identical from the outside.)
+    const source: Record<string, unknown> = { big: "x".repeat(2_000_000) };
+    for (let i = 0; i < 6000; i++) source[`empty${i}`] = null;
+    const huge = JSON.stringify(source);
+    expect(huge.length).toBeGreaterThan(2_000_000);
     const r = pruneContent([{ type: "text", text: huge }]);
-    // Over the 2MB parse threshold — falls through to text-mode only.
-    // No crash, no JSON mangling; bytes stay ~identical.
-    expect(r.content[0].text.length).toBeGreaterThan(2_999_000);
+    // No crash, no JSON mangling, and every null still there.
+    expect(r.content[0].text.length).toBe(huge.length);
+    expect(r.content[0].text).toContain('"empty0":null');
+    expect(r.content[0].text).toContain('"empty5999":null');
+    expect(r.bytesPruned).toBe(r.bytesRaw);
   });
 
   // Fix 4: array elements that prune to "empty" must NOT be dropped --
@@ -256,6 +276,75 @@ describe("pruneContent", () => {
     expect(r.content[0].text).toContain("empty0");
   });
 
+  it("leaves the '.0' spelling of 2^53+1 alone too", () => {
+    // Same lost digit as the integer case, one character apart -- and the
+    // fractional branch is the one that used to wave it through: a 17-digit
+    // bound is the double->decimal direction, so 9007199254740993.0 was
+    // declared faithful and the model got 9007199254740992 with nothing
+    // logged. NUMERIC columns serialize in exactly this shape.
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"id": 9007199254740993.0, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toContain("9007199254740993.0");
+    // Whole document skipped, not merely returned by the savings gate.
+    expect(r.content[0].text).toContain("empty0");
+  });
+
+  it("leaves a 17-significant-digit fraction alone (0.12345678901234567)", () => {
+    // Re-serializes as 0.12345678901234566 -- the last digit CHANGES, so the
+    // document keeps its original bytes. A high-precision measurement is the
+    // everyday shape here; the '.0' case above is its integer twin.
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"reading": 0.12345678901234567, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toContain("0.12345678901234567");
+    expect(r.content[0].text).toContain("empty0");
+  });
+
+  it("leaves a literal that underflows to zero alone (1e-400)", () => {
+    // The digits are GONE, not rounded: JSON.stringify emits 0, so a
+    // measurement below the double's range would reach the model as nothing
+    // at all.
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"tiny": 1e-400, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toContain("1e-400");
+    expect(r.content[0].text).toContain("empty0");
+  });
+
+  it("still prunes a computed double that needs all 17 digits (0.30000000000000004)", () => {
+    // The counterweight to the three cases above. JSON.stringify reproduces
+    // this literal byte for byte, so it is faithful -- but a mantissa bound of
+    // 15 (the decimal->double->decimal guarantee) would call it unfaithful,
+    // and ONE unfaithful literal costs the WHOLE document its pruning. Sums,
+    // averages, and lat/lon land here constantly, so that bound would be a
+    // savings regression on very ordinary responses.
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"sum": 0.30000000000000004, "lon": -122.41941550000001, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.sum).toBe(0.30000000000000004);
+    expect(parsed.lon).toBe(-122.41941550000001);
+    expect(parsed.empty0).toBeUndefined();
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
+
+  it("still prunes when a fractional literal is only REFORMATTED (19.90 -> 19.9)", () => {
+    // 19.90 -> 19.9, 1.0 -> 1, 0.0000001 -> 1e-7: the double is unchanged and
+    // only the spelling moves, which the module explicitly sanctions. Bailing
+    // on these would disable pruning for every response carrying a
+    // trailing-zero money column.
+    const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
+    const raw = `{"price": 19.90, "whole": 1.0, "tiny": 0.0000001, ${nulls}}`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const parsed = JSON.parse(r.content[0].text);
+    expect(parsed.price).toBe(19.9);
+    expect(parsed.whole).toBe(1);
+    expect(parsed.tiny).toBe(1e-7);
+    expect(parsed.empty0).toBeUndefined();
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
+
   it("leaves a literal that overflows to Infinity alone (JSON.stringify emits null)", () => {
     const nulls = Array.from({ length: 40 }, (_, i) => `"empty${i}": null`).join(", ");
     const raw = `{"huge": 1e400, ${nulls}}`;
@@ -266,7 +355,9 @@ describe("pruneContent", () => {
 
   it("still prunes when the long digit run is inside a STRING, not a number", () => {
     // String-quoted ids are the safe shape and must not lose their savings:
-    // the scanner blanks string literals before looking for numbers.
+    // the scanner is one regex alternating string-literal | number with the
+    // STRING form first, so a quoted run of digits is consumed as part of that
+    // string match and never reaches the number test.
     const source: Record<string, unknown> = { id: "12345678901234567890", keep: "value" };
     for (let i = 0; i < 40; i++) source[`empty${i}`] = null;
     const r = pruneContent([{ type: "text", text: JSON.stringify(source) }]);

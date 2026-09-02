@@ -35,6 +35,27 @@ describe("buildCoUsageMap", () => {
     const m = buildCoUsageMap(packs);
     expect(m.get("zzz")).toEqual(["aaa", "mmm"]);
   });
+
+  it("drops namespaces that are no longer installed", () => {
+    // Pack history persists across restarts, so a server removed from
+    // bundles.json still shows up in it. Naming it as a peer tells the model
+    // to load something `activate` can no longer find.
+    const packs: DetectedPack[] = [{ namespaces: ["gh", "linear", "gone"], frequency: 2, lastSeenAt: 100 }];
+    const m = buildCoUsageMap(packs, new Set(["gh", "linear"]));
+    expect(m.get("gh")).toEqual(["linear"]);
+    expect(m.get("linear")).toEqual(["gh"]);
+    expect(m.has("gone")).toBe(false);
+  });
+
+  it("keeps the whole history when no installed set is given", () => {
+    const packs: DetectedPack[] = [{ namespaces: ["gh", "gone"], frequency: 2, lastSeenAt: 100 }];
+    expect(buildCoUsageMap(packs).get("gh")).toEqual(["gone"]);
+  });
+
+  it("emits no entry for a pack whose peers were all filtered out", () => {
+    const packs: DetectedPack[] = [{ namespaces: ["gh", "gone"], frequency: 2, lastSeenAt: 100 }];
+    expect(buildCoUsageMap(packs, new Set(["gh"])).has("gh")).toBe(false);
+  });
 });
 
 describe("formatUsageHint", () => {
@@ -48,6 +69,19 @@ describe("formatUsageHint", () => {
 
   it("renders a success count", () => {
     expect(formatUsageHint(usage(4), [])).toBe("usage: used 4x");
+  });
+
+  it("rounds a graded-reward sum instead of printing float noise", () => {
+    // `succeeded` is a SUM of graded rewards in [0,1] (learning.ts), not an
+    // integer count, so IEEE-754 accumulation lands on values like
+    // 3.3000000000000003 -- which rendered verbatim before the Math.round.
+    expect(formatUsageHint(usage(3.3000000000000003, 4), [])).toBe("usage: used 3x");
+  });
+
+  it("suppresses the count on a sub-1 reward sum rather than rounding it up to 1x", () => {
+    // The MIN_SUCCESS_TO_SHOW floor is checked against the RAW sum: rounding
+    // first would turn 0.6 of one graded success into a confident "used 1x".
+    expect(formatUsageHint(usage(0.6, 1), [])).toBeNull();
   });
 
   it("renders co-usage peers", () => {

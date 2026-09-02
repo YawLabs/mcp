@@ -1,5 +1,6 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { computeOutcomeReward } from "../reward.js";
 import {
   buildGraderPrompt,
   firstResultText,
@@ -56,6 +57,22 @@ describe("isUncertainReward", () => {
       expect(isUncertainReward(r)).toBe(false);
     }
   });
+
+  // Coupling guard. The bands are defined in reward.ts and this predicate used
+  // to restate them as bare literals, so moving one would have switched the
+  // grader off with nothing red. Drive the predicate from the grades
+  // computeOutcomeReward actually produces instead of from numbers.
+  it("is true for the grades computeOutcomeReward produces for the uncertain shapes", () => {
+    // Error-shaped 200 (soft failure) and empty body -- the two bands where the
+    // keyword heuristic is most likely wrong in either direction.
+    expect(isUncertainReward(computeOutcomeReward({ content: [{ type: "text", text: "not found" }] }))).toBe(true);
+    expect(isUncertainReward(computeOutcomeReward({ content: [{ type: "text", text: "" }] }))).toBe(true);
+  });
+
+  it("is false for the grades computeOutcomeReward produces for the confident shapes", () => {
+    expect(isUncertainReward(computeOutcomeReward({ isError: true }))).toBe(false);
+    expect(isUncertainReward(computeOutcomeReward({ content: [{ type: "text", text: "all good" }] }))).toBe(false);
+  });
 });
 
 describe("firstResultText", () => {
@@ -97,6 +114,15 @@ describe("buildGraderPrompt", () => {
   it("omits the goal line when no intent is known", () => {
     const p = buildGraderPrompt({ toolName: "list_prs", resultText: "[]" });
     expect(p).not.toContain("Goal:");
+  });
+
+  it("truncates a long intent, the one field that used to skip every bound", () => {
+    // resultText is fenced AND length-capped; the intent was interpolated raw,
+    // so an unbounded caller-supplied string went straight into the client's
+    // sampling budget.
+    const p = buildGraderPrompt({ intent: "z".repeat(500), toolName: "t", resultText: "[]" });
+    expect(p).toContain(`Goal: ${"z".repeat(200)}...`);
+    expect(p).not.toContain("z".repeat(201));
   });
 
   it("truncates fenced content at 4000 chars and appends the truncation marker", () => {
@@ -206,6 +232,20 @@ describe("gradeOutcomeViaSampling", () => {
     });
     expect(await gradeOutcomeViaSampling(server, ctx)).toBe(1.0);
     expect(seenOptions).toMatchObject({ timeout: 4000 });
+  });
+
+  // Regression: an 8-token budget truncated the reply before the labelled
+  // `GRADE:` line the prompt asks for could land, which put parseGrade back on
+  // a verdict word from the narration -- the mis-grade the last-verdict rule
+  // exists to prevent.
+  it("budgets enough tokens for a labelled verdict to land after a sentence of narration", async () => {
+    let seenParams: { maxTokens?: number } | undefined;
+    const server = mockServer({ sampling: {} }, async (params) => {
+      seenParams = params as { maxTokens?: number };
+      return { content: { type: "text", text: "No results were returned, but the call succeeded. GRADE: YES" } };
+    });
+    expect(await gradeOutcomeViaSampling(server, ctx)).toBe(1.0);
+    expect(seenParams?.maxTokens).toBeGreaterThanOrEqual(48);
   });
 
   it("returns null (never throws) when the SDK's request timeout rejects the call", async () => {

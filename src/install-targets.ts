@@ -163,19 +163,32 @@ export interface ResolvePathOptions {
   projectDir?: string;
   /** Override for tests; defaults to os.homedir(). */
   home?: string;
-  /** Override for tests; defaults to process.env.APPDATA (Windows). */
+  /** Override for tests. Defaults to `<home>/AppData/Roaming` whenever `home`
+   *  is supplied, and only otherwise to `process.env.APPDATA` (Windows) --
+   *  see the derivation in resolveInstallPath for why `home` wins. */
   appData?: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`. When set (truthy), claude-code
    *  user/local scope writes to `<dir>/.claude.json` instead of
    *  `<home>/.claude.json`, matching Claude Code's actual read path.
-   *  Resolver stays pure: callers (install-cmd, doctor-cmd, index.ts)
-   *  read `process.env.CLAUDE_CONFIG_DIR` and pass it in. */
+   *  The resolver never reads this one from the environment on its own:
+   *  callers (install-cmd, doctor-cmd, index.ts) read
+   *  `process.env.CLAUDE_CONFIG_DIR` and pass it in. (`appData` above is the
+   *  one env read left, and only when the caller overrode no `home`.) */
   claudeConfigDir?: string;
 }
 
 export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
   const home = opts.home ?? homedir();
-  const appData = opts.appData ?? process.env.APPDATA ?? join(home, "AppData", "Roaming");
+  // A caller-supplied `home` OWNS the appData derivation. Reading the ambient
+  // process.env.APPDATA ahead of it made a synthetic home leak onto the real
+  // machine: claude-desktop is the one client that lives under %APPDATA%, so a
+  // hermetic run that overrode `home` but not `appData` resolved to (and would
+  // have written) the DEVELOPER's own claude_desktop_config.json. Every caller
+  // re-derived `<home>/AppData/Roaming` by hand to dodge that; owning the rule
+  // here means the caller that forgets is hermetic anyway. The env is consulted
+  // only when no `home` override was given -- i.e. when `home` IS the machine's.
+  const envAppData = opts.home === undefined ? process.env.APPDATA : undefined;
+  const appData = opts.appData ?? envAppData ?? join(home, "AppData", "Roaming");
   const { clientId, scope, os, projectDir, claudeConfigDir } = opts;
   const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
   if (!target) throw new Error(`Unknown client: ${clientId}`);
@@ -406,15 +419,28 @@ export interface LaunchEntry {
 const CMD_METACHARS = /[&|<>^()]/g;
 const HAS_CMD_METACHAR = /[&|<>^()]/;
 
-/** Node/Python launcher names that ship as `.cmd`/`.bat` SHIMS on Windows
- *  (npx.cmd, uvx.cmd, pipx.cmd, ...). A shim forwards its args through `%*`,
- *  which cmd.exe RE-PARSES a second time -- so an arg bound for a shim must
- *  survive TWO cmd parses, not one (see escapeCmdArg for the caret depth). */
-const KNOWN_CMD_SHIM_LAUNCHERS = new Set(["npx", "uvx", "pipx", "npm", "pnpm", "yarn", "bunx"]);
+/** Node launcher names that ship as `.cmd`/`.bat` SHIMS on Windows (npx.cmd,
+ *  npm.cmd, yarn.cmd, ...). A shim forwards its args through `%*`, which
+ *  cmd.exe RE-PARSES a second time -- so an arg bound for a shim must survive
+ *  TWO cmd parses, not one (see escapeCmdArg for the caret depth).
+ *
+ *  npm's own installers are what put these here: every `node_modules/.bin`
+ *  entry and every global npm bin gets a generated `.cmd` wrapper on Windows. */
+const KNOWN_CMD_SHIM_LAUNCHERS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
 
 /** Real executables cmd.exe launches DIRECTLY -- one cmd parse, no `%*`
  *  re-parse. Listed so the common direct launchers get single-level
- *  (full-fidelity) escaping instead of the fail-safe shim depth. */
+ *  (full-fidelity) escaping instead of the fail-safe shim depth.
+ *
+ *  `uvx` and `pipx` sit here, NOT in the shim set above, even though they are
+ *  Python-ecosystem launchers: uv ships `uvx.exe` beside `uv.exe` (and yaw-mcp's
+ *  own bootstrap installs exactly that native binary -- see uv-bootstrap.ts),
+ *  and pipx installs `pipx.exe`. Calling them shims cost an arg a caret level it
+ *  never spends: a no-space metachar arg was triple-caret escaped and reached
+ *  uvx.exe as the corrupted `^&` instead of `&`, after ONE cmd parse. The
+ *  residual risk is a user who hand-rolls their own `uvx.cmd` on PATH -- that
+ *  arg is under-escaped -- but an explicit `uvx.cmd` spelling in the config is
+ *  still caught by the extension test in isCmdShimLauncher. */
 const KNOWN_DIRECT_BINARIES = new Set([
   "node",
   "deno",
@@ -422,6 +448,8 @@ const KNOWN_DIRECT_BINARIES = new Set([
   "python",
   "python3",
   "py",
+  "uvx",
+  "pipx",
   "ruby",
   "php",
   "docker",
@@ -431,7 +459,7 @@ const KNOWN_DIRECT_BINARIES = new Set([
 ]);
 
 /** Is `command` a `.cmd`/`.bat` shim whose `%*` forwarding makes cmd.exe parse
- *  the forwarded args a SECOND time?  npx/uvx/pipx are; node/docker are not.
+ *  the forwarded args a SECOND time?  npx/npm/yarn are; node/uvx/docker are not.
  *
  *  This sets the caret depth in escapeCmdArg: an arg reaching a shim must
  *  survive two cmd parses (triple-caret), an arg reaching a real exe only one
@@ -511,17 +539,36 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
   if (opts.upstream) {
     // Upstream-shape entry (yaw-mcp try): preserve the upstream command +
     // args verbatim, but wrap on Windows so a `.cmd` shim launcher
-    // (npx.cmd, uvx.cmd, pipx.cmd) doesn't ENOENT when the client
+    // (npx.cmd, npm.cmd, yarn.cmd) doesn't ENOENT when the client
     // spawns it directly.
     const { command, args, env } = opts.upstream;
     if (opts.os === "windows") {
+      // A whitespace-bearing COMMAND cannot survive this wrap at all, so refuse
+      // it here rather than persist an entry that dies at client-spawn time.
+      // escapeCmdArg leaves such a token verbatim (shape 3) because libuv
+      // quote-WRAPS it -- correct for an arg, wrong for the command, because
+      // `cmd /c` has a rule of its own: when the line has more than one quoted
+      // token, cmd strips the FIRST and LAST quote of the whole line. The
+      // command's opening quote is the one that goes, so `"C:\Program Files\x\
+      // srv.cmd" "--flag=a b"` is executed as `C:\Program` and the client
+      // reports `'C:\Program' is not recognized`. No caret depth reaches it (the
+      // quotes are libuv's, added after we return), which is why this is a
+      // refusal and not an escape -- same trade as escapeCmdArg's shape 1.
+      if (/[ \t]/.test(command)) {
+        throw new Error(
+          `Cannot safely encode a launcher command that contains whitespace for the Windows cmd /c ` +
+            `launcher: ${command} -- cmd.exe strips the outer quotes when the line carries another ` +
+            `quoted token, so the client's spawn fails with "'...' is not recognized". Point the ` +
+            `server at a whitespace-free launcher (a bare npx/uvx resolved on PATH, or a short path).`,
+        );
+      }
       // Caret-escape cmd.exe metacharacters (see escapeCmdArg): without it,
       // any upstream token carrying an unquoted `&` / `|` / `<` / `>` splits
       // the `cmd /c` line when the CLIENT spawns the entry, running the tail
       // as a second command. The COMMAND token is parsed by cmd ONCE -- it is
       // resolved and launched, never forwarded through a shim's `%*` -- so it
       // escapes at the single-parse depth. The ARG tokens, when `command` is a
-      // `.cmd`/`.bat` shim (npx/uvx/pipx), cross a SECOND cmd parse via that
+      // `.cmd`/`.bat` shim (npx/npm/yarn), cross a SECOND cmd parse via that
       // shim's `%*`, so they escape at the deeper shim depth. escapeCmdArg
       // throws on a genuinely unsafe shape (quote + metachar); that rejection
       // propagates to the caller's dispatch and surfaces as a clean error.
@@ -638,10 +685,16 @@ export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp__*";
  *  When `claudeConfigDir` is set, user-scope `settings.json` lives at
  *  `<DIR>/settings.json` (NOT `<DIR>/.claude/settings.json` — the `.claude`
  *  segment is absorbed by the env redirect). Project/local scopes are
- *  project-relative and unaffected. */
+ *  project-relative and unaffected.
+ *
+ *  `os` is DEAD and now optional: unlike pathFor (which spells a `display`
+ *  string for the TARGET os), every path here is built with `node:path.join`
+ *  against the runner's own platform -- the only thing a caller writing the
+ *  file could use. It stays declared solely so the existing call sites keep
+ *  compiling; new callers should omit it and old ones can drop it. */
 export function resolveClaudeCodeSettingsPath(
   scope: InstallScope,
-  opts: { home: string; projectDir?: string; os: InstallOS; claudeConfigDir?: string },
+  opts: { home: string; projectDir?: string; os?: InstallOS; claudeConfigDir?: string },
 ): string | null {
   const { home, projectDir, claudeConfigDir } = opts;
   const cfgDir = claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : null;

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
   mkdirSync(join(root, ".yaw-mcp"), { recursive: true });
@@ -10,17 +11,39 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  DOCTOR_ENV_VARS,
   DOCTOR_USAGE,
   formatRelativeAge,
   oamRunEntryPath,
   parseDoctorArgs,
   registrySkipCheck,
-  runDoctor,
+  runDoctor as runDoctorUnstubbed,
   scanShellHistoryForShadows,
 } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
+
+/** The shape probeOam returns when oam is not installed at all. */
+const oamNotInstalled = () => ({
+  bin: null,
+  binPath: null,
+  version: null,
+  belowMin: false,
+  failure: null,
+  failureDetail: null,
+});
+
+/** runDoctor with a DEFAULT oam probe injected.
+ *
+ *  Without it, every call below that does not pass its own `oamProbe` falls
+ *  through to the real probeOam, which SPAWNS `oam --version` on the host --
+ *  probeOam has no VITEST guard, so the suite's timing and its OAM RUNTIME
+ *  output would depend on whatever oam happens to be installed on the runner
+ *  (and on a machine WITH oam, on its version). Tests that care about a
+ *  specific oam state still pass their own fixture, which wins. */
+const runDoctor: typeof runDoctorUnstubbed = (opts = {}) =>
+  runDoctorUnstubbed({ ...opts, oamProbe: opts.oamProbe ?? oamNotInstalled });
 
 let synthHome: string;
 let synthCwd: string;
@@ -348,7 +371,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
     });
@@ -361,7 +384,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
     });
@@ -376,12 +399,31 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
     });
     expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.malformed).toBe(true);
     expect(cap.text()).toMatch(/JSON is malformed/);
+  });
+
+  it("does not call a config malformed just because an arg is not a string", async () => {
+    // The JSON parses fine -- `args` simply carries a number, which a hand-
+    // edited config reasonably can. The launch-shape helpers call string
+    // methods on every token, so an unchecked cast threw a TypeError that the
+    // classifier's outer catch reported as "JSON is malformed", sending the
+    // user hunting for a syntax error that is not there.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "cmd", args: ["/c", 5, null, "oam"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const entry = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(entry?.malformed).toBe(false);
+    // And the entry is still SEEN -- the throw used to lose it entirely.
+    expect(entry?.hasMcpEntry).toBe(true);
+    expect(cap.text()).not.toMatch(/JSON is malformed/);
   });
 
   it("suggests a `yaw-mcp install` command when a configured-looking file lacks the entry", async () => {
@@ -390,7 +432,7 @@ describe("runDoctor — client detection", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
     });
@@ -411,7 +453,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
     });
@@ -431,7 +473,7 @@ describe("runDoctor — client detection", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
     });
@@ -455,7 +497,7 @@ describe("runDoctor — client detection", () => {
       const r = await runDoctor({
         cwd: synthCwd,
         home: synthHome,
-        env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
+        env: { CLAUDE_CONFIG_DIR: wrapperDir },
         os: "linux",
         out: cap.out,
       });
@@ -478,7 +520,7 @@ describe("runDoctor — client detection", () => {
       const r = await runDoctor({
         cwd: synthCwd,
         home: synthHome,
-        env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
+        env: { CLAUDE_CONFIG_DIR: wrapperDir },
         os: "linux",
         out: cap.out,
       });
@@ -641,7 +683,7 @@ describe("runDoctor — STATE section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -672,7 +714,7 @@ describe("runDoctor — STATE section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -695,7 +737,7 @@ describe("runDoctor — STATE section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -711,7 +753,11 @@ describe("runDoctor — STATE section", () => {
     // server.ts / reset-learning accepts a case-insensitive "true" as well as
     // "1". Pinned here because the shared predicate is the only thing keeping
     // doctor from reporting persistence ON while the broker has it OFF.
-    delete process.env.YAW_MCP_DISABLE_PERSISTENCE;
+    //
+    // This used to `delete process.env.YAW_MCP_DISABLE_PERSISTENCE` first --
+    // a no-op by the comment's own logic (nothing here reads process.env),
+    // and a global mutation with no restore, so a real value in the ambient
+    // env would have been destroyed for every test that ran after this one.
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
       join(synthHome, ".yaw-mcp", STATE_FILENAME),
@@ -721,7 +767,7 @@ describe("runDoctor — STATE section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "TRUE" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "TRUE" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -749,7 +795,7 @@ describe("runDoctor — RELIABILITY section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -775,7 +821,7 @@ describe("runDoctor — RELIABILITY section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -812,7 +858,7 @@ describe("runDoctor — RELIABILITY section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -827,7 +873,7 @@ describe("runDoctor — ENVIRONMENT section", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       skipRegistryCheck: true,
@@ -849,7 +895,6 @@ describe("runDoctor — ENVIRONMENT section", () => {
       cwd: synthCwd,
       home: synthHome,
       env: {
-        YAW_MCP_TOKEN: "mcp_pat_aaaa",
         YAW_MCP_SERVER_CAP: "10",
         YAW_MCP_MIN_COMPLIANCE: "B",
         YAW_MCP_AUTO_LOAD: "1",
@@ -864,6 +909,52 @@ describe("runDoctor — ENVIRONMENT section", () => {
     expect(txt).toMatch(/YAW_MCP_AUTO_LOAD\s+1/);
     // Unset vars should still show their default hint.
     expect(txt).toMatch(/YAW_MCP_PRUNE_RESPONSES\s+\(not set/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DOCTOR_ENV_VARS is a hand-maintained SECOND copy of the env table in
+// `yaw-mcp --help` (index.ts), and the two drifted apart by seven variables
+// once -- which hurts most here, since doctor is the paste-into-a-ticket
+// surface. Nothing pinned them together; this does, in both directions.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — env table lockstep with `yaw-mcp --help`", () => {
+  // The help text lives inline in the dispatcher, which runs at IMPORT time
+  // (top-level process.argv side effects), so it cannot be imported -- read
+  // the source. A table row starts at 4 spaces; the continuation lines of a
+  // wrapped description are indented far further, so the anchor picks up row
+  // starts only. The slice drops everything above the table, where a var can
+  // be named in ordinary prose.
+  const indexSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "index.ts"), "utf8");
+  const helpTable = indexSource.slice(indexSource.indexOf("Environment variables:"));
+  const helpVars = new Set([...helpTable.matchAll(/^ {4}(YAW_MCP_[A-Z0-9_]+)/gm)].map((m) => m[1]));
+
+  // Vars --help documents that doctor's raw-value ENVIRONMENT table
+  // deliberately omits. Widening this set is a decision, not a formality --
+  // see the reasoning on DOCTOR_ENV_VARS in doctor-cmd.ts.
+  const EXCLUDED = new Set([
+    "YAW_MCP_DISABLE_PERSISTENCE", // has its own STATE section, with richer context
+    "YAW_MCP_TRUST_PROJECT", // reported by the project-trust gate
+    "YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS", // reported by the project-trust gate
+    "YAW_MCP_CATALOG_URL", // endpoint override, not a behavior toggle
+    "YAW_MCP_BASE_URL", // endpoint override, not a behavior toggle
+    "YAW_MCP_VAULT_PASSPHRASE", // a credential -- SECRET VAULT reports it as a boolean
+    "YAW_MCP_VAULT_PASSPHRASE_NEW", // a credential, same reason
+  ]);
+
+  it("finds the help table at all", () => {
+    // Without this the pair below passes vacuously if the table is ever moved
+    // or reshaped so the row anchor matches nothing.
+    expect(helpVars.size).toBeGreaterThan(10);
+  });
+
+  it("prints no env var that `--help` does not document", () => {
+    expect(DOCTOR_ENV_VARS.map((v) => v.name).filter((n) => !helpVars.has(n))).toEqual([]);
+  });
+
+  it("prints every documented behavior toggle that is not a listed exclusion", () => {
+    expect([...helpVars].filter((n) => !EXCLUDED.has(n) && !DOCTOR_ENV_VARS.some((v) => v.name === n))).toEqual([]);
   });
 });
 
@@ -899,7 +990,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -918,7 +1009,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -936,7 +1027,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -957,7 +1048,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -977,7 +1068,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -993,7 +1084,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -1012,7 +1103,7 @@ describe("runDoctor — UPGRADE AVAILABLE method-aware hints", () => {
     await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       currentVersion: "0.40.0",
@@ -1059,6 +1150,11 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
+      // The ONE fixture that still sets the retired YAW_MCP_TOKEN / YAW_MCP_URL
+      // on purpose, and it must stay: this test asserts neither value reaches
+      // the blob, so dropping them from the env makes the leak assertion below
+      // vacuously true. Every other fixture had them removed -- doctor reads
+      // neither, so carrying them implied a dependency the code does not have.
       env: { YAW_MCP_TOKEN: "mcp_pat_DO_NOT_LEAK_1234", YAW_MCP_URL: "https://corp.example" },
       os: "linux",
       out: cap.out,
@@ -1118,7 +1214,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -1140,7 +1236,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1168,7 +1264,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1184,7 +1280,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1202,7 +1298,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_DISABLE_PERSISTENCE: "1" },
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -1231,7 +1327,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1249,7 +1345,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_SERVER_CAP: "12" },
+      env: { YAW_MCP_SERVER_CAP: "12" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -1266,7 +1362,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa", YAW_MCP_POLL_INTERVAL: "300" },
+      env: { YAW_MCP_POLL_INTERVAL: "300" },
       os: "linux",
       out: cap.out,
       json: true,
@@ -1290,7 +1386,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1306,7 +1402,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1323,7 +1419,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1368,7 +1464,7 @@ describe("runDoctor — --json", () => {
     const rj = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: capJson.out,
       json: true,
@@ -1400,7 +1496,7 @@ describe("runDoctor — --json", () => {
     const rt = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: capText.out,
       err: (s) => errLines.push(s),
@@ -1445,7 +1541,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -1486,7 +1582,7 @@ describe("runDoctor — --json", () => {
     const r = await runDoctor({
       cwd: synthCwd,
       home: synthHome,
-      env: { YAW_MCP_TOKEN: "mcp_pat_aaaa" },
+      env: {},
       os: "linux",
       out: cap.out,
       json: true,
@@ -2851,6 +2947,28 @@ describe("runDoctor — SECRET VAULT", () => {
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(cap.text()).not.toContain("SECRET VAULT");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("still renders the section when refs exist but the vault file does not", async () => {
+    // refs present / vault absent -- the state a user lands in the moment they
+    // paste a `${secret:NAME}` into bundles.json and have not run `secrets set`
+    // yet. The section must NOT hide itself (it only skips when the vault AND
+    // the refs are both absent), and the remedy has to be `secrets set`: every
+    // referenced name is unstored, so a report that only says "unlock the
+    // vault" sends the user to unlock a vault that was never created.
+    writeBundlesWithRef();
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("SECRET VAULT");
+    expect(txt).toContain("(does not exist yet)");
+    // Not "unreadable" -- there is nothing to read, which is a different fact.
+    expect(txt).toContain("entries:    (none)");
+    expect(txt).toContain("gh: ${secret:gh}");
+    expect(txt).toContain("missing:    referenced but not stored -- gh");
+    expect(txt).toContain("yaw-mcp secrets set <name>");
+    // Informational, like every other state of this section.
     expect(r.exitCode).toBe(0);
   });
 

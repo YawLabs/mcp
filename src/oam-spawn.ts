@@ -19,8 +19,10 @@
 // default-runtime.ts), not an opt-in tier -- that changed in #99, and this note
 // described the opt-in model for two releases after it.
 //
-// MEASURED: the SDK-hosting mechanism re-verified against oam 0.12.1 on
-// 2026-08-29 (a stdio @modelcontextprotocol/sdk server completes
+// MEASURED: the SDK-hosting mechanism re-verified against oam 0.13.0 on
+// 2026-09-02, and the floor moved to 0.13.1 the same day without re-running
+// it -- 0.13.1 is a same-day patch on 0.13.0, so the mechanism check is
+// carried forward, not re-measured (a stdio @modelcontextprotocol/sdk server completes
 // initialize + tools/list + tools/call hosted on `oam run`); the full
 // per-server matrix below was last run against 0.11.0 on 2026-08-22
 // (first 0.9.0 on 2026-08-08). Re-run at least the mechanism check for
@@ -215,7 +217,7 @@ export function npxSpec(args: readonly string[]): string | null {
  * aggressive floor costs nothing but a fallback, while a lax one silently
  * hosts production sidecars on a runtime that is no longer current.
  */
-export const MIN_OAM_VERSION = "0.12.1";
+export const MIN_OAM_VERSION = "0.13.1";
 
 /** The oam installer one-liners, as oamjs.org publishes them. Both install the
  *  current release, which always satisfies MIN_OAM_VERSION. */
@@ -396,9 +398,12 @@ export interface OamProbe {
   version: string | null;
   /** True when oam IS installed but below MIN_OAM_VERSION (bin is null). */
   belowMin: boolean;
-  /** Set when oam was present but unusable, so callers can tell a BROKEN oam
-   *  from an ABSENT one -- both carry bin=null, and reporting the former as
-   *  "not installed" sends the user looking for an install they already have. */
+  /** Set when oam could not be used AND "not installed" is the wrong thing to
+   *  say, so callers can tell a BROKEN oam from an ABSENT one -- both carry
+   *  bin=null, and reporting the former as "not installed" sends the user
+   *  looking for an install they already have. Usually that means oam was
+   *  present and did not answer `--version`; an OAM_BIN naming a path that does
+   *  not exist lands here too, because the installer cannot fix that either. */
   failure: OamProbeFailure | null;
   /** The underlying error message behind `failure`, for diagnostics. Null
    *  whenever `failure` is null. */
@@ -879,8 +884,24 @@ export async function probeOam(run: (bin: string) => Promise<string> = spawnVers
   return oamProbeInFlight;
 }
 
+/**
+ * Deliberately does NOT re-check oamProbeCache. Its only caller is probeOam,
+ * which reads the cache and then calls this with no await in between -- so on a
+ * single-threaded loop the cache cannot have been populated since. A guard here
+ * used to suggest a race that cannot happen, and an unreachable branch is worse
+ * than none: it reads as tested when nothing can reach it. The real concurrency
+ * is handled elsewhere -- oamProbeInFlight collapses racing callers onto one
+ * spawn, and `generation` is what stops a stale result publishing.
+ */
 async function probeOamUncached(run: (bin: string) => Promise<string>, generation: number): Promise<OamProbe> {
-  if (oamProbeCache !== undefined) return oamProbeCache;
+  /** Whether the path probed was CHOSEN by the user rather than guessed by us.
+   *  It changes what an ENOENT MEANS: a bare `oam` missing from PATH is "oam is
+   *  not installed", the routine node-only case. An OAM_BIN that does not exist
+   *  is a broken CONFIGURATION -- reporting it as absence hands the user the
+   *  installer, which cannot fix it, because OAM_BIN still wins after they run
+   *  it. That is exactly the "reinstall software you already have" loop the
+   *  failure/absence split at OamProbe.failure exists to prevent. */
+  const explicit = Boolean(process.env.OAM_BIN);
   const bin = winNormalize(process.env.OAM_BIN || (process.platform === "win32" ? "oam.exe" : "oam"));
   /** Publish only if no reset landed while we were awaiting the spawn. The
    *  result is still RETURNED to this call's own caller either way -- it is
@@ -939,8 +960,10 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
       failureDetail: null,
     });
   } catch (err) {
-    // "oam is not installed" is the expected, silent case -- ENOENT here is
-    // routine and logging it would be noise on every node-only setup.
+    // "oam is not installed" is the expected, silent case -- an ENOENT on the
+    // bare name we guessed is routine, and logging it would be noise on every
+    // node-only setup. An ENOENT on an OAM_BIN the user SET is not that case at
+    // all (see `explicit` above); it gets the same treatment as a broken oam.
     //
     // EVERY other failure is not routine: oam IS on disk and did not produce a
     // usable --version. Since the probe result is cached for the process
@@ -949,6 +972,8 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
     // the belowMin path, and let the timeout keep its own message -- it is the
     // only failure with an actionable budget attached to it.
     const code = (err as { code?: unknown } | null)?.code;
+    /** ENOENT is absence ONLY when the name was ours to guess. */
+    const absent = code === "ENOENT" && !explicit;
     if (code === "ETIMEDOUT") {
       log("warn", "oam did not respond to --version in time; falling back to node for this process", {
         timeoutMs: OAM_PROBE_TIMEOUT_MS,
@@ -962,17 +987,26 @@ async function probeOamUncached(run: (bin: string) => Promise<string>, generatio
         bin,
         error: err instanceof Error ? err.message : String(err),
       });
+    } else if (explicit) {
+      // The stale-OAM_BIN case. Named separately from the line above because
+      // the fix is different: nothing is broken, the variable points somewhere
+      // that no longer exists, and the path it names is the whole message.
+      log("warn", "OAM_BIN points at a path that does not exist; falling back to node for this process", {
+        bin,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
-    // ENOENT is absence, not a failure -- see OamProbeFailure. Everything else
-    // is a present-but-unusable oam, which doctor must not report as "not
+    // A guessed-name ENOENT is absence, not a failure -- see OamProbeFailure.
+    // Everything else, an explicit OAM_BIN that resolves to nothing included, is
+    // an oam the user believes they have, which doctor must not report as "not
     // installed".
     return publish({
       bin: null,
       binPath: null,
       version: null,
       belowMin: false,
-      failure: code === "ENOENT" ? null : classifyProbeFailure(err),
-      failureDetail: code === "ENOENT" ? null : err instanceof Error ? err.message : String(err),
+      failure: absent ? null : classifyProbeFailure(err),
+      failureDetail: absent ? null : err instanceof Error ? err.message : String(err),
     });
   }
 }
@@ -1340,7 +1374,18 @@ export function resetNpmCacheDir(): void {
 
 function resolveNpmCacheDir(fromUrl: string): string | null {
   // npm's precedence, highest first.
-  const fromEnv = process.env.npm_config_cache;
+  //
+  // The env key is matched CASE-INSENSITIVELY because npm matches it that way:
+  // it lowercases the `npm_config_` prefix when folding the environment into
+  // config, so `NPM_CONFIG_CACHE` -- the spelling CI images and Dockerfiles
+  // reach for, since the rest of their env is uppercase -- is applied by npm.
+  // Reading only the lowercase spelling meant npm filled one cache while this
+  // resolver scanned the `_npx` under a different one, and every npx sidecar
+  // silently stayed on npx. A POSIX-only bug: process.env is already
+  // case-insensitive on Windows, which is why it survived. If BOTH spellings
+  // are set (a user error either way) the first one enumerated wins.
+  const envKey = Object.keys(process.env).find((k) => /^npm_config_cache$/i.test(k));
+  const fromEnv = envKey === undefined ? undefined : process.env[envKey];
   if (fromEnv) return fromEnv;
 
   const candidates = [join(homedir(), ".npmrc")];

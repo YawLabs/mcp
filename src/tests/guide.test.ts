@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { loadGuides, loadProjectGuide, loadUserGuide, projectGuideNotice, renderGuide } from "../guide.js";
 import { CONFIG_DIRNAME, GUIDE_FILENAME } from "../paths.js";
@@ -19,9 +19,16 @@ describe("loadUserGuide", () => {
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-home-"));
+    // Two tests below assert a WARN-level line captured off process.stderr.
+    // logger.ts resolves LOG_LEVEL per call (deliberately, so a host can flip
+    // it mid-session), so a developer shell or CI job exporting LOG_LEVEL=error
+    // suppresses those lines and fails the tests for a reason that has nothing
+    // to do with guide.ts. Pin the threshold the assertions depend on.
+    vi.stubEnv("LOG_LEVEL", "warn");
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -194,6 +201,25 @@ describe("loadProjectGuide approval flag", () => {
     const p = writeProjectBundles({ version: 1, servers: [] });
     await grantTrust(p, readFileSync(p), { home });
     const g = await loadProjectGuide(project, home, {});
+    expect(g?.unapproved).toBeUndefined();
+    expect(projectGuideNotice(g)).toBeNull();
+  });
+
+  it("does NOT flag when a previously-approved bundles.json has become UNREADABLE", async () => {
+    // loadLocalBundles honours an unreadable project file whose PATH was
+    // approved before ("an approved bundles.json is authoritative even when it
+    // is broken" -- projectFileIsHonoured). The guide re-implemented only the
+    // `bypassed || trusted` half of that predicate, so this directory kept
+    // loading its servers while `yaw-mcp doctor` printed a "not approved"
+    // notice about the guide sitting beside them. A DIRECTORY where
+    // bundles.json belongs makes the read fail on every platform.
+    writeGuide(join(project, CONFIG_DIRNAME), "project notes");
+    const p = writeProjectBundles({ version: 1, servers: [] });
+    await grantTrust(p, readFileSync(p), { home });
+    rmSync(p, { force: true });
+    mkdirSync(p, { recursive: true });
+    const g = await loadProjectGuide(project, home, {});
+    expect(g?.content).toBe("project notes");
     expect(g?.unapproved).toBeUndefined();
     expect(projectGuideNotice(g)).toBeNull();
   });

@@ -2,7 +2,10 @@ import { log } from "./logger.js";
 
 export type ProgressReporter = (message: string, progress?: number, total?: number) => void;
 
-export interface ProgressSender {
+// Module-private: nothing outside this file names the type. It exists only
+// to give createProgressReporter's parameter one place to index the callback
+// shape out of, so exporting it would advertise an API no caller consumes.
+interface ProgressSender {
   sendNotification: (notification: {
     method: "notifications/progress";
     params: {

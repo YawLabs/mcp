@@ -8,8 +8,16 @@
 // Case-insensitive so the surrounding English is matched in any casing,
 // but the captured name is post-filtered to require ALL_CAPS so ordinary
 // English words ("var", "missing") never sneak through.
+//
+// Pattern 1 tolerates every phrasing servers actually emit around the name:
+// an optional "required", an optional "env"/"environment", an optional
+// "var"/"variable", and an optional COLON after it -- "Missing env var:
+// OPENAI_API_KEY" (this file's own header example) matched none of those
+// before. The `\s+` AFTER the optional colon is load-bearing: without it
+// "Missing VARIANT_TOKEN" has its leading "VAR" eaten by the var/variable
+// group and reports the name as "IANT_TOKEN".
 const MISSING_PATTERNS: RegExp[] = [
-  /\bmissing\s+(?:env\s+|environment\s+)?(?:variable\s+|var\s+)?([A-Z_][A-Z0-9_]{2,})\b/gi,
+  /\bmissing\s+(?:required\s+)?(?:env\s+|environment\s+)?(?:(?:variable|var)\s*:?\s+)?([A-Z_][A-Z0-9_]{2,})\b/gi,
   /\b([A-Z_][A-Z0-9_]{2,})\s+is\s+(?:required|not\s+set|missing|empty|undefined)\b/gi,
   /\b([A-Z_][A-Z0-9_]{2,})\s+must\s+be\s+set\b/gi,
   /\bplease\s+set\s+(?:env\s+(?:var\s+|variable\s+)?)?([A-Z_][A-Z0-9_]{2,})\b/gi,
@@ -27,6 +35,12 @@ const MISSING_PATTERNS: RegExp[] = [
 // -- the exact false positive this filter exists to stop. AUTH is
 // deliberately absent for that reason; a genuine token is spelled with one of
 // the words below somewhere in the name.
+//
+// A bare "API" segment is absent for the same reason: it makes API_URL,
+// API_HOST and API_BASE credential-shaped and pops a secret prompt for a
+// URL, while adding nothing for real keys -- API_KEY / STRIPE_API_KEY /
+// OPENAI_API_KEY all still match on their KEY (or TOKEN) segment, and the
+// underscore-less APIKEY spelling is listed in its own right below.
 const CREDENTIAL_SEGMENTS = new Set([
   "TOKEN",
   "TOKENS",
@@ -35,7 +49,6 @@ const CREDENTIAL_SEGMENTS = new Set([
   "KEY",
   "KEYS",
   "APIKEY",
-  "API",
   "PASSWORD",
   "PASSWD",
   "PASS",

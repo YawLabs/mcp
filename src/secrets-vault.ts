@@ -1,7 +1,8 @@
 // On-disk vault for Yaw MCP secrets. Stores per-entry encrypted blobs
-// at ~/.yaw-mcp/secrets.json (or <project>/.yaw-mcp/secrets.json for
-// project-local overrides). The salt sits at the vault level so the
-// passphrase-derived key is computed once per session.
+// at ~/.yaw-mcp/secrets.json -- user-global only. Unlike bundles.json there
+// is NO project-local override: vaultPath() below is the single location,
+// and nothing walks up from cwd looking for one. The salt sits at the vault
+// level so the passphrase-derived key is computed once per session.
 //
 // File format:
 //   {
@@ -25,17 +26,22 @@
 //
 // Process lifetime: the derived key is cached in module-scoped memory
 // so subsequent operations within the same yaw-mcp process don't
-// re-prompt. The cache is cleared on `yaw-mcp secrets lock` or on
-// process exit -- nothing persists across processes.
+// re-prompt. lock() clears the cache of THE CALLING PROCESS ONLY -- so a
+// `yaw-mcp secrets lock` CLI run, being its own short-lived process, cannot
+// reach the cache of a yaw-mcp server that is already running (that one
+// keeps its key until it exits; see the `lock` entry in secrets-cmd.ts's
+// help). Otherwise the cache dies with the process, and nothing persists
+// across processes.
 //
 // The vault is local-only: it is never uploaded anywhere. Every
 // operation reads and writes the on-disk file above.
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import {
@@ -47,6 +53,7 @@ import {
   generateSalt,
   isValidKdfParams,
   type KdfParams,
+  LEGACY_KDF,
   normalizePassphrase,
   SALT_LEN,
 } from "./secrets-crypto.js";
@@ -71,7 +78,8 @@ export interface VaultFile {
   version: number;
   salt: string; // base64
   /** scrypt parameters the vault's key is derived under. Absent on v1
-   *  vaults, which were all written with DEFAULT_KDF. */
+   *  vaults, which were all written with LEGACY_KDF -- the pinned historical
+   *  value, NOT whatever DEFAULT_KDF happens to be at read time. */
   kdf?: KdfParams;
   entries: Record<string, EncryptedEntry>;
   /** Vault-level verification token: a fixed known constant encrypted
@@ -192,6 +200,16 @@ export async function loadVault(path: string): Promise<VaultFile | null> {
       throw new VaultEntryCorruptError(name);
     }
   }
+  // A malformed `check` is deliberately NOT fatal the way a malformed entry
+  // is: the marker is a verification convenience the next mutating write
+  // re-stamps (ensureCheck), never user data, so throwing here would lock a
+  // user out of intact secrets over a damaged token. But dropping it in total
+  // silence is the other extreme -- the vault quietly falls back to the
+  // legacy any-entry-decrypts path with nothing anywhere saying why. Log it,
+  // then discard it.
+  if (obj.check !== undefined && !isEncryptedEntry(obj.check)) {
+    log("warn", "Vault verification token is malformed; ignoring it (the next write re-stamps it)", { path });
+  }
   const check = isEncryptedEntry(obj.check) ? obj.check : undefined;
   return {
     version: typeof obj.version === "number" ? obj.version : LEGACY_SCHEMA_VERSION,
@@ -212,29 +230,31 @@ function isEncryptedEntry(v: unknown): v is EncryptedEntry {
 }
 
 export async function saveVault(path: string, vault: VaultFile): Promise<void> {
-  // atomicWriteFile mkdirs the target dir recursively (atomic-write.ts:19)
-  // before writing the temp file, so the caller does NOT need to create
-  // the directory first. We DO chmod the dir to 0o700 on POSIX so the
-  // vault directory itself isn't group/other-readable -- the file inside
-  // is born 0o600 below, but a world-readable parent dir lets others
-  // observe its existence and timestamps.
-  const dir = dirname(path);
-  await mkdir(dir, { recursive: true });
+  // atomicWriteFile mkdirs the target dir recursively before writing the temp
+  // file, so the caller does NOT need to create the directory first -- and
+  // MUST NOT. dirMode only applies to directories atomicWriteFile itself
+  // creates (atomic-write.ts:195 mkdirpWithMode), so an explicit mkdir here
+  // would hand it a directory that already exists, make the 0o700 below a
+  // no-op, and leave ~/.yaw-mcp born at the umask default (typically 0o755)
+  // for the window before the chmod. Letting atomicWriteFile create it means
+  // the dir is BORN 0o700 -- which is what secrets-audit.ts's "matching
+  // saveVault" note describes.
+  //
+  // The file is likewise born 0o600, so the encrypted vault is never
+  // group/other-readable in the window between rename and the chmod below
+  // (ciphertext only, but consistent with the token/cookie files).
+  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8", 0o600, 0o700);
   if (process.platform !== "win32") {
+    // Both chmods are best-effort belt-and-suspenders over the birth modes
+    // above. The DIRECTORY one is not redundant: atomicWriteFile leaves a
+    // PRE-EXISTING ~/.yaw-mcp alone (it will not tighten a directory the user
+    // already had), so this is the only thing that narrows one created by an
+    // earlier release or by a non-secret yaw-mcp file.
     try {
-      await chmod(dir, 0o700);
+      await chmod(dirname(path), 0o700);
     } catch {
       // not critical
     }
-  }
-  // Born 0o600 so the encrypted vault is never group/other-readable in the
-  // window between rename and the chmod below (ciphertext only, but consistent
-  // with the token/cookie files). The dirMode: 0o700 closes the same gap
-  // for any parent directory atomicWriteFile creates -- belt-and-suspenders
-  // alongside the explicit chmod(dir, 0o700) above, which only handles the
-  // immediate parent (and only if it already existed).
-  await atomicWriteFile(path, `${JSON.stringify(vault, null, 2)}\n`, "utf8", 0o600, 0o700);
-  if (process.platform !== "win32") {
     try {
       await chmod(path, 0o600);
     } catch {
@@ -311,8 +331,13 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   }
   const salt = Buffer.from(vault.salt, "base64");
   // The vault's OWN parameters, not this build's default: a vault written
-  // under a different cost factor must keep opening.
-  const params = vault.kdf ?? DEFAULT_KDF;
+  // under a different cost factor must keep opening. A vault that records
+  // NONE falls back to LEGACY_KDF -- the pinned v1 constant -- rather than
+  // DEFAULT_KDF, because DEFAULT_KDF is free to move: reading a kdf-less
+  // vault under a raised default derives a different key and reports "wrong
+  // passphrase" for a correct one, which is precisely the lockout recording
+  // the parameters was meant to prevent.
+  const params = vault.kdf ?? LEGACY_KDF;
   let key = await deriveKey(passphrase, salt, params);
   try {
     verifyKey(vault, key);
@@ -495,7 +520,12 @@ export async function rotateVault(vault: VaultFile, oldKey: Buffer, newPassphras
   try {
     const entries: Record<string, EncryptedEntry> = {};
     for (const [name, value] of plaintext) {
-      entries[name] = encryptEntry(value, newKey, name);
+      // setJsonKey, never `entries[name] = ...`: a legally-named "__proto__"
+      // secret (SECRET_NAME_RE allows it, and set/get/list/save/load all
+      // preserve it) would assign through Object.prototype's inherited
+      // setter, create NO own key, and silently vanish from the rotated
+      // vault -- destroying it, since the caller then overwrites the file.
+      setJsonKey(entries, name, encryptEntry(value, newKey, name));
     }
     return {
       version: SECRETS_SCHEMA_VERSION,
@@ -538,9 +568,18 @@ export function setSecret(vault: VaultFile, key: Buffer, name: string, value: st
   // ensureCheck stamps vault.check on first save so future unlocks can
   // verify the passphrase before caching the derived key. The ciphertext is
   // bound to `name` (AAD) so it cannot be moved to another entry later.
+  //
+  // `kdf` is stamped on the same path, so a vault that recorded none stops
+  // being kdf-less the first time it is written to. The value is LEGACY_KDF,
+  // not DEFAULT_KDF: the key this entry is being encrypted under came from
+  // unlock(), which derived a kdf-less vault under LEGACY_KDF, so that is
+  // what the file must record. (`entries` is a computed key in an object
+  // literal, which defines an own property -- a "__proto__" secret survives
+  // this path; see rotateVault for the one that needed setJsonKey.)
   return ensureCheck(
     {
       ...vault,
+      kdf: vault.kdf ?? { ...LEGACY_KDF },
       entries: {
         ...vault.entries,
         [name]: encryptEntry(value, key, name),
@@ -600,9 +639,17 @@ export function newVault(): VaultFile {
  *    - upstream.ts   -- the spawn-time ref scan + the stderr redactor.
  *  Keep those importing this constant rather than re-declaring a local
  *  copy; three copies of one regex drift.
- *  Global flag => callers using `.exec`/`.matchAll` must mind lastIndex
- *  (reset by creating a fresh RegExp or using String.matchAll, which
- *  clones internally). */
+ *  Global flag => this object carries mutable lastIndex state that every
+ *  importer shares. String.matchAll does NOT rescue that: its internal clone
+ *  is SEEDED FROM this regex's lastIndex (matchAll only spares the original
+ *  from being advanced), so an offset left behind by any `.exec`/`.test`
+ *  elsewhere makes the next scan silently skip the head of the string.
+ *  Scan with a fresh instance instead --
+ *  `new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags)` -- which is what
+ *  collectSecretRefNames below does; name-only callers should go through that
+ *  helper rather than re-deriving the rule. `String.replace` is the one safe
+ *  sharer: on a global regex it zeroes lastIndex before matching and again
+ *  after, which is why resolveSecretRefs below can pass this object directly. */
 export const SECRET_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
 export function resolveSecretRefs(
   env: Record<string, string>,
@@ -637,6 +684,30 @@ export function resolveSecretRefs(
     });
   }
   return { resolved, missing };
+}
+
+/** Distinct `${secret:NAME}` names referenced across an env map -- the
+ *  values-free half of resolveSecretRefs, and the one scanner every name-only
+ *  caller shares: upstream.ts's spawn-time audit, meta-tools.ts's
+ *  `mcp_connect_secrets` report and doctor's vault section each carried a
+ *  byte-equivalent copy of this loop, agreeing only by luck and each having to
+ *  re-derive the fresh-instance rule below.
+ *
+ *  A fresh RegExp per call rather than the shared SECRET_REF_RE: that object
+ *  carries /g, so it holds mutable lastIndex state that every importer shares,
+ *  and matchAll SEEDS its internal clone from it -- an offset left behind by an
+ *  `.exec`/`.test` elsewhere would make the scan silently skip leading matches,
+ *  dropping a referenced secret from the caller's report. Non-string values are
+ *  skipped rather than coerced; only a string env value can carry a ref. */
+export function collectSecretRefNames(env: Record<string, string> | undefined): Set<string> {
+  const names = new Set<string>();
+  if (!env) return names;
+  const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
+  for (const v of Object.values(env)) {
+    if (typeof v !== "string") continue;
+    for (const m of v.matchAll(re)) if (m[1]) names.add(m[1]);
+  }
+  return names;
 }
 
 /** True iff any env value carries a `${secret:NAME}` reference. */

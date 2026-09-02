@@ -22,6 +22,7 @@ import {
   MAX_RESOURCES_PER_SERVER,
   MAX_TOOLS_PER_SERVER,
   resetOamDowngrades,
+  scrubInternalSecretsFromProcessEnv,
   setSessionVaultPassphrase,
   stripInternalSecretsFromEnv,
   VaultPassphraseRequiredError,
@@ -34,23 +35,29 @@ import {
 // ---------------------------------------------------------------------------
 
 // Mock secrets-vault so resolveServerEnv tests never touch the filesystem.
-vi.mock("../secrets-vault.js", () => ({
-  hasSecretRefs: vi.fn(),
-  loadVault: vi.fn(),
-  resolveSecretRefs: vi.fn(),
-  unlock: vi.fn(),
-  vaultPath: vi.fn().mockReturnValue("/tmp/fake-vault.json"),
-  // Real value, not a stub: upstream's collectSecretNames builds its scan
-  // regex from this (single source of truth for the `${secret:NAME}` shape),
-  // so a mocked-away export would break audit-name collection.
-  SECRET_REF_RE: /\$\{secret:([a-zA-Z0-9_.-]+)\}/g,
-  // Real value for the same reason: resolveServerEnv and verifyVaultPassphrase
-  // both compare an unlock failure's message against it to tell "the vault is
-  // damaged, the passphrase is fine" from "wrong passphrase". A stub would
-  // make those two branches indistinguishable.
-  VAULT_CHECK_CORRUPT_ERROR:
-    'vault verification token ("check") is corrupt -- the passphrase is correct, but the check marker does not decrypt',
-}));
+vi.mock("../secrets-vault.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../secrets-vault.js")>();
+  return {
+    hasSecretRefs: vi.fn(),
+    loadVault: vi.fn(),
+    resolveSecretRefs: vi.fn(),
+    unlock: vi.fn(),
+    vaultPath: vi.fn().mockReturnValue("/tmp/fake-vault.json"),
+    // Real values, re-exported from the module itself rather than hand-copied.
+    // The spawn audit scans the env with collectSecretRefNames (secrets-vault's
+    // single source of truth for the `${secret:NAME}` shape, built on
+    // SECRET_REF_RE), and resolveServerEnv / verifyVaultPassphrase both compare
+    // an unlock failure's message against VAULT_CHECK_CORRUPT_ERROR to tell
+    // "the vault is damaged, the passphrase is fine" from "wrong passphrase".
+    // Stubs would make those branches indistinguishable -- and a literal COPY
+    // of any of them would silently go stale the day secrets-vault changes the
+    // ref charset or the corrupt-check wording, leaving these suites green
+    // against a value the shipped code no longer uses.
+    collectSecretRefNames: actual.collectSecretRefNames,
+    SECRET_REF_RE: actual.SECRET_REF_RE,
+    VAULT_CHECK_CORRUPT_ERROR: actual.VAULT_CHECK_CORRUPT_ERROR,
+  };
+});
 
 // Mock the audit appender: the real one writes to ~/.yaw-mcp/secrets-audit.log,
 // and resolveServerEnv records events on BOTH the success and the missing-refs
@@ -259,7 +266,8 @@ describe("fetchToolsFromUpstream size cap", () => {
   });
 
   it("truncates to the cap and logs a warning when over", async () => {
-    const tools = Array.from({ length: MAX_TOOLS_PER_SERVER + 25 }, (_, i) => ({
+    const reported = MAX_TOOLS_PER_SERVER + 25;
+    const tools = Array.from({ length: reported }, (_, i) => ({
       name: `t${i}`,
       inputSchema: { type: "object" },
     }));
@@ -270,7 +278,9 @@ describe("fetchToolsFromUpstream size cap", () => {
     // First tool preserved, last one is index MAX-1 (the tail is dropped).
     expect(out[0].name).toBe("t0");
     expect(out[MAX_TOOLS_PER_SERVER - 1].name).toBe(`t${MAX_TOOLS_PER_SERVER - 1}`);
-    expect(stderr.writes.some((w) => w.includes("truncating") && w.includes('"reported":1025'))).toBe(true);
+    // Derived from the cap, not a literal: moving MAX_TOOLS_PER_SERVER must
+    // not break this test for a reason unrelated to truncation.
+    expect(stderr.writes.some((w) => w.includes("truncating") && w.includes(`"reported":${reported}`))).toBe(true);
   });
 });
 
@@ -372,6 +382,35 @@ describe("stripInternalSecretsFromEnv", () => {
 });
 
 // ---------------------------------------------------------------------------
+// scrubInternalSecretsFromProcessEnv -- the in-place sibling, for the one-shot
+// CLI paths that hand `process.env` itself to a third party that spawns with it
+// (`yaw-mcp audit` -> @yawlabs/mcp-compliance). Its uppercase path is covered
+// by audit-cmd.test.ts; the case-insensitive twin -- the whole reason the match
+// runs through toUpperCase -- had no coverage anywhere.
+// ---------------------------------------------------------------------------
+
+describe("scrubInternalSecretsFromProcessEnv", () => {
+  afterEach(() => {
+    delete process.env.yaw_mcp_vault_passphrase;
+    delete process.env.Yaw_Mcp_Token;
+    delete process.env.YAW_MCP_SCRUB_KEEPER;
+  });
+
+  it("deletes case-variant twins in place and leaves everything else alone", () => {
+    process.env.yaw_mcp_vault_passphrase = "hunter2";
+    process.env.Yaw_Mcp_Token = "tok";
+    process.env.YAW_MCP_SCRUB_KEEPER = "keep-me";
+
+    scrubInternalSecretsFromProcessEnv();
+
+    expect(process.env.yaw_mcp_vault_passphrase).toBeUndefined();
+    expect(process.env.Yaw_Mcp_Token).toBeUndefined();
+    // Only the internal trio goes -- a neighbouring YAW_MCP_* key survives.
+    expect(process.env.YAW_MCP_SCRUB_KEEPER).toBe("keep-me");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // nextCursor pagination -- the MCP spec defines cursors for all three list
 // endpoints; a paginating upstream must not have pages past the first
 // silently dropped.
@@ -402,6 +441,10 @@ describe("list pagination (nextCursor)", () => {
     expect(listResources.mock.calls[0][0]).toEqual({});
     expect(listResources.mock.calls[1][0]).toEqual({ cursor: "c1" });
     expect(listResources.mock.calls[2][0]).toEqual({ cursor: "c2" });
+    // The per-page request options are the ONLY thing bounding a server that
+    // completes connect and then hangs on inventory, so pin them: LIST_TIMEOUT
+    // is module-private, hence the shape rather than the exact value.
+    expect(listResources.mock.calls[0][1]).toEqual({ timeout: expect.any(Number) });
   });
 
   it("fetchPromptsFromUpstream follows nextCursor across pages", async () => {
@@ -414,6 +457,8 @@ describe("list pagination (nextCursor)", () => {
     const out = await fetchPromptsFromUpstream(client, "ns");
     expect(out.map((p) => p.name)).toEqual(["p0", "p1"]);
     expect(listPrompts.mock.calls[1][0]).toEqual({ cursor: "c1" });
+    // Every page carries its own bound -- see the resources test above.
+    expect(listPrompts.mock.calls[0][1]).toEqual({ timeout: expect.any(Number) });
   });
 
   it("fetchToolsFromUpstream follows nextCursor across pages", async () => {
@@ -426,6 +471,8 @@ describe("list pagination (nextCursor)", () => {
     const out = await fetchToolsFromUpstream(client, "ns");
     expect(out.map((t) => t.name)).toEqual(["t0", "t1"]);
     expect(listTools.mock.calls[1][0]).toEqual({ cursor: "c1" });
+    // Every page carries its own bound -- see the resources test above.
+    expect(listTools.mock.calls[0][1]).toEqual({ timeout: expect.any(Number) });
   });
 
   it("a failure on a later page still surfaces as ActivationError (tools)", async () => {
@@ -443,9 +490,14 @@ describe("list pagination (nextCursor)", () => {
     // LIST_TIMEOUT, so the page cap (MAX_LIST_PAGES, far below the item
     // cap) has to stop the loop -- bounding pages by the item cap would
     // let a slow dribble hold activation for 1000 sequential requests.
-    const listResources = vi
-      .fn()
-      .mockImplementation(() => Promise.resolve({ resources: [{ uri: "file:///same" }], nextCursor: "again" }));
+    // Every page hands back a DISTINCT cursor: a server that echoes the one it
+    // was just sent is stopped earlier by the repeat guard (own test below),
+    // which would otherwise mask the page cap this test is here to pin.
+    let n = 0;
+    const listResources = vi.fn().mockImplementation(() => {
+      n += 1;
+      return Promise.resolve({ resources: [{ uri: `file:///r${n}` }], nextCursor: `c${n}` });
+    });
     const client = makeClient({ listResources });
 
     const out = await fetchResourcesFromUpstream(client, "ns");
@@ -455,17 +507,49 @@ describe("list pagination (nextCursor)", () => {
   });
 
   it("terminates at the page cap on the tools path too", async () => {
-    const listTools = vi
-      .fn()
-      .mockImplementation(() =>
-        Promise.resolve({ tools: [{ name: "t", inputSchema: { type: "object" } }], nextCursor: "again" }),
-      );
+    let n = 0;
+    const listTools = vi.fn().mockImplementation(() => {
+      n += 1;
+      return Promise.resolve({ tools: [{ name: `t${n}`, inputSchema: { type: "object" } }], nextCursor: `c${n}` });
+    });
     const client = makeClient({ listTools });
 
     const out = await fetchToolsFromUpstream(client, "ns");
     expect(out).toHaveLength(MAX_LIST_PAGES);
     expect(listTools).toHaveBeenCalledTimes(MAX_LIST_PAGES);
     expect(stderr.writes.some((w) => w.includes("exceeded page cap"))).toBe(true);
+  });
+
+  it("stops when the server echoes back the cursor it was just sent", async () => {
+    // The same cursor every time means the next request re-fetches the page
+    // just read: every further round trip is a duplicate, and MAX_LIST_PAGES
+    // of them would concatenate one page into the inventory 50 times over.
+    const listResources = vi
+      .fn()
+      .mockImplementation(() => Promise.resolve({ resources: [{ uri: "file:///same" }], nextCursor: "again" }));
+    const client = makeClient({ listResources });
+
+    const out = await fetchResourcesFromUpstream(client, "ns");
+    // Page 1 sent no cursor, so the repeat is only visible on page 2.
+    expect(out).toHaveLength(2);
+    expect(listResources).toHaveBeenCalledTimes(2);
+    expect(stderr.writes.some((w) => w.includes("repeated its pagination cursor"))).toBe(true);
+  });
+
+  it("treats an EMPTY nextCursor as the end, not as a cursor to send back", async () => {
+    // `nextCursor: ""` is the other arm of the same guard: re-requesting with
+    // an empty cursor is either the first page again or a protocol error, so
+    // neither answer is worth another LIST_TIMEOUT-bounded round trip.
+    const listPrompts = vi
+      .fn()
+      .mockResolvedValueOnce({ prompts: [{ name: "p0" }], nextCursor: "" })
+      .mockResolvedValueOnce({ prompts: [{ name: "never" }] });
+    const client = makeClient({ listPrompts });
+
+    const out = await fetchPromptsFromUpstream(client, "ns");
+    expect(out.map((p) => p.name)).toEqual(["p0"]);
+    expect(listPrompts).toHaveBeenCalledTimes(1);
+    expect(stderr.writes.some((w) => w.includes("repeated its pagination cursor"))).toBe(true);
   });
 
   it("breaks out of an empty-page dribble (zero items but a cursor)", async () => {
@@ -726,6 +810,36 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).not.toContain("_SUFFIX_9999");
     expect(err!.stderrTail).toContain("***OUTER_TOKEN***");
   });
+
+  it("rewrites an UNRESOLVED ${secret:NAME} literal to ${secret:***} rather than naming the env key", async () => {
+    // Defense in depth: a ref that reached the child unresolved (or was echoed
+    // back by it) still names a vault entry, which is not something to publish
+    // in an error message. Two branches at once -- the value loop SKIPS a value
+    // that is itself a `${secret:...}` literal, so the catch-all rewrite is what
+    // has to fire. If the skip went away the value loop would replace the whole
+    // literal with ***TOKEN***, and the rewrite would never see it.
+    const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from("config error: ${secret:MY_TOKEN} was rejected"));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain("${secret:***}");
+    // The vault entry's NAME is gone from both surfaces ...
+    expect(err!.stderrTail).not.toContain("MY_TOKEN");
+    expect(err!.message).not.toContain("MY_TOKEN");
+    // ... and the literal took the rewrite, not the value-substitution path.
+    expect(err!.stderrTail).not.toContain("***TOKEN***");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -733,6 +847,12 @@ describe("redactSecretsInOutput", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveServerEnv", () => {
+  beforeEach(() => {
+    // Cleared so the child-env assertions below can never read a slot left
+    // behind by an earlier suite if a case fails before the transport is built.
+    _sdkBehavior.lastStdioArgs = null;
+  });
+
   afterEach(() => {
     vi.clearAllMocks();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
@@ -761,6 +881,9 @@ describe("resolveServerEnv", () => {
     // The error should be an ActivationError (transport/connect failure), not
     // a vault error, confirming resolveServerEnv returned early.
     expect(err).toBeInstanceOf(ActivationError);
+    // "unchanged" means it actually reached the child that way -- the value
+    // the config declared, spawned verbatim.
+    expect(_sdkBehavior.lastStdioArgs?.env?.PLAIN).toBe("hello");
   });
 
   it("substitutes ${secret:NAME} with vault value when vault is loaded", async () => {
@@ -799,6 +922,17 @@ describe("resolveServerEnv", () => {
     const ae = err as ActivationError;
     // The error must NOT be a vault error -- it is a transport-level failure.
     expect(ae.message).not.toMatch(/vault/i);
+    // The spawn boundary itself: this is the only suite that mocks the stdio
+    // transport AND resolves a vault ref, so it is the only place the three
+    // parts of `env: { ...stripInternalSecretsFromEnv(process.env), ...serverEnv }`
+    // can be checked together. toMatchObject, not toEqual -- the child env
+    // carries the whole (stripped) parent env alongside the server's own keys.
+    expect(_sdkBehavior.lastStdioArgs?.env).toMatchObject({ API_KEY: resolvedValue });
+    // The broker's own passphrase (set above) is stripped, so no third-party
+    // upstream can read the vault it unlocks.
+    expect(_sdkBehavior.lastStdioArgs?.env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+    // ... and the ref was RESOLVED on the way in, not passed through literal.
+    expect(_sdkBehavior.lastStdioArgs?.env?.API_KEY).not.toContain("${secret:");
   });
 
   it("throws when secret NAME is missing from vault", async () => {
@@ -962,7 +1096,11 @@ describe("resolveServerEnv", () => {
 
     expect(process.env.YAW_MCP_VAULT_PASSPHRASE).toBeUndefined();
     expect(vaultPassphrase()).toBe("never-in-the-environment");
-    expect(stripInternalSecretsFromEnv(process.env)).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+    // Scan the VALUES, not the one key: asserting that key's absence would be
+    // tautological (it was deleted two lines up, so the strip cannot produce
+    // it whatever the strip list says). The invariant worth pinning is that
+    // the session passphrase reaches no child env under ANY key.
+    expect(Object.values(stripInternalSecretsFromEnv(process.env))).not.toContain("never-in-the-environment");
   });
 
   it('treats an empty session passphrase as absent rather than installing ""', async () => {
@@ -1178,9 +1316,10 @@ describe("connectToUpstream oam boot-probe fallback", () => {
   });
 
   it("does NOT downgrade on non-activation failures (vault refusals rethrow untouched)", async () => {
-    // Secret refs present but no passphrase -> resolveServerEnv throws a
-    // plain Error AFTER the rewrite gate. Downgrading would just fail
-    // identically on node, so the wrapper must rethrow without a respawn.
+    // Secret refs present but no passphrase -> resolveServerEnv throws the
+    // typed VaultPassphraseRequiredError AFTER the rewrite gate, which is not
+    // an ActivationError. Downgrading would just fail identically on node, so
+    // the wrapper must rethrow without a respawn.
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/e.js"] });
@@ -1193,6 +1332,17 @@ describe("connectToUpstream oam boot-probe fallback", () => {
     await expect(connectToUpstream(config)).rejects.toThrow(/vault locked/);
     // The env is resolved before the transport is built -> no spawn at all.
     expect(_sdkBehavior.stdioConstructions).toHaveLength(0);
+    // ... and the spawn count alone cannot see the respawn, because the retry
+    // refuses at the same point with the same zero spawns. resolveServerEnv
+    // calls hasSecretRefs exactly once per connectToUpstreamOnce, so a second
+    // call is the fingerprint of a downgrade attempt: without the
+    // `err instanceof ActivationError` guard this reads 2.
+    expect(vi.mocked(hasSecretRefs)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(log)).not.toHaveBeenCalledWith(
+      "warn",
+      expect.stringContaining("downgrading to node"),
+      expect.anything(),
+    );
   });
 
   it("the downgrade STICKS for the session once node proves oam was the cause", async () => {
@@ -1281,6 +1431,11 @@ describe("connectToUpstream oam boot-probe fallback", () => {
 // ---------------------------------------------------------------------------
 
 describe("connectToUpstream runtime reporting", () => {
+  // Installed purely to keep the runner quiet: the downgrade case below really
+  // does emit a warn, and the logger stub forwards warns to the process's own
+  // stderr. Assertions here read the log mock, not these writes.
+  let stderr: { restore: () => void; writes: string[] };
+
   beforeEach(() => {
     vi.mocked(hasSecretRefs).mockReturnValue(false);
     _sdkBehavior.clientConnect = () => Promise.resolve();
@@ -1292,9 +1447,11 @@ describe("connectToUpstream runtime reporting", () => {
     vi.mocked(resolveOamSpawn).mockReset();
     resetOamDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
+    stderr = captureStderr();
   });
 
   afterEach(() => {
+    stderr.restore();
     vi.clearAllMocks();
     resetListHooks();
     _sdkBehavior.notificationHandlers = [];
@@ -1375,7 +1532,10 @@ describe("connectToUpstream runtime reporting", () => {
 // initialization", protocol_error) rather than return a dead "connected"
 // connection over an already-closed client (fetchResources/Prompts swallow
 // errors, so without the closedBeforeReady flag the dead child would slip
-// through). See upstream.ts:517-537.
+// through). See the `client.onclose` handler and the `if (closedBeforeReady)`
+// guard in connectToUpstreamOnce (upstream.ts) -- named rather than cited by
+// line, because every line number in this file's headers had drifted ~400
+// lines and pointed readers at unrelated code.
 // ---------------------------------------------------------------------------
 
 describe("connectToUpstream closedBeforeReady", () => {
@@ -1486,7 +1646,8 @@ function resetListHooks(): void {
 }
 
 // ---------------------------------------------------------------------------
-// list-changed notification chains (upstream.ts:560-604)
+// list-changed notification chains (the three setNotificationHandler blocks in
+// connectToUpstreamOnce, upstream.ts)
 //
 // Each category (tools/resources/prompts) serializes its refreshes onto its
 // own promise chain. Two back-to-back notifications from one upstream must
@@ -1724,8 +1885,10 @@ describe("connectToUpstream list-changed chains", () => {
     // resources/prompts fetchers, which swallow). The chain link must still
     // RESOLVE -- a rejected link would poison every later notification.
     await expect(handler({ method: "notifications/tools/list_changed" })).resolves.toBeUndefined();
-    // Nothing was published: the previous inventory stands and no route
-    // rebuild was triggered off a failed fetch.
+    // Nothing was published off the failed fetch. The baseline here is the
+    // EMPTY initial inventory, so this pair cannot tell "left alone" from
+    // "reset to []" -- that distinction is the seeded-baseline loop below,
+    // which now covers tools too.
     expect(connection.tools).toEqual([]);
     expect(onListChanged).not.toHaveBeenCalled();
     expect(
@@ -1741,13 +1904,18 @@ describe("connectToUpstream list-changed chains", () => {
   });
 
   // A failed REFRESH must leave the previous inventory standing, for all three
-  // categories. The tools branch gets that for free (fetchToolsFromUpstream
+  // categories -- so all three run here, against a SEEDED (non-empty) baseline.
+  // A baseline of [] cannot fail: an implementation that reset the category to
+  // [] on a failed fetch would pass every assertion.
+  //
+  // The tools branch gets the invariant for free (fetchToolsFromUpstream
   // rethrows); resources/prompts only get it because the refresh handlers pass
   // throwOnError. Without it those two fetchers return [] on any transport
   // error or LIST_TIMEOUT, so one blip mid-session wiped a healthy server's
   // entire resource/prompt inventory from the client -- silently, until some
-  // future list_changed that may never arrive.
-  for (const category of LIST_CHANGED_CATEGORIES.filter((c) => c.label !== "tools")) {
+  // future list_changed that may never arrive. "For free" is still worth
+  // pinning: it is a property of a fetcher this suite does not own.
+  for (const category of LIST_CHANGED_CATEGORIES) {
     it(`keeps the previous ${category.label} inventory when the refresh fetch fails`, async () => {
       const onListChanged = vi.fn();
       const connection = await connectToUpstream(makeLocalConfig(), undefined, onListChanged);
@@ -1781,13 +1949,16 @@ describe("connectToUpstream list-changed chains", () => {
     });
   }
 
-  // The fetchers still SWALLOW at connect time (a server that doesn't
-  // implement the capability answers with an error, and that is not a boot
-  // failure), so a throwing onListChanged remains a distinct way into those
-  // catch arms -- and it is a real risk: the callback rebuilds routes in
-  // server.ts. The chain has to absorb it rather than wedge every later
-  // notification for that category.
-  for (const category of LIST_CHANGED_CATEGORIES.filter((c) => c.label !== "tools")) {
+  // A throwing onListChanged is a real risk on EVERY chain -- the callback
+  // rebuilds routes in server.ts -- and each category's catch arm is the only
+  // thing keeping one bad rebuild from wedging every later notification for
+  // that category. So all three run here, tools included: its catch arm is
+  // otherwise reachable only through a failing fetch, which is a different
+  // entry point. (For resources/prompts it is doubly worth pinning: those
+  // fetchers still SWALLOW at connect time -- a server that doesn't implement
+  // the capability answers with an error, and that is not a boot failure -- so
+  // a throwing callback is the distinct way into their catch arms.)
+  for (const category of LIST_CHANGED_CATEGORIES) {
     it(`catches a throwing onListChanged without breaking the ${category.label} chain`, async () => {
       const onListChanged = vi.fn().mockImplementationOnce(() => {
         throw new Error("route rebuild failed");
@@ -1816,7 +1987,7 @@ describe("connectToUpstream list-changed chains", () => {
 });
 
 // ---------------------------------------------------------------------------
-// disconnectFromUpstream (upstream.ts:615-626) -- a wedged upstream failing to
+// disconnectFromUpstream (upstream.ts) -- a wedged upstream failing to
 // close cleanly is the NORMAL case (the child is already gone / the pipe is
 // broken), so the catch arm must swallow it and the function must still run to
 // completion. A throw here would abort whatever teardown loop called it.
@@ -1872,6 +2043,31 @@ describe("disconnectFromUpstream", () => {
     expect(vi.mocked(log)).toHaveBeenCalledWith("info", "Disconnected from upstream", { namespace: "test" });
   });
 
+  it("sets status BEFORE closing, so a close-driven onclose is not read as an unexpected drop", async () => {
+    // A real transport fires onclose from INSIDE close(). The status write
+    // ordering is the only thing keeping an intentional teardown out of the
+    // onclose handler's live-connection arm; close-then-status would leave the
+    // connection "error" with a bogus "Upstream disconnected unexpectedly" and
+    // hand the namespace to the reconnect callback for a shutdown the caller
+    // asked for. Nothing else in the suite notices a reorder, because the
+    // default mock close() never fires the handler.
+    const onDisconnect = vi.fn();
+    const connection = await connectToUpstream(makeLocalConfig(), onDisconnect);
+    expect(connection.status).toBe("connected");
+
+    _sdkBehavior.clientClose = () => {
+      connection.client.onclose?.();
+      return Promise.resolve();
+    };
+
+    await expect(disconnectFromUpstream(connection)).resolves.toBeUndefined();
+
+    expect(connection.status).toBe("disconnected");
+    expect(connection.error).toBeUndefined();
+    expect(onDisconnect).not.toHaveBeenCalled();
+    expect(stderr.writes.some((w) => w.includes("Upstream disconnected unexpectedly"))).toBe(false);
+  });
+
   it("does not throw when close() throws synchronously", async () => {
     const connection = await connectToUpstream(makeLocalConfig());
     _sdkBehavior.clientClose = () => {
@@ -1885,7 +2081,8 @@ describe("disconnectFromUpstream", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Unexpected disconnect AFTER the connection went live (upstream.ts:518-527).
+// Unexpected disconnect AFTER the connection went live (the `client.onclose`
+// handler in connectToUpstreamOnce, upstream.ts).
 // Distinct from closedBeforeReady: here status is already "connected", so the
 // handler must mark the connection errored and hand the namespace to the
 // reconnect callback instead of silently leaving a dead "connected" entry.
@@ -2070,7 +2267,8 @@ describe("connectToUpstream downstream capability bridge", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Activation failure categorization (upstream.ts:442-489). The dispatch and
+// Activation failure categorization (categorizeSpawnError plus the connect
+// catch block in connectToUpstreamOnce, upstream.ts). The dispatch and
 // activate handlers compose their user-facing messages off `category`, so a
 // mis-bucketed failure produces advice that points at the wrong thing ("check
 // your PATH" for a server that actually refused the handshake).
@@ -2090,6 +2288,10 @@ function makeRemoteConfig(overrides: Record<string, unknown> = {}): any {
 }
 
 describe("connectToUpstream activation failure categories", () => {
+  // Kept only so any warn the failure paths emit stays out of the runner's
+  // output -- the logger stub forwards warns to the real stderr.
+  let stderr: { restore: () => void; writes: string[] };
+
   beforeEach(() => {
     vi.mocked(hasSecretRefs).mockReturnValue(false);
     _sdkBehavior.clientClose = () => Promise.resolve();
@@ -2101,9 +2303,11 @@ describe("connectToUpstream activation failure categories", () => {
     resetListHooks();
     resetOamDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
+    stderr = captureStderr();
   });
 
   afterEach(() => {
+    stderr.restore();
     vi.clearAllMocks();
   });
 
@@ -2118,6 +2322,9 @@ describe("connectToUpstream activation failure categories", () => {
   }
 
   it("buckets ENOENT as spawn_failure with a PATH-oriented message", async () => {
+    // resolveUvSpawn is stubbed to a passthrough for this file, so the command
+    // that fails here IS config.command. Production rewrites uvx to a managed
+    // binary first -- see the next test for that (messier) shape.
     _sdkBehavior.clientConnect = () => Promise.reject(new Error("spawn uvx ENOENT"));
 
     const err = await failedConnect(makeLocalConfig({ command: "uvx" }));
@@ -2129,6 +2336,31 @@ describe("connectToUpstream activation failure categories", () => {
     // The child never wrote to stderr, so there is no tail to attach.
     expect(err.stderrTail).toBeUndefined();
     expect((err.cause as Error).message).toBe("spawn uvx ENOENT");
+  });
+
+  it("names config.command even when the ENOENT is on the MANAGED uv binary", async () => {
+    // The production shape: uvx is rewritten to yaw-mcp's own managed uv before
+    // the spawn, so an ENOENT/EACCES there is about a binary the user never
+    // typed. The message leads with the CONFIG command -- that is the line the
+    // operator has to edit -- and then names the path that actually failed,
+    // because stopping at "install Python for uvx" advises installing a runtime
+    // that is not the missing thing. Both halves are pinned: dropping either
+    // sends the reader somewhere they cannot fix.
+    const managed = "/home/u/.yaw-mcp/uv/uvx";
+    vi.mocked(resolveUvSpawn).mockResolvedValueOnce({ command: managed, args: ["mcp-server-git"] });
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error(`spawn ${managed} ENOENT`));
+
+    const err = await failedConnect(makeLocalConfig({ command: "uvx", args: ["mcp-server-git"] }));
+
+    expect(err.category).toBe("spawn_failure");
+    expect(_sdkBehavior.stdioConstructions[0]?.command).toBe(managed);
+    // The message names the CONFIG command first...
+    expect(err.message).toContain("Command 'uvx' is not on PATH or is not executable.");
+    expect(err.message).toContain("Python for uvx");
+    // ...and then the binary the OS could not actually find.
+    expect(err.message).toContain(`The binary that actually failed to spawn was '${managed}'.`);
+    // `cause` still carries the raw spawn error with that same path.
+    expect((err.cause as Error).message).toContain(managed);
   });
 
   it("buckets EACCES as spawn_failure too (second categorizer arm)", async () => {
@@ -2292,6 +2524,11 @@ describe("connectToUpstream activation failure categories", () => {
 // ---------------------------------------------------------------------------
 
 describe("connectToUpstream remote-entry diagnostics", () => {
+  // Every case here deliberately trips a warn, and the logger stub forwards
+  // warns to the real stderr; capture them so the runner's output stays clean.
+  // The assertions read the log mock (see warnings()), not these writes.
+  let stderr: { restore: () => void; writes: string[] };
+
   beforeEach(() => {
     vi.mocked(hasSecretRefs).mockReturnValue(false);
     _sdkBehavior.clientClose = () => Promise.resolve();
@@ -2303,9 +2540,11 @@ describe("connectToUpstream remote-entry diagnostics", () => {
     resetOamDowngrades();
     vi.mocked(defaultRuntime).mockResolvedValue(null);
     vi.mocked(log).mockClear();
+    stderr = captureStderr();
   });
 
   afterEach(() => {
+    stderr.restore();
     vi.clearAllMocks();
   });
 
@@ -2407,6 +2646,29 @@ describe("verifyVaultPassphrase", () => {
     vi.mocked(loadVault).mockRejectedValue(new Error("EACCES: permission denied"));
 
     await expect(verifyVaultPassphrase("fine")).resolves.toBe(true);
+  });
+
+  it("commits nothing to module state on a passphrase that verifies TRUE", async () => {
+    // The whole reason this function exists: it CHECKS. Installing the value it
+    // just verified would make "verify, then decide" impossible and quietly
+    // displace whatever the session (or the env var) already holds.
+    setSessionVaultPassphrase("already-committed");
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("k"));
+
+    await expect(verifyVaultPassphrase("a-different-one")).resolves.toBe(true);
+    expect(vaultPassphrase()).toBe("already-committed");
+  });
+
+  it("commits nothing to module state on a passphrase that verifies FALSE", async () => {
+    // The failure direction matters more: a typo that displaced a working
+    // passphrase would break every later resolve in the session.
+    setSessionVaultPassphrase("already-committed");
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { A: {} } } as any);
+    vi.mocked(unlock).mockRejectedValue(new Error("wrong passphrase for this vault (decryption failed)"));
+
+    await expect(verifyVaultPassphrase("typo")).resolves.toBe(false);
+    expect(vaultPassphrase()).toBe("already-committed");
   });
 });
 

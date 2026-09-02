@@ -40,17 +40,29 @@ const MIN_SUCCESS_TO_SHOW = 1;
 // entry for namespace N lists every OTHER namespace that appeared in
 // any pack containing N.
 //
+// Pass `installed` (the namespaces currently in bundles.json) to drop
+// namespaces the user has since removed. Pack history is PERSISTED across
+// restarts, so without the filter discover() prints `often loaded with
+// "<ns>"` about a server that can no longer be activated at all -- the
+// adjacent Suggested-packs block already filters exactly this way. Omitting
+// the argument keeps the raw history, which is only right for a caller that
+// has no installed list to check against.
+//
 // Output is sorted + deduped so rendering is stable across calls even
 // as the underlying pack list's internal order shifts.
-export function buildCoUsageMap(packs: DetectedPack[]): Map<string, string[]> {
+export function buildCoUsageMap(packs: DetectedPack[], installed?: ReadonlySet<string>): Map<string, string[]> {
   const result = new Map<string, Set<string>>();
+  const isInstalled = (ns: string): boolean => installed === undefined || installed.has(ns);
   for (const pack of packs) {
-    for (const ns of pack.namespaces) {
+    const namespaces = pack.namespaces.filter(isInstalled);
+    for (const ns of namespaces) {
       const bucket = result.get(ns) ?? new Set<string>();
-      for (const peer of pack.namespaces) {
+      for (const peer of namespaces) {
         if (peer !== ns) bucket.add(peer);
       }
-      result.set(ns, bucket);
+      // A pack whose other members were all filtered out leaves no peer to
+      // name, so it earns no entry rather than an empty one.
+      if (bucket.size > 0) result.set(ns, bucket);
     }
   }
   const sorted = new Map<string, string[]>();

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,7 +36,14 @@ describe("suggestSubcommand", () => {
   });
 
   it("respects the limit", () => {
-    expect(suggestSubcommand("set", 1).length).toBeLessThanOrEqual(1);
+    // The input has to produce MORE hits than the limit or the assertion is
+    // vacuous. This was written as suggestSubcommand("set", 1) against the
+    // Yaw Team surface; "set-active" was deleted five weeks later, "set" now
+    // matches nothing, and `[].length <= 1` cannot fail however the clamp
+    // behaves. "tru" is a prefix of `trust` (tier 1) and one edit from `try`
+    // (tier 3), so the unclamped pool holds two.
+    expect(suggestSubcommand("tru", 3).length).toBeGreaterThan(1);
+    expect(suggestSubcommand("tru", 1)).toHaveLength(1);
   });
 });
 
@@ -101,21 +109,50 @@ describe("KNOWN_SUBCOMMANDS table", () => {
   });
 
   it("ends with the flag aliases", () => {
-    for (const f of FLAG_ALIASES) {
-      expect(KNOWN_SUBCOMMANDS).toContain(f);
-    }
+    // Containment is guaranteed by construction (the table spreads
+    // ...FLAG_ALIASES), so a per-alias toContain loop asserted nothing the
+    // declaration did not already make true. ORDER is the real claim in the
+    // title, and it is load-bearing: suggestSubcommand filters the pool by
+    // `startsWith("-")`, so an alias moved into the middle would sit among
+    // the visible names and read as a subcommand to anyone scanning the
+    // table.
+    expect(KNOWN_SUBCOMMANDS.slice(-FLAG_ALIASES.length)).toEqual([...FLAG_ALIASES]);
+  });
+
+  it("lists exactly the subcommands index.ts dispatches", async () => {
+    // Closes the loop the KNOWN_SUBCOMMANDS header describes but nothing
+    // enforced: the table is hand-maintained against the dispatch chain, and
+    // when commit 45a3462 removed the Yaw Team surface, login/logout/sync/
+    // stats/token/set-active lingered here -- did-you-mean and shell
+    // completion kept offering dead commands while every guard stayed green
+    // (the completion drift guard compares SUBCOMMAND_SPEC against THIS
+    // table, so a stale entry is consistent with itself).
+    //
+    // Source-text technique, same as the handler-order check below: index.ts
+    // dispatches at import time and cannot be imported to be inspected.
+    const src = await readFile(INDEX_SRC, "utf8");
+    const dispatched = [...src.matchAll(/subcommand === "([^"]+)"/g)].map((m) => m[1]);
+    expect(dispatched.length).toBeGreaterThan(0);
+    expect(new Set<string>(dispatched)).toEqual(new Set<string>(KNOWN_SUBCOMMANDS));
   });
 });
 
-// --- startup failure path ---------------------------------------------
+// --- index.ts run as a real process ------------------------------------
 //
 // The dispatcher's top-level side effects mean index.ts cannot be imported,
 // so this suite bundles it the way the shipped binary is built (esbuild,
 // esm, node target) into a throwaway dir and runs it as a real process.
-// Regression guarded: `runServer()` used to be fire-and-forget, so a fatal
-// startup rejection landed on the last-resort unhandledRejection handler --
-// logged as a JSON line, no server started, process exiting 0. The `.catch()`
-// on runServer() is what makes that path print and exit 1 instead.
+//
+// What runs here: the argv branches that must NOT reach runServer (an
+// unknown or mis-cased flag), and a boot with an inert legacy env var that
+// must still start. This block was called "runServer startup failure" and
+// its header claimed to guard a regression -- `runServer()` was
+// fire-and-forget, so a fatal startup rejection landed on the last-resort
+// unhandledRejection handler: logged as a JSON line, no server started,
+// process exiting 0 -- while not one test in it caused a startup failure.
+// That regression is guarded now, but by SOURCE SHAPE rather than behavior:
+// every startup path is fail-open by construction, so no input makes
+// runServer() reject. See "keeps runServer()'s rejection on a real catch".
 const INDEX_SRC = fileURLToPath(new URL("../index.ts", import.meta.url));
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
@@ -209,7 +246,7 @@ async function runEntry(
   });
 }
 
-describe("runServer startup failure", () => {
+describe("index.ts entry, run as a real process", () => {
   beforeAll(async () => {
     const { build } = await import("esbuild");
     workDir = await mkdtemp(join(tmpdir(), "yaw-mcp-entry-"));
@@ -300,14 +337,52 @@ describe("runServer startup failure", () => {
     expect(shortFlag.stderr).toContain('unknown flag "-x"');
   }, 120_000);
 
+  it("keeps runServer()'s rejection on a real catch, not the last-resort handler", async () => {
+    // The regression this block used to be NAMED for and never tested. A
+    // behavioral version would need runServer() to actually reject, and
+    // nothing makes it: loadYawMcpConfig turns every read/parse error into a
+    // warning (readConfigAt), the migration and the project-dir walk-up each
+    // carry their own .catch(), and server.start() is fire-and-forget with
+    // its OWN .catch() that exits 1 without ever rejecting this promise. So
+    // pin the shape that produced the bug instead -- `runServer()` must not
+    // go back to being fire-and-forget, and its handler must print and set
+    // exitCode 1 rather than process.exit(), which would truncate the stderr
+    // write on a slow pipe the way every other branch in the file avoids.
+    const src = await readFile(INDEX_SRC, "utf8");
+    const callIdx = src.indexOf("runServer().catch(");
+    expect(callIdx, "runServer() is fire-and-forget again -- a startup rejection would exit 0").toBeGreaterThan(-1);
+    const handler = src.slice(callIdx, src.indexOf("});", callIdx));
+    expect(handler).toContain("process.stderr.write(");
+    expect(handler).toContain("process.exitCode = 1");
+    expect(handler, "a synchronous exit here can truncate the stderr write").not.toContain("process.exit(");
+  });
+
   it("still registers the last-resort handlers before the first await", async () => {
     // The exit-1 path must not be bought by deleting the net that covers
     // genuine post-startup rejections (e.g. a late-rejecting upstream
     // connect), which must keep logging without killing the server.
+    //
+    // The invariant is "before the FIRST await", so that is what gets
+    // measured. Pinning the offset of one NAMED call (`await
+    // loadYawMcpConfig(`) instead only proves the handlers precede that
+    // particular line -- insert any other await above it and the assertion
+    // still passes while the rejection window it guards is wide open again.
+    //
+    // Scoped to runServer's own body (it is the last function in the file,
+    // so its closing brace is the first `}` in column 0 after the
+    // declaration), and comments are stripped first: the prose above the
+    // handlers says "before the first await below", and an unstripped search
+    // would match that word and put the "first await" ahead of the very
+    // registrations under test.
     const src = await readFile(INDEX_SRC, "utf8");
-    const rejectionIdx = src.indexOf('process.on("unhandledRejection"');
-    const exceptionIdx = src.indexOf('process.on("uncaughtException"');
-    const firstAwaitIdx = src.indexOf("await loadYawMcpConfig(");
+    const fnStart = src.indexOf("async function runServer(");
+    expect(fnStart).toBeGreaterThan(-1);
+    const fnEnd = src.indexOf("\n}", fnStart);
+    expect(fnEnd).toBeGreaterThan(fnStart);
+    const body = src.slice(fnStart, fnEnd).replace(/\/\/.*$/gm, "");
+    const rejectionIdx = body.indexOf('process.on("unhandledRejection"');
+    const exceptionIdx = body.indexOf('process.on("uncaughtException"');
+    const firstAwaitIdx = body.search(/\bawait\b/);
     expect(rejectionIdx).toBeGreaterThan(-1);
     expect(exceptionIdx).toBeGreaterThan(-1);
     expect(firstAwaitIdx).toBeGreaterThan(-1);
@@ -316,22 +391,66 @@ describe("runServer startup failure", () => {
   });
 });
 
+/** Env names shipped code reads that are deliberately NOT in --help: OS,
+ *  platform and runner plumbing yaw-mcp only CONSUMES. None of them is a knob
+ *  a user would set to change yaw-mcp's behavior, which is what the help block
+ *  documents. Anything read by src/ and not listed here must appear in the
+ *  block -- add the doc line, not an entry here, unless the name genuinely
+ *  belongs to this category. */
+const UNDOCUMENTED_INTERNAL_ENV = new Set([
+  "APPDATA",
+  "ELECTRON_RUN_AS_NODE",
+  "HOME",
+  "LOCALAPPDATA",
+  "MSYSTEM",
+  "PATH",
+  "USERPROFILE",
+  "VITEST",
+  "XDG_CACHE_HOME",
+]);
+
 describe("--help environment variable coverage", () => {
-  it("documents every live env knob, including the four that used to be missing", async () => {
-    // Regression: YAW_MCP_REWARD_GRADER (spends the client's LLM budget),
-    // YAW_MCP_TOOL_EXPOSURE (switches the whole tools/list surface),
-    // YAW_MCP_ROUTE_EFFORT, and MCP_LIST_TIMEOUT were all read by the code
-    // but absent from the --help Environment variables block -- and the
-    // help footer points at `yaw-mcp <subcommand> --help` for everything
-    // else, so no other surface named them.
+  it("documents every live env knob", async () => {
+    // The old shape checked four hardcoded names (YAW_MCP_REWARD_GRADER,
+    // YAW_MCP_TOOL_EXPOSURE, YAW_MCP_ROUTE_EFFORT, MCP_LIST_TIMEOUT -- the
+    // batch that had gone missing) and called itself "documents every live
+    // env knob". It enumerated nothing, so the NEXT knob added without a doc
+    // line was just as invisible, and the help footer points at
+    // `yaw-mcp <subcommand> --help` for everything else, so no other surface
+    // would name it either. Derive the set instead; the four are subsumed.
     const src = await readFile(INDEX_SRC, "utf8");
     const start = src.indexOf("Environment variables:");
     const end = src.indexOf("Config resolution");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
+    // Covers both YAW_MCP_-prefixed and unprefixed sections: the "without the
+    // YAW_MCP_ prefix" heading sits between them and "Config resolution".
     const envBlock = src.slice(start, end);
-    for (const name of ["YAW_MCP_TOOL_EXPOSURE", "YAW_MCP_ROUTE_EFFORT", "YAW_MCP_REWARD_GRADER", "MCP_LIST_TIMEOUT"]) {
-      expect(envBlock).toContain(name);
+
+    const srcDir = fileURLToPath(new URL("../", import.meta.url));
+    const read: string[] = [];
+    for (const entry of readdirSync(srcDir, { recursive: true })) {
+      const rel = String(entry);
+      if (!rel.endsWith(".ts") || rel.includes("tests")) continue;
+      const text = readFileSync(join(srcDir, rel), "utf8");
+      // Comments are stripped first: prose that NAMES a variable is not a read
+      // of it. This is a text scan, so try-cmd.ts's note that a Windows shell
+      // var stored as `Github_Token` "answers to process.env.GITHUB_TOKEN"
+      // counted as a live knob -- and GITHUB_TOKEN is an example of an UPSTREAM
+      // server's credential, not something yaw-mcp reads or could honestly
+      // document in its own --help. The `[^:]` guard keeps a `https://` inside
+      // a string literal from swallowing the rest of its line.
+      const code = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+      for (const m of code.matchAll(/process\.env\.([A-Z_]+)/g)) read.push(m[1]);
+      for (const m of code.matchAll(/env\["([A-Z_]+)"\]/g)) read.push(m[1]);
     }
+    // Only the literal-name reads are visible to a regex; a handful of knobs
+    // are reached through a const (paths.ts's ALLOW_UNOWNED_ENV) or a
+    // destructured `env` param, so this is a floor on coverage, not a
+    // census. The floor is still the thing that was missing.
+    const knobs = [...new Set(read)].filter((n) => !UNDOCUMENTED_INTERNAL_ENV.has(n)).sort();
+    expect(knobs.length, "the scan found almost nothing -- the regexes stopped matching").toBeGreaterThan(10);
+    const missing = knobs.filter((n) => !envBlock.includes(n));
+    expect(missing, "read by shipped code, absent from the --help Environment variables block").toEqual([]);
   });
 });

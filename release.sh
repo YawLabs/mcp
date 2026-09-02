@@ -26,6 +26,19 @@
 # Environment:
 #   SKIP_CONFIRM=1                   skip the y/N confirm prompt
 #   NO_COLOR=1                       disable ANSI colors
+#   SKIP_LINT=1                      DISABLES THE LINT GATE. win32-arm64
+#                                    escape hatch only -- biome segfaults
+#                                    there on every input, so the tolerance
+#                                    paths in run_npm_check can never engage.
+#                                    Typecheck + tests still gate the release;
+#                                    formatting goes unverified on that host.
+#   GITHUB_TOKEN=<pat>               GitHub token for the step-5 MCP-registry
+#                                    login (needs publish rights on
+#                                    io.github.YawLabs/*). Only read when the
+#                                    persisted registry JWT is missing/expired.
+#   MCP_REGISTRY_TOKEN=<pat>         second-choice spelling of the same token;
+#                                    read only when GITHUB_TOKEN is unset. If
+#                                    neither is set, `gh auth token` is tried.
 #
 # Required tools on PATH: node, npm, git, curl, tar, sha256sum (or shasum).
 # The first run also needs `mcp-publisher` (downloaded to a temp dir on
@@ -218,6 +231,12 @@ command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MC
 # always reflect the current on-disk state.
 current_pkg_version() { node -p "require('./package.json').version"; }
 current_server_version() { node -p "require('./server.json').version"; }
+# The registry-side identity pair: package.json's `mcpName` is what the MCP
+# registry reads out of the published npm tarball to prove the publisher owns
+# the server name in server.json. Drift between them is only discovered in
+# step 5 -- after the irreversible npm publish.
+current_pkg_mcp_name() { node -p "require('./package.json').mcpName || ''"; }
+current_server_name() { node -p "require('./server.json').name || ''"; }
 current_head_sha() { git rev-parse HEAD; }
 current_branch() { git rev-parse --abbrev-ref HEAD; }
 
@@ -243,6 +262,31 @@ RESUMING=false
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
+  # A resume is not a licence to publish a dirty tree. The legitimate resume
+  # case -- died between the bump and the commit -- dirties exactly
+  # package.json, package-lock.json and server.json, so gate on everything
+  # ELSE. Without this, a re-run packed and published whatever happened to be
+  # in the working tree while the tag pointed at a commit that did not contain
+  # it, and step 5 then attested that version to the MCP registry. npm forbids
+  # overwriting a published version, so the irreproducible tarball is permanent.
+  #
+  # Pathspec exclusion, not a grep over the status codes: porcelain is
+  # "XY <path>", so the staged form ("M  package.json" -- an interrupt in the
+  # window between `git add` and `commit`) and the mixed "MM " form must be
+  # tolerated too, and a code-shaped regex misses both. -uno keeps a stray
+  # untracked scratch file from hard-failing the resume; it is warned about
+  # below instead, because pressuring the operator toward `git stash -u`
+  # mid-release is its own way to lose work.
+  RESUME_DIRT=$(git status --porcelain -uno -- . \
+    ':(exclude)package.json' ':(exclude)package-lock.json' ':(exclude)server.json')
+  if [ -n "$RESUME_DIRT" ]; then
+    printf '%s\n' "$RESUME_DIRT" >&2
+    fail "Working directory has changes outside the version bump (listed above) -- commit or stash them before resuming. The tag would not contain them; the published tarball would."
+  fi
+  RESUME_UNTRACKED=$(git ls-files --others --exclude-standard)
+  if [ -n "$RESUME_UNTRACKED" ]; then
+    warn "Untracked files present -- not in the tag, but anything under package.json's \"files\" allow-list (dist, schemas, README.md, CHANGELOG.md) still gets packed: $(printf '%s' "$RESUME_UNTRACKED" | tr '\n' ' ')"
+  fi
   info "Already at v${VERSION} -- resuming"
 else
   if [ -n "$(git status --porcelain)" ]; then
@@ -308,7 +352,18 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "  Install method is ${CYAN}npm install -g @yawlabs/mcp${NC} (or ${CYAN}npx -y @yawlabs/mcp${NC})."
   echo ""
-  read -p "Continue? (y/N) " -n 1 -r
+  # Non-interactive stdin (piped, nohup, an agent harness) gets EOF from
+  # `read`, which returns non-zero -- under `set -e` that used to kill the run
+  # with the generic "Release failed at line NNN" banner, as if a gate had
+  # failed. Nothing has been mutated at this point, so say what happened and
+  # exit the same clean way a declined prompt does. `|| REPLY=""` covers the
+  # EOF-on-a-tty case (Ctrl-D) the same way.
+  if [ ! -t 0 ]; then
+    echo "Aborted: stdin is not a terminal, so the confirm prompt cannot be answered."
+    echo "Re-run with -y (or SKIP_CONFIRM=1 ./release.sh ${VERSION}) to release non-interactively."
+    exit 0
+  fi
+  read -p "Continue? (y/N) " -n 1 -r || REPLY=""
   echo
   if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo "Aborted."
@@ -319,7 +374,15 @@ fi
 step 1 "Lint + typecheck + tests"
 run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
-npm test || fail "Tests failed"
+# Tests go through the same wrapper as lint/typecheck: `npm test` is an
+# npm-run script on the same host that segfaults (139/134) in npm's exit
+# cleanup AFTER the tool has printed its report, so a bare `npm test || fail`
+# turned a green suite into a failed release. vitest's own summary line is the
+# authority. The failure pattern is anchored to that summary rather than the
+# looser 'FAIL|[0-9]+ failed': a test NAME containing "FAILS" already exists
+# (foundry-routing.test.ts) and captured console output is echoed verbatim, so
+# a loose pattern can hard-fail a passing run.
+run_npm_check "Tests" test 'Test Files +[0-9]+ failed|Tests +[0-9]+ failed' 'Test Files +[0-9]+ passed'
 info "Lint + typecheck + tests passed"
 
 step 2 "Build"
@@ -379,7 +442,15 @@ fi
 
 if [ -n "$(git status --porcelain package.json package-lock.json server.json 2>/dev/null)" ]; then
   git add package.json package-lock.json server.json
-  git -c core.hooksPath=/dev/null commit -m "v${VERSION}"
+  # core.hooksPath is pointed at a path with no hooks in it, so the bump commit
+  # cannot be rewritten or rejected by a local hook (the gates it would re-run
+  # are step 1's, already green). MSYS_NO_PATHCONV=1 is load-bearing on this
+  # script's primary host: Git Bash rewrites a Unix-shaped argument into a
+  # Windows path before git.exe sees it, so `/dev/null` arrives as
+  # C:/Users/<user>/scoop/apps/git/<ver>/dev/null. The effect happens to be the
+  # same (both are hook-free), but the config value git records is not the one
+  # written here -- pin it so the line means what it reads as on every host.
+  MSYS_NO_PATHCONV=1 git -c core.hooksPath=/dev/null commit -m "v${VERSION}"
   info "Committed version bump"
 else
   info "Nothing to commit (already at v${VERSION})"
@@ -404,6 +475,17 @@ fi
 SERVER_NOW=$(current_server_version)
 if [ "$SERVER_NOW" != "$VERSION" ]; then
   fail "server.json shows $SERVER_NOW but tag is v${VERSION} -- refusing to push (registry would 400 on drift)"
+fi
+# The other half of the registry contract, checked in the same place and for
+# the same reason: mcp-publisher proves ownership by reading `mcpName` out of
+# the published npm package and comparing it to server.json's `name`. A
+# mismatch is only surfaced in step 5, which runs AFTER the irreversible npm
+# publish -- stranding the release with a version on npm that can never be
+# registered. Version drift already fails here; name drift now does too.
+MCPNAME_NOW=$(current_pkg_mcp_name)
+SERVER_NAME_NOW=$(current_server_name)
+if [ "$MCPNAME_NOW" != "$SERVER_NAME_NOW" ]; then
+  fail "package.json mcpName (${MCPNAME_NOW:-<unset>}) != server.json name (${SERVER_NAME_NOW:-<unset>}) -- refusing to push. The MCP registry would reject the ownership check in step 5, after npm publish has already gone out."
 fi
 
 # Re-read the branch here (not at script start -- it can change between steps)
@@ -440,9 +522,33 @@ else
   MAX_ATTEMPTS=3
   while true; do
     PUBLISH_LOG=$(mktemp)
-    if npm publish --access public 2>&1 | tee "$PUBLISH_LOG"; then
+    # `|| PUBLISH_RC=$?` rather than `if npm publish ...; then`: the exit code
+    # itself is needed below, and under `set -o pipefail` the pipeline carries
+    # npm's code, not tee's.
+    PUBLISH_RC=0
+    npm publish --access public 2>&1 | tee "$PUBLISH_LOG" || PUBLISH_RC=$?
+    if [ "$PUBLISH_RC" -eq 0 ]; then
       rm -f "$PUBLISH_LOG"
       break
+    fi
+    # Same ARM64 tolerance the build and the step-1 gates get, applied to the
+    # one command where a false failure is most expensive: npm can segfault
+    # (139/134) in its exit cleanup AFTER the tarball has been accepted, and
+    # npm forbids re-publishing a version, so a re-run of a "failed" publish
+    # dies on EPUBLISHCONFLICT with the release half-done. The registry is the
+    # authority -- ask it, with a short poll for the read path's lag.
+    if [ "$IS_MINGW_ARM64" = true ] && { [ "$PUBLISH_RC" -eq 139 ] || [ "$PUBLISH_RC" -eq 134 ]; }; then
+      PUBLISH_PROBE=""
+      for PROBE_TRY in 1 2 3; do
+        PUBLISH_PROBE=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+        [ "$PUBLISH_PROBE" = "$VERSION" ] && break
+        sleep 6
+      done
+      if [ "$PUBLISH_PROBE" = "$VERSION" ]; then
+        warn "npm publish exited $PUBLISH_RC (ARM64 npm exit-cleanup segfault) but @yawlabs/mcp@${VERSION} is live on npm -- tolerating"
+        rm -f "$PUBLISH_LOG"
+        break
+      fi
     fi
     if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"

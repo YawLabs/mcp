@@ -19,8 +19,14 @@
 export type CompletionShell = "bash" | "zsh" | "fish" | "powershell";
 
 export interface CompletionCommandOptions {
-  shell?: CompletionShell;
+  /** Required. parseCompletionArgs resolves and validates the shell before
+   *  index.ts dispatches, so there is no runtime "missing shell" path left to
+   *  guard -- the type is what keeps it that way. */
+  shell: CompletionShell;
   out?: (s: string) => void;
+  /** Accepted for symmetry with the sibling command options, and never
+   *  written to: with `shell` required there is no error this command can
+   *  report. Tests pass it to assert exactly that (stdout only, stderr empty). */
   err?: (s: string) => void;
 }
 
@@ -214,16 +220,15 @@ export function parseCompletionArgs(
   return { ok: true, options: { shell } };
 }
 
-export async function runCompletion(opts: CompletionCommandOptions = {}): Promise<CompletionCommandResult> {
+export async function runCompletion(opts: CompletionCommandOptions): Promise<CompletionCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
   const lines: string[] = [];
 
-  if (!opts.shell) {
-    writeErr(`yaw-mcp completion: missing shell argument\n${COMPLETION_USAGE}\n`);
-    return { exitCode: 2, lines };
-  }
-
+  // No missing-shell guard: parseCompletionArgs (above) rejects an absent or
+  // unknown shell with exit 2 BEFORE index.ts dispatches, so the branch that
+  // used to live here could not fire from any user input -- and the only test
+  // that reached it had to call runCompletion directly. `shell` is required by
+  // the options type instead, which moves the check to compile time.
   const script = renderScript(opts.shell);
   // Write the script WITHOUT print's trailing newline: every renderScript
   // branch already ends its last line with "\n", so routing it through print
@@ -289,11 +294,14 @@ function renderBash(): string {
       ({ candidates, index }) =>
         `    if [[ $cword -eq $((${index} + 2)) && $cur != -* ]]; then\n      COMPREPLY=( $(compgen -W "${candidates.join(" ")}" -- "$cur") )\n      return 0\n    fi`,
     );
+    // No `.filter(p => p !== "")` here: every posClause is a non-empty
+    // multi-line if-block and the two tail lines are literals, so the filter
+    // could never drop an element.
     const parts = [
       ...posClauses,
       `    COMPREPLY=( $(compgen -W "${spec.flags.join(" ")}" -- "$cur") )`,
       "    return 0",
-    ].filter((p) => p !== "");
+    ];
     return `  ${spec.name})\n${parts.join("\n")}\n    ;;`;
   }).join("\n");
 
@@ -337,20 +345,24 @@ function renderZsh(): string {
 
   const argsCases = SUBCOMMAND_SPEC.map((spec) => {
     const lines = [`      ${spec.name})`];
-    const positionals = realPositionals(spec);
-    if (positionals.length > 0) {
-      // Emit one _arguments entry per positional SLOT with every alternative
-      // for that slot in its candidate group, using the slot's original index
-      // for the zsh slot number (slot == slotIndex + 1 because zsh _arguments
-      // slot numbering is 1-based and slot 1 is already claimed by the
-      // subcommand dispatch in the outer _arguments call).
-      const posArgs = positionals
-        .map(({ candidates, index }) => `'${index + 1}: :(${candidates.join(" ")})'`)
-        .join(" ");
-      lines.push(`        _arguments ${posArgs} '*: :(${spec.flags.join(" ")})'`);
-    } else {
-      lines.push(`        _arguments '*: :(${spec.flags.join(" ")})'`);
-    }
+    // Emit one _arguments entry per positional SLOT with every alternative
+    // for that slot in its candidate group, using the slot's original index
+    // for the zsh slot number (slot == slotIndex + 1 because zsh _arguments
+    // slot numbering is 1-based and slot 1 is already claimed by the
+    // subcommand dispatch in the outer _arguments call).
+    const posArgs = realPositionals(spec).map(({ candidates, index }) => `'${index + 1}: :(${candidates.join(" ")})'`);
+    // Flags are real zsh OPTION specs, not a `'*: :(...)'` rest group. The rest
+    // group is only consulted once the numbered slots are used up, so at the
+    // FIRST argument slot -- the only position `install --list` / `--all` can
+    // occupy -- `yaw-mcp install --<TAB>` offered nothing at all. As option
+    // specs zsh offers them at every position, which is what bash's `$cur != -*`
+    // fallthrough already does. A bare name is a valid spec (no description
+    // needed), and `(...)`-free so nothing here can open an action group.
+    const flagArgs = spec.flags.map((f) => `'${f}'`);
+    const argSpecs = [...posArgs, ...flagArgs];
+    // `help` carries neither, and `_arguments` with no spec at all is a usage
+    // error -- keep the inert rest group for that case only.
+    lines.push(`        _arguments ${argSpecs.length > 0 ? argSpecs.join(" ") : "'*: :()'"}`);
     lines.push("        ;;");
     return lines.join("\n");
   }).join("\n");
@@ -383,8 +395,31 @@ _yaw-mcp "$@"
 }
 
 function renderFish(): string {
+  // One helper, emitted once, resolves the ACTIVE subcommand. The flag lines
+  // below used to be guarded by `__fish_seen_subcommand_from <name>`, which
+  // matches a token ANYWHERE on the line -- so `yaw-mcp sidecars install
+  // --<TAB>` saw the `install` token (a positional VALUE of `sidecars`) and
+  // offered install's flags, none of which `sidecars` accepts. The helper takes
+  // the FIRST token that is one of yaw-mcp's own subcommands, so `sidecars`
+  // wins there. It scans rather than indexing a fixed position because a
+  // wrapper invocation (`command yaw-mcp ...`, `env FOO=1 yaw-mcp ...`) shifts
+  // the subcommand off any hardcoded slot, and it reads `commandline -opc`
+  // ONCE per call instead of once per guard.
   const header = `# fish completion for yaw-mcp — generated by \`yaw-mcp completion fish\`
 # Install: save this to ~/.config/fish/completions/yaw-mcp.fish
+function __yaw_mcp_using_subcommand
+  set -l tokens (commandline -opc)
+  set -l known ${SUBCOMMAND_SPEC.map((s) => s.name).join(" ")}
+  for tok in $tokens
+    if contains -- $tok $known
+      if test "$tok" = "$argv[1]"
+        return 0
+      end
+      return 1
+    end
+  end
+  return 1
+end
 complete -c yaw-mcp -f`;
 
   const subcommandLines = SUBCOMMAND_SPEC.map((spec) => {
@@ -411,7 +446,7 @@ complete -c yaw-mcp -f`;
       // a single-dash flag (e.g. `-V`) would produce invalid `-l -V` syntax.
       if (!f.startsWith("--")) continue;
       const long = f.slice(2);
-      flagLines.push(`complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}" -l ${long}`);
+      flagLines.push(`complete -c yaw-mcp -n "__yaw_mcp_using_subcommand ${spec.name}" -l ${long}`);
     }
   }
 

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { parseAuditArgs } from "../audit-cmd.js";
+import { parseBundlesArgs } from "../bundles-cmd.js";
 import {
   COMPLETION_USAGE,
   parseCompletionArgs,
@@ -6,7 +8,18 @@ import {
   runCompletion,
   SUBCOMMAND_SPEC,
 } from "../completion-cmd.js";
+import { parseDoctorArgs } from "../doctor-cmd.js";
+import { parseFoundryArgs } from "../foundry-cmd.js";
+import { parseInstallArgs } from "../install-cmd.js";
+import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
+import { parseResetLearningArgs } from "../reset-learning-cmd.js";
+import { parseSecretsArgs } from "../secrets-cmd.js";
+import { parseServersArgs } from "../servers-cmd.js";
+import { parseSidecarsArgs } from "../sidecars-cmd.js";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
+import { parseTrustArgs } from "../trust-cmd.js";
+import { parseTryArgs, parseTryCleanupArgs } from "../try-cmd.js";
+import { parseUpgradeArgs } from "../upgrade-cmd.js";
 
 const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
 
@@ -85,9 +98,19 @@ describe("renderScript — bash", () => {
 
   it("includes every spec'd subcommand in the top-level compgen", () => {
     const s = renderScript("bash");
+    // Scope the assertion to the `$cword -eq 1` word list it names. A whole-
+    // script `toContain(sub)` could not fail for that reason: every subcommand
+    // also appears as its own bash `case` label further down, so the check
+    // passed even when the top-level list was missing entries.
+    const topLevel = s.match(/COMPREPLY=\( \$\(compgen -W "([^"]*)" -- "\$cur"\) \)/);
+    expect(topLevel, "no compgen word list in the generated bash script").not.toBeNull();
+    const words = (topLevel as RegExpMatchArray)[1].split(" ");
     for (const sub of SUBCOMMAND_NAMES) {
-      expect(s).toContain(sub);
+      expect(words, `subcommand missing from the top-level compgen: ${sub}`).toContain(sub);
     }
+    // The top-level list carries the global flags too, which is how we know the
+    // match above is the `$cword -eq 1` line and not a per-subcommand one.
+    expect(words).toEqual(expect.arrayContaining(["--help", "-h", "--version", "-V"]));
   });
 
   it("branches on install client choices", () => {
@@ -184,6 +207,29 @@ describe("renderScript — zsh", () => {
     expect(s).toContain("'1: :(bash zsh fish powershell)'");
     expect(s).toContain("'1: :(list match)'");
   });
+
+  it("emits flags as real option specs, so a dash word completes at slot 1", () => {
+    // REGRESSION: flags used to live ONLY in a `'*: :(...)'` rest group, which
+    // zsh consults after the numbered slots -- so at the FIRST argument slot
+    // `yaw-mcp install --<TAB>` offered nothing at all, and `--list` / `--all`
+    // (which forbid a client argument, making slot 1 the only position they can
+    // occupy) were untabbable. bash, fish and powershell all offer flags there.
+    // As option specs zsh offers them at every position.
+    const s = renderScript("zsh");
+    const installLine = s.split("\n").find((l) => l.includes("'1: :(claude-code claude-desktop cursor vscode)'"));
+    expect(installLine, "no install _arguments line in the generated zsh script").toBeDefined();
+    for (const flag of ["--list", "--all", "--scope", "--dry-run", "--help"]) {
+      expect(installLine, `install flag missing from the zsh option specs: ${flag}`).toContain(`'${flag}'`);
+    }
+    // Every flag-carrying subcommand gets the same treatment, and no flag is
+    // left hiding in a rest group.
+    for (const spec of SUBCOMMAND_SPEC) {
+      for (const flag of spec.flags) {
+        expect(s).toContain(`'${flag}'`);
+      }
+    }
+    expect(s).not.toContain("'*: :(--");
+  });
 });
 
 describe("renderScript — fish", () => {
@@ -199,9 +245,35 @@ describe("renderScript — fish", () => {
     }
   });
 
-  it("scopes flags to each subcommand via __fish_seen_subcommand_from", () => {
+  it("scopes flags to the ACTIVE subcommand, not to any token on the line", () => {
+    // REGRESSION: the flag lines were guarded by __fish_seen_subcommand_from,
+    // which matches a token ANYWHERE on the line. `install` is a positional
+    // VALUE of `sidecars`, so `yaw-mcp sidecars install --<TAB>` offered
+    // --scope / --project-dir / --os / --force / --skip / --dry-run / --list /
+    // --all, none of which sidecars accepts -- picking one exits non-zero with
+    // `unknown argument`. The emitted helper resolves the FIRST token that is a
+    // real subcommand instead, so `sidecars` wins there.
     const s = renderScript("fish");
-    expect(s).toMatch(/__fish_seen_subcommand_from install/);
+    expect(s).toContain("function __yaw_mcp_using_subcommand");
+    // The helper's known-subcommand set is generated from the spec, so it can't
+    // drift away from the subcommands it has to recognize.
+    const knownLine = s.split("\n").find((l) => l.trimStart().startsWith("set -l known "));
+    expect(knownLine, "no known-subcommand set in the generated fish helper").toBeDefined();
+    const known = (knownLine as string).trim().slice("set -l known ".length).split(" ");
+    expect(known).toEqual(SUBCOMMAND_NAMES);
+
+    const flagLines = s.split("\n").filter((l) => / -l [a-z0-9-]+$/.test(l));
+    expect(flagLines.length).toBeGreaterThan(0);
+    for (const line of flagLines) {
+      expect(line, `flag line is not scoped to the active subcommand: ${line}`).toMatch(
+        /-n "__yaw_mcp_using_subcommand [a-z-]+"/,
+      );
+      expect(line).not.toContain("__fish_seen_subcommand_from");
+    }
+    // `--scope` belongs to install alone: no other subcommand's guard offers it.
+    expect(flagLines.filter((l) => l.endsWith(" -l scope"))).toEqual([
+      'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand install" -l scope',
+    ]);
   });
 
   it("offers positional alternatives at the same argument position", () => {
@@ -324,6 +396,47 @@ function simulatePowershell(script: string, tokens: string[], wordToComplete: st
   return candidates.filter((c) => c.startsWith(wordToComplete));
 }
 
+/**
+ * The live argv parser behind each spec entry, so `spec.flags` can be checked
+ * against what the CLI really accepts instead of against a hand-copied literal.
+ * Same posture as DISPATCHED_SUBCOMMANDS above: the ground truth is imported,
+ * not mirrored.
+ *
+ * The check is behavioral (feed the parser the flag, assert it is not rejected
+ * as unknown) rather than a comparison against an exported flag list: the
+ * parsers are switch/if chains with no such list to export, and probing them is
+ * the same evidence a user gets when they tab a flag and run it.
+ */
+type ProbeResult = { ok: true } | { ok: false; error: string };
+const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
+  install: parseInstallArgs,
+  add: parseAddArgs,
+  remove: parseRemoveArgs,
+  list: parseListArgs,
+  sidecars: parseSidecarsArgs,
+  trust: parseTrustArgs,
+  try: parseTryArgs,
+  "try-cleanup": parseTryCleanupArgs,
+  doctor: parseDoctorArgs,
+  servers: parseServersArgs,
+  bundles: parseBundlesArgs,
+  upgrade: parseUpgradeArgs,
+  completion: parseCompletionArgs,
+  secrets: parseSecretsArgs,
+  audit: parseAuditArgs,
+  foundry: parseFoundryArgs,
+  // Signals help/error with a `kind` discriminant instead of `ok`.
+  "reset-learning": (argv) => {
+    const r = parseResetLearningArgs(argv);
+    return r.kind === "error" ? { ok: false, error: r.error } : { ok: true };
+  },
+};
+
+// `compliance` has no local parser -- --strict / --min-grade are forwarded
+// verbatim to the mcp-compliance child (npxArgs in compliance-cmd.ts), so there
+// is nothing in this repo to check them against. `help` carries no flags.
+const NO_LOCAL_PARSER = new Set(["compliance", "help"]);
+
 describe("SUBCOMMAND_SPEC coverage", () => {
   it("covers every dispatched subcommand (no drift vs the real KNOWN_SUBCOMMANDS table)", () => {
     // Every non-flag, non-`help` subcommand the dispatcher knows MUST have a
@@ -382,6 +495,34 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     expect(missing).toEqual([]);
   });
 
+  it("only advertises flags the real parser accepts", () => {
+    // The four "keep them in sync" comments in SUBCOMMAND_SPEC (remove, trust,
+    // secrets, compliance) were the ONLY thing holding parser and completion
+    // together: subcommand NAMES are drift-guarded against KNOWN_SUBCOMMANDS,
+    // but flags were a three-way hand-maintained mirror (parser /
+    // SUBCOMMAND_SPEC / test literal). Tabbing a flag the parser rejects exits
+    // non-zero with `unknown flag` and a usage dump.
+    //
+    // SUBSET, not equality: the spec deliberately omits flags that are still
+    // accepted but no longer suggested (install's --token and
+    // --no-yaw-mcp-config), so a parser flag with no spec entry is fine.
+    for (const spec of SUBCOMMAND_SPEC) {
+      if (spec.flags.length === 0 || NO_LOCAL_PARSER.has(spec.name)) continue;
+      const parse = FLAG_PARSERS[spec.name];
+      expect(parse, `no parser wired for "${spec.name}" -- add one or list it in NO_LOCAL_PARSER`).toBeDefined();
+      for (const flag of spec.flags) {
+        const r = parse([flag]);
+        // A value-taking flag ("--scope requires user|project|local") or a
+        // missing positional ("Expected exactly one server slug") is fine --
+        // both prove the flag itself was recognized. Only "unknown" is a bug.
+        const error = r.ok ? "" : r.error;
+        expect(error, `\`yaw-mcp ${spec.name} ${flag}\` is completable but its parser rejects the flag`).not.toMatch(
+          /unknown (flag|argument|option)/i,
+        );
+      }
+    }
+  });
+
   it("keeps the compliance entry in sync with the flags that drive its exit code", () => {
     // --strict and --min-grade are forwarded verbatim to the mcp-compliance
     // child, and their ONLY effect is turning a failing grade into a non-zero
@@ -422,12 +563,11 @@ describe("runCompletion", () => {
     expect(io.err).toEqual([]);
   });
 
-  it("exits 2 when shell is missing", async () => {
-    const io = capture();
-    const r = await runCompletion({ out: io.push, err: io.pushErr });
-    expect(r.exitCode).toBe(2);
-    expect(io.err.join("")).toContain("missing shell argument");
-  });
+  // There is no "exits 2 when shell is missing" case any more: `shell` is a
+  // REQUIRED option, and parseCompletionArgs rejects an absent shell with exit
+  // 2 before index.ts ever dispatches (covered by "rejects missing shell
+  // argument" above). The old test could only reach that branch by calling
+  // runCompletion in a shape no user input produces.
 
   it("writes the script byte-for-byte, without appending a second newline", async () => {
     // Every renderScript branch already terminates its last line, so routing

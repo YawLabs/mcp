@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildCorpusFromTraces,
   FOUNDRY_CORPUS_VERSION,
+  type FoundryCorpusEntry,
   loadFoundryCorpus,
   parseTraceLines,
   scoreCorpus,
@@ -24,6 +25,14 @@ const SERVERS: RankableServer[] = [
     tools: [{ name: "create_charge" }],
   },
 ];
+
+/** Entry count per `chosen` namespace -- what a stratified cap actually
+ *  claims, as opposed to "both namespaces appear somewhere in the result". */
+function countByChosen(entries: FoundryCorpusEntry[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const e of entries) out[e.chosen] = (out[e.chosen] ?? 0) + 1;
+  return out;
+}
 
 describe("parseTraceLines", () => {
   it("parses valid lines and skips blank / garbage / shape-invalid", () => {
@@ -72,9 +81,21 @@ describe("buildCorpusFromTraces", () => {
     for (let i = 0; i < 10; i++) traces.push({ tokens: [`sl${i}tok`, "gamma", "delta"], chosen: "slack" });
     const c = buildCorpusFromTraces(traces, SERVERS, { cap: 4 });
     expect(c.entries).toHaveLength(4);
-    const chosen = new Set(c.entries.map((e) => e.chosen));
-    expect(chosen.has("github")).toBe(true);
-    expect(chosen.has("slack")).toBe(true);
+    // COUNT per namespace rather than assert both appear somewhere: a 3/1
+    // split still puts one of each in the set, so the membership check passed
+    // for an implementation that was not stratifying at all.
+    expect(countByChosen(c.entries)).toEqual({ github: 2, slack: 2 });
+  });
+
+  it("does not let a dominant namespace crowd a rare one out of the cap", () => {
+    // The case stratification exists for. github has 10x the traffic, and the
+    // round-robin still owes slack its share of the 4 slots -- first-N (or
+    // highest-weight-first across the pooled entries) would yield 4/0 here.
+    const traces = [];
+    for (let i = 0; i < 20; i++) traces.push({ tokens: [`gh${i}tok`, "alpha"], chosen: "github" });
+    for (let i = 0; i < 2; i++) traces.push({ tokens: [`sl${i}tok`, "gamma"], chosen: "slack" });
+    const c = buildCorpusFromTraces(traces, SERVERS, { cap: 4 });
+    expect(countByChosen(c.entries)).toEqual({ github: 2, slack: 2 });
   });
 });
 

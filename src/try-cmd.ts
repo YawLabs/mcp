@@ -156,6 +156,13 @@ export interface TryCommandOptions {
   cwd?: string;
   os?: InstallOS;
   env?: NodeJS.ProcessEnv;
+  /** Override for tests; defaults to process.platform. Decides ONE thing --
+   *  whether the 0600 tightening in step 7 applies, since POSIX perms are a
+   *  no-op on win32. Injected rather than read globally so a test can pin the
+   *  POSIX arm without redefining process.platform for the whole process,
+   *  which also flips atomicWriteFile out of its Windows rename-retry path
+   *  (the AV/indexer EPERM dance) on the machine this suite runs on. */
+  platform?: NodeJS.Platform;
   /** Override for tests; defaults to the catalog read in defaultFetchExplore.
    *  `catalogUrl` carries runTry's resolved $YAW_MCP_CATALOG_URL override
    *  (undefined when unset or empty) so the seam never has to read
@@ -298,8 +305,18 @@ export function parseTryCleanupArgs(
   return { ok: true, options: opts };
 }
 
+/** Upper bound on a TTL: 100 years in ms, comfortably inside the ~±8.64e15ms
+ *  range a JS Date can represent. `--ttl 100000000d` is a perfectly good digit
+ *  run, but it pushes `now + ttl` past that range, where the dry-run preview's
+ *  `new Date(expiresAt).toISOString()` throws a bare RangeError ("Invalid time
+ *  value") that dispatch() renders as an opaque error -- and the real run
+ *  persists the absurd marker without complaint. Rejecting at parse time gives
+ *  both paths the same clear "cannot parse" message instead. */
+const MAX_TTL_MS = 100 * 365 * 86_400_000;
+
 /** Parse a duration suffix string (10s, 30m, 1h, 7d) into milliseconds.
- *  Returns null on parse failure so callers can surface a clear error. */
+ *  Returns null when the string is unparseable OR names a duration beyond
+ *  MAX_TTL_MS, so callers can surface a clear error either way. */
 export function parseDurationMs(s: string): number | null {
   const m = /^(\d+)\s*([smhd])$/i.exec(s.trim());
   if (!m) return null;
@@ -307,7 +324,8 @@ export function parseDurationMs(s: string): number | null {
   if (!Number.isFinite(n) || n <= 0) return null;
   const unit = m[2].toLowerCase();
   const factor = unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
-  return n * factor;
+  const ms = n * factor;
+  return ms > MAX_TTL_MS ? null : ms;
 }
 
 /** Trials root: `~/.yaw-mcp/trials/`. */
@@ -343,19 +361,78 @@ function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: numb
   return null;
 }
 
+/** The marker fields every consumer reads VERBATIM off disk and hands to the
+ *  peel. Throws rather than returning a boolean so the one caller that reports
+ *  the reason -- runTryCleanup's "marker at <path> is unreadable (...)" -- has
+ *  a message, while the callers that treat "cannot tell" as "nothing to do"
+ *  simply catch. Checking one field instead of all three let a marker with no
+ *  clientPath through: existsSync(undefined) is false, so the peel was
+ *  skipped, the marker was unlinked, and the user was told the trial was
+ *  "cleaned up" while its entry -- inline secret and all -- stayed wired with
+ *  nothing left on disk naming it. */
+function assertTrialMarkerShape(parsed: unknown): asserts parsed is TrialMarker {
+  const m = parsed as TrialMarker | null;
+  if (
+    !m ||
+    typeof m !== "object" ||
+    typeof m.clientPath !== "string" ||
+    typeof m.entryName !== "string" ||
+    !Array.isArray(m.containerPath)
+  ) {
+    throw new Error("marker is missing required fields");
+  }
+}
+
 /** Load a trial marker off disk without throwing. Returns null when the file
  *  is absent, unreadable, unparseable, or missing the fields the peel path
- *  needs -- callers treat "cannot tell" the same as "nothing to do". */
-async function readTrialMarker(markerPath: string): Promise<TrialMarker | null> {
+ *  needs -- callers treat "cannot tell" the same as "nothing to do".
+ *
+ *  The RAW bytes come back alongside the parsed marker: runTry's rollback has
+ *  to be able to put the previous marker back byte-for-byte when its own
+ *  client-config write fails (re-serializing would be close, but the bytes on
+ *  disk are what the user had). */
+async function readTrialMarker(markerPath: string): Promise<{ marker: TrialMarker; raw: string } | null> {
   try {
-    const parsed = JSON.parse(await readFile(markerPath, "utf8")) as TrialMarker;
-    if (!parsed || typeof parsed !== "object") return null;
-    if (typeof parsed.clientPath !== "string" || typeof parsed.entryName !== "string") return null;
-    if (!Array.isArray(parsed.containerPath)) return null;
-    return parsed;
+    const raw = await readFile(markerPath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    assertTrialMarkerShape(parsed);
+    return { marker: parsed, raw };
   } catch {
     return null;
   }
+}
+
+/** The read -> parse -> remove -> write core the three peel sites share
+ *  (peelTrialEntry, runTryCleanup, gcExpiredTrials). It reports WHAT happened
+ *  and lets each caller decide what that MEANS -- the part that legitimately
+ *  differs between them:
+ *   - "removed":    the entry was present and the file was rewritten (or, with
+ *                   `dryRun`, would have been).
+ *   - "absent":     nothing to do (no file, empty file, entry already gone).
+ *   - "not-object": valid JSON that is NOT an object, so there is no container
+ *                   to name the entry in and no peel is possible. The GC
+ *                   refuses to unlink the marker on this; try-cleanup warns
+ *                   and carries on.
+ *  Read/parse/write errors propagate to the caller's own catch. */
+async function peelEntryFromConfig(
+  clientPath: string,
+  containerPath: string[],
+  entryName: string,
+  dryRun = false,
+): Promise<"removed" | "absent" | "not-object"> {
+  if (!existsSync(clientPath)) return "absent";
+  const raw = await readFile(clientPath, "utf8");
+  if (raw.trim().length === 0) return "absent";
+  const parsed = parseJsonc(raw);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "not-object";
+  const next = removeJsoncEntry(raw, containerPath, entryName);
+  if (next === raw) return "absent";
+  if (dryRun) return "removed";
+  // No explicit mode: atomicWriteFile carries the config's existing perms
+  // forward, so peeling a trial can never widen a 0600 file that still
+  // holds another trial's inline secret.
+  await atomicWriteFile(clientPath, next.endsWith("\n") ? next : `${next}\n`);
+  return "removed";
 }
 
 /** Peel `marker.entryName` out of the client config the marker names,
@@ -363,22 +440,15 @@ async function readTrialMarker(markerPath: string): Promise<TrialMarker | null> 
  *   - "removed": the entry was present and the file was rewritten.
  *   - "absent":  nothing to do (no file, empty file, entry already gone).
  *   - "failed":  the marker is untrusted, or the file could not be read /
- *                parsed / written. The caller warns and carries on. */
-async function peelTrialEntry(marker: TrialMarker): Promise<"removed" | "absent" | "failed"> {
+ *                parsed / written. The caller warns and carries on.
+ *
+ *  With `dryRun`, every check runs but the write does not -- so --dry-run can
+ *  promise a removal only when the real run would actually perform one. */
+async function peelTrialEntry(marker: TrialMarker, dryRun = false): Promise<"removed" | "absent" | "failed"> {
   if (rejectUntrustedMarker(marker) !== null) return "failed";
-  if (!existsSync(marker.clientPath)) return "absent";
   try {
-    const raw = await readFile(marker.clientPath, "utf8");
-    if (raw.trim().length === 0) return "absent";
-    const parsed = parseJsonc(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "failed";
-    const next = removeJsoncEntry(raw, marker.containerPath, marker.entryName);
-    if (next === raw) return "absent";
-    // No explicit mode: atomicWriteFile carries the config's existing perms
-    // forward, so peeling a trial can never widen a 0600 file that still
-    // holds another trial's inline secret.
-    await atomicWriteFile(marker.clientPath, next.endsWith("\n") ? next : `${next}\n`);
-    return "removed";
+    const outcome = await peelEntryFromConfig(marker.clientPath, marker.containerPath, marker.entryName, dryRun);
+    return outcome === "not-object" ? "failed" : outcome;
   } catch {
     return "failed";
   }
@@ -420,10 +490,16 @@ async function defaultFetchExplore(
 
 /** Auto-detect which AI client to install the trial into. Probes in the
  *  same order as `yaw-mcp install --list` (claude-code -> claude-desktop ->
- *  cursor -> vscode, per INSTALL_TARGETS), picking the first one whose
- *  config file already exists OR whose user-scope directory is writable.
- *  Falls back to claude-code (the most likely target) when nothing
- *  obvious is installed. */
+ *  cursor -> vscode, per INSTALL_TARGETS -- one slot per client AND scope),
+ *  picking the first slot whose config file already EXISTS and parses.
+ *  Failing that it takes the first client merely AVAILABLE on this OS, which
+ *  is always claude-code (the most likely target) since that is first in
+ *  INSTALL_TARGETS and ships on every InstallOS.
+ *
+ *  There is no writability probe: availability is decided by OS, not by
+ *  whether the config directory can be written. A client whose directory is
+ *  read-only is still selected here and fails later, at the write, with a
+ *  path in the message. */
 async function autoDetectClient(opts: {
   home: string;
   os: InstallOS;
@@ -496,6 +572,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     ttlMs = parsedTtl;
   }
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Hermetic-home seam: keep the %APPDATA%-based claude-desktop path inside an
+  // overridden home (mirrors install-cmd / doctor). Computed ONCE -- the step-2
+  // probe and the step-3 resolve have to agree on it, and spelling the same
+  // expression at both sites is how they drift.
+  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
 
   // Step 1: fetch the canonical launch shape. The catalog override comes from
   // the SAME injectable env every other lookup here uses -- and an EMPTY value
@@ -520,7 +601,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       os,
       cwd,
       claudeConfigDir,
-      appData: opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined,
+      appData,
     }));
 
   // Step 3: resolve the config file path (user scope; project scope
@@ -537,9 +618,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       scope,
       os,
       home,
-      // Hermetic-home seam: keep the %APPDATA%-based claude-desktop path
-      // inside an overridden home (mirrors install-cmd / doctor).
-      appData: opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined,
+      appData,
       projectDir,
       claudeConfigDir,
     });
@@ -552,11 +631,20 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // supplied via --env AND not in the current process env blocks the
   // trial — silent runtime failure inside the client is worse than a
   // clear "you need to set FOO" up front.
-  const supplied = { ...env, ...(opts.envOverrides ?? {}) } as Record<string, string | undefined>;
+  //
+  // A LOOKUP, not a merged object. Spreading `env` into a plain object drops
+  // whatever lookup semantics the source had -- and on Windows process.env is
+  // case-INSENSITIVE, so a var the user actually stores as `Github_Token`
+  // answers to process.env.GITHUB_TOKEN but misses in the copy, and `try`
+  // reports a required var missing that is sitting right there in the shell.
+  // Reading THROUGH the original object preserves those semantics. Overrides
+  // still win on exactly the old spread's terms: an explicit "" from --env
+  // shadows the shell value, an absent key falls through to it.
+  const lookup = (k: string): string | undefined => opts.envOverrides?.[k] ?? env[k];
   // Trim before the emptiness test so a whitespace-only value (FOO=" ")
   // counts as missing instead of slipping through and writing a blank-ish
   // secret into the trial entry.
-  const missing = (server.requiredEnvVars ?? []).filter((k) => (supplied[k] ?? "").trim() === "");
+  const missing = (server.requiredEnvVars ?? []).filter((k) => (lookup(k) ?? "").trim() === "");
   if (missing.length > 0) {
     printErr(`yaw-mcp try: ${server.name} needs the following env var(s) before it can run:`);
     for (const k of missing) printErr(`  - ${k}`);
@@ -587,7 +675,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   for (const k of server.requiredEnvVars ?? []) {
     // Use the trimmed value so a padded entry doesn't carry surrounding
     // whitespace into the secret (the missing-check above already trims).
-    const v = (supplied[k] ?? "").trim();
+    const v = (lookup(k) ?? "").trim();
     if (v) trialEnv[k] = v;
   }
   // Honor any --env overrides for keys NOT in requiredEnvVars too --
@@ -606,9 +694,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // `add`, `try` DOES persist these inline (see divergence note above); the
   // note at step 9 tells the user the secret was sourced from their shell so
   // they're aware it now lives in the client config on disk.
+  // `!overrides[k]` alone covers both "key absent" and "key present but empty"
+  // -- "" is falsy, so the old `|| overrides[k] === ""` disjunct could never
+  // add a case the first one had not already caught.
   const overrides = opts.envOverrides ?? {};
   const ambientOnlyRequired = (server.requiredEnvVars ?? []).filter(
-    (k) => (!overrides[k] || overrides[k] === "") && (supplied[k] ?? "").trim() !== "",
+    (k) => !overrides[k] && (lookup(k) ?? "").trim() !== "",
   );
   const entry = buildLaunchEntry({
     os,
@@ -727,7 +818,8 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // The marker is read BEFORE the dry-run return so the preview can name the
   // removal too: a --dry-run that omits a write the real run performs is
   // exactly the report a user consults --dry-run to avoid.
-  const previousMarker = await readTrialMarker(trialMarkerPath(slug, home));
+  const previousRead = await readTrialMarker(trialMarkerPath(slug, home));
+  const previousMarker = previousRead?.marker ?? null;
   const peelsPrevious =
     previousMarker !== null &&
     (previousMarker.clientPath !== resolved.absolute || previousMarker.entryName !== entryName);
@@ -746,13 +838,19 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     print(`  expires:    ${new Date(expiresAt).toISOString()}`);
     print(`  marker:     ${trialMarkerPath(slug, home)}`);
     if (previousMarker && peelsPrevious) {
-      if (previousRefusal === null) {
-        print(
-          `  would remove: the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`,
-        );
-      } else {
+      if (previousRefusal !== null) {
         print(
           `  would NOT remove: the previous ${slug} marker ${previousRefusal} -- remove that entry from ${previousMarker.clientPath} by hand`,
+        );
+      } else if ((await peelTrialEntry(previousMarker, true)) === "removed") {
+        // Every check the real peel runs, minus the write. Naming the removal
+        // on the STRENGTH of the clientPath/entryName comparison alone
+        // over-promised: when that file (or that entry inside it) is already
+        // gone, the real run's peel returns "absent" and prints nothing at
+        // all. An "absent"/"failed" preview therefore stays quiet too, which
+        // is the direction --dry-run is allowed to be wrong in.
+        print(
+          `  would remove: the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`,
         );
       }
     }
@@ -785,8 +883,11 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // config. Rationale: if the process CRASHES between the two writes (where
   // the catch-block rollback below cannot run), a sweepable marker is left
   // behind so doctor's GC can reclaim it. On a CAUGHT client-write failure we
-  // do NOT rely on that -- the catch explicitly unlinks the marker (see
-  // below) so doctor never sees a trial whose launch entry was never written.
+  // do NOT rely on that -- the catch rolls the marker back (see below) so
+  // doctor never sees a trial whose launch entry was never written. "Rolls
+  // back" is not always "unlinks": on a same-target re-run the marker we are
+  // about to overwrite still names a LIVE entry, so it is restored, not
+  // deleted.
   const written: string[] = [];
   try {
     await mkdir(trialsDir(home), { recursive: true });
@@ -812,7 +913,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // have tightened it by hand. Only a genuinely new file lands at the umask
   // default.
   const entryHasSecrets = entry.env !== undefined && Object.keys(entry.env).length > 0;
-  const tightenPerms = entryHasSecrets && process.platform !== "win32";
+  const tightenPerms = entryHasSecrets && (opts.platform ?? process.platform) !== "win32";
   try {
     // Born-0600 on the create path closes the TOCTOU window where a 0644
     // file with secrets exists between rename and the post-hoc chmod.
@@ -832,14 +933,36 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     printErr(`yaw-mcp try: failed to write ${resolved.absolute}: ${(e as Error).message}`);
     // Best-effort marker rollback so doctor doesn't think a trial is
     // active when its launch entry was never written.
-    await unlink(trialMarkerPath(slug, home)).catch(() => undefined);
+    //
+    // On a re-run that targets the SAME client file and entry name, though,
+    // unlinking is the wrong rollback: the marker we just overwrote named the
+    // PREVIOUS run's entry, which is still live in the file this write failed
+    // on -- inline secret and all -- and that marker was the only thing on
+    // disk naming it. Deleting it strands the entry beyond the reach of both
+    // `try-cleanup` ("no trial marker ... nothing to do") and doctor's GC.
+    // Put the previous bytes back instead. (When the previous marker named a
+    // DIFFERENT file or entry, step 6b already peeled it, so there is nothing
+    // left for a restored marker to point at -- unlink stays right there, as
+    // it does for a first run with no previous marker at all.)
+    //
+    // The restore writes to the same disk that just failed us, so it is
+    // best-effort on the same terms as the unlink, and passes no explicit mode
+    // -- atomicWriteFile's preserve-the-target path is what a marker wants.
+    if (previousRead !== null && !peelsPrevious) {
+      await atomicWriteFile(trialMarkerPath(slug, home), previousRead.raw).catch(() => undefined);
+    } else {
+      await unlink(trialMarkerPath(slug, home)).catch(() => undefined);
+    }
     return { exitCode: 1, written: [] };
   }
 
   // Step 9: nudge. The keep-it path is local (`add` writes the server into
   // ~/.yaw-mcp/bundles.json) -- there is no account and no signup page.
   const ttlPretty = formatTtl(ttlMs);
-  print(`Trial wired: ${server.name} via yaw-mcp-try-${slug} -> ${resolved.absolute}`);
+  // `entryName`, not a rebuilt literal: the name printed here has to be the
+  // name actually written, or a change to TRIAL_ENTRY_PREFIX makes this line
+  // lie about what is in the file.
+  print(`Trial wired: ${server.name} via ${entryName} -> ${resolved.absolute}`);
   // "Expires in Nh" alone read as a timer. Nothing sweeps on a schedule: the
   // TTL is only consumed by gcExpiredTrials, which runs from `yaw-mcp doctor`
   // and nowhere else. A user who never runs doctor keeps the entry -- and its
@@ -889,23 +1012,13 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
 
   let marker: TrialMarker;
   try {
-    const raw = await readFile(markerPath, "utf8");
-    const parsed = JSON.parse(raw) as TrialMarker;
-    // Validate every field the peel below consumes -- the SAME set
-    // readTrialMarker requires -- not just entryName. Checking one of the
-    // three let a marker with no clientPath through: existsSync(undefined)
-    // is false, so the peel was skipped, the marker was unlinked, and the
-    // user was told the trial was "cleaned up" while its entry (inline secret
-    // and all) stayed wired with nothing left on disk naming it.
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      typeof parsed.entryName !== "string" ||
-      typeof parsed.clientPath !== "string" ||
-      !Array.isArray(parsed.containerPath)
-    ) {
-      throw new Error("marker is missing required fields");
-    }
+    // The SAME field checks readTrialMarker applies, from the same helper --
+    // spelled out separately here, the two drifted (this one checked entryName
+    // alone for a while, which let a marker with no clientPath through).
+    // assertTrialMarkerShape throws a message, which is what this catch needs
+    // and readTrialMarker's own catch discards.
+    const parsed: unknown = JSON.parse(await readFile(markerPath, "utf8"));
+    assertTrialMarkerShape(parsed);
     marker = parsed;
   } catch (e) {
     printErr(`yaw-mcp try-cleanup: marker at ${markerPath} is unreadable (${(e as Error).message}).`);
@@ -928,29 +1041,27 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
   // through `removeJsoncEntry` so user comments in the client config survive
   // -- a JSON.parse + JSON.stringify pass would silently strip them.
   const written: string[] = [];
-  if (existsSync(marker.clientPath)) {
-    try {
-      const raw = await readFile(marker.clientPath, "utf8");
-      if (raw.trim().length > 0) {
-        // Sanity-parse first so we refuse to write garbage back if the file
-        // has drifted into an invalid shape since the marker was created.
-        const parsed = parseJsonc(raw);
-        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          const next = removeJsoncEntry(raw, marker.containerPath, marker.entryName);
-          if (next !== raw) {
-            const out = next.endsWith("\n") ? next : `${next}\n`;
-            await atomicWriteFile(marker.clientPath, out);
-            written.push(marker.clientPath);
-            print(`Removed ${marker.entryName} from ${marker.clientPath}`);
-          }
-        }
-      }
-    } catch (e) {
+  try {
+    const outcome = await peelEntryFromConfig(marker.clientPath, marker.containerPath, marker.entryName);
+    if (outcome === "removed") {
+      written.push(marker.clientPath);
+      print(`Removed ${marker.entryName} from ${marker.clientPath}`);
+    } else if (outcome === "not-object") {
+      // Valid JSON that is not an object (an array, a string, a number): there
+      // is no container for removeJsoncEntry to name the entry in, so no peel
+      // is possible. SAY so. Skipping it silently and then printing "cleaned
+      // up" is the same false all-clear over a plaintext credential that the
+      // GC was fixed to refuse -- the user reads "cleaned up", and the entry
+      // is still wired.
       printErr(
-        `yaw-mcp try-cleanup: warning -- couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
+        `yaw-mcp try-cleanup: warning -- couldn't strip ${marker.entryName} from ${marker.clientPath} (${marker.clientPath} is not a JSON object).`,
       );
-      // Continue -- still drop the marker so doctor stops surfacing it.
     }
+  } catch (e) {
+    printErr(
+      `yaw-mcp try-cleanup: warning -- couldn't strip ${marker.entryName} from ${marker.clientPath} (${(e as Error).message}).`,
+    );
+    // Continue -- still drop the marker so doctor stops surfacing it.
   }
 
   // Drop the marker.
@@ -1027,6 +1138,11 @@ export async function scanTrials(opts: { home?: string; now?: () => number } = {
         typeof parsed.slug !== "string" ||
         typeof parsed.expiresAt !== "number" ||
         typeof parsed.clientPath !== "string" ||
+        // Not consumed by the peel, but doctor PRINTS it verbatim ("demo ->
+        // claude-code (expires in 42m)"), so a hand-rolled marker without it
+        // renders as "demo -> undefined". Malformed is the honest reading of a
+        // marker missing a field every writer of ours fills in.
+        typeof parsed.clientName !== "string" ||
         !Array.isArray(parsed.containerPath) ||
         typeof parsed.entryName !== "string" ||
         // Same trust check runTryCleanup applies: the GC deletes these three
@@ -1074,33 +1190,18 @@ export async function gcExpiredTrials(opts: {
     // the config is already clean and only the marker lingers.
     let stage: TrialGcFailure["stage"] = "peel";
     try {
-      if (existsSync(marker.clientPath)) {
-        const raw = await readFile(marker.clientPath, "utf8");
-        if (raw.trim().length > 0) {
-          // Sanity-parse to confirm the file is still a JSON object before
-          // we hand the raw text to removeJsoncEntry (it would also throw,
-          // but we want the same shape as runTryCleanup -- skip the GC
-          // write if the file has drifted out of valid shape).
-          const parsed = parseJsonc(raw);
-          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-            // Route through removeJsoncEntry so user comments in the client
-            // config survive doctor's GC pass -- the previous JSON.parse +
-            // JSON.stringify shape silently stripped them.
-            const next = removeJsoncEntry(raw, marker.containerPath, marker.entryName);
-            if (next !== raw) {
-              const out = next.endsWith("\n") ? next : `${next}\n`;
-              await atomicWriteFile(marker.clientPath, out);
-            }
-          } else {
-            // Valid JSON, but not an object (an array, a string, a number):
-            // removeJsoncEntry has no container to name the entry in, so the
-            // peel cannot happen. Fail LOUDLY rather than falling through to
-            // the unlink -- dropping the marker here would leave the trial
-            // entry wired with nothing on disk that could ever name it again.
-            // Throwing keeps stage "peel", which is what the user needs told.
-            throw new Error(`${marker.clientPath} is not a JSON object`);
-          }
-        }
+      // Routed through removeJsoncEntry (inside the shared peel) so user
+      // comments in the client config survive doctor's GC pass -- the previous
+      // JSON.parse + JSON.stringify shape silently stripped them.
+      const outcome = await peelEntryFromConfig(marker.clientPath, marker.containerPath, marker.entryName);
+      if (outcome === "not-object") {
+        // Valid JSON, but not an object (an array, a string, a number):
+        // removeJsoncEntry has no container to name the entry in, so the
+        // peel cannot happen. Fail LOUDLY rather than falling through to
+        // the unlink -- dropping the marker here would leave the trial
+        // entry wired with nothing on disk that could ever name it again.
+        // Throwing keeps stage "peel", which is what the user needs told.
+        throw new Error(`${marker.clientPath} is not a JSON object`);
       }
       // Unlink the file that was actually scanned -- deriving the path from
       // marker.slug would orphan a marker whose filename mismatches its slug.

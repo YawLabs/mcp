@@ -9,6 +9,7 @@ import {
   type EncryptedEntry,
   encryptEntry,
   generateSalt,
+  LEGACY_KDF,
 } from "../secrets-crypto.js";
 import {
   getSecret,
@@ -95,6 +96,19 @@ describe("secrets-crypto", () => {
       authTag: Buffer.from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "base64").toString("base64"),
     };
     expect(() => decryptEntry(tampered, key)).toThrow();
+  });
+
+  it("decrypt refuses an IV or auth tag of the wrong LENGTH, by name", async () => {
+    // loadVault only type-checks the three fields as strings, so a truncated
+    // iv/authTag reaches decrypt intact. These two guards are what turn that
+    // into a named error instead of whatever createDecipheriv/setAuthTag
+    // happen to throw -- and neither had a test.
+    const key = await deriveKey("hunter2", generateSalt());
+    const entry = encryptEntry("secret", key);
+    expect(() => decryptEntry({ ...entry, iv: Buffer.alloc(8).toString("base64") }, key)).toThrow(/invalid IV length/i);
+    expect(() => decryptEntry({ ...entry, authTag: Buffer.alloc(8).toString("base64") }, key)).toThrow(
+      /invalid auth tag length/i,
+    );
   });
 });
 
@@ -345,7 +359,10 @@ describe("secrets-vault: set/get/list/remove", () => {
 
 describe("SECRET_REF_RE is exported and matches ${secret:NAME}", () => {
   it("captures the name", () => {
-    // Fresh regex use to avoid lastIndex carryover from the global flag.
+    // NOT a fresh regex: matchAll seeds its internal clone FROM this shared
+    // object's lastIndex, so it resets nothing. Nothing above advances it, so
+    // it is still 0 here -- the real callers re-instantiate rather than lean
+    // on that (see doctor-cmd.ts, meta-tools.ts, upstream.ts).
     const m = [...`x ${"${secret:gh}"} y`.matchAll(SECRET_REF_RE)];
     expect(m[0][1]).toBe("gh");
   });
@@ -416,6 +433,65 @@ describe("rotateVault", () => {
     await expect(rotateVault(vault, wrongKey, "new-passphrase")).rejects.toThrow(/current passphrase is wrong/i);
     expect(JSON.stringify(vault)).toBe(snapshot);
   });
+
+  it("does not lose an entry literally named __proto__", async () => {
+    // SECRET_NAME_RE allows it, and set/get/list/save/load all keep it as an
+    // own property -- but rebuilding the rotated entries with `entries[name]
+    // = ...` assigns through Object.prototype's inherited __proto__ setter,
+    // creating no own key. The secret then vanishes from the file rotate
+    // atomically overwrites, with no backup and no error.
+    //
+    // Built via setSecret on purpose: an object literal with a bare
+    // `__proto__:` key would set the prototype instead of storing anything.
+    let vault = newVault();
+    const oldKey = await unlock(vault, "old-passphrase");
+    vault = setSecret(vault, oldKey, "__proto__", "proto-value");
+    vault = setSecret(vault, oldKey, "github", "ghp_abc");
+    expect(listKeys(vault)).toEqual(["__proto__", "github"]);
+
+    const rotated = await rotateVault(vault, oldKey, "new-passphrase");
+
+    expect(listKeys(rotated)).toContain("__proto__");
+    lock();
+    const newKey = await unlock(rotated, "new-passphrase");
+    expect(getSecret(rotated, newKey, "__proto__")).toBe("proto-value");
+    // ...and the ordinary entry alongside it is untouched.
+    expect(getSecret(rotated, newKey, "github")).toBe("ghp_abc");
+  });
+
+  it("migrates a v1, kdf-less vault with UNBOUND entries to v2", async () => {
+    // The migration path the source advertises, end to end: rotate is what
+    // rewrites a pre-v2 file into the current schema. Built by hand because
+    // no code path produces a v1 vault any more.
+    const salt = generateSalt();
+    const oldKey = await deriveKey("old-passphrase", salt, LEGACY_KDF);
+    const legacy: VaultFile = {
+      version: 1,
+      salt: salt.toString("base64"),
+      // No AAD: v1 ciphertexts were not bound to the name they sat under.
+      entries: {
+        github: encryptEntry("ghp_legacy", oldKey),
+        aws: encryptEntry("aws_legacy", oldKey),
+      },
+    };
+    lock();
+
+    const rotated = await rotateVault(legacy, oldKey, "new-passphrase");
+
+    expect(rotated.version).toBe(SECRETS_SCHEMA_VERSION);
+    expect(rotated.kdf).toEqual(DEFAULT_KDF);
+    expect(listKeys(rotated)).toEqual(["aws", "github"]);
+
+    lock();
+    const newKey = await unlock(rotated, "new-passphrase");
+    expect(getSecret(rotated, newKey, "github")).toBe("ghp_legacy");
+    expect(getSecret(rotated, newKey, "aws")).toBe("aws_legacy");
+
+    // The rewritten entries are name-BOUND, which is the point of the bump:
+    // an unbound decrypt of the same blob is now refused.
+    expect(() => decryptEntry(rotated.entries.github, newKey)).toThrow();
+    expect(decryptEntry(rotated.entries.github, newKey, "github")).toBe("ghp_legacy");
+  });
 });
 
 describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
@@ -450,6 +526,26 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     const { resolved, missing } = resolveSecretRefs({ GITHUB_TOKEN: "${secret:nonesuch}" }, vault, key);
     expect(resolved.GITHUB_TOKEN).toBe("${secret:nonesuch}");
     expect(missing).toEqual(["nonesuch"]);
+  });
+
+  it("resolveSecretRefs reports a PRESENT but undecryptable entry as missing", async () => {
+    // Distinct from the absent case above: the entry exists, so the
+    // own-property lookup finds it and the decrypt is what fails. That branch
+    // is the difference between a spawn failing closed and a corrupt blob
+    // being substituted into a child's env, and nothing covered it.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "gh", "ghp_abc");
+    const damaged: VaultFile = {
+      ...vault,
+      entries: {
+        ...vault.entries,
+        gh: { ...vault.entries.gh, ciphertext: Buffer.from("tampered").toString("base64") },
+      },
+    };
+    const { resolved, missing } = resolveSecretRefs({ GITHUB_TOKEN: "${secret:gh}" }, damaged, key);
+    expect(resolved.GITHUB_TOKEN).toBe("${secret:gh}");
+    expect(missing).toEqual(["gh"]);
   });
 
   it("resolveSecretRefs passes through env values without refs", async () => {
@@ -512,6 +608,35 @@ describe("secrets-vault v2: recorded KDF parameters", () => {
     expect(loaded.kdf).toEqual(params);
     const key = await unlock(loaded, "hunter2");
     expect(getSecret(loaded, key, "github")).toBe("ghp_abc");
+  });
+
+  it("a kdf-LESS vault stays readable after the build default is bumped", async () => {
+    // The cost bump this whole design exists to make possible is also the
+    // thing that breaks a v1 vault: it records no `kdf`, so whatever the
+    // reader falls back to IS its derivation. Falling back to DEFAULT_KDF
+    // means raising DEFAULT_KDF silently re-keys every v1 vault in the wild
+    // into "wrong passphrase for this vault" -- so the fallback is pinned to
+    // LEGACY_KDF, which must never move.
+    const salt = generateSalt();
+    const legacyKey = await deriveKey("hunter2", salt, LEGACY_KDF);
+    const legacy: VaultFile = {
+      version: 1,
+      salt: salt.toString("base64"),
+      entries: { github: encryptEntry("ghp_legacy", legacyKey) },
+    };
+
+    // Stand in for a future release raising the cost factor.
+    const originalN = DEFAULT_KDF.N;
+    DEFAULT_KDF.N = 1 << 14;
+    try {
+      expect(DEFAULT_KDF.N).not.toBe(LEGACY_KDF.N);
+      lock();
+      const key = await unlock(legacy, "hunter2");
+      expect(getSecret(legacy, key, "github")).toBe("ghp_legacy");
+    } finally {
+      DEFAULT_KDF.N = originalN;
+      lock();
+    }
   });
 
   it("a saved vault records its parameters on disk", async () => {
@@ -685,6 +810,19 @@ describe("secrets-vault: loadVault error shapes", () => {
     const err = await loadVault(path).catch((e) => e);
     expect(err).toBeInstanceOf(VaultEntryCorruptError);
     expect((err as VaultEntryCorruptError).entryName).toBe(badName);
+  });
+
+  it("propagates a NON-ENOENT read error instead of reporting no vault", async () => {
+    // ENOENT is the only "vault absent" signal. Anything else (EACCES, EIO,
+    // EISDIR) means the file is probably there and unreadable, and returning
+    // null would let the caller bootstrap a fresh vault straight over it.
+    // A directory at the vault path produces exactly that shape.
+    const { mkdirSync } = await import("node:fs");
+    const path = vaultPath(synthHome);
+    mkdirSync(path, { recursive: true });
+    await expect(loadVault(path)).rejects.toThrow();
+    // ...and the absent case still reports absent rather than throwing.
+    await expect(loadVault(join(synthHome, ".yaw-mcp", "not-here.json"))).resolves.toBeNull();
   });
 
   it("refuses a vault whose version is a STRING instead of assuming it is current", async () => {

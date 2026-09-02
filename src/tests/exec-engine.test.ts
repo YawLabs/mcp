@@ -11,6 +11,7 @@ import {
   resolveArgs,
   resolveRef,
   stepBindingKey,
+  validateExecRefs,
   validateExecRequest,
 } from "../exec-engine.js";
 
@@ -65,6 +66,26 @@ describe("exec-engine: parseRefPath", () => {
     // exec-engine.ts:68 -- after ']', the next char must be '.', '[', or EOS.
     // A bare identifier immediately following ']' is malformed.
     expect(parseRefPath("foo[0]bar")).toBeNull();
+  });
+
+  it("rejects a trailing dot", () => {
+    // A path ending in '.' names nothing past the last segment; without the
+    // endsWith check it would parse as if the dot were not there.
+    expect(parseRefPath("foo.")).toBeNull();
+    expect(parseRefPath("foo[0].")).toBeNull();
+  });
+
+  it("parses chained brackets", () => {
+    // After ']' another '[' is legal -- "matrix[0][1]" is the canonical
+    // nested-array form.
+    expect(parseRefPath("foo[0][1]")).toEqual(["foo", 0, 1]);
+  });
+
+  it("parses a bracket-leading path to a NUMERIC first token", () => {
+    // Not malformed, but it names no step: the dot-numeric post-pass starts
+    // at index 1, so the first token stays a number. resolveRef and
+    // collectRefDeps both guard on exactly this shape.
+    expect(parseRefPath("[0]")).toEqual([0]);
   });
 });
 
@@ -127,6 +148,24 @@ describe("exec-engine: resolveRef", () => {
 
   it("throws RefError on malformed path", () => {
     expect(() => resolveRef("stepA..foo", bindings)).toThrow(/malformed path/);
+  });
+
+  it("throws RefError on a bracket-leading ref instead of indexing the bindings map", () => {
+    // LOAD-BEARING guard (exec-engine.ts:129-136). "[0]" parses to the single
+    // NUMBER token 0, which names no step. The bindings here deliberately
+    // carry a "0" key -- the positional slot an unnamed step would bind
+    // under -- so a regression to a bare `bindings[stepIdToken]` lookup would
+    // resolve to "x" instead of throwing.
+    expect(() => resolveRef("[0]", { "0": "x" })).toThrow(/missing step id/);
+    expect(() => resolveRef("[0]", { "0": "x" })).toThrow(RefError);
+  });
+
+  it("throws RefError when drilling through a null intermediate", () => {
+    expect(() => resolveRef("nested.inner.deep", { nested: { inner: null } })).toThrow(/cannot read "deep" of null/);
+  });
+
+  it("throws RefError when a numeric index lands on a non-array", () => {
+    expect(() => resolveRef("stepA.count[0]", bindings)).toThrow(/index \[0\] applied to non-array/);
   });
 });
 
@@ -376,6 +415,158 @@ describe("exec-engine: validateExecRequest", () => {
     });
     expect(r.ok).toBe(true);
   });
+
+  it("rejects a step that is not an object", () => {
+    for (const bad of [null, "gh_list_prs", 42, ["gh_list_prs"]]) {
+      const r = validateExecRequest({ steps: [bad] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain("step 0: must be an object");
+    }
+  });
+
+  it("rejects an id that is present but not a non-empty string", () => {
+    for (const bad of [42, "", null]) {
+      const r = validateExecRequest({ steps: [{ id: bad, tool: "x" }] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain("`id` must be a non-empty string");
+    }
+  });
+
+  it("rejects args that are present but not a plain object", () => {
+    for (const bad of [null, "x", 7]) {
+      const r = validateExecRequest({ steps: [{ tool: "t", args: bad }] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain("`args` must be an object");
+    }
+  });
+
+  it("rejects a return that is present but not a non-empty string", () => {
+    for (const bad of [42, "", null]) {
+      const r = validateExecRequest({ steps: [{ id: "a", tool: "x" }], return: bad });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain("`return` must be a non-empty step id string");
+    }
+  });
+
+  it("rejects ids containing a $ref path separator", () => {
+    // '.', '[' and ']' split a ref path, so an id carrying one can never be
+    // named by a $ref -- "a.b" reads as step "a" drilling into key "b".
+    for (const id of ["a.b", "a[0", "a]b"]) {
+      const r = validateExecRequest({ steps: [{ id, tool: "x" }] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain("may not contain");
+    }
+  });
+
+  it("rejects an unknown step key instead of dispatching with no arguments", () => {
+    // `arguments:` is the classic typo: the step validates, `args` is
+    // undefined, and the tool fires with {} -- a real call with every
+    // argument silently dropped.
+    const r = validateExecRequest({ steps: [{ tool: "gh_create_issue", arguments: { title: "x" } }] });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('step 0: unknown key "arguments" (allowed: id, tool, args)');
+  });
+
+  it("still accepts the exact allowed key set", () => {
+    const r = validateExecRequest({ steps: [{ id: "a", tool: "t", args: { x: 1 } }] });
+    expect(r.ok).toBe(true);
+  });
+});
+
+describe("exec-engine: validateExecRefs", () => {
+  it("accepts refs that name an earlier step", () => {
+    const r = validateExecRefs([
+      { id: "a", tool: "gh_list_prs" },
+      { id: "b", tool: "gh_get_pr", args: { number: { $ref: "a.items[0].number" } } },
+    ]);
+    expect(r.ok).toBe(true);
+  });
+
+  it("accepts a positional ref to an earlier unnamed step", () => {
+    // Unnamed steps bind under String(index), so "0" is a real producer key
+    // and must not be mistaken for an unknown step.
+    const r = validateExecRefs([{ tool: "gh_list_prs" }, { tool: "gh_get_pr", args: { n: { $ref: "0.number" } } }]);
+    expect(r.ok).toBe(true);
+  });
+
+  it("rejects a ref to a step that does not exist -- before step 0 runs", () => {
+    // The whole point: steps 0..N-1 may be side-effecting (gh_create_issue),
+    // so a typo in step 2 must not cost a filed issue plus a duplicate on the
+    // re-run.
+    const r = validateExecRefs([
+      { id: "a", tool: "gh_create_issue" },
+      { id: "b", tool: "gh_comment", args: { issue: { $ref: "aa.number" } } },
+    ]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain("step 1");
+      expect(r.message).toContain('names step "aa"');
+    }
+  });
+
+  it("rejects a forward ref to a LATER step", () => {
+    const r = validateExecRefs([
+      { id: "a", tool: "t", args: { x: { $ref: "b.value" } } },
+      { id: "b", tool: "t" },
+    ]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('names step "b"');
+  });
+
+  it("rejects a step referencing ITSELF", () => {
+    // The producing key is bound only after its own args are checked, so a
+    // self-ref is a forward ref.
+    const r = validateExecRefs([{ id: "a", tool: "t", args: { x: { $ref: "a" } } }]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('names step "a"');
+  });
+
+  it("rejects a malformed ref", () => {
+    const r = validateExecRefs([
+      { id: "a", tool: "t" },
+      { tool: "t", args: { x: { $ref: "a..b" } } },
+    ]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("is malformed");
+  });
+
+  it("rejects a bracket-leading ref with the runtime's own wording", () => {
+    const r = validateExecRefs([
+      { id: "a", tool: "t" },
+      { tool: "t", args: { x: { $ref: "[0]" } } },
+    ]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("missing step id");
+  });
+
+  it("finds refs nested in arrays and objects", () => {
+    const r = validateExecRefs([
+      { id: "a", tool: "t" },
+      { tool: "t", args: { payload: { list: ["literal", { deep: { $ref: "nope.value" } }] } } },
+    ]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain('names step "nope"');
+  });
+
+  it("ignores $ref-plus-extras, which is a plain object rather than a ref", () => {
+    const r = validateExecRefs([{ tool: "t", args: { schema: { $ref: "#/defs/X", title: "T" } } }]);
+    expect(r.ok).toBe(true);
+  });
+
+  it("reports an over-deep args tree in the resolver's words instead of throwing", () => {
+    let node: unknown = { $ref: "nope" };
+    for (let i = 0; i < MAX_REF_DEPTH + 1; i++) node = { a: node };
+    const r = validateExecRefs([{ tool: "t", args: node as Record<string, unknown> }]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain("step 0");
+      expect(r.message).toContain(String(MAX_REF_DEPTH));
+    }
+  });
+
+  it("accepts steps with no args at all", () => {
+    expect(validateExecRefs([{ tool: "a" }, { tool: "b" }]).ok).toBe(true);
+  });
 });
 
 describe("exec-engine: collectRefDeps", () => {
@@ -433,6 +624,14 @@ describe("exec-engine: collectRefDeps", () => {
     // isRefNode requires $ref to be the ONLY key; with extras it is a plain
     // object and contributes no dep (and its nested $ref string is just a value).
     expect(collectRefDeps({ $ref: "a.b", default: 0 })).toEqual([]);
+  });
+
+  it("contributes no dep for a bracket-leading ref", () => {
+    // Pins the typeof guard at exec-engine.ts:270, which is NOT redundant:
+    // "[0]" parses fine but to a NUMBER first token, which names no producer
+    // step. Without the guard the number would be added as a dep and blame a
+    // step that never existed.
+    expect(collectRefDeps({ x: { $ref: "[0]" } })).toEqual([]);
   });
 });
 

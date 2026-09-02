@@ -1,7 +1,34 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Confines the candidate probe to the synthetic trees a test created. OUTSIDE
+// $HOME the walk is unbounded by design -- it runs to the filesystem root --
+// so every test whose candidate is rejected otherwise climbed from tmpdir to
+// the drive root against the REAL filesystem, stat-ing (and warning about)
+// the developer's own ~/.yaw-mcp on every run: slow, and green or red
+// depending on whose machine it ran on. With roots registered, anything
+// outside them reports ENOENT, which is exactly what the walk sees on a box
+// with nothing planted above the checkout. An empty root list disarms the
+// sandbox, so the bounded describes below are untouched.
+const sandbox = vi.hoisted(() => ({ roots: [] as string[] }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const inSandbox = (p: string): boolean =>
+    sandbox.roots.length === 0 || sandbox.roots.some((root) => p === root || p.startsWith(`${root}${sep}`));
+  return {
+    ...actual,
+    stat: (async (target: unknown) => {
+      const p = String(target);
+      if (!inSandbox(p)) {
+        throw Object.assign(new Error(`ENOENT: outside the test sandbox, stat '${p}'`), { code: "ENOENT" });
+      }
+      return actual.stat(p);
+    }) as unknown as typeof actual.stat,
+  };
+});
 
 import {
   ALLOW_UNOWNED_ENV,
@@ -48,16 +75,21 @@ describe("cacheDir", () => {
     expect(cacheDir()).toMatch(/custom[\\/]cache[\\/]yaw-mcp$/);
   });
 
-  it("falls back to ~/.cache on linux when XDG_CACHE_HOME missing", () => {
+  it("falls back to ~/.cache on linux when XDG_CACHE_HOME is UNSET", () => {
+    // `undefined` deletes the variable rather than blanking it -- the unset
+    // case is a different branch input from the empty-string one below, and
+    // stubbing both to "" (the previous shape) tested the same thing twice
+    // and the unset case not at all.
     Object.defineProperty(process, "platform", { value: "linux" });
-    vi.stubEnv("XDG_CACHE_HOME", "");
-    expect(cacheDir()).toMatch(/\.cache[\\/]yaw-mcp$/);
+    vi.stubEnv("XDG_CACHE_HOME", undefined);
+    expect(process.env.XDG_CACHE_HOME).toBeUndefined();
+    expect(cacheDir()).toBe(join(homedir(), ".cache", "yaw-mcp"));
   });
 
-  it("ignores empty XDG_CACHE_HOME", () => {
+  it("ignores an EMPTY XDG_CACHE_HOME (set but blank)", () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     vi.stubEnv("XDG_CACHE_HOME", "");
-    expect(cacheDir()).toMatch(/\.cache[\\/]yaw-mcp$/);
+    expect(cacheDir()).toBe(join(homedir(), ".cache", "yaw-mcp"));
   });
 });
 
@@ -177,6 +209,20 @@ describe("findProjectConfigDir", () => {
     expect(await findProjectConfigDir(startFrom, home)).toBe(realpathSync(cfgDir));
   });
 
+  it("skips a regular FILE named .yaw-mcp and keeps walking", async () => {
+    // The probe used to be access(), which only proves the entry EXISTS: a
+    // stray file named `.yaw-mcp` (a note, a `touch` typo, an editor swap
+    // file) was returned as the project config dir, every later read under it
+    // failed ENOTDIR, and because the walk stops at the first hit the real
+    // `.yaw-mcp/` one level up never got a look.
+    const cfgDir = join(root, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    const inner = join(root, "pkg");
+    mkdirSync(inner);
+    writeFileSync(join(inner, CONFIG_DIRNAME), "not a directory", "utf8");
+    expect(await findProjectConfigDir(inner, home)).toBe(realpathSync(cfgDir));
+  });
+
   it("prefers the nearest .yaw-mcp/ when multiple exist on the path", async () => {
     mkdirSync(join(root, CONFIG_DIRNAME));
     const innerProject = join(root, "apps", "web");
@@ -276,9 +322,14 @@ describe("findProjectConfigDir outside $HOME", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-paths-home-"));
     project = mkdtempSync(join(tmpdir(), "yaw-mcp-paths-outside-"));
+    // Arm the stat sandbox (see the mock at the top of this file): the walk
+    // from `project` is unbounded, and only these two trees exist as far as
+    // it is concerned.
+    sandbox.roots = [realpathSync(home), realpathSync(project)];
   });
 
   afterEach(() => {
+    sandbox.roots = [];
     rmSync(home, { recursive: true, force: true });
     rmSync(project, { recursive: true, force: true });
     if (ORIG_GETEUID) Object.defineProperty(process, "geteuid", ORIG_GETEUID);
@@ -377,6 +428,11 @@ describe("findProjectConfigDir outside $HOME", () => {
     const cfgDir = join(project, CONFIG_DIRNAME);
     mkdirSync(cfgDir);
     stubGeteuid(999_999_999);
+    // The logger resolves LOG_LEVEL per call, so an operator running the suite
+    // with LOG_LEVEL=error exported emitted zero lines here and failed the
+    // assertion below on an environment setting that has nothing to do with
+    // the dedupe. Pin it. (The describe's afterEach unstubs.)
+    vi.stubEnv("LOG_LEVEL", "warn");
     const written: string[] = [];
     const orig = process.stderr.write.bind(process.stderr);
     process.stderr.write = ((chunk: unknown): boolean => {

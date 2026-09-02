@@ -68,9 +68,10 @@ export class LearningStore {
   /**
    * @deprecated Test-only. The binary recordDispatch + recordSuccess pair was
    * replaced on the proxy path by the graded recordOutcome; no production
-   * caller remains (grep src/ outside tests). Kept because existing tests in
-   * persistence.test.ts and server.test.ts still seed stores through it --
-   * delete both methods together with those call sites, not before. Do NOT
+   * caller remains (grep src/ outside tests). Kept because existing tests still
+   * seed stores through it: learning.test.ts is by far the heaviest user, with
+   * persistence.test.ts and server.test.ts behind it -- delete both methods
+   * together with all three sets of call sites, not before. Do NOT
    * reach for it in new code: it records a denominator with no numerator,
    * which recordMiss already expresses with an accurate name.
    */

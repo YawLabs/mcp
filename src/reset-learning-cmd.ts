@@ -29,7 +29,7 @@
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { userConfigDir } from "./paths.js";
-import { isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
+import { isFileNotFound, isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -157,15 +157,22 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // is correct regardless, and reset-learning is a manual, one-shot admin
   // command, not something racing a live writer in practice. The counts
   // are advisory reporting, not a contract.
-  const { state: persisted, parsedCleanly } = await loadStateClassified(filePath);
-  const learningCount = Object.keys(persisted.learning).length;
-  const packCount = persisted.packHistory.length;
+  //
+  // rawCounts, not the sanitized state: this report is about what the FILE
+  // held and the unlink destroyed, not about what yaw-mcp would have been
+  // willing to use. The sanitized numbers say "0 entries removed" for a file
+  // whose tool caches had all aged past TOOLCACHE_TTL_MS, or whose learning
+  // rows were hand-edited into invalid shapes -- real content, really deleted,
+  // reported as nothing.
+  const { parsedCleanly, rawCounts } = await loadStateClassified(filePath);
+  const learningCount = rawCounts.learning;
+  const packCount = rawCounts.packHistory;
   // The v2 file's third section. Deleting it silently was the report
   // claiming to account for the file while omitting a whole category:
   // every namespace whose learned tool list is dropped costs one extra
   // upstream handshake on the next session, which is exactly the kind of
   // consequence someone running a reset wants to see up front.
-  const toolCacheCount = Object.keys(persisted.toolCache).length;
+  const toolCacheCount = rawCounts.toolCache;
 
   try {
     await unlink(filePath);
@@ -198,8 +205,4 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   print(`  tool caches removed:          ${toolCacheCount}`);
   for (const line of RUNNING_SERVE_NOTE) print(line);
   return { exitCode: 0, lines, removed: true, path: filePath };
-}
-
-function isFileNotFound(err: unknown): boolean {
-  return !!err && typeof err === "object" && "code" in err && (err as { code?: unknown }).code === "ENOENT";
 }

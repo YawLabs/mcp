@@ -19,7 +19,15 @@ vi.mock("../upstream.js", async (importOriginal) => {
   return {
     ...actual,
     connectToUpstream: vi.fn(),
-    disconnectFromUpstream: vi.fn().mockResolvedValue(undefined),
+    // Mirrors PRODUCTION: upstream.ts flips the status synchronously and only
+    // then awaits the close. A plain mockResolvedValue(undefined) does not, so
+    // whether a test ran against the production shape used to depend on
+    // whether an EARLIER test had installed the flipping implementation --
+    // ordering decided semantics. Passed to vi.fn() (not attached afterwards)
+    // so mockReset() restores exactly this behaviour for every test.
+    disconnectFromUpstream: vi.fn(async (c: UpstreamConnection) => {
+      c.status = "disconnected";
+    }),
     // Mocked because the real one reads the DEVELOPER's ~/.yaw-mcp/secrets.json
     // via vaultPath()/homedir(). Unmocked, every elicitation test would be
     // graded against whatever vault the machine running the suite happens to
@@ -31,7 +39,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 });
 
 import { CONFIG_DIRNAME } from "../paths.js";
-import { buildToolList, buildToolRoutes, isRoutingFaultResult } from "../proxy.js";
+import { isRoutingFaultResult } from "../proxy.js";
 import {
   ConnectServer,
   computeToolOverlaps,
@@ -99,6 +107,65 @@ function getPrivate(server: ConnectServer) {
   return server as any;
 }
 
+// Drive the REAL tools/list handler rather than re-implementing its call to
+// buildToolList. The handler is where resolveToolExposure() (gateway by
+// default) and this.sessionActivated are wired together, so a regression in
+// that wiring shows up here instead of being papered over by a hand-passed
+// argument list.
+async function listTools(priv: any): Promise<Array<{ name: string; inputSchema?: unknown }>> {
+  const handler = priv.server._requestHandlers.get("tools/list");
+  const res = await handler({ method: "tools/list", params: {} }, {} as never);
+  return res.tools;
+}
+
+// The same list with the meta-tools dropped, i.e. what a client sees of the
+// UPSTREAM catalog.
+async function listedUpstreamToolNames(priv: any): Promise<string[]> {
+  return (await listTools(priv)).map((t) => t.name).filter((n) => !n.startsWith("mcp_connect_"));
+}
+
+// runActivateOne sleeps a fixed 1s before its single retry (server.ts). Every
+// test that drives a FAILING activation pays that second in real wall clock;
+// running the call under fake timers collapses it. Only setTimeout/clearTimeout
+// are faked -- Date stays real so activationFailures ageing and the 3s discover
+// cache TTL keep behaving exactly as they do under real time.
+async function withoutRetryBackoff(run: () => Promise<any>): Promise<any> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const promise = run();
+    // Comfortably past the single 1s step, so a call that ends up scheduling
+    // more than one of them (a batch, an elicited re-entry) still drains.
+    await vi.advanceTimersByTimeAsync(5000);
+    return await promise;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+// Yield to the microtask queue until `predicate` holds. Everything under these
+// tests is mocked, so waiting on the STATE we actually care about beats
+// sleeping a fixed number of milliseconds and hoping it was enough.
+async function until(predicate: () => boolean, maxTicks = 200): Promise<void> {
+  for (let i = 0; i < maxTicks; i++) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error("condition never became true");
+}
+
+// File-level, so it runs before EVERY describe's own beforeEach.
+// vi.clearAllMocks() only wipes call history: a persistent mockRejectedValue /
+// mockImplementation installed by one test otherwise survives into every later
+// test in the file, which made the module mocks' default behaviour depend on
+// test ORDER (a later test's first call past its own ...Once queue picked up an
+// earlier test's leftovers). mockReset() restores each mock to the
+// implementation the vi.mock factory handed vi.fn(), so every test starts from
+// the same declared default.
+beforeEach(() => {
+  vi.mocked(connectToUpstream).mockReset();
+  vi.mocked(disconnectFromUpstream).mockReset();
+});
+
 describe("ConnectServer", () => {
   let server: ConnectServer;
 
@@ -134,12 +201,42 @@ describe("ConnectServer", () => {
       ]);
       const conn = makeConnection("gh", ["create_issue", "list_prs"]);
       priv.connections.set("gh", conn);
+      // Advertised, not merely connected. Under the default gateway exposure
+      // discover reports what tools/list actually surfaces, and that keys on
+      // sessionActivated -- a hand-injected connection is what prewarm or a
+      // deferred first call produces, which is deliberately rendered as
+      // "connected (not advertised)" and contributes nothing to the tool
+      // total. handleActivate is what adds the namespace here, so a test
+      // asserting the LOADED rendering has to do the same.
+      priv.sessionActivated.add("gh");
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       expect(text).toContain("gh — GitHub [loaded (2 tools)]");
       expect(text).toContain("slack — Slack [ready]");
       expect(text).toContain("1 loaded in this session, 2 tools in context");
+    });
+
+    it("calls a connected-but-never-activated server unadvertised, and leaves it out of the tool total", () => {
+      // The other half of the rule the test above pins: prewarm's claim and a
+      // deferred first tools/call both leave a CONNECTED entry the client
+      // never asked for. It holds a slot (so it counts as loaded), but under
+      // gateway exposure tools/list withholds its tools -- so the "in context"
+      // number must not include them.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+      // Pinned blank: resolveToolExposure reads the env on every discover, so
+      // an exported YAW_MCP_TOOL_EXPOSURE=full would advertise the namespace
+      // and quietly turn this into a no-op assertion.
+      vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
+      try {
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("gh — GitHub [connected (not advertised — activate to expose)]");
+        expect(text).toContain("1 loaded in this session, 0 tools in context");
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
 
     it("shows disabled servers separately", () => {
@@ -174,6 +271,12 @@ describe("ConnectServer", () => {
       // only — cached estimate, tilde prefix.
       priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
       priv.toolCache.set("slack", [{ name: "post" }, { name: "list_channels" }, { name: "dm" }]);
+      // Only an ADVERTISED namespace adds to the session token total (the
+      // per-server label is rendered either way -- it is what activating WOULD
+      // cost). Injecting the connection by hand skips handleActivate, so the
+      // namespace has to be marked activated for the summary to describe
+      // context actually spent.
+      priv.sessionActivated.add("gh");
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
@@ -181,8 +284,11 @@ describe("ConnectServer", () => {
       expect(text).toMatch(/gh — GitHub.*?— 2 tools, \d+ tokens/);
       // Cached: "N tools, ~M tokens" with tilde.
       expect(text).toMatch(/slack — Slack.*?— 3 tools, ~\d+ tokens/);
-      // Session summary also mentions approximate total tokens.
-      expect(text).toMatch(/1 loaded in this session, 2 tools in context \(~\d+ tokens\)/);
+      // Session summary also mentions approximate total tokens. The source
+      // renders that number with toLocaleString(), so the digits can carry
+      // grouping separators once the total crosses 1,000 (and can be non-ASCII
+      // under a non-Latin locale) -- match a rendered NUMBER, not a bare \d+.
+      expect(text).toMatch(/1 loaded in this session, 2 tools in context \(~\p{N}[\p{N}\p{P}\p{Zs}]* tokens\)/u);
     });
 
     it("omits the cost label when there's nothing to estimate", () => {
@@ -200,13 +306,17 @@ describe("ConnectServer", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
       const conn = makeConnection("gh", ["create_issue"]);
-      // 4/10 failed = 40% → above the 30% warning threshold.
+      // 4/10 failed = 40% → above WARN_RATE_FLOOR, the 10% warning gate in
+      // health-score.ts (and past the 3-call observation floor).
       conn.health = { totalCalls: 10, errorCount: 4, totalLatencyMs: 0, lastErrorMessage: "502 bad gateway" };
       priv.connections.set("gh", conn);
 
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      expect(text).toContain("warn: 4 of last 10 calls failed: 502 bad gateway");
+      // "4 of 10", not "4 of the last 10": health.totalCalls / errorCount run
+      // from the first call of the session and never decay, so there is no
+      // window for "last" to name (see formatHealthWarning in health-score.ts).
+      expect(text).toContain("warn: 4 of 10 calls failed: 502 bad gateway");
     });
 
     it("surfaces a recent activation failure as a discover warning", () => {
@@ -539,9 +649,12 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).not.toContain("Bundle completions");
     });
 
-    it("suppresses the block when every matching bundle is fully installed", () => {
-      // github + linear fully satisfies pr-review, and no other curated
-      // bundle shares just those two namespaces — so partial is empty.
+    it("does not list a bundle whose servers are all installed", () => {
+      // github + linear fully satisfies pr-review. devops-incident and
+      // product-release still share those namespaces, so the block IS
+      // rendered here -- which is exactly why the header assertion has to
+      // come first: without it the negative match below passes trivially if
+      // the whole block ever stops rendering.
       const priv = getPrivate(server);
       priv.config = makeConfig([
         makeServerConfig({ namespace: "github", name: "GitHub" }),
@@ -549,11 +662,23 @@ describe("ConnectServer", () => {
       ]);
       const result = priv.handleDiscover();
       const text = result.content[0].text;
-      // pr-review is fully installed; nothing to "complete" for it.
-      // Other bundles may still be partial (share github/linear), so we
-      // only assert that pr-review doesn't appear as a completion target.
+      expect(text).toContain("Bundle completions");
       const completionsBlock = text.split("Bundle completions")[1] ?? "";
       expect(completionsBlock).not.toMatch(/^\s+pr-review/m);
+    });
+
+    it("suppresses the block when every bundle it touches is fully installed", () => {
+      // postgres + aws + snowflake is exactly data-ops, and no other curated
+      // bundle shares ANY of those namespaces -- so there is no partial
+      // bundle left and the header must not be printed at all.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "postgres", name: "Postgres" }),
+        makeServerConfig({ namespace: "aws", name: "AWS" }),
+        makeServerConfig({ namespace: "snowflake", name: "Snowflake" }),
+      ]);
+      const result = priv.handleDiscover();
+      expect(result.content[0].text).not.toContain("Bundle completions");
     });
 
     it("caps the bundle-completions block at 3 entries", () => {
@@ -565,7 +690,10 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       const text = result.content[0].text;
       const completionLines = text.split("\n").filter((l: string) => l.startsWith("  ") && l.includes("have: slack"));
-      expect(completionLines.length).toBeLessThanOrEqual(3);
+      // Exactly 3, not "at most 3": <= 3 is also satisfied by zero matching
+      // lines, so it could not fail if the block stopped rendering or the
+      // line format moved.
+      expect(completionLines).toHaveLength(3);
     });
   });
 
@@ -651,7 +779,7 @@ describe("ConnectServer", () => {
       const conn = makeConnection("gh", ["create_issue"]);
       vi.mocked(connectToUpstream).mockRejectedValueOnce(new Error("connection refused")).mockResolvedValueOnce(conn);
 
-      const result = await priv.handleActivate(["gh"]);
+      const result = await withoutRetryBackoff(() => priv.handleActivate(["gh"]));
       expect(result.isError).toBeUndefined();
       expect(result.content[0].text).toContain('Loaded "gh"');
       expect(connectToUpstream).toHaveBeenCalledTimes(2);
@@ -664,7 +792,7 @@ describe("ConnectServer", () => {
 
       vi.mocked(connectToUpstream).mockRejectedValue(new Error("timeout"));
 
-      const result = await priv.handleActivate(["gh"]);
+      const result = await withoutRetryBackoff(() => priv.handleActivate(["gh"]));
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain('Failed to load "gh": timeout');
     });
@@ -695,7 +823,7 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([makeServerConfig({ namespace: "bad" })]);
       vi.mocked(connectToUpstream).mockRejectedValue(new Error("bad server down"));
 
-      const result = await priv.handleActivate(["bad"]);
+      const result = await withoutRetryBackoff(() => priv.handleActivate(["bad"]));
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("bad server down");
     });
@@ -703,7 +831,6 @@ describe("ConnectServer", () => {
     it("fix#3: compliance-refusal partial success also sets isError true", async () => {
       // Compliance refusal is synchronous (no retry delay). Use it to
       // exercise the anyError && anyChanged=true branch without a 1s wait.
-      const { default: process } = await import("node:process");
       const priv = getPrivate(server);
       priv.config = makeConfig([
         makeServerConfig({ namespace: "gh" }),
@@ -711,7 +838,11 @@ describe("ConnectServer", () => {
       ]);
       // Only gh will be activated (bad is blocked by compliance).
       vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
-      process.env.YAW_MCP_MIN_COMPLIANCE = "B";
+      // stubEnv, not a raw process.env write: `delete process.env.X` in the
+      // finally would permanently REMOVE a real YAW_MCP_MIN_COMPLIANCE from
+      // the developer's shell for the rest of the run, where unstubAllEnvs
+      // restores whatever was there.
+      vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
       try {
         const result = await priv.handleActivate(["gh", "bad"]);
         // anyError=true (bad refused), anyChanged=true (gh loaded).
@@ -722,7 +853,7 @@ describe("ConnectServer", () => {
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toContain("Refused");
       } finally {
-        delete process.env.YAW_MCP_MIN_COMPLIANCE;
+        vi.unstubAllEnvs();
       }
     });
   });
@@ -1058,6 +1189,20 @@ describe("ConnectServer", () => {
       expect(priv.exportToolCache()).toEqual({ gh: { tools: [{ name: "create_issue" }], learnedAt: 12_345 } });
     });
 
+    it('exportToolCache preserves a "__proto__" namespace as an own key', () => {
+      // sanitizeToolCache/hydrateToolCache preserve a "__proto__" toolCache
+      // namespace on load; the export side must not undo that one flush
+      // later via the inherited setter (same shape as learning's
+      // exportSnapshot hardening).
+      const priv = getPrivate(server);
+      priv.toolCache.set("__proto__", [{ name: "t", namespacedName: "__proto___t", inputSchema: {} }]);
+      priv.toolCacheLearnedAt.set("__proto__", 123);
+      const out = priv.exportToolCache();
+      expect(Object.hasOwn(out, "__proto__")).toBe(true);
+      const roundTripped = JSON.parse(JSON.stringify(out));
+      expect(Object.getOwnPropertyDescriptor(roundTripped, "__proto__")?.value.learnedAt).toBe(123);
+    });
+
     it("a live activation refreshes the cache and stamps it with a fresh learnedAt", async () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
@@ -1084,7 +1229,12 @@ describe("ConnectServer", () => {
       writeFileSync(join(nudgeHome, ".bash_history"), `${lines.join("\n")}\n`, "utf8");
       const priv = getPrivate(server);
       priv.nudgeHome = nudgeHome;
-      priv.nudgeEnv = { ...extra }; // no APPDATA -> PowerShell source skipped
+      // No APPDATA, so the %APPDATA% PowerShell source is skipped. The
+      // PowerShell 7 XDG source is NOT skipped -- doctor-cmd.ts always adds
+      // it -- but it resolves under the synthetic home
+      // (<home>/.local/share/powershell/...), where no history file exists,
+      // so .bash_history is still the only source with content.
+      priv.nudgeEnv = { ...extra };
       // The discover dedup cache is keyed on config/context/active-set, not
       // on nudge state — clear it so repeated handleDiscover() calls in one
       // test re-render instead of returning a stale cached block.
@@ -1106,21 +1256,47 @@ describe("ConnectServer", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
       // Even with a heavy tailscale history present, the gate is off so
-      // nothing is surfaced.
+      // nothing is surfaced. The gate is NOT forced here: `installNudge = false`
+      // is the constructor default (server.ts), and a test that reassigns it
+      // could not tell "off by default" from "off because we said so".
       primeHistory(server, HEAVY("tailscale"));
-      priv.installNudge = false;
+      expect(priv.installNudge).toBe(false);
+
+      // Instrument the one field the scan reads. buildInstallCandidatesLines
+      // returns on the gate BEFORE it touches this.nudgeHome, so a read count
+      // of 0 PROVES the history was never opened -- an absent substring only
+      // proves nothing was rendered.
+      let homeReads = 0;
+      let home: string = priv.nudgeHome;
+      Object.defineProperty(priv, "nudgeHome", {
+        configurable: true,
+        get: () => {
+          homeReads++;
+          return home;
+        },
+        set: (v: string) => {
+          home = v;
+        },
+      });
 
       const withFeatureOff = priv.handleDiscover().content[0].text;
+      expect(homeReads).toBe(0);
       expect(withFeatureOff).not.toContain("Install candidates");
       expect(withFeatureOff).not.toContain("tailscale");
 
       // Byte-identical to a server whose nudgeHome points nowhere (scan
-      // would find nothing) — proves the off path doesn't read history.
-      priv.discoverCache = null;
-      priv.nudgeHome = mkdtempSync(join(tmpdir(), "yaw-mcp-empty-"));
-      const baseline = priv.handleDiscover().content[0].text;
-      expect(withFeatureOff).toBe(baseline);
-      rmSync(priv.nudgeHome, { recursive: true, force: true });
+      // would find nothing) — the off path renders the same discover body.
+      const emptyHome = mkdtempSync(join(tmpdir(), "yaw-mcp-empty-"));
+      try {
+        priv.discoverCache = null;
+        priv.nudgeHome = emptyHome;
+        const baseline = priv.handleDiscover().content[0].text;
+        expect(withFeatureOff).toBe(baseline);
+      } finally {
+        // finally, not a trailing statement: an assertion failure above used
+        // to leak the temp dir for the life of the machine.
+        rmSync(emptyHome, { recursive: true, force: true });
+      }
     });
 
     it("ON: surfaces a heavily-used first-party CLI as an install candidate", () => {
@@ -1193,7 +1369,11 @@ describe("ConnectServer", () => {
       expect(text).not.toContain("Install candidates");
     });
 
-    it("per-CLI suppression: a second discover within the cooldown does not re-nudge", () => {
+    // Titled for what it actually drives: buildInstallCandidatesLines twice,
+    // not two discovers. A real second discover inside the 3s memo would hand
+    // back the cached body without re-running the block at all, so it could
+    // never exercise the per-CLI cooldown this pins.
+    it("per-CLI suppression: a second buildInstallCandidatesLines within the cooldown does not re-nudge", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
       priv.installNudge = true;
@@ -1210,15 +1390,19 @@ describe("ConnectServer", () => {
   });
 
   describe("per-tool load", () => {
-    // `tools/list` is constructed by buildToolList(this.connections, …,
-    // this.toolFilters). These tests drive handleToolCall so the full
-    // activate → filter-apply → routes rebuild → list path is exercised
-    // end-to-end, matching what a real MCP client would see.
-    function listedUpstreamToolNames(priv: any): string[] {
-      return buildToolList(priv.connections, priv.getDeferredServers(), priv.toolFilters)
-        .map((t: { name: string }) => t.name)
-        .filter((n: string) => !n.startsWith("mcp_connect_"));
-    }
+    // These tests drive handleToolCall so the full activate → filter-apply →
+    // routes rebuild → list path is exercised end-to-end, and read the result
+    // through the REAL tools/list handler (listedUpstreamToolNames) so the
+    // exposure mode is production's, not a hand-passed "full". The env is
+    // pinned to blank -- resolveToolExposure reads it per call, so an exported
+    // YAW_MCP_TOOL_EXPOSURE=full would otherwise decide what these assert.
+    beforeEach(() => {
+      vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
 
     it("activate without tools exposes every upstream tool (baseline)", async () => {
       const priv = getPrivate(server);
@@ -1228,7 +1412,7 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
       expect(result.isError).toBeUndefined();
       expect(priv.toolFilters.has("gh")).toBe(false);
-      expect(listedUpstreamToolNames(priv).sort()).toEqual(["gh_bar", "gh_baz", "gh_foo"]);
+      expect((await listedUpstreamToolNames(priv)).sort()).toEqual(["gh_bar", "gh_baz", "gh_foo"]);
     });
 
     it("activate with tools: ['foo'] only surfaces that one tool (others hidden)", async () => {
@@ -1240,7 +1424,7 @@ describe("ConnectServer", () => {
 
       // Filter is persisted on the server for subsequent tools/list calls.
       expect(priv.toolFilters.get("gh")).toEqual(new Set(["foo"]));
-      expect(listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+      expect(await listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
     });
 
     it("re-activating the same namespace without tools clears the filter", async () => {
@@ -1252,11 +1436,11 @@ describe("ConnectServer", () => {
       vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar"]));
 
       await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
-      expect(listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+      expect(await listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
 
       await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
       expect(priv.toolFilters.has("gh")).toBe(false);
-      expect(listedUpstreamToolNames(priv).sort()).toEqual(["gh_bar", "gh_foo"]);
+      expect((await listedUpstreamToolNames(priv)).sort()).toEqual(["gh_bar", "gh_foo"]);
     });
 
     it("dispatch path still routes filtered-out tools (raw upstream reachable)", async () => {
@@ -1270,7 +1454,7 @@ describe("ConnectServer", () => {
       await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
 
       // `gh_bar` is absent from tools/list …
-      expect(listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+      expect(await listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
       // … but the route map still carries it (dispatch path unchanged).
       expect(priv.toolRoutes.has("gh_bar")).toBe(true);
 
@@ -1278,7 +1462,12 @@ describe("ConnectServer", () => {
       const callResult = await priv.handleToolCall("gh_bar", {});
       expect(callResult.isError).toBeUndefined();
       expect(callResult.content[0].text).toBe("bar called");
-      expect(conn.client.callTool).toHaveBeenCalledWith({ name: "bar", arguments: {} });
+      // Only the tools/call PARAMS are this test's business. routeToolCall
+      // also passes `undefined` (keep the SDK's result schema) and a request-
+      // options object carrying the call timeout; those two slots are pinned
+      // in proxy.test.ts, and spelling them out here would make every server
+      // test re-assert the proxy's calling convention.
+      expect(vi.mocked(conn.client.callTool).mock.calls[0][0]).toEqual({ name: "bar", arguments: {} });
     });
 
     it("discover() surfaces a 'filtered: K of N' indicator for filtered servers", async () => {
@@ -1313,7 +1502,7 @@ describe("ConnectServer", () => {
 
       expect(priv.toolFilters.has("gh")).toBe(false);
       expect(priv.toolFilters.has("slack")).toBe(false);
-      expect(listedUpstreamToolNames(priv).sort()).toEqual(["gh_bar", "gh_foo", "slack_send"]);
+      expect((await listedUpstreamToolNames(priv)).sort()).toEqual(["gh_bar", "gh_foo", "slack_send"]);
     });
 
     it("deactivating a server also drops its filter", async () => {
@@ -1388,9 +1577,53 @@ describe("ConnectServer", () => {
       expect(result.isError).toBeUndefined();
       expect(result.content[0].text).toContain("wasn't loaded");
     });
+
+    it("drops the namespace from sessionActivated so gateway mode stops advertising it", async () => {
+      // Load-bearing for the default exposure: buildToolList keys the
+      // advertised surface on sessionActivated, so an entry left behind here
+      // keeps the tools in tools/list and makes the response's "Tools removed
+      // from context" a lie.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+      priv.sessionActivated.add("gh");
+
+      await priv.handleDeactivate(["gh"]);
+
+      expect(priv.sessionActivated.has("gh")).toBe(false);
+    });
+
+    it("skips the routes refresh when nothing was actually unloaded", async () => {
+      // anyChanged gates refreshRoutesAndNotify. An idempotent retry against a
+      // namespace that was never loaded moved no surface, so it must not emit
+      // a list_changed triplet -- clients refetch all three lists on one.
+      const priv = getPrivate(server);
+      const refresh = vi.spyOn(priv, "refreshRoutesAndNotify");
+
+      await priv.handleDeactivate(["ghost"]);
+      expect(refresh).not.toHaveBeenCalled();
+
+      // ...and a mixed call, where something DID unload, still refreshes once.
+      priv.connections.set("gh", makeConnection("gh"));
+      await priv.handleDeactivate(["gh", "ghost"]);
+      expect(refresh).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("trackUsageAndAutoDeactivate", () => {
+    // The fixtures below are built from resolveIdleThreshold(), which reads
+    // the real env. An operator value under the adaptive floor of 5, or at or
+    // above the ceiling of 50, are both accepted by the parser and would make
+    // these fail on that machine only -- pin the documented default instead.
+    beforeEach(() => {
+      vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "");
+      vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
     it("resets idle count for called server", async () => {
       const priv = getPrivate(server);
       priv.connections.set("gh", makeConnection("gh"));
@@ -1526,6 +1759,49 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toContain("last error: timeout at 2026-01-01T00:00:00Z");
     });
 
+    describe("profile header block", () => {
+      it("names both sources when a project profile is layered over a user one", () => {
+        const priv = getPrivate(server);
+        priv.profile = {
+          path: "/proj/.yaw-mcp/config.json",
+          userPath: "/h/.yaw-mcp/config.json",
+          servers: ["gh", "linear"],
+          blocked: ["prod-db"],
+        };
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("Project profile: /proj/.yaw-mcp/config.json");
+        expect(text).toContain("User profile:    /h/.yaw-mcp/config.json");
+        expect(text).toContain("allow: gh, linear");
+        expect(text).toContain("block: prod-db");
+      });
+
+      it("falls back to the generic label when only one source loaded", () => {
+        // `path` alone cannot say WHICH of the two it came from, so the
+        // generic label is the honest one -- claiming "Project profile" for a
+        // user-global file would send the operator editing the wrong file.
+        const priv = getPrivate(server);
+        priv.profile = { path: "/h/.yaw-mcp/config.json" };
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("Profile: /h/.yaw-mcp/config.json");
+        expect(text).not.toContain("Project profile:");
+        expect(text).not.toContain("User profile:");
+        // Neither list is configured, so neither line is printed.
+        expect(text).not.toContain("allow:");
+        expect(text).not.toContain("block:");
+      });
+
+      it("prints no profile block at all when no profile is loaded", () => {
+        const priv = getPrivate(server);
+        priv.profile = null;
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).not.toContain("Profile:");
+        expect(text).toContain("No servers loaded in this session");
+      });
+    });
+
     describe("cross-session reliability block", () => {
       it("surfaces a flaky dormant namespace from persisted learning", () => {
         const priv = getPrivate(server);
@@ -1579,16 +1855,29 @@ describe("ConnectServer", () => {
           zeta: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
           alpha: { dispatched: 20, succeeded: 10, lastUsedAt: Date.now() },
           worst: { dispatched: 5, succeeded: 1, lastUsedAt: Date.now() },
+          // aaa/bbb tie with zeta on BOTH keys (50% of 10), so only the
+          // third comparator can order them. Without a pair like this the
+          // test's name overclaims: alpha (20) and zeta (10) already differ
+          // on dispatched, so the alphabetical tiebreak never runs.
+          bbb: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
+          aaa: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
         });
 
         const result = priv.handleHealth();
         const text = result.content[0].text;
         const worstIdx = text.indexOf("worst ");
         const alphaIdx = text.indexOf("alpha ");
+        const aaaIdx = text.indexOf("aaa ");
+        const bbbIdx = text.indexOf("bbb ");
         const zetaIdx = text.indexOf("zeta ");
         expect(worstIdx).toBeGreaterThan(-1);
+        // 20% beats every 50%.
         expect(worstIdx).toBeLessThan(alphaIdx);
-        expect(alphaIdx).toBeLessThan(zetaIdx);
+        // Same rate, more dispatched.
+        expect(alphaIdx).toBeLessThan(aaaIdx);
+        // Same rate AND same dispatched -> alphabetical.
+        expect(aaaIdx).toBeLessThan(bbbIdx);
+        expect(bbbIdx).toBeLessThan(zetaIdx);
       });
 
       it("caps the list at 5 entries", () => {
@@ -1709,8 +1998,8 @@ describe("ConnectServer", () => {
       priv.packDetector.recordCall("gh", "create_issue", t0 + 300_000);
       priv.packDetector.recordCall("linear", "list_issues", t0 + 301_000);
       // Already connected — no action for the LLM to take.
-      priv.connections.set("gh", { ...makeConnection("gh"), status: "connected" });
-      priv.connections.set("linear", { ...makeConnection("linear"), status: "connected" });
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("linear", makeConnection("linear"));
 
       const result = await priv.handleToolCall("mcp_connect_discover", {});
       expect(result.content[0].text).not.toContain("Recurring packs");
@@ -1729,6 +2018,42 @@ describe("ConnectServer", () => {
 
       const result = await priv.handleToolCall("mcp_connect_discover", {});
       expect(result.content[0].text).not.toContain("Recurring packs");
+    });
+
+    it("caps the block at 3 and orders by frequency desc, then recency", async () => {
+      // Four distinct actionable packs. Frequencies 4 / 3 / 2 / 2 exercise
+      // both comparators: {a1,a2} and {b1,b2} separate on frequency, while
+      // {c1,c2} and {d1,d2} tie at 2 and can only be ordered by lastSeenAt --
+      // and the cap then has to drop the OLDER of the two.
+      const priv = getPrivate(server);
+      priv.config = makeConfig(
+        ["a1", "a2", "b1", "b2", "c1", "c2", "d1", "d2"].map((ns, i) =>
+          makeServerConfig({ id: String(i + 1), namespace: ns, name: ns }),
+        ),
+      );
+      // Bursts are 300s apart (> the 120s idle gap) so each is its own burst;
+      // the two calls inside a burst are 1s apart (< the gap).
+      const t0 = 1_000_000;
+      const burst = (pair: [string, string], index: number): void => {
+        const at = t0 + index * 300_000;
+        priv.packDetector.recordCall(pair[0], "t", at);
+        priv.packDetector.recordCall(pair[1], "t", at + 1000);
+      };
+      for (const i of [0, 1, 2, 3]) burst(["a1", "a2"], i);
+      for (const i of [4, 5, 6]) burst(["b1", "b2"], i);
+      for (const i of [7, 8]) burst(["c1", "c2"], i);
+      for (const i of [9, 10]) burst(["d1", "d2"], i);
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      const text = result.content[0].text;
+      const packLines = text.split("\n").filter((l: string) => l.startsWith("  {"));
+      expect(packLines).toHaveLength(3);
+      expect(packLines[0]).toContain("{a1, a2} — seen 4x");
+      expect(packLines[1]).toContain("{b1, b2} — seen 3x");
+      // d is the more RECENT of the two 2x packs, so it takes the last slot...
+      expect(packLines[2]).toContain("{d1, d2} — seen 2x");
+      // ...and c is dropped by the cap.
+      expect(text).not.toContain("{c1, c2}");
     });
   });
 
@@ -1831,8 +2156,9 @@ describe("ConnectServer", () => {
       // connect promise stays pending), so its slot only exists as a
       // reservation in pendingActivations — not yet in this.connections.
       // With cap=1, "b" racing the check must see that reservation and be
-      // refused. Without the pendingActivations counting (server.ts
-      // 2077-2084) both would pass the check against the same empty
+      // refused. Without the pendingActivations counting in evaluateCapFor
+      // (and the synchronous reservation runActivateOne takes before its
+      // first await) both would pass the check against the same empty
       // connected set and connect, overshooting the cap.
       const priv = getPrivate(server);
       priv.serverCap = 1;
@@ -2019,7 +2345,11 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("gh_create_issue", { title: "test" });
       expect(result.content[0].text).toBe("Issue created");
       expect(conn.health.totalCalls).toBe(1);
-      expect(conn.health.totalLatencyMs).toBeGreaterThanOrEqual(0);
+      // NOT `totalLatencyMs >= 0`: the fixture starts at 0 and the counter is
+      // only ever added to, so that assertion held whether or not anything was
+      // booked. The error side of the same booking is what can actually move.
+      expect(conn.health.errorCount).toBe(0);
+      expect(conn.health.lastErrorMessage).toBeUndefined();
     });
 
     it("tracks error health on failed tool calls", async () => {
@@ -2032,8 +2362,12 @@ describe("ConnectServer", () => {
 
       const result = await priv.handleToolCall("gh_create_issue", {});
       expect(result.isError).toBe(true);
+      expect(conn.health.totalCalls).toBe(1);
       expect(conn.health.errorCount).toBe(1);
-      expect(conn.health.lastErrorMessage).toBeDefined();
+      // Pin the TEXT, not just its presence: a booking that stored the wrong
+      // error (a generic "call failed", or a previous call's message) still
+      // satisfies toBeDefined().
+      expect(conn.health.lastErrorMessage).toContain("upstream failed");
     });
 
     it("attempts auto-reconnect for errored connections", async () => {
@@ -2083,11 +2417,15 @@ describe("ConnectServer", () => {
     });
 
     it("every routing-fault message is recognized by isRoutingFaultText", async () => {
-      // handleExec attributes step blame by substring-matching these
-      // markers. Two of the four messages are produced in proxy.ts, so a
-      // reword there (out of server.ts's reach) would silently start
-      // penalizing an upstream for yaw-mcp's own routing miss. Pin the
-      // real strings, not the constants alone.
+      // What handleExec (and the direct path) actually attribute blame with is
+      // the STRUCTURAL brand, isRoutingFaultResult -- not these marker strings;
+      // isRoutingFaultText has no production caller left and this test is its
+      // only invoker. The markers are still worth pinning as the documented
+      // phrasing: two of the four messages are produced in proxy.ts, so a
+      // reword there (out of server.ts's reach) drifts the docs away from the
+      // text an operator greps for. Cases 1 and 2 assert the real emitted
+      // result (brand AND text); cases 3 and 4 pass hand-typed literals, so
+      // they only re-prove that those constants are in ROUTING_FAULT_MARKERS.
       const priv = getPrivate(server);
 
       // 1. Unknown tool (proxy.ts). Both the pinned text AND the
@@ -2239,24 +2577,24 @@ describe("ConnectServer", () => {
       const fresh = makeConnection("gh", ["create_issue"]);
       fresh.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
       vi.mocked(connectToUpstream).mockImplementation(() => gate as never);
-      // Mirror the PRODUCTION disconnect: flip status synchronously
-      // (upstream.ts does exactly this before awaiting close). With the old
-      // disconnect-first ordering, this flip made every concurrent caller
-      // skip the reconnect branch and take a spurious "no longer connected"
-      // fault -- the default resolved-undefined mock could never catch that.
-      vi.mocked(disconnectFromUpstream).mockImplementation(async (c: UpstreamConnection) => {
-        c.status = "disconnected";
-      });
+      // The disconnect mock mirrors PRODUCTION by default now (see the
+      // vi.mock factory at the top of this file): upstream.ts flips the status
+      // synchronously before awaiting close, and with the old
+      // disconnect-first ordering that flip made every concurrent caller skip
+      // the reconnect branch and take a spurious "no longer connected" fault.
       const refresh = vi.spyOn(priv, "refreshRoutesAndNotify");
       const p1 = priv.handleToolCall("gh_create_issue", {});
       const p2 = priv.handleToolCall("gh_create_issue", {});
-      // Let both callers reach the reconnect await before the spawn lands,
-      // then fire a THIRD caller mid-spawn: the stale entry must still read
-      // status "error" (the disconnect happens after activation), so it
-      // joins the shared inflight instead of erroring.
-      await new Promise((r) => setTimeout(r, 20));
+      // Wait for the STATE, not a stopwatch: both callers have reached the
+      // reconnect await exactly once the shared spawn has been issued. Then
+      // fire a THIRD caller mid-spawn -- the stale entry must still read
+      // status "error" (the disconnect happens after activation), so it joins
+      // the shared inflight instead of erroring.
+      await until(() => vi.mocked(connectToUpstream).mock.calls.length === 1);
       const p3 = priv.handleToolCall("gh_create_issue", {});
-      await new Promise((r) => setTimeout(r, 20));
+      // One macrotask turn so p3 gets to the same await before the spawn
+      // resolves. A zero-delay tick, not a 20ms guess.
+      await new Promise((r) => setTimeout(r, 0));
       release(fresh);
       const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
       expect(r1.isError).toBeFalsy();
@@ -2405,20 +2743,6 @@ describe("ConnectServer", () => {
       expect(markReply).toHaveBeenCalledWith("gh", false);
     });
 
-    it('exportToolCache preserves a "__proto__" namespace as an own key', () => {
-      // sanitizeToolCache/hydrateToolCache preserve a "__proto__" toolCache
-      // namespace on load; the export side must not undo that one flush
-      // later via the inherited setter (same shape as learning's
-      // exportSnapshot hardening).
-      const priv = getPrivate(server);
-      priv.toolCache.set("__proto__", [{ name: "t", namespacedName: "__proto___t", inputSchema: {} }]);
-      priv.toolCacheLearnedAt.set("__proto__", 123);
-      const out = priv.exportToolCache();
-      expect(Object.hasOwn(out, "__proto__")).toBe(true);
-      const roundTripped = JSON.parse(JSON.stringify(out));
-      expect(Object.getOwnPropertyDescriptor(roundTripped, "__proto__")?.value.learnedAt).toBe(123);
-    });
-
     it("exec steps mark redispatch replies on the dispatched namespace", async () => {
       // markReply must run OUTSIDE the deferLearning guard: exec steps are
       // real usage even though their learning credit is attributed per
@@ -2562,7 +2886,13 @@ describe("ConnectServer", () => {
       const conn = makeConnection("gh", ["create_issue"]);
       vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
 
-      await priv.handleDispatch("github issue", 1);
+      const result = await priv.handleDispatch("github issue", 1);
+      // Prove the activation HAPPENED first: "learning.get is undefined" is
+      // also the untouched initial state, so without these the test would
+      // pass on a dispatch that ranked nothing and activated nothing.
+      expect(result.isError).toBeUndefined();
+      expect(connectToUpstream).toHaveBeenCalledTimes(1);
+      expect(priv.connections.get("gh")).toBe(conn);
       expect(priv.learning.get("gh")).toBeUndefined();
     });
 
@@ -2583,11 +2913,13 @@ describe("ConnectServer", () => {
     it("dispatch does NOT record a namespace whose activation failed", async () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
-      // Persistent rejection: runActivateOne retries once, and a
-      // ...Once mock would hand the retry a default-resolved undefined.
+      // Persistent rejection: runActivateOne retries once, and a ...Once mock
+      // would hand the retry whatever the module mock resolves to (undefined,
+      // now that the file-level beforeEach resets implementations between
+      // tests) rather than a second failure.
       vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
 
-      await priv.handleDispatch("github issue", 1);
+      await withoutRetryBackoff(() => priv.handleDispatch("github issue", 1));
       // Success-only, mirroring handleActivate.
       expect(priv.sessionActivated.has("gh")).toBe(false);
     });
@@ -2701,7 +3033,9 @@ describe("ConnectServer", () => {
       // The second upstream call must have received the resolved value,
       // not the raw $ref marker -- otherwise the resolver never fired.
       // "42" parses as the number 42 via JSON.parse, so number (not string).
-      expect(callTool).toHaveBeenNthCalledWith(2, {
+      // Params only -- routeToolCall's result-schema and request-options slots
+      // are proxy.test.ts's contract, not this pipeline test's.
+      expect(callTool.mock.calls[1][0]).toEqual({
         name: "get_pr",
         arguments: { number: 42 },
       });
@@ -2797,8 +3131,9 @@ describe("ConnectServer", () => {
       expect(parsed.ok).toBe(true);
       // The parsed object from the second call.
       expect(parsed.result).toEqual({ title: "bug fix" });
-      // The upstream received the resolved number from the first step.
-      expect(conn.client.callTool).toHaveBeenNthCalledWith(2, {
+      // The upstream received the resolved number from the first step. Params
+      // only, for the reason the sibling $ref test above gives.
+      expect(vi.mocked(conn.client.callTool).mock.calls[1][0]).toEqual({
         name: "get_pr",
         arguments: { number: 7 },
       });
@@ -2910,7 +3245,7 @@ describe("activateOne dedup", () => {
 
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("down"));
 
-    const r1 = await priv.activateOne("gh");
+    const r1 = await withoutRetryBackoff(() => priv.activateOne("gh"));
     expect(r1.ok).toBe(false);
     expect(priv.activationInflight.has("gh")).toBe(false);
 
@@ -2937,7 +3272,8 @@ describe("exec step-level split-blame attribution", () => {
     // A two-step pipeline across DISTINCT namespaces: producer "prod"
     // succeeds and feeds its output into consumer "cons" via {$ref:"p"}.
     // "cons" then fails with an input-shaped (validation) error. The
-    // split-blame logic (server.ts 3745-3758) must:
+    // split-blame logic in handleExec's step-attribution block (the
+    // `inputShaped && deps.length > 0` arm in server.ts) must:
     //   - leave the producer's dispatch count at 1 (it already booked its
     //     own dispatch on success) and only DOCK its earned credit by 0.5
     //     via delta-only adjustSucceeded — NOT re-book a fresh dispatch.
@@ -2991,6 +3327,51 @@ describe("exec step-level split-blame attribution", () => {
     expect(cons?.dispatched).toBe(1);
     expect(cons?.succeeded).toBeCloseTo(0.5, 5);
   });
+
+  it("splits blame on the TRANSPORT-level [code=-32602] arm too", async () => {
+    // inputShaped is a disjunction: the case above covers the structured
+    // isError body that classifyError reads as validation_error. This covers
+    // the OTHER arm -- callTool THROWS a JSON-RPC error carrying code -32602,
+    // and proxy.ts renders it as a "[code=-32602]" tag in the error text.
+    // Only that tag identifies it; classifyError never sees a structured body.
+    const priv = getPrivate(server);
+
+    const prodConn = makeConnection("prod", ["make"]);
+    prodConn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "prod-ok" }] });
+
+    const consConn = makeConnection("cons", ["use"]);
+    consConn.client.callTool = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("Invalid arguments"), { code: -32602 }));
+
+    priv.connections.set("prod", prodConn);
+    priv.connections.set("cons", consConn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "prod" }), makeServerConfig({ namespace: "cons" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [
+        { id: "p", tool: "prod_make", args: {} },
+        { id: "c", tool: "cons_use", args: { x: { $ref: "p" } } },
+      ],
+      return: "c",
+    });
+
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.failedStep).toBe("c");
+    expect(parsed.error).toContain("[code=-32602]");
+
+    // Same split as the structured-body case: producer docked, consumer
+    // booked at half credit. A regression that only recognised the
+    // classifyError arm would full-blame the consumer (succeeded 0) here.
+    const prod = priv.learning.get("prod");
+    expect(prod?.dispatched).toBe(1);
+    expect(prod?.succeeded).toBeCloseTo(0.5, 5);
+    const cons = priv.learning.get("cons");
+    expect(cons?.dispatched).toBe(1);
+    expect(cons?.succeeded).toBeCloseTo(0.5, 5);
+  });
 });
 
 describe("handleToolCall route snapshot", () => {
@@ -3005,7 +3386,13 @@ describe("handleToolCall route snapshot", () => {
     await server.shutdown();
   });
 
-  it("uses the route snapshot even if toolRoutes is swapped mid-call", async () => {
+  it("survives a toolRoutes swap during the reconnect await", async () => {
+    // Named for what actually recovers here. The entry snapshot is NOT it:
+    // the reconnect branch re-snapshots (`routes = this.toolRoutes; route =
+    // routes.get(name)`) after its own rebuild, so this test would stay green
+    // even if routeToolCall read this.toolRoutes directly. What it pins is
+    // that the post-reconnect rebuild repopulates the table an unrelated
+    // rebuild emptied mid-await, instead of dead-ending on "Unknown tool".
     const priv = getPrivate(server);
     const errorConn = makeConnection("gh", ["create_issue"], "error");
     priv.connections.set("gh", errorConn);
@@ -3017,10 +3404,8 @@ describe("handleToolCall route snapshot", () => {
       content: [{ type: "text", text: "ok after reconnect" }],
     });
 
-    // Simulate an unrelated rebuild swapping this.toolRoutes during
-    // the reconnect await. With the old code, the subsequent
-    // routeToolCall would run against the empty Map and return an
-    // "Unknown tool" error. With the snapshot, it still resolves.
+    // Simulate an unrelated rebuild swapping this.toolRoutes during the
+    // reconnect await.
     vi.mocked(connectToUpstream).mockImplementationOnce(async () => {
       priv.toolRoutes = new Map();
       return freshConn;
@@ -3203,11 +3588,23 @@ describe("resources/templates/list", () => {
     // found. Empty is honest today: buildResourceRoutes only ever sees
     // concrete conn.resources, so a templated URI could not be read
     // through the proxy anyway.
+    //
+    // Driven through a REAL client over a linked in-memory transport rather
+    // than reaching into the SDK's private _requestHandlers map: the point of
+    // the test is that a probing client does not get -32601, and a rename of
+    // that internal field is not a behaviour change.
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
     const priv = getPrivate(server);
-    const handler = priv.server._requestHandlers.get("resources/templates/list");
-    expect(handler).toBeDefined();
-    const res = await handler({ method: "resources/templates/list", params: {} }, {} as never);
-    expect(res).toEqual({ resourceTemplates: [] });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await priv.server.connect(serverTransport);
+    const client = new Client({ name: "templates-probe", version: "0" });
+    try {
+      await client.connect(clientTransport);
+      await expect(client.listResourceTemplates()).resolves.toEqual({ resourceTemplates: [] });
+    } finally {
+      await client.close();
+    }
   });
 });
 
@@ -3223,7 +3620,10 @@ describe("prewarmDormantServers", () => {
     await server.shutdown();
   });
 
-  it("activates dormant servers, persists toolCache, and disconnects", async () => {
+  // "caches", not "persists": nothing is written to disk in unit tests --
+  // persistenceReady stays false without start(), so scheduleStateSave no-ops
+  // and the only thing this can (and does) assert is the in-memory toolCache.
+  it("activates dormant servers, caches their tools in memory, and disconnects", async () => {
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -3326,8 +3726,14 @@ describe("prewarmDormantServers", () => {
       .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
       .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
       .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
-    const result = await priv.activateOne("gh", undefined, /* fromPrewarm */ true);
+    const result = await withoutRetryBackoff(() => priv.activateOne("gh", undefined, /* fromPrewarm */ true));
     expect(result.ok).toBe(true);
+    // Pin the SHAPE, not just the outcome: two failed attempts plus exactly
+    // one elicited retry. Without these, a path that simply succeeded on some
+    // other attempt would satisfy the assertions below and the "the ELICITED
+    // retry stayed cap-exempt" claim would be inferred rather than proved.
+    expect(connectToUpstream).toHaveBeenCalledTimes(3);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
     // The retry ran cap-exempt: toolCache learned, namespace visible.
     expect(priv.toolCache.get("gh")).toBeDefined();
   });
@@ -3441,7 +3847,7 @@ describe("prewarmDormantServers", () => {
       return makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]);
     });
 
-    await priv.prewarmDormantServers();
+    await withoutRetryBackoff(() => priv.prewarmDormantServers());
 
     // "ok" still populated its cache even though "broken" threw.
     expect(priv.toolCache.get("ok")).toEqual([{ name: "ok_tool", description: undefined }]);
@@ -3518,8 +3924,10 @@ describe("auto-load on startup", () => {
     expect(isAutoLoadEnabled()).toBe(false);
   });
 
+  // The three cases below call autoLoadRecurringPack() DIRECTLY, which is
+  // below the gate -- so no YAW_MCP_AUTO_LOAD stub is set here; one would be
+  // dead setup that reads as coverage the gate does not have.
   it("activates every namespace in the top recurring pack when all are installed", async () => {
-    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -3553,7 +3961,6 @@ describe("auto-load on startup", () => {
   });
 
   it("does not activate anything when some pack namespaces aren't installed", async () => {
-    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     const priv = getPrivate(server);
     // Only `gh` is installed — the {gh, slack} pack can't be activated
     // as a whole, so we must skip it entirely. Activating just `gh`
@@ -3575,7 +3982,6 @@ describe("auto-load on startup", () => {
   });
 
   it("is a silent no-op when pack history is empty", async () => {
-    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -3587,48 +3993,75 @@ describe("auto-load on startup", () => {
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
   });
 
-  describe("fix#5: dispatch budget schema declares default: 1", () => {
-    it("budget property carries default: 1 in the JSON schema", async () => {
-      // The description text says 'Default budget is 1' but the JSON schema
-      // property had no `default` annotation. Both must agree with the
-      // runtime behaviour (server.ts line 795: defaults to 1 when omitted).
-      const { META_TOOLS } = await import("../meta-tools.js");
-      const budgetProp = (META_TOOLS.dispatch.inputSchema.properties as Record<string, unknown>).budget as Record<
-        string,
-        unknown
-      >;
-      expect(budgetProp).toBeDefined();
-      expect(budgetProp.default).toBe(1);
-    });
+  it("the start() gate needs BOTH the env flag and hydrated persistence", () => {
+    // The only consultation of isAutoLoadEnabled() is `isAutoLoadEnabled() &&
+    // this.persistenceReady` inside start()'s oninitialized hook, and start()
+    // needs a live stdio transport, so the conjunction itself is not reachable
+    // from a unit test. Each conjunct is: the env read, and persistenceReady,
+    // which stays false until start() has hydrated state -- which is why a
+    // unit-test ConnectServer never auto-loads however the env is set.
+    vi.stubEnv("YAW_MCP_AUTO_LOAD", "1");
+    expect(isAutoLoadEnabled()).toBe(true);
+    expect(getPrivate(server).persistenceReady).toBe(false);
+  });
+});
+
+describe("fix#5: dispatch budget schema declares default: 1", () => {
+  // Top-level: this is a meta-tools.ts schema assertion that never touches
+  // ConnectServer, let alone auto-load, and was nested under "auto-load on
+  // startup" purely by where it was written.
+  it("budget property carries default: 1 in the JSON schema", async () => {
+    // The description text says 'Default budget is 1' but the JSON schema
+    // property had no `default` annotation. Both must agree with the
+    // runtime behaviour (handleToolCall's dispatch branch in server.ts
+    // defaults `budget` to 1 when it is absent or non-finite).
+    const { META_TOOLS } = await import("../meta-tools.js");
+    const budgetProp = (META_TOOLS.dispatch.inputSchema.properties as Record<string, unknown>).budget as Record<
+      string,
+      unknown
+    >;
+    expect(budgetProp).toBeDefined();
+    expect(budgetProp.default).toBe(1);
+  });
+});
+
+describe("fix#6: deferred-route miss error names mcp_connect_discover", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
   });
 
-  describe("fix#6: deferred-route miss error names mcp_connect_discover", () => {
-    it("names mcp_connect_discover in the 'tool vanished' error message", async () => {
-      // When a deferred-route activation succeeds but the tool is no
-      // longer in the live schema, the error must name the recovery call
-      // so the model knows what to do next.
-      const priv = getPrivate(server);
-      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-      // Set up a deferred route for gh_stale_tool.
-      priv.toolRoutes = new Map([
-        [
-          "gh_stale_tool",
-          {
-            namespace: "gh",
-            originalName: "stale_tool",
-            namespacedName: "gh_stale_tool",
-            deferred: true,
-          },
-        ],
-      ]);
-      // connectToUpstream succeeds but returns a connection without stale_tool.
-      const conn = makeConnection("gh", ["create_issue"]);
-      vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+  afterEach(async () => {
+    await server.shutdown();
+  });
 
-      const result = await priv.handleToolCall("gh_stale_tool", {});
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("mcp_connect_discover");
-    });
+  it("names mcp_connect_discover in the 'tool vanished' error message", async () => {
+    // When a deferred-route activation succeeds but the tool is no
+    // longer in the live schema, the error must name the recovery call
+    // so the model knows what to do next.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    // Set up a deferred route for gh_stale_tool.
+    priv.toolRoutes = new Map([
+      [
+        "gh_stale_tool",
+        {
+          namespace: "gh",
+          originalName: "stale_tool",
+          namespacedName: "gh_stale_tool",
+          deferred: true,
+        },
+      ],
+    ]);
+    // connectToUpstream succeeds but returns a connection without stale_tool.
+    const conn = makeConnection("gh", ["create_issue"]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+
+    const result = await priv.handleToolCall("gh_stale_tool", {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("mcp_connect_discover");
   });
 });
 
@@ -3838,6 +4271,39 @@ describe("idle threshold env knob", () => {
     expect(resolveIdleThreshold()).toBe(DEFAULT_IDLE_CALL_THRESHOLD);
   });
 
+  it("warns once per distinct baseline that sits below the adaptive floor", () => {
+    // adaptiveThreshold() clamps UP to ADAPTIVE_MIN, so 1..4 all behave as 5
+    // and an operator asking for aggressive reaping silently gets the floor.
+    // The mirror of the above-the-ceiling warn, and it has to live in
+    // resolveIdleThreshold: adaptiveThreshold is pure and is scored on every
+    // tool call, so warning there would log per call. Same reason this
+    // function must not warn per call either -- hence the once-per-value
+    // assertion below.
+    const written: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    }) as never);
+    try {
+      // Pinned so a developer running with LOG_LEVEL=error does not silence
+      // the very line under test.
+      vi.stubEnv("LOG_LEVEL", "");
+      // 2 is not used by any sibling case here: the warn dedups on the VALUE,
+      // and the module-level slot outlives a single test.
+      vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "2");
+      // The raw value still comes back -- clamping is adaptiveThreshold's job.
+      expect(resolveIdleThreshold()).toBe(2);
+      resolveIdleThreshold();
+
+      const warns = written.filter((l) => l.includes("Idle threshold below the adaptive floor"));
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toContain('"configured":2');
+      expect(warns[0]).toContain('"effectiveMin":5');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("is re-read per call, not latched at import", async () => {
     const s = new ConnectServer();
     const priv = getPrivate(s);
@@ -3925,10 +4391,17 @@ describe("idle reaper vs in-flight tool calls", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // The fixtures below seed idle counts from resolveIdleThreshold(), which
+    // reads the real env: an exported value below the adaptive floor of 5 (or
+    // at/above the ceiling of 50) would make these fail on that machine only.
+    // 10 is DEFAULT_IDLE_CALL_THRESHOLD, i.e. what an unset env resolves to.
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "10");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "");
     server = new ConnectServer();
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await server.shutdown();
   });
 
@@ -4102,7 +4575,7 @@ describe("per-tool filter rollback on a failed activation", () => {
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
 
-    const result = await priv.handleActivate(["gh"], undefined, ["foo"]);
+    const result = await withoutRetryBackoff(() => priv.handleActivate(["gh"], undefined, ["foo"]));
     expect(result.isError).toBe(true);
     // A surviving filter would silently narrow a LATER successful load --
     // dispatch and the deferred path never touch toolFilters.
@@ -4115,7 +4588,7 @@ describe("per-tool filter rollback on a failed activation", () => {
     priv.toolFilters.set("gh", new Set(["create_issue"]));
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
 
-    await priv.handleActivate(["gh"], undefined, ["close_issue"]);
+    await withoutRetryBackoff(() => priv.handleActivate(["gh"], undefined, ["close_issue"]));
 
     expect([...(priv.toolFilters.get("gh") ?? [])]).toEqual(["create_issue"]);
   });
@@ -4159,7 +4632,7 @@ describe("discover cache invalidation", () => {
     expect(first.content[0].text).not.toContain("last activation failed");
 
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
-    await priv.activateOne("gh");
+    await withoutRetryBackoff(() => priv.activateOne("gh"));
 
     // Same cache key, still inside the 3s TTL -- but the failure warning
     // must show up. This is the exact "discover, failed activate, discover
@@ -4254,29 +4727,63 @@ describe("shutdown drains and refuses activations", () => {
 });
 
 describe("resolveToolExposure", () => {
-  const prev = process.env.YAW_MCP_TOOL_EXPOSURE;
+  // stubEnv / unstubAllEnvs like the rest of the file, rather than a
+  // hand-rolled save at COLLECTION time (which snapshots before any other
+  // suite has run) and a restore in afterEach.
   afterEach(() => {
-    if (prev === undefined) delete process.env.YAW_MCP_TOOL_EXPOSURE;
-    else process.env.YAW_MCP_TOOL_EXPOSURE = prev;
+    vi.unstubAllEnvs();
   });
 
   it("defaults to gateway when unset or blank", () => {
-    delete process.env.YAW_MCP_TOOL_EXPOSURE;
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", undefined);
     expect(resolveToolExposure()).toBe("gateway");
-    process.env.YAW_MCP_TOOL_EXPOSURE = "   ";
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "   ");
     expect(resolveToolExposure()).toBe("gateway");
   });
 
   it("honors an explicit full opt-out, case-insensitively", () => {
-    process.env.YAW_MCP_TOOL_EXPOSURE = "FULL";
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "FULL");
     expect(resolveToolExposure()).toBe("full");
   });
 
   it("falls back to gateway on an unrecognized value, not to the full surface", () => {
     // A typo must not silently restore the ~27,000-token catalog; failing
     // toward the smaller surface is the recoverable direction.
-    process.env.YAW_MCP_TOOL_EXPOSURE = "gatway";
+    // LOG_LEVEL=error mutes the once-per-bad-value warn this path emits --
+    // an expected diagnostic should not print into the suite's own output.
+    vi.stubEnv("LOG_LEVEL", "error");
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "gatway");
     expect(resolveToolExposure()).toBe("gateway");
+  });
+
+  it("warns once per distinct bad value, not once per call", () => {
+    // This resolver runs from all three list handlers, so an unconditional
+    // warn is three lines per client refresh and three more after every
+    // list_changed notification -- noise an operator learns to skim past.
+    // Keyed on the VALUE, so swapping one typo for another is still reported.
+    const written: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    }) as never);
+    try {
+      // Matched on the structured `raw` field, not on the message: the line is
+      // JSON, so the quotes the message puts around the value arrive escaped.
+      const warnsFor = (value: string) =>
+        written.filter((l) => l.includes("unrecognized YAW_MCP_TOOL_EXPOSURE") && l.includes(`"raw":"${value}"`));
+
+      vi.stubEnv("LOG_LEVEL", "");
+      vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "gatewya");
+      resolveToolExposure();
+      resolveToolExposure();
+      expect(warnsFor("gatewya")).toHaveLength(1);
+
+      vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "fulll");
+      resolveToolExposure();
+      expect(warnsFor("fulll")).toHaveLength(1);
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });
 
@@ -4284,31 +4791,26 @@ describe("session activation lifetime (gateway mode)", () => {
   let server: ConnectServer;
   beforeEach(() => {
     vi.clearAllMocks();
+    // Gateway is the DEFAULT exposure, so the tests below read the real
+    // tools/list handler (listedUpstreamToolNames) with the env left blank
+    // rather than re-implementing the handler's buildToolList call with a
+    // hardcoded "gateway". That is what puts resolveToolExposure() and
+    // this.sessionActivated under test instead of around it.
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
     server = new ConnectServer();
   });
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await server.shutdown();
   });
-
-  function listed(priv: any): string[] {
-    return buildToolList(
-      priv.connections,
-      priv.getDeferredServers(),
-      priv.toolFilters,
-      "gateway",
-      priv.sessionActivated,
-    )
-      .map((t: { name: string }) => t.name)
-      .filter((n: string) => !n.startsWith("mcp_connect_"));
-  }
 
   it("advertises a namespace only after an explicit activate", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
-    expect(listed(priv)).toEqual([]);
+    expect(await listedUpstreamToolNames(priv)).toEqual([]);
     await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
-    expect(listed(priv)).toEqual(["gh_foo"]);
+    expect(await listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
   });
 
   it("stops advertising it after deactivate", async () => {
@@ -4342,7 +4844,7 @@ describe("session activation lifetime (gateway mode)", () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     vi.mocked(connectToUpstream).mockRejectedValueOnce(new Error("nope"));
-    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await withoutRetryBackoff(() => priv.handleToolCall("mcp_connect_activate", { server: "gh" }));
     expect(priv.sessionActivated.has("gh")).toBe(false);
   });
 });
@@ -4351,26 +4853,22 @@ describe("gateway activation contract (what a client observes)", () => {
   let server: ConnectServer;
   beforeEach(() => {
     vi.clearAllMocks();
+    // Same reason as the sibling describe: drive the REAL tools/list handler
+    // (listTools) at the default exposure. The local `list()` helper this
+    // replaced was a verbatim copy of the sibling's `listed()` minus the name
+    // mapping, and neither exercised resolveToolExposure().
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
     server = new ConnectServer();
   });
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await server.shutdown();
   });
 
-  function list(priv: any) {
-    return buildToolList(
-      priv.connections,
-      priv.getDeferredServers(),
-      priv.toolFilters,
-      "gateway",
-      priv.sessionActivated,
-    );
-  }
-
-  it("serves only the meta-tools before any activation", () => {
+  it("serves only the meta-tools before any activation", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
-    const names = list(priv).map((t) => t.name);
+    const names = (await listTools(priv)).map((t) => t.name);
     expect(names.every((n) => n.startsWith("mcp_connect_"))).toBe(true);
     expect(names.length).toBeGreaterThan(0);
   });
@@ -4383,7 +4881,7 @@ describe("gateway activation contract (what a client observes)", () => {
     priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
     vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo"]));
     await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
-    const foo = list(priv).find((t) => t.name === "gh_foo");
+    const foo = (await listTools(priv)).find((t) => t.name === "gh_foo");
     expect(foo?.inputSchema).toEqual({ type: "object" });
     expect(foo?.inputSchema).not.toHaveProperty("additionalProperties");
   });
@@ -4397,13 +4895,18 @@ describe("gateway activation contract (what a client observes)", () => {
     expect(spy).toHaveBeenCalled();
   });
 
-  it("keeps a route to an unadvertised tool, so dispatch can still reach it", () => {
-    // The guarantee that makes withholding the catalog safe.
+  it("keeps a route to an unadvertised tool, so dispatch can still reach it", async () => {
+    // The guarantee that makes withholding the catalog safe. Both halves now
+    // run against the SERVER's own state: the config is installed and
+    // rebuildRoutes() populates this.toolRoutes, instead of calling proxy.ts
+    // directly with a hand-built list while the server knew about no servers
+    // at all -- under which tools/list could not have contained the tool
+    // under ANY exposure, so the negative half proved nothing.
     const priv = getPrivate(server);
-    const inactive = [{ ...makeServerConfig({ namespace: "tailscale" }), toolCache: [{ name: "status" }] }];
-    const routes = buildToolRoutes(priv.connections, inactive as any);
-    expect(routes.has("tailscale_status")).toBe(true);
-    expect(list(priv).some((t) => t.name === "tailscale_status")).toBe(false);
+    priv.config = makeConfig([{ ...makeServerConfig({ namespace: "tailscale" }), toolCache: [{ name: "status" }] }]);
+    priv.rebuildRoutes();
+    expect(priv.toolRoutes.has("tailscale_status")).toBe(true);
+    expect((await listTools(priv)).some((t) => t.name === "tailscale_status")).toBe(false);
   });
 });
 
@@ -4506,6 +5009,10 @@ describe("resolveIdleThreshold strict parse + clamp notice", () => {
   });
 
   it("warns that a baseline above the adaptive ceiling will be clamped", () => {
+    // log() drops warn-level lines before they reach stderr when LOG_LEVEL is
+    // `error`, so an operator shell exporting that turns this red for reasons
+    // that have nothing to do with the clamp. Pin the level the assertion needs.
+    vi.stubEnv("LOG_LEVEL", "warn");
     const writes: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") writes.push(chunk);
@@ -4546,7 +5053,7 @@ describe("failed prewarm releases its namespace claim", () => {
     // Persistent rejection: runActivateOne retries once internally.
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT"));
 
-    await priv.prewarmDormantServers();
+    await withoutRetryBackoff(() => priv.prewarmDormantServers());
 
     // The claim exists to stop prewarm tearing down a connection an explicit
     // activate took over. A FAILED prewarm owns no connection, so leaving the
@@ -4608,6 +5115,12 @@ describe("discover summary counts only connected servers", () => {
       makeServerConfig({ namespace: "slack", name: "Slack" }),
     ]);
     priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+    // Both namespaces are marked activated so the tool total below is decided
+    // by the connection STATUS -- the thing under test -- rather than by
+    // gateway exposure withholding an unadvertised namespace, which would make
+    // the assertion pass for the wrong reason.
+    priv.sessionActivated.add("gh");
+    priv.sessionActivated.add("slack");
     // Dead slot: the cap logic (evaluateCapFor) does not count it, so the
     // summary must not either.
     priv.connections.set("slack", makeConnection("slack", [], "error"));
@@ -4622,10 +5135,16 @@ describe("auto-warm failure reaches the discover output", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // handleDiscoverWithAutoWarm short-circuits to a plain discover when
+    // isAutoActivateEnabled() is false, so an operator YAW_MCP_AUTO_ACTIVATE=0
+    // would make every case here assert against output the auto-warm path
+    // never produced. Blank reads as the documented default (ON).
+    vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "");
     server = new ConnectServer();
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await server.shutdown();
   });
 
@@ -4655,17 +5174,19 @@ describe("auto-warm failure reaches the discover output", () => {
     vi.spyOn(priv, "twoStageRank").mockResolvedValue([{ namespace: "gh", score: 5 }]);
     vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn ENOENT npx"));
 
-    const result = await priv.handleDiscoverWithAutoWarm("github issue");
+    const result = await withoutRetryBackoff(() => priv.handleDiscoverWithAutoWarm("github issue"));
     const text = result.content.map((c: { text: string }) => c.text).join("\n");
     expect(text).toContain('Could not auto-load "gh"');
     expect(text).toContain("spawn ENOENT npx");
 
     // The failure line is appended to a COPY: a memoized body must never
-    // carry this one attempt's failure into later cache hits.
-    if (priv.discoverCache) {
-      const cachedText = priv.discoverCache.result.content.map((c: { text: string }) => c.text).join("\n");
-      expect(cachedText).not.toContain("Could not auto-load");
-    }
+    // carry this one attempt's failure into later cache hits. Asserted
+    // unconditionally -- the old `if (priv.discoverCache)` guard silently
+    // skipped the whole check if a future edit ever left the memo null after
+    // a failed auto-warm, which is exactly when it would stop being proved.
+    expect(priv.discoverCache).not.toBeNull();
+    const cachedText = priv.discoverCache.result.content.map((c: { text: string }) => c.text).join("\n");
+    expect(cachedText).not.toContain("Could not auto-load");
   });
 });
 
@@ -4850,10 +5371,15 @@ describe("response pruning respects structuredContent", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // isPruneEnabled() reads the env per call, so an operator
+    // YAW_MCP_PRUNE_RESPONSES=0 would make the first case below assert against
+    // an unpruned body. Blank reads as the documented default (pruning on).
+    vi.stubEnv("YAW_MCP_PRUNE_RESPONSES", "");
     server = new ConnectServer();
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await server.shutdown();
   });
 
@@ -4903,17 +5429,20 @@ describe("vault passphrase elicitation", () => {
   let server: ConnectServer;
 
   beforeEach(() => {
-    // mockReset, not just clearAllMocks: clear wipes call history but LEAVES
-    // implementations, so a persistent mockRejectedValue set by one case
-    // survives into the next -- and into any describe appended after this
-    // one, where it surfaces as an unrelated flake on the first call past
-    // that test's own ...Once queue.
-    vi.mocked(connectToUpstream).mockReset();
-    // Same reason, and the default has to be re-established: a case that sets
-    // a persistent `false` here (the attempt-budget one) would otherwise make
-    // every later case's passphrase fail verification.
+    // connectToUpstream / disconnectFromUpstream are reset by the file-level
+    // beforeEach. verifyVaultPassphrase needs its own, and its default has to
+    // be re-established because it was attached with mockResolvedValue rather
+    // than passed to vi.fn(): a case that sets a persistent `false` here (the
+    // attempt-budget one) would otherwise make every later case's passphrase
+    // fail verification.
     vi.mocked(verifyVaultPassphrase).mockReset().mockResolvedValue(true);
     vi.clearAllMocks();
+    // vaultPassphrase() falls back to the real env when no session value is
+    // set, and exporting YAW_MCP_VAULT_PASSPHRASE is the product's own
+    // documented way to skip the prompt -- so on such a machine every
+    // `toBeUndefined()` below would read the developer's own passphrase.
+    // `undefined` tells Vitest to DELETE the variable for the test.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", undefined);
     server = new ConnectServer();
   });
 
@@ -4922,6 +5451,7 @@ describe("vault passphrase elicitation", () => {
     // braces for a case that throws before reaching it.
     await server.shutdown();
     clearSessionVaultPassphrase();
+    vi.unstubAllEnvs();
   });
 
   function lockedVaultError(namespace: string, reason: "missing" | "invalid" = "missing") {
@@ -5079,7 +5609,16 @@ describe("vault passphrase elicitation", () => {
       .mockRejectedValueOnce(lockedVaultError("gh"))
       .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
 
-    await priv.activateOne("gh");
+    const result = await priv.activateOne("gh");
+
+    // Prove the vault-elicitation path RAN before asserting what it did not
+    // store: an elicitedEnv entry is absent on a path that never prompted at
+    // all, so without these the test stays green if the whole flow no-ops.
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    expect(vaultPassphrase()).toBe("s3kr1t");
+    // One refused spawn plus the post-elicitation retry, and the retry won.
+    expect(connectToUpstream).toHaveBeenCalledTimes(2);
+    expect(result.ok).toBe(true);
 
     expect(priv.elicitedEnv.get("gh")).toBeUndefined();
     // Belt and braces: whatever env the retry spawned with, it is not in it.
@@ -5135,7 +5674,7 @@ describe("vault passphrase elicitation", () => {
       new ActivationError("spawn failed", "unknown", "YAW_MCP_VAULT_PASSPHRASE is not set\n"),
     );
 
-    const result = await priv.activateOne("evil");
+    const result = await withoutRetryBackoff(() => priv.activateOne("evil"));
 
     expect(result.ok).toBe(false);
     expect(priv.server.elicitInput).not.toHaveBeenCalled();
@@ -5158,11 +5697,346 @@ describe("vault passphrase elicitation", () => {
       .mockRejectedValueOnce(new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"))
       .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
 
-    const result = await priv.activateOne("gh");
+    // Unlike the vault refusals above, a generic credential failure DOES burn
+    // both attempts -- so this case pays runActivateOne's 1s retry sleep.
+    const result = await withoutRetryBackoff(() => priv.activateOne("gh"));
 
     expect(result.ok).toBe(true);
     expect(priv.elicitedEnv.get("gh")).toEqual({ GITHUB_TOKEN: "ghp_x" });
     // The child credential goes to the child, NOT to the vault.
     expect(vaultPassphrase()).toBeUndefined();
+  });
+
+  it("opens ONE modal when two namespaces hit the locked vault at once, and both then load", async () => {
+    // Prewarm runs several activations concurrently, so more than one
+    // namespace can reach a locked vault in the same instant -- and they are
+    // all asking the ONE question this vault has. Without vaultElicitInflight
+    // each opened its own modal, which is N interruptions for one answer and
+    // burns the shared MAX_VAULT_PASSPHRASE_PROMPTS budget N times faster.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "linear", name: "Linear" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+
+    // The modal stays open until BOTH activations are parked on it. A prompt
+    // that resolves immediately would let the winner finish before the
+    // follower ever reaches the vault path, so the dedup would never be
+    // exercised and the test would pass on a build without it.
+    let answer: (result: unknown) => void = () => {};
+    const answered = new Promise((resolve) => {
+      answer = resolve;
+    });
+    priv.server.elicitInput = vi.fn().mockReturnValue(answered);
+
+    // Locked until the passphrase lands -- the same gate for both namespaces,
+    // which is the point: unlocking for one unlocks for all.
+    vi.mocked(connectToUpstream).mockImplementation((async (cfg: UpstreamServerConfig) => {
+      if (vaultPassphrase() === undefined) throw lockedVaultError(cfg.namespace);
+      return makeConnection(cfg.namespace, ["t"]);
+    }) as unknown as typeof connectToUpstream);
+
+    const both = Promise.all([priv.activateOne("gh"), priv.activateOne("linear")]);
+    await until(() => vi.mocked(priv.server.elicitInput).mock.calls.length > 0);
+    answer({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "s3kr1t" } });
+    const [gh, linear] = await both;
+
+    // One question, one modal.
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    // And the follower gets the benefit: it retries on the winner's answer
+    // rather than failing with the stale "vault is locked" error.
+    expect(gh.ok).toBe(true);
+    expect(linear.ok).toBe(true);
+    expect(vaultPassphrase()).toBe("s3kr1t");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deferred-load notification fan-out. A first tools/call on a dormant server
+// activates it and tells the client its lists moved. When several calls race
+// for the SAME dormant server they share one activation, so they must also
+// share one notification -- each racer notifying made a client like Claude
+// Code refetch the whole catalog once per racer for a single load.
+// ---------------------------------------------------------------------------
+
+describe("concurrent deferred first calls", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("sends ONE list_changed triplet for one deferred load, however many callers raced for it", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      { ...makeServerConfig({ namespace: "gh" }), toolCache: [{ name: "foo" }, { name: "bar" }] },
+    ]);
+    priv.rebuildRoutes();
+    // Both routes are placeholders: neither caller has a live connection yet.
+    expect(priv.toolRoutes.get("gh_foo")?.deferred).toBe(true);
+    expect(priv.toolRoutes.get("gh_bar")?.deferred).toBe(true);
+
+    const tools = vi.spyOn(priv.server, "sendToolListChanged").mockResolvedValue(undefined);
+    const resources = vi.spyOn(priv.server, "sendResourceListChanged").mockResolvedValue(undefined);
+    const prompts = vi.spyOn(priv.server, "sendPromptListChanged").mockResolvedValue(undefined);
+
+    // Hold the spawn open so the second call lands while the first activation
+    // is still in flight. That window is the only one in which a joiner can
+    // duplicate the notification, so a mock that resolves immediately would
+    // pass on a build without the fix.
+    let finishConnect: (conn: UpstreamConnection) => void = () => {};
+    const connecting = new Promise<UpstreamConnection>((resolve) => {
+      finishConnect = resolve;
+    });
+    vi.mocked(connectToUpstream).mockReturnValue(connecting as never);
+
+    const conn = makeConnection("gh", ["foo", "bar"]);
+    conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+
+    const first = priv.handleToolCall("gh_foo", {});
+    await until(() => priv.activationInflight.has("gh"));
+    const second = priv.handleToolCall("gh_bar", {});
+    await until(() => vi.mocked(connectToUpstream).mock.calls.length > 0);
+    finishConnect(conn);
+
+    const [a, b] = await Promise.all([first, second]);
+    // Both calls reached the upstream -- the joiner rebuilds its routes
+    // locally, so skipping the NOTIFY half must not cost it its dispatch.
+    expect(a.isError).toBeUndefined();
+    expect(b.isError).toBeUndefined();
+    expect(connectToUpstream).toHaveBeenCalledTimes(1);
+
+    expect(tools).toHaveBeenCalledTimes(1);
+    expect(resources).toHaveBeenCalledTimes(1);
+    expect(prompts).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("auto-loaded pack visibility under gateway exposure", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await server.shutdown();
+  });
+
+  it("advertises every loaded pack member in tools/list, not just in this.connections", async () => {
+    // The feature's whole claim is that it skips the discover + activate
+    // round-trip. Connecting the pack without recording it in
+    // sessionActivated spends a cap slot and a child process on tools the
+    // client still cannot see, because gateway exposure keys tools/list on
+    // exactly that set -- so the stated purpose does not hold.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ id: "linear-id", namespace: "linear", name: "Linear" }),
+    ]);
+    // Three bursts of (gh, linear) -> one detected pack at frequency 3.
+    const t0 = 1_000_000;
+    for (let i = 0; i < 3; i++) {
+      priv.packDetector.recordCall("gh", "create_issue", t0 + i * 300_000);
+      priv.packDetector.recordCall("linear", "list_issues", t0 + i * 300_000 + 1000);
+    }
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, ["do_thing"]),
+    );
+    // Pinned blank: resolveToolExposure reads the env on every tools/list, so
+    // an exported YAW_MCP_TOOL_EXPOSURE=full would advertise both namespaces
+    // regardless of sessionActivated and make the assertion vacuous.
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
+
+    await priv.autoLoadRecurringPack();
+
+    // Not vacuous the other way either: both really connected, so the only
+    // thing under test is whether tools/list surfaces them.
+    expect(priv.connections.get("gh")?.status).toBe("connected");
+    expect(priv.connections.get("linear")?.status).toBe("connected");
+    const listed = await listedUpstreamToolNames(priv);
+    expect(listed).toContain("gh_do_thing");
+    expect(listed).toContain("linear_do_thing");
+  });
+});
+
+describe("upstream tools/list_changed re-learns the tool cache", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("refreshes toolCache so the post-eviction deferred routes carry the new names", async () => {
+    // Rebuilding routes from the refreshed connection is only half of it:
+    // this.toolCache is what every COLD reader uses (deferred routes after an
+    // idle eviction, discover's `known tools:` line, the BM25 corpus, the next
+    // state.json save), so leaving it stale keeps all four serving the
+    // pre-change list until the namespace is activated again.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    const toolsChanged = vi.spyOn(priv.server, "sendToolListChanged").mockResolvedValue(undefined);
+    vi.spyOn(priv.server, "sendResourceListChanged").mockResolvedValue(undefined);
+    vi.spyOn(priv.server, "sendPromptListChanged").mockResolvedValue(undefined);
+
+    const conn = makeConnection("gh", ["old_tool"]);
+    priv.connections.set("gh", conn);
+    priv.toolCache.set("gh", [{ name: "old_tool" }]);
+    priv.toolCacheLearnedAt.set("gh", 1);
+
+    // upstream.ts re-lists onto the SAME connection object and only then fires
+    // the callback, so this is the state the handler actually observes.
+    conn.tools = makeConnection("gh", ["new_tool"]).tools;
+    priv.onUpstreamListChanged("gh");
+    // Drain the fire-and-forget refreshRoutesAndNotify before touching routes.
+    await until(() => toolsChanged.mock.calls.length > 0);
+
+    expect(priv.toolCache.get("gh").map((t: { name: string }) => t.name)).toEqual(["new_tool"]);
+    expect(priv.toolCacheLearnedAt.get("gh")).toBeGreaterThan(1);
+
+    // Drop the connection the way the idle reaper does. The deferred routes
+    // rebuilt from the learned cache must follow the change.
+    priv.connections.delete("gh");
+    priv.rebuildRoutes();
+    expect(priv.toolRoutes.get("gh_new_tool")?.deferred).toBe(true);
+    expect(priv.toolRoutes.has("gh_old_tool")).toBe(false);
+  });
+});
+
+describe("elicitation retry vs the concurrent-server cap", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("connects the retry even when other namespaces filled the cap while the prompt was open", async () => {
+    // By the time the retry runs the user has already typed the credential.
+    // Refusing it there spends that input for nothing -- and the reservation
+    // this namespace still holds is deliberately NOT a self-allowance in
+    // evaluateCapFor, so only the explicit skipCap keeps the retry alive.
+    const priv = getPrivate(server);
+    priv.serverCap = 1;
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" }), makeServerConfig({ namespace: "busy" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockImplementation(async () => {
+      // The window the finding is about: an unrelated namespace takes the
+      // last slot while the modal is up. gh cleared the cap on the way in.
+      priv.connections.set("busy", makeConnection("busy", ["t"]));
+      return { action: "accept", content: { GITHUB_TOKEN: "ghp_x" } };
+    });
+    // Both attempts of the first pass fail naming the credential; the elicited
+    // retry is the third call and succeeds.
+    vi.mocked(connectToUpstream)
+      .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
+      .mockRejectedValueOnce(new Error("GITHUB_TOKEN is required"))
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await withoutRetryBackoff(() => priv.activateOne("gh"));
+
+    expect(result.ok).toBe(true);
+    expect(result.capped).toBeUndefined();
+    // Pin the SHAPE, not just the outcome: two failures plus exactly one
+    // elicited retry, so a path that succeeded some other way could not
+    // satisfy the assertions above.
+    expect(connectToUpstream).toHaveBeenCalledTimes(3);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    expect(priv.connections.get("gh")?.status).toBe("connected");
+    // The cap really was full when the retry ran.
+    expect(priv.connections.get("busy")?.status).toBe("connected");
+  });
+});
+
+describe("discover match summary", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("does not surface unrelated tools for a stopword-laden context", () => {
+    // The per-tool match is a bare set intersection with no IDF, so a query
+    // carrying "the" / "with" hit every tool whose DESCRIPTION happened to
+    // contain one -- and the 5-hit cap then filled with whatever came first in
+    // list order, dropping the tool that genuinely matched.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", description: "Issue tracker" })]);
+    priv.toolCache.set("gh", [
+      { name: "list_runners", description: "List the self-hosted runners" },
+      { name: "get_workflow", description: "Fetch the workflow definition" },
+      { name: "list_branches", description: "Enumerate the branches with their heads" },
+      { name: "read_file", description: "Read the file contents" },
+      { name: "list_commits", description: "Walk the commit log with pagination" },
+      { name: "create_issue", description: "Open a bug report" },
+    ]);
+
+    const text = priv.handleDiscover("create the issue with the label").content[0].text;
+    const lines = text.split("\n");
+    const header = lines.indexOf("Matches for your query:");
+    expect(header).toBeGreaterThanOrEqual(0);
+    const summary = lines[header + 1];
+
+    // The one genuine hit is a NAME match on create/issue and survives.
+    expect(summary).toContain("create_issue");
+    // Every other tool matched only through a closed-class word. Asserting
+    // each by name also catches the empty-hits fallback, which would return
+    // the first three tools in list order.
+    expect(summary).not.toContain("list_runners");
+    expect(summary).not.toContain("get_workflow");
+    expect(summary).not.toContain("list_branches");
+    expect(summary).not.toContain("read_file");
+    expect(summary).not.toContain("list_commits");
+  });
+
+  it("keeps a late NAME match when earlier tools already fill the 5-hit cap by description", () => {
+    // The other half of the same fix: hits are collected in full and only
+    // then capped, so a tool matching on NAME outranks five earlier tools
+    // that merely mention the term in prose. Breaking out of the loop at
+    // five dropped it purely for being last in list order.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", description: "Issue tracker" })]);
+    priv.toolCache.set("gh", [
+      { name: "list_runners", description: "Report an issue with a runner" },
+      { name: "get_workflow", description: "Diagnose an issue in a workflow" },
+      { name: "list_branches", description: "Find an issue branch" },
+      { name: "read_file", description: "Locate an issue in a file" },
+      { name: "list_commits", description: "Trace an issue to a commit" },
+      { name: "create_issue", description: "Open a bug report" },
+    ]);
+
+    const text = priv.handleDiscover("issue").content[0].text;
+    const lines = text.split("\n");
+    const header = lines.indexOf("Matches for your query:");
+    expect(header).toBeGreaterThanOrEqual(0);
+    const summary = lines[header + 1];
+
+    // Last in list order, first in the summary.
+    expect(summary).toContain("create_issue");
+    // The cap still applies -- five hits, so the last description-only match
+    // is the one that falls off, not the name match.
+    expect(summary).not.toContain("list_commits");
   });
 });

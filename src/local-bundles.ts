@@ -1026,10 +1026,35 @@ function resolveUpsertTarget(
   };
 }
 
+/** The entry doUpsertUserBundle would actually put on disk for `target`.
+ *  Pure -- shared with previewUpsertUserBundle for the same reason
+ *  resolveUpsertTarget is: a dry run has to describe the run it previews.
+ *  Rendering the caller's PRE-MERGE input instead drifted from the write on
+ *  exactly the entries a user hand-edited -- a stored `--env` value, a
+ *  per-server `"runtime"`, and above all an explicit `"isActive": false`,
+ *  which mergeServerEntry deliberately keeps (rule 3) while every incoming
+ *  entry carries `isActive: true`. The preview showed an entry that would
+ *  load; the run wrote one that stays disabled. */
+function mergedUpsertEntry(
+  servers: Array<Partial<UpstreamServerConfig> | undefined>,
+  entry: Partial<UpstreamServerConfig>,
+  target: ReturnType<typeof resolveUpsertTarget>,
+): Partial<UpstreamServerConfig> {
+  if (target.idx < 0) return entry;
+  const written = mergeServerEntry(servers[target.idx] ?? {}, entry);
+  if (target.matchedByNamespace) return written;
+  // Name-fallback match: keep the stored namespace and id -- never rename out
+  // from under the user (see the upsertUserBundle doc).
+  return { ...written, namespace: target.namespace ?? written.namespace, id: target.id ?? written.id };
+}
+
 /** Read-only preview of what upsertUserBundle would do -- the refusal it
- *  would throw (if any) and the namespace the file would actually hold.
- *  `add --dry-run` reports THIS instead of re-deriving its own answer, so
- *  the preview and the real run can never disagree. Throws the same
+ *  would throw (if any), the namespace the file would actually hold, and the
+ *  MERGED entry the write would land (mergedUpsertEntry, the same fold the
+ *  real run applies -- so a stored env value, a per-server override and a
+ *  hand-set `"isActive": false` all show up in the preview exactly as they
+ *  will on disk). `add --dry-run` reports THIS instead of re-deriving its own
+ *  answer, so the preview and the real run can never disagree. Throws the same
  *  could-not-be-parsed error the real run throws for an unreadable file. */
 export async function previewUpsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
@@ -1038,6 +1063,7 @@ export async function previewUpsertUserBundle(
   replaced: boolean;
   refusal: string | null;
   namespace: string | undefined;
+  entry: Partial<UpstreamServerConfig>;
   launchChanged?: { from: string; to: string };
 }> {
   const home = opts.home ?? homedir();
@@ -1047,6 +1073,7 @@ export async function previewUpsertUserBundle(
     replaced: target.idx >= 0,
     refusal: target.refusal,
     namespace: target.namespace ?? entry.namespace,
+    entry: mergedUpsertEntry(file.servers, entry, target),
     launchChanged: target.launchChanged,
   };
 }
@@ -1065,22 +1092,19 @@ async function doUpsertUserBundle(
   const file = await readRawUserBundles(home);
   const target = resolveUpsertTarget(file.servers, entry);
   if (target.refusal) throw new Error(target.refusal);
-  const { idx, matchedByNamespace } = target;
+  const idx = target.idx;
   const replaced = idx >= 0;
-  let written = replaced ? mergeServerEntry(file.servers[idx] ?? {}, entry) : entry;
-  if (replaced && !matchedByNamespace) {
-    written = {
-      ...written,
-      namespace: target.namespace ?? written.namespace,
-      id: target.id ?? written.id,
-    };
-  }
+  // The fold itself lives in mergedUpsertEntry so `add --dry-run` runs the
+  // identical merge -- see previewUpsertUserBundle.
+  const written = mergedUpsertEntry(file.servers, entry, target);
   if (replaced) file.servers[idx] = written;
   else file.servers.push(written);
-  // Preserve a newer on-disk schema version rather than downgrading it; only
-  // stamp CURRENT when the file had none (readRawUserBundles guarantees a
-  // numeric version when the file existed, so this only fills the fresh case).
-  file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
+  // `file.version` is written back exactly as readRawUserBundles produced it:
+  // it already preserves a newer on-disk version rather than downgrading it,
+  // and already stamps CURRENT for the absent-file and version-less cases. A
+  // `?? CURRENT` here used to look like the defaulting step, but it could
+  // never fire -- both of that function's returns carry a number.
+  //
   // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
   // (matching secrets-vault): bundles.json can carry per-server `--env`
   // secrets, so its parent dir must not be group/other-listable.
@@ -1125,8 +1149,10 @@ async function doRemoveUserBundle(
   const before = file.servers.length;
   file.servers = file.servers.filter((s) => s?.namespace !== namespace);
   if (file.servers.length === before) return { path, removed: false };
-  // Preserve a newer on-disk schema version rather than downgrading it.
-  file.version = file.version ?? CURRENT_BUNDLES_SCHEMA_VERSION;
+  // `file.version` round-trips from readRawUserBundles, which already preserves
+  // a newer on-disk version and defaults a version-less file to CURRENT -- see
+  // the same note in doUpsertUserBundle.
+  //
   // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
   // (matching secrets-vault): bundles.json can carry per-server `--env`
   // secrets, so its parent dir must not be group/other-listable.

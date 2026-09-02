@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   defaultRuntime,
   describeDefaultRuntime,
@@ -12,6 +12,24 @@ import {
 import { localBundlesPath } from "../local-bundles.js";
 import { MIN_OAM_VERSION, type OamProbe, rewriteForOam } from "../oam-spawn.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+
+// A counting PASSTHROUGH over the loader -- the real implementation still
+// runs, so every other test in this file behaves exactly as it did. It exists
+// for the concurrency test below, which has to count READS rather than
+// answers: the memo it pins is invisible in the return value (three callers
+// get "oam" either way) and only shows up as how many times the file was
+// actually loaded.
+const { loadCalls } = vi.hoisted(() => ({ loadCalls: { n: 0 } }));
+vi.mock("../local-bundles.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../local-bundles.js")>();
+  return {
+    ...actual,
+    loadLocalBundles: (...args: Parameters<typeof actual.loadLocalBundles>) => {
+      loadCalls.n += 1;
+      return actual.loadLocalBundles(...args);
+    },
+  };
+});
 
 let synthHome: string;
 let synthCwd: string;
@@ -85,6 +103,39 @@ describe("describeDefaultRuntime", () => {
   it("returns null/null when nothing is configured", async () => {
     const r = await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome });
     expect(r).toEqual({ runtime: null, source: null, path: null });
+  });
+
+  it("threads env into the load, so the caller's env decides which project file is honoured", async () => {
+    // `env` is not just the YAW_MCP_DEFAULT_RUNTIME source: it is handed to
+    // loadLocalBundles so the loader's project-trust gate sees the SAME
+    // environment the caller's own probe did. Without it the loader falls back
+    // to process.env, and this resolver could honour a project bundles.json
+    // that doctor -- running with an injected env -- reports as ignored, so
+    // doctor's OAM RUNTIME section would name a default no other surface
+    // agrees with. Nothing else in this file fails if the argument is deleted.
+    //
+    // The trust bypass is the observable end of that thread: same two files,
+    // two different injected envs, two different answers.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "node" });
+    writeBundles(synthCwd, { version: 1, servers: [], defaultRuntime: "oam" });
+
+    // No bypass in the injected env -> the project file is unapproved and
+    // ignored -> the user-global value is the one reported.
+    expect(await describeDefaultRuntime({ env: {}, cwd: synthCwd, home: synthHome })).toEqual({
+      runtime: "node",
+      source: "bundles",
+      path: localBundlesPath(join(synthHome, CONFIG_DIRNAME)),
+    });
+
+    // Bypass set on the INJECTED env only (never process.env) -> the loader
+    // honours the project file, and its value wins.
+    expect(
+      await describeDefaultRuntime({ env: { YAW_MCP_TRUST_PROJECT: "1" }, cwd: synthCwd, home: synthHome }),
+    ).toEqual({
+      runtime: "oam",
+      source: "bundles",
+      path: localBundlesPath(join(synthCwd, CONFIG_DIRNAME)),
+    });
   });
 
   // The `bundles` seam exists so a caller that ALREADY read bundles.json (doctor
@@ -186,20 +237,28 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     // observe the skipped read from outside the module: the replacement is
     // written at the same byte length and stamped with the same mtime, so a
     // call that re-read the file would answer "node" here.
+    //
+    // The clock is pinned for BOTH calls rather than left on wall time: the
+    // skip only holds inside DEGRADED_RECHECK_MS, so on a loaded machine (a
+    // slow trust hash, a GC pause, a suspended CI runner) the second call
+    // could cross the 5s boundary, re-read, and answer "node" -- a failure
+    // about scheduling, not about the negative cache this test pins.
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     const file = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
     const valid = JSON.stringify({ version: 1, servers: [], defaultRuntime: "node" });
     const broken = "{ not json at all".padEnd(valid.length, " ");
     expect(broken.length).toBe(valid.length);
     const stamp = new Date(2020, 0, 1);
+    const t0 = Date.now();
+    const nowFixed = () => t0;
 
     writeFileSync(file, broken);
     utimesSync(file, stamp, stamp);
-    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome, now: nowFixed })).toBeNull();
 
     writeFileSync(file, valid);
     utimesSync(file, stamp, stamp);
-    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome, now: nowFixed })).toBeNull();
   });
 
   it("caches a degraded read that still resolved a value", async () => {
@@ -257,8 +316,16 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(localBundlesPath(join(synthHome, CONFIG_DIRNAME)), "{ not json at all");
 
+    // Pinned clock for the two calls that must land INSIDE the recheck
+    // window. On wall time the grantTrust round trip between them could
+    // outlast DEGRADED_RECHECK_MS on a slow machine, and the stale-null
+    // assertion below would then fail for a scheduling reason rather than
+    // the caching one it is about.
+    const t0 = Date.now();
+    const nowFixed = () => t0;
+
     // Broken global, no project file -> degraded AND empty -> cache armed.
-    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome, now: nowFixed })).toBeNull();
 
     // User drops a project bundles.json in and approves it. The global file
     // is untouched, so a global-only stat gate skips the re-read.
@@ -272,7 +339,7 @@ describe("defaultRuntime (cached hot-path variant)", () => {
     // no stat can see a directory that did not exist when the probe was
     // armed, so the stale null is served. This is the documented bound, not
     // an accident -- pinning it keeps the window from being quietly widened.
-    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+    expect(await defaultRuntime({ cwd: synthCwd, home: synthHome, now: nowFixed })).toBeNull();
 
     // Past the window, the verdict is re-derived and the new project file
     // wins. Injected clock rather than a real wait: the guarantee is "bounded
@@ -289,6 +356,24 @@ describe("defaultRuntime (cached hot-path variant)", () => {
 
     writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
     expect(await defaultRuntime({ cwd: synthCwd, home: synthHome })).toBeNull();
+  });
+
+  it("collapses a CONCURRENT burst of calls into one bundles.json read", async () => {
+    // The result cache is written after the await, so on its own it does
+    // nothing for the burst that actually happens on this path: prewarm
+    // connects every active server at the same moment, every one of those
+    // calls finds the cache still undefined, and each starts its own full
+    // load -- read, project-trust walk, hash, parse -- plus its own copy of
+    // the loader's read-time warnings. Memoizing the in-flight PROMISE is
+    // what makes the module's documented "read once" true for that case.
+    writeBundles(synthHome, { version: 1, servers: [], defaultRuntime: "oam" });
+    const opts = { cwd: synthCwd, home: synthHome };
+    loadCalls.n = 0;
+
+    const answers = await Promise.all([defaultRuntime(opts), defaultRuntime(opts), defaultRuntime(opts)]);
+
+    expect(answers).toEqual(["oam", "oam", "oam"]);
+    expect(loadCalls.n).toBe(1);
   });
 });
 

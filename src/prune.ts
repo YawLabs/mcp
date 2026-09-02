@@ -108,13 +108,10 @@ function pruneText(text: string): string {
 // skip JSON mode for the whole document and fall back to whitespace-only
 // cleanup, which cannot alter a value.
 //
-// Integers -- the shape that actually breaks -- get an exact test, so a
-// 16-digit id a double holds precisely still prunes. Fractional forms get a
-// conservative digit bound instead.
-
-/** Significant mantissa digits a double round-trips (a double's shortest
- *  representation never needs more than 17). */
-const MAX_FAITHFUL_MANTISSA_DIGITS = 17;
+// Both shapes get an EXACT test, so a 16-digit id a double holds precisely
+// still prunes: integers compare the re-serialized text byte for byte,
+// fractional / exponent forms compare canonical (sign, digits, exponent)
+// triples so a pure reformat passes and a changed value does not.
 
 /** A JSON string literal (escapes included) OR a JSON number literal, in one
  *  alternation with the STRING form first. Order is what makes it safe: digits
@@ -170,15 +167,45 @@ function numberLiteralIsFaithful(literal: string): boolean {
   if (/^-?\d+$/.test(literal)) return String(n) === literal;
   // Fractional / exponent forms: the double IS the value every JSON parser
   // sees, and JSON.stringify emits the shortest text that round-trips to
-  // that same double, so re-serializing only reformats (1.0 -> 1, 19.90 ->
-  // 19.9). What can still lose information is underflow to zero, and a
-  // mantissa carrying more precision than a double holds
-  // (0.1000000000000000000001 collapses to 0.1) -- guard those two.
+  // that same double, so re-serializing is allowed to REFORMAT (1.0 -> 1,
+  // 19.90 -> 19.9, 0.0000001 -> 1e-7) but never to change the value.
   const mantissa = literal.replace(/^-/, "").split(/[eE]/)[0];
   const digits = mantissa.replace(".", "").replace(/^0+/, "");
   // 1e-400 underflows to 0 -- the digits are gone, not merely rounded.
   if (n === 0) return !/[1-9]/.test(digits);
-  return digits.replace(/0+$/, "").length <= MAX_FAITHFUL_MANTISSA_DIGITS;
+  // Comparing the two spellings in canonical form IS the reformat-or-not
+  // test: it accepts every reshaping above and rejects a literal carrying
+  // more precision than a double holds (0.12345678901234567 comes back
+  // ...66, 0.1000000000000000000001 collapses to 0.1). A digit-count bound
+  // cannot do both -- 15 (the decimal->double->decimal guarantee) rejects
+  // ordinary computed doubles like 0.30000000000000004, and one rejected
+  // literal costs the WHOLE document its pruning; 17 (the double->decimal
+  // direction) accepts 16-17 digit literals a double does not hold.
+  const canonical = canonicalDecimal(literal);
+  return canonical !== null && canonical === canonicalDecimal(String(n));
+}
+
+/** A decimal number's value as a `(sign, significant digits, exponent)`
+ *  triple, in which two spellings of the SAME value compare equal: `19.90`,
+ *  `19.9` and `1.990e1` all canonicalize to `199e-1`, while
+ *  `9007199254740993.0` and the `9007199254740992` a double re-serializes to
+ *  do not. Returns null for a shape it cannot parse, which the caller treats
+ *  as unfaithful. */
+function canonicalDecimal(s: string): string | null {
+  const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(s);
+  if (m === null) return null;
+  const [, sign, intPart, fracPart = "", expPart = ""] = m;
+  // value === digits * 10^pow, with the digit string read as an integer:
+  // every fraction digit shifts the point right by one, the exponent shifts
+  // it back (Number("") is 0, which is the no-exponent case). Leading zeros
+  // do not change an integer's value, so dropping them leaves pow alone;
+  // each dropped TRAILING zero divides the digits by ten, so pow gains one
+  // back.
+  const digits = `${intPart}${fracPart}`.replace(/^0+/, "");
+  if (digits === "") return "0";
+  const significant = digits.replace(/0+$/, "");
+  const pow = Number(expPart) - fracPart.length + (digits.length - significant.length);
+  return `${sign === "-" ? "-" : ""}${significant}e${pow}`;
 }
 
 // CRLF-aware on purpose: a Windows-hosted MCP server that shells out (git,

@@ -2,9 +2,23 @@
 // localMode branch was deleted. Everything here runs against a synthetic
 // $HOME + cwd on the REAL filesystem (mkdtemp), so the trust gate, the
 // grade cache, the state file and the bundles loader all exercise their
-// production I/O. Only two things are stubbed, both process boundaries:
-// the stdio transport (it would seize the test runner's stdin) and
-// connectToUpstream/disconnectFromUpstream (they would spawn children).
+// production I/O. Five modules are mocked below — four process boundaries
+// plus one seam:
+//   - the stdio transport (it would seize the test runner's stdin);
+//   - connectToUpstream/disconnectFromUpstream (they would spawn children);
+//   - maybeAutoUpgrade (it can shell out to `npm install -g`);
+//   - ensureUv (it would download a uv binary — the gate's own predicate,
+//     uvLaunchKind, stays real);
+//   - loadLocalBundles, pass-through except in the one "loader throws" case
+//     (it swallows every I/O error internally, so start()'s catch is
+//     unreachable from the filesystem alone).
+//
+// One further process boundary start() reaches is NOT stubbed here:
+// maybeRefreshSidecars, which can run an `npm install`. It stays inert
+// because sidecar-refresh gates each of its default implementations on
+// process.env.VITEST, so under the runner the first gate answers "no managed
+// tree" and it no-ops. That is a property of production code, not of this
+// file — relax that gating and these tests start doing real work.
 //
 // $HOME is redirected by setting HOME + USERPROFILE rather than by mocking
 // node:os — os.homedir() reads USERPROFILE on win32 and HOME on POSIX, so
@@ -97,7 +111,6 @@ import { gradesCachePath } from "../grades-cache.js";
 import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME } from "../persistence.js";
-import { buildToolList } from "../proxy.js";
 import { ConnectServer } from "../server.js";
 import { grantTrust } from "../trust.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
@@ -112,6 +125,11 @@ const ENV_KEYS = [
   "YAW_MCP_AUTO_LOAD",
   "YAW_MCP_SERVER_CAP",
   "YAW_MCP_TRUST_PROJECT",
+  // Now that listedUpstreamTools drives the real tools/list handler,
+  // resolveToolExposure() decides what these tests see -- so an exported value
+  // has to be saved and cleared like every other knob here, or the developer's
+  // shell picks the exposure the assertions run at.
+  "YAW_MCP_TOOL_EXPOSURE",
 ] as const;
 
 let synthHome: string;
@@ -142,6 +160,7 @@ beforeEach(() => {
   delete process.env.YAW_MCP_AUTO_LOAD;
   delete process.env.YAW_MCP_SERVER_CAP;
   delete process.env.YAW_MCP_TRUST_PROJECT;
+  delete process.env.YAW_MCP_TOOL_EXPOSURE;
 
   cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(synthCwd);
 
@@ -219,6 +238,11 @@ interface Started {
    *  finished — start() never awaits it, so assertions about spawning
    *  would otherwise race. */
   prewarmed: Promise<void>;
+  /** The same capture for the fire-and-forget auto-load. Meaningful ONLY
+   *  when YAW_MCP_AUTO_LOAD is on: start() does not call
+   *  autoLoadRecurringPack when the gate is off, so awaiting this in a
+   *  gate-off test would hang until the suite timeout. */
+  autoLoaded: Promise<void>;
   transport: { started: boolean; closed: boolean; sent: unknown[] };
 }
 
@@ -248,9 +272,9 @@ async function driveInitialize(
   transport.onmessage?.({ jsonrpc: "2.0", method: "notifications/initialized" });
 }
 
-/** Construct + start a ConnectServer, capturing the pre-warm promise.
- *  The capture wraps the private method on the INSTANCE (production code
- *  is untouched) so the fire-and-forget call becomes awaitable. By
+/** Construct + start a ConnectServer, capturing the pre-warm and auto-load
+ *  promises. Each capture wraps the private method on the INSTANCE (production
+ *  code is untouched) so the fire-and-forget call becomes awaitable. By
  *  default the downstream initialize handshake is driven too;
  *  `handshake: false` leaves the client un-initialized so the gating
  *  itself can be observed. */
@@ -271,6 +295,18 @@ async function startServer(opts: { handshake?: boolean } = {}): Promise<Started>
     return prewarmPromise;
   };
 
+  const originalAutoLoad = priv.autoLoadRecurringPack.bind(priv);
+  let captureAutoLoad: () => void = () => {};
+  const autoLoadCaptured = new Promise<void>((resolve) => {
+    captureAutoLoad = resolve;
+  });
+  let autoLoadPromise: Promise<void> = Promise.resolve();
+  priv.autoLoadRecurringPack = () => {
+    autoLoadPromise = originalAutoLoad();
+    captureAutoLoad();
+    return autoLoadPromise;
+  };
+
   await server.start();
   const transport = hoisted.transports[hoisted.transports.length - 1];
   if (opts.handshake !== false) {
@@ -282,6 +318,10 @@ async function startServer(opts: { handshake?: boolean } = {}): Promise<Started>
     prewarmed: (async () => {
       await prewarmCaptured;
       await prewarmPromise;
+    })(),
+    autoLoaded: (async () => {
+      await autoLoadCaptured;
+      await autoLoadPromise;
     })(),
     transport,
   };
@@ -299,11 +339,38 @@ function spawnedNamespaces(): string[] {
     .sort();
 }
 
-/** Tool names a client would see in tools/list, minus the meta-tools. */
-function listedUpstreamTools(priv: any): string[] {
-  return buildToolList(priv.connections, priv.getDeferredServers(), priv.toolFilters)
-    .map((t) => t.name)
-    .filter((n) => !n.startsWith("mcp_connect_"));
+/**
+ * Tool names a client would see in tools/list, minus the meta-tools.
+ *
+ * Drives the REAL tools/list handler rather than re-implementing its call to
+ * buildToolList. The handler is where resolveToolExposure() and
+ * this.sessionActivated get wired into the arguments, and the hand-rolled
+ * stand-in this replaces passed neither -- so it ran at buildToolList's own
+ * "full" default and could not fail a gateway-exposure regression, which is
+ * exactly the wiring the auto-load test below needs to pin.
+ */
+async function listedUpstreamTools(priv: any): Promise<string[]> {
+  const handler = priv.server._requestHandlers.get("tools/list");
+  const res = await handler({ method: "tools/list", params: {} }, {} as never);
+  return res.tools.map((t: { name: string }) => t.name).filter((n: string) => !n.startsWith("mcp_connect_"));
+}
+
+/**
+ * Run `fn` with tools/list at "full" exposure.
+ *
+ * The DEFERRED placeholders that pre-warm produces are a full-exposure-only
+ * surface: gateway mode withholds them on purpose (they are the ~27,000 tokens
+ * the mode exists to remove), so a test asserting a cached tool is visible
+ * without a live child has to name the exposure it means instead of inheriting
+ * whichever one the environment happens to carry.
+ */
+async function atFullExposure<T>(fn: () => Promise<T>): Promise<T> {
+  process.env.YAW_MCP_TOOL_EXPOSURE = "full";
+  try {
+    return await fn();
+  } finally {
+    delete process.env.YAW_MCP_TOOL_EXPOSURE;
+  }
 }
 
 // --- tests ------------------------------------------------------------------
@@ -334,7 +401,12 @@ describe("ConnectServer.start() — transport + config load", () => {
     // is surfaced as deferred, so the client sees tools without a live child.
     expect(spawnedNamespaces()).toEqual(["gh"]);
     expect(priv.connections.size).toBe(0);
-    expect(listedUpstreamTools(priv)).toEqual(["gh_gh_live"]);
+    expect(await atFullExposure(() => listedUpstreamTools(priv))).toEqual(["gh_gh_live"]);
+    // And the same handler withholds it under the default gateway exposure --
+    // the deferred placeholder is the token cost that mode exists to remove.
+    // buildToolRoutes ignores exposure, so a first tools/call still reaches it.
+    expect(await listedUpstreamTools(priv)).toEqual([]);
+    expect(priv.toolRoutes.has("gh_gh_live")).toBe(true);
   });
 
   it("drops a duplicate namespace from bundles.json, keeping the first entry", async () => {
@@ -466,8 +538,12 @@ describe("ConnectServer.start() — persisted state hydration", () => {
     // The original age rides through the round-trip — a hydrated entry must
     // not be refreshed for free, or it would never age out under the TTL.
     expect(priv.toolCacheLearnedAt.get("known")).toBe(learnedAt);
-    // And the cached tools are visible to the client without a spawn.
-    expect(listedUpstreamTools(priv).sort()).toEqual(["fresh_fresh_live", "known_cached_tool"]);
+    // And the cached tools are visible to the client without a spawn (at the
+    // exposure where deferred placeholders are advertised at all).
+    expect((await atFullExposure(() => listedUpstreamTools(priv))).sort()).toEqual([
+      "fresh_fresh_live",
+      "known_cached_tool",
+    ]);
   });
 
   it("pre-warms EVERY server when there is no persisted tool cache", async () => {
@@ -594,6 +670,72 @@ describe("ConnectServer.start() — startup activation waits for the initialize 
   });
 });
 
+describe("ConnectServer.start() — opt-in auto-load of the recurring pack", () => {
+  /** Persisted history holding TWO {gh, linear} bursts. The 10-minute gap
+   *  between them is what makes the set recurring: the pack detector closes a
+   *  burst at a 120 s idle boundary, and a namespace set has to appear in at
+   *  least two bursts before detectChains() will surface it. */
+  function writeRecurringPackHistory(): void {
+    const first = Date.now() - 30 * 60_000;
+    const second = first + 10 * 60_000;
+    writeState({
+      version: 2,
+      savedAt: Date.now(),
+      learning: {},
+      packHistory: [
+        { namespace: "gh", toolName: "list_prs", at: first },
+        { namespace: "linear", toolName: "list_issues", at: first + 1_000 },
+        { namespace: "gh", toolName: "list_prs", at: second },
+        { namespace: "linear", toolName: "list_issues", at: second + 1_000 },
+      ],
+      toolCache: {},
+    });
+  }
+
+  it("activates and advertises the top pack when YAW_MCP_AUTO_LOAD=1", async () => {
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear"), serverEntry("solo")]);
+    writeRecurringPackHistory();
+    process.env.YAW_MCP_AUTO_LOAD = "1";
+
+    const { priv, prewarmed, autoLoaded } = await startServer();
+    await Promise.all([prewarmed, autoLoaded]);
+
+    // Auto-load activates for REAL, unlike pre-warm, which disconnects as
+    // soon as it has learned the tool list. The pack's members are the only
+    // servers still holding a connection.
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(priv.connections.has("linear")).toBe(true);
+    expect(priv.connections.has("solo")).toBe(false);
+    // And they are ADVERTISED: under the default gateway exposure a connected
+    // namespace stays invisible in tools/list until it lands in
+    // sessionActivated, so without this the feature spends a cap slot and a
+    // child process on a pack the client still has to discover and activate —
+    // the exact step YAW_MCP_AUTO_LOAD exists to skip.
+    expect([...priv.sessionActivated].sort()).toEqual(["gh", "linear"]);
+    // Asserted through the REAL tools/list handler, at the real default
+    // exposure, so the sessionActivated bookkeeping above is checked where it
+    // actually pays off. `solo` is neither connected nor advertised, and
+    // gateway mode withholds deferred placeholders, so it contributes nothing.
+    expect((await listedUpstreamTools(priv)).sort()).toEqual(["gh_gh_live", "linear_linear_live"]);
+  });
+
+  it("auto-loads nothing when YAW_MCP_AUTO_LOAD is unset", async () => {
+    // Negative control: identical history and servers, gate off. `autoLoaded`
+    // is deliberately not awaited — start() never calls autoLoadRecurringPack
+    // here, so it never resolves.
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear"), serverEntry("solo")]);
+    writeRecurringPackHistory();
+
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    expect(priv.sessionActivated.size).toBe(0);
+    // Pre-warm learned every server's tools and hung up; nothing stayed live.
+    expect(priv.connections.size).toBe(0);
+    expect(spawnedNamespaces()).toEqual(["gh", "linear", "solo"]);
+  });
+});
+
 describe("ConnectServer.start() — profile", () => {
   it("loads the user-global profile and skips pre-warm for a blocked namespace", async () => {
     writeBundles(synthHome, [serverEntry("allowed"), serverEntry("denied")]);
@@ -608,6 +750,8 @@ describe("ConnectServer.start() — profile", () => {
     // keeps it out of every surfacing path, pre-warm included.
     expect(namespacesOf(priv).sort()).toEqual(["allowed", "denied"]);
     expect(spawnedNamespaces()).toEqual(["allowed"]);
-    expect(listedUpstreamTools(priv)).toEqual(["allowed_allowed_live"]);
+    // Full exposure so the assertion is about the PROFILE, not about gateway
+    // mode withholding the deferred placeholders of both namespaces alike.
+    expect(await atFullExposure(() => listedUpstreamTools(priv))).toEqual(["allowed_allowed_live"]);
   });
 });

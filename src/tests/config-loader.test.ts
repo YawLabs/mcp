@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,17 +25,22 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-cfg-home-"));
+  // realpathSync both roots: the loader resolves paths physically, so on
+  // macOS -- where os.tmpdir() sits under the /var -> /private/var symlink --
+  // a logical `join(synthCwd, CONFIG_DIRNAME)` in an assertion never
+  // byte-matches the /private/var spelling the loader returns.
+  synthHome = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-cfg-home-")));
   // synthCwd lives INSIDE synthHome so walk-up terminates at the
   // synthetic home boundary rather than escaping past tmpdir into the
   // real user dir — where a real ~/.yaw-mcp/ on dev machines would
   // otherwise get claimed as the project config and leak into assertions.
-  synthCwd = mkdtempSync(join(synthHome, "cwd-"));
+  synthCwd = realpathSync(mkdtempSync(join(synthHome, "cwd-")));
 });
 
 afterEach(() => {
+  // One rm is enough: synthCwd is created INSIDE synthHome, so the recursive
+  // removal above already took it (a second rmSync on it was a no-op).
   rmSync(synthHome, { recursive: true, force: true });
-  rmSync(synthCwd, { recursive: true, force: true });
 });
 
 // Writes <root>/.yaw-mcp/<filename> with the given JSON object.
@@ -138,14 +143,25 @@ describe("loadYawMcpConfig — deprecated token / apiBase keys", () => {
   // It is now just another deprecated key: no URL validation, no throw --
   // nothing dials it. The env override (YAW_MCP_URL) is likewise inert; it
   // must not throw either, since nothing reads it any more.
-  it("never throws on an unusable apiBase, from a file or from the env", async () => {
+  it("never throws on an unusable apiBase, and leaves the retired YAW_MCP_URL env var wholly inert", async () => {
     writeConfig(synthHome, CONFIG_FILENAME, { apiBase: "not a url at all" });
     const fromFile = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(fromFile.warnings.some((w) => w.includes("'apiBase'"))).toBe(true);
 
-    await expect(
-      loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: { YAW_MCP_URL: "http://example.com" } }),
-    ).resolves.toBeDefined();
+    // `resolves.toBeDefined()` alone could not fail -- the loader has never
+    // read opts.env, so it asserted nothing about YAW_MCP_URL. Pin the real
+    // contract instead: the env load must be INDISTINGUISHABLE from the
+    // no-env one, and must not echo the value into a warning.
+    const fromEnv = await loadYawMcpConfig({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { YAW_MCP_URL: "http://example.com" },
+    });
+    expect(fromEnv.warnings).toEqual(fromFile.warnings);
+    expect(fromEnv.servers).toEqual(fromFile.servers);
+    expect(fromEnv.blocked).toEqual(fromFile.blocked);
+    expect(fromEnv.loadedFiles.map((f) => f.scope)).toEqual(fromFile.loadedFiles.map((f) => f.scope));
+    expect(fromEnv.warnings.some((w) => w.includes("example.com"))).toBe(false);
   });
 });
 
@@ -216,9 +232,16 @@ describe("loadYawMcpConfig — schema versioning", () => {
 // so a key added on one side only would have shown up as "invalid config" in
 // the user's editor while loading fine -- or the reverse.
 describe("shipped config JSON schema", () => {
+  interface SchemaProperty {
+    type?: string;
+    minimum?: number;
+    deprecated?: boolean;
+    uniqueItems?: boolean;
+    items?: { type?: string; minLength?: number };
+  }
   const schema = JSON.parse(readFileSync(join(SCHEMA_DIR, "yaw-mcp.config.v1.json"), "utf8")) as {
     additionalProperties?: boolean;
-    properties?: Record<string, unknown>;
+    properties?: Record<string, SchemaProperty>;
   };
 
   it("declares exactly the keys the loader knows, plus the deprecated ones it still tolerates", () => {
@@ -231,6 +254,40 @@ describe("shipped config JSON schema", () => {
 
   it("stays additionalProperties:false, which is what makes the key list a contract", () => {
     expect(schema.additionalProperties).toBe(false);
+  });
+
+  // Key NAMES alone were the whole contract, so every declared TYPE and
+  // CONSTRAINT could drift from the loader without a failure. Pin the shapes
+  // too. Where the loader is deliberately more lenient than the schema, the
+  // gap is named here rather than left implicit -- the schema is the
+  // editor-facing contract, the loader is soft-failing by design:
+  //   - `version`: schema says integer >= 1; the loader accepts any number
+  //     and only compares it against CURRENT_SCHEMA_VERSION.
+  //   - `token` / `apiBase`: schema says string; the loader triggers its
+  //     deprecation warning on key PRESENCE at any type.
+  //   - `servers` / `blocked`: schema says uniqueItems; the loader does not
+  //     dedupe `servers` (`blocked` unions through a Set, so it does).
+  // The `items` assertions are deliberately per-keyword rather than a deep
+  // equality, so ADDING a constraint (a namespace `pattern`, say) does not
+  // fail here while REMOVING minLength/type still does.
+  it("pins the declared type and constraints of every property, not just the key names", () => {
+    const props = schema.properties ?? {};
+    expect(props.$schema?.type).toBe("string");
+    expect(props.version?.type).toBe("integer");
+    expect(props.version?.minimum).toBe(1);
+    expect(props.installNudge?.type).toBe("boolean");
+    for (const key of DEPRECATED_KEYS) {
+      expect(props[key]?.type).toBe("string");
+      // The `deprecated` annotation is what makes an editor grey the key out;
+      // without it the retained property reads as current.
+      expect(props[key]?.deprecated).toBe(true);
+    }
+    for (const field of ["servers", "blocked"]) {
+      expect(props[field]?.type).toBe("array");
+      expect(props[field]?.uniqueItems).toBe(true);
+      expect(props[field]?.items?.type).toBe("string");
+      expect(props[field]?.items?.minLength).toBe(1);
+    }
   });
 });
 
@@ -387,6 +444,84 @@ describe("loadYawMcpConfig — non-string blocked entries (fix F1, blocked field
   });
 });
 
+// A field that is PRESENT but not an array at all. The mirror image of the
+// F1 case above and quieter: the field was discarded with no diagnostic on
+// any surface, so `"servers": "github"` -- written to lock a session down to
+// one server -- left isAllowed returning true for everything while `doctor`
+// exited 0 with an empty warnings array.
+describe("loadYawMcpConfig — non-array servers/blocked field", () => {
+  it("warns and ignores a string 'servers' instead of dropping it in silence", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: "github" }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toBeUndefined();
+    const w = r.warnings.find((x) => x.includes("'servers' must be an array"));
+    expect(w).toBeDefined();
+    expect(w).toContain("found string");
+    // The FIELD is dropped, not the file: everything else still loads.
+    expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
+  });
+
+  it("warns for a non-array 'blocked' too, and names null as null rather than object", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: null, installNudge: true }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blocked).toBeUndefined();
+    expect(r.installNudge).toBe(true);
+    const w = r.warnings.find((x) => x.includes("'blocked' must be an array"));
+    expect(w).toBeDefined();
+    expect(w).toContain("found null");
+  });
+
+  it("stays silent for a field that is simply ABSENT (the normal case)", async () => {
+    // The trap in this fix: warning on every non-array would warn on the
+    // undefined that every unconfigured scope produces, making `doctor` noisy
+    // for everyone. Only a PRESENT wrong-typed field is reported.
+    writeConfig(synthHome, CONFIG_FILENAME, { blocked: ["slack"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings).toEqual([]);
+  });
+});
+
+// Entries were validated with `.trim()` but KEPT untrimmed, so `" github"`
+// survived as an allow-list no installed namespace can ever match: a silent
+// deny-all that also shadows a valid parent scope. Trim on the way in, and
+// warn (never drop) on anything NAMESPACE_RE would reject.
+describe("loadYawMcpConfig — namespace shape of servers/blocked entries", () => {
+  it("keeps the TRIMMED spelling, so a padded entry can still match an installed server", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ servers: [" github", "slack  "] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual(["github", "slack"]);
+    expect(isAllowed(r, "github")).toBe(true);
+    // Nothing was dropped and nothing looks malformed after the trim.
+    expect(r.warnings).toEqual([]);
+  });
+
+  it("trims 'blocked' the same way (a padded deny becomes a real deny)", async () => {
+    writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ blocked: [" slack"] }));
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blocked).toEqual(["slack"]);
+    expect(isAllowed(r, "slack")).toBe(false);
+  });
+
+  it("warns about an unmatchable namespace but KEEPS it, so the scope is not silently promoted", async () => {
+    // Dropping "GitHub" would empty the array, hit the all-invalid
+    // fall-through, and resolve this scope to the parent's allow-all -- the
+    // exact F1 bug filterStringArray exists to prevent. Warn instead.
+    writeConfigRaw(synthCwd, LOCAL_CONFIG_FILENAME, JSON.stringify({ servers: ["GitHub"] }));
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.servers).toEqual(["GitHub"]);
+    const w = r.warnings.find((x) => x.includes("is not a valid namespace"));
+    expect(w).toBeDefined();
+    expect(w).toContain("'GitHub'");
+  });
+
+  it("does not warn about well-formed namespaces", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github", "postgres_2"], blocked: ["slack"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings).toEqual([]);
+  });
+});
+
 describe("loadYawMcpConfig — walk-up project discovery", () => {
   it("finds .yaw-mcp/ in a parent directory", async () => {
     writeConfig(synthCwd, CONFIG_FILENAME, { servers: ["parent-scoped"] });
@@ -411,21 +546,47 @@ describe("loadYawMcpConfig — walk-up project discovery", () => {
   });
 });
 
-describe("loadYawMcpConfig — legacy migration runs once per process", () => {
+// Two separate facts, deliberately in two separate tests: that the loader
+// CALLS the migrator at all, and that it calls it only once per (cwd, home).
+// Asserting only the second is vacuous -- it passes unchanged if
+// `migrateLegacyConfigPathsOnce` is deleted from loadYawMcpConfig outright,
+// which proves nothing ran rather than that the memo is what stopped it.
+describe("loadYawMcpConfig — legacy migration", () => {
+  it("folds a pre-0.12 flat ~/.yaw-mcp.json into .yaw-mcp/config.json on the first load", async () => {
+    const legacy = join(synthHome, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ servers: ["legacy_only"] }));
+
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+
+    // The 0.11.x allow-list survived the upgrade, which is only true if the
+    // loader calls the migrator BEFORE resolving files. Deleting that call --
+    // or moving it after the readConfigAt calls, equally invisible today --
+    // turns this red.
+    expect(r.servers).toEqual(["legacy_only"]);
+    expect(r.loadedFiles.map((f) => f.scope)).toEqual(["global"]);
+    // Renamed, not copied: the legacy path is gone and the new one exists.
+    expect(existsSync(legacy)).toBe(false);
+    expect(existsSync(join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME))).toBe(true);
+  });
+
   it("does not re-walk for a (cwd, home) pair it has already migrated", async () => {
     // First load primes the memo (nothing to migrate yet).
     await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
 
-    // Drop a pre-0.12 flat config AFTER that first load. Because the
-    // migration is memoized per (cwd, home), the second load must not
-    // walk again -- the legacy file stays exactly where it is.
-    const legacy = join(synthHome, ".yaw-mcp.json");
-    writeFileSync(legacy, JSON.stringify({ servers: ["legacy-only"] }));
+    // Drop a pre-0.12 flat config AFTER that first load, at PROJECT scope.
+    // Scope matters: a second GLOBAL legacy file would prove nothing, because
+    // the migrator is idempotent and deliberately leaves a legacy file alone
+    // once ~/.yaw-mcp/config.json exists -- memo or no memo. This target does
+    // NOT exist and the walker reaches synthCwd, so a re-walk would migrate it
+    // into a project-scope config that then outranks global.
+    const legacy = join(synthCwd, ".yaw-mcp.json");
+    writeFileSync(legacy, JSON.stringify({ servers: ["project_legacy"] }));
 
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.servers).toBeUndefined();
+    expect(r.loadedFiles).toEqual([]);
     expect(existsSync(legacy)).toBe(true);
-    expect(existsSync(join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME))).toBe(false);
+    expect(existsSync(join(synthCwd, CONFIG_DIRNAME, CONFIG_FILENAME))).toBe(false);
   });
 });
 
@@ -538,9 +699,21 @@ describe("loadYawMcpConfig — installNudge flag", () => {
     expect(r.installNudge).toBe(true);
   });
 
-  it("ignores a non-boolean installNudge (no coercion of a typo)", async () => {
+  it("ignores a non-boolean installNudge (no coercion of a typo) and says so", async () => {
     writeConfigRaw(synthHome, CONFIG_FILENAME, JSON.stringify({ installNudge: "true" }));
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.installNudge).toBeUndefined();
+    // A wrong-typed `version` has warned for a while; installNudge was
+    // discarded in silence, so a user who opted in read their own config as
+    // enabled while the nudge stayed off on every surface.
+    const w = r.warnings.find((x) => x.includes("'installNudge' must be a boolean"));
+    expect(w).toBeDefined();
+    expect(w).toContain("found string");
+  });
+
+  it("does not warn about installNudge when the key is absent", async () => {
+    writeConfig(synthHome, CONFIG_FILENAME, { servers: ["github"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((x) => x.includes("'installNudge'"))).toBe(false);
   });
 });

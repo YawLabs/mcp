@@ -24,6 +24,12 @@ interface SpawnCall {
   opts: Record<string, unknown>;
 }
 
+/** The spawned bin's own name, stripped of the quotes and directory npmBin
+ *  adds when it finds an npm beside the running node. WHICH shape comes back
+ *  depends on the machine running the suite, so the spawn tests assert the
+ *  name; npmBin's own tests below pin both shapes exactly. */
+const binName = (bin: string): string => bin.replace(/^"|"$/g, "").split(/[\\/]/).pop() ?? bin;
+
 const spawnCalls: SpawnCall[] = [];
 /** Exit code the fake npm reports; null + a signal models a killed child. */
 let exitCode: number | null = 0;
@@ -49,13 +55,10 @@ vi.mock("node:child_process", () => ({
   },
 }));
 
-const { runSidecarsInstall, sidecarsRoot } = await import("../sidecars-cmd.js");
+const { defaultRunNpm, npmBin, runSidecarsInstall, sidecarsRoot } = await import("../sidecars-cmd.js");
 
 describe("sidecars install default npm runner", () => {
   let home: string;
-  const realPlatform = process.platform;
-
-  const setPlatform = (p: NodeJS.Platform) => Object.defineProperty(process, "platform", { value: p });
 
   beforeEach(() => {
     spawnCalls.length = 0;
@@ -85,17 +88,24 @@ describe("sidecars install default npm runner", () => {
   });
 
   afterEach(() => {
-    setPlatform(realPlatform);
     rmSync(home, { recursive: true, force: true });
   });
 
   // The oam probe spawns too, and it would go through the same mock and land in
   // spawnCalls -- so it is stubbed out here, leaving the npm spawns this file
   // exists to observe. Its own options live in oam-probe-options.test.ts.
-  const run = () =>
+  //
+  // `platform` is INJECTED rather than stamped onto process.platform: the two
+  // platform-branch tests below need a platform this machine may not be, and
+  // redefining the global for the whole call also strips atomicWriteFile of its
+  // Windows-only rename retry -- the AV/indexer EPERM dance that exists for
+  // exactly the host those tests would otherwise be flaky on. Every other test
+  // here passes nothing and runs against the real platform.
+  const run = (platform?: NodeJS.Platform) =>
     runSidecarsInstall({
       home,
       cwd: home,
+      platform,
       out: () => {},
       oamProbe: async () => ({
         bin: null,
@@ -112,8 +122,6 @@ describe("sidecars install default npm runner", () => {
     // packages in 12s") to STDOUT; inheriting that put it ahead of the JSON
     // document, so `sidecars install --json | jq` failed outright. fd 2 keeps
     // the progress visible without it landing in the parsed stream.
-    setPlatform("linux");
-
     await run();
 
     // Two steps: `install` acquires, `update` is the only one that can move an
@@ -126,25 +134,38 @@ describe("sidecars install default npm runner", () => {
     expect(stdio[2]).toBe("inherit");
   });
 
+  it("silences the child when the caller asks -- the background install's shape", async () => {
+    // sidecar-refresh's backgroundInstallOptions runs this same runner from
+    // inside `serve`, where fd 2 is the stream the MCP client reads our
+    // diagnostics from and npm's progress has nowhere to go. It differs on
+    // stdio ALONE: a second spawn of its own would have to restate the
+    // Windows-shell concession and the fixed-literal-args condition that makes
+    // it safe. Reddens if the override is dropped and the default shape wins.
+    await defaultRunNpm(["install"], home, { stdio: "ignore" });
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].opts.stdio).toBe("ignore");
+    expect(spawnCalls[0].opts.cwd).toBe(home);
+  });
+
   it("goes through the shell on Windows, where npm is a .cmd shim", async () => {
     // Node refuses to exec .cmd/.bat directly since the CVE-2024-27980 fix and
     // fails EINVAL before the process starts -- observed, not theoretical.
-    setPlatform("win32");
+    await run("win32");
 
-    await run();
-
-    expect(spawnCalls[0].bin).toBe("npm.cmd");
+    // The bin is `npm.cmd`, or an absolute quoted path ending in it when this
+    // machine has one beside its node (npmBin prefers the sibling, and the
+    // quotes are what survive cmd.exe splitting `C:\Program Files\...`).
+    expect(binName(spawnCalls[0].bin)).toBe("npm.cmd");
     expect(spawnCalls[0].opts.shell).toBe(true);
   });
 
   it("does NOT use a shell off Windows", async () => {
     // The shell is a Windows-only concession; taking it everywhere would put a
     // command line through an extra parser for no reason.
-    setPlatform("linux");
+    await run("linux");
 
-    await run();
-
-    expect(spawnCalls[0].bin).toBe("npm");
+    expect(binName(spawnCalls[0].bin)).toBe("npm");
     expect(spawnCalls[0].opts.shell).toBe(false);
   });
 
@@ -152,8 +173,6 @@ describe("sidecars install default npm runner", () => {
     // `cwd` travels as a spawn OPTION rather than in the command line, which
     // is what makes the Windows shell above safe -- no user-controlled path is
     // ever parsed by cmd. If this moved into the args it would be injectable.
-    setPlatform("linux");
-
     await run();
 
     expect(spawnCalls.map((c) => c.args)).toEqual([
@@ -165,6 +184,9 @@ describe("sidecars install default npm runner", () => {
     for (const call of spawnCalls) {
       expect(call.opts.cwd).toBe(sidecarsRoot(home));
       expect(call.args.join(" ")).not.toContain(home);
+      // No platform injected, so the shape must be the HOST's -- which is what
+      // makes this a check on the real default rather than on an override.
+      expect(call.opts.shell).toBe(process.platform === "win32");
     }
   });
 
@@ -175,7 +197,6 @@ describe("sidecars install default npm runner", () => {
     // the child inside the Promise executor, so an uncaught throw there rejects
     // runSidecarsInstall and the CLI prints a raw Node message (index.ts)
     // instead of the degradation the ENOENT case above pins.
-    setPlatform("linux");
     spawnThrows = new Error("spawn EINVAL");
 
     const res = await run();
@@ -187,7 +208,6 @@ describe("sidecars install default npm runner", () => {
   it("reports failure when npm cannot be spawned at all", async () => {
     // npm missing from PATH. The command must degrade to "your servers keep
     // using npx", not crash the CLI.
-    setPlatform("linux");
     childError = new Error("spawn npm ENOENT");
 
     const res = await run();
@@ -199,12 +219,43 @@ describe("sidecars install default npm runner", () => {
   it("treats a signal death as failure rather than success", async () => {
     // `close` reports code null when the child died on a signal; reading that
     // as 0 would declare an interrupted install (Ctrl-C, OOM) successful.
-    setPlatform("linux");
     exitCode = null;
     exitSignal = "SIGKILL";
 
     const res = await run();
 
     expect(res.exitCode).toBe(1);
+  });
+});
+
+describe("npmBin", () => {
+  let nodeDir: string;
+
+  beforeEach(() => {
+    nodeDir = mkdtempSync(join(tmpdir(), "sidecar-npmbin-"));
+  });
+  afterEach(() => rmSync(nodeDir, { recursive: true, force: true }));
+
+  it("prefers the npm installed beside the running node", () => {
+    // npm resolves native bindings for the node that RUNS it, while the
+    // platform marker records the node running THIS process. On a mixed-arch
+    // machine -- the case the marker exists for -- a PATH `npm` can belong to a
+    // different node, and the marker would then certify an arch the tree was
+    // never built for.
+    writeFileSync(join(nodeDir, "npm"), "#!/bin/sh\n");
+    writeFileSync(join(nodeDir, "npm.cmd"), "@echo off\r\n");
+
+    expect(npmBin("linux", nodeDir)).toBe(join(nodeDir, "npm"));
+    // Quoted on Windows: the command line goes through cmd.exe, and the default
+    // install location (`C:\Program Files\nodejs`) splits at the space without
+    // them.
+    expect(npmBin("win32", nodeDir)).toBe(`"${join(nodeDir, "npm.cmd")}"`);
+  });
+
+  it("falls back to the PATH shim when node has no npm beside it", () => {
+    // A standalone node build, or an image that puts npm elsewhere. The bare
+    // name is what this always used, so the fallback is the old behaviour.
+    expect(npmBin("linux", nodeDir)).toBe("npm");
+    expect(npmBin("win32", nodeDir)).toBe("npm.cmd");
   });
 });

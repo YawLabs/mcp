@@ -1,8 +1,13 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseFoundryArgs, runFoundryExport } from "../foundry-cmd.js";
+import { FOUNDRY_FILENAME } from "../foundry.js";
+import { DEFAULT_OUT, defaultLoadServers, FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "../foundry-cmd.js";
+import { DEFAULT_CORPUS_CAP } from "../foundry-corpus.js";
+import { localBundlesPath } from "../local-bundles.js";
+import { userConfigDir } from "../paths.js";
+import { statePath } from "../persistence.js";
 import type { RankableServer } from "../relevance.js";
 
 const SERVERS: RankableServer[] = [
@@ -16,8 +21,32 @@ describe("parseFoundryArgs", () => {
     expect(p.ok).toBe(true);
     if (p.ok) {
       expect(p.options.action).toBe("export");
-      expect(p.options.cap).toBeGreaterThan(0);
+      // PIN the defaults, don't just prove cap is positive. `out` is the path
+      // the routing gate loads its fixture from, so a silent change here
+      // un-gates routing with the whole suite still green.
+      expect(p.options.cap).toBe(DEFAULT_CORPUS_CAP);
+      expect(p.options.out).toBe(DEFAULT_OUT);
+      expect(p.options.json).toBe(false);
     }
+  });
+
+  it("flags --help with a `help` discriminant rather than by the error string", () => {
+    // index.ts used to recover the help case by `error === FOUNDRY_USAGE`, so
+    // appending anything to the usage body at one site turned `foundry --help`
+    // into a stderr dump at exit 2. The flag is the signal.
+    for (const flag of ["--help", "-h"]) {
+      const p = parseFoundryArgs([flag]);
+      expect(p.ok).toBe(false);
+      if (!p.ok) {
+        expect(p.help).toBe(true);
+        expect(p.error).toBe(FOUNDRY_USAGE);
+      }
+    }
+    // A genuine argv error must never read as help, even though it embeds the
+    // same usage text.
+    const bad = parseFoundryArgs(["export", "--nope"]);
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.help).toBeUndefined();
   });
 
   it("parses --out / --cap / --json", () => {
@@ -134,5 +163,125 @@ describe("runFoundryExport", () => {
       ...silent,
     });
     expect(r.exitCode).toBe(1);
+  });
+
+  it("reads the harvest off disk when no readTraces hook is injected", async () => {
+    // The PRODUCTION path. Every other case here injects readTraces, so the
+    // readFileSync fallback -- the only thing a maintainer actually runs --
+    // had no coverage at all.
+    mkdirSync(userConfigDir(dir), { recursive: true });
+    writeFileSync(
+      join(userConfigDir(dir), FOUNDRY_FILENAME),
+      `${JSON.stringify({ tokens: ["issue", "pull"], chosen: "github" })}\n`,
+      "utf8",
+    );
+    const out = join(dir, "corpus.json");
+    const r = await runFoundryExport({
+      out,
+      cap: 500,
+      json: false,
+      home: dir,
+      loadServers: async () => SERVERS,
+      ...silent,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(out, "utf8")).entries).toHaveLength(1);
+  });
+
+  it("resolves a relative --out against opts.cwd, not process.cwd()", async () => {
+    // `cwd` used to steer only the bundles.json lookup: the file the export
+    // produced still landed relative to process.cwd(), so the one knob that
+    // could redirect the command moved half of it.
+    const r = await runFoundryExport({
+      out: join("nested", "corpus.json"),
+      cap: 500,
+      json: false,
+      cwd: dir,
+      readTraces: () => JSON.stringify({ tokens: ["issue", "pull"], chosen: "github" }),
+      loadServers: async () => SERVERS,
+      ...silent,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(dir, "nested", "corpus.json"))).toBe(true);
+  });
+
+  it("warns when snapshot servers carry no tools", async () => {
+    // A tool-less snapshot ranks on name + namespace only, so the printed
+    // accuracy measures a catalog that cannot be the one that produced
+    // `chosen`. Silence there reads as a bad corpus instead of a bad snapshot.
+    const errs: string[] = [];
+    const jsonLines: string[] = [];
+    const r = await runFoundryExport({
+      out: join(dir, "corpus.json"),
+      cap: 500,
+      json: true,
+      readTraces: () => JSON.stringify({ tokens: ["issue", "pull"], chosen: "github" }),
+      loadServers: async () => [{ namespace: "github", name: "GitHub", description: "issues", tools: [] }],
+      write: (s) => jsonLines.push(s),
+      writeErr: (s) => errs.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(errs.join("")).toContain("1/1 snapshot servers carry no tools");
+    // The same count rides the machine-readable summary so a script can gate.
+    expect(JSON.parse(jsonLines.join("")).toollessServers).toBe(1);
+  });
+});
+
+describe("defaultLoadServers", () => {
+  let home: string;
+  let cwd: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-foundry-home-"));
+    // cwd lives INSIDE home so loadLocalBundles' project-trust walk-up stops
+    // at the synthetic home boundary and never reaches the developer's real
+    // ~/.yaw-mcp -- same isolation pattern as local-bundles.test.ts.
+    cwd = mkdtempSync(join(home, "cwd-"));
+    mkdirSync(userConfigDir(home), { recursive: true });
+    writeFileSync(
+      localBundlesPath(userConfigDir(home)),
+      JSON.stringify({
+        version: 1,
+        servers: [{ namespace: "github", name: "GitHub", description: "issues and pulls", command: "npx" }],
+      }),
+      "utf8",
+    );
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("hydrates each snapshot server's tools from the persisted tool cache", async () => {
+    // bundles.json's loader drops `toolCache` on the way in, so a snapshot
+    // built from the config alone gave EVERY server tools: [] -- and toolName
+    // is tied with namespace for the heaviest BM25 field weight. The exported
+    // corpus then replayed the floor against a catalog that could not be the
+    // one that produced `chosen`.
+    writeFileSync(
+      statePath(userConfigDir(home)),
+      JSON.stringify({
+        version: 2,
+        savedAt: Date.now(),
+        learning: {},
+        packHistory: [],
+        toolCache: {
+          github: { tools: [{ name: "create_issue", description: "open an issue" }], learnedAt: Date.now() },
+        },
+      }),
+      "utf8",
+    );
+    const servers = await defaultLoadServers(cwd, home);
+    expect(servers).toHaveLength(1);
+    expect(servers[0].tools).toEqual([{ name: "create_issue", description: "open an issue" }]);
+  });
+
+  it("leaves tools empty when state.json has no entry for the namespace", async () => {
+    // The honest degraded case the export's tool-less warning exists to name:
+    // no state file (or an entry aged past the tool-cache TTL) means the
+    // snapshot really does rank on name + namespace only.
+    const servers = await defaultLoadServers(cwd, home);
+    expect(servers).toHaveLength(1);
+    expect(servers[0].tools).toEqual([]);
   });
 });

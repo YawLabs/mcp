@@ -41,8 +41,10 @@ export interface ServersCommandOptions {
 
 export interface ServersCommandResult {
   exitCode: number;
-  /** Lines printed (stdout + stderr interleaved) — exposed for tests. */
-  lines: string[];
+  // No `lines` transcript here, unlike the sibling commands. It was documented
+  // as "exposed for tests" and nothing ever read it -- not index.ts (which uses
+  // `exitCode` alone) and not servers-cmd.test.ts, which asserts on the `out` /
+  // `err` sinks it already injects. The exit code IS this command's contract.
 }
 
 export interface ParsedServersArgs {
@@ -92,11 +94,9 @@ export const SERVERS_DEPRECATED_MESSAGE =
 export async function runServersCommand(opts: ServersCommandOptions = {}): Promise<ServersCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
-  const lines: string[] = [];
 
   // stderr unconditionally: a human running this interactively needs to see
   // WHY, and a script redirecting stdout into a parser still gets the reason.
-  lines.push(SERVERS_DEPRECATED_MESSAGE);
   writeErr(`${SERVERS_DEPRECATED_MESSAGE}\n`);
 
   // Under --json keep stdout parseable — a consumer piping into `jq` gets an
@@ -104,9 +104,8 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
   // is still the load-bearing signal; this is a courtesy, not a contract.
   if (opts.json) {
     const payload = JSON.stringify({ ok: false, deprecated: true, error: SERVERS_DEPRECATED_MESSAGE });
-    lines.push(payload);
     write(`${payload}\n`);
   }
 
-  return { exitCode: 1, lines };
+  return { exitCode: 1 };
 }

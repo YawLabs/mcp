@@ -34,14 +34,14 @@ export const FOUNDRY_TOP3_FLOOR = 0.7;
 
 // One harvested trace as written by foundry.ts/appendFoundryTrace.
 //
-// `candidates` is ns-only ON DISK: appendFoundryTrace in foundry.ts
-// deliberately strips the per-candidate `score` before writing, because a
-// score reflects the ranker's live health/learning state at decision time
-// and would bias an eval replay against that same state. The in-memory
-// FoundryTrace in foundry.ts still carries scores; this is the read shape.
+// No `candidates` field: appendFoundryTrace used to persist the ranker's
+// shortlist ns-only (scores stripped, because a score reflects the ranker's
+// live health/learning state and would bias an eval replay against that same
+// state), but nothing ever read it back, so it was dropped from the write.
+// A line left over from an older harvest may still carry the key -- parsing
+// ignores unknown keys, so such a file folds into a corpus unchanged.
 export interface HarvestedTrace {
   tokens: string[];
-  candidates?: Array<{ ns: string }>;
   chosen: string;
   redactedCount?: number;
 }

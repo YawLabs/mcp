@@ -81,8 +81,11 @@ export function installNudgeEnabled(env: NodeJS.ProcessEnv, config: { installNud
  *  external rewrite can be missed, and this module is fail-open by design --
  *  the worst case there is one extra nudge, exactly like a lost write.
  *
- *  (This does NOT batch the WRITES: recordNudge still writes once per
- *  candidate, because the call site drives one call per CLI.) */
+ *  The WRITE side is batched separately, by `recordNudges`: one discover
+ *  surfaces its candidates together, so the whole set lands in a single
+ *  read-modify-write. `recordNudge` is the one-CLI spelling of it, so a caller
+ *  that still loops per candidate pays one write per CLI -- pass the whole
+ *  list instead. */
 let stateMemo: { path: string; mtimeMs: number; size: number; state: NudgeState } | null = null;
 
 /** Read + parse the suppression state. Fail-open: any absent / unreadable /
@@ -156,26 +159,46 @@ export function shouldNudge(cli: string, home: string, now: () => number = Date.
 }
 
 /** Record that `cli` was just nudged so it's suppressed for the cooldown.
- *  Read-modify-write so concurrent CLIs surfaced in the same discover each
- *  land; the prior timestamp for this CLI (if any) is replaced. Stale
- *  entries past the cooldown are pruned on write to bound file growth.
+ *  The one-CLI spelling of `recordNudges` -- see there for the semantics. A
+ *  caller with several CLIs from one discover should pass them together rather
+ *  than loop, so the whole set costs a single write. */
+export function recordNudge(cli: string, home: string, now: () => number = Date.now): void {
+  recordNudges([cli], home, now);
+}
+
+/** Record that every CLI in `clis` was just nudged, in ONE read-modify-write,
+ *  so each is suppressed for the cooldown. A discover surfaces its candidates
+ *  as a set, so this is the shape the call site wants: looping recordNudge
+ *  re-read and rewrote the whole state file once per candidate, and every
+ *  record landed with a slightly different timestamp for what was one event.
+ *
+ *  Prior timestamps for the named CLIs are replaced, a repeated name in `clis`
+ *  collapses to one record, and stale entries past the cooldown are pruned on
+ *  write to bound file growth. An empty batch writes nothing at all.
  *  Fail-open: a write/mkdir failure is logged at debug and swallowed — the
  *  cost is a possible repeat nudge, never a thrown error. `now` is
  *  injectable for tests. */
-export function recordNudge(cli: string, home: string, now: () => number = Date.now): void {
+export function recordNudges(clis: string[], home: string, now: () => number = Date.now): void {
+  // Nothing to record: leave the file (and its absence) exactly as it is
+  // rather than rewriting it just to prune.
+  if (clis.length === 0) return;
+  const recorded = new Set(clis);
   try {
     const at = now();
     const state = readState(home);
-    // Drop the existing record for this cli plus any entry whose cooldown
-    // has fully lapsed (those would read as "never nudged" anyway, so
-    // keeping them just grows the file). Every surviving entry is REWRITTEN
-    // with its timestamp clamped to now, so a future-dated record (see
-    // clampToNow) is normalised on the next write instead of sitting in the
-    // file forever suppressing its CLI.
+    // Drop the existing record for every cli in this batch, plus any entry
+    // whose cooldown has fully lapsed (those would read as "never nudged"
+    // anyway, so keeping them just grows the file). Every surviving entry is
+    // REWRITTEN with its timestamp clamped to now, so a future-dated record
+    // (see clampToNow) is normalised on the next write instead of sitting in
+    // the file forever suppressing its CLI.
     const kept = state.nudges
-      .filter((n) => n.cli !== cli && at - clampToNow(n.nudgedAt, at) < INSTALL_NUDGE_COOLDOWN_MS)
+      .filter((n) => !recorded.has(n.cli) && at - clampToNow(n.nudgedAt, at) < INSTALL_NUDGE_COOLDOWN_MS)
       .map((n) => ({ cli: n.cli, nudgedAt: clampToNow(n.nudgedAt, at) }));
-    kept.push({ cli, nudgedAt: at });
+    // Iterating the SET, not the argument: two candidates naming the same CLI
+    // are one nudge, and a duplicated record would make the file grow by one
+    // entry per repeat.
+    for (const cli of recorded) kept.push({ cli, nudgedAt: at });
     const path = installNudgeStatePath(home);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify({ nudges: kept }, null, 2)}\n`, "utf8");
@@ -192,8 +215,10 @@ export function recordNudge(cli: string, home: string, now: () => number = Date.
     }
   } catch (err) {
     // Best-effort suppression — losing a write just risks one extra nudge.
+    // The whole batch is lost together, so the line names every CLI in it
+    // rather than the first (a single-CLI call reads exactly as it used to).
     log("debug", "install-nudge: failed to record nudge state", {
-      cli,
+      cli: [...recorded].join(", "),
       error: err instanceof Error ? err.message : String(err),
     });
   }

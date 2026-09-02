@@ -31,6 +31,6 @@
     "lineWidth": 120
   },
   "files": {
-    "includes": ["src/**", "!src/tests/fixtures/*.json"]
+    "includes": ["src/**", "*.ts", "tsconfig.json", "!src/tests/fixtures/*.json"]
   }
 }

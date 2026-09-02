@@ -7,20 +7,29 @@ import { type RankableServer, rankServers } from "../relevance.js";
 // seeded 15-server config; verify the top-ranked server is correct or
 // within top-3 in all cases."
 //
-// BENCHMARK below carries 14 intents (the original 10, plus 4 added for
-// fetch-mcp v0.2.0's expanded surface). Keep this count in sync when
-// adding cases -- it sets what the accuracy floor actually buys: at 14
-// intents the >=80% top-1 gate tolerates 2 misses (12/14 = 85.7% passes,
-// 11/14 = 78.6% fails).
+// BM25 (relevance.ts) is the WHOLE ranker. This file used to call itself
+// the "floor" beneath a Voyage rerank and tolerate misses on that basis;
+// the rerank ran on the hosted backend, which is retired, and nothing in
+// the repo reranks today. The only thing downstream of BM25 is dispatch's
+// optional LLM sampling tiebreak, which reorders ranked.slice(0, 3) when
+// the top candidates are close AND the budget resolves to one server AND
+// the client advertises sampling — it can promote a top-3 result to #1,
+// but it is skipped silently when any of those does not hold, and it can
+// never rescue a server BM25 left out of the list. So a miss here is a
+// production mis-route.
 //
-// This file runs the BM25 side of that check — no Voyage rerank, so it
-// tests the *floor* of ranking quality (what every user sees even when
-// the backend rerank key is missing or the call times out). If this
-// suite stays green across refactors, dispatch never regresses below
-// the lexical baseline.
+// Hence the two gates below are graded differently:
+//   BENCHMARK — one intent per server, all 15 of them, so the number
+//     measures 15 INDEPENDENT routing decisions. Held to 100% top-1:
+//     with no second ranking stage there is nothing for a tolerance to
+//     defer to, and every intent here passes today.
+//   SUBTOOL_COVERAGE — several intents aimed at one server's separate
+//     sub-tools. Held to top-3 only, and kept OUT of the accuracy gate:
+//     five fetch intents inside a 14-intent >=80% gate meant one server's
+//     ranking behavior, not routing breadth, consumed most of the
+//     tolerance budget.
 //
-// The benchmark is deliberately a unit test, not a live-backend
-// integration test, so it runs in CI without a Voyage key.
+// Both are deliberately unit tests, not live-backend integration tests.
 // ═══════════════════════════════════════════════════════════════════════
 
 // Realistic seed of 15 MCP servers drawn from the mcp.hosting catalog.
@@ -168,10 +177,15 @@ const CORPUS: RankableServer[] = [
   },
 ];
 
-// Varied intents a real user might give Claude. Each names the
-// expected top-match namespace. Intents deliberately avoid including
-// the namespace string itself in the query (that would be trivial) —
-// they lean on the description/tools metadata instead.
+// Varied intents a real user might give Claude, one per server in CORPUS.
+// Each names the expected top-match namespace. Intents deliberately avoid
+// including the namespace string itself in the query (that would be
+// trivial) — they lean on the description/tools metadata instead.
+//
+// One intent per server is the point: duplicates would let a single
+// server's ranking behavior move the accuracy number more than a whole
+// other server going unrouted. Sub-tool variants belong in
+// SUBTOOL_COVERAGE below.
 const BENCHMARK: Array<{ intent: string; expected: string }> = [
   { intent: "open a new issue about a login bug on our repo", expected: "github" },
   { intent: "post a message to the #launch channel", expected: "slack" },
@@ -183,7 +197,18 @@ const BENCHMARK: Array<{ intent: string; expected: string }> = [
   { intent: "search the web for recent news about llms", expected: "brave_search" },
   { intent: "what time is it in Tokyo right now", expected: "time" },
   { intent: "look up the latest unresolved error events in our project", expected: "sentry" },
-  // fetch-mcp v0.2.0 expanded surface — each intent targets a different sub-tool.
+  { intent: "add a page to our team workspace and append some blocks", expected: "notion" },
+  { intent: "upload a spreadsheet and list the shared documents in my cloud folder", expected: "gdrive" },
+  { intent: "remember the entities and relations from this session for later", expected: "memory" },
+  { intent: "break this hard problem into numbered steps of structured reasoning", expected: "sequential_thinking" },
+  { intent: "insert a row into the local db file and inspect its schema", expected: "sqlite" },
+];
+
+// fetch-mcp v0.2.0's expanded surface — each intent targets a different
+// sub-tool of the SAME server, so these measure sub-tool recall inside one
+// document rather than routing between servers. Top-3 only, and excluded
+// from the accuracy gate for the reason in the header.
+const SUBTOOL_COVERAGE: Array<{ intent: string; expected: string }> = [
   { intent: "parse the xml sitemap for example.com", expected: "fetch" },
   { intent: "extract the main article body from this blog post url", expected: "fetch" },
   { intent: "get the opengraph metadata from this page url", expected: "fetch" },
@@ -196,33 +221,38 @@ function topN(intent: string, n: number): string[] {
     .map((r) => r.namespace);
 }
 
-describe("smart-routing quality gate (BM25 floor)", () => {
-  // Primary gate from the launch TODO: top-3 must contain expected.
-  // If any intent drops out of the top-3, the next commit to the
-  // ranker probably regressed — investigate before merging.
-  it.each(BENCHMARK)("top-3 contains expected namespace for: $intent", ({ intent, expected }) => {
+describe("smart-routing quality gate (BM25 is the whole ranker)", () => {
+  // Primary gate from the launch TODO: top-3 must contain expected. This
+  // is where the sub-tool intents are graded too — dispatch's sampling
+  // tiebreak only ever reorders the top 3, so falling out of it is
+  // unrecoverable no matter what the client supports.
+  it.each([...BENCHMARK, ...SUBTOOL_COVERAGE])("top-3 contains expected namespace for: $intent", ({
+    intent,
+    expected,
+  }) => {
     const top3 = topN(intent, 3);
     expect(top3, `top-3 was: ${top3.join(", ")}`).toContain(expected);
   });
 
-  // Stronger gate: the expected namespace is also #1 for most intents.
-  // We tolerate a small number of "top-3 but not top-1" misses because
-  // BM25 alone is lexical — that's what Voyage rerank is for in prod.
-  // At the current 14 intents the 80% floor tolerates exactly 2 misses;
-  // a 3rd miss fails the gate. If top-1 accuracy drops below 80% here,
-  // the corpus got worse OR the ranker regressed; either way, investigate.
-  it("top-1 accuracy meets the BM25-only floor (≥80%)", () => {
-    const hits = BENCHMARK.filter(({ intent, expected }) => topN(intent, 1)[0] === expected).length;
-    const accuracy = hits / BENCHMARK.length;
-    expect(
-      accuracy,
-      `got ${hits}/${BENCHMARK.length} correct @1 — intents are in routing-quality.test.ts`,
-    ).toBeGreaterThanOrEqual(0.8);
+  // Stronger gate, and the one that matters: with one intent per server
+  // and no second ranking stage, every intent must rank its server #1.
+  // A miss is a user typing an intent and getting the wrong server
+  // spawned, so it is fixed (or the intent deleted as unrealistic) rather
+  // than absorbed by a tolerance. Sub-tool intents are excluded so one
+  // server cannot dominate the number.
+  it("routes every benchmark intent to its own server at rank 1", () => {
+    const misses = BENCHMARK.filter(({ intent, expected }) => topN(intent, 1)[0] !== expected).map(
+      ({ intent, expected }) => `${expected} != ${topN(intent, 3).join(", ")} for ${JSON.stringify(intent)}`,
+    );
+    expect(misses, `top-1 misses (${misses.length}/${BENCHMARK.length}):\n  ${misses.join("\n  ")}`).toEqual([]);
   });
 
-  // Sanity: every intent resolves to at least one candidate. Empty
-  // result = BM25 tokenizer broke or the corpus is missing a field.
-  it.each(BENCHMARK)("produces at least one match for: $intent", ({ intent }) => {
-    expect(topN(intent, 5).length).toBeGreaterThan(0);
+  // Coverage guard on the benchmark itself: every server in CORPUS is
+  // routed to by exactly one intent. Adding a server without an intent
+  // (the state notion / gdrive / memory / sequential_thinking / sqlite
+  // were in) leaves it silently unexercised.
+  it("carries exactly one benchmark intent per server in the corpus", () => {
+    const expected = BENCHMARK.map((b) => b.expected).sort();
+    expect(expected).toEqual(CORPUS.map((s) => s.namespace).sort());
   });
 });

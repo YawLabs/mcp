@@ -22,7 +22,7 @@ const MIN_FACTOR = 0.5;
 // Minimum error rate that earns a human-visible warning line in discover().
 // Below this we still let errorRateFactor nudge ranking, but stay silent:
 // totalCalls/errorCount never decay, so a single stale error in a large
-// sample (1 in 1000) must not emit a permanent "N of last M failed" line at
+// sample (1 in 1000) must not emit a permanent "N of M failed" line at
 // a negligible penalty -- that would train the model to skip a fine server.
 const WARN_RATE_FLOOR = 0.1;
 
@@ -39,9 +39,24 @@ export function errorRateFactor(health: ConnectionHealth | undefined): number {
   return Math.max(MIN_FACTOR, factor);
 }
 
+// True while an activation failure is still inside its TTL window.
+//
+// The lower bound is not decoration: `at` is a wall-clock stamp taken when the
+// activation failed, and a BACKWARDS clock step (NTP correction, VM resume,
+// manual set) makes `now - at` NEGATIVE. An upper-bound-only check reads that
+// as "younger than the TTL", so the namespace stays pinned at the MIN_FACTOR
+// penalty -- and formatHealthWarning keeps rendering "last activation failed
+// 1m ago", because Math.max(1, round(negative/60_000)) floors to 1 -- until the
+// clock catches back up to the stamp, which can be hours. A future-dated stamp
+// is skew, not evidence, so it expires immediately instead.
+function isWithinActivationTtl(failure: ActivationFailure, now: number): boolean {
+  const age = now - failure.at;
+  return age >= 0 && age <= ACTIVATION_FAILURE_TTL_MS;
+}
+
 export function activationFailureFactor(failure: ActivationFailure | undefined, now: number = Date.now()): number {
   if (!failure) return 1.0;
-  if (now - failure.at > ACTIVATION_FAILURE_TTL_MS) return 1.0;
+  if (!isWithinActivationTtl(failure, now)) return 1.0;
   return MIN_FACTOR;
 }
 
@@ -82,7 +97,7 @@ export function formatHealthWarning(
   activationFailure: ActivationFailure | undefined,
   now: number = Date.now(),
 ): string | null {
-  if (activationFailure && now - activationFailure.at <= ACTIVATION_FAILURE_TTL_MS) {
+  if (activationFailure && isWithinActivationTtl(activationFailure, now)) {
     const ageMin = Math.max(1, Math.round((now - activationFailure.at) / 60_000));
     const msg = activationFailure.message ? `: ${truncateForWarning(activationFailure.message)}` : "";
     return `warn: last activation failed ${ageMin}m ago${msg}`;
@@ -93,10 +108,16 @@ export function formatHealthWarning(
     // than the old >=30% so a genuinely flaky server (which errorRateFactor is
     // already down-ranking) no longer hides, but NOT rate>0: totalCalls /
     // errorCount never decay, so a lone early error would otherwise emit a
-    // permanent "N of last M failed" line at a negligible 1/M penalty.
+    // permanent "N of M failed" line at a negligible 1/M penalty.
+    //
+    // The line says "N of M", NOT "N of the last M": there is no window. Both
+    // counters run from the first call of the session and never decay, so M is
+    // the all-time total for this process and the failures it counts can all be
+    // hours old. "last" claimed a recency the numbers do not carry, and it is
+    // the LLM reading this line and deciding whether to route elsewhere.
     if (rate >= WARN_RATE_FLOOR) {
       const lastErr = health.lastErrorMessage ? `: ${truncateForWarning(health.lastErrorMessage)}` : "";
-      return `warn: ${health.errorCount} of last ${health.totalCalls} calls failed${lastErr}`;
+      return `warn: ${health.errorCount} of ${health.totalCalls} calls failed${lastErr}`;
     }
   }
   return null;
@@ -124,7 +145,23 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: string }> = [
   { re: /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: REDACTED },
   // 2. A secret-ish key followed by = or : and a value -- a query string, a
   //    JSON body, a header dump, or a Python repr ({'token': 'abc'}).
-  { re: new RegExp(`\\b(${SECRET_KEY_NAMES})("?\\s*[=:]\\s*"?)[^\\s,;&"'}\\]<]+`, "gi"), replace: `$1$2${REDACTED}` },
+  //
+  //    The name may carry an underscore/hyphen-joined PREFIX (NOTION_API_KEY,
+  //    auth_token, MY_SECRET), and that prefix is part of the match rather than
+  //    something \b can skip over: `_` is a word character, so a bare \b in
+  //    front of the name token never matches inside SOMETHING_TOKEN. Env-var
+  //    spellings are the dominant shape in MCP spawn/config errors, so that gap
+  //    left the raw value in the excerpt whenever the key carried a prefix and
+  //    the value itself had no vendor prefix for rule 3 to catch. The prefix
+  //    group sits INSIDE $1 so the full name still survives into the output.
+  //
+  //    Prefixed NON-secrets stay readable, because the name has to both END the
+  //    prefixed run and be followed by = or : -- "SSH_AUTH_SOCK=/tmp/..." has
+  //    `_SOCK` sitting after `AUTH`, so no alternative matches.
+  {
+    re: new RegExp(`\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)[^\\s,;&"'}\\]<]+`, "gi"),
+    replace: `$1$2${REDACTED}`,
+  },
   // 3. A vendor-prefixed key carrying no name for rule 2 to anchor on.
   {
     re: /\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|github_pat|xoxb|xoxp|xoxa|xapp|glpat)[-_][A-Za-z0-9_-]{8,}/g,

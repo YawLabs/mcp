@@ -84,9 +84,11 @@ function splitTokens(text: string | undefined, minLen: number): string[] {
     .filter((w) => w.length >= minLen);
 }
 
-/** Prose tokenizer (3-char floor). Also the shape external callers get --
- *  foundry.ts and the re-dispatch miss detector in server.ts both compare
- *  intent text with it, so widening THIS would change their recall too. */
+/** Prose tokenizer (3-char floor). Exactly one production consumer outside
+ *  this file: the re-dispatch miss detector in server.ts, which compares intent
+ *  text with it, so widening THIS would change its recall too. (foundry.ts used
+ *  to be the second, which is what this comment claimed; the harvest moved to
+ *  tokenizeQuery so it tokenizes at the floor the live ranker actually uses.) */
 export function tokenize(text: string | undefined): string[] {
   return splitTokens(text, MIN_TOKEN_LEN);
 }
@@ -166,9 +168,12 @@ const SUB_FLOOR_STOPWORDS = new Set([
 /** Query tokenizer. Same 1-char floor as the document identifier fields --
  *  "use pg" has to survive or the document-side widening is unreachable --
  *  minus the closed-class words that floor would otherwise admit.
- *  Exported for foundry.ts: the harvest must tokenize intents with the SAME
- *  floor the live ranker uses, or short identifiers (pg, gh, s3) are deleted
- *  from the corpus that scores that very ranker. */
+ *  Exported for the two callers that have to agree with the live ranker rather
+ *  than roll a third floor of their own: the foundry harvest, which would
+ *  otherwise delete short identifiers (pg, gh, s3) from the corpus that scores
+ *  this very ranker, and discover's match summary in server.ts, whose per-tool
+ *  set intersection would otherwise credit a tool for a term the ranker
+ *  deliberately strips. */
 export function tokenizeQuery(text: string | undefined): string[] {
   return tokenizeIdent(text).filter((t) => t.length >= MIN_TOKEN_LEN || !SUB_FLOOR_STOPWORDS.has(t));
 }
@@ -378,27 +383,40 @@ function touch<V>(cache: Map<string, V>, key: string, value: V): void {
   cache.set(key, value);
 }
 
-/** Field separator for a server signature. Doubled wherever it occurs
- *  inside a field, which makes the encoding unambiguous: a lone separator is
- *  a field boundary, a doubled one is literal text. */
+/** Field separator for a server signature, plus the escape byte that makes the
+ *  encoding injective: inside a field ESC is written ESC ESC and SEP is written
+ *  ESC SEP, so a bare SEP is always a field boundary and no field content can
+ *  forge one.
+ *
+ *  Doubling the separator instead -- the previous scheme -- is NOT unambiguous,
+ *  whatever its comment claimed: a field ending in SEP followed by a field "b",
+ *  and a field "a" followed by a field starting with SEP, both render as
+ *  a SEP SEP SEP b, so two distinct servers sign identically. That never
+ *  poisoned the cache only because the bytes that shift across the boundary in
+ *  such a pair are SEPs themselves, and SEP is also a token separator, so the
+ *  colliding corpora happened to tokenize alike -- a property of the byte
+ *  chosen, not of the encoding. */
 const SEP = "\u0000";
+const ESC = String.fromCharCode(1); // U+0001 SOH
 
-/** Escape the separator out of one field. Upstream tool names and
- *  descriptions arrive from third-party servers over JSON-RPC, where every
- *  character -- control characters included -- is legal string content, so a
- *  scheme that assumed some byte was absent would be trusting the untrusted
- *  side. The scan allocates nothing in the overwhelming common case of text
- *  that contains no separator at all. */
+/** Escape the separator -- and the escape byte itself -- out of one field.
+ *  Upstream tool names and descriptions arrive from third-party servers over
+ *  JSON-RPC, where every character -- control characters included -- is legal
+ *  string content, so a scheme that assumed some byte was absent would be
+ *  trusting the untrusted side. Order matters: ESC is escaped first, or the ESC
+ *  this function puts in front of a SEP would be escaped again on the second
+ *  pass. The scan allocates nothing in the overwhelming common case of text
+ *  that contains neither byte. */
 function esc(text: string): string {
-  return text.includes(SEP) ? text.replaceAll(SEP, SEP + SEP) : text;
+  return text.includes(ESC) || text.includes(SEP) ? text.replaceAll(ESC, ESC + ESC).replaceAll(SEP, ESC + SEP) : text;
 }
 
 /** Content signature for one server: every string BM25 will read, in order,
- *  separator-escaped so distinct field splits cannot collide onto one key.
- *  Without the escaping, namespace "a b" + name "c" signs identically to
- *  namespace "a" + name "b c", silently serving one corpus its neighbour's
- *  index -- and with a bare control character as the separator, the text that
- *  triggers the collision is supplied by the upstream server. */
+ *  escaped through `esc` so distinct field splits cannot collide onto one key.
+ *  Unescaped, namespace "a b" + name "c" signs identically to namespace "a" +
+ *  name "b c", silently serving one corpus its neighbour's index -- and since
+ *  the separator is a bare control character, the text that triggers the
+ *  collision is supplied by the upstream server. */
 function serverSignature(server: RankableServer): string {
   let sig = `${esc(server.namespace)}${SEP}${esc(server.name)}${SEP}${esc(server.description ?? "")}`;
   for (const tool of server.tools) {

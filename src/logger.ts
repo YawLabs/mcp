@@ -17,10 +17,14 @@ function minLevel(): number {
 // process down -- losing the session over a log line. One no-op listener
 // downgrades it to a dropped line. Attached only when nothing else is
 // listening, so a host that installed its own handler keeps it.
-let stderrErrorGuarded = false;
+//
+// There is deliberately no "already guarded" latch. A latch set before the
+// attach was attempted permanently disabled the guard whenever a foreign
+// 'error' listener happened to be present at the FIRST log() call -- that
+// call attached nothing, and every later one returned early. `listenerCount`
+// is O(1) and the count===0 check is already idempotent, so re-checking per
+// call costs nothing and re-arms us if a host later removes its handler.
 function guardStderrErrors(): void {
-  if (stderrErrorGuarded) return;
-  stderrErrorGuarded = true;
   try {
     if (process.stderr.listenerCount("error") === 0) {
       process.stderr.on("error", () => {

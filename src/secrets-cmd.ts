@@ -1223,17 +1223,22 @@ async function runSecretsRotate(
   }
 
   if (await vaultChangedSinceLoad(path, baseline)) {
-    // Drop the cached key: it was derived against the snapshot we just
-    // refused to overwrite, and the file that replaced it may carry a
-    // different salt.
+    // Belt-and-braces, NOT load-bearing: unlock() keys its cache on the
+    // vault's salt (cachedSalt in secrets-vault.ts), so a key derived against
+    // the snapshot we just refused to overwrite can never be handed to
+    // whatever replaced it -- which is why `set` and `remove` take these same
+    // two exits without a lock() and still cannot leak a stale key. rotate
+    // drops it anyway: holding a derived key for a vault this command was
+    // just told it does not have is state with no use left.
     lock();
     return vaultChangedResult(io, opts.json, "rotate");
   }
   const failed = await saveVaultOrReport(path, rotated, io, opts.json, "rotate");
   if (failed) {
-    // The on-disk vault is still the pre-rotation one, and the cached key was
-    // derived against it -- but the caller was just told nothing was saved,
-    // so drop it and let the next command re-derive from what is on disk.
+    // Same belt-and-braces drop as the refusal above: the on-disk vault is
+    // still the pre-rotation one (so the cached key remains valid for it),
+    // but the caller was just told nothing was saved. Only the lock() on the
+    // success path below is load-bearing -- there the salt really changed.
     lock();
     return failed;
   }
