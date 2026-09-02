@@ -5429,12 +5429,18 @@ describe("exec pipeline idle tracking and meta-tool refusal ordering", () => {
     });
 
     expect(result.isError).toBe(true);
-    const parsed = JSON.parse(result.content[0].text);
+    const text = result.content[0].text;
     // What makes the step illegal is the tool it names, not its args -- a
     // ref error here sent the model off fixing arguments for a call exec was
     // never going to make.
-    expect(parsed.error).toContain("meta-tool");
-    expect(parsed.error).not.toContain("ref");
+    expect(text).toContain("meta-tool");
+    expect(text).not.toContain("ref");
+    // Preflight refusals are plain text; the {ok, failedStep, partial} envelope
+    // is reserved for a failure AFTER steps have run, so that the shape alone
+    // says whether anything happened. Pinned because this check was hoisted out
+    // of the dispatch loop, where the envelope had been correct.
+    expect(text.startsWith("exec: ")).toBe(true);
+    expect(() => JSON.parse(text)).toThrow();
   });
 });
 

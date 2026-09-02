@@ -4290,20 +4290,20 @@ export class ConnectServer {
       const step = steps[i];
       if (!(META_TOOL_NAMES as Set<string>).has(step.tool)) continue;
       const key = stepBindingKey(step, i);
+      // Plain text, like both sibling preflight refusals, because the SHAPE is
+      // the phase marker: `exec: ...` means nothing ran, while the
+      // {ok, failedStep, error, partial} envelope means execution started and
+      // `partial` holds what completed. That distinction is what tells a reader
+      // whether a retry is free or can double a side effect, so a preflight
+      // refusal must not borrow the envelope -- reporting `partial: {}` here
+      // asserted the pipeline ran and completed nothing. This check used to sit
+      // INSIDE the dispatch loop, where the envelope was right; hoisting it to a
+      // pre-pass moved it across that boundary, and the shape moves with it.
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                ok: false,
-                failedStep: key,
-                error: `step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
-                partial: {},
-              },
-              null,
-              2,
-            ),
+            text: `exec: step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
           },
         ],
         isError: true,
