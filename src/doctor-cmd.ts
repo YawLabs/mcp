@@ -57,6 +57,7 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  resolveAppDataDir,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -497,8 +498,11 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
   // Keep the %APPDATA%-based claude-desktop path inside a synthetic home
-  // whenever home is overridden (test seam hermeticity; see ProbeOptions).
-  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
+  // whenever home is overridden (test seam hermeticity; see ProbeOptions), and
+  // otherwise read the ambient %APPDATA% -- the shared helper, so doctor names
+  // the same claude_desktop_config.json that install writes on a box where
+  // %APPDATA% is redirected away from <home>\AppData\Roaming.
+  const appData = resolveAppDataDir({ home: opts.home, env: opts.env });
   const os = opts.os ?? CURRENT_OS;
   const env = opts.env ?? process.env;
   const timestamp = new Date().toISOString();
@@ -2324,8 +2328,10 @@ function readTailLines(path: string, n: number): string[] {
 // leading env-var assignments (`FOO=bar CMD=quux cmd arg`), launcher
 // wrappers (`sudo` / `env` / `nohup` / `nice` / ...), path-style
 // invocations (`/usr/local/bin/npm` → `npm`) and a Windows executable
-// suffix (`npm.cmd` → `npm`). Returns null for lines we can't
-// confidently parse (pipes, command substitution, assignments only).
+// suffix (`npm.cmd` → `npm`), and lowercasing the result (`NPM` → `npm`)
+// so it matches the lowercase-keyed tables in cli-shadows.ts. Returns null
+// for lines we can't confidently parse (pipes, command substitution,
+// assignments only).
 function extractLeadingBinary(command: string): string | null {
   let rest = command.trimStart();
   if (!rest) return null;
@@ -2362,12 +2368,15 @@ function extractLeadingBinary(command: string): string | null {
   // Strip path prefix — we match on the binary name.
   const slash = Math.max(first.lastIndexOf("/"), first.lastIndexOf("\\"));
   const name = slash === -1 ? first : first.slice(slash + 1);
-  // Strip a Windows executable suffix. PowerShell / cmd history records what
-  // the user typed, and on Windows that is routinely `npm.cmd audit` or
-  // `gh.exe pr list` -- neither of which matches the shadow map, whose keys
-  // are bare binary names. Case-insensitive: PATHEXT is upper-case by
-  // convention and `NPM.CMD` is the same program.
-  return name.replace(/\.(exe|cmd|bat)$/i, "");
+  // Strip a Windows executable suffix, then lowercase. PowerShell / cmd
+  // history records what the user typed, and on Windows that is routinely
+  // `npm.cmd audit`, `gh.EXE pr list` or plain `NPM audit` -- none of which
+  // matches the shadow map, whose keys are bare lowercase binary names and are
+  // compared exactly. Both tables in cli-shadows.ts push that normalization
+  // onto the caller, and this is the caller. Lowercasing the whole name (not
+  // just the suffix) is safe because ShadowHit.cli is only displayed and
+  // looked up, never executed.
+  return name.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
 }
 
 // Version compare, delegated to oam-spawn's `compareVersions` -- the canonical

@@ -1984,6 +1984,123 @@ describe("runTry — client-config write failure on a re-run", () => {
     expect(JSON.parse(clientAfterFirstRun).mcpServers["yaw-mcp-try-demo"].env).toEqual({ D_TOKEN: "secret" });
   });
 
+  it("restores a previous marker whose step-6b peel FAILED, keeping the still-wired entry reachable", async () => {
+    // The re-run targets a DIFFERENT client, so step 6b tries to peel the old
+    // cursor entry -- but that peel is best-effort and can return "failed" on
+    // an unreadable / unparseable / unwritable old client file. The entry is
+    // then STILL live over there, so the "step 6b already peeled it" reasoning
+    // that justifies an unconditional unlink does not hold: unlinking strands
+    // the cursor entry (inline secret and all) past the reach of both
+    // `try-cleanup` and doctor's GC, exactly as on the same-target re-run above.
+    const common = {
+      slug: "demo",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux" as const,
+      env: {},
+      envOverrides: { D_TOKEN: "secret" },
+      fetchExplore: async (): Promise<ExploreServerResponse> => ({ ...SAMPLE, requiredEnvVars: ["D_TOKEN"] }),
+    };
+    const cap1 = captureIO();
+    const first = await runTry({
+      ...common,
+      clientId: "cursor",
+      now: () => 1_700_000_000_000,
+      out: cap1.pushOut,
+      err: cap1.pushErr,
+    });
+    expect(first.exitCode).toBe(0);
+    const cursorPath = join(synthHome, ".cursor", "mcp.json");
+    const clientPath = join(synthHome, ".claude.json");
+    const markerPath = trialMarkerPath("demo", synthHome);
+    const markerAfterFirstRun = readFileSync(markerPath, "utf8");
+    const cursorAfterFirstRun = readFileSync(cursorPath, "utf8");
+
+    // Fail the step-6b peel of the cursor file AND the new client write; the
+    // marker write between them still lands, so there is something to roll back.
+    const atomic = await import("../atomic-write.js");
+    const realWrite = atomic.atomicWriteFile;
+    vi.spyOn(atomic, "atomicWriteFile").mockImplementation(async (path, contents, encoding, mode, dirMode) => {
+      if (path === cursorPath || path === clientPath) throw new Error("EACCES: permission denied");
+      await realWrite(path, contents, encoding, mode, dirMode);
+    });
+
+    const cap = captureIO();
+    const r = await runTry({
+      ...common,
+      clientId: "claude-code",
+      now: () => 1_700_000_777_000,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toMatch(/couldn't remove the previous demo trial \(yaw-mcp-try-demo\)/);
+    expect(cap.errText()).toMatch(/failed to write .*EACCES/);
+    // The peel really did fail: the cursor entry is untouched, secret included.
+    expect(readFileSync(cursorPath, "utf8")).toBe(cursorAfterFirstRun);
+    expect(JSON.parse(cursorAfterFirstRun).mcpServers["yaw-mcp-try-demo"].env).toEqual({ D_TOKEN: "secret" });
+    // ...so the marker naming it must be back, byte for byte.
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, "utf8")).toBe(markerAfterFirstRun);
+    const restored = JSON.parse(readFileSync(markerPath, "utf8")) as TrialMarker;
+    expect(restored.clientPath).toBe(cursorPath);
+    expect(restored.entryName).toBe("yaw-mcp-try-demo");
+  });
+
+  it("still unlinks when the peel 'failed' because the previous marker was REFUSED", async () => {
+    // The other side of that gate. peelTrialEntry reports an untrusted marker
+    // as "failed" too, but it refused before touching anything -- and every
+    // other consumer (try-cleanup, doctor's GC) refuses it just the same, so
+    // restoring it would only re-arm a marker nothing on disk will ever act on.
+    // Consuming it is the deliberate behaviour; the stderr warning is what
+    // tells the user to remove the entry by hand.
+    const otherClient = join(synthHome, ".cursor", "mcp.json");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(otherClient, JSON.stringify({ mcpServers: { "not-a-trial-entry": { command: "x", args: [] } } }));
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const markerPath = trialMarkerPath("demo", synthHome);
+    writeFileSync(
+      markerPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        slug: "demo",
+        name: "Demo",
+        expiresAt: Date.now() + 3_600_000,
+        clientPath: otherClient,
+        clientName: "cursor",
+        containerPath: ["mcpServers"],
+        // Not a `yaw-mcp-try-*` name: rejectUntrustedMarker refuses it.
+        entryName: "not-a-trial-entry",
+        createdAt: Date.now(),
+      }),
+    );
+
+    const clientPath = join(synthHome, ".claude.json");
+    const atomic = await import("../atomic-write.js");
+    const realWrite = atomic.atomicWriteFile;
+    vi.spyOn(atomic, "atomicWriteFile").mockImplementation(async (path, contents, encoding, mode, dirMode) => {
+      if (path === clientPath) throw new Error("EACCES: permission denied");
+      await realWrite(path, contents, encoding, mode, dirMode);
+    });
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toMatch(/couldn't remove the previous demo trial \(not-a-trial-entry\)/);
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
   it("still unlinks the marker on a FIRST run, where nothing was wired before", async () => {
     // The other half of the gate: with no previous marker there is no entry to
     // keep reachable, and leaving a marker behind would have doctor report a

@@ -498,8 +498,10 @@ function refuseUnusableStore(home: string, store: TrustStore): void {
 }
 
 /**
- * The lookup keys a revoke tries, in order: the caller's own spelling first,
- * then the PHYSICAL one (parent realpath'd, basename rejoined).
+ * Every lookup key a revoke has to clear: the caller's own spelling, plus the
+ * PHYSICAL one (parent realpath'd, basename rejoined). A revoke removes ALL of
+ * them that are present, not the first hit -- both can name one bundles.json in
+ * the same store, and leaving either behind keeps the file trusted.
  *
  * Grants are keyed physically in practice. Every `yaw-mcp trust` grant reaches
  * the store through findProjectConfigDir, which realpaths the project dir, so
@@ -528,9 +530,10 @@ async function revokeKeyCandidates(p: string, platform: NodeJS.Platform): Promis
 }
 
 /**
- * Drop consent for `path`. Returns removed:false when the path was not in
- * the store (a no-op revoke is a success -- "make it absent" happened) or
- * when the store is malformed.
+ * Drop consent for `path` -- EVERY row that names it, in one write, not just
+ * the first candidate key that matches (see revokeKeyCandidates). Returns
+ * removed:false when the path was not in the store (a no-op revoke is a
+ * success -- "make it absent" happened) or when the store is malformed.
  *
  * A malformed store is REPORTED rather than rewritten: nothing is trusted
  * while it is unusable, so there is nothing for a revoke to remove, and
@@ -559,13 +562,24 @@ export async function revokeTrust(
   // Object.prototype, so `"toString" in entries` is true for every store.
   // normalizeTrustKey yields an absolute path today, which is why this was
   // never reachable -- the guard must not depend on that staying true.
-  const key = candidates.find((c) => Object.hasOwn(store.entries, c));
-  if (key === undefined) return { storePath, removed: false, storeWasMalformed: false };
+  //
+  // filter, not find: ALL matching rows go, not just the first. One
+  // bundles.json can legitimately hold BOTH candidate keys -- findProjectConfigDir
+  // was purely lexical until it started realpath'ing the project dir, so a
+  // checkout reached through a symlink granted a lexical row then, and the
+  // re-grant every upgrade forces (the key derivation changed under it) adds
+  // the physical one beside it. Removing one and reporting "Revoked" left the
+  // survivor keeping the file trusted and loading -- a false confirmation on a
+  // consent-WITHDRAWAL command, the same class of bug the physical candidate
+  // was added to fix.
+  const keys = candidates.filter((c) => Object.hasOwn(store.entries, c));
+  if (keys.length === 0) return { storePath, removed: false, storeWasMalformed: false };
   const fresh = await readTrustStore(home, platform);
   if (fresh.malformed) return { storePath, removed: false, storeWasMalformed: true };
-  if (!Object.hasOwn(fresh.entries, key)) return { storePath, removed: false, storeWasMalformed: false };
+  const present = keys.filter((k) => Object.hasOwn(fresh.entries, k));
+  if (present.length === 0) return { storePath, removed: false, storeWasMalformed: false };
   const entries = { ...fresh.entries };
-  delete entries[key];
+  for (const k of present) delete entries[k];
   await writeTrustStore(home, entries);
   log("info", "Revoked project bundles.json trust", { path: resolve(path) });
   return { storePath, removed: true, storeWasMalformed: false };

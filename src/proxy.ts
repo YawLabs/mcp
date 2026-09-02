@@ -1,6 +1,7 @@
 import { log } from "./logger.js";
 import { META_TOOLS } from "./meta-tools.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
+import { MAX_TIMEOUT_MS } from "./upstream.js";
 
 export interface ToolRoute {
   namespace: string;
@@ -559,11 +560,19 @@ export function isRoutingFaultResult(result: unknown): boolean {
 // the reliability/usage lines discover renders. This knob is how an operator
 // says "that one is legitimately slow" instead of watching a working server be
 // described as flaky.
+//
+// Clamped to MAX_TIMEOUT_MS for the same reason the connect ceiling is: the
+// number reaches the SDK's setTimeout, which stores its delay in a signed
+// 32-bit int, so anything above 2^31-1 overflows and fires after ~1ms. An
+// operator following the index.ts help text and reaching for a very large
+// ceiling would otherwise make EVERY proxied tools/call return -32001
+// immediately -- and a timeout is not branded a routing fault, so server.ts
+// would book each one against the upstream's health and error rate.
 const CALL_TIMEOUT = (() => {
   const env = process.env.MCP_CALL_TIMEOUT;
   if (!env) return 60_000;
   const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? n : 60_000;
+  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : 60_000;
 })();
 
 // `text` is OPTIONAL on the items this returns, and that is not pedantry: on

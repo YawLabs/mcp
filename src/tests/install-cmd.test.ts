@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   INSTALL_USAGE,
   mergeClientConfig,
@@ -45,16 +45,18 @@ afterEach(() => {
  *  the written JSON. No-op on POSIX. */
 const projectsKey = (dir: string): string => dir.replace(/\\/g, "/");
 
-/** One of `--all`'s per-client header lines (`── cursor (user) ──`).
+/** One of `--all`'s per-client header lines (`-- cursor (user) --`).
  *
- *  Both separator spellings are accepted on purpose. install renders it with
- *  box-drawing `──` today, while the sibling module whose output it sits
- *  beside documents ASCII-only for the Windows-console mojibake reason -- so
- *  pinning the glyph here would pin the side of that question these tests are
- *  not the place to decide. Matching the LINE shape is also what makes a
- *  header count meaningful: counting bare `──` tokens double-counts, since
- *  every header carries two. */
-const CLIENT_HEADER_LINE = /^(?:──|--) \S+ \(\w+\) (?:──|--)$/;
+ *  ASCII, and pinned as ASCII: install renders the separator with `--` today
+ *  (install-cmd.ts, the per-plan header in runInstallAll), for the same
+ *  Windows-console mojibake reason the sibling module it prints beside
+ *  documents at oam-spawn.ts:285-287 -- a box-drawing `──` written to a
+ *  console whose active codepage is not UTF-8 comes back as `ΓÇö`-class
+ *  garbage. Accepting BOTH spellings pinned neither, so reverting the code to
+ *  box-drawing kept the suite green. Matching the LINE shape (rather than the
+ *  separator token) is also what makes a header COUNT meaningful: counting
+ *  bare separator tokens double-counts, since every header carries two. */
+const CLIENT_HEADER_LINE = /^-- \S+ \(\w+\) --$/;
 
 function captureIo() {
   const out: string[] = [];
@@ -1630,6 +1632,122 @@ describe("runInstall — mutually exclusive flags", () => {
   });
 });
 
+describe("runInstall — --project-dir at a scope that resolves none", () => {
+  // Pins CURRENT behaviour: a `--project-dir` handed to a scope that reads no
+  // project directory is REFUSED at exit 2 with nothing written, rather than
+  // accepted-and-dropped. The refusal cannot live in the parser because the
+  // scope is only known once the client's default has resolved -- claude-code,
+  // claude-desktop and cursor all default to `user` (install-targets.ts) -- so
+  // it is the runner that has to reject it, and nothing exercised the branch.
+  // Load-bearing because the pre-refusal spelling was a SUCCESSFUL user-scope
+  // install at exit 0: whether refusing is the right call, or the flag should
+  // instead be ignored with a warning for a client that has no project scope,
+  // is a product question these tests only record the answer to.
+
+  it("claude-code (user) refuses at exit 2, writes nothing, and names the scopes that read it", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      // No explicit scope: claude-code DEFAULTS to user, which is the whole
+      // point -- the plain `install claude-code --project-dir /repo` a user
+      // types is the shape that used to quietly write ~/.claude.json.
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      // The refusal is ahead of the oam probe: a usage error must not pay for
+      // (or be able to fail on) a machine probe it never uses.
+      oamProbe: OAM_PROBE_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    // The user-scope file it would otherwise have written is untouched.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+    const stderr = cap.stderr();
+    expect(stderr).toMatch(/cannot honor --project-dir/);
+    // Both project-reading scopes are offered, in INSTALL_TARGETS order.
+    expect(stderr).toMatch(/--scope project \| local/);
+  });
+
+  it("claude-desktop refuses at exit 2 and says it has no project scope at all", async () => {
+    // The other half of the branch: with no project-reading scope to suggest,
+    // the fix line must say so rather than print an empty `--scope `.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-desktop",
+      // macos, so this is the not-available-on-linux refusal's sibling and not
+      // that refusal itself -- claude-desktop ships on macos and windows.
+      os: "macos",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    expect(existsSync(join(synthHome, "Library", "Application Support", "Claude", "claude_desktop_config.json"))).toBe(
+      false,
+    );
+    const stderr = cap.stderr();
+    expect(stderr).toMatch(/cannot honor --project-dir/);
+    expect(stderr).toMatch(/has no project-directory scope/);
+    expect(stderr).not.toMatch(/--scope\s*$/m);
+  });
+});
+
+describe("runInstall — Windows %APPDATA% redirection", () => {
+  it("the write path and --list name the SAME redirected claude-desktop file", async () => {
+    // Windows lets %APPDATA% be redirected (roaming profile, folder
+    // redirection) away from `<home>\AppData\Roaming`, and Claude Desktop reads
+    // the redirected location. resolveInstallPath used to read
+    // process.env.APPDATA itself, but ONLY when the caller passed no `home` --
+    // which is the write path alone (runInstall threads opts.home straight
+    // through and there is no --home flag). Every reader resolves a home first
+    // (probeClientsAsync requires `home: string`), so `--list` and doctor
+    // reported the HOME-derived path while install wrote the redirected one.
+    // resolveAppData now owns the env read for BOTH surfaces.
+    const redirected = mkdtempSync(join(tmpdir(), "yaw-mcp-appdata-"));
+    // homedir() is the fallback on the no-`home` path both calls below take;
+    // stub it off the real machine so this stays hermetic.
+    vi.stubEnv("APPDATA", redirected);
+    vi.stubEnv("USERPROFILE", synthHome);
+    vi.stubEnv("HOME", synthHome);
+    try {
+      const expected = join(redirected, "Claude", "claude_desktop_config.json");
+      const capWrite = captureIo();
+      const w = await runInstall({
+        clientId: "claude-desktop",
+        scope: "user",
+        os: "windows",
+        io: capWrite.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(w.exitCode).toBe(0);
+      expect(w.written).toEqual([expected]);
+      expect(existsSync(expected)).toBe(true);
+      // ...and NOT the HOME-derived spelling the readers used to name.
+      expect(existsSync(join(synthHome, "AppData", "Roaming", "Claude", "claude_desktop_config.json"))).toBe(false);
+
+      const capList = captureIo();
+      const l = await runInstall({ listOnly: true, os: "windows", io: capList.io });
+      expect(l.exitCode).toBe(0);
+      const row = l.messages.find((m) => m.includes("Claude Desktop"));
+      expect(row).toBeDefined();
+      // Same path, and read back as configured -- i.e. --list opened the file
+      // install just wrote instead of describing a different one as absent.
+      expect(row).toContain(expected);
+      expect(row).toMatch(/installed/);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(redirected, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("parseInstallArgs — --list / --all", () => {
   it("accepts --list with no positional", () => {
     const r = parseInstallArgs(["--list"]);
@@ -2589,13 +2707,13 @@ describe("runInstall — returned messages match what was printed", () => {
     // Emitted by the --all layer itself; a second, locally-built array dropped
     // every one of these while the user saw them all on stdout/stderr.
     expect(trail).toContain(TOKEN_FLAG_DEPRECATION);
-    // Both spellings of the two decorative glyphs are accepted -- see
-    // CLIENT_HEADER_LINE. The subject here is which LINES the returned trail
-    // carries, so cementing `…` and `──` into it would make these assertions
-    // fail the day install's terminal output goes ASCII for the same
-    // mojibake reason the module it quotes already documents.
-    expect(trail).toMatch(/Installing into \d+ clients?(?:…|\.\.\.)/);
-    expect(trail).toMatch(/^(?:──|--) claude-code \(user\) (?:──|--)$/m);
+    // Pinned ASCII, both glyphs -- see CLIENT_HEADER_LINE. install renders the
+    // ellipsis as `...` and the header separator as `--` today, for the
+    // Windows-console mojibake reason documented at oam-spawn.ts:285-287.
+    // Accepting the box-drawing spelling alongside pinned neither: the code
+    // could revert to `──` / `…` with the suite still green.
+    expect(trail).toMatch(/Installing into \d+ clients?\.\.\./);
+    expect(trail).toMatch(/^-- claude-code \(user\) --$/m);
     expect(trail).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // ...and still carries each sub-install's own trail.
     expect(trail).toContain(`Wrote ${join(synthHome, ".claude.json")}`);

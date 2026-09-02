@@ -2703,6 +2703,25 @@ describe("scanShellHistoryForShadows -- window size and wrapper parsing", () => 
     expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
   });
 
+  it("lowercases the leading binary, suffixed or bare", () => {
+    // Both CLI-keyed tables in cli-shadows.ts are keyed by bare lowercase names
+    // and matched EXACTLY, so extractLeadingBinary is the caller that owes the
+    // lowercase. Without it a PowerShell / cmd line -- where `NPM.CMD audit`
+    // and a bare `KUBECTL get pods` are both what the user actually typed --
+    // missed shadowMap.has() and the shadowed-CLI row silently vanished.
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["NPM.CMD audit", "KUBECTL get pods", String.raw`C:\bin\GH.EXE pr list`].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "kubectl")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
+    // The reported cli is the lowercase spelling, not the typed one -- doctor
+    // embeds it straight into the row and re-looks it up.
+    expect(hits.map((h) => h.cli)).not.toContain("NPM");
+  });
+
   it("strips env / nohup / nice launcher wrappers", () => {
     writeFileSync(
       join(synthHome, ".bash_history"),

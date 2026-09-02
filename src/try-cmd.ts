@@ -62,6 +62,7 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  resolveAppDataDir,
   resolveInstallPath,
 } from "./install-targets.js";
 import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
@@ -573,10 +574,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
   const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
   // Hermetic-home seam: keep the %APPDATA%-based claude-desktop path inside an
-  // overridden home (mirrors install-cmd / doctor). Computed ONCE -- the step-2
-  // probe and the step-3 resolve have to agree on it, and spelling the same
-  // expression at both sites is how they drift.
-  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
+  // overridden home, and otherwise read the ambient %APPDATA% so try names the
+  // same file install writes. Computed ONCE -- the step-2 probe and the step-3
+  // resolve have to agree on it, and spelling the same expression at both sites
+  // is how they drift; the shared helper is why it no longer drifts from
+  // install-cmd and doctor either.
+  const appData = resolveAppDataDir({ home: opts.home, env });
 
   // Step 1: fetch the canonical launch shape. The catalog override comes from
   // the SAME injectable env every other lookup here uses -- and an EMPTY value
@@ -857,6 +860,15 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 0, written: [], marker };
   }
 
+  // Set when step 6b tried to peel a marker it TRUSTED and the peel failed
+  // anyway (an unreadable / unparseable / unwritable old client file). The
+  // previous entry is then STILL LIVE, so the rollback in step 7 has to put its
+  // marker back rather than unlink it -- see the comment there. Deliberately
+  // NOT set for an untrusted or newer-schema marker: peelTrialEntry reports
+  // those as "failed" too, but it refused them before touching anything and
+  // every other consumer refuses them as well, so restoring one would only
+  // re-arm a marker nothing on disk will ever act on.
+  let previousPeelFailedWhileTrusted = false;
   if (previousMarker && peelsPrevious) {
     const outcome = await peelTrialEntry(previousMarker);
     if (outcome === "removed") {
@@ -873,6 +885,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
         clientJson = respliced.json;
       }
     } else if (outcome === "failed") {
+      previousPeelFailedWhileTrusted = previousRefusal === null;
       printErr(
         `yaw-mcp try: warning -- couldn't remove the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}. Remove that entry by hand; the marker below no longer points at it.`,
       );
@@ -940,15 +953,19 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     // on -- inline secret and all -- and that marker was the only thing on
     // disk naming it. Deleting it strands the entry beyond the reach of both
     // `try-cleanup` ("no trial marker ... nothing to do") and doctor's GC.
-    // Put the previous bytes back instead. (When the previous marker named a
-    // DIFFERENT file or entry, step 6b already peeled it, so there is nothing
+    // Put the previous bytes back instead. When the previous marker named a
+    // DIFFERENT file or entry, step 6b normally peeled it, so there is nothing
     // left for a restored marker to point at -- unlink stays right there, as
-    // it does for a first run with no previous marker at all.)
+    // it does for a first run with no previous marker at all. But that peel is
+    // best-effort: on a trusted marker whose old client file could not be read,
+    // parsed, or written, it returned "failed" and the previous entry is STILL
+    // wired, so its marker has to come back here too. (An untrusted or
+    // newer-schema marker is excluded -- see previousPeelFailedWhileTrusted.)
     //
     // The restore writes to the same disk that just failed us, so it is
     // best-effort on the same terms as the unlink, and passes no explicit mode
     // -- atomicWriteFile's preserve-the-target path is what a marker wants.
-    if (previousRead !== null && !peelsPrevious) {
+    if (previousRead !== null && (!peelsPrevious || previousPeelFailedWhileTrusted)) {
       await atomicWriteFile(trialMarkerPath(slug, home), previousRead.raw).catch(() => undefined);
     } else {
       await unlink(trialMarkerPath(slug, home)).catch(() => undefined);

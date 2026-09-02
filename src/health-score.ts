@@ -140,9 +140,24 @@ const SECRET_KEY_NAMES =
   "api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|" +
   "private[-_]?key|secret|password|passwd|pwd|token|authorization|auth|credential|signature|sig";
 
-const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: string }> = [
+// A VALUE that is a bare absence word is a DIAGNOSTIC, not a credential, and
+// redacting it inverts what upstream said. "GITHUB_TOKEN: not set" becomes
+// "GITHUB_TOKEN: <redacted> set" -- the value class stops at the first
+// whitespace, so only `not` is consumed and the surviving `set` flips the
+// reading from "credential absent" to "credential present but rejected". Same
+// for "NOTION_API_KEY: missing" and "AUTH_TOKEN: undefined". These are exactly
+// the lines a spawn/config failure produces, and they reach the user through
+// activationFailures -> the discover() warn line. Over-scrubbing is an
+// equal-and-opposite regression to leaking (see the header above), and an
+// INVERTED diagnostic is worse than a hidden one.
+//
+// Anchored on purpose: it gates only a value that is nothing BUT the absence
+// word, so `token=notasecret123` is still blanked.
+const ABSENCE_VALUE = /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank)$/i;
+
+const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...groups: string[]) => string }> = [
   // 1. An HTTP `Authorization: Bearer <blob>` / `Basic <blob>` header value.
-  { re: /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: REDACTED },
+  { re: /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: () => REDACTED },
   // 2. A secret-ish key followed by = or : and a value -- a query string, a
   //    JSON body, a header dump, or a Python repr ({'token': 'abc'}).
   //
@@ -157,17 +172,19 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: string }> = [
   //
   //    Prefixed NON-secrets stay readable, because the name has to both END the
   //    prefixed run and be followed by = or : -- "SSH_AUTH_SOCK=/tmp/..." has
-  //    `_SOCK` sitting after `AUTH`, so no alternative matches.
+  //    `_SOCK` sitting after `AUTH`, so no alternative matches. The VALUE is
+  //    gated too: an absence word there is a diagnostic, not a credential, so
+  //    the whole match is handed back untouched (see ABSENCE_VALUE above).
   {
-    re: new RegExp(`\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)[^\\s,;&"'}\\]<]+`, "gi"),
-    replace: `$1$2${REDACTED}`,
+    re: new RegExp(`\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)([^\\s,;&"'}\\]<]+)`, "gi"),
+    replace: (match, name, sep, value) => (ABSENCE_VALUE.test(value) ? match : `${name}${sep}${REDACTED}`),
   },
   // 3. A vendor-prefixed key carrying no name for rule 2 to anchor on.
   {
     re: /\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|github_pat|xoxb|xoxp|xoxa|xapp|glpat)[-_][A-Za-z0-9_-]{8,}/g,
-    replace: REDACTED,
+    replace: () => REDACTED,
   },
-  { re: /\bAKIA[0-9A-Z]{16}\b/g, replace: REDACTED },
+  { re: /\bAKIA[0-9A-Z]{16}\b/g, replace: () => REDACTED },
 ];
 
 /** Blank out credential-shaped substrings before an upstream error excerpt

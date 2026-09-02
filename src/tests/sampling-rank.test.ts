@@ -432,9 +432,13 @@ describe("shouldSample", () => {
 
   it("auto preserves the SAMPLING_TIEBREAK_RATIO top-2 tiebreak exactly (no entropy-driven over-sampling)", () => {
     // The entropy blend would push these into sampling; the auto path must
-    // NOT, since auto mirrors the historical second/top >= ratio gate. Framed
-    // against the exported constant rather than a third hardcoded 0.9, so a
-    // deliberate retune moves the test with the code instead of reddening it.
+    // NOT, since auto mirrors the historical second/top >= ratio gate. The
+    // relative assertions below document that intent, but relative alone is
+    // self-referential -- 0.81/0.85/0.88/0.95 all keep them green while the
+    // DEFAULT dispatch path changes how often it spends a client-LLM
+    // round-trip. So pin the constant by value too, the same way the k=3
+    // default is pinned above; a deliberate retune must edit this line.
+    expect(SAMPLING_TIEBREAK_RATIO).toBe(0.9);
     for (const r of [0.5, 0.7, SAMPLING_TIEBREAK_RATIO - 0.02, SAMPLING_TIEBREAK_RATIO - 0.01]) {
       const ranked = [
         { namespace: "a", score: 1 },

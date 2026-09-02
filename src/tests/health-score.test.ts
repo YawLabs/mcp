@@ -283,6 +283,32 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     expect(scrubForWarning(line)).toBe(line);
   });
 
+  it("does not invert a missing-credential diagnostic into a present-but-rejected one", () => {
+    // The name side of rule 2 matches these (the prefix run ends in TOKEN /
+    // API_KEY, followed by ':'), but the VALUE is an absence word, not a
+    // credential. Redacting it consumed only the first whitespace-delimited
+    // token, so "GITHUB_TOKEN: not set" came out as "GITHUB_TOKEN: <redacted>
+    // set" -- the surviving "set" flips the reading from "credential absent"
+    // to "credential present but rejected". Reachable: upstream stderr tail ->
+    // activationFailures -> the discover() warn line.
+    expect(scrubForWarning("Error: GITHUB_TOKEN: not set")).toBe("Error: GITHUB_TOKEN: not set");
+    expect(scrubForWarning("env var NOTION_API_KEY: missing")).toBe("env var NOTION_API_KEY: missing");
+    expect(scrubForWarning("AUTH_TOKEN: undefined")).toBe("AUTH_TOKEN: undefined");
+  });
+
+  it("gates only a value that is NOTHING BUT an absence word", () => {
+    // The absence gate is anchored, so it cannot be used to smuggle a real
+    // value past the scrubber by prefixing it with "not" / "none".
+    expect(scrubForWarning("GITHUB_TOKEN=notasecret123")).toBe("GITHUB_TOKEN=<redacted>");
+    expect(scrubForWarning("api_key=noneofyourbusiness42")).toBe("api_key=<redacted>");
+  });
+
+  it("still reports the absence-word case through the activation-failure line", () => {
+    const now = 1_000_000;
+    const w = formatHealthWarning(undefined, { at: now - 60_000, message: "Error: GITHUB_TOKEN: not set" }, now);
+    expect(w).toBe("warn: last activation failed 1m ago: Error: GITHUB_TOKEN: not set");
+  });
+
   it("scrubs BEFORE truncating, so the 120-char budget is spent on actionable text", () => {
     // The ordering inside truncateForWarning is load-bearing, and every other
     // credential fixture here is short enough that either order would pass.

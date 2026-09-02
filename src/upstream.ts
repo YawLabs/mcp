@@ -316,8 +316,12 @@ const DEFAULT_CONNECT_TIMEOUT = (() => {
  *  almost immediately. A `connectTimeoutMs` past that -- a typo'd extra digit
  *  in bundles.json, which the loader's `> 0` check happily accepts -- would
  *  therefore fail the connect instantly while the error message quoted a
- *  multi-day ceiling. Clamp so the value used and the value reported match. */
-const MAX_TIMEOUT_MS = 2_147_483_647;
+ *  multi-day ceiling. Clamp so the value used and the value reported match.
+ *
+ *  Exported because every operator-facing timeout knob needs the same clamp:
+ *  LIST_TIMEOUT below, and CALL_TIMEOUT in proxy.ts, whose values are handed
+ *  straight to the SDK's own setTimeout. A `> 0` check alone is not enough. */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
 
 // Bound on per-request listTools/listResources/listPrompts after the
 // initial handshake. Without this, a server that completes connect but
@@ -325,11 +329,17 @@ const MAX_TIMEOUT_MS = 2_147_483_647;
 // CONNECT_TIMEOUT timer above is already cleared by the time we reach
 // the listX calls). 15s matches the connect ceiling -- if a server
 // can't list its own tools in 15s, surface it as a real failure.
+//
+// Clamped to MAX_TIMEOUT_MS: this value goes to the SDK as a request option
+// and lands in setTimeout, so an out-of-range override (a typo'd extra digit)
+// would overflow the signed 32-bit delay, fire after ~1ms, and make every
+// inventory call time out instantly -- the opposite of what the operator who
+// raised the knob asked for.
 const LIST_TIMEOUT = (() => {
   const env = process.env.MCP_LIST_TIMEOUT;
   if (!env) return 15_000;
   const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? n : 15_000;
+  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : 15_000;
 })();
 
 // Cap captured stderr so a chatty server can't balloon yaw-mcp's memory.

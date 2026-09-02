@@ -395,6 +395,43 @@ describe("trust store grant / revoke / list round-trip", () => {
     expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
   });
 
+  it("clears BOTH rows when one bundles.json is keyed lexically AND physically", async () => {
+    // A store can hold both candidate keys for ONE file without any hand
+    // editing: findProjectConfigDir was purely lexical before it started
+    // realpath'ing the project dir, so a grant made from a symlinked checkout
+    // back then left a LEXICAL row, and the re-grant the key-derivation change
+    // forces afterwards adds the PHYSICAL one beside it. Revoking the first
+    // match only dropped one, printed "Revoked ... Restart to stop loading it"
+    // and exited 0 while the survivor kept the file trusted and loading -- the
+    // same false confirmation on a consent-WITHDRAWAL command that the physical
+    // candidate was added to fix, just one row further along.
+    writeBundles(synthCwd, HOSTILE);
+    const link = join(synthHome, "link-to-project");
+    symlinkSync(synthCwd, link, "junction");
+    const physical = projectBundlesPath(synthCwd);
+    const logical = projectBundlesPath(link);
+    expect(logical).not.toBe(physical);
+
+    const bytes = readFileSync(physical);
+    await grantTrust(logical, bytes, { home: synthHome });
+    await grantTrust(physical, bytes, { home: synthHome });
+    // Two genuinely distinct rows, both pinned to the same live file.
+    expect(await listTrusted({ home: synthHome })).toHaveLength(2);
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config?.servers).toHaveLength(1);
+
+    const res = await revokeTrust(logical, { home: synthHome });
+    expect(res.removed).toBe(true);
+    // Neither row survives -- in memory, and on disk.
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+    expect(Object.keys(raw.trusted)).toEqual([]);
+    // The claim the command makes: the project really stops loading. The probe
+    // keys PHYSICALLY, so the surviving physical row is exactly what used to
+    // keep this green while the revoke reported success.
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+    expect((await loadLocalBundles({ home: synthHome, cwd: link, env: {} })).config).toBeNull();
+  });
+
   it("revoking against a malformed store reports it instead of rewriting it", async () => {
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(trustStorePath(synthHome), "nope");

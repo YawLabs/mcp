@@ -163,32 +163,57 @@ export interface ResolvePathOptions {
   projectDir?: string;
   /** Override for tests; defaults to os.homedir(). */
   home?: string;
-  /** Override for tests. Defaults to `<home>/AppData/Roaming` whenever `home`
-   *  is supplied, and only otherwise to `process.env.APPDATA` (Windows) --
-   *  see the derivation in resolveInstallPath for why `home` wins. */
+  /** Windows `%APPDATA%`. Defaults to `<home>/AppData/Roaming` -- the resolver
+   *  never reads `process.env.APPDATA` itself, so a caller on a box where
+   *  %APPDATA% is redirected must pass it (see `resolveAppDataDir` below, the
+   *  one helper that reads the env, shared by install's write path, `--list`,
+   *  `doctor` and `try` so none of them can disagree). */
   appData?: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`. When set (truthy), claude-code
    *  user/local scope writes to `<dir>/.claude.json` instead of
    *  `<home>/.claude.json`, matching Claude Code's actual read path.
    *  The resolver never reads this one from the environment on its own:
    *  callers (install-cmd, doctor-cmd, index.ts) read
-   *  `process.env.CLAUDE_CONFIG_DIR` and pass it in. (`appData` above is the
-   *  one env read left, and only when the caller overrode no `home`.) */
+   *  `process.env.CLAUDE_CONFIG_DIR` and pass it in. Same for `appData` above
+   *  -- this function reads NO environment at all. */
   claudeConfigDir?: string;
+}
+
+/** The one place that decides where %APPDATA% lives for a caller.
+ *
+ *  `resolveInstallPath` is deliberately pure, which makes picking this the
+ *  CALLER's job -- and every caller has to pick it the SAME way or read and
+ *  write disagree. They did: `doctor` and `try` each derived it from `home`
+ *  alone, so on a box with %APPDATA% redirected away from
+ *  `<home>\AppData\Roaming` they reported the home-derived path while install
+ *  wrote the real one. An explicit `appData` wins; an overridden `home` keeps a
+ *  hermetic run inside that home; otherwise the ambient %APPDATA% is
+ *  authoritative, because that is the directory Claude Desktop itself reads. */
+export function resolveAppDataDir(opts: { appData?: string; home?: string; env?: NodeJS.ProcessEnv }): string {
+  if (opts.appData !== undefined) return opts.appData;
+  if (opts.home !== undefined) return join(opts.home, "AppData", "Roaming");
+  const env = opts.env ?? process.env;
+  return env.APPDATA ?? join(homedir(), "AppData", "Roaming");
 }
 
 export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
   const home = opts.home ?? homedir();
-  // A caller-supplied `home` OWNS the appData derivation. Reading the ambient
-  // process.env.APPDATA ahead of it made a synthetic home leak onto the real
-  // machine: claude-desktop is the one client that lives under %APPDATA%, so a
-  // hermetic run that overrode `home` but not `appData` resolved to (and would
-  // have written) the DEVELOPER's own claude_desktop_config.json. Every caller
-  // re-derived `<home>/AppData/Roaming` by hand to dodge that; owning the rule
-  // here means the caller that forgets is hermetic anyway. The env is consulted
-  // only when no `home` override was given -- i.e. when `home` IS the machine's.
-  const envAppData = opts.home === undefined ? process.env.APPDATA : undefined;
-  const appData = opts.appData ?? envAppData ?? join(home, "AppData", "Roaming");
+  // PURE: this resolver reads NO environment, and `appData` defaults off `home`
+  // alone. It used to consult process.env.APPDATA whenever the caller passed no
+  // `home`, which split READ from WRITE: every reader resolves a home first
+  // (probeClientsAsync requires `home: string`; doctor, `install --list` and
+  // `try` all pass homedir()) and so got `<home>/AppData/Roaming`, while the
+  // writer (runInstall) passes `home: undefined` and got the ambient %APPDATA%.
+  // On a box where %APPDATA% is redirected away from `<home>\AppData\Roaming`,
+  // install wrote the claude_desktop_config.json Claude Desktop actually reads
+  // while doctor and --list reported a different path. Choosing %APPDATA% is a
+  // CALLER's job -- see `resolveAppDataDir` below, the single helper that reads
+  // the env, used by install's write path, `--list`, `doctor` and `try` alike
+  // so they cannot disagree. Keeping the env out of here is also what keeps a hermetic run
+  // hermetic: claude-desktop is the one client living under %APPDATA%, so a
+  // test that overrode `home` but not `appData` would otherwise resolve to (and
+  // install would have written) the DEVELOPER's own config file.
+  const appData = opts.appData ?? join(home, "AppData", "Roaming");
   const { clientId, scope, os, projectDir, claudeConfigDir } = opts;
   const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
   if (!target) throw new Error(`Unknown client: ${clientId}`);

@@ -35,7 +35,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { atomicWriteFile } from "./atomic-write.js";
@@ -52,6 +52,7 @@ import {
   type InstallScope,
   isProjectLocalEntry,
   LEGACY_ENTRY_NAMES,
+  resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "./install-targets.js";
@@ -169,13 +170,24 @@ function oamIsAbsent(probe: OamProbe): boolean {
   return probe.bin === null && probe.binPath === null && !probe.belowMin && probe.failure === null;
 }
 
-/** %APPDATA% for this run: the explicit override, else derived from a `home`
- *  override so a synthetic home cannot escape into the real
- *  process.env.APPDATA (see InstallCommandOptions.appData). Shared by the write
- *  path and `--list` -- spelled out in both, the two surfaces could drift into
- *  disagreeing about where claude-desktop's config lives on Windows. */
+/** %APPDATA% for this run, resolved in ONE place and threaded to
+ *  resolveInstallPath (which reads no environment of its own).
+ *
+ *  Precedence: the explicit override; else a `home` override owns it, so a
+ *  synthetic home cannot escape into the real process.env.APPDATA (see
+ *  InstallCommandOptions.appData); else the machine's, which means the ambient
+ *  %APPDATA% ahead of `<homedir()>/AppData/Roaming`. That last step is the
+ *  load-bearing one: Windows lets %APPDATA% be redirected (roaming profiles,
+ *  folder redirection) away from `<home>\AppData\Roaming`, and Claude Desktop
+ *  reads the redirected location. Deriving it from HOME instead named a file
+ *  the app never reads.
+ *
+ *  Shared by the write path and `--list` deliberately: spelled out separately,
+ *  the two surfaces drifted into disagreeing about where claude-desktop's
+ *  config lives on Windows -- install wrote the real one while --list reported
+ *  the HOME-derived one. */
 function resolveAppData(opts: InstallCommandOptions): string | undefined {
-  return opts.appData ?? (opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined);
+  return resolveAppDataDir({ appData: opts.appData, home: opts.home });
 }
 
 export interface InstallResult {

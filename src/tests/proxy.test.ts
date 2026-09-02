@@ -916,14 +916,23 @@ describe("routeToolCall — request options", () => {
     expect(calls[0][2]).toEqual({ timeout: 60_000 });
   });
 
-  it("resolves the ceiling from MCP_CALL_TIMEOUT, falling back on a junk value", async () => {
+  it("resolves the ceiling from MCP_CALL_TIMEOUT, falling back on junk and clamping out-of-range", async () => {
     // Read once at module load, like MCP_LIST_TIMEOUT, so each case needs a
     // fresh module rather than a plain stubEnv.
+    //
+    // The last row is the one `Number.isFinite(n) && n > 0` alone let through:
+    // the SDK hands this straight to setTimeout, which stores its delay in a
+    // signed 32-bit int, so 3e9 overflows and fires after ~1ms. Unclamped, an
+    // operator raising the knob per the index.ts help text would make EVERY
+    // proxied tools/call return -32001 immediately -- and a timeout is not
+    // branded a routing fault, so server.ts books each one against the
+    // upstream's health and error rate.
     try {
       for (const [env, expected] of [
         ["5000", 5000],
         ["nonsense", 60_000],
         ["0", 60_000],
+        ["3000000000", 2_147_483_647],
       ] as const) {
         vi.stubEnv("MCP_CALL_TIMEOUT", env);
         vi.resetModules();

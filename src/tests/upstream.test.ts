@@ -447,6 +447,45 @@ describe("list pagination (nextCursor)", () => {
     expect(listResources.mock.calls[0][1]).toEqual({ timeout: expect.any(Number) });
   });
 
+  it("resolves the per-page bound from MCP_LIST_TIMEOUT, falling back on junk and clamping out-of-range", async () => {
+    // LIST_TIMEOUT is read once at module load, so each case needs a fresh
+    // module rather than a plain stubEnv. All three inventory calls share the
+    // constant, so all three are asserted -- the shape-only assertions above
+    // would pass on any number, including the broken one.
+    //
+    // The last row is the case `Number.isFinite(n) && n > 0` alone let through:
+    // the value reaches the SDK as a request option and lands in setTimeout,
+    // which stores its delay in a signed 32-bit int, so 3e9 overflows, fires
+    // after ~1ms, and times out every inventory call instantly -- the opposite
+    // of what an operator raising the knob asked for.
+    try {
+      for (const [env, expected] of [
+        ["5000", 5000],
+        ["nonsense", 15_000],
+        ["0", 15_000],
+        ["3000000000", 2_147_483_647],
+      ] as const) {
+        vi.stubEnv("MCP_LIST_TIMEOUT", env);
+        vi.resetModules();
+        const fresh = await import("../upstream.js");
+        const client = makeClient({
+          listResources: vi.fn().mockResolvedValue({ resources: [] }),
+          listPrompts: vi.fn().mockResolvedValue({ prompts: [] }),
+          listTools: vi.fn().mockResolvedValue({ tools: [] }),
+        });
+        await fresh.fetchResourcesFromUpstream(client, "ns");
+        await fresh.fetchPromptsFromUpstream(client, "ns");
+        await fresh.fetchToolsFromUpstream(client, "ns");
+        for (const fn of [client.listResources, client.listPrompts, client.listTools]) {
+          expect(fn.mock.calls[0][1], `MCP_LIST_TIMEOUT=${env}`).toEqual({ timeout: expected });
+        }
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
   it("fetchPromptsFromUpstream follows nextCursor across pages", async () => {
     const listPrompts = vi
       .fn()

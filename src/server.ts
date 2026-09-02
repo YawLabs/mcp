@@ -25,6 +25,7 @@ import {
   RefError,
   resolveArgs,
   stepBindingKey,
+  validateExecRefs,
   validateExecRequest,
 } from "./exec-engine.js";
 import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js";
@@ -2190,12 +2191,19 @@ export class ConnectServer {
       }
     }
 
+    // Hoisted above the co-usage map because both blocks need it: pack
+    // history is PERSISTED across restarts, so without the installed filter a
+    // server the user has since removed from bundles.json still shows up in
+    // another server's `often loaded with "<ns>"` line -- naming something
+    // `activate` can no longer load. The Suggested-packs block below filters
+    // exactly the same way.
+    const installedNamespaces = new Set(activeServers.map((s) => s.namespace));
     // Precompute the co-usage map once per discover call. Derived from
     // the PackDetector's current history — same signal `suggest` surfaces,
     // but delivered inline so the LLM doesn't need a second meta-tool
     // roundtrip to see "often used with X."
     const chains = this.packDetector.detectChains();
-    const coUsageMap = buildCoUsageMap(chains);
+    const coUsageMap = buildCoUsageMap(chains, installedNamespaces);
 
     // Inline "Suggested packs" block. Surfaces recurring co-activation
     // history from chains at the top of the output so the LLM can take
@@ -2204,7 +2212,6 @@ export class ConnectServer {
     // (so `activate` can actually load them) AND at least one must not
     // be connected yet (otherwise the pack is already loaded — no action
     // to take). Ranked by frequency desc, tie-break by recency.
-    const installedNamespaces = new Set(activeServers.map((s) => s.namespace));
     const connectedNamespaces = new Set(
       [...this.connections.entries()].filter(([, c]) => c.status === "connected").map(([ns]) => ns),
     );
@@ -2677,11 +2684,20 @@ export class ConnectServer {
   // (see its "skip self" comment), so a re-check there could refuse the
   // retry because OTHER namespaces filled the cap while the modal was open --
   // credentials typed, slot gone, nothing to show for it.
+  //
+  // `isElicitRetry` marks the ONE re-entry maybeElicitAndRetry makes after the
+  // user typed credentials. It exists to stop that re-entry eliciting again:
+  // the prompt budget is per namespace, not per activate, so a child that
+  // keeps reporting the same key missing would otherwise open a second,
+  // byte-identical modal inside the same activate call -- spending the whole
+  // budget (and three spawn attempts plus their retry sleeps) before the user
+  // has any chance to go fix the value somewhere else.
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
     fromPrewarm = false,
     skipCap = false,
+    isElicitRetry = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string; capped?: boolean }> {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
@@ -2838,7 +2854,7 @@ export class ConnectServer {
       //
       // Guarded by the haven't-just-tried-this-credential check: if elicited
       // values are already present for every detected name, don't ask twice.
-      const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress, fromPrewarm);
+      const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress, fromPrewarm, isElicitRetry);
       if (elicitedRetry) return elicitedRetry;
 
       log("error", "Failed to activate upstream", {
@@ -2880,6 +2896,7 @@ export class ConnectServer {
     lastError: unknown,
     progress?: ProgressReporter,
     fromPrewarm = false,
+    isElicitRetry = false,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
     // yaw-mcp's OWN vault passphrase is a separate path, matched by ERROR
     // TYPE rather than by pattern-matching text. resolveServerEnv throws
@@ -2902,6 +2919,32 @@ export class ConnectServer {
     // case is the typed branch above.
     const missing = detectMissingCredentials(haystack).filter((k) => !INTERNAL_SECRET_ENV_KEYS.has(k.toUpperCase()));
     if (missing.length === 0) return null;
+
+    // We are already inside the retry a prompt bought, and the child still
+    // reports the same thing missing. Asking again HERE opens a second modal
+    // in the same breath as the first, worded identically, with nothing new
+    // for the user to type -- and it spends the rest of the per-namespace
+    // budget (plus another pair of spawn attempts and their retry sleeps)
+    // before they can go look the real value up. Say what happened instead
+    // and leave the budget alone, so the next explicit activate can re-ask.
+    // The vault path's "rejected" branch reports its own not-accepted value
+    // the same way.
+    if (isElicitRetry) {
+      log("info", "Credentials still missing after the elicited retry — not re-asking inside the same activation", {
+        namespace,
+        missing,
+      });
+      const promptsSoFar = this.credentialPrompts.get(namespace) ?? 0;
+      const retryHint =
+        promptsSoFar >= MAX_CREDENTIAL_PROMPTS
+          ? ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and restart this MCP client.`
+          : ` Activate "${namespace}" again to try new ones.`;
+      return {
+        ok: false,
+        isChanged: false,
+        message: `Could not load "${namespace}": it still reports ${missing.join(", ")} missing, so the values just provided were not accepted.${retryHint}`,
+      };
+    }
 
     // A value we already supplied did not work. That used to end it for the
     // session: the stored-but-wrong entry made every later activation of
@@ -2993,7 +3036,10 @@ export class ConnectServer {
     // the cap on the way in and still holds its reservation, so re-checking
     // it here could refuse a user who has just typed credentials because
     // OTHER namespaces filled the cap while the modal was open.
-    return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
+    // isElicitRetry: this re-entry is the one round-trip the prompt bought.
+    // If the child STILL reports the same key missing, the branch above turns
+    // that into a message rather than a second identical modal.
+    return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true, /* isElicitRetry */ true);
   }
 
   // The vault-passphrase counterpart to maybeElicitAndRetry. Split out
@@ -4218,6 +4264,62 @@ export class ConnectServer {
     }));
     const explicitReturn = typeof args.return === "string" ? args.return : undefined;
 
+    // Whole-pipeline refusals, decided BEFORE step 0 fires a side effect.
+    // Both used to be per-step checks inside the dispatch loop below, where
+    // "before" only meant before the OFFENDING step: a one-character typo in
+    // the second step of `create issue -> comment on it` still cost a filed
+    // issue, and the usual reaction (fix the ref, re-run the exec) filed a
+    // second one. Every producer key is known statically, so neither refusal
+    // needs anything to have run. Nothing has, so there is no partial output
+    // to report and no idle tracking to settle on these paths.
+    //
+    // Meta-tools first, which is validateExecRefs' documented ORDERING
+    // CONTRACT: what makes a meta-tool step illegal is the tool it names, not
+    // its arguments, so a meta-tool step carrying a bad $ref must report the
+    // meta-tool refusal rather than a ref error that sends the model off
+    // fixing arguments for a call exec will never make.
+    //
+    // Meta-tools are callable by the client directly; routing them through
+    // exec would let a step, say, deactivate the server another step is about
+    // to use. Keep exec's surface narrowly proxy-only.
+    //
+    // Cast: META_TOOL_NAMES is a Set typed over the literal meta-tool names,
+    // but step.tool is a user-supplied string. The cast widens `.has()` to
+    // accept arbitrary strings without losing the runtime check.
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (!(META_TOOL_NAMES as Set<string>).has(step.tool)) continue;
+      const key = stepBindingKey(step, i);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                failedStep: key,
+                error: `step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
+                partial: {},
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const refCheck = validateExecRefs(steps);
+    if (!refCheck.ok) {
+      // Same plain-text shape as the validateExecRequest refusal above: this
+      // is preflight, so there is no failedStep to attribute and no partial
+      // bindings map -- the message already names the offending step index.
+      return {
+        content: [{ type: "text", text: `exec: ${refCheck.message}` }],
+        isError: true,
+      };
+    }
+
     const bindings: Record<string, unknown> = {};
     const stepKeys: string[] = [];
     // stepKey -> namespace, built as steps run, so a failing step can
@@ -4274,42 +4376,6 @@ export class ConnectServer {
       const step = steps[i];
       const key = stepBindingKey(step, i);
       stepKeys.push(key);
-
-      // Meta-tools are callable by the client directly; routing them
-      // through exec would let a step, say, deactivate the server
-      // another step is about to use. Keep exec's surface narrowly
-      // proxy-only.
-      //
-      // Checked BEFORE $ref resolution: what makes this step illegal is the
-      // tool it names, not its arguments, so a meta-tool step carrying a bad
-      // $ref must report the meta-tool refusal rather than a ref error that
-      // sends the model off fixing arguments for a call exec will never make.
-      //
-      // Cast: META_TOOL_NAMES is a Set typed over the literal meta-tool
-      // names, but step.tool is a user-supplied string. The cast widens
-      // `.has()` to accept arbitrary strings without losing the runtime
-      // check.
-      if ((META_TOOL_NAMES as Set<string>).has(step.tool)) {
-        await settleIdleTracking();
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  ok: false,
-                  failedStep: key,
-                  error: `step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
-                  partial: bindings,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
 
       // Resolve $ref markers against the running bindings map BEFORE the
       // tool call goes out, so the upstream sees a concrete args object.

@@ -1593,6 +1593,35 @@ describe("ConnectServer", () => {
       expect(priv.sessionActivated.has("gh")).toBe(false);
     });
 
+    it("refuses to unload a namespace with a call still in flight", async () => {
+      // Same guard the idle reaper applies (see "idle reaper vs in-flight tool
+      // calls"): closing under a live call rejects the caller's own pending
+      // tools/call, the proxy turns that into an isError result, and
+      // handleToolCall books a 0.0 reward against an upstream that was
+      // answering normally. The namespace stays loaded instead.
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.inflightCalls.set("gh", 1);
+      const refresh = vi.spyOn(priv, "refreshRoutesAndNotify");
+
+      const result = await priv.handleDeactivate(["gh"]);
+
+      expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+      expect(priv.connections.has("gh")).toBe(true);
+      // The response has to name the count, or the caller cannot tell this
+      // apart from "wasn't loaded" and won't know to call again.
+      expect(result.content[0].text).toContain('"gh" still has 1 tool call in flight');
+      expect(result.content[0].text).not.toContain("Unloaded");
+      // Nothing moved, so no list_changed triplet either.
+      expect(refresh).not.toHaveBeenCalled();
+
+      // Once the call drains, the same request unloads it.
+      priv.inflightCalls.delete("gh");
+      const after = await priv.handleDeactivate(["gh"]);
+      expect(after.content[0].text).toContain('Unloaded "gh"');
+      expect(priv.connections.has("gh")).toBe(false);
+    });
+
     it("skips the routes refresh when nothing was actually unloaded", async () => {
       // anyChanged gates refreshRoutesAndNotify. An idempotent retry against a
       // namespace that was never loaded moved no surface, so it must not emit
@@ -1931,6 +1960,24 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("mcp_connect_discover", {});
       expect(result.content[0].text).toContain('often loaded with "linear"');
       expect(result.content[0].text).toContain('often loaded with "gh"');
+    });
+
+    it("drops a peer the user has since removed from bundles.json", async () => {
+      // Pack history is PERSISTED across restarts, so it still names servers
+      // that are no longer installed. Printing one as `often loaded with
+      // "gone"` points the model at something activate can no longer load --
+      // and "gone" was the only peer here, so gh earns no usage line at all.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" })]);
+      const t0 = 1_000_000;
+      priv.packDetector.recordCall("gh", "create_issue", t0);
+      priv.packDetector.recordCall("gone", "do_thing", t0 + 1000);
+      priv.packDetector.recordCall("gh", "create_issue", t0 + 300_000);
+      priv.packDetector.recordCall("gone", "do_thing", t0 + 301_000);
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      expect(result.content[0].text).not.toContain("gone");
+      expect(result.content[0].text).not.toContain("usage:");
     });
 
     it("stays silent when neither signal has evidence", async () => {
@@ -3333,7 +3380,14 @@ describe("exec step-level split-blame attribution", () => {
     // isError body that classifyError reads as validation_error. This covers
     // the OTHER arm -- callTool THROWS a JSON-RPC error carrying code -32602,
     // and proxy.ts renders it as a "[code=-32602]" tag in the error text.
-    // Only that tag identifies it; classifyError never sees a structured body.
+    //
+    // The message is deliberately one classifyError does NOT read as a
+    // validation_error: it names an argument called `timeout`, unquoted, so
+    // classifyError's timeout check (which runs FIRST) preempts the -32602
+    // branch and returns "timeout". That leaves the code tag as the ONLY
+    // signal that this was bad input -- which is exactly the arm under test.
+    // With a plain "Invalid arguments" message the other disjunct also fires
+    // and deleting the tag check keeps this test green.
     const priv = getPrivate(server);
 
     const prodConn = makeConnection("prod", ["make"]);
@@ -3342,7 +3396,7 @@ describe("exec step-level split-blame attribution", () => {
     const consConn = makeConnection("cons", ["use"]);
     consConn.client.callTool = vi
       .fn()
-      .mockRejectedValue(Object.assign(new Error("Invalid arguments"), { code: -32602 }));
+      .mockRejectedValue(Object.assign(new Error("timeout must be a positive integer"), { code: -32602 }));
 
     priv.connections.set("prod", prodConn);
     priv.connections.set("cons", consConn);
@@ -5340,6 +5394,31 @@ describe("exec pipeline idle tracking and meta-tool refusal ordering", () => {
     expect(priv.discoverCache).toBeNull();
   });
 
+  it("refuses a typo'd $ref before step 0 fires its side effects", async () => {
+    // The whole point of the preflight: step 0 FILES AN ISSUE. Catching the
+    // one-character typo when step 1 resolves its args means the obvious
+    // reaction -- fix the ref, re-run the exec -- files a second one. Every
+    // producer key is known statically, so nothing has to run to decide this.
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh", ["create_issue", "comment"]);
+    conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: '{"number":7}' }] });
+    priv.connections.set("gh", conn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [
+        { id: "issue", tool: "gh_create_issue", args: {} },
+        { tool: "gh_comment", args: { n: { $ref: "isue.number" } } },
+      ],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('names step "isue"');
+    // Zero dispatches. Not "one dispatch and a good error".
+    expect(conn.client.callTool).not.toHaveBeenCalled();
+  });
+
   it("refuses a meta-tool step before resolving its $refs", async () => {
     const priv = getPrivate(server);
     priv.config = makeConfig([makeServerConfig({ namespace: "alpha" })]);
@@ -5962,6 +6041,50 @@ describe("elicitation retry vs the concurrent-server cap", () => {
     expect(priv.connections.get("gh")?.status).toBe("connected");
     // The cap really was full when the retry ran.
     expect(priv.connections.get("busy")?.status).toBe("connected");
+  });
+
+  it("asks once per activate when the child keeps reporting the same key missing", async () => {
+    // The prompt budget is per NAMESPACE, not per activate. The elicited retry
+    // re-enters runActivateOne, so without the isElicitRetry guard the nested
+    // maybeElicitAndRetry saw asked=1 < 2 and opened a SECOND, byte-identical
+    // modal in the same breath as the first -- nothing new for the user to
+    // type, the whole budget spent, six spawns and their retry sleeps inside
+    // one activate, and the namespace latched for the session.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { GITHUB_TOKEN: "ghp_x" },
+    });
+    // The child never accepts the value: every spawn reports the same key.
+    const stillMissing = new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n");
+    vi.mocked(connectToUpstream).mockRejectedValue(stillMissing);
+
+    const first = await withoutRetryBackoff(() => priv.activateOne("gh"));
+
+    expect(first.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    // One ask spent, not the whole budget.
+    expect(priv.credentialPrompts.get("gh")).toBe(1);
+    // And it says what happened, rather than repeating the raw spawn error.
+    expect(first.message).toContain("were not accepted");
+    expect(first.message).toContain('Activate "gh" again');
+
+    // The budget survived, so the NEXT explicit activate still gets to ask --
+    // which is the point of not burning it inside the first one.
+    const second = await withoutRetryBackoff(() => priv.activateOne("gh"));
+    expect(second.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(2);
+    expect(priv.credentialPrompts.get("gh")).toBe(2);
+    // That ask spent the last of the budget, so this one must NOT invite
+    // another activate it would refuse to prompt for.
+    expect(second.message).toContain("No further prompts");
+
+    // Budget exhausted: no third modal.
+    const third = await withoutRetryBackoff(() => priv.activateOne("gh"));
+    expect(third.ok).toBe(false);
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(2);
   });
 });
 

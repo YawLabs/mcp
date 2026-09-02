@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import {
@@ -354,13 +354,23 @@ describe("resolveInstallPath — Claude Desktop", () => {
     expect(r.display).toBe("%APPDATA%\\Claude\\claude_desktop_config.json");
   });
 
-  it("a supplied home beats the ambient process.env.APPDATA", () => {
-    // claude-desktop is the one client that lives under %APPDATA%, so the
-    // resolver preferring the ambient env over an explicit `home` meant a
-    // hermetic run (tests, `--home` overrides) resolved to -- and install would
-    // have written -- the DEVELOPER's real claude_desktop_config.json. Every
-    // caller re-derived `<home>/AppData/Roaming` by hand to dodge that; the
-    // resolver owns the rule now, so the caller that forgets is hermetic too.
+  it("never reads process.env.APPDATA -- with a `home` override or without one", () => {
+    // The resolver is PURE: it consults no environment, and `appData` defaults
+    // off `home` alone. Deciding %APPDATA% belongs to the CALLER (resolveAppData
+    // in install-cmd.ts), which threads it in. Two separate failures ride on
+    // that, one per branch below.
+    //
+    // WITH a `home`: claude-desktop is the one client living under %APPDATA%,
+    // so an env read ahead of an explicit `home` meant a hermetic run (tests, a
+    // `--home` override) resolved to -- and install would have written -- the
+    // DEVELOPER's real claude_desktop_config.json.
+    //
+    // WITHOUT a `home`, which is the branch that split READ from WRITE: the
+    // resolver used to fall back to the ambient env there, and only the WRITE
+    // path reaches it (runInstall passes `home: undefined`; there is no --home
+    // flag). Every reader resolves a home first, so on a box where %APPDATA% is
+    // redirected away from `<home>\AppData\Roaming`, install wrote the file
+    // Claude Desktop actually reads while doctor and --list named another.
     vi.stubEnv("APPDATA", "C:\\Users\\REAL-DEVELOPER\\AppData\\Roaming");
     try {
       const r = resolveInstallPath({
@@ -371,6 +381,10 @@ describe("resolveInstallPath — Claude Desktop", () => {
       });
       expect(r.absolute).toBe(join("C:\\synth-home", "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
       expect(r.absolute).not.toContain("REAL-DEVELOPER");
+      // No `home` either: still derived from the resolved home, never the env.
+      const ambient = resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "windows" });
+      expect(ambient.absolute).toBe(join(homedir(), "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
+      expect(ambient.absolute).not.toContain("REAL-DEVELOPER");
       // An explicit appData still wins over both.
       const explicit = resolveInstallPath({
         clientId: "claude-desktop",

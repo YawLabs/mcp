@@ -14,13 +14,13 @@
 // of that snapshot", and re-check it against the live catalog before relying
 // on it. Namespace keys are lowercased at lookup time.
 //
-// CLI-name lookups are NOT case-normalized. Both CLI-keyed tables below (the
-// cliToNamespaces reverse index and SHADOW_INSTALL_TARGETS) are keyed by bare,
-// already-lowercase binary names and matched exactly, so the CALLER lowercases
-// before it looks up. doctor's extractLeadingBinary is that caller: it already
-// strips path, wrapper and `.exe`/`.cmd` decoration, and the lowercase belongs
-// in the same place -- a PowerShell history line reading `NPM audit` matches
-// nothing without it.
+// CLI-name lookups are NOT case-normalized here. Both CLI-keyed tables below
+// (the cliToNamespaces reverse index and SHADOW_INSTALL_TARGETS) are keyed by
+// bare, already-lowercase binary names and matched exactly, so the CALLER
+// lowercases before it looks up. doctor's extractLeadingBinary is that caller
+// and does exactly that: it strips path, wrapper and `.exe`/`.cmd` decoration
+// and lowercases the result, because a PowerShell history line reading
+// `NPM.CMD audit` matches nothing otherwise.
 //
 // A multi-word catalog slug needs TWO keys when it actually shadows something,
 // and both are registered below. The forward lookup is keyed on a real

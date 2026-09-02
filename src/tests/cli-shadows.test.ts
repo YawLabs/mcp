@@ -332,9 +332,9 @@ describe("cliToNamespaces", () => {
     // only that prose landed. installTargetForCli's half is pinned by "matches
     // the CLI name exactly (no path/case fuzzing here)" above -- this is the
     // reverse index's half. doctor's extractLeadingBinary is the caller that
-    // owes the normalization: it already strips path, wrapper and `.exe`/`.cmd`
-    // decoration, and a PowerShell history line reading `NPM audit` matches
-    // nothing unless it lowercases in the same place.
+    // does the normalization: it strips path, wrapper and `.exe`/`.cmd`
+    // decoration AND lowercases, which is what makes a PowerShell history line
+    // reading `NPM audit` resolve at all (pinned in doctor-cmd.test.ts).
     const reverse = cliToNamespaces();
     for (const decorated of ["NPM", "Npm", "KUBECTL", "npm.exe", "/usr/bin/npm", "C:\\bin\\npm.exe", " npm"]) {
       expect(reverse.get(decorated), `${decorated} must not resolve -- the caller normalizes`).toBeUndefined();
