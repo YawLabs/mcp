@@ -1,7 +1,7 @@
 import { log } from "./logger.js";
 import { META_TOOLS } from "./meta-tools.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
-import { MAX_TIMEOUT_MS } from "./upstream.js";
+import { resolveTimeoutEnv } from "./upstream.js";
 
 export interface ToolRoute {
   namespace: string;
@@ -561,19 +561,16 @@ export function isRoutingFaultResult(result: unknown): boolean {
 // says "that one is legitimately slow" instead of watching a working server be
 // described as flaky.
 //
-// Clamped to MAX_TIMEOUT_MS for the same reason the connect ceiling is: the
-// number reaches the SDK's setTimeout, which stores its delay in a signed
-// 32-bit int, so anything above 2^31-1 overflows and fires after ~1ms. An
-// operator following the index.ts help text and reaching for a very large
-// ceiling would otherwise make EVERY proxied tools/call return -32001
-// immediately -- and a timeout is not branded a routing fault, so server.ts
-// would book each one against the upstream's health and error rate.
-const CALL_TIMEOUT = (() => {
-  const env = process.env.MCP_CALL_TIMEOUT;
-  if (!env) return 60_000;
-  const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : 60_000;
-})();
+// Parsed by the shared resolveTimeoutEnv (upstream.ts), which the connect and
+// inventory knobs use too: a strict digit run in 1..MAX_TIMEOUT_MS, anything
+// else falling back to the 60s default with one warn. Both halves matter here.
+// A prefix-parsed "3e9" or "30s" would become a 3ms or 30ms ceiling, and an
+// out-of-range value clamped to MAX_TIMEOUT_MS would be an effectively
+// infinite one -- so EVERY proxied tools/call would either return -32001
+// immediately (and a timeout is not branded a routing fault, so server.ts
+// books each one against the upstream's health and error rate) or pend for
+// ~24.8 days holding the namespace's inflightCalls marker.
+const CALL_TIMEOUT = resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000);
 
 // `text` is OPTIONAL on the items this returns, and that is not pedantry: on
 // the success path the body is whatever the upstream sent, and MCP content

@@ -11,6 +11,7 @@ import {
   INSTALL_TARGETS,
   isCmdShimLauncher,
   isProjectLocalEntry,
+  resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "../install-targets.js";
@@ -399,10 +400,71 @@ describe("resolveInstallPath — Claude Desktop", () => {
     }
   });
 
+  it("an empty `appData` is treated as unset, never as a relative path", () => {
+    // resolveInstallPath's own `opts.appData ?? join(home, ...)` was nullish-only,
+    // so a caller-supplied "" -- or one threaded in from an empty-but-set
+    // %APPDATA%, which is ordinary on Windows and in CI -- survived, and
+    // claude-desktop resolved to the RELATIVE "Claude\claude_desktop_config.json".
+    // doctor stats and prints that against the process cwd.
+    const withHome = resolveInstallPath({
+      clientId: "claude-desktop",
+      scope: "user",
+      os: "windows",
+      home: "C:\\synth-home",
+      appData: "",
+    });
+    expect(withHome.absolute).toBe(
+      join("C:\\synth-home", "AppData", "Roaming", "Claude", "claude_desktop_config.json"),
+    );
+    // No `home` either: the fallback is still the resolved home, NOT the env
+    // (this resolver stays pure), and the result is ABSOLUTE on any runner.
+    const ambient = resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "windows", appData: "" });
+    expect(ambient.absolute).toBe(join(homedir(), "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
+    expect(isAbsolute(ambient.absolute)).toBe(true);
+  });
+
   it("Linux is refused (no Linux build)", () => {
     expect(() =>
       resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "linux", home: "/home/alice" }),
     ).toThrow(/not available on linux/);
+  });
+});
+
+describe("resolveAppDataDir", () => {
+  it("treats an EMPTY %APPDATA% as unset and still resolves an ABSOLUTE dir", () => {
+    // Empty-but-set env vars are ordinary on Windows and in CI. `env.APPDATA ??
+    // join(homedir(), ...)` only falls back on null/undefined, so this returned
+    // "" -- and every caller threads that into resolveInstallPath, which made
+    // claude-desktop's path relative to the process cwd.
+    const r = resolveAppDataDir({ env: { APPDATA: "" } });
+    expect(r).toBe(join(homedir(), "AppData", "Roaming"));
+    expect(isAbsolute(r)).toBe(true);
+  });
+
+  it("treats an empty `appData` override as unset, falling through to home then env", () => {
+    expect(resolveAppDataDir({ appData: "", home: "C:\\synth-home" })).toBe(
+      join("C:\\synth-home", "AppData", "Roaming"),
+    );
+    expect(resolveAppDataDir({ appData: "", env: { APPDATA: "D:\\Redirected\\Roaming" } })).toBe(
+      "D:\\Redirected\\Roaming",
+    );
+  });
+
+  it("precedence: explicit appData, then home, then the ambient %APPDATA%, then homedir()", () => {
+    const env = { APPDATA: "D:\\Redirected\\Roaming" };
+    // An explicit value wins over both, and a `home` override wins over the env
+    // so a hermetic run cannot escape into the developer's real %APPDATA%.
+    expect(resolveAppDataDir({ appData: "C:\\explicit\\Roaming", home: "C:\\synth-home", env })).toBe(
+      "C:\\explicit\\Roaming",
+    );
+    expect(resolveAppDataDir({ home: "C:\\synth-home", env })).toBe(join("C:\\synth-home", "AppData", "Roaming"));
+    // With neither, the ambient %APPDATA% is authoritative -- that is the
+    // directory Claude Desktop reads when it is redirected off the home tree.
+    expect(resolveAppDataDir({ env })).toBe("D:\\Redirected\\Roaming");
+    expect(resolveAppDataDir({ env: {} })).toBe(join(homedir(), "AppData", "Roaming"));
+    // An empty `home` is NOT re-interpreted as unset: falling through to the env
+    // would aim a run that asked for a synthetic home at the real config file.
+    expect(resolveAppDataDir({ home: "", env })).toBe(join("", "AppData", "Roaming"));
   });
 });
 

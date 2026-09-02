@@ -20,8 +20,10 @@ import {
   MAX_LIST_PAGES,
   MAX_PROMPTS_PER_SERVER,
   MAX_RESOURCES_PER_SERVER,
+  MAX_TIMEOUT_MS,
   MAX_TOOLS_PER_SERVER,
   resetOamDowngrades,
+  resolveTimeoutEnv,
   scrubInternalSecretsFromProcessEnv,
   setSessionVaultPassphrase,
   stripInternalSecretsFromEnv,
@@ -447,23 +449,32 @@ describe("list pagination (nextCursor)", () => {
     expect(listResources.mock.calls[0][1]).toEqual({ timeout: expect.any(Number) });
   });
 
-  it("resolves the per-page bound from MCP_LIST_TIMEOUT, falling back on junk and clamping out-of-range", async () => {
+  it("resolves the per-page bound from MCP_LIST_TIMEOUT, falling back on junk and on out-of-range", async () => {
     // LIST_TIMEOUT is read once at module load, so each case needs a fresh
     // module rather than a plain stubEnv. All three inventory calls share the
     // constant, so all three are asserted -- the shape-only assertions above
     // would pass on any number, including the broken one.
     //
-    // The last row is the case `Number.isFinite(n) && n > 0` alone let through:
-    // the value reaches the SDK as a request option and lands in setTimeout,
-    // which stores its delay in a signed 32-bit int, so 3e9 overflows, fires
-    // after ~1ms, and times out every inventory call instantly -- the opposite
-    // of what an operator raising the knob asked for.
+    // The "3e9" and "30s" rows are the ones Number.parseInt's PREFIX parsing
+    // let through as 3 and 30: a millisecond-scale bound that times out every
+    // inventory call instantly, which is how activation dies on tools/list.
+    // The "3000000000" row is the out-of-range one, and the default is the
+    // right answer rather than MAX_TIMEOUT_MS -- clamping there would hand the
+    // SDK an effectively infinite bound (~24.8 days) instead of the instant
+    // failure, which is not an improvement. The last two rows pin the edges of
+    // the accepted range, and the leading/trailing space is the cmd.exe
+    // `set VAR= && ...` shape.
     try {
       for (const [env, expected] of [
         ["5000", 5000],
+        [" 5000 ", 5000],
         ["nonsense", 15_000],
         ["0", 15_000],
-        ["3000000000", 2_147_483_647],
+        ["3e9", 15_000],
+        ["30s", 15_000],
+        ["3000000000", 15_000],
+        ["2147483647", 2_147_483_647],
+        ["2147483648", 15_000],
       ] as const) {
         vi.stubEnv("MCP_LIST_TIMEOUT", env);
         vi.resetModules();
@@ -632,6 +643,84 @@ describe("list pagination (nextCursor)", () => {
     // The overshoot page proved there was more than the cap; no third fetch.
     expect(listResources).toHaveBeenCalledTimes(2);
     expect(stderr.writes.some((w) => w.includes("truncating"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared timeout env parser
+// ---------------------------------------------------------------------------
+
+// One parser backs all three operator-facing timeout knobs -- MCP_CONNECT_TIMEOUT
+// and MCP_LIST_TIMEOUT here, MCP_CALL_TIMEOUT in proxy.ts. It is shared because
+// the previous round hardened ONE site and left the other two prefix-parsing;
+// the per-site tests pin the wiring, these pin the contract.
+describe("resolveTimeoutEnv", () => {
+  beforeEach(() => {
+    vi.mocked(log).mockClear();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("accepts a whole-number millisecond value inside the range, trimmed", () => {
+    for (const [raw, expected] of [
+      ["5000", 5000],
+      ["  5000  ", 5000],
+      ["1", 1],
+      [String(MAX_TIMEOUT_MS), MAX_TIMEOUT_MS],
+    ] as const) {
+      vi.stubEnv("MCP_CONNECT_TIMEOUT", raw);
+      expect(resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000), raw).toBe(expected);
+    }
+    expect(vi.mocked(log)).not.toHaveBeenCalled();
+  });
+
+  it("takes the default silently when the var is unset or empty once trimmed", () => {
+    // cmd.exe's `set VAR= && ...` idiom leaves a whitespace-only value behind,
+    // which reads as "unset" -- warning about it would be noise on a shape the
+    // other resolvers in this repo already document.
+    expect(resolveTimeoutEnv("YAW_MCP_TIMEOUT_FIXTURE_UNSET", 15_000)).toBe(15_000);
+    for (const raw of ["", " "]) {
+      vi.stubEnv("MCP_CONNECT_TIMEOUT", raw);
+      expect(resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000), JSON.stringify(raw)).toBe(15_000);
+    }
+    expect(vi.mocked(log)).not.toHaveBeenCalled();
+  });
+
+  it("rejects a prefix-parseable value instead of taking the prefix", () => {
+    // The defect the clamp did not close: Number.parseInt("3e9", 10) is 3,
+    // "30s" is 30, "1_000" is 1. Each is a millisecond-scale ceiling produced
+    // by a value that reads generous, so every call on that leg fails instantly
+    // -- and a timeout is not branded a routing fault, so server.ts books each
+    // one against the upstream's health and error rate.
+    for (const raw of ["3e9", "30s", "1_000", "0x10", "5.5", "-1", "nonsense", "0"]) {
+      vi.stubEnv("MCP_CALL_TIMEOUT", raw);
+      expect(resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000), raw).toBe(60_000);
+    }
+  });
+
+  it("rejects an out-of-range value instead of clamping it to MAX_TIMEOUT_MS", () => {
+    // Clamping is strictly worse than the overflow it replaced: an overflowed
+    // delay at least SETTLES after ~1ms, so the inflightCalls marker gets
+    // cleared. MAX_TIMEOUT_MS pends for ~24.8 days with no AbortSignal, which
+    // leaves the namespace neither deactivatable nor idle-reapable.
+    for (const raw of [String(MAX_TIMEOUT_MS + 1), "3000000000", "999999999999999999999"]) {
+      vi.stubEnv("MCP_LIST_TIMEOUT", raw);
+      expect(resolveTimeoutEnv("MCP_LIST_TIMEOUT", 15_000), raw).toBe(15_000);
+    }
+  });
+
+  it("warns on a rejected value, naming it, the ceiling, and the default in effect", () => {
+    // Neither the pre- nor the post-clamp code gave the operator any signal
+    // that the knob they set was being ignored.
+    vi.stubEnv("MCP_CALL_TIMEOUT", "3e9");
+    expect(resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000)).toBe(60_000);
+    expect(vi.mocked(log)).toHaveBeenCalledTimes(1);
+    const [level, msg, data] = vi.mocked(log).mock.calls[0];
+    expect(level).toBe("warn");
+    expect(msg).toContain("MCP_CALL_TIMEOUT");
+    expect(msg).toContain(String(MAX_TIMEOUT_MS));
+    expect(data).toEqual({ value: "3e9", maxMs: MAX_TIMEOUT_MS, usingMs: 60_000 });
   });
 });
 

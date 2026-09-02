@@ -916,23 +916,32 @@ describe("routeToolCall — request options", () => {
     expect(calls[0][2]).toEqual({ timeout: 60_000 });
   });
 
-  it("resolves the ceiling from MCP_CALL_TIMEOUT, falling back on junk and clamping out-of-range", async () => {
+  it("resolves the ceiling from MCP_CALL_TIMEOUT, falling back on junk and on out-of-range", async () => {
     // Read once at module load, like MCP_LIST_TIMEOUT, so each case needs a
-    // fresh module rather than a plain stubEnv.
+    // fresh module rather than a plain stubEnv. The parsing contract itself is
+    // pinned on resolveTimeoutEnv (upstream.test.ts); this pins that proxy.ts
+    // is actually wired to it.
     //
-    // The last row is the one `Number.isFinite(n) && n > 0` alone let through:
-    // the SDK hands this straight to setTimeout, which stores its delay in a
-    // signed 32-bit int, so 3e9 overflows and fires after ~1ms. Unclamped, an
-    // operator raising the knob per the index.ts help text would make EVERY
-    // proxied tools/call return -32001 immediately -- and a timeout is not
+    // "3e9" and "30s" are what Number.parseInt's PREFIX parsing turned into 3
+    // and 30 -- a millisecond ceiling from a value that reads generous, making
+    // EVERY proxied tools/call return -32001 immediately, and a timeout is not
     // branded a routing fault, so server.ts books each one against the
-    // upstream's health and error rate.
+    // upstream's health and error rate. "3000000000" is out of range, and the
+    // 60s default is the right answer there rather than MAX_TIMEOUT_MS: a
+    // clamped ceiling never settles, so the namespace's inflightCalls marker
+    // is never cleared and the namespace stops being deactivatable or
+    // idle-reapable. The last two rows pin the edges of the accepted range.
     try {
       for (const [env, expected] of [
         ["5000", 5000],
+        [" 5000 ", 5000],
         ["nonsense", 60_000],
         ["0", 60_000],
-        ["3000000000", 2_147_483_647],
+        ["3e9", 60_000],
+        ["30s", 60_000],
+        ["3000000000", 60_000],
+        ["2147483647", 2_147_483_647],
+        ["2147483648", 60_000],
       ] as const) {
         vi.stubEnv("MCP_CALL_TIMEOUT", env);
         vi.resetModules();
@@ -946,6 +955,40 @@ describe("routeToolCall — request options", () => {
       vi.unstubAllEnvs();
       vi.resetModules();
     }
+  });
+
+  it("warns at module load when MCP_CALL_TIMEOUT is rejected", async () => {
+    // The diagnostic has to survive where the value is actually resolved: the
+    // constant is latched in a module-level initialiser, so the only place the
+    // operator can be told their knob was ignored is that import. Captured off
+    // the REAL logger (this file does not stub it) to prove stderr at module
+    // load is a path that works, not just that resolveTimeoutEnv calls log().
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("MCP_CALL_TIMEOUT", "3e9");
+    vi.resetModules();
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      await import("../proxy.js");
+    } finally {
+      process.stderr.write = original;
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+    const warn = writes.find((w) => w.includes("MCP_CALL_TIMEOUT"));
+    expect(warn).toBeDefined();
+    // The rejected value, the ceiling, and the number actually in effect --
+    // without the last one the operator cannot tell what the call is bounded by.
+    expect(JSON.parse(warn as string)).toMatchObject({
+      level: "warn",
+      value: "3e9",
+      maxMs: 2_147_483_647,
+      usingMs: 60_000,
+    });
   });
 });
 

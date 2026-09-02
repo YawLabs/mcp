@@ -299,29 +299,66 @@ async function recordResolveAudit(namespace: string, env: Record<string, string>
 
 declare const __VERSION__: string;
 
-/** Default connect timeout. Per-server `config.connectTimeoutMs` wins
- *  when present; this is the fallback used otherwise. Env override
- *  (MCP_CONNECT_TIMEOUT) tunes the FALLBACK only -- per-server config
- *  always takes precedence so a slow server can be tuned independently
- *  of the global default. */
-const DEFAULT_CONNECT_TIMEOUT = (() => {
-  const env = process.env.MCP_CONNECT_TIMEOUT;
-  if (!env) return 15_000;
-  const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? n : 15_000;
-})();
-
 /** Node's timer ceiling. setTimeout stores its delay in a signed 32-bit int,
  *  so ANY delay above 2^31-1 ms (~24.9 days) silently becomes 1ms and fires
  *  almost immediately. A `connectTimeoutMs` past that -- a typo'd extra digit
  *  in bundles.json, which the loader's `> 0` check happily accepts -- would
  *  therefore fail the connect instantly while the error message quoted a
- *  multi-day ceiling. Clamp so the value used and the value reported match.
+ *  multi-day ceiling. That per-server CONFIG value is clamped at the connect
+ *  site so the value used and the value reported match.
  *
- *  Exported because every operator-facing timeout knob needs the same clamp:
- *  LIST_TIMEOUT below, and CALL_TIMEOUT in proxy.ts, whose values are handed
- *  straight to the SDK's own setTimeout. A `> 0` check alone is not enough. */
+ *  For the operator-facing ENV knobs it is the top of the ACCEPTED RANGE
+ *  rather than a clamp target -- see resolveTimeoutEnv for why the two
+ *  differ. */
 export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** Shared parser for the three timeout env knobs -- MCP_CONNECT_TIMEOUT here,
+ *  MCP_LIST_TIMEOUT below, MCP_CALL_TIMEOUT in proxy.ts. Every one of them
+ *  ends up as a setTimeout delay (ours for the handshake, the SDK's for the
+ *  inventory and tools/call legs), so both halves of this matter.
+ *
+ *  STRICT DIGIT-RUN PARSE -- the shape resolveServerCap (server-cap.ts) and
+ *  the idle-threshold resolver (server.ts) already use. Number.parseInt PREFIX
+ *  parses, so "3e9" is 3, "30s" is 30 and "1_000" is 1: a 3ms ceiling from a
+ *  value that reads like a generous one. Every call on that leg then fails
+ *  instantly, and a timeout is NOT branded a routing fault, so server.ts books
+ *  each one against the upstream's health and error rate.
+ *
+ *  REJECT OUT-OF-RANGE RATHER THAN CLAMP. Clamping to MAX_TIMEOUT_MS turns an
+ *  absurd knob into an effectively infinite one (~24.8 days): the call never
+ *  settles, so the namespace's inflightCalls marker is never cleared and the
+ *  namespace stops being deactivatable or idle-reapable. Falling back to the
+ *  documented default is what the junk branch already does, and it is the
+ *  right answer for both.
+ *
+ *  Trimmed first for the cmd.exe `set VAR= && ...` idiom other resolvers in
+ *  this repo already document; a value that is empty once trimmed reads as
+ *  unset and takes the default silently. Anything else we refuse gets one warn
+ *  naming the rejected value, the ceiling, and the number actually in effect
+ *  -- otherwise the operator's knob is ignored with no diagnostic at all. */
+export function resolveTimeoutEnv(name: string, defaultMs: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultMs;
+  const trimmed = raw.trim();
+  if (trimmed === "") return defaultMs;
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number.parseInt(trimmed, 10);
+    if (n > 0 && n <= MAX_TIMEOUT_MS) return n;
+  }
+  log("warn", `${name} ignored: expected a whole number of milliseconds in 1..${MAX_TIMEOUT_MS}`, {
+    value: raw,
+    maxMs: MAX_TIMEOUT_MS,
+    usingMs: defaultMs,
+  });
+  return defaultMs;
+}
+
+/** Default connect timeout. Per-server `config.connectTimeoutMs` wins
+ *  when present; this is the fallback used otherwise. Env override
+ *  (MCP_CONNECT_TIMEOUT) tunes the FALLBACK only -- per-server config
+ *  always takes precedence so a slow server can be tuned independently
+ *  of the global default. */
+const DEFAULT_CONNECT_TIMEOUT = resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000);
 
 // Bound on per-request listTools/listResources/listPrompts after the
 // initial handshake. Without this, a server that completes connect but
@@ -329,18 +366,7 @@ export const MAX_TIMEOUT_MS = 2_147_483_647;
 // CONNECT_TIMEOUT timer above is already cleared by the time we reach
 // the listX calls). 15s matches the connect ceiling -- if a server
 // can't list its own tools in 15s, surface it as a real failure.
-//
-// Clamped to MAX_TIMEOUT_MS: this value goes to the SDK as a request option
-// and lands in setTimeout, so an out-of-range override (a typo'd extra digit)
-// would overflow the signed 32-bit delay, fire after ~1ms, and make every
-// inventory call time out instantly -- the opposite of what the operator who
-// raised the knob asked for.
-const LIST_TIMEOUT = (() => {
-  const env = process.env.MCP_LIST_TIMEOUT;
-  if (!env) return 15_000;
-  const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : 15_000;
-})();
+const LIST_TIMEOUT = resolveTimeoutEnv("MCP_LIST_TIMEOUT", 15_000);
 
 // Cap captured stderr so a chatty server can't balloon yaw-mcp's memory.
 // 8KB tail is plenty to see the last error message — servers that emit

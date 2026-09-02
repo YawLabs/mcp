@@ -140,20 +140,45 @@ const SECRET_KEY_NAMES =
   "api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|" +
   "private[-_]?key|secret|password|passwd|pwd|token|authorization|auth|credential|signature|sig";
 
-// A VALUE that is a bare absence word is a DIAGNOSTIC, not a credential, and
-// redacting it inverts what upstream said. "GITHUB_TOKEN: not set" becomes
-// "GITHUB_TOKEN: <redacted> set" -- the value class stops at the first
-// whitespace, so only `not` is consumed and the surviving `set` flips the
-// reading from "credential absent" to "credential present but rejected". Same
-// for "NOTION_API_KEY: missing" and "AUTH_TOKEN: undefined". These are exactly
-// the lines a spawn/config failure produces, and they reach the user through
+// A VALUE that is PROSE is a DIAGNOSTIC, not a credential, and redacting it
+// inverts what upstream said. The value class at rule 2 stops at the first
+// whitespace, so a redaction consumes only the first word and the rest of the
+// sentence survives: "GITHUB_TOKEN: not set" became "GITHUB_TOKEN: <redacted>
+// set", flipping the reading from "credential absent" to "credential present
+// but rejected". The same inversion hit every other diagnostic phrasing --
+// "SLACK_BOT_TOKEN: must be provided", "API_KEY: environment variable not
+// found", "api_key: value is empty", and zod's "GITHUB_TOKEN: Invalid input:
+// expected string, received undefined". These are exactly the lines a
+// spawn/config failure produces, and they reach the user through
 // activationFailures -> the discover() warn line. Over-scrubbing is an
 // equal-and-opposite regression to leaking (see the header above), and an
 // INVERTED diagnostic is worse than a hidden one.
 //
-// Anchored on purpose: it gates only a value that is nothing BUT the absence
-// word, so `token=notasecret123` is still blanked.
-const ABSENCE_VALUE = /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank)$/i;
+// So the invariant is "this value is prose, not a credential" -- NOT "this
+// value is one of N enumerated words", which only ever covered the first word
+// of the first phrasing anyone happened to list. Two gates, both required:
+//
+//   PROSE_VALUE  -- the value is purely alphabetic and short, so it cannot be
+//                   a strong credential. Any digit, any punctuation, or more
+//                   than 12 chars fails it, which keeps GITHUB_TOKEN=
+//                   notasecret123 and api_key=noneofyourbusiness42 blanked.
+//   trailing text -- more word text follows on the SAME LINE, i.e. the value
+//                   sits in a sentence rather than ending a NAME=value dump.
+//
+// ABSENCE_VALUE stays as the fast path for the other half: a bare absence word
+// ENDS the clause ("AUTH_TOKEN: undefined", "GITHUB_TOKEN: nil"), so it has no
+// trailing text and the second gate cannot see it. Anchored on purpose -- it
+// gates only a value that is nothing BUT the absence word.
+//
+// A value that fails either gate is redacted WHOLE. We never emit a partial
+// redaction that leaves surviving words -- that is the inversion itself.
+//
+// Residual risk, stated plainly: a SHORT ALL-ALPHABETIC secret followed by
+// prose ("token: hunter from env") stays visible. That is bounded -- a value
+// with no digit and no punctuation in 12 chars is not a strong credential --
+// and the 120-char cap below still applies.
+const ABSENCE_VALUE = /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank|nil|n\/a)$/i;
+const PROSE_VALUE = /^[A-Za-z]{1,12}$/;
 
 const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...groups: string[]) => string }> = [
   // 1. An HTTP `Authorization: Bearer <blob>` / `Basic <blob>` header value.
@@ -173,11 +198,23 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   //    Prefixed NON-secrets stay readable, because the name has to both END the
   //    prefixed run and be followed by = or : -- "SSH_AUTH_SOCK=/tmp/..." has
   //    `_SOCK` sitting after `AUTH`, so no alternative matches. The VALUE is
-  //    gated too: an absence word there is a diagnostic, not a credential, so
-  //    the whole match is handed back untouched (see ABSENCE_VALUE above).
+  //    gated too: prose there is a diagnostic, not a credential, so the whole
+  //    match is handed back untouched (see ABSENCE_VALUE / PROSE_VALUE above).
+  //
+  //    The trailing `(?=([^\n]*))` is a LOOKAHEAD -- it captures the rest of
+  //    the line as $4 without consuming it, which is how the callback tells a
+  //    value sitting mid-sentence from one that ends the clause. Consuming it
+  //    instead would swallow the tail into the replacement.
   {
-    re: new RegExp(`\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)([^\\s,;&"'}\\]<]+)`, "gi"),
-    replace: (match, name, sep, value) => (ABSENCE_VALUE.test(value) ? match : `${name}${sep}${REDACTED}`),
+    re: new RegExp(
+      `\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)([^\\s,;&"'}\\]<]+)(?=([^\\n]*))`,
+      "gi",
+    ),
+    replace: (match, name, sep, value, rest) => {
+      if (ABSENCE_VALUE.test(value)) return match;
+      if (PROSE_VALUE.test(value) && /[A-Za-z]/.test(rest)) return match;
+      return `${name}${sep}${REDACTED}`;
+    },
   },
   // 3. A vendor-prefixed key carrying no name for rule 2 to anchor on.
   {

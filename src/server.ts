@@ -2920,20 +2920,42 @@ export class ConnectServer {
     const missing = detectMissingCredentials(haystack).filter((k) => !INTERNAL_SECRET_ENV_KEYS.has(k.toUpperCase()));
     if (missing.length === 0) return null;
 
+    // Only a key the prompt actually SUPPLIED can have been "not accepted".
+    // A child that validates sequentially (rejects on AWS_ACCESS_KEY_ID,
+    // then on AWS_SECRET_ACCESS_KEY once the first one is accepted) names a
+    // key nobody has typed yet -- that is new information, not a
+    // byte-identical second modal, so it belongs on the normal
+    // MAX_CREDENTIAL_PROMPTS-bounded ask below rather than in the branch
+    // that tells the user their values were rejected.
+    const supplied = this.elicitedEnv.get(namespace) ?? {};
+
     // We are already inside the retry a prompt bought, and the child still
-    // reports the same thing missing. Asking again HERE opens a second modal
-    // in the same breath as the first, worded identically, with nothing new
-    // for the user to type -- and it spends the rest of the per-namespace
-    // budget (plus another pair of spawn attempts and their retry sleeps)
-    // before they can go look the real value up. Say what happened instead
-    // and leave the budget alone, so the next explicit activate can re-ask.
-    // The vault path's "rejected" branch reports its own not-accepted value
-    // the same way.
-    if (isElicitRetry) {
+    // reports missing exactly the keys we just supplied. Asking again HERE
+    // opens a second modal in the same breath as the first, worded
+    // identically, with nothing new for the user to type -- and it spends the
+    // rest of the per-namespace budget (plus another pair of spawn attempts
+    // and their retry sleeps) before they can go look the real value up. Say
+    // what happened instead and leave the budget alone, so the next explicit
+    // activate can re-ask. The vault path's "rejected" branch reports its own
+    // not-accepted value the same way.
+    if (isElicitRetry && missing.every((k) => k in supplied)) {
       log("info", "Credentials still missing after the elicited retry — not re-asking inside the same activation", {
         namespace,
         missing,
       });
+      // Returning non-null short-circuits runActivateOne at the
+      // `if (elicitedRetry) return elicitedRetry;` line, which sits ABOVE the
+      // give-up path that normally books the failure. Book it here or nothing
+      // does: formatHealthWarning (discover's `warn: last activation failed`
+      // line) and healthFactor (dispatch routing) both read activationFailures,
+      // so without this routing keeps picking a server that cannot start.
+      this.activationFailures.set(namespace, {
+        at: Date.now(),
+        message: lastError instanceof Error ? lastError.message : String(lastError),
+      });
+      // The failure touches nothing in the discover cache key, so a
+      // re-discover inside the 3s TTL would hand back the pre-failure text.
+      this.invalidateDiscoverCache();
       const promptsSoFar = this.credentialPrompts.get(namespace) ?? 0;
       const retryHint =
         promptsSoFar >= MAX_CREDENTIAL_PROMPTS
@@ -2953,7 +2975,6 @@ export class ConnectServer {
     // failure the vault path was redesigned away from. Re-ask instead,
     // bounded by MAX_CREDENTIAL_PROMPTS per namespace so a server failing
     // for an unrelated reason cannot turn every activation into a modal.
-    const alreadyElicited = this.elicitedEnv.get(namespace);
     const asked = this.credentialPrompts.get(namespace) ?? 0;
     if (asked >= MAX_CREDENTIAL_PROMPTS) {
       log("info", "Missing credentials persist after the prompt budget; not asking again", {
@@ -3021,7 +3042,7 @@ export class ConnectServer {
     }
     if (Object.keys(values).length === 0) return null;
 
-    this.elicitedEnv.set(namespace, { ...alreadyElicited, ...values });
+    this.elicitedEnv.set(namespace, { ...supplied, ...values });
     progress?.("Got credentials — retrying load");
     // Recurse — runActivateOne merges elicitedEnv on this attempt.
     // Call runActivateOne directly (not activateOne) because we're

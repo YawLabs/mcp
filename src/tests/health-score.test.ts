@@ -285,22 +285,66 @@ describe("formatHealthWarning -- credential scrubbing", () => {
 
   it("does not invert a missing-credential diagnostic into a present-but-rejected one", () => {
     // The name side of rule 2 matches these (the prefix run ends in TOKEN /
-    // API_KEY, followed by ':'), but the VALUE is an absence word, not a
-    // credential. Redacting it consumed only the first whitespace-delimited
-    // token, so "GITHUB_TOKEN: not set" came out as "GITHUB_TOKEN: <redacted>
-    // set" -- the surviving "set" flips the reading from "credential absent"
-    // to "credential present but rejected". Reachable: upstream stderr tail ->
-    // activationFailures -> the discover() warn line.
+    // API_KEY, followed by ':'), but the VALUE is a bare absence word ENDING
+    // the clause, not a credential. Redacting it consumed only the first
+    // whitespace-delimited token, so "GITHUB_TOKEN: not set" came out as
+    // "GITHUB_TOKEN: <redacted> set" -- the surviving "set" flips the reading
+    // from "credential absent" to "credential present but rejected".
+    // Reachable: upstream stderr tail -> activationFailures -> the discover()
+    // warn line.
     expect(scrubForWarning("Error: GITHUB_TOKEN: not set")).toBe("Error: GITHUB_TOKEN: not set");
     expect(scrubForWarning("env var NOTION_API_KEY: missing")).toBe("env var NOTION_API_KEY: missing");
     expect(scrubForWarning("AUTH_TOKEN: undefined")).toBe("AUTH_TOKEN: undefined");
+    // "nil" / "n/a" end a clause the same way, so they belong on the same
+    // fast path -- without them "GITHUB_TOKEN: nil" redacted to
+    // "GITHUB_TOKEN: <redacted>", hiding the diagnostic outright.
+    expect(scrubForWarning("GITHUB_TOKEN: nil")).toBe("GITHUB_TOKEN: nil");
+    expect(scrubForWarning("SLACK_BOT_TOKEN: n/a")).toBe("SLACK_BOT_TOKEN: n/a");
   });
 
-  it("gates only a value that is NOTHING BUT an absence word", () => {
-    // The absence gate is anchored, so it cannot be used to smuggle a real
-    // value past the scrubber by prefixing it with "not" / "none".
+  it("does not invert a diagnostic whose first word is not an enumerated absence word", () => {
+    // The enumerated list only ever covered the FIRST whitespace-delimited
+    // token of the phrasings someone happened to list, so every other prose
+    // shape inverted exactly the same way. The real invariant is "this value
+    // is prose, not a credential": purely alphabetic, short, and followed by
+    // more word text on the line. The last one is zod v4's .parse(process.env)
+    // output -- the dominant config-validation shape in TS MCP servers.
+    expect(scrubForWarning("SLACK_BOT_TOKEN: must be provided")).toBe("SLACK_BOT_TOKEN: must be provided");
+    expect(scrubForWarning("API_KEY: environment variable not found")).toBe("API_KEY: environment variable not found");
+    expect(scrubForWarning("api_key: value is empty")).toBe("api_key: value is empty");
+    expect(scrubForWarning("Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined")).toBe(
+      "Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined",
+    );
+  });
+
+  it("gates only a value that is prose, never one that could be a credential", () => {
+    // Both gates are anchored, so neither can be used to smuggle a real value
+    // past the scrubber: a digit or any punctuation fails the prose gate, and
+    // prefixing with "not" / "none" does not satisfy the anchored absence gate.
     expect(scrubForWarning("GITHUB_TOKEN=notasecret123")).toBe("GITHUB_TOKEN=<redacted>");
     expect(scrubForWarning("api_key=noneofyourbusiness42")).toBe("api_key=<redacted>");
+    // Alphabetic but too long to be prose -- 13+ chars fails the gate.
+    expect(scrubForWarning("api_key=correcthorsebatterystaple then 502")).toBe("api_key=<redacted> then 502");
+    // Short and alphabetic, but it ENDS the clause: a NAME=value dump, not a
+    // sentence, so it is redacted WHOLE rather than left visible.
+    expect(scrubForWarning("token=hunter")).toBe("token=<redacted>");
+  });
+
+  it("never emits a PARTIAL redaction that leaves surviving words", () => {
+    // A partial redaction is the inversion itself -- the surviving tail reads
+    // as if the credential were present. Whatever the gates decide, the output
+    // is either the line untouched or the value blanked in full, so a
+    // <redacted> marker is never followed by leftover prose from the value.
+    for (const line of [
+      "GITHUB_TOKEN: not set",
+      "SLACK_BOT_TOKEN: must be provided",
+      "API_KEY: environment variable not found",
+      "api_key: value is empty",
+      "Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined",
+      "GITHUB_TOKEN: nil",
+    ]) {
+      expect(scrubForWarning(line)).toBe(line);
+    }
   });
 
   it("still reports the absence-word case through the activation-failure line", () => {

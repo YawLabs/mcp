@@ -6092,6 +6092,82 @@ describe("elicitation retry vs the concurrent-server cap", () => {
     expect(third.ok).toBe(false);
     expect(priv.server.elicitInput).toHaveBeenCalledTimes(2);
   });
+
+  it("books the activation failure on the first activate, not only once the budget runs out", async () => {
+    // The isElicitRetry branch RETURNS a result, and runActivateOne hands that
+    // straight back -- above the give-up path that records the failure. So the
+    // branch has to book it itself: formatHealthWarning (discover's
+    // `warn: last activation failed` line) and healthFactor (dispatch routing)
+    // both read activationFailures, and a namespace that cannot start looked
+    // healthy to both until the whole prompt budget was spent.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    priv.server.elicitInput = vi.fn().mockResolvedValue({
+      action: "accept",
+      content: { GITHUB_TOKEN: "ghp_x" },
+    });
+    vi.mocked(connectToUpstream).mockRejectedValue(
+      new ActivationError("boom", "unknown", "GITHUB_TOKEN is required\n"),
+    );
+    // A discover body memoized before the failure: the failure touches nothing
+    // in the cache KEY, so only an explicit invalidation stops a re-discover
+    // inside the 3s TTL replaying the pre-failure text.
+    priv.discoverCache = { key: "k", result: { content: [] }, expires: Date.now() + 3000 };
+
+    const first = await withoutRetryBackoff(() => priv.activateOne("gh"));
+
+    expect(first.ok).toBe(false);
+    expect(first.message).toContain("were not accepted");
+    // Booked here, on the first activate -- the budget still has an ask left.
+    expect(priv.credentialPrompts.get("gh")).toBe(1);
+    expect(priv.activationFailures.get("gh")?.message).toBe("boom");
+    expect(priv.discoverCache).toBeNull();
+  });
+
+  it("asks for a key the prompt never supplied instead of calling the supplied ones rejected", async () => {
+    // A child that validates its keys SEQUENTIALLY rejects on
+    // AWS_ACCESS_KEY_ID, then -- once that one is accepted -- on
+    // AWS_SECRET_ACCESS_KEY. Keying the guard on isElicitRetry alone read that
+    // second rejection as "the values just provided were not accepted", which
+    // is false (the first one was accepted fine) and never asked for the key
+    // it actually names. A key nobody has typed yet is new information, not a
+    // byte-identical second modal, so it earns a normal budget-bounded ask.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "aws" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    const elicit = vi
+      .fn()
+      .mockResolvedValueOnce({ action: "accept", content: { AWS_ACCESS_KEY_ID: "AKIA" } })
+      .mockResolvedValueOnce({ action: "accept", content: { AWS_SECRET_ACCESS_KEY: "s3cr3t" } });
+    priv.server.elicitInput = elicit;
+    const noKeyId = new ActivationError("boom", "unknown", "AWS_ACCESS_KEY_ID is required\n");
+    const noSecret = new ActivationError("boom", "unknown", "AWS_SECRET_ACCESS_KEY is required\n");
+    vi.mocked(connectToUpstream)
+      // Both spawn attempts of the first pass want the key id.
+      .mockRejectedValueOnce(noKeyId)
+      .mockRejectedValueOnce(noKeyId)
+      // The key id was accepted; the child now names the NEXT one.
+      .mockRejectedValueOnce(noSecret)
+      .mockRejectedValueOnce(noSecret)
+      // Both supplied, so it starts.
+      .mockImplementationOnce(async (cfg: UpstreamServerConfig) => makeConnection(cfg.namespace, ["t"]));
+
+    const result = await withoutRetryBackoff(() => priv.activateOne("aws"));
+
+    expect(result.ok).toBe(true);
+    expect(result.message).not.toContain("were not accepted");
+    expect(elicit).toHaveBeenCalledTimes(2);
+    // The second modal names the new key, not a re-run of the first.
+    expect(elicit.mock.calls[1][0].requestedSchema.required).toEqual(["AWS_SECRET_ACCESS_KEY"]);
+    // Both values survived into the env the working spawn was given.
+    expect(priv.elicitedEnv.get("aws")).toEqual({
+      AWS_ACCESS_KEY_ID: "AKIA",
+      AWS_SECRET_ACCESS_KEY: "s3cr3t",
+    });
+    // Nothing was booked against a server that did, in the end, start.
+    expect(priv.activationFailures.has("aws")).toBe(false);
+  });
 });
 
 describe("discover match summary", () => {

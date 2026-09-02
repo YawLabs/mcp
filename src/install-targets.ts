@@ -167,7 +167,13 @@ export interface ResolvePathOptions {
    *  never reads `process.env.APPDATA` itself, so a caller on a box where
    *  %APPDATA% is redirected must pass it (see `resolveAppDataDir` below, the
    *  one helper that reads the env, shared by install's write path, `--list`,
-   *  `doctor` and `try` so none of them can disagree). */
+   *  `doctor` and `try` so none of them can disagree).
+   *
+   *  An EMPTY string counts as unset and takes the same `<home>/AppData/Roaming`
+   *  default: an empty-but-set %APPDATA% is ordinary on Windows and in CI, and
+   *  passing it through made every claude-desktop path RELATIVE
+   *  (`Claude\claude_desktop_config.json`), which doctor then stat-ed and printed
+   *  against the process cwd. */
   appData?: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`. When set (truthy), claude-code
    *  user/local scope writes to `<dir>/.claude.json` instead of
@@ -188,12 +194,22 @@ export interface ResolvePathOptions {
  *  `<home>\AppData\Roaming` they reported the home-derived path while install
  *  wrote the real one. An explicit `appData` wins; an overridden `home` keeps a
  *  hermetic run inside that home; otherwise the ambient %APPDATA% is
- *  authoritative, because that is the directory Claude Desktop itself reads. */
+ *  authoritative, because that is the directory Claude Desktop itself reads.
+ *
+ *  EMPTY counts as UNSET at both env-shaped steps -- matching `cacheDir()` in
+ *  paths.ts and the `claudeConfigDir` guards below. A nullish-only check let an
+ *  empty-but-set %APPDATA% (ordinary on Windows and in CI) return "", which
+ *  `resolveInstallPath` passed straight through, resolving claude-desktop to the
+ *  RELATIVE `Claude\claude_desktop_config.json` -- a file doctor stat-ed and
+ *  printed against the process cwd. `home` is deliberately NOT guarded that way:
+ *  falling an empty `home` through to the ambient %APPDATA% would point a run
+ *  that asked for a synthetic home at the developer's REAL config file. */
 export function resolveAppDataDir(opts: { appData?: string; home?: string; env?: NodeJS.ProcessEnv }): string {
-  if (opts.appData !== undefined) return opts.appData;
+  if (opts.appData !== undefined && opts.appData.length > 0) return opts.appData;
   if (opts.home !== undefined) return join(opts.home, "AppData", "Roaming");
   const env = opts.env ?? process.env;
-  return env.APPDATA ?? join(homedir(), "AppData", "Roaming");
+  const fromEnv = env.APPDATA;
+  return fromEnv && fromEnv.length > 0 ? fromEnv : join(homedir(), "AppData", "Roaming");
 }
 
 export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
@@ -213,7 +229,12 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
   // hermetic: claude-desktop is the one client living under %APPDATA%, so a
   // test that overrode `home` but not `appData` would otherwise resolve to (and
   // install would have written) the DEVELOPER's own config file.
-  const appData = opts.appData ?? join(home, "AppData", "Roaming");
+  //
+  // Empty counts as unset here too (see the `appData` doc above): a caller who
+  // threaded through an empty-but-set %APPDATA% otherwise got a RELATIVE
+  // claude-desktop path. Still no env read on this branch -- the fallback is the
+  // resolved `home`, which is what keeps a hermetic run hermetic.
+  const appData = opts.appData && opts.appData.length > 0 ? opts.appData : join(home, "AppData", "Roaming");
   const { clientId, scope, os, projectDir, claudeConfigDir } = opts;
   const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
   if (!target) throw new Error(`Unknown client: ${clientId}`);
