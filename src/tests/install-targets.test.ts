@@ -638,6 +638,14 @@ describe("escapeCmdArg (Windows cmd /c metacharacter neutralization)", () => {
 // win32 spawn is what proves the string-level expectations are the RIGHT ones.
 describe("escapeCmdArg / buildLaunchEntry -- spawn-through-shim (win32 only)", () => {
   const runWin = process.platform === "win32";
+  // Every test here spawns real `cmd /c` children -- the point of the block is
+  // that only a genuine spawn proves the escaping. A Windows process spawn is
+  // tens of ms idle but runs into seconds when the parallel suite has the CPU
+  // oversubscribed (the full run packs 406 s of test time into 87 s of wall
+  // clock), and the 11-spawn case below blew the 30 s global testTimeout on a
+  // release run while passing in 6 s standalone. These budgets are sized for
+  // spawn-under-contention; they are not a hint that the work is slow.
+  const WIN_SPAWN_TIMEOUT_MS = 180_000;
   const tmp = runWin ? mkdtempSync(join(tmpdir(), "yaw-cmdesc-")) : "";
   afterAll(() => {
     if (tmp) rmSync(tmp, { recursive: true, force: true });
@@ -672,74 +680,101 @@ describe("escapeCmdArg / buildLaunchEntry -- spawn-through-shim (win32 only)", (
     return argvFrom(r.stdout);
   }
 
-  it.runIf(runWin)("SHIM path delivers every escaped arg intact through the %* re-parse", () => {
-    const { env } = setupFixtures();
-    const intended = [
-      "hello",
-      "https://api/x?a=1&b=2", // the reproduced truncation payload
-      "a|b",
-      "a<b>c",
-      "x^y",
-      "(group)",
-      "a&b|c",
-      "C:\\a&b\\dir\\", // metachar + trailing backslash
-      "foo & bar", // space -> libuv quotes it
-      '{"a":1}', // quote, no metachar -> verbatim
-      '{"a": "b c"}', // quote + space, no metachar
-    ];
-    for (const A of intended) {
-      const stored = escapeCmdArg(A, { shim: true });
-      expect(deliverViaShim([stored], env), `intended=${A} stored=${stored}`).toEqual([A]);
-    }
-  });
+  it.runIf(runWin)(
+    "SHIM path delivers every escaped arg intact through the %* re-parse",
+    () => {
+      const { env } = setupFixtures();
+      const intended = [
+        "hello",
+        "https://api/x?a=1&b=2", // the reproduced truncation payload
+        "a|b",
+        "a<b>c",
+        "x^y",
+        "(group)",
+        "a&b|c",
+        "C:\\a&b\\dir\\", // metachar + trailing backslash
+        "foo & bar", // space -> libuv quotes it
+        '{"a":1}', // quote, no metachar -> verbatim
+        '{"a": "b c"}', // quote + space, no metachar
+      ];
+      for (const A of intended) {
+        const stored = escapeCmdArg(A, { shim: true });
+        expect(deliverViaShim([stored], env), `intended=${A} stored=${stored}`).toEqual([A]);
+      }
+    },
+    WIN_SPAWN_TIMEOUT_MS,
+  );
 
-  it.runIf(runWin)("DIRECT path delivers every escaped arg intact (single cmd parse)", () => {
-    const { echo } = setupFixtures();
-    const intended = ["hello", "https://api/x?a=1&b=2", "a|b", "x^y", "(group)", "foo & bar", '{"a":1}'];
-    for (const A of intended) {
-      const stored = escapeCmdArg(A, { shim: false });
-      expect(deliverViaDirect([stored], echo), `intended=${A} stored=${stored}`).toEqual([A]);
-    }
-  });
+  it.runIf(runWin)(
+    "DIRECT path delivers every escaped arg intact (single cmd parse)",
+    () => {
+      const { echo } = setupFixtures();
+      const intended = ["hello", "https://api/x?a=1&b=2", "a|b", "x^y", "(group)", "foo & bar", '{"a":1}'];
+      for (const A of intended) {
+        const stored = escapeCmdArg(A, { shim: false });
+        expect(deliverViaDirect([stored], echo), `intended=${A} stored=${stored}`).toEqual([A]);
+      }
+    },
+    WIN_SPAWN_TIMEOUT_MS,
+  );
 
-  it.runIf(runWin)("a full buildLaunchEntry shim entry delivers all args intact", () => {
-    const { env } = setupFixtures();
-    // Build the real entry, then swap the shim command name so it resolves to
-    // our %*-forwarding fixture instead of the real npx.
-    const entry = buildLaunchEntry({
-      os: "windows",
-      upstream: { command: "npx", args: ["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2", "--flag", "a|b"] },
-    });
-    expect(entry.command).toBe("cmd");
-    // entry.args = ["/c", "npx", ...escaped]; replace "npx" with "myshim".
-    const stored = entry.args.slice(2);
-    expect(deliverViaShim(stored, env)).toEqual(["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2", "--flag", "a|b"]);
-  });
+  it.runIf(runWin)(
+    "a full buildLaunchEntry shim entry delivers all args intact",
+    () => {
+      const { env } = setupFixtures();
+      // Build the real entry, then swap the shim command name so it resolves to
+      // our %*-forwarding fixture instead of the real npx.
+      const entry = buildLaunchEntry({
+        os: "windows",
+        upstream: { command: "npx", args: ["-y", "@demo/mcp", "--url", "https://api/x?a=1&b=2", "--flag", "a|b"] },
+      });
+      expect(entry.command).toBe("cmd");
+      // entry.args = ["/c", "npx", ...escaped]; replace "npx" with "myshim".
+      const stored = entry.args.slice(2);
+      expect(deliverViaShim(stored, env)).toEqual([
+        "-y",
+        "@demo/mcp",
+        "--url",
+        "https://api/x?a=1&b=2",
+        "--flag",
+        "a|b",
+      ]);
+    },
+    WIN_SPAWN_TIMEOUT_MS,
+  );
 
-  it.runIf(runWin)("the reproduced payload does NOT execute the injected command (shim)", () => {
-    const { env } = setupFixtures();
-    // No-space metachar payload -> exercises the CARET path (the one bug #1
-    // fixed), not the libuv-quote path. `x&cd>PWNED.txt` WOULD create the file
-    // if the `&` split the line (verified: unescaped it does). Triple-caret
-    // neutralizes it so the whole thing arrives as one literal argv element.
-    rmSync(join(tmp, "PWNED.txt"), { force: true });
-    const stored = escapeCmdArg("x&cd>PWNED.txt", { shim: true });
-    expect(deliverViaShim([stored], env)).toEqual(["x&cd>PWNED.txt"]);
-    const exists = spawnSync("cmd", ["/c", "if", "exist", "PWNED.txt", "echo", "YES"], {
-      cwd: tmp,
-      encoding: "utf8",
-    }).stdout;
-    expect(exists).not.toContain("YES");
-  });
+  it.runIf(runWin)(
+    "the reproduced payload does NOT execute the injected command (shim)",
+    () => {
+      const { env } = setupFixtures();
+      // No-space metachar payload -> exercises the CARET path (the one bug #1
+      // fixed), not the libuv-quote path. `x&cd>PWNED.txt` WOULD create the file
+      // if the `&` split the line (verified: unescaped it does). Triple-caret
+      // neutralizes it so the whole thing arrives as one literal argv element.
+      rmSync(join(tmp, "PWNED.txt"), { force: true });
+      const stored = escapeCmdArg("x&cd>PWNED.txt", { shim: true });
+      expect(deliverViaShim([stored], env)).toEqual(["x&cd>PWNED.txt"]);
+      const exists = spawnSync("cmd", ["/c", "if", "exist", "PWNED.txt", "echo", "YES"], {
+        cwd: tmp,
+        encoding: "utf8",
+      }).stdout;
+      expect(exists).not.toContain("YES");
+    },
+    WIN_SPAWN_TIMEOUT_MS,
+  );
 
-  it.runIf(runWin)("a bare & would inject WITHOUT escaping -- the fixture proves the harness bites", () => {
-    // Control: the UNescaped payload truncates at `&` through the shim, proving
-    // the shim path really does re-parse (so the pass above is meaningful).
-    const { env } = setupFixtures();
-    expect(deliverViaShim(["https://api/x?a=1&b=2"], env)).toEqual(["https://api/x?a=1"]);
-    // And the OLD single-caret form is likewise a no-op against the shim.
-    expect(deliverViaShim(["https://api/x?a=1^&b=2"], env)).toEqual(["https://api/x?a=1"]);
-  });
+  it.runIf(runWin)(
+    "a bare & would inject WITHOUT escaping -- the fixture proves the harness bites",
+    () => {
+      // Control: the UNescaped payload truncates at `&` through the shim, proving
+      // the shim path really does re-parse (so the pass above is meaningful).
+      const { env } = setupFixtures();
+      expect(deliverViaShim(["https://api/x?a=1&b=2"], env)).toEqual(["https://api/x?a=1"]);
+      // And the OLD single-caret form is likewise a no-op against the shim.
+      expect(deliverViaShim(["https://api/x?a=1^&b=2"], env)).toEqual(["https://api/x?a=1"]);
+    },
+    WIN_SPAWN_TIMEOUT_MS,
+  );
 });
 
 describe("claudeCodeProjectKey (projects[] key spelling)", () => {

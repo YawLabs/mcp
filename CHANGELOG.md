@@ -2,6 +2,24 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.79.1 -- `classifyError` stops scanning bodies that cannot match, and two timing assertions stop flaking the release
+
+**Fixed -- a release died on a perf tripwire that nothing had regressed**
+
+The `classifyError` backtracking guard asserts that a 98 KB reply classifies in under 500 ms. A release run measured 822 ms and failed. The regex was not slower: the suite runs in parallel and packs 394 s of test time into 88 s of wall clock, so any wall-clock assertion inside it competes for CPU at roughly 4x oversubscription, and a 500 ms budget left nothing for that. The budget is now 3000 ms, which clears the contended worst case by about 3x while sitting about 6x under the regression it exists to catch -- re-introducing the quadratic shape costs 4.3 s in ONE of the four regexes, so roughly 17 s in the call the test times. The numbers and the reasoning are recorded next to the assertion, because a bare constant invites the next person to tighten it back.
+
+The sibling failure had the same cause and a different surface: the five Windows shim-escaping tests spawn real `cmd /c` children -- the only thing that actually proves the argument escaping -- and the 11-spawn case ran past the 30 s global `testTimeout` under that same contention while passing in 6 s standalone. Those five now carry the 180 s budget this suite already uses for its `npm run build` step.
+
+**Changed -- `classifyError` skips the status regexes on bodies that cannot contain a status code**
+
+The four HTTP-status patterns are large four-shape alternations, and `reward.ts` runs `classifyError` over EVERY proxied result -- overwhelmingly successful replies carrying no status code at all. Each of those paid four full regex scans of the whole body. Each pattern now sits behind a `t.includes("<code>")` pre-check. All four shapes concatenate the code digits into the CONSUMING path, never inside an optional group or a lookaround, so the substring is a necessary condition for a match and the guard can only skip work -- it cannot change a classification. On a 98 KB body with no status code the call drops from 58 ms to under 1 ms; a 21,480-input differential against the previous implementation found zero disagreements, and no classification in the suite moves.
+
+That guard would have quietly made the tripwire above meaningless -- a digit-free body now exits before the regexes it was written to time. The test input carries a suffix of `x401x x403x x404x x429x`: glued to word characters, so the pre-check opens but no shape can match (`429\b` needs a boundary after the 9) and all four patterns still scan the full 98 KB. The test also asserts the result is `upstream_error`, which is only true if no earlier branch returned -- so a future short-circuit added above them fails the test instead of hollowing it out.
+
+## 0.79.0 -- no code changes
+
+Published 2026-09-01 carrying a `CHANGELOG.md` line recorded under the 0.78.0 heading, plus the version bump itself: no source change, no dependency change, no metadata change. Noted here for the same reason 0.76.2 is, so a reader who finds no entry can tell "nothing shipped" from "nobody wrote it down".
+
 ## 0.78.0 -- the vault passphrase prompt reaches the code that needed it, and sidecars stop drifting
 
 **Added -- sidecars stopped moving, and nothing said so**

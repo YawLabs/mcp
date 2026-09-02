@@ -225,11 +225,40 @@ describe("classifyError", () => {
     // a whitespace-separated run of it re-entered the bridge from every
     // intro position: 11 s on a 98 KB reply (measured). Every proxied
     // result is classified by reward.ts, so this must stay linear-ish.
+    //
+    // The suffix keeps the tripwire honest: classifyError now short-circuits
+    // each status regex on `t.includes("<code>")`, so a digit-free body
+    // never reaches the regexes at all -- without this suffix the test would
+    // measure the guard rejecting the input (0-58 ms) instead of the regexes
+    // running, and would pass no matter how badly they backtracked. Each
+    // token glues the digits to word chars ("x429x"), so the guard opens but
+    // no shape can match (`429\b` needs a boundary after the 9): all four
+    // regexes full-scan the 98 KB. Every case below must therefore come back
+    // `upstream_error` -- an earlier branch returning would mean the scans
+    // never happened, so the assertion below checks that too.
+    const digitBait = "x401x x403x x404x x429x";
+    // Warm-up: the first .test() of each regex pays V8's lazy compile of a
+    // very large pattern; that cost is real but is not the backtracking
+    // this test guards, so pull it out of the timed runs.
+    classifyError(digitBait);
     for (const word of ["status", "with", "a", "error", "status with a status of", "failed with a"]) {
-      const big = `${word} `.repeat(Math.ceil(98_000 / (word.length + 1)));
+      const big = `${word} `.repeat(Math.ceil(98_000 / (word.length + 1))) + digitBait;
       const t0 = performance.now();
-      classifyError(big);
-      expect(performance.now() - t0, `run of ${JSON.stringify(word)}`).toBeLessThan(500);
+      const category = classifyError(big);
+      const elapsed = performance.now() - t0;
+      // Budget. Measured on a Windows ARM64 box: the linear scans take
+      // 26-250 ms standalone, and the 500 ms budget this replaces still
+      // failed a release run at 822 ms -- the suite runs in parallel (276 s
+      // of test time inside 63 s of wall clock), so a timing assertion here
+      // is competing for CPU with ~4x oversubscription. Re-introducing the
+      // quadratic bug costs 4.3 s in ONE of the four regexes, so ~17 s in
+      // this call. 3000 ms clears the contended worst case by ~3x and sits
+      // ~6x under the regression: wide enough not to flake a release,
+      // narrow enough that the catastrophic shape cannot slip through.
+      expect(elapsed, `run of ${JSON.stringify(word)}`).toBeLessThan(3000);
+      // Guards against a vacuous timing: had an earlier branch returned,
+      // the four status regexes would never have run.
+      expect(category, `run of ${JSON.stringify(word)} must reach the status regexes`).toBe("upstream_error");
     }
   });
 
