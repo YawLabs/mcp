@@ -330,20 +330,40 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     expect(scrubForWarning("token=hunter")).toBe("token=<redacted>");
   });
 
-  it("never emits a PARTIAL redaction that leaves surviving words", () => {
+  it("redacts a machine-written pair even when more text follows on the line", () => {
+    // The gate discriminates on the SEPARATOR, not on whether text follows.
+    // An earlier revision asked "does a letter appear later on this line?",
+    // which exempted a value whenever ANYTHING word-shaped came after it -- a
+    // second pair, a JSON sibling, a query parameter, even the <redacted>
+    // marker rule 1 had just inserted. Each of these was left fully in the
+    // clear by that revision, so they are the regression this pins.
+    expect(scrubForWarning("password=hunter host=db")).toBe("password=<redacted> host=db");
+    expect(scrubForWarning("?api_key=deadbeef&user=bob")).toBe("?api_key=<redacted>&user=bob");
+    expect(scrubForWarning('{"token": "abcdef", "x":1}')).toBe('{"token": "<redacted>", "x":1}');
+    // Two secrets on one line: BOTH go, not just the last.
+    expect(scrubForWarning("PASSWORD=letmein API_KEY=zzzzzzzzzz")).toBe("PASSWORD=<redacted> API_KEY=<redacted>");
+    // Worst case in production: remoteFailureDetail collapses an error to ONE
+    // line, so under the old gate every pair but the last had a tail.
+    expect(scrubForWarning("401: token=hunter Authorization: Bearer eyJhbGciOiJIUzI1NiJ9")).toBe(
+      "401: token=<redacted> Authorization: <redacted>",
+    );
+  });
+
+  it("never emits a PARTIAL redaction that leaves surviving words of the value", () => {
     // A partial redaction is the inversion itself -- the surviving tail reads
-    // as if the credential were present. Whatever the gates decide, the output
-    // is either the line untouched or the value blanked in full, so a
-    // <redacted> marker is never followed by leftover prose from the value.
-    for (const line of [
-      "GITHUB_TOKEN: not set",
-      "SLACK_BOT_TOKEN: must be provided",
-      "API_KEY: environment variable not found",
-      "api_key: value is empty",
-      "Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined",
-      "GITHUB_TOKEN: nil",
+    // as if the credential were present. This has to be asserted on lines that
+    // ARE redacted: a line the scrubber leaves untouched cannot exhibit it, so
+    // asserting output === input on prose fixtures proves nothing here.
+    for (const [input, expected] of [
+      ["api_key=correcthorsebatterystaple then 502", "api_key=<redacted> then 502"],
+      ["NOTION_API_KEY=abc123def456", "NOTION_API_KEY=<redacted>"],
+      ["token=hunter", "token=<redacted>"],
+      ["password=hunter host=db", "password=<redacted> host=db"],
     ]) {
-      expect(scrubForWarning(line)).toBe(line);
+      const out = scrubForWarning(input);
+      expect(out).toBe(expected);
+      // No surviving word butted up against the marker.
+      expect(out).not.toMatch(/<redacted>[A-Za-z]/);
     }
   });
 

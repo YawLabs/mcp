@@ -156,29 +156,52 @@ const SECRET_KEY_NAMES =
 //
 // So the invariant is "this value is prose, not a credential" -- NOT "this
 // value is one of N enumerated words", which only ever covered the first word
-// of the first phrasing anyone happened to list. Two gates, both required:
+// of the first phrasing anyone happened to list.
 //
+// The discriminator is the SEPARATOR, not the surrounding text. That is the
+// third attempt at this gate and the reason for it is worth recording, because
+// the two obvious approaches are both wrong:
+//
+//   * An enumerated absence-word list only matches the first whitespace-
+//     delimited token, so every phrasing nobody thought of ("must be
+//     provided", zod's "Invalid input: ...") still inverted.
+//   * Testing whether TEXT FOLLOWS on the line exempts a value whenever
+//     anything word-shaped appears later -- a second name=value pair, a JSON
+//     sibling key, a query parameter, even the <redacted> marker rule 1 just
+//     inserted. That un-redacted real secrets ("password=hunter host=db",
+//     "?api_key=deadbeef&user=bob"), worst on remoteFailureDetail, which
+//     collapses an error to ONE line so every pair but the last has a tail.
+//     It also cost a line-length rescan per match: 796 ms on 260 KB vs 11 ms.
+//
+// A separator carries the intent directly, in constant time. Machines write
+// NAME=value and "name": "value" -- compact, or quoted. Humans writing a
+// sentence put a space after the colon: "GITHUB_TOKEN: not set". So:
+//
+//   PROSE_SEPARATOR -- whitespace AFTER the = or :, and NO quote anywhere in
+//                   the separator. A quote means the value was machine-quoted;
+//                   no trailing space means a compact dump. Either way, redact.
 //   PROSE_VALUE  -- the value is purely alphabetic and short, so it cannot be
 //                   a strong credential. Any digit, any punctuation, or more
 //                   than 12 chars fails it, which keeps GITHUB_TOKEN=
 //                   notasecret123 and api_key=noneofyourbusiness42 blanked.
-//   trailing text -- more word text follows on the SAME LINE, i.e. the value
-//                   sits in a sentence rather than ending a NAME=value dump.
 //
-// ABSENCE_VALUE stays as the fast path for the other half: a bare absence word
-// ENDS the clause ("AUTH_TOKEN: undefined", "GITHUB_TOKEN: nil"), so it has no
-// trailing text and the second gate cannot see it. Anchored on purpose -- it
-// gates only a value that is nothing BUT the absence word.
+// ABSENCE_VALUE stays as a separator-independent fast path, so the bare-absence
+// case survives even in a compact dump ("GITHUB_TOKEN=unset"). Anchored on
+// purpose -- it gates only a value that is nothing BUT the absence word.
 //
-// A value that fails either gate is redacted WHOLE. We never emit a partial
-// redaction that leaves surviving words -- that is the inversion itself.
+// A value that fails the gates is redacted WHOLE: the gates never CREATE a
+// partial redaction, which is the inversion itself. (The value class below
+// stops at a quote or a delimiter, so `token=abc'def` has always redacted to
+// `token=<redacted>'def`. That is a value-class question, older than these
+// gates, and deliberately not folded in here.)
 //
-// Residual risk, stated plainly: a SHORT ALL-ALPHABETIC secret followed by
-// prose ("token: hunter from env") stays visible. That is bounded -- a value
-// with no digit and no punctuation in 12 chars is not a strong credential --
-// and the 120-char cap below still applies.
+// Residual risk, stated plainly: a SHORT ALL-ALPHABETIC secret written with a
+// space after the colon ("token: hunter") stays visible. That is bounded -- a
+// value with no digit and no punctuation in 12 chars is not a strong
+// credential -- and the 120-char cap below still applies.
 const ABSENCE_VALUE = /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank|nil|n\/a)$/i;
 const PROSE_VALUE = /^[A-Za-z]{1,12}$/;
+const PROSE_SEPARATOR = /^[^"]*[=:]\s+$/;
 
 const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...groups: string[]) => string }> = [
   // 1. An HTTP `Authorization: Bearer <blob>` / `Basic <blob>` header value.
@@ -197,22 +220,20 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   //
   //    Prefixed NON-secrets stay readable, because the name has to both END the
   //    prefixed run and be followed by = or : -- "SSH_AUTH_SOCK=/tmp/..." has
-  //    `_SOCK` sitting after `AUTH`, so no alternative matches. The VALUE is
-  //    gated too: prose there is a diagnostic, not a credential, so the whole
-  //    match is handed back untouched (see ABSENCE_VALUE / PROSE_VALUE above).
+  //    `_SOCK` sitting after `AUTH`, so no alternative matches. The VALUE and
+  //    the SEPARATOR are gated too: prose there is a diagnostic, not a
+  //    credential, so the whole match is handed back untouched (see
+  //    ABSENCE_VALUE / PROSE_VALUE / PROSE_SEPARATOR above).
   //
-  //    The trailing `(?=([^\n]*))` is a LOOKAHEAD -- it captures the rest of
-  //    the line as $4 without consuming it, which is how the callback tells a
-  //    value sitting mid-sentence from one that ends the clause. Consuming it
-  //    instead would swallow the tail into the replacement.
+  //    Everything the callback needs is inside the match, so this stays a
+  //    single linear pass. An earlier revision looked ahead at the rest of the
+  //    line to decide; that was both wrong (any later word exempted the value)
+  //    and quadratic on a long collapsed line.
   {
-    re: new RegExp(
-      `\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)([^\\s,;&"'}\\]<]+)(?=([^\\n]*))`,
-      "gi",
-    ),
-    replace: (match, name, sep, value, rest) => {
+    re: new RegExp(`\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)([^\\s,;&"'}\\]<]+)`, "gi"),
+    replace: (match, name, sep, value) => {
       if (ABSENCE_VALUE.test(value)) return match;
-      if (PROSE_VALUE.test(value) && /[A-Za-z]/.test(rest)) return match;
+      if (PROSE_SEPARATOR.test(sep) && PROSE_VALUE.test(value)) return match;
       return `${name}${sep}${REDACTED}`;
     },
   },
