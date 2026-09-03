@@ -19,8 +19,18 @@ describe("loadProjectGuide outside $HOME trust gate", () => {
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-trust-home-"));
-    // The guide sits at the walk's starting dir so discovery never
-    // escapes into the real filesystem.
+    // `outside` is a SIBLING of the synthetic home, not a child, which is the
+    // whole point: findProjectConfigDir only stops at the $HOME bound for a
+    // walk that started under $HOME, so out here the walk runs to the
+    // filesystem root. The `.yaw-mcp/` is planted at the starting dir so an
+    // ACCEPTED candidate ends the walk immediately -- but a REJECTED one does
+    // not: the walk then climbs every ancestor of tmpdir, stat()ing a
+    // `.yaw-mcp` at each (on Windows, where tmpdir lives under the real
+    // profile, that includes the developer's own ~/.yaw-mcp, which the
+    // ownership gate rejects in turn and warn-logs once per process). Nothing
+    // up there can be RETURNED under these stubs, but the walk is not confined
+    // to the temp tree, so a `.yaw-mcp/` planted above tmpdir on the test
+    // machine is the one thing that could perturb these assertions.
     outside = mkdtempSync(join(tmpdir(), "yaw-mcp-guide-trust-outside-"));
   });
 
@@ -67,6 +77,13 @@ describe("loadProjectGuide outside $HOME trust gate", () => {
     Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
     vi.stubEnv(ALLOW_UNOWNED_ENV, "");
     expect(await loadProjectGuide(outside, home, {})).toBeNull();
+    // POSITIVE CONTROL. A bare toBeNull cannot tell "the gate rejected this
+    // candidate" from "the walk never found it" or "the read failed" -- every
+    // one of those returns null. Flipping ONLY the opt-in and re-running
+    // against the SAME directory serves the guide, which pins the null above
+    // on the ownership gate specifically.
+    vi.stubEnv(ALLOW_UNOWNED_ENV, "1");
+    expect((await loadProjectGuide(outside, home, {}))?.content).toBe("planted notes");
   });
 
   it("serves the guide when ownership is unverifiable but the env opt-in is set", async () => {

@@ -6,8 +6,8 @@
 // could replay to measure routing quality -- WITHOUT ever persisting the
 // raw English intent the user typed. Two layers keep it privacy-safe:
 //
-//   1. Path-splitting in `tokenize` (src/relevance.ts) already shreds most
-//      structure: it lowercases and splits on every non-alphanumeric run,
+//   1. Path-splitting in `tokenizeQuery` (src/relevance.ts) already shreds
+//      most structure: it lowercases and splits on every non-alphanumeric run,
 //      so emails, URLs, file paths, `key=value` pairs, and dotted hosts are
 //      blown apart into bare alphanumeric tokens before we ever see them.
 //      `user@host.com/secret` becomes ["user", "host", "com", "secret"].
@@ -32,9 +32,10 @@
 // on intents that routinely carry such PII.
 //
 // Default is privacy-safe: harvesting is DISABLED unless YAW_MCP_FOUNDRY is
-// explicitly "1" / "true". When enabled, only the redacted+sorted token bag,
-// the candidate namespaces + scores, and the chosen namespace are written --
-// never the raw intent string.
+// explicitly "1" / "true". When enabled, only the redacted+sorted token bag
+// and the chosen namespace are written -- never the raw intent string, and
+// never the candidate shortlist or its scores (see FoundryTrace.candidates:
+// callers may still pass it, nothing persists or reads it).
 
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -71,10 +72,11 @@ const TOKEN_SECRET_PREFIXES = SECRET_PREFIXES.filter((p) => /^[a-z0-9]+$/.test(p
  *  matched on the raw intent instead. */
 const RAW_SECRET_PREFIXES = SECRET_PREFIXES.filter((p) => !/^[a-z0-9]+$/.test(p));
 
-// A token "looks like a secret/PII" when any of these hold. tokenize has
+// A token "looks like a secret/PII" when any of these hold. tokenizeQuery has
 // already lowercased and stripped non-alphanumerics, so by the time we see
-// a token it is a single [a-z0-9]+ run (>= 3 chars). The checks therefore
-// target what survives: long high-entropy blobs and prefixed/hex tokens.
+// a token it is a single [a-z0-9]+ run (>= 1 char -- the ranker's QUERY floor,
+// not the 3-char prose floor). The checks therefore target what survives:
+// long high-entropy blobs and prefixed/hex tokens.
 function looksSensitive(token: string): boolean {
   // Known secret prefixes (case-insensitive; token is already lowercased).
   // Only the punctuation-free ones can ever match here -- see SECRET_PREFIXES.
@@ -99,14 +101,14 @@ function looksSensitive(token: string): boolean {
   return false;
 }
 
-// Tokenize an intent (via relevance `tokenize`) THEN drop any surviving
+// Tokenize an intent (via relevance `tokenizeQuery`) THEN drop any surviving
 // token that looks like a secret/PII. Returns the kept tokens plus the
-// number dropped. Note on "email / IPv4 / @" rules from the spec: tokenize
-// splits on `@` and `.`, so an email or IPv4 never reaches here as a single
-// token -- its alphanumeric pieces ("user", "gmail", "com", "192", "168")
-// pass through as ordinary tokens, which is acceptable since the
+// number dropped. Note on "email / IPv4 / @" rules from the spec:
+// tokenizeQuery splits on `@` and `.`, so an email or IPv4 never reaches here
+// as a single token -- its alphanumeric pieces ("user", "gmail", "com", "192",
+// "168") pass through as ordinary tokens, which is acceptable since the
 // identifying structure (the @ and dots) is already destroyed. We document
-// this rather than re-detect a structure tokenize has already removed.
+// this rather than re-detect a structure tokenizeQuery has already removed.
 // A raw-string scrub rule. `re` NOMINATES a match; `applies`, when present,
 // decides whether it is really PII. The two are split because the phone and
 // ticket-ref shapes are ambiguous with ordinary technical vocabulary, and the
@@ -136,7 +138,14 @@ function isPhoneShape(match: string): boolean {
   // date has 8 ("2024-01-15") and a short dotted version fewer still.
   const digits = match.replace(/[^0-9]/g, "");
   if (digits.length < 9) return false;
-  return !DOTTED_NUMERIC_RE.test(match.trim());
+  // The exclusion is per-GROUP, not per-match. Whitespace is inside the
+  // nominating character class, so two adjacent IPv4 literals
+  // ("192.168.1.100 10.0.0.1") arrive as ONE match that no whole-match test
+  // recognizes -- and the pair clears the 9-digit floor on its own even
+  // though neither literal does. Splitting on whitespace first judges each
+  // literal as itself; a single group reduces to the old whole-match test.
+  const groups = match.trim().split(/\s+/);
+  return !groups.every((g) => DOTTED_NUMERIC_RE.test(g));
 }
 
 // Standards, algorithms and encodings share Jira's PROJ-1234 shape. They are
@@ -183,7 +192,10 @@ function isTicketRef(match: string): boolean {
 // boundary is preserved) and counted toward redactedCount.
 //   - email: user@host.tld
 //   - phone-shape: 9+ actual digits with optional +/separators (isPhoneShape)
-//   - GitHub-style refs: #1234
+//   - GitHub-style refs: #1234, at the same 2-digit floor isTicketRef uses.
+//     A single digit is a priority marker or a list index ("priority #1"),
+//     not an issue ref, and keeping "PROJ-1" while scrubbing "#1" made the
+//     two sibling rules disagree about the same shape.
 //   - Jira-style ticket refs: PROJ-1234 (isTicketRef)
 // Each pattern is wrapped with `(?<![A-Za-z0-9])...(?![A-Za-z0-9])` so it only
 // matches when bounded by non-alphanumerics (start/end of string, whitespace,
@@ -193,7 +205,7 @@ function isTicketRef(match: string): boolean {
 const RAW_PII_RULES: RawScrubRule[] = [
   { re: /(?<![A-Za-z0-9])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])/g },
   { re: /(?<![A-Za-z0-9])\+?[0-9][0-9\s().-]{8,}(?![A-Za-z0-9])/g, applies: isPhoneShape },
-  { re: /(?<![A-Za-z0-9])#\d+(?![A-Za-z0-9])/g },
+  { re: /(?<![A-Za-z0-9])#\d{2,}(?![A-Za-z0-9])/g },
   { re: /(?<![A-Za-z0-9])[A-Z]+-\d+(?![A-Za-z0-9])/g, applies: isTicketRef },
 ];
 
@@ -266,7 +278,15 @@ export function redactIntent(intent: string): RedactedIntent {
 
 export interface FoundryTrace {
   tokens: string[];
-  candidates: Array<{ ns: string; score: number }>;
+  /** The ranker's shortlist at decision time. ACCEPTED but NOT PERSISTED:
+   *  nothing has ever read it back. It was written ns-only (scores stripped,
+   *  because a score reflects the ranker's live health/learning state and
+   *  would bias an eval replay against that same state), and a ns-only
+   *  shortlist no consumer opens is pure weight against the 5 MiB harvest
+   *  cap -- fewer traces fit for no signal. Kept OPTIONAL on the in-memory
+   *  shape so the dispatch call site (server.ts) still type-checks while it
+   *  is unwound; drop it there and it can leave this interface too. */
+  candidates?: Array<{ ns: string; score: number }>;
   chosen: string;
   redactedCount: number;
 }
@@ -289,7 +309,11 @@ export function isFoundryEnabled(): boolean {
 // rotate/truncate: rotation adds I/O and complexity for telemetry that must
 // stay best-effort and never throw, and an eval corpus only needs a bounded
 // sample, not the most-recent window. Bounded-by-drop is the simple choice.
-const MAX_FOUNDRY_BYTES = 5 * 1024 * 1024;
+//
+// Exported so the cap test pins THIS number instead of re-declaring its own
+// copy -- with a local copy, lowering the cap here made that test pass
+// vacuously (it staged a file at the old, now-larger size).
+export const MAX_FOUNDRY_BYTES = 5 * 1024 * 1024;
 
 export const FOUNDRY_FILENAME = "foundry.jsonl";
 
@@ -320,14 +344,12 @@ export async function appendFoundryTrace(trace: FoundryTrace, home: string = hom
       // and let the append attempt proceed / fail quietly below.
     }
 
-    // Persist ONLY the redacted bag + routing decision -- never raw intent.
-    // Strip per-candidate score fields before write: scores reflect the
-    // ranker's live health/learning state at decision time, which biases an
-    // eval replay against the SAME ranker state instead of measuring it.
-    const candidatesNoScores = trace.candidates.map((c) => ({ ns: c.ns }));
+    // Persist ONLY the redacted bag + routing decision -- never raw intent,
+    // and never `trace.candidates`: the shortlist was written scores-stripped
+    // (to keep an eval replay off the ranker's own live state) and then never
+    // read by anything, so it only ate into the size cap. See FoundryTrace.
     const line = `${JSON.stringify({
       tokens: trace.tokens,
-      candidates: candidatesNoScores,
       chosen: trace.chosen,
       redactedCount: trace.redactedCount,
     })}\n`;

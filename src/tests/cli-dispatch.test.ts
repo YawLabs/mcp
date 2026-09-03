@@ -13,10 +13,11 @@
 // dist is absent so a bare `npm test` on a fresh clone still works.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const cli = join(repoRoot, "dist", "index.js");
@@ -37,18 +38,44 @@ function newestSourceMtime(): number {
   return newest;
 }
 
+/** Throwaway HOME for every child spawned by runCli. See the beforeAll. */
+let workDir: string;
+
 beforeAll(() => {
+  // The child must not read the developer's own MCP stack. HOME, USERPROFILE
+  // and CLAUDE_CONFIG_DIR all point here, and it is also the child's cwd, so
+  // the walk-up in config-loader.ts cannot reach this repo's project-local
+  // `.yaw-mcp/` either. The sibling index-dispatch.test.ts learned this the
+  // expensive way: with an un-isolated HOME its child loaded the real
+  // bundles.json, PRE-WARMED the servers in it, and blew the timeout about
+  // one run in four for a reason nothing in that file mentioned.
+  workDir = mkdtempSync(join(tmpdir(), "yaw-mcp-cli-"));
   if (existsSync(cli) && statSync(cli).mtimeMs >= newestSourceMtime()) return;
   // npm on Windows is a .cmd shim, and Node refuses to exec one without a
   // shell since the CVE-2024-27980 fix -- same concession sidecars-cmd makes
   // for the same reason. Every argument here is a fixed literal.
   const isWindows = process.platform === "win32";
-  execFileSync(isWindows ? "npm.cmd" : "npm", ["run", "build"], {
-    cwd: repoRoot,
-    stdio: "ignore",
-    shell: isWindows,
-  });
+  try {
+    execFileSync(isWindows ? "npm.cmd" : "npm", ["run", "build"], {
+      cwd: repoRoot,
+      // NOT "ignore": a tsup failure used to leave beforeAll throwing a bare
+      // "Command failed", which took all of the tests below down with no
+      // cause to act on. tsup names the offending file:line, so keep it.
+      stdio: "pipe",
+      encoding: "utf8",
+      shell: isWindows,
+    });
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message?: string };
+    throw new Error(
+      `npm run build failed -- the CLI under test was not rebuilt (${e.message ?? "no message"}).\n--- build stdout ---\n${e.stdout ?? "(empty)"}\n--- build stderr ---\n${e.stderr ?? "(empty)"}`,
+    );
+  }
 }, 180_000);
+
+afterAll(() => {
+  if (workDir) rmSync(workDir, { recursive: true, force: true });
+});
 
 interface CliRun {
   code: number;
@@ -57,10 +84,42 @@ interface CliRun {
 }
 
 /** Run the built CLI. spawnSync gives the child PIPES rather than a tty,
- *  which is the condition the exitCode-instead-of-exit change exists for. */
+ *  which is the condition the exitCode-instead-of-exit change exists for.
+ *  The child is hermetic -- see the beforeAll note on workDir. */
 function runCli(args: string[]): CliRun {
-  const res = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", timeout: 30_000 });
-  return { code: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+  // Scrub inherited YAW_MCP_* so a developer's own knobs cannot change which
+  // branch the child takes, then point every home-shaped lookup at workDir.
+  // YAW_MCP_AUTO_UPGRADE=0 is applied AFTER the scrub (which would delete it)
+  // to drop the startup registry check.
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const k of Object.keys(childEnv)) {
+    if (k.startsWith("YAW_MCP_")) delete childEnv[k];
+  }
+  const res = spawnSync(process.execPath, [cli, ...args], {
+    encoding: "utf8",
+    timeout: 30_000,
+    cwd: workDir,
+    env: {
+      ...childEnv,
+      HOME: workDir,
+      USERPROFILE: workDir,
+      CLAUDE_CONFIG_DIR: workDir,
+      YAW_MCP_AUTO_UPGRADE: "0",
+    },
+  });
+  // Never collapse a spawn failure or a kill into a status number. The two
+  // failure modes this file exists to catch -- a CLI that hangs now that
+  // process.exit() is gone, and one that cannot start at all -- both used to
+  // reach the assertion as `-1` and report "expected -1 to be 0", which names
+  // neither of them.
+  const status = res.status;
+  if (res.error || status === null) {
+    const why = res.error ? res.error.message : `killed by ${res.signal ?? "an unknown signal"}`;
+    throw new Error(
+      `yaw-mcp ${args.join(" ")}: did not exit normally -- ${why}. A 30s timeout here means the CLI hung instead of exiting.\n--- stdout ---\n${res.stdout ?? "(empty)"}\n--- stderr ---\n${res.stderr ?? "(empty)"}`,
+    );
+  }
+  return { code: status, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
 
 describe("CLI dispatch -- help goes to stdout and exits 0", () => {
@@ -77,6 +136,21 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
     const r = runCli(["install", "--help"]);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode>");
+    expect(r.stderr).toBe("");
+  });
+
+  it("prints foundry's usage, the one branch that recognizes help by string identity", () => {
+    // foundry's parser has no `help` flag: it signals --help by returning
+    // FOUNDRY_USAGE as the `error`, and index.ts re-labels that ONE exact
+    // string as help. Give the usage a prefix in foundry-cmd.ts the way its
+    // five siblings prefix theirs, or wrap it, and the identity check stops
+    // matching -- help moves to stderr with exit 2, `yaw-mcp foundry --help`
+    // prints nothing to stdout, `| less` shows a blank pager, and any script
+    // treating help as success starts failing. Nothing else in the repo
+    // covers this branch, so nothing else would go red.
+    const r = runCli(["foundry", "--help"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("Usage: yaw-mcp foundry export");
     expect(r.stderr).toBe("");
   });
 

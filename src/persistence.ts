@@ -148,9 +148,29 @@ export function emptyState(): PersistedState {
   return { version: STATE_SCHEMA_VERSION, savedAt: 0, learning: {}, packHistory: [], toolCache: {} };
 }
 
+/** How many entries the FILE carried, counted before sanitization dropped
+ *  anything. Zero across the board when there was no file, or when it could
+ *  not be read/parsed (nothing was counted, so nothing is claimed). */
+export interface RawStateCounts {
+  learning: number;
+  packHistory: number;
+  toolCache: number;
+}
+
+const NO_RAW_COUNTS: RawStateCounts = { learning: 0, packHistory: 0, toolCache: 0 };
+
 /** loadState's result plus how the file was classified on the way in. */
 export interface ClassifiedState {
   state: PersistedState;
+  /**
+   * Pre-sanitization entry counts (see RawStateCounts). The sanitized `state`
+   * is what yaw-mcp will USE; these are what the file HELD, and the two differ
+   * whenever an entry was dropped -- a TTL-expired tool cache, a hand-edited
+   * learning row with a negative `lastUsedAt`. A caller reporting on a file it
+   * is about to delete (reset-learning) must use these, or it tells the user
+   * "0 entries removed" about a file that really held five.
+   */
+  rawCounts: RawStateCounts;
   /**
    * True when the returned state reflects what was actually ON DISK: the file
    * parsed as an object at a readable version, or there was no file at all
@@ -187,20 +207,21 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
     // start empty. Same split as grades-cache/config-loader. Clean, not
     // failed: with no file on disk the empty state IS what is there.
     if (isFileNotFound(err) || (err as NodeJS.ErrnoException).code === "ENOTDIR")
-      return { state: emptyState(), parsedCleanly: true };
+      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: true };
     // The file EXISTS but we could not read it -- a transient handle error
     // (win32 AV/indexer EBUSY, EACCES) on a presumed-HEALTHY file. Flag it
     // so the caller does not overwrite real learning/packHistory/toolCache
     // with the empty state we are about to return: without the flag, one
     // transient read error plus one debounced save silently wiped the file.
-    log(
-      "warn",
-      "Could not read yaw-mcp state file; state saves are disabled for this session so it is not overwritten",
-      {
-        error: errorMessage(err),
-      },
-    );
-    return { state: { ...emptyState(), loadFailed: true }, parsedCleanly: false };
+    //
+    // The message describes what THIS function did, not what the caller will
+    // do next: it used to promise "state saves are disabled for this session",
+    // which is true for server.ts and flatly false for reset-learning, whose
+    // very next act is to delete the file.
+    log("warn", "Could not read yaw-mcp state file; flagged unreadable so a save cannot overwrite it", {
+      error: errorMessage(err),
+    });
+    return { state: { ...emptyState(), loadFailed: true }, rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
   }
   try {
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing -- same strip
@@ -210,13 +231,14 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
     // sanitizeLearning); without the strip, one Notepad save would drop ALL
     // learning, pack history, and tool cache via the empty-state fallback.
     const parsed = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-    if (!parsed || typeof parsed !== "object") return { state: emptyState(), parsedCleanly: false };
+    if (!parsed || typeof parsed !== "object")
+      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
     // Any version loadState can READ counts as clean, not just the current
     // one: v1 MIGRATES (see READABLE_STATE_VERSIONS), so treating it as
     // unreadable would discard real counts for the one session before the
     // first save rewrites the file.
     if (!isReadableStateVersion((parsed as { version?: unknown }).version))
-      return { state: emptyState(), parsedCleanly: false };
+      return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
     const p = parsed as Record<string, unknown>;
     return {
       state: {
@@ -228,6 +250,13 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
         // the v1 -> v2 migration; no other field changed shape.
         toolCache: sanitizeToolCache(p.toolCache),
       },
+      // Counted off `p`, BEFORE the sanitizers above run: what the file held,
+      // not what survived. See RawStateCounts.
+      rawCounts: {
+        learning: countRawEntries(p.learning),
+        packHistory: countRawEntries(p.packHistory),
+        toolCache: countRawEntries(p.toolCache),
+      },
       parsedCleanly: true,
     };
   } catch (err) {
@@ -235,8 +264,16 @@ export async function loadStateClassified(filePath: string = statePath()): Promi
     // The file is genuinely unusable, so starting fresh (and letting the
     // next save replace it) is the intended behavior; no loadFailed flag.
     log("warn", "Failed to load yaw-mcp state, starting fresh", { error: errorMessage(err) });
-    return { state: emptyState(), parsedCleanly: false };
+    return { state: emptyState(), rawCounts: NO_RAW_COUNTS, parsedCleanly: false };
   }
+}
+
+/** Count entries in a raw (unsanitized) state section: object keys for the
+ *  learning/toolCache maps, elements for the packHistory array. Anything that
+ *  is not an object or array held no entries, so it counts as 0. */
+function countRawEntries(input: unknown): number {
+  if (!input || typeof input !== "object") return 0;
+  return Array.isArray(input) ? input.length : Object.keys(input).length;
 }
 
 // In-process serializer. Two saveState calls debounced too close in time
@@ -284,7 +321,11 @@ async function doSaveState(state: SavableState, filePath: string): Promise<void>
 }
 
 function sanitizeLearning(input: unknown): Record<string, PersistedLearningUsage> {
-  if (!input || typeof input !== "object") return {};
+  // Arrays are rejected outright, exactly like sanitizeToolCache does: without
+  // the check, a hand-edited `"learning": [{...}]` walks Object.entries and
+  // lands as namespaces literally named "0", "1", "2" -- entries that can
+  // never match a real namespace but do occupy the learning map forever.
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
   const out: Record<string, PersistedLearningUsage> = {};
   for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
     if (!k) continue;
@@ -331,11 +372,16 @@ function sanitizePackHistory(input: unknown): PersistedPackCall[] {
  * that answer is what made pre-warm re-spawn such a server every session (see
  * the inline note at the length check below). Survivors are then trimmed to
  * the most recently learned TOOLCACHE_MAX_NAMESPACES.
- *
- * `now` is injectable so tests can pin TTL behavior without faking timers.
  */
-function sanitizeToolCache(input: unknown, now: number = Date.now()): Record<string, PersistedToolCacheEntry> {
+function sanitizeToolCache(input: unknown): Record<string, PersistedToolCacheEntry> {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  // Read the clock once so every entry is aged against the same instant --
+  // a per-entry Date.now() could expire one entry and keep its neighbour
+  // across a TTL boundary. This used to be a `now` parameter defaulted to
+  // Date.now(), documented as test-injectable, but no caller ever passed
+  // one: both call sites hand it a single argument. Tests pin TTL behavior
+  // by choosing `learnedAt` relative to Date.now() instead.
+  const now = Date.now();
   const kept: Array<[string, PersistedToolCacheEntry]> = [];
   for (const [namespace, value] of Object.entries(input as Record<string, unknown>)) {
     if (!namespace) continue;
@@ -380,7 +426,13 @@ function sanitizeToolCache(input: unknown, now: number = Date.now()): Record<str
   return Object.fromEntries(kept);
 }
 
-function isFileNotFound(err: unknown): boolean {
+/** True for an ENOENT errno -- "the file is not there", as distinct from
+ *  "the file is there and something went wrong reading it". Exported because
+ *  reset-learning needs exactly this split on its unlink (ENOENT is the benign
+ *  nothing-to-reset path, anything else is a real I/O failure) and used to
+ *  carry a byte-identical private copy: two predicates that could drift into
+ *  disagreeing about which errnos are benign. */
+export function isFileNotFound(err: unknown): boolean {
   return !!err && typeof err === "object" && "code" in err && (err as { code?: unknown }).code === "ENOENT";
 }
 

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { MAX_EXEC_STEPS } from "../exec-engine.js";
+import { PENALTY_RATE_THRESHOLD } from "../learning.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "../meta-tools.js";
 import { SECRET_REF_RE } from "../secrets-vault.js";
 
@@ -38,11 +40,40 @@ describe("META_TOOL_NAMES", () => {
     expect(META_TOOL_NAMES.size).toBe(declared.length);
     expect([...META_TOOL_NAMES].sort()).toEqual([...declared].sort());
   });
+});
 
-  it("has an entry for every key of META_TOOLS", () => {
-    for (const key of Object.keys(META_TOOLS) as Array<keyof typeof META_TOOLS>) {
-      expect((META_TOOL_NAMES as Set<string>).has(META_TOOLS[key].name)).toBe(true);
-    }
+describe("meta-tool descriptions quote the constants that enforce them", () => {
+  it("renders exec's step cap from MAX_EXEC_STEPS", () => {
+    // The description sells a hard cap to the model; validateExecRequest is
+    // what actually enforces it. A hardcoded number here goes stale silently
+    // the first time the cap moves.
+    expect(META_TOOLS.exec.description).toContain(`Max ${MAX_EXEC_STEPS} steps per exec.`);
+  });
+
+  it("renders health's reliability floor from PENALTY_RATE_THRESHOLD", () => {
+    // learning.ts promises that moving this threshold moves every surface
+    // that renders it -- this description is one of those surfaces.
+    expect(META_TOOLS.health.description).toContain(`<${Math.round(PENALTY_RATE_THRESHOLD * 100)}%`);
+  });
+});
+
+describe("mcp_connect_exec description matches what handleExec does", () => {
+  it("no longer claims exec never auto-activates", () => {
+    // Tripwire, not coverage: handleExec routes each step through
+    // handleToolCall, which lazy-loads a deferred (cached-but-not-connected)
+    // server on first use exactly as a direct tools/call would. The old
+    // parenthetical told the model to spend an mcp_connect_activate
+    // round-trip first -- the very round-trip exec exists to save.
+    expect(META_TOOLS.exec.description).not.toContain("does not auto-activate");
+    expect(META_TOOLS.exec.inputSchema.properties.steps.items.properties.tool.description).not.toContain(
+      "currently loaded",
+    );
+  });
+
+  it("declares the step item schema closed so a misspelled `arguments` key is not silently legal", () => {
+    // Without this a step written as {tool, arguments:{...}} reads as a legal
+    // extension and dispatches the tool with no arguments at all.
+    expect(META_TOOLS.exec.inputSchema.properties.steps.items.additionalProperties).toBe(false);
   });
 });
 
@@ -56,6 +87,17 @@ describe("computeSecretsReport (names only, never values)", () => {
     ];
     const rows = computeSecretsReport(servers, new Set(["gh"]));
     expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: ["missing_one"] }]);
+  });
+
+  it("reports only the vault keys this server references, never the whole key list", () => {
+    // injectedSecrets is referenced ∩ vaultKeys, in that direction. Leaking
+    // the vault's other key NAMES here would turn a per-server preview into
+    // an inventory of every credential the user holds.
+    const servers = [{ namespace: "gh", env: { T: "${secret:gh}" } }];
+    const rows = computeSecretsReport(servers, new Set(["gh", "aws", "slack"]));
+    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [] }]);
+    expect(JSON.stringify(rows)).not.toContain("aws");
+    expect(JSON.stringify(rows)).not.toContain("slack");
   });
 
   it("omits servers with no ${secret:...} references", () => {

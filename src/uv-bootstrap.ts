@@ -108,15 +108,6 @@ function archiveExt(): "zip" | "tar.gz" {
   return process.platform === "win32" ? "zip" : "tar.gz";
 }
 
-async function exists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // Resolve a bare command against PATH. Runs the binary with
 // `--version` and considers exit 0 as "present." Faster and more
 // portable than rolling our own PATH walk (which has to cope with
@@ -214,7 +205,7 @@ export async function onPath(cmd: string): Promise<boolean> {
 // later activation re-burned the budget. 20 minutes still bounds the
 // one-byte-per-29s wedge this exists for (that shape would take ~10 hours).
 const UV_FETCH_TIMEOUT_MS = 30_000;
-export const UV_FETCH_TOTAL_MS = 20 * 60_000;
+const UV_FETCH_TOTAL_MS = 20 * 60_000;
 
 async function fetchWithRedirects(url: string, maxHops = 5): Promise<Buffer> {
   let current = url;
@@ -466,7 +457,13 @@ async function resolveUv(): Promise<string> {
   // linux libc, so a glibc cache entry can't shadow a musl one.
   const installDir = path.join(cacheDir(), "uv", UV_VERSION, target);
   const finalBin = path.join(installDir, binName());
-  if (await exists(finalBin)) return finalBin;
+  // Same predicate the race fallback below uses -- isFile() AND non-empty, not
+  // a bare existence check. Nothing on this path ever invalidates the cache, so
+  // a truncated (interrupted rename/copy) or non-regular finalBin accepted here
+  // is trusted for the life of the install dir; requiring a real, non-empty
+  // file lets a poisoned entry fall through to a re-download instead.
+  const cached = await fs.stat(finalBin).catch(() => null);
+  if (cached?.isFile() && cached.size > 0) return finalBin;
 
   await fs.mkdir(installDir, { recursive: true });
   log("info", "Bootstrapping uv", { version: UV_VERSION, target, cache: installDir });

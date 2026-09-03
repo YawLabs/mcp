@@ -14,7 +14,7 @@
     "version": {
       "type": "integer",
       "minimum": 1,
-      "description": "Config schema version. Current version: 1. A value newer than the CLI understands triggers a warning but is not fatal."
+      "description": "Config schema version. Current version: 1. A value newer than the CLI understands triggers a warning but is not fatal. Declared `integer` with `minimum: 1` because that is the only shape yaw-mcp ever writes or documents. The loader (config-loader.ts readConfigAt) is deliberately more lenient -- it honors ANY numeric value and only warns when it exceeds the version it knows, so a hand-written `0` or `1.5` still loads. That gap is intentional: this schema is the editor-facing contract (flag the typo while it is being typed), the loader soft-fails by design (never refuse a file over a field it can ignore). A NON-number (`\"1\"`, null) is rejected here and warned about there."
     },
     "token": {
       "type": "string",
@@ -32,22 +32,23 @@
     },
     "servers": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
       "uniqueItems": true,
-      "description": "Allow-list of server namespaces to activate. If set in any scope, only these servers are active. Precedence: local scope wins over project, which wins over global (most-specific overrides)."
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_]{0,29}$" },
+      "description": "Allow-list of server namespaces to activate. If set in any scope, only these servers are active. Precedence: local scope wins over project, which wins over global (most-specific overrides). Entries are matched literally against an installed namespace, so `pattern` mirrors NAMESPACE_RE (src/local-bundles.ts): a lowercase letter followed by up to 29 more of [a-z0-9_]. A blank, padded, or wrong-case entry ('GitHub', ' github') can never name a server. The loader is softer about the same three cases, and the split is deliberate -- it drops a blank entry with a warning, trims a padded one, and KEEPS an unmatchable one with a warning (dropping it would empty the array and silently promote this scope to the parent's allow-list). `uniqueItems` likewise flags a repeated namespace in the editor, where it is always a typo; the loader treats the duplicate as the harmless no-op it is."
     },
     "blocked": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
       "uniqueItems": true,
-      "description": "Deny-list of server namespaces that are never activated. Merged as a union across all scopes (additive, not overriding)."
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_]{0,29}$" },
+      "description": "Deny-list of server namespaces that are never activated. Merged as a union across all scopes (additive, not overriding). Same namespace `pattern` and `uniqueItems` as `servers`, and the same strict-schema / lenient-loader split: the union is a Set, so the loader absorbs a duplicate rather than rejecting it."
     }
   },
   "examples": [
     {
+      "$schema": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json",
       "version": 1,
       "servers": ["github", "filesystem"],
-      "blocked": ["legacy-db"]
+      "blocked": ["legacy_db"]
     },
     {
       "version": 1,

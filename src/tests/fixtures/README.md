@@ -55,9 +55,11 @@ This gate exists only to add the thing that file cannot have: real traffic.
 
    Defaults: `--out src/tests/fixtures/foundry-corpus.json`, `--cap 500`
    (stratified by `chosen`, so rare servers survive the cap). `--json` emits a
-   machine-readable summary. Exit codes: `0` written, `1` no harvest / no
-   parseable traces, `2` traces exist but no entry's `chosen` is in the local
-   catalog.
+   machine-readable summary. Exit codes (the table at the top of
+   `src/foundry-cmd.ts`): `0` corpus written; `1` any runtime failure -- no
+   harvest file, no parseable traces, or no usable entries after folding
+   (every trace's `chosen` is unknown to the local server catalog, or all
+   tokens were empty); `2` bad argv, the CLI-wide usage-error code.
 
 4. **Review before committing.** Skim the token bags in the written JSON. They
    are what ships to the repo forever. Anything you would not put in a commit

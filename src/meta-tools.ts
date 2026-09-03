@@ -1,10 +1,21 @@
-// Single source of truth for the `${secret:NAME}` reference shape. This
-// file used to keep a byte-identical private copy; importing the real one
-// means a change to the reference syntax can't leave the values-free
-// secrets report matching the old shape. (secrets-vault does touch the
-// filesystem elsewhere in the module, but nothing runs at import time --
-// computeSecretsReport below stays pure.)
-import { SECRET_REF_RE } from "./secrets-vault.js";
+// Single source of truth for the `${secret:NAME}` reference shape AND for the
+// scan over it is secrets-vault's collectSecretRefNames. This file used to keep
+// a byte-identical private copy of that loop, re-deriving the fresh-RegExp rule
+// the module-shared /g object demands; importing the real scanner means a
+// change to the reference syntax can't leave the values-free secrets report
+// matching the old shape. (secrets-vault does touch the filesystem elsewhere in
+// the module, but nothing runs at import time -- computeSecretsReport below
+// stays pure.)
+import { MAX_EXEC_STEPS } from "./exec-engine.js";
+import { PENALTY_RATE_THRESHOLD } from "./learning.js";
+import { collectSecretRefNames } from "./secrets-vault.js";
+
+// Numbers the descriptions below quote to the model, interpolated from the
+// constants that actually enforce them rather than retyped. learning.ts
+// promises that moving PENALTY_RATE_THRESHOLD moves every surface that
+// renders it, and exec's step cap is enforced by validateExecRequest --
+// a hardcoded "<80%" or "Max 16 steps" is a lie the moment either moves.
+const PENALTY_RATE_PCT = Math.round(PENALTY_RATE_THRESHOLD * 100);
 
 export const META_TOOLS = {
   discover: {
@@ -89,8 +100,7 @@ export const META_TOOLS = {
   },
   health: {
     name: "mcp_connect_health",
-    description:
-      "Show health stats for MCP servers loaded in the current session: total calls, error count, average latency, and last error. Per-call telemetry covers LOADED servers only; installed-but-unloaded servers with a poor persisted success rate (<80% across sessions) are listed in a separate cross-session reliability block — do NOT load a server just to see its history, loading it resets the in-session counters to zero.",
+    description: `Show health stats for MCP servers loaded in the current session: total calls, error count, average latency, and last error. Per-call telemetry covers LOADED servers only; installed-but-unloaded servers with a poor persisted success rate (<${PENALTY_RATE_PCT}% across sessions) are listed in a separate cross-session reliability block — do NOT load a server just to see its history, loading it resets the in-session counters to zero.`,
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -235,8 +245,13 @@ export const META_TOOLS = {
   },
   exec: {
     name: "mcp_connect_exec",
-    description:
-      "Run a short DECLARATIVE pipeline of upstream tool calls in a single round-trip. Use this when you already know the exact 2-4 tool calls to make and one call's output feeds another's args — e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: there is no expression language, no loops, no branching, no arithmetic. The only control flow is sequential step execution; the only data-flow primitive is `{\"$ref\": \"<stepId>[.path.to.value]\"}` which substitutes a prior step's output (or a nested field of it) into the next step's args. Paths support dot keys and `[N]` / `.N` array indexing. Each step's `tool` must be a namespaced, already-loaded tool name (the exec does not auto-activate — call `mcp_connect_activate` first). Max 16 steps per exec. If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success returns `{ ok: true, result: <return-step output>, steps: { ...all outputs } }`. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
+    // Joined rather than one literal so the step cap can be interpolated from
+    // MAX_EXEC_STEPS -- the constant validateExecRequest actually enforces.
+    description: [
+      "Run a short DECLARATIVE pipeline of upstream tool calls in a single round-trip. Use this when you already know the exact 2-4 tool calls to make and one call's output feeds another's args — e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: there is no expression language, no loops, no branching, no arithmetic. The only control flow is sequential step execution; the only data-flow primitive is `{\"$ref\": \"<stepId>[.path.to.value]\"}` which substitutes a prior step's output (or a nested field of it) into the next step's args. Paths support dot keys and `[N]` / `.N` array indexing. Each step's `tool` is a namespaced upstream tool name: an already-loaded server is called directly, and a not-yet-loaded server whose tools are known from cache is loaded on first use exactly as a direct tools/call would be — that adds its tools to this session, and can still be refused (server cap, compliance floor). A name that is neither loaded nor cached fails the step.",
+      `Max ${MAX_EXEC_STEPS} steps per exec.`,
+      "If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success returns `{ ok: true, result: <return-step output>, steps: { ...all outputs } }`. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
+    ].join(" "),
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -255,7 +270,7 @@ export const META_TOOLS = {
               tool: {
                 type: "string",
                 description:
-                  'Namespaced tool name (e.g. "gh_list_prs"). Must be a tool currently loaded in the session. Meta-tools (mcp_connect_*) are not callable from exec.',
+                  'Namespaced tool name (e.g. "gh_list_prs"). Loaded servers are called directly; a not-yet-loaded server whose tools are known from cache is loaded on first use, adding its tools to the session. A name that is neither loaded nor cached fails the step. Meta-tools (mcp_connect_*) are not callable from exec.',
               },
               args: {
                 type: "object",
@@ -265,6 +280,13 @@ export const META_TOOLS = {
               },
             },
             required: ["tool"],
+            // A misspelled `arguments` / `arg` / `input` key would otherwise
+            // read as a legal extension and the step would dispatch with no
+            // arguments at all. validateExecRequest rejects the same shape at
+            // runtime (the low-level Server never validates against this
+            // schema); declaring it here is what steers a schema-aware client
+            // away from sending it in the first place.
+            additionalProperties: false,
           },
         },
         return: {
@@ -308,21 +330,17 @@ export function computeSecretsReport(
   vaultKeys: Set<string>,
 ): SecretsReportRow[] {
   const rows: SecretsReportRow[] = [];
-  // SECRET_REF_RE carries /g and is module-shared with secrets-vault's own
-  // callers. matchAll does NOT start from zero: it seeds its internal clone
-  // from the source regex's lastIndex, so a stale lastIndex left behind by
-  // any `.exec()`/`.test()` elsewhere would make this scan silently skip
-  // leading matches -- and a skipped `${secret:NAME}` drops a row from the
-  // report, which reads as "this server needs no secrets". Build a fresh
-  // instance from the shared source instead, exactly as upstream.ts's
-  // collectSecretNames does.
-  const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
   for (const server of servers) {
-    const referenced = new Set<string>();
-    for (const v of Object.values(server.env ?? {})) {
-      if (typeof v !== "string") continue;
-      for (const m of v.matchAll(re)) referenced.add(m[1]);
-    }
+    // The shared scanner, not a local matchAll over SECRET_REF_RE: that object
+    // carries /g and is module-shared with secrets-vault's own callers, and
+    // matchAll does NOT start from zero -- it seeds its internal clone from the
+    // source regex's lastIndex, so a stale offset left behind by an
+    // `.exec()`/`.test()` elsewhere would make the scan silently skip leading
+    // matches, and a skipped `${secret:NAME}` drops a row from the report,
+    // which reads as "this server needs no secrets". collectSecretRefNames owns
+    // the fresh-instance rule for every name-only caller (upstream.ts's spawn
+    // audit and doctor's vault section are the others).
+    const referenced = collectSecretRefNames(server.env);
     if (referenced.size === 0) continue;
     const injectedSecrets: string[] = [];
     const missing: string[] = [];

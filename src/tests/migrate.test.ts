@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { lstat, stat } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,13 +13,41 @@ import {
 import { CONFIG_DIRNAME, userConfigDir } from "../paths.js";
 
 // findLegacyProjectRoot is not exported -- all walk-up behaviour is exercised
-// indirectly through migrateLegacyConfigPaths in cases 5-6 below.
+// indirectly through migrateLegacyConfigPaths, in the SECOND describe block
+// below ("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)").
+// The numbers on the individual cases are historical labels from the order
+// they were written, not a reading order: the walk-up block holds 5, 5b, 6,
+// 7, 8, 12 and 13, while 9, 10 and 11 sit in the first block above them.
 
 // Helper: create a legacy file at <dir>/<name> with minimal content.
 function writeLegacy(dir: string, name: string): string {
   const p = join(dir, name);
   writeFileSync(p, JSON.stringify({ token: "mcp_pat_legacy_aaaa" }), "utf8");
   return p;
+}
+
+// logger.ts writes one JSON object per line to stderr. Parse the captured
+// chunks rather than substring-matching a PATH against them: on a Windows
+// runner every separator in the payload is JSON-escaped to `\\`, so
+// `toContain(somePath)` never matches even when the field is exactly right.
+// Message substrings carry no separators and are safe either way.
+function logLines(chunks: string[]): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const line of chunks.join("").split("\n")) {
+    if (line.trim().length === 0) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed && typeof parsed === "object") out.push(parsed as Record<string, unknown>);
+    } catch {
+      // Not one of ours (a stray write from the runner) -- ignore it.
+    }
+  }
+  return out;
+}
+
+// The parsed log line whose `msg` contains `needle`, or undefined.
+function findLog(chunks: string[], needle: string): Record<string, unknown> | undefined {
+  return logLines(chunks).find((l) => typeof l.msg === "string" && l.msg.includes(needle));
 }
 
 describe("migrateLegacyConfigPaths", () => {
@@ -31,9 +59,15 @@ describe("migrateLegacyConfigPaths", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "yaw-mcp-migrate-home-"));
     cwd = mkdtempSync(join(home, "proj-"));
+    // The stderr-spy cases below assert on WARN lines, and logger.ts resolves
+    // LOG_LEVEL per call from the ambient env. A runner shell carrying
+    // LOG_LEVEL=error would suppress exactly the lines they assert on, so the
+    // threshold is pinned here rather than inherited.
+    vi.stubEnv("LOG_LEVEL", "warn");
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -47,7 +81,6 @@ describe("migrateLegacyConfigPaths", () => {
     // Legacy file should no longer exist (rename, not copy).
     await expect(stat(legacyPath)).rejects.toThrow();
     // Target should now exist with the original content.
-    const { readFile } = await import("node:fs/promises");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
     expect(content.token).toBe("mcp_pat_legacy_aaaa");
   });
@@ -61,15 +94,65 @@ describe("migrateLegacyConfigPaths", () => {
     const targetPath = join(targetDir, "config.json");
     writeFileSync(targetPath, JSON.stringify({ token: "mcp_pat_new_bbbb" }), "utf8");
 
-    await migrateLegacyConfigPaths({ cwd, home });
+    const warns: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      warns.push(String(chunk));
+      return true;
+    });
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      spy.mockRestore();
+    }
 
     // Target content must be unchanged (new token wins, legacy is orphaned).
-    const { readFile } = await import("node:fs/promises");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
     expect(content.token).toBe("mcp_pat_new_bbbb");
 
     // Legacy file must still exist (not deleted, not renamed).
     await expect(stat(join(home, LEGACY_GLOBAL_FILENAME))).resolves.toBeDefined();
+
+    // ...and the orphaning is ANNOUNCED. Asserting only the skip would pass
+    // against a migrator that had gone silent, leaving the user with a legacy
+    // file nothing reads and nothing mentions.
+    const ignored = findLog(warns, "legacy file exists alongside new location -- legacy is ignored");
+    expect(ignored, "no 'legacy is ignored' warn was emitted").toBeDefined();
+    expect(ignored?.legacy).toBe(join(home, LEGACY_GLOBAL_FILENAME));
+    expect(ignored?.target).toBe(targetPath);
+  });
+
+  // 11. The rename-failure catch: a filesystem that refuses the move must warn
+  //     and leave the legacy file in place, never lose it. Forced by planting a
+  //     regular FILE where `.yaw-mcp/` needs to be a directory, so migrateFile's
+  //     `mkdir(dirname(target), { recursive: true })` throws EEXIST/ENOTDIR --
+  //     the same shape a locked or read-only path produces in production.
+  it("warns and leaves the legacy file in place when the move fails", async () => {
+    const legacyPath = writeLegacy(home, LEGACY_GLOBAL_FILENAME);
+    // `~/.yaw-mcp` as a FILE: mkdir(recursive) on it throws instead of no-oping.
+    writeFileSync(userConfigDir(home), "not a directory", "utf8");
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      warns.push(String(chunk));
+      return true;
+    });
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Fail-open: the legacy file is untouched, so the user is no worse off
+    // than if they had never upgraded.
+    await expect(stat(legacyPath)).resolves.toBeDefined();
+    // ...and the failure is visible rather than swallowed by the catch.
+    const failed = findLog(warns, "legacy migration failed -- leaving file in place");
+    expect(failed, "no 'migration failed' warn was emitted").toBeDefined();
+    expect(failed?.legacy).toBe(legacyPath);
+    expect(failed?.scope).toBe("global");
+    // The reason travels with it -- a bare "it failed" is not diagnosable.
+    expect(typeof failed?.error).toBe("string");
+    expect(String(failed?.error).length).toBeGreaterThan(0);
   });
 
   // 3. No-op when legacy file does not exist (ENOENT).
@@ -144,7 +227,7 @@ describe("migrateLegacyConfigPaths", () => {
 
   // 9. A symlinked legacy path is left alone: the inode the trust check
   //    covered (stat follows) was never the one rename() would have moved.
-  it("skips a legacy file that is a symlink instead of moving the link", async () => {
+  it("skips a legacy file that is a symlink instead of moving the link", async (ctx) => {
     // The old code stat'ed (following the link) for the ownership decision and
     // then renamed the LINK, so the file it vetted and the file it moved were
     // different inodes -- and a relative link target dangles once the link
@@ -155,7 +238,11 @@ describe("migrateLegacyConfigPaths", () => {
     try {
       symlinkSync(realFile, linkPath, "file");
     } catch {
-      return; // symlink creation unavailable (unelevated Windows); nothing to pin
+      // ctx.skip(), not a bare `return`: returning early reported this as
+      // PASSED with zero assertions, so a machine that cannot create file
+      // symlinks (unelevated Windows) looked like it had verified the
+      // symlink-skip branch when it had not run a line of it.
+      ctx.skip("file symlink creation unavailable on this machine");
     }
     const warns: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
@@ -168,8 +255,9 @@ describe("migrateLegacyConfigPaths", () => {
       spy.mockRestore();
     }
 
-    // The link is still a link, still where it was...
-    await expect(lstat(linkPath)).resolves.toMatchObject({});
+    // The link is still a link, still where it was. (`toMatchObject({})` used
+    // to stand here as well; an empty object matches ANY object, so it asserted
+    // nothing beyond "lstat resolved" -- which this line already proves.)
     expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
     // ...nothing was hoisted into ~/.yaw-mcp/, and the target is untouched.
     await expect(stat(join(userConfigDir(home), "config.json"))).rejects.toThrow();
@@ -231,7 +319,6 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     // The legacy project file should have been moved to .yaw-mcp/config.json
     // inside the project root.
     const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.json");
-    const { readFile } = await import("node:fs/promises");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
     expect(content.token).toBe("mcp_pat_legacy_aaaa");
 
@@ -255,10 +342,65 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     await migrateLegacyConfigPaths({ cwd: deep, home });
 
     const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.json");
-    const { readFile } = await import("node:fs/promises");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
     expect(content.token).toBe("mcp_pat_legacy_aaaa");
     await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
+  });
+
+  // 12. The project-LOCAL rename, on its own: `.yaw-mcp.local.json` is the
+  //     highest-precedence (gitignored) allow/deny override, and it is also the
+  //     only file that can make the walker pick a root by itself -- the `||
+  //     exists(legacyLocal)` arm in findLegacyProjectRoot. With only the
+  //     `.yaw-mcp.json` cases above, dropping that arm or typo'ing
+  //     NEW_LOCAL_FILENAME left the suite green while a 0.11.x user's override
+  //     was either never migrated or renamed to a name the loader does not
+  //     read -- the loader then falls through to project/global config with no
+  //     warning, silently changing which MCP servers are allowed.
+  it("migrates a project legacy LOCAL file and finds the root by that file alone", async () => {
+    const projectRoot = mkdtempSync(join(home, "proj-"));
+    writeLegacy(projectRoot, LEGACY_LOCAL_FILENAME);
+    // No `.yaw-mcp.json` anywhere: the walker must return this root off the
+    // local file alone.
+    const deep = join(projectRoot, "packages", "api", "src");
+    mkdirSync(deep, { recursive: true });
+
+    await migrateLegacyConfigPaths({ cwd: deep, home });
+
+    // Pinned as a literal, not re-derived from the module: a typo in
+    // NEW_LOCAL_FILENAME has to fail here rather than travel into the
+    // expectation with the code.
+    const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.local.json");
+    const content = JSON.parse(await readFile(targetPath, "utf8"));
+    expect(content.token).toBe("mcp_pat_legacy_aaaa");
+
+    await expect(stat(join(projectRoot, LEGACY_LOCAL_FILENAME))).rejects.toThrow();
+    // The shared config.json is NOT invented on the local file's behalf.
+    await expect(stat(join(projectRoot, CONFIG_DIRNAME, "config.json"))).rejects.toThrow();
+  });
+
+  // 13. Both legacy files in one root: each lands under its own new name in
+  //     the SAME `.yaw-mcp/`, and neither move clobbers the other (migrateFile
+  //     mkdirs the parent for each, and the second mkdir must be idempotent).
+  it("migrates both legacy files in a root into one .yaw-mcp/ directory", async () => {
+    const projectRoot = mkdtempSync(join(home, "proj-"));
+    // Distinct tokens (writeLegacy's single token could not tell the two moves
+    // apart if one file's contents landed under the other's new name).
+    const writeToken = (name: string, token: string): void =>
+      writeFileSync(join(projectRoot, name), JSON.stringify({ token }), "utf8");
+    writeToken(LEGACY_PROJECT_FILENAME, "mcp_pat_shared_cccc");
+    writeToken(LEGACY_LOCAL_FILENAME, "mcp_pat_local_dddd");
+
+    await migrateLegacyConfigPaths({ cwd: projectRoot, home });
+
+    const newDir = join(projectRoot, CONFIG_DIRNAME);
+    const shared = JSON.parse(await readFile(join(newDir, "config.json"), "utf8"));
+    const local = JSON.parse(await readFile(join(newDir, "config.local.json"), "utf8"));
+    // Contents did not cross over: each legacy file kept its own payload.
+    expect(shared.token).toBe("mcp_pat_shared_cccc");
+    expect(local.token).toBe("mcp_pat_local_dddd");
+
+    await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
+    await expect(stat(join(projectRoot, LEGACY_LOCAL_FILENAME))).rejects.toThrow();
   });
 
   // 6. Returns null (no project migration) when the walk reaches $HOME itself.
@@ -310,7 +452,7 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
   });
 
   // 8. A symlinked $HOME spelling still migrates (realpath'd bound).
-  it("migrates when $HOME is passed via a symlinked spelling of the same directory", async () => {
+  it("migrates when $HOME is passed via a symlinked spelling of the same directory", async (ctx) => {
     // Production shape: HOME is the logical spelling (/home/u) while
     // process.cwd() reports the physical path (/var/home/u) -- symlinked
     // homes, NFS automounts. findLegacyProjectRoot used to compare the two
@@ -325,7 +467,9 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
       symlinkSync(home, homeLink, "junction");
     } catch {
       rmSync(linkParent, { recursive: true, force: true });
-      return; // symlink creation unavailable in this environment; nothing to pin
+      // Same reason as the file-symlink case above: a bare `return` reported
+      // this as a zero-assertion PASS, hiding that the branch never ran here.
+      ctx.skip("directory junction creation unavailable on this machine");
     }
     try {
       const projectRoot = mkdtempSync(join(home, "proj-"));

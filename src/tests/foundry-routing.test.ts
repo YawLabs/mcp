@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FOUNDRY_TOP3_FLOOR, type FoundryCorpus, loadFoundryCorpus, scoreCorpus } from "../foundry-corpus.js";
 import { type RankableServer, rankServers } from "../relevance.js";
@@ -39,7 +40,11 @@ import { type RankableServer, rankServers } from "../relevance.js";
 // BM25-only, so it runs with no Voyage key, exactly like routing-quality.
 // ═══════════════════════════════════════════════════════════════════════
 
-const FIXTURE = join(process.cwd(), "src", "tests", "fixtures", "foundry-corpus.json");
+// Resolved from THIS module's URL, not process.cwd(): a run started anywhere
+// but the repo root (an editor's test runner, a monorepo-wide invocation) would
+// otherwise miss a committed fixture and drop the gate into exactly the dormant
+// state this file exists to make loud. Matches the sibling test files.
+const FIXTURE = fileURLToPath(new URL("./fixtures/foundry-corpus.json", import.meta.url));
 const HARVEST_DOC = join("src", "tests", "fixtures", "README.md");
 
 // Existence and validity are separate questions -- conflating them is what
@@ -126,9 +131,13 @@ describe("foundry routing regression gate", () => {
           `regressions over real dispatches are NOT gated. Activate per ${HARVEST_DOC}.`,
         "warning",
       );
-      // Assert the state this branch claims, so the banner can never go stale:
-      // if a fixture ever lands, this branch is not the one that runs.
-      expect(fixturePresent, `${FIXTURE} exists -- the dormant branch should not have been taken`).toBe(false);
+      // Assert the state this branch claims, so the banner can never go stale.
+      // Both checks re-read DISK at test time. Re-asserting the `fixturePresent`
+      // const would be tautological -- it is the very condition this branch
+      // switched on, so it cannot be anything but false here -- while a fresh
+      // existsSync can still catch a fixture that landed after module load
+      // (a --watch rerun, a concurrent export) and would make the banner a lie.
+      expect(existsSync(FIXTURE), `${FIXTURE} exists -- the dormant branch should not have been taken`).toBe(false);
       expect(loadFoundryCorpus(FIXTURE)).toBeNull();
     });
 

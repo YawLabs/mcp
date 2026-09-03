@@ -81,11 +81,14 @@ export function closestNames(query: string, candidates: readonly string[], limit
       } else if (
         // Substring containment is only a credible "typo" signal when the
         // shorter string covers at least half the longer one. Without this
-        // gate a short query ("set") substring-matches long commands
-        // ("set-active") and surfaces misleading suggestions the header
-        // calls conservative. The Levenshtein tier still catches genuine
-        // short typos. (The old q.length >= 3 gate here is subsumed by the
-        // MIN_TYPO_QUERY_LEN gate on the whole inexact block.)
+        // gate an interior fragment of a long command ("ctiv", "act" inside
+        // "set-active") substring-matches it and surfaces the misleading
+        // suggestions the header calls conservative. What the gate does NOT
+        // suppress is a genuine prefix like "set": that never reaches here,
+        // because the ungated prefix tier above already scored it 1. The
+        // Levenshtein tier still catches genuine short typos. (The old
+        // q.length >= 3 gate here is subsumed by the MIN_TYPO_QUERY_LEN gate
+        // on the whole inexact block.)
         (lc.includes(q) || q.includes(lc)) &&
         Math.min(q.length, lc.length) * 2 >= Math.max(q.length, lc.length)
       ) {

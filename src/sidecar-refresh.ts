@@ -43,6 +43,22 @@
 // this machine to fetch. (See KNOWN GAPS: the action cannot honour that
 // distinction as precisely as the plan states it.)
 //
+// WHICH CONFIG IT ACTS ON: the USER-GLOBAL one, always. Both halves -- the plan
+// (loadSidecarSpecs) and the action (backgroundInstallOptions) -- run with `cwd`
+// forced to $HOME, which paths.ts's project walk stops just short of, so a
+// project-local `<project>/.yaw-mcp/bundles.json` is never consulted here. This
+// module runs from inside `serve`, whose cwd is whatever project the MCP client
+// happened to launch in, while the managed tree is keyed on HOME alone and is
+// shared by every project on the machine. Planning against one project's file
+// and then rewriting the shared manifest from it would npm-prune every other
+// project's servers out of that tree -- silently, because both output channels
+// are ignored down here. `sidecars install` prints "shared by every project on
+// this machine" when a human runs it from a project; a background task has
+// nobody to tell. So a project-local sidecar set is refreshed ONLY by the manual
+// `yaw-mcp sidecars install`, and a user whose only bundles.json is project-
+// local gets no background refresh at all. That is the intended trade: no
+// refresh is recoverable, a pruned shared tree is not.
+//
 // Never blocks serving: the registry probes run in parallel behind one short
 // abort budget, the npm child's stdio is ignored, and the whole thing is
 // fire-and-forget. A failure is a no-op -- worst case the sidecars stay on the
@@ -70,7 +86,10 @@
 //   - The lock is advisory: a sidecars root we cannot write to yields a no-op
 //     lock and the old unserialized behavior, and a lock left behind by a
 //     killed process is stolen once it goes stale (auto-upgrade owns both
-//     rules and the constants behind them).
+//     rules and the constants behind them). A lock this process still HOLDS is
+//     kept out of that stale window by a heartbeat -- see defaultAcquireLock,
+//     which is why the reused ten-minute window does not have to cover a
+//     whole-tree install.
 //   - The npm child is not detached, so an MCP client that tears down the
 //     process tree takes a half-finished install with it. Recovery is a manual
 //     `yaw-mcp sidecars install`; nothing here repairs a partial tree.
@@ -78,8 +97,7 @@
 // Opt-out: YAW_MCP_SIDECAR_REFRESH=0 (or =false), parsed exactly like
 // auto-upgrade's YAW_MCP_AUTO_UPGRADE.
 
-import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { acquireUpgradeLock } from "./auto-upgrade.js";
@@ -89,11 +107,15 @@ import { compareVersions } from "./oam-spawn.js";
 import { CONFIG_DIRNAME, sidecarsRoot } from "./paths.js";
 import {
   collectSidecarSpecs,
+  configuredRange,
+  defaultRunNpm,
   hasManagedSidecars,
   installedVersion,
   runSidecarsInstall,
   type SidecarSpec,
+  type SidecarsInstallOptions,
 } from "./sidecars-cmd.js";
+import type { UpstreamServerConfig } from "./types.js";
 
 /** How long a completed check suppresses the next one. A day: sidecar releases
  *  land on the order of days, and the cost of checking is N registry round
@@ -126,20 +148,32 @@ export function sidecarRefreshStatePath(home: string = homedir()): string {
   return join(home, CONFIG_DIRNAME, SIDECAR_REFRESH_STATE_FILENAME);
 }
 
-/** The persisted throttle state. One key today; read-modify-written rather
- *  than overwritten so a key a later build adds here is not dropped by an
- *  older binary's write. */
-interface SidecarRefreshState {
+/** The persisted throttle state. One KNOWN key today; read-modify-written
+ *  rather than overwritten so a key a later build adds here is not dropped by
+ *  an older binary's write.
+ *
+ *  Exported because it is part of SidecarRefreshDeps' surface (readStateImpl
+ *  returns it): a caller that had to hand-copy `{ lastSidecarRefreshCheck?:
+ *  number }` would be re-introducing exactly the drift the index signature
+ *  below exists to prevent. */
+export interface SidecarRefreshState {
   /** Epoch ms of the last COMPLETED check. See maybeRefreshSidecars for the
    *  one path that deliberately does not record it. */
   lastSidecarRefreshCheck?: number;
+  /** Anything else the file carried. A NEWER build's key rides through
+   *  parse -> merge -> write untouched instead of being erased by this one's
+   *  save; without the index signature parseSidecarRefreshState could not
+   *  return the keys it preserved, and the read-modify-write above would be a
+   *  read-rebuild-write that silently drops them. */
+  [key: string]: unknown;
 }
 
-/** What a write must supply: the state's keys, with the timestamp REQUIRED.
- *  Derived from SidecarRefreshState so the two cannot drift -- adding a key
- *  there widens this automatically instead of leaving a hand-copied literal
- *  behind. */
-type SidecarRefreshStatePatch = Required<Pick<SidecarRefreshState, "lastSidecarRefreshCheck">>;
+/** What a write must supply: the state's KNOWN keys, with the timestamp
+ *  REQUIRED. Derived from SidecarRefreshState so the two cannot drift --
+ *  adding a key there widens this automatically instead of leaving a
+ *  hand-copied literal behind. Exported alongside it for the same reason:
+ *  writeStateImpl takes one. */
+export type SidecarRefreshStatePatch = Required<Pick<SidecarRefreshState, "lastSidecarRefreshCheck">>;
 
 export interface SidecarRefreshDeps {
   /** Test hook: replace the per-package registry probe. */
@@ -190,29 +224,6 @@ export interface SidecarRefreshPlan {
  *  (defaultAcquireLock) and doctor (registrySkipCheck). */
 function inUnitTest(): boolean {
   return Boolean(process.env.VITEST);
-}
-
-/**
- * The configured version range for a spec, derived EXACTLY the way
- * sidecarsManifest derives the dependency value it writes into the managed
- * package.json: everything after the package name, with the `@` separator
- * stripped, and a bare name reading as `latest`.
- *
- * It has to be the same derivation, because the manifest is what npm actually
- * acts on. If this read `pkg@^1.0.0` as floating while the manifest wrote
- * `^1.0.0`, we would schedule a refresh npm then refuses to perform, and
- * re-schedule it every day forever.
- */
-export function configuredRange(spec: SidecarSpec): string {
-  // collectSidecarSpecs derives `pkg` FROM `spec` via packageName, so the name
-  // is always a prefix -- but a caller constructing a SidecarSpec by hand (or a
-  // future collector) could break that, and slicing by a length that does not
-  // correspond to a prefix yields a nonsense range. Report the whole spec as
-  // the range: it will not equal "latest", so the package is left alone, which
-  // is the safe direction for an input we do not understand.
-  if (!spec.spec.startsWith(spec.pkg)) return spec.spec;
-  const raw = spec.spec.slice(spec.pkg.length).replace(/^@/, "");
-  return raw === "" ? "latest" : raw;
 }
 
 /**
@@ -314,6 +325,20 @@ async function defaultFetchLatest(pkg: string): Promise<string | null> {
   }
 }
 
+/** The lockfile auto-upgrade's acquireUpgradeLock creates, by name. A second
+ *  copy of a constant that module does not export -- deliberate, and safe in
+ *  ONE direction only: it is used solely to keep an mtime fresh (below), so if
+ *  auto-upgrade ever renames its lock, the touch fails ENOENT, the heartbeat
+ *  quietly stops and the behavior degrades to what it was before the heartbeat
+ *  existed. It can never touch, or delete, the wrong file. */
+const UPGRADE_LOCK_NAME = ".yaw-mcp-upgrade.lock";
+
+/** How often a held lock's mtime is refreshed while the refresh runs. An order
+ *  of magnitude inside auto-upgrade's ten-minute stale window, so a heartbeat
+ *  that is merely late (a loaded machine, a paused VM) still lands well before
+ *  the lock reads as abandoned. */
+export const SIDECAR_LOCK_HEARTBEAT_MS = 60 * 1000;
+
 /** The lock the serve path actually uses.
  *
  *  auto-upgrade's acquireUpgradeLock, not a second implementation of it: the
@@ -323,50 +348,81 @@ async function defaultFetchLatest(pkg: string): Promise<string | null> {
  *  -- the two features serialize independently even though they share the
  *  primitive. (Wart, called out so nobody hunts for a bug: the file it creates
  *  is named `.yaw-mcp-upgrade.lock` even here. Renaming it per-caller would
- *  mean parameterizing auto-upgrade, for a filename nothing reads.) */
+ *  mean parameterizing auto-upgrade, for a filename nothing reads.)
+ *
+ *  What IS added on top: a heartbeat. auto-upgrade's ten-minute stale-steal
+ *  window was sized for its own hold -- one `npm install -g` of one package,
+ *  seconds long -- and an unstealable lock there would disable self-upgrade
+ *  forever, so ten minutes is generous for THAT caller. This caller holds the
+ *  same lock across a whole-tree `npm install` plus `npm update` that this
+ *  module's header calls "network and minutes", and on a cold cache or a slow
+ *  link minutes can pass ten of them. A second pane starting inside a live
+ *  refresh would then read the lock as abandoned, steal it, and run a second
+ *  npm into the same tree -- the exact concurrent-install the lock exists to
+ *  prevent. Touching the file every minute keeps the mtime acquireUpgradeLock
+ *  measures inside the window for as long as this process is alive, so only a
+ *  lock whose owner really is gone gets stolen. The timer is unref'd (it must
+ *  never hold the process open) and cleared by the release callback, and a
+ *  failed touch stops the heartbeat rather than logging once a minute. */
 function defaultAcquireLock(dir: string): (() => void) | null {
   if (inUnitTest()) return () => {};
-  return acquireUpgradeLock(dir);
+  const release = acquireUpgradeLock(dir);
+  // Null is "someone else holds it": nothing was taken, so there is nothing to
+  // keep warm. (acquireUpgradeLock's other degraded answer -- a no-op release
+  // for a directory it could not write -- is indistinguishable from a real
+  // take here, and needs no special case: the first touch fails ENOENT and
+  // switches the heartbeat off.)
+  if (release === null) return null;
+  const lockPath = join(dir, UPGRADE_LOCK_NAME);
+  const beat = setInterval(() => {
+    try {
+      const now = new Date();
+      utimesSync(lockPath, now, now);
+    } catch {
+      // Gone (stolen as stale after all, or the tree was cleaned up) or not
+      // writable. Nothing to keep alive; stop rather than retry every minute.
+      clearInterval(beat);
+    }
+  }, SIDECAR_LOCK_HEARTBEAT_MS);
+  // Guarded the way settledWithin (server.ts) guards its own: under an embedded
+  // host whose global setInterval is the browser one, there is no unref to call.
+  if (typeof beat.unref === "function") beat.unref();
+  return () => {
+    clearInterval(beat);
+    release();
+  };
 }
 
-/** npm runner for the BACKGROUND refresh: silent, and that is the whole point.
+/** The options the background install runs with. Exported (and pure) so the
+ *  two properties that matter are pinned by a test rather than by a comment:
  *
- *  sidecars-cmd's own defaultRunNpm spawns with `stdio: ["ignore", 2,
- *  "inherit"]` -- npm's stdout routed to fd 2, npm's stderr inherited. That is
- *  right for the CLI, where progress on stderr keeps `--json` on stdout
- *  parseable and a human wants to watch a long install. It is WRONG here:
- *  called from inside `serve`, it sprays "added 220 packages in 12s" and every
- *  npm warning into the MCP server's own stderr, which is the stream the client
- *  reads our diagnostics from. Hence `stdio: "ignore"` and the no-op out/err at
- *  the call site -- the injectable runNpm hook exists for exactly this.
+ *  - `cwd` is the HOME dir, so the install rewrites the shared manifest from
+ *    the USER-GLOBAL bundles.json and never from whatever project the MCP
+ *    client was launched in. It must stay in lockstep with loadSidecarSpecs,
+ *    which plans against the same scope: a plan computed from one config and
+ *    an install performed from another is a plan that describes nothing.
+ *  - all three output channels are silenced. `out`/`err` default to the
+ *    command's prose on stdout/stderr, which from inside serve would put an
+ *    "Installed:" table in the middle of the MCP stream, and runNpm defaults to
+ *    a child whose own output goes to fd 2 -- which from inside serve is the
+ *    stream the MCP client reads our diagnostics from, sprayed with "added 220
+ *    packages in 12s" and every npm warning.
  *
- *  The rest is defaultRunNpm's shape, and must stay that way: npm on Windows is
- *  a .cmd shim Node refuses to spawn without a shell (post-CVE-2024-27980),
- *  which is safe ONLY because every argument here is a fixed literal and `cwd`
- *  travels as a spawn option rather than in the command line. Do not
- *  interpolate a package name into these args. */
-function silentRunNpm(args: string[], cwd: string): Promise<number> {
-  return new Promise((resolve) => {
-    const isWindows = process.platform === "win32";
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(isWindows ? "npm.cmd" : "npm", args, {
-        cwd,
-        stdio: "ignore",
-        // Not detached, so the install shares yaw-mcp's process group -- see the
-        // KNOWN GAP in the header about what a client-side teardown does to it.
-        detached: false,
-        shell: isWindows,
-      });
-    } catch {
-      // spawn can fail SYNCHRONOUSLY (an option the platform rejects, a cwd
-      // that vanished) rather than emitting 'error'. Same -1 as the error path.
-      resolve(-1);
-      return;
-    }
-    child.on("error", () => resolve(-1));
-    child.on("close", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
-  });
+ *  The runner is sidecars-cmd's defaultRunNpm with the ONE thing this caller
+ *  differs on -- `stdio` -- rather than a second spawn of its own. The rest of
+ *  that shape is security-sensitive: npm on Windows is a .cmd shim Node refuses
+ *  to spawn without a shell (post-CVE-2024-27980), which is safe ONLY because
+ *  every argument is a fixed literal and `cwd` travels as a spawn option rather
+ *  than in the command line. A hand-copied runner is how that condition comes
+ *  to be kept in one place and forgotten in the other. */
+export function backgroundInstallOptions(home: string): SidecarsInstallOptions {
+  return {
+    home,
+    cwd: home,
+    runNpm: (args, cwd) => defaultRunNpm(args, cwd, { stdio: "ignore" }),
+    out: () => {},
+    err: () => {},
+  };
 }
 
 /** Run the refresh in the background and release the lock when it settles.
@@ -387,17 +443,14 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: str
   }
   void (async () => {
     try {
-      const result = await runSidecarsInstall({
-        home,
-        // Silent on all three channels. `out`/`err` default to writing the
-        // command's prose to stdout/stderr, which from inside serve would mean
-        // an "Installed:" table in the middle of the MCP stream.
-        runNpm: silentRunNpm,
-        out: () => {},
-        err: () => {},
-      });
+      const result = await runSidecarsInstall(backgroundInstallOptions(home));
       if (result.exitCode === 0) {
-        log("info", "yaw-mcp sidecar refresh complete; restart your MCP client to spawn the new versions", {
+        // NOT "restart your MCP client": this writes into the very tree this
+        // process re-spawns servers from, so the next ACTIVATION of a refreshed
+        // server -- which the idle reaper makes a routine mid-session event --
+        // already picks up the new version. Only a server that is loaded right
+        // now keeps the copy it started on, until it is next re-spawned.
+        log("info", "yaw-mcp sidecar refresh complete; the next activation of each server spawns the new version", {
           refreshed: stale.map((s) => s.pkg),
           installed: result.installed.map((i) => `${i.pkg}@${i.version ?? "?"}`),
         });
@@ -416,20 +469,63 @@ function defaultSpawnRefresh(stale: SidecarSpec[], onDone: () => void, home: str
   })();
 }
 
-/** Read the throttle state. Fail-open: an absent, unreadable or corrupt file
- *  reads as null, i.e. "never checked", so the worst case is one extra check --
- *  never a suppressed feature. */
+/**
+ * The state file's contents, validated. Null means "there is no usable state
+ * here" -- which reads as "never checked" (fail-open), so the worst case is one
+ * extra check, never a suppressed feature.
+ *
+ * PURE, and separate from the read it is fed by, because this is where all the
+ * judgement lives: corrupt JSON, a document that is not an object, a stamp that
+ * is not a number, NaN / Infinity, a negative stamp, and the forward-compat
+ * rule below. The I/O wrapper around it is short-circuited under VITEST (see
+ * inUnitTest), so anything left inside that wrapper is untestable by
+ * construction -- which is exactly what this split exists to undo.
+ *
+ * Foreign keys are PRESERVED. A newer build that adds a second key to
+ * SidecarRefreshState must be able to write it, run this (older) build once,
+ * and still find it: the state is read-modify-written, and a read that rebuilt
+ * a fresh object from the one key it knows would quietly drop the rest on the
+ * next write. Only `lastSidecarRefreshCheck` is normalized; everything else
+ * rides through untouched and unread.
+ */
+export function parseSidecarRefreshState(text: string): SidecarRefreshState | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  // `null` is typeof "object"; an ARRAY is too, and spreading one below would
+  // turn its indices into state keys that then get written back out as
+  // `{"0": ...}`. Neither is a state document.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const { lastSidecarRefreshCheck: at, ...rest } = parsed as Record<string, unknown>;
+  // A non-finite / negative timestamp is a hand-edited or corrupt file. Drop
+  // the VALUE rather than the whole document: NaN fails every comparison
+  // silently, and "never checked" is the honest reading of a broken stamp --
+  // while any OTHER key in the file is still someone's data.
+  if (typeof at !== "number" || !Number.isFinite(at) || at < 0) return rest;
+  return { ...rest, lastSidecarRefreshCheck: at };
+}
+
+/** The read-modify-write, as a pure function: what was on disk, with the patch
+ *  applied over it. Split out for the same reason as the parse -- it is the
+ *  half that either honours or drops a newer build's key, and it is one line
+ *  that nothing could otherwise reach under VITEST. */
+export function mergeSidecarRefreshState(
+  prev: SidecarRefreshState | null,
+  patch: SidecarRefreshStatePatch,
+): SidecarRefreshState {
+  return { ...(prev ?? {}), ...patch };
+}
+
+/** Read the throttle state. A thin wrapper over parseSidecarRefreshState: an
+ *  absent or unreadable file is the same null the parse returns for a corrupt
+ *  one. */
 function defaultReadState(home: string): SidecarRefreshState | null {
   if (inUnitTest()) return null;
   try {
-    const parsed = JSON.parse(readFileSync(sidecarRefreshStatePath(home), "utf8")) as unknown;
-    if (!parsed || typeof parsed !== "object") return null;
-    const at = (parsed as SidecarRefreshState).lastSidecarRefreshCheck;
-    // A non-finite / negative timestamp is a hand-edited or corrupt file. Drop
-    // the VALUE rather than the whole read: NaN fails every comparison
-    // silently, and "never checked" is the honest reading of a broken stamp.
-    if (typeof at !== "number" || !Number.isFinite(at) || at < 0) return {};
-    return { lastSidecarRefreshCheck: at };
+    return parseSidecarRefreshState(readFileSync(sidecarRefreshStatePath(home), "utf8"));
   } catch {
     return null;
   }
@@ -445,7 +541,7 @@ function defaultWriteState(home: string, patch: SidecarRefreshStatePatch): void 
   if (inUnitTest()) return;
   try {
     const path = sidecarRefreshStatePath(home);
-    const next = { ...(defaultReadState(home) ?? {}), ...patch };
+    const next = mergeSidecarRefreshState(defaultReadState(home), patch);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
   } catch (err) {
@@ -455,22 +551,48 @@ function defaultWriteState(home: string, patch: SidecarRefreshStatePatch): void 
   }
 }
 
-/** The configured sidecar specs, from the same loader `sidecars install` uses
- *  so the plan is computed against the manifest the refresh will actually
- *  write. A load failure yields no specs, which is a clean no-op. */
-async function defaultSpecs(home: string): Promise<SidecarSpec[]> {
-  // Gated like every other default. loadLocalBundles walks the real cwd AND
-  // the real home for bundles.json, so an ungated call made a test's result
-  // depend on the developer's own config -- observably: running this module's
-  // suite logged "Skipping an untrusted .yaw-mcp/ dir outside $HOME" naming a
-  // real path. No specs is the same clean no-op the catch below produces.
-  if (inUnitTest()) return [];
+/** Just the slice of loadLocalBundles this module uses. Narrow on purpose: the
+ *  real loader satisfies it, and a test can hand over a two-line fake instead of
+ *  building out LoadLocalBundlesResult's other eight fields. */
+type BundlesLoader = (opts: { cwd?: string; home?: string }) => Promise<{
+  config: { servers?: Array<Partial<UpstreamServerConfig>> } | null;
+}>;
+
+/**
+ * The configured sidecar specs, from the same loader `sidecars install` uses so
+ * the plan is computed against the manifest the refresh will actually write.
+ * A load failure yields no specs, which is a clean no-op.
+ *
+ * `cwd` is the HOME dir, NOT process.cwd(), and that is the whole point of this
+ * function existing separately from its gated caller. findProjectConfigDir
+ * stops just before $HOME when the walk starts there, so passing home as the
+ * cwd resolves to "user-global bundles.json only" -- see the header's WHICH
+ * CONFIG IT ACTS ON. It must agree with backgroundInstallOptions, which forces
+ * the same scope on the install; that pairing is what keeps the plan honest
+ * about what gets written.
+ *
+ * The loader is injectable purely so that pairing is testable: every default in
+ * this module is short-circuited under VITEST, so without a seam nothing could
+ * observe which config scope the real path asks for.
+ */
+export async function loadSidecarSpecs(home: string, load: BundlesLoader = loadLocalBundles): Promise<SidecarSpec[]> {
   try {
-    const bundles = await loadLocalBundles({ home });
+    const bundles = await load({ cwd: home, home });
     return collectSidecarSpecs(bundles.config?.servers ?? []);
   } catch {
     return [];
   }
+}
+
+/** `loadSidecarSpecs`, gated. loadLocalBundles reads the real home (and, but
+ *  for the cwd above, would walk the real cwd) for bundles.json, so an ungated
+ *  call made a test's result depend on the developer's own config --
+ *  observably: running this module's suite logged "Skipping an untrusted
+ *  .yaw-mcp/ dir outside $HOME" naming a real path. No specs is the same clean
+ *  no-op loadSidecarSpecs' own catch produces. */
+async function defaultSpecs(home: string): Promise<SidecarSpec[]> {
+  if (inUnitTest()) return [];
+  return loadSidecarSpecs(home);
 }
 
 /** `hasManagedSidecars`, gated. One existsSync against the real
@@ -493,16 +615,35 @@ function defaultInstalledVersion(pkg: string, home: string): string | null {
 }
 
 /**
+ * Is the background refresh switched off? `YAW_MCP_SIDECAR_REFRESH=0` or
+ * `=false`, case-insensitively -- the same parse auto-upgrade uses for
+ * YAW_MCP_AUTO_UPGRADE, so one habit ("=0 or =false turns it off") covers both
+ * background features.
+ *
+ * Exported because this module is not the only place that has to answer the
+ * question: doctor-cmd re-derives it to decide whether to describe a stale
+ * package as one the refresher will carry forward (saying so on a machine where
+ * the user turned the refresher off is simply false, to exactly the reader who
+ * most needs to be told to run `sidecars install` by hand). That copy, and
+ * auto-upgrade's for its own variable, should call this rather than re-spelling
+ * the parse -- three hand-copies each carrying a comment promising to match the
+ * others is how "=FALSE" ends up honoured by two of them and not the third.
+ * `env` is a parameter for doctor's sake: it takes the environment as input.
+ */
+export function isSidecarRefreshDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.YAW_MCP_SIDECAR_REFRESH;
+  return raw === "0" || raw?.toLowerCase() === "false";
+}
+
+/**
  * Fire-and-forget startup sidecar refresh check. Resolves once the check
  * completes; callers must NOT await it on the serve hot path, and it never
  * rejects -- every failure inside is absorbed to a no-op.
  */
 export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promise<void> {
   try {
-    // 1. Opt-out, before anything else -- same parse as auto-upgrade's, so one
-    // habit ("=0 or =false turns it off") covers both background features.
-    const optOut = process.env.YAW_MCP_SIDECAR_REFRESH;
-    if (optOut === "0" || optOut?.toLowerCase() === "false") return;
+    // 1. Opt-out, before anything else.
+    if (isSidecarRefreshDisabled()) return;
 
     const home = deps.home ?? homedir();
     const now = (deps.nowImpl ?? Date.now)();

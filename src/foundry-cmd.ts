@@ -30,9 +30,14 @@ import {
 } from "./foundry-corpus.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
+import { loadState, statePath } from "./persistence.js";
 import type { RankableServer } from "./relevance.js";
 
-const DEFAULT_OUT = path.join("src", "tests", "fixtures", "foundry-corpus.json");
+/** Default corpus destination. Exported because three files independently
+ *  depend on this exact path -- the parser's default, the usage text, and the
+ *  routing gate that loads the fixture -- so a change here has to move all of
+ *  them together instead of silently un-gating routing. */
+export const DEFAULT_OUT = path.join("src", "tests", "fixtures", "foundry-corpus.json");
 
 export interface ParsedFoundryArgs {
   action: "export";
@@ -51,16 +56,21 @@ export const FOUNDRY_USAGE = `Usage: yaw-mcp foundry export [--out <path>] [--ca
   --cap <n>      Max entries, stratified by chosen server (default: ${DEFAULT_CORPUS_CAP}).
   --json         Emit a machine-readable summary instead of text.`;
 
+// `help: true` is the ONLY signal that `error` carries the usage text rather
+// than a real argv complaint. index.ts used to recover that by comparing
+// `error === FOUNDRY_USAGE`, which quietly re-classified `foundry --help` as a
+// usage ERROR (stderr, exit 2) the moment any site appended so much as a
+// newline to the help body. Branch on the flag, never on string identity.
 export function parseFoundryArgs(
   argv: string[],
-): { ok: true; options: ParsedFoundryArgs } | { ok: false; error: string } {
+): { ok: true; options: ParsedFoundryArgs } | { ok: false; error: string; help?: boolean } {
   let action: "export" | undefined;
   let out = DEFAULT_OUT;
   let cap = DEFAULT_CORPUS_CAP;
   let json = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--help" || a === "-h") return { ok: false, error: FOUNDRY_USAGE };
+    if (a === "--help" || a === "-h") return { ok: false, error: FOUNDRY_USAGE, help: true };
     if (a === "--json") {
       json = true;
     } else if (a === "--out") {
@@ -91,6 +101,10 @@ export interface FoundryExportOptions {
   cap: number;
   json: boolean;
   home?: string;
+  /** Directory both the bundles.json lookup and a RELATIVE `out` resolve
+   *  against. Defaults to process.cwd(); `out` used to resolve against
+   *  process.cwd() unconditionally, so this knob moved the catalog lookup
+   *  without moving the file it produced. */
   cwd?: string;
   // Test hooks: inject the harvested blob + server catalog to bypass fs/bundles.
   readTraces?: () => string | null;
@@ -99,13 +113,32 @@ export interface FoundryExportOptions {
   writeErr?: (s: string) => void;
 }
 
-async function defaultLoadServers(cwd: string | undefined, home: string): Promise<RankableServer[]> {
+// The production catalog snapshot. Exported for tests: every runFoundryExport
+// test injects `loadServers`, so this -- the path a maintainer actually runs --
+// had no coverage at all, which is how the empty-tools snapshot the hydration
+// below fixes went unnoticed.
+export async function defaultLoadServers(cwd: string | undefined, home: string): Promise<RankableServer[]> {
   const { config } = await loadLocalBundles({ cwd, home });
+  // Hydrate the PERSISTED tool cache, mirroring ConnectServer.rankableFor.
+  // bundles.json's loader does not carry `toolCache` through its field
+  // whitelist, so a snapshot built from the config alone gives every server
+  // `tools: []` -- and FIELD_WEIGHTS (relevance.ts) scores toolName at 2.0
+  // (tied with namespace) and toolDescription at 1.0, while `description` is
+  // absent on most entries. Without this the corpus replays the BM25 floor
+  // against a catalog missing its two heaviest fields, i.e. NOT the catalog
+  // that produced `chosen`, which is the corpus's whole premise.
+  //
+  // state.json is keyed by namespace, and loadState drops entries older than
+  // TOOLCACHE_TTL_MS on the way in -- so a renamed server, or a stale state
+  // file, still snapshots empty. runFoundryExport counts the tool-less
+  // servers so that is visible instead of silent. `s.toolCache` stays as the
+  // fallback in case a future bundles.json does carry the field.
+  const state = await loadState(statePath(userConfigDir(home)));
   return (config?.servers ?? []).map((s) => ({
     namespace: s.namespace,
     name: s.name,
     description: s.description,
-    tools: s.toolCache ?? [],
+    tools: state.toolCache[s.namespace]?.tools ?? s.toolCache ?? [],
   }));
 }
 
@@ -160,13 +193,26 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     return { exitCode: 1, lines };
   }
 
-  mkdirSync(path.dirname(path.resolve(opts.out)), { recursive: true });
+  // A snapshot server with no tools is indexed on name+namespace only, so any
+  // intent phrased in tool vocabulary ("create issue") scores near zero
+  // against it and drags the measured floor down for reasons that have
+  // nothing to do with the ranker. Say so rather than letting the maintainer
+  // read it as a bad corpus.
+  const toolless = servers.filter((s) => s.tools.length === 0).length;
+  if (toolless > 0) {
+    printErr(
+      `yaw-mcp foundry: warning -- ${toolless}/${servers.length} snapshot servers carry no tools (no entry in ~/.yaw-mcp/state.json, or it aged past the tool-cache TTL). Those rank on name + namespace only, which depresses the accuracy printed below; activate them once and re-export.`,
+    );
+  }
+
+  const outPath = path.resolve(opts.cwd ?? process.cwd(), opts.out);
+  mkdirSync(path.dirname(outPath), { recursive: true });
   // Indent 2 for a reviewable diff when the fixture is committed. Verified
   // against biome 2.4.16: `biome check` WOULD reformat this (it collapses the
   // short `tokens` arrays onto one line), which would red the lint gate the
   // moment a real corpus lands under src/. biome.json therefore excludes
   // src/tests/fixtures/*.json -- keep the two in step if either moves.
-  writeFileSync(opts.out, `${JSON.stringify(corpus, null, 2)}\n`, "utf8");
+  writeFileSync(outPath, `${JSON.stringify(corpus, null, 2)}\n`, "utf8");
 
   const score = scoreCorpus(corpus);
   // The routing gate (foundry-routing.test.ts) fails when top-3 is below
@@ -178,9 +224,10 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     print(
       JSON.stringify(
         {
-          out: opts.out,
+          out: outPath,
           entries: corpus.entries.length,
           servers: corpus.servers.length,
+          toollessServers: toolless,
           fromTraces: traces.length,
           top1: score.top1,
           top3: score.top3,
@@ -194,7 +241,7 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     return { exitCode: 0, lines };
   }
 
-  print(`Wrote ${corpus.entries.length} entries (from ${traces.length} traces) to ${opts.out}`);
+  print(`Wrote ${corpus.entries.length} entries (from ${traces.length} traces) to ${outPath}`);
   print(
     `BM25-floor accuracy on this corpus: top-1 ${(score.top1 * 100).toFixed(1)}%, top-3 ${(score.top3 * 100).toFixed(1)}%`,
   );

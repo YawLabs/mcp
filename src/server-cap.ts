@@ -35,10 +35,14 @@ export interface LoadedSlot {
   idleCount: number;
 }
 
-export interface CapDecision {
-  allow: boolean;
-  message?: string;
-}
+// A discriminated union, not `{ allow: boolean; message?: string }`: the
+// refusal text is present exactly when `allow` is false, and encoding that in
+// the type is what makes the callers' `capDecision.message ?? "<fallback>"`
+// unnecessary. With the optional-property shape every caller had to carry a
+// fallback string that could never run -- and would quietly stand in for the
+// real message if a future edit dropped it, turning a regression into a
+// vaguer error instead of a red typecheck.
+export type CapDecision = { allow: true } | { allow: false; message: string };
 
 // Decide whether to permit activating `namespace` given the set of
 // currently-loaded slots and the cap. Returns a helpful error message
@@ -50,7 +54,16 @@ export interface CapDecision {
 // thing to drop, followed by read_tool as a zero-activation fallback.
 export function evaluateServerCap(namespace: string, loaded: LoadedSlot[], cap: number): CapDecision {
   if (cap === 0) return { allow: true }; // disabled
-  if (loaded.some((s) => s.namespace === namespace)) return { allow: true }; // already counts
+  // Self-allowance: the candidate already occupies one of the slots the
+  // CALLER passed in, so admitting it costs nothing. It covers exactly what
+  // is in `loaded` and nothing else -- server.ts's evaluateCapFor puts the
+  // candidate's own error-state connection in the list (an auto-reconnect
+  // rides the slot it already holds) but deliberately filters the
+  // candidate's own pending reservation OUT before calling. So a re-entrant
+  // activation of a namespace that is only mid-flight gets no exemption
+  // here; the post-elicitation retry stays unblocked because it passes
+  // skipCap, not because of this line.
+  if (loaded.some((s) => s.namespace === namespace)) return { allow: true };
   if (loaded.length < cap) return { allow: true };
 
   const sorted = [...loaded].sort((a, b) => {

@@ -116,22 +116,34 @@ export function bundleActivateHint(bundle: CuratedBundle): string {
 }
 
 /**
- * Rank partial-match bundles for an inline "complete this stack" nudge.
- * Primary sort: fewest missing namespaces first (the cheapest install to
- * unlock a curated bundle). Tie-break: more already-installed namespaces
- * first (most momentum), then bundle id alphabetical for stability.
+ * The one ranking order for partial-match bundles. Primary sort: fewest
+ * missing namespaces first (the cheapest install to unlock a curated bundle).
+ * Tie-break: more already-installed namespaces first (most momentum), then
+ * bundle id alphabetical for stability.
+ *
+ * Exported because TWO surfaces present this list -- the inline discover nudge
+ * (topPartialBundles below) and `yaw-mcp bundles match` (bundles-cmd.ts
+ * renderMatch) -- and a user who sees them disagree reads it as a bug. The
+ * CLI re-implemented this comparator inline, so a tie-break tweak here would
+ * silently desync the two; both now sort through this function.
+ */
+export function comparePartialBundles(
+  a: BundleMatchResult["partial"][number],
+  b: BundleMatchResult["partial"][number],
+): number {
+  if (a.missing.length !== b.missing.length) return a.missing.length - b.missing.length;
+  if (a.have.length !== b.have.length) return b.have.length - a.have.length;
+  return a.bundle.id.localeCompare(b.bundle.id);
+}
+
+/**
+ * Rank partial-match bundles for an inline "complete this stack" nudge, using
+ * the shared comparePartialBundles order.
  *
  * Returns at most `limit` bundles. Empty array if nothing matches.
  */
 export function topPartialBundles(installedNamespaces: Iterable<string>, limit: number): BundleMatchResult["partial"] {
   if (limit <= 0) return [];
   const { partial } = matchBundles(installedNamespaces);
-  return partial
-    .slice()
-    .sort((a, b) => {
-      if (a.missing.length !== b.missing.length) return a.missing.length - b.missing.length;
-      if (a.have.length !== b.have.length) return b.have.length - a.have.length;
-      return a.bundle.id.localeCompare(b.bundle.id);
-    })
-    .slice(0, limit);
+  return partial.slice().sort(comparePartialBundles).slice(0, limit);
 }

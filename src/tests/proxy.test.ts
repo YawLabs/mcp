@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { META_TOOLS } from "../meta-tools.js";
 import {
   type BuiltinResource,
@@ -8,10 +8,12 @@ import {
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  isRoutingFaultResult,
   type PromptRoute,
   type ResourceRoute,
   routePromptGet,
   routeResourceRead,
+  routeToolCall,
 } from "../proxy.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 
@@ -56,6 +58,39 @@ function makeConnection(
     health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
     status: "connected",
   } as UpstreamConnection;
+}
+
+/** Run `fn` with process.stderr.write captured, returning every line the
+ *  logger wrote alongside whatever `fn` returned. The real writer is restored
+ *  even when `fn` throws.
+ *
+ *  Assertions belong AFTER the call, not inside `fn`: a failing expect while
+ *  stderr is monkey-patched swallows the diff vitest would otherwise print.
+ *  Pair it with a pinned LOG_LEVEL -- log() consults the env var per call, so
+ *  an ambient LOG_LEVEL=error makes a "warns" assertion fail and a "does NOT
+ *  warn" assertion pass for the wrong reason. */
+function withCapturedStderr<T>(fn: () => T): { writes: string[]; value: T } {
+  const writes: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  };
+  try {
+    return { writes, value: fn() };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+/** Pin LOG_LEVEL for a describe whose assertions read captured stderr. */
+function pinLogLevel(): void {
+  beforeEach(() => {
+    vi.stubEnv("LOG_LEVEL", "warn");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
 }
 
 describe("buildToolList", () => {
@@ -157,6 +192,33 @@ describe("buildToolList — deferred tools from inactive-but-cached servers", ()
     expect(ghTools[0].inputSchema).toEqual({ type: "object" });
   });
 
+  it("stands the activation note alone when the cached tool has no description", () => {
+    // The other half of deferredDescription: with nothing to prepend, the
+    // note must be the WHOLE description -- not "undefined\n\n[note]", and
+    // not a leading blank line. A whitespace-only cached description takes
+    // the same path (the `.trim()` is what makes it falsy).
+    const bare = buildToolList(new Map(), [makeInactiveServer("gh", [{ name: "create_issue" }])]);
+    const bareEntry = bare.find((t) => t.name === "gh_create_issue");
+    expect(bareEntry?.description).toBe('[yaw-mcp: server "gh" not yet connected — first call activates it]');
+
+    const blank = buildToolList(new Map(), [makeInactiveServer("gh", [{ name: "create_issue", description: "  " }])]);
+    expect(blank.find((t) => t.name === "gh_create_issue")?.description).toBe(bareEntry?.description);
+  });
+
+  it("emits ONE entry when two INACTIVE servers flatten to the same name", () => {
+    // buildToolRoutes warns about this pair and keeps the first cached
+    // server; the LIST has to agree, or the client is shown a placeholder
+    // belonging to a namespace dispatch will never reach.
+    const tools = buildToolList(new Map(), [
+      makeInactiveServer("gh", [{ name: "actions_list", description: "first-cached" }]),
+      makeInactiveServer("gh_actions", [{ name: "list", description: "second-cached" }]),
+    ]);
+    const collided = tools.filter((t) => t.name === "gh_actions_list");
+    expect(collided).toHaveLength(1);
+    expect(collided[0].description).toContain("first-cached");
+    expect(collided[0].description).not.toContain("second-cached");
+  });
+
   it("skips inactive servers whose toolCache is missing or empty", () => {
     const connections = new Map<string, UpstreamConnection>();
     const inactive: UpstreamServerConfig[] = [
@@ -226,6 +288,8 @@ describe("buildToolList — cross-namespace name collisions", () => {
 });
 
 describe("buildToolRoutes — deferred routes", () => {
+  pinLogLevel();
+
   it("marks deferred: true for routes generated from toolCache", () => {
     const connections = new Map<string, UpstreamConnection>();
     const inactive = [makeInactiveServer("gh", [{ name: "create_issue" }])];
@@ -253,117 +317,86 @@ describe("buildToolRoutes — deferred routes", () => {
     // First cached server wins; the loser's tool is unreachable until an
     // operator renames a namespace, so the collision must not be silent.
     // (The active-vs-deferred case above is intended shadowing -- no warn.)
-    const writes: string[] = [];
-    const original = process.stderr.write.bind(process.stderr);
-    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
-      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-      return true;
-    };
-    try {
-      const routes = buildToolRoutes(new Map(), [
+    const { writes, value: routes } = withCapturedStderr(() =>
+      buildToolRoutes(new Map(), [
         makeInactiveServer("gh", [{ name: "actions_list" }]),
         makeInactiveServer("gh_actions", [{ name: "list" }]),
-      ]);
-      // First writer wins.
-      expect(routes.get("gh_actions_list")).toEqual({
-        namespace: "gh",
-        originalName: "actions_list",
-        deferred: true,
-      });
-      expect(writes.some((w) => w.includes("Deferred tool route collision"))).toBe(true);
-    } finally {
-      process.stderr.write = original;
-    }
+      ]),
+    );
+    // First writer wins.
+    expect(routes.get("gh_actions_list")).toEqual({
+      namespace: "gh",
+      originalName: "actions_list",
+      deferred: true,
+    });
+    expect(writes.some((w) => w.includes("Deferred tool route collision"))).toBe(true);
   });
 
   it("does NOT warn when an active route shadows a deferred one", () => {
-    const writes: string[] = [];
-    const original = process.stderr.write.bind(process.stderr);
-    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
-      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-      return true;
-    };
-    try {
-      const connections = new Map<string, UpstreamConnection>();
-      connections.set("gh", makeConnection("gh", ["actions_list"]));
-      buildToolRoutes(connections, [makeInactiveServer("gh_actions", [{ name: "list" }])]);
-      expect(writes.some((w) => w.includes("collision"))).toBe(false);
-    } finally {
-      process.stderr.write = original;
-    }
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["actions_list"]));
+    const { writes } = withCapturedStderr(() =>
+      buildToolRoutes(connections, [makeInactiveServer("gh_actions", [{ name: "list" }])]),
+    );
+    expect(writes.some((w) => w.includes("collision"))).toBe(false);
   });
 });
 
 describe("buildToolRoutes — active-vs-active collisions", () => {
+  pinLogLevel();
+
   it("warns when two LIVE upstreams flatten to the same namespaced name", () => {
     // (ns=`gh`, tool=`actions_list`) and (ns=`gh_actions`, tool=`list`) both
     // render `gh_actions_list`. This used to be silent, so an operator had no
     // way to know one upstream's tool had become unreachable.
-    const writes: string[] = [];
-    const original = process.stderr.write.bind(process.stderr);
-    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
-      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-      return true;
-    };
-    try {
-      const connections = new Map<string, UpstreamConnection>();
-      connections.set("gh", makeConnection("gh", ["actions_list"]));
-      connections.set("gh_actions", makeConnection("gh_actions", ["list"]));
-      const routes = buildToolRoutes(connections);
-      const warning = writes.find((w) => w.includes("Tool route collision"));
-      expect(warning).toBeDefined();
-      // Both sides are named so the operator knows which namespace to rename.
-      expect(warning).toContain("gh_actions_list");
-      expect(warning).toContain("gh_actions");
-      // FIRST writer wins, and it must be the SAME winner buildToolList
-      // picks. Regression guard: routes used to be last-writer-wins while
-      // buildToolList's `seen` guard is first-writer-wins, so a collision
-      // meant the model was shown `gh`'s description + inputSchema while a
-      // call dispatched to `gh_actions` -- schema and execution pointing at
-      // two different upstreams, with a later-activated server able to
-      // capture an earlier one's traffic.
-      expect(routes.get("gh_actions_list")).toEqual({ namespace: "gh", originalName: "actions_list" });
-      expect(routes.size).toBe(1);
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["actions_list"]));
+    connections.set("gh_actions", makeConnection("gh_actions", ["list"]));
+    const { writes, value: routes } = withCapturedStderr(() => buildToolRoutes(connections));
+    const warning = writes.find((w) => w.includes("Tool route collision"));
+    expect(warning).toBeDefined();
+    // Both sides are named so the operator knows which namespace to rename.
+    expect(warning).toContain("gh_actions_list");
+    expect(warning).toContain("gh_actions");
+    // FIRST writer wins, and it must be the SAME winner buildToolList
+    // picks. Regression guard: routes used to be last-writer-wins while
+    // buildToolList's `seen` guard is first-writer-wins, so a collision
+    // meant the model was shown `gh`'s description + inputSchema while a
+    // call dispatched to `gh_actions` -- schema and execution pointing at
+    // two different upstreams, with a later-activated server able to
+    // capture an earlier one's traffic.
+    expect(routes.get("gh_actions_list")).toEqual({ namespace: "gh", originalName: "actions_list" });
+    expect(routes.size).toBe(1);
 
-      // Pin the AGREEMENT itself, not just each side's value: whatever
-      // tools/list advertises must be what dispatch resolves to. Tag each
-      // upstream's inputSchema so the advertised entry is attributable --
-      // the two tools are otherwise indistinguishable once flattened.
-      const ghConn = connections.get("gh") as UpstreamConnection;
-      const actionsConn = connections.get("gh_actions") as UpstreamConnection;
-      ghConn.tools[0].inputSchema = { type: "object", properties: { from: { const: "gh" } } };
-      actionsConn.tools[0].inputSchema = { type: "object", properties: { from: { const: "gh_actions" } } };
+    // Pin the AGREEMENT itself, not just each side's value: whatever
+    // tools/list advertises must be what dispatch resolves to. Tag each
+    // upstream's inputSchema so the advertised entry is attributable --
+    // the two tools are otherwise indistinguishable once flattened.
+    const ghConn = connections.get("gh") as UpstreamConnection;
+    const actionsConn = connections.get("gh_actions") as UpstreamConnection;
+    ghConn.tools[0].inputSchema = { type: "object", properties: { from: { const: "gh" } } };
+    actionsConn.tools[0].inputSchema = { type: "object", properties: { from: { const: "gh_actions" } } };
 
-      const advertised = buildToolList(connections);
-      const collided = advertised.filter((t) => t.name === "gh_actions_list");
-      expect(collided).toHaveLength(1);
-      const advertisedFrom = (collided[0].inputSchema as { properties: { from: { const: string } } }).properties.from
-        .const;
-      // Same namespace on both surfaces. Fails if either flips independently.
-      expect(advertisedFrom).toBe("gh");
-      expect(buildToolRoutes(connections).get("gh_actions_list")?.namespace).toBe(advertisedFrom);
-    } finally {
-      process.stderr.write = original;
-    }
+    const advertised = buildToolList(connections);
+    const collided = advertised.filter((t) => t.name === "gh_actions_list");
+    expect(collided).toHaveLength(1);
+    const advertisedFrom = (collided[0].inputSchema as { properties: { from: { const: string } } }).properties.from
+      .const;
+    // Same namespace on both surfaces. Fails if either flips independently.
+    expect(advertisedFrom).toBe("gh");
+    // Captured too: the rebuild warns a second time, and that line is noise
+    // in the run's real stderr, not part of what this test asserts.
+    const { value: rebuilt } = withCapturedStderr(() => buildToolRoutes(connections));
+    expect(rebuilt.get("gh_actions_list")?.namespace).toBe(advertisedFrom);
   });
 
   it("does NOT warn when one connection repeats a namespaced name against itself", () => {
     // Same namespace on both sides is not an operator-fixable collision --
     // there is no second upstream to rename -- so it must stay quiet.
-    const writes: string[] = [];
-    const original = process.stderr.write.bind(process.stderr);
-    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
-      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-      return true;
-    };
-    try {
-      const conn = makeConnection("gh", ["list", "list_dup"]);
-      conn.tools[1].namespacedName = "gh_list";
-      buildToolRoutes(new Map([["gh", conn]]));
-      expect(writes.some((w) => w.includes("collision"))).toBe(false);
-    } finally {
-      process.stderr.write = original;
-    }
+    const conn = makeConnection("gh", ["list", "list_dup"]);
+    conn.tools[1].namespacedName = "gh_list";
+    const { writes } = withCapturedStderr(() => buildToolRoutes(new Map([["gh", conn]])));
+    expect(writes.some((w) => w.includes("collision"))).toBe(false);
   });
 });
 
@@ -381,6 +414,62 @@ describe("buildResourceList / buildResourceRoutes", () => {
     connections.set("db", makeConnection("db", [], ["db://tables"]));
     const routes = buildResourceRoutes(connections);
     expect(routes.get("connect://db/db://tables")).toEqual({ namespace: "db", originalUri: "db://tables" });
+  });
+});
+
+describe("buildResourceList / buildResourceRoutes — duplicate uris", () => {
+  // The resource path used to be the odd one out: no `seen` guard on the list
+  // and last-writer-wins with no warning on the routes, while the tool and
+  // prompt paths suppressed the duplicate and named both sides.
+  pinLogLevel();
+
+  it("emits ONE entry when an upstream lists the same uri twice", () => {
+    const connections = new Map([["db", makeConnection("db", [], ["db://tables", "db://tables"])]]);
+    const list = buildResourceList(connections);
+    expect(list.filter((r) => r.uri === "connect://db/db://tables")).toHaveLength(1);
+  });
+
+  it("does NOT warn when one upstream repeats its own uri", () => {
+    // Nothing an operator could rename, so it must stay quiet -- same rule
+    // the tool and prompt routes follow for a self-collision.
+    const connections = new Map([["db", makeConnection("db", [], ["db://tables", "db://tables"])]]);
+    const { writes, value: routes } = withCapturedStderr(() => buildResourceRoutes(connections));
+    expect(routes.size).toBe(1);
+    expect(writes.some((w) => w.includes("collision"))).toBe(false);
+  });
+
+  it("warns and keeps the FIRST upstream when two namespaces flatten to one uri", () => {
+    // `connect://${namespace}/${uri}` flattens just like the tool and prompt
+    // names do: (ns=`db`, uri=`x/y`) and (ns=`db/x`, uri=`y`) both render
+    // `connect://db/x/y`.
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("db", makeConnection("db", [], ["x/y"]));
+    connections.set("db/x", makeConnection("db/x", [], ["y"]));
+    const { writes, value: routes } = withCapturedStderr(() => buildResourceRoutes(connections));
+    expect(routes.get("connect://db/x/y")).toEqual({ namespace: "db", originalUri: "x/y" });
+    expect(routes.size).toBe(1);
+    const warning = writes.find((w) => w.includes("Resource route collision"));
+    // Both sides named so the operator knows which namespace to rename.
+    // Keyed, not a bare substring: "db/x" also occurs inside the uri.
+    expect(warning).toBeDefined();
+    expect(warning).toContain("connect://db/x/y");
+    expect(warning).toContain('"keptNamespace":"db"');
+    expect(warning).toContain('"ignoredNamespace":"db/x"');
+    // Both surfaces agree on the winner, same contract as tools and prompts.
+    expect(buildResourceList(connections).filter((r) => r.uri === "connect://db/x/y")).toHaveLength(1);
+  });
+
+  it("a builtin uri shadows an upstream that published the same string", () => {
+    // routeResourceRead already serves the builtin for a colliding uri; the
+    // list has to agree, or the client sees the uri twice and can only read
+    // one of them.
+    const conn = makeConnection("ns", [], ["guide"]);
+    conn.resources[0].namespacedUri = "yaw-mcp://guide";
+    conn.resources[0].name = "impostor";
+    const builtin: BuiltinResource = { uri: "yaw-mcp://guide", name: "yaw-mcp guide", read: () => ({ contents: [] }) };
+    const list = buildResourceList(new Map([["ns", conn]]), [builtin]);
+    expect(list.filter((r) => r.uri === "yaw-mcp://guide")).toHaveLength(1);
+    expect(list[0].name).toBe("yaw-mcp guide");
   });
 });
 
@@ -532,7 +621,31 @@ describe("routeResourceRead — upstream routing", () => {
     // The upstream has never heard of yaw-mcp's `connect://` prefix; sending
     // it would look like a request for a resource the server does not have.
     expect(seen).toEqual(["db://tables"]);
-    expect(result.contents).toEqual([{ uri: "db://tables", text: "rows", mimeType: "text/plain" }]);
+    // ...and the reply is re-namespaced on the way back out. The upstream's
+    // raw uri is a string the client cannot read again -- resources/list, the
+    // route table and this function's own error arms all speak the
+    // `connect://<ns>/<uri>` form.
+    expect(result.contents).toEqual([{ uri: "connect://db/db://tables", text: "rows", mimeType: "text/plain" }]);
+    // The guarantee that matters: whatever uri came back is resolvable.
+    expect(buildResourceRoutes(connections).has(result.contents[0].uri)).toBe(true);
+  });
+
+  it("namespaces EVERY returned entry, not just the one the client asked for", async () => {
+    // A read may legitimately answer with several sub-resources, so blindly
+    // rewriting all of them to the requested uri would lose which is which.
+    const conn = connectedWith({
+      readResource: async () => ({
+        contents: [
+          { uri: "db://tables", text: "index" },
+          { uri: "db://tables/users", text: "users" },
+        ],
+      }),
+    });
+    const connections = new Map([["db", conn]]);
+    const result = await routeResourceRead(NAMESPACED, buildResourceRoutes(connections), connections);
+    expect(result.contents.map((c) => c.uri)).toEqual(["connect://db/db://tables", "connect://db/db://tables/users"]);
+    // Bodies ride through untouched -- only the uri is rewritten.
+    expect(result.contents.map((c) => c.text)).toEqual(["index", "users"]);
   });
 
   it("does not fuzzy-match: a near-miss uri is Unknown even with a populated route table", async () => {
@@ -607,6 +720,8 @@ describe("buildPromptList / buildPromptRoutes — cross-namespace name collision
   // (ns=`gh`, prompt=`review_pr`) and (ns=`gh_review`, prompt=`pr`) both
   // render `gh_review_pr`. Underscore-bearing namespaces are real in this
   // product (e.g. `mcp_hosting`), so this is reachable, not theoretical.
+  pinLogLevel();
+
   function collidingConnections(): Map<string, UpstreamConnection> {
     const connections = new Map<string, UpstreamConnection>();
     connections.set("gh", makeConnection("gh", [], [], ["review_pr"]));
@@ -621,61 +736,44 @@ describe("buildPromptList / buildPromptRoutes — cross-namespace name collision
   });
 
   it("warns and keeps the FIRST upstream, and both surfaces agree on it", () => {
-    const writes: string[] = [];
-    const original = process.stderr.write.bind(process.stderr);
-    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
-      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-      return true;
-    };
-    try {
-      const connections = collidingConnections();
-      const routes = buildPromptRoutes(connections);
-      const warning = writes.find((w) => w.includes("Prompt route collision"));
-      // Silent before: an operator had no way to know one upstream's prompt
-      // had become unreachable. Both sides are named so they know which
-      // namespace to rename.
-      expect(warning).toBeDefined();
-      expect(warning).toContain("gh_review_pr");
-      expect(warning).toContain("gh_review");
+    const connections = collidingConnections();
+    const { writes, value: routes } = withCapturedStderr(() => buildPromptRoutes(connections));
+    const warning = writes.find((w) => w.includes("Prompt route collision"));
+    // Silent before: an operator had no way to know one upstream's prompt
+    // had become unreachable. Both sides are named so they know which
+    // namespace to rename.
+    expect(warning).toBeDefined();
+    expect(warning).toContain("gh_review_pr");
+    expect(warning).toContain("gh_review");
 
-      // FIRST writer wins, matching buildPromptList's `seen` guard. Routes
-      // used to be last-writer-wins, so a collision meant the client picked
-      // the prompt it saw from `gh` and prompts/get executed `gh_review`'s --
-      // and a later-activated server could capture an earlier one's traffic.
-      expect(routes.get("gh_review_pr")).toEqual({ namespace: "gh", originalName: "review_pr" });
-      expect(routes.size).toBe(1);
+    // FIRST writer wins, matching buildPromptList's `seen` guard. Routes
+    // used to be last-writer-wins, so a collision meant the client picked
+    // the prompt it saw from `gh` and prompts/get executed `gh_review`'s --
+    // and a later-activated server could capture an earlier one's traffic.
+    expect(routes.get("gh_review_pr")).toEqual({ namespace: "gh", originalName: "review_pr" });
+    expect(routes.size).toBe(1);
 
-      // Pin the AGREEMENT itself, not just each side's value. Tag each
-      // upstream's description so the advertised entry is attributable --
-      // the two prompts are otherwise indistinguishable once flattened.
-      (connections.get("gh") as UpstreamConnection).prompts[0].description = "from gh";
-      (connections.get("gh_review") as UpstreamConnection).prompts[0].description = "from gh_review";
+    // Pin the AGREEMENT itself, not just each side's value. Tag each
+    // upstream's description so the advertised entry is attributable --
+    // the two prompts are otherwise indistinguishable once flattened.
+    (connections.get("gh") as UpstreamConnection).prompts[0].description = "from gh";
+    (connections.get("gh_review") as UpstreamConnection).prompts[0].description = "from gh_review";
 
-      const advertised = buildPromptList(connections).filter((p) => p.name === "gh_review_pr");
-      expect(advertised).toHaveLength(1);
-      expect(advertised[0].description).toBe("from gh");
-      expect(buildPromptRoutes(connections).get("gh_review_pr")?.namespace).toBe("gh");
-    } finally {
-      process.stderr.write = original;
-    }
+    const advertised = buildPromptList(connections).filter((p) => p.name === "gh_review_pr");
+    expect(advertised).toHaveLength(1);
+    expect(advertised[0].description).toBe("from gh");
+    // Captured too: the rebuild warns again, and that line is noise in the
+    // run's real stderr rather than part of what this test asserts.
+    const { value: rebuilt } = withCapturedStderr(() => buildPromptRoutes(connections));
+    expect(rebuilt.get("gh_review_pr")?.namespace).toBe("gh");
   });
 
   it("does NOT warn when one connection repeats a namespaced prompt name against itself", () => {
     // No second upstream to rename, so there is nothing an operator could fix.
-    const writes: string[] = [];
-    const original = process.stderr.write.bind(process.stderr);
-    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
-      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-      return true;
-    };
-    try {
-      const conn = makeConnection("gh", [], [], ["review_pr", "review_pr_dup"]);
-      conn.prompts[1].namespacedName = "gh_review_pr";
-      buildPromptRoutes(new Map([["gh", conn]]));
-      expect(writes.some((w) => w.includes("collision"))).toBe(false);
-    } finally {
-      process.stderr.write = original;
-    }
+    const conn = makeConnection("gh", [], [], ["review_pr", "review_pr_dup"]);
+    conn.prompts[1].namespacedName = "gh_review_pr";
+    const { writes } = withCapturedStderr(() => buildPromptRoutes(new Map([["gh", conn]])));
+    expect(writes.some((w) => w.includes("collision"))).toBe(false);
   });
 });
 
@@ -745,6 +843,152 @@ describe("routePromptGet", () => {
     const connections = new Map([["gh", conn]]);
     const result = await routePromptGet("gh_review_pr", undefined, buildPromptRoutes(connections), connections);
     expect(result.messages[0].content.text).toBe("Error: transport closed");
+  });
+});
+
+describe("routeToolCall — upstream failures", () => {
+  function callableWith(callTool: unknown): UpstreamConnection {
+    const conn = makeConnection("gh", ["create_issue"]);
+    (conn as any).client = { callTool };
+    return conn;
+  }
+
+  it("tags the MCP error code so the model can tell bad args from a dead upstream", async () => {
+    // This is the string error-category.ts's classifier reads and the one the
+    // model sees. It was only ever pinned by a hand-typed literal in another
+    // file, so producer and consumer could drift apart with nothing red.
+    const err = Object.assign(new Error("MCP error -32602: bad args"), { code: -32602 });
+    const connections = new Map([["gh", callableWith(() => Promise.reject(err))]]);
+    const result = await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("[code=-32602]");
+    expect(result.content[0].text).toContain("bad args");
+    expect(result.content[0].text).toContain("gh_create_issue");
+    // NOT a routing fault: the upstream answered, badly. server.ts books it
+    // against that server's health precisely because of this distinction.
+    expect(isRoutingFaultResult(result)).toBe(false);
+  });
+
+  it("omits the tag when the rejection carries no numeric code", async () => {
+    for (const thrown of [new Error("plain failure"), Object.assign(new Error("stringy"), { code: "-32602" })]) {
+      const connections = new Map([["gh", callableWith(() => Promise.reject(thrown))]]);
+      const result = await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections);
+      expect(result.isError).toBe(true);
+      // A string `code` must not render as `[code=-32602]`: the tag promises a
+      // JSON-RPC error code, and the classifier keys on that promise.
+      expect(result.content[0].text).not.toContain("[code=");
+      expect(result.content[0].text).toContain(thrown.message);
+    }
+  });
+
+  it("stringifies a non-Error rejection instead of rendering it as undefined", async () => {
+    const connections = new Map([["gh", callableWith(() => Promise.reject("transport closed"))]]);
+    const result = await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections);
+    expect(result.content[0].text).toBe("Error calling gh_create_issue: transport closed");
+  });
+});
+
+describe("routeToolCall — request options", () => {
+  function recordingConnection(calls: unknown[][]): UpstreamConnection {
+    const conn = makeConnection("gh", ["create_issue"]);
+    (conn as any).client = {
+      callTool: async (...args: unknown[]) => {
+        calls.push(args);
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+    };
+    return conn;
+  }
+
+  it("bounds the call with a timeout passed as the THIRD argument", async () => {
+    const calls: unknown[][] = [];
+    const connections = new Map([["gh", recordingConnection(calls)]]);
+    await routeToolCall("gh_create_issue", { title: "x" }, buildToolRoutes(connections), connections);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toEqual({ name: "create_issue", arguments: { title: "x" } });
+    // Slot 2 is the RESULT SCHEMA. Putting the options object there would
+    // silently replace CallToolResultSchema and take the SDK's
+    // structured-output validation with it.
+    expect(calls[0][1]).toBeUndefined();
+    // The default stays the SDK's own 60s: a longer ceiling holds the
+    // namespace's inflightCalls marker and stalls the model that much longer
+    // on a wedged upstream, so raising it is an operator decision.
+    expect(calls[0][2]).toEqual({ timeout: 60_000 });
+  });
+
+  it("resolves the ceiling from MCP_CALL_TIMEOUT, falling back on junk and on out-of-range", async () => {
+    // Read once at module load, like MCP_LIST_TIMEOUT, so each case needs a
+    // fresh module rather than a plain stubEnv. The parsing contract itself is
+    // pinned on resolveTimeoutEnv (upstream.test.ts); this pins that proxy.ts
+    // is actually wired to it.
+    //
+    // "3e9" and "30s" are what Number.parseInt's PREFIX parsing turned into 3
+    // and 30 -- a millisecond ceiling from a value that reads generous, making
+    // EVERY proxied tools/call return -32001 immediately, and a timeout is not
+    // branded a routing fault, so server.ts books each one against the
+    // upstream's health and error rate. "3000000000" is out of range, and the
+    // 60s default is the right answer there rather than MAX_TIMEOUT_MS: a
+    // clamped ceiling never settles, so the namespace's inflightCalls marker
+    // is never cleared and the namespace stops being deactivatable or
+    // idle-reapable. The last two rows pin the edges of the accepted range.
+    try {
+      for (const [env, expected] of [
+        ["5000", 5000],
+        [" 5000 ", 5000],
+        ["nonsense", 60_000],
+        ["0", 60_000],
+        ["3e9", 60_000],
+        ["30s", 60_000],
+        ["3000000000", 60_000],
+        ["2147483647", 2_147_483_647],
+        ["2147483648", 60_000],
+      ] as const) {
+        vi.stubEnv("MCP_CALL_TIMEOUT", env);
+        vi.resetModules();
+        const fresh = await import("../proxy.js");
+        const calls: unknown[][] = [];
+        const connections = new Map([["gh", recordingConnection(calls)]]);
+        await fresh.routeToolCall("gh_create_issue", {}, fresh.buildToolRoutes(connections), connections);
+        expect(calls[0][2], `MCP_CALL_TIMEOUT=${env}`).toEqual({ timeout: expected });
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
+  it("warns at module load when MCP_CALL_TIMEOUT is rejected", async () => {
+    // The diagnostic has to survive where the value is actually resolved: the
+    // constant is latched in a module-level initialiser, so the only place the
+    // operator can be told their knob was ignored is that import. Captured off
+    // the REAL logger (this file does not stub it) to prove stderr at module
+    // load is a path that works, not just that resolveTimeoutEnv calls log().
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    vi.stubEnv("LOG_LEVEL", "warn");
+    vi.stubEnv("MCP_CALL_TIMEOUT", "3e9");
+    vi.resetModules();
+    (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    try {
+      await import("../proxy.js");
+    } finally {
+      process.stderr.write = original;
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+    const warn = writes.find((w) => w.includes("MCP_CALL_TIMEOUT"));
+    expect(warn).toBeDefined();
+    // The rejected value, the ceiling, and the number actually in effect --
+    // without the last one the operator cannot tell what the call is bounded by.
+    expect(JSON.parse(warn as string)).toMatchObject({
+      level: "warn",
+      value: "3e9",
+      maxMs: 2_147_483_647,
+      usingMs: 60_000,
+    });
   });
 });
 

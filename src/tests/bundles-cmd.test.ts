@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -101,12 +101,35 @@ describe("runBundlesCommand — list", () => {
   });
 
   it("is fully static -- reads no config file at all", async () => {
-    const io = captureIO();
-    // Note: no home/cwd seed. `list` never touches bundles.json, so it can't
-    // emit a load warning or an empty-state hint here.
-    const r = await runBundlesCommand({ action: "list", out: io.push, err: io.pushErr });
-    expect(r.exitCode).toBe(0);
-    expect(io.err).toEqual([]);
+    // Point home AND cwd at a sandbox whose bundles.json and config.json are
+    // both unparseable. `match` on exactly this seed warns "invalid JSON" on
+    // stderr (see the malformed cases below), so a SILENT stderr here is
+    // evidence `list` opened neither file. Asserting an empty stderr against
+    // the developer's real home -- what this test used to do -- proved nothing:
+    // it passed whether or not `list` read config, and would have gone red for
+    // an unrelated reason the day the real ~/.yaw-mcp/bundles.json went bad.
+    const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-list-")));
+    try {
+      mkdirSync(join(sandbox, CONFIG_DIRNAME), { recursive: true });
+      writeFileSync(join(sandbox, CONFIG_DIRNAME, "bundles.json"), "{ not json", "utf8");
+      writeFileSync(join(sandbox, CONFIG_DIRNAME, "config.json"), "{ not json", "utf8");
+      const io = captureIO();
+      const r = await runBundlesCommand({
+        action: "list",
+        home: sandbox,
+        cwd: sandbox,
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(io.err).toEqual([]);
+      expect(r.stderr).toEqual([]);
+      // ...and the catalog still rendered in full, so "no warnings" is not
+      // just "no output".
+      expect(io.out.join("\n")).toContain(`${CURATED_BUNDLES.length} curated bundles`);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 });
 
@@ -125,7 +148,11 @@ describe("runBundlesCommand — match", () => {
     runBundlesCommand({ home, cwd: home, action: "match", ...opts });
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-"));
+    // realpathSync: the loader resolves paths physically and grantTrust keys on
+    // the real path, so where tmpdir() is a symlink (macOS /var -> /private/var)
+    // a raw mkdtemp path makes the trust grant miss and the project file read as
+    // untrusted. Same convention as config-loader.test.ts / paths.test.ts.
+    home = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-bundles-")));
     mkdirSync(join(home, CONFIG_DIRNAME), { recursive: true });
   });
 

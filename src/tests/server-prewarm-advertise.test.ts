@@ -75,12 +75,20 @@ let priv: any;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Pin discover's auto-warm gate ON. It defaults on, but a `0`/`false` in
+  // YAW_MCP_AUTO_ACTIVATE is a documented ops opt-out, and an ambient shell
+  // carrying one would silently downgrade the auto-warm case below to a plain
+  // handleDiscover -- which still returns discover content, so the run would
+  // read green rather than red. isAutoActivateEnabled() re-reads the env per
+  // call, so stubbing here covers every case in the file.
+  vi.stubEnv("YAW_MCP_AUTO_ACTIVATE", "1");
   server = new ConnectServer();
   priv = getPrivate(server);
 });
 
 afterEach(async () => {
   await server.shutdown();
+  vi.unstubAllEnvs();
 });
 
 describe("prewarmDormantServers -- teardown safety", () => {
@@ -94,9 +102,18 @@ describe("prewarmDormantServers -- teardown safety", () => {
     priv.connections.set("gh", live);
     priv.toolCache.set("gh", [{ name: "create_issue" }]);
     priv.toolCacheLearnedAt.set("gh", EIGHT_DAYS_AGO());
+    const activate = vi.spyOn(priv, "activateOne");
 
     await priv.prewarmDormantServers();
 
+    // The load-bearing assertion: prewarm never even ATTEMPTS an activation,
+    // because the connected-check excluded "gh" from the dormant list itself.
+    // The three below cannot carry this test on their own -- delete the
+    // connected-check and the sibling isChanged gate produces the identical
+    // observable outcome (claim taken, already-connected early return, claim
+    // dropped, nothing spawned or torn down), so a regression to the dormant
+    // list would still read green.
+    expect(activate).not.toHaveBeenCalled();
     expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
     expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
     expect(priv.connections.get("gh")).toBe(live);

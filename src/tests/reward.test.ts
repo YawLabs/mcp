@@ -94,6 +94,31 @@ describe("computeOutcomeReward", () => {
         }),
       ).toBe(0.2);
     });
+
+    // classifyError matches by raw SUBSTRING, so scanning the whole block let a
+    // big successful result set that merely MENTIONS "not found" be graded 0.2.
+    // Three of those drop a healthy search-shaped server under
+    // PENALTY_RATE_THRESHOLD and it is rendered flaky from then on.
+    it("does NOT fire on a long benign payload that mentions an error phrase far from the start", () => {
+      const rows = Array.from(
+        { length: 60 },
+        (_, i) => `{"id":${i + 1},"name":"widget ${i + 1}","state":"active"}`,
+      ).join(",");
+      expect(rows.length).toBeGreaterThan(1000);
+      const payload = `[${rows}] -- further pages are not found`;
+      expect(computeOutcomeReward({ content: [{ type: "text", text: payload }] })).toBe(1.0);
+    });
+
+    // The paired guard for the case above: bounding the scan must not let a
+    // GENUINE soft failure quietly upgrade to full credit. The failure here is
+    // named ~300 chars in, behind an envelope of request context -- past a
+    // first-line / ~200-char cut, but well inside the scan window.
+    it("still fires on a long genuine soft failure whose envelope leads with request context", () => {
+      const context = `request_id=${"a".repeat(300)}; endpoint=/v1/widgets/42; `;
+      const body = `${context}not found: no widget with that id. ${"b".repeat(2000)}`;
+      expect(body.length).toBeGreaterThan(1000);
+      expect(computeOutcomeReward({ content: [{ type: "text", text: body }] })).toBe(0.2);
+    });
   });
 
   describe("rule 3: empty / whitespace body -> 0.3", () => {

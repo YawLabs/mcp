@@ -48,6 +48,25 @@ describe("classifyError", () => {
       'MCP error -32602: Input validation error: Invalid arguments for tool aws_call: [{"expected":"string","code":"invalid_type","path":["operation"],"message":"Invalid input: expected string, received undefined"}]',
       "validation_error",
     ],
+    // Every validation case above carries -32602, which is the first
+    // sub-pattern tested -- so the other three ("invalid input",
+    // "invalid_type", "invalid arguments") could each be deleted with the
+    // suite still green. These pin one apiece as the SOLE deciding
+    // condition: an upstream that reports zod issues without the JSON-RPC
+    // code (a raw validator throw, a re-wrapped SDK message) still has to
+    // classify as validation_error rather than falling through to
+    // upstream_error, which reward.ts grants full credit.
+    ["'invalid input' alone, no -32602", "Invalid input: expected string, received undefined", "validation_error"],
+    [
+      "'invalid_type' zod issue alone, no -32602",
+      '[{"code":"invalid_type","expected":"number","path":["limit"]}]',
+      "validation_error",
+    ],
+    [
+      "'invalid arguments' alone, no -32602",
+      "Invalid arguments for tool gh_search: missing required property",
+      "validation_error",
+    ],
     [
       "dispatcher unknown tool",
       "Unknown tool: npmjs_npm_trusted_publishers. Use mcp_connect_discover to see available servers, then mcp_connect_activate to load tools.",
@@ -248,8 +267,8 @@ describe("classifyError", () => {
       const elapsed = performance.now() - t0;
       // Budget. Measured on a Windows ARM64 box: the linear scans take
       // 26-250 ms standalone, and the 500 ms budget this replaces still
-      // failed a release run at 822 ms -- the suite runs in parallel (276 s
-      // of test time inside 63 s of wall clock), so a timing assertion here
+      // failed a release run at 822 ms -- the suite runs in parallel (394 s
+      // of test time inside 88 s of wall clock), so a timing assertion here
       // is competing for CPU with ~4x oversubscription. Re-introducing the
       // quadratic bug costs 4.3 s in ONE of the four regexes, so ~17 s in
       // this call. 3000 ms clears the contended worst case by ~3x and sits
@@ -275,9 +294,27 @@ describe("classifyError", () => {
   });
 
   it("only ever returns values in the ERROR_CATEGORIES allowlist", () => {
-    const out = new Set(cases.map(([, input]) => classifyError(input)));
-    for (const value of out) {
-      expect(ERROR_CATEGORIES).toContain(value);
+    // Deliberately NOT sourced from `cases` (nor from the empty/null test
+    // above): every one of those inputs already has an assertion pinning its
+    // exact category, so re-classifying them here cannot fail unless that
+    // assertion has already failed -- the check was true by construction.
+    // These are shapes nothing else covers: whitespace, control bytes, an
+    // ordinary success body, every category's trigger word crammed into one
+    // string, a run of status intros, and bodies long enough to reach past
+    // the substring pre-checks in both directions (digit-free and not).
+    const probes: string[] = [
+      "   ",
+      `${String.fromCharCode(0, 27, 9)}[31m NUL + ESC + tab`,
+      "OK",
+      '{"ok":true,"rows":[1,2,3]}',
+      "-32602 -32601 -32001 429 401 404 timed out unknown tool not found",
+      "status 429 status 401 status 404 status 403",
+      "a".repeat(20_000),
+      `${"lorem ipsum ".repeat(2_000)}401`,
+    ];
+    for (const probe of probes) {
+      const label = probe.length > 60 ? `${probe.slice(0, 60)}... (${probe.length} chars)` : probe;
+      expect(ERROR_CATEGORIES, `probe: ${JSON.stringify(label)}`).toContain(classifyError(probe));
     }
   });
 

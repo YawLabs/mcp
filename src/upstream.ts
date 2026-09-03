@@ -23,10 +23,10 @@ import { log } from "./logger.js";
 import { oamHeapOomHint, probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
 import {
+  collectSecretRefNames,
   hasSecretRefs,
   loadVault,
   resolveSecretRefs,
-  SECRET_REF_RE,
   unlock,
   VAULT_CHECK_CORRUPT_ERROR,
   vaultPath,
@@ -198,12 +198,19 @@ export async function resolveServerEnv(
       "missing",
     );
   }
-  const vault = await loadVault(vaultPath()).catch((err) => {
-    log("warn", "Failed to load vault for env resolution", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  });
+  // A vault that EXISTS but cannot be READ is a different failure from having
+  // no vault at all, and collapsing the two told the operator to create a vault
+  // they already have while the real reason (bad JSON, a truncated write,
+  // EACCES) survived only in the warn line below. Keep "no vault exists yet"
+  // for the null result and surface the read error on its own throw.
+  let vault: Awaited<ReturnType<typeof loadVault>>;
+  try {
+    vault = await loadVault(vaultPath());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("warn", "Failed to load vault for env resolution", { error: msg });
+    throw new Error(`vault unreadable: ${msg}`);
+  }
   if (!vault) {
     throw new Error("vault locked: server env references ${secret:...} but no vault exists yet");
   }
@@ -281,40 +288,77 @@ async function recordResolveAudit(namespace: string, env: Record<string, string>
     }
     return;
   }
-  for (const name of collectSecretNames(env)) {
+  // Single source of truth for the ref shape AND for the scan itself is
+  // secrets-vault's collectSecretRefNames -- this file used to keep its own
+  // byte-equivalent copy of that loop (as did meta-tools.ts and doctor-cmd.ts),
+  // each re-deriving the fresh-RegExp rule the shared /g object demands.
+  for (const name of collectSecretRefNames(env)) {
     await appendAuditEvent({ server: namespace, secret: name, event: "injected" });
   }
 }
 
-/** Distinct `${secret:NAME}` names referenced across an env map. */
-function collectSecretNames(env: Record<string, string>): string[] {
-  const names = new Set<string>();
-  // Single source of truth for the ref shape is secrets-vault's
-  // SECRET_REF_RE. It carries /g and is module-shared, and matchAll seeds
-  // its internal clone from the source's lastIndex -- so build a fresh
-  // instance from it rather than scanning with the shared object, which a
-  // stale lastIndex elsewhere could make silently skip leading matches.
-  const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
-  for (const v of Object.values(env)) {
-    if (typeof v !== "string") continue;
-    for (const m of v.matchAll(re)) names.add(m[1]);
-  }
-  return [...names];
-}
-
 declare const __VERSION__: string;
+
+/** Node's timer ceiling. setTimeout stores its delay in a signed 32-bit int,
+ *  so ANY delay above 2^31-1 ms (~24.9 days) silently becomes 1ms and fires
+ *  almost immediately. A `connectTimeoutMs` past that -- a typo'd extra digit
+ *  in bundles.json, which the loader's `> 0` check happily accepts -- would
+ *  therefore fail the connect instantly while the error message quoted a
+ *  multi-day ceiling. That per-server CONFIG value is clamped at the connect
+ *  site so the value used and the value reported match.
+ *
+ *  For the operator-facing ENV knobs it is the top of the ACCEPTED RANGE
+ *  rather than a clamp target -- see resolveTimeoutEnv for why the two
+ *  differ. */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** Shared parser for the three timeout env knobs -- MCP_CONNECT_TIMEOUT here,
+ *  MCP_LIST_TIMEOUT below, MCP_CALL_TIMEOUT in proxy.ts. Every one of them
+ *  ends up as a setTimeout delay (ours for the handshake, the SDK's for the
+ *  inventory and tools/call legs), so both halves of this matter.
+ *
+ *  STRICT DIGIT-RUN PARSE -- the shape resolveServerCap (server-cap.ts) and
+ *  the idle-threshold resolver (server.ts) already use. Number.parseInt PREFIX
+ *  parses, so "3e9" is 3, "30s" is 30 and "1_000" is 1: a 3ms ceiling from a
+ *  value that reads like a generous one. Every call on that leg then fails
+ *  instantly, and a timeout is NOT branded a routing fault, so server.ts books
+ *  each one against the upstream's health and error rate.
+ *
+ *  REJECT OUT-OF-RANGE RATHER THAN CLAMP. Clamping to MAX_TIMEOUT_MS turns an
+ *  absurd knob into an effectively infinite one (~24.8 days): the call never
+ *  settles, so the namespace's inflightCalls marker is never cleared and the
+ *  namespace stops being deactivatable or idle-reapable. Falling back to the
+ *  documented default is what the junk branch already does, and it is the
+ *  right answer for both.
+ *
+ *  Trimmed first for the cmd.exe `set VAR= && ...` idiom other resolvers in
+ *  this repo already document; a value that is empty once trimmed reads as
+ *  unset and takes the default silently. Anything else we refuse gets one warn
+ *  naming the rejected value, the ceiling, and the number actually in effect
+ *  -- otherwise the operator's knob is ignored with no diagnostic at all. */
+export function resolveTimeoutEnv(name: string, defaultMs: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultMs;
+  const trimmed = raw.trim();
+  if (trimmed === "") return defaultMs;
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number.parseInt(trimmed, 10);
+    if (n > 0 && n <= MAX_TIMEOUT_MS) return n;
+  }
+  log("warn", `${name} ignored: expected a whole number of milliseconds in 1..${MAX_TIMEOUT_MS}`, {
+    value: raw,
+    maxMs: MAX_TIMEOUT_MS,
+    usingMs: defaultMs,
+  });
+  return defaultMs;
+}
 
 /** Default connect timeout. Per-server `config.connectTimeoutMs` wins
  *  when present; this is the fallback used otherwise. Env override
  *  (MCP_CONNECT_TIMEOUT) tunes the FALLBACK only -- per-server config
  *  always takes precedence so a slow server can be tuned independently
  *  of the global default. */
-const DEFAULT_CONNECT_TIMEOUT = (() => {
-  const env = process.env.MCP_CONNECT_TIMEOUT;
-  if (!env) return 15_000;
-  const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? n : 15_000;
-})();
+const DEFAULT_CONNECT_TIMEOUT = resolveTimeoutEnv("MCP_CONNECT_TIMEOUT", 15_000);
 
 // Bound on per-request listTools/listResources/listPrompts after the
 // initial handshake. Without this, a server that completes connect but
@@ -322,12 +366,7 @@ const DEFAULT_CONNECT_TIMEOUT = (() => {
 // CONNECT_TIMEOUT timer above is already cleared by the time we reach
 // the listX calls). 15s matches the connect ceiling -- if a server
 // can't list its own tools in 15s, surface it as a real failure.
-const LIST_TIMEOUT = (() => {
-  const env = process.env.MCP_LIST_TIMEOUT;
-  if (!env) return 15_000;
-  const n = Number.parseInt(env, 10);
-  return Number.isFinite(n) && n > 0 ? n : 15_000;
-})();
+const LIST_TIMEOUT = resolveTimeoutEnv("MCP_LIST_TIMEOUT", 15_000);
 
 // Cap captured stderr so a chatty server can't balloon yaw-mcp's memory.
 // 8KB tail is plenty to see the last error message — servers that emit
@@ -443,6 +482,59 @@ function categorizeSpawnError(err: unknown): ActivationFailureCategory {
   if (/ENOENT|not found|cannot find|command failed to start/i.test(msg)) return "spawn_failure";
   if (/EACCES|permission denied/i.test(msg)) return "spawn_failure";
   return "unknown";
+}
+
+/** One-line reason for a failed REMOTE connect, appended after the verbatim
+ *  "refused the connection." sentence.
+ *
+ *  Without it every non-timeout remote failure read as "the server is down":
+ *  an unauthenticated 401 against a hosted MCP, a typo'd host (ENOTFOUND), a
+ *  wrong path (404) and a self-signed certificate all produced that one
+ *  sentence while the SDK error carrying the actual reason was discarded --
+ *  steering the reader away from the real fix (auth, URL, TLS).
+ *
+ *  Assembled rather than lifted from `err.message` because the fetch-based
+ *  transports report EVERY network failure as the useless "fetch failed" (the
+ *  real reason hangs off `err.cause`) and expose the HTTP status only as a
+ *  numeric `.code`. Codes outside the HTTP range are skipped: a JSON-RPC
+ *  error code (-32000 and friends) is not a status and must not be printed as
+ *  one. Truncated because a streamable-http failure can carry a whole HTML
+ *  error page from `response.text()`. */
+function remoteFailureDetail(err: unknown): string {
+  const parts: string[] = [];
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === "number" && code >= 100 && code <= 599) parts.push(`HTTP ${code}`);
+  const cause = err instanceof Error ? err.cause : undefined;
+  const message = cause instanceof Error ? cause.message : err instanceof Error ? err.message : String(err);
+  if (message) parts.push(message);
+  return parts.join(": ").replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+/** Attach the child's stderr tail to an ActivationError raised AFTER the
+ *  handshake -- the inventory-fetch window, where a child that dies mid-fetch
+ *  surfaces either as "disconnected during initialization" or as a tools/list
+ *  error, and where nothing used to carry the reason it printed on the way
+ *  out. The pre-handshake catch already does this; without it here the
+ *  elicitation haystack (server.ts scans `stderrTail` for "SOME_TOKEN is
+ *  required") and the oam heap-cap hint both lost their input exactly where
+ *  the comment on the boot-probe downgrade says such deaths surface.
+ *
+ *  Deliberately narrow: only an ActivationError that has NO tail yet and only
+ *  when something was actually captured. message, category and cause are
+ *  carried over verbatim so the downgrade gate (which compares categories) and
+ *  server.ts's instanceof branches behave exactly as before -- the tail and the
+ *  appended reason are additive. Remote connections never populate the ring,
+ *  so this is a no-op for them. */
+function withStderrTail(err: unknown, stderrRing: string, env: Record<string, string>): unknown {
+  if (!(err instanceof ActivationError) || err.stderrTail) return err;
+  const trimmed = stderrRing.trim();
+  if (trimmed.length === 0) return err;
+  const safe = redactSecretsInOutput(trimmed, env);
+  // The hint goes in the MESSAGE, ahead of the tail: buried in 500 characters
+  // of banner it is invisible, and the message is the only part the user reads.
+  const oomHint = oamHeapOomHint(trimmed);
+  const message = `${err.message}${oomHint ? ` ${oomHint}` : ""} stderr tail: ${safe.slice(-500)}`;
+  return new ActivationError(message, err.category, safe, err.cause);
 }
 
 /** Spawn facts for one connectToUpstream CALL (not one attempt), threaded out
@@ -693,6 +785,12 @@ async function connectToUpstreamOnce(
   // config.env still carries `${secret:NAME}` literals; the child sees
   // the cleartext and may echo it on failure.
   let resolvedServerEnv: Record<string, string> = {};
+  // The command that is ACTUALLY handed to the transport, post uv/oam rewrite.
+  // config.command is what the operator typed (`npx`, `uvx`); the process that
+  // fails to spawn may be yaw-mcp's managed uv binary or the oam runtime, and
+  // the spawn_failure message names both so "not on PATH" points at the file
+  // the OS could not find as well as the entry to edit.
+  let spawnedCommand = config.command;
 
   if (config.type === "local") {
     if (!config.command) {
@@ -704,7 +802,9 @@ async function connectToUpstreamOnce(
     // case-insensitive. Everything else from process.env (PATH, HOME, proxy
     // vars, etc.) is intentionally forwarded so the child spawns/runs in the
     // user's normal environment; server-specific secrets come via serverEnv,
-    // resolved from the vault above.
+    // which resolveServerEnv resolves from the vault BELOW -- after the uv and
+    // oam resolvers, so a locked vault pays a uv bootstrap and an oam probe
+    // before it refuses.
     const parentEnv = stripInternalSecretsFromEnv(process.env);
     // Resolve the launch command: `uv`/`uvx` to our managed binary, then
     // node/npx onto the oam runtime. BOTH resolvers can throw (unsupported
@@ -766,6 +866,7 @@ async function connectToUpstreamOnce(
         err,
       );
     }
+    spawnedCommand = resolved.command;
 
     // Resolve ${secret:NAME} references in the server's env against the
     // local secret vault. Fail-CLOSED: when the env carries refs and
@@ -823,7 +924,23 @@ async function connectToUpstreamOnce(
       );
     }
 
-    const url = new URL(config.url);
+    // A scheme-less or otherwise malformed url ("localhost:3000", a stray
+    // space) makes the URL constructor throw a bare TypeError("Invalid URL"):
+    // no category, no namespace, no url, and none of the "Fix in ..." pointer
+    // every other connect failure carries -- and server.ts spends its retry on
+    // what is a permanent config error. Classify it here instead.
+    let url: URL;
+    try {
+      url = new URL(config.url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new ActivationError(
+        withConfigPointer(`Server "${config.namespace}" has an invalid url "${config.url}": ${message}`, config),
+        "unknown",
+        undefined,
+        err,
+      );
+    }
     if (config.transport === "sse") {
       transport = new SSEClientTransport(url);
     } else {
@@ -837,10 +954,15 @@ async function connectToUpstreamOnce(
   // Errors are categorized (spawn/install/timeout/protocol) so the caller
   // can produce an actionable message for the LLM. stderr tail is included
   // when available — it's the part that usually explains the real failure.
-  const connectTimeoutMs =
+  // Clamped to MAX_TIMEOUT_MS: an out-of-range delay makes setTimeout fire
+  // after 1ms, so an absurd config value would fail the connect instantly
+  // while every message below quoted the absurd ceiling back at the reader.
+  const connectTimeoutMs = Math.min(
     typeof config.connectTimeoutMs === "number" && config.connectTimeoutMs > 0
       ? config.connectTimeoutMs
-      : DEFAULT_CONNECT_TIMEOUT;
+      : DEFAULT_CONNECT_TIMEOUT,
+    MAX_TIMEOUT_MS,
+  );
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -873,9 +995,14 @@ async function connectToUpstreamOnce(
 
     if (config.type !== "local") {
       category = timedOut ? "init_timeout" : "protocol_error";
+      // The refusal sentence stays verbatim and the underlying reason is
+      // APPENDED: on its own it reads as "server down" for failures that are
+      // nothing of the kind (401, 404, ENOTFOUND, a self-signed certificate),
+      // and the SDK error carrying the truth was discarded entirely.
+      const detail = timedOut ? "" : remoteFailureDetail(err);
       message = timedOut
         ? `Remote server at ${config.url} did not respond within ${connectTimeoutMs / 1000}s. Verify the URL is reachable.`
-        : `Remote server at ${config.url} refused the connection.`;
+        : `Remote server at ${config.url} refused the connection.${detail ? ` ${detail}` : ""}`;
     } else if (timedOut) {
       category = "init_timeout";
       message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${connectTimeoutMs / 1000}s.${
@@ -897,7 +1024,16 @@ async function connectToUpstreamOnce(
     } else {
       category = categorizeSpawnError(err);
       if (category === "spawn_failure") {
-        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).`;
+        // Name the CONFIG command first (it is the line the operator has to
+        // edit) but do not stop there: after a uv/oam rewrite the binary that
+        // actually ENOENT'd is one the user never typed, and advising them to
+        // install a runtime that is not the missing thing sends them the wrong
+        // way. When the two differ, say which file the OS could not find.
+        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).${
+          spawnedCommand && spawnedCommand !== config.command
+            ? ` The binary that actually failed to spawn was '${spawnedCommand}'.`
+            : ""
+        }`;
       } else {
         message = err instanceof Error ? err.message : String(err);
       }
@@ -911,12 +1047,23 @@ async function connectToUpstreamOnce(
 
   // Name the runtime that actually won: "oam" (with the probed oam version)
   // when the rewrite applied, an explicit downgrade marker when the boot-probe
-  // fallback respawned on node, and nothing extra for plain node spawns.
-  const runtimeFields = attempt.oamRewriteApplied
-    ? disableOamRewrite
+  // fallback respawned on node, that same marker plus `oamPinned` when the
+  // session memo skipped the rewrite for a namespace an EARLIER downgrade
+  // pinned to node, and nothing extra for plain node spawns.
+  //
+  // The pinned case is why this is not a two-way branch: a memo-served connect
+  // never sets oamRewriteApplied, so it used to log as an ordinary node spawn
+  // and the only trace that the server had left oam was the warn line from the
+  // connect that pinned it -- invisible to anyone reading a later reconnect,
+  // and the exact question doctor output raises ("why is this on node?").
+  let runtimeFields: Record<string, unknown> = {};
+  if (attempt.oamRewriteApplied) {
+    runtimeFields = disableOamRewrite
       ? { runtime: "node", downgradedFromOam: true }
-      : { runtime: "oam", oamVersion: attempt.oamVersion }
-    : {};
+      : { runtime: "oam", oamVersion: attempt.oamVersion };
+  } else if (config.type === "local" && oamDowngradedNamespaces.has(config.namespace)) {
+    runtimeFields = { runtime: "node", downgradedFromOam: true, oamPinned: true };
+  }
   log("info", "Connected to upstream", {
     name: config.name,
     namespace: config.namespace,
@@ -978,21 +1125,42 @@ async function connectToUpstreamOnce(
     });
 
     if (onListChanged) {
-      let toolsChain: Promise<void> = chainsGate;
-      let resourcesChain: Promise<void> = chainsGate;
-      let promptsChain: Promise<void> = chainsGate;
+      // A chain carries at most TWO steps: the one at its head (in flight, or
+      // about to be) plus ONE queued behind it. Serializing alone did not
+      // coalesce, so an upstream that fires a burst of list_changed -- a
+      // gateway republishing its catalogue tool-by-tool -- queued one full
+      // inventory fetch AND one downstream route rebuild per notification, all
+      // of them fetching the same final state. Beyond the queued step the
+      // notification is folded into it: the queued fetch has not started yet,
+      // so it will observe the newest inventory anyway and nothing is lost.
+      type RefreshState = { chain: Promise<void>; outstanding: number };
+      const queueRefresh = (state: RefreshState, run: () => Promise<void>): Promise<void> => {
+        if (state.outstanding >= 2) return state.chain;
+        state.outstanding += 1;
+        state.chain = state.chain.then(async () => {
+          try {
+            await run();
+          } finally {
+            state.outstanding -= 1;
+          }
+        });
+        return state.chain;
+      };
 
-      client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
-        toolsChain = toolsChain.then(async () => {
+      const toolsRefresh: RefreshState = { chain: chainsGate, outstanding: 0 };
+      const resourcesRefresh: RefreshState = { chain: chainsGate, outstanding: 0 };
+      const promptsRefresh: RefreshState = { chain: chainsGate, outstanding: 0 };
+
+      client.setNotificationHandler(ToolListChangedNotificationSchema, () =>
+        queueRefresh(toolsRefresh, async () => {
           try {
             connection.tools = await fetchToolsFromUpstream(client, config.namespace);
             onListChanged(config.namespace);
           } catch (err: any) {
             log("warn", "Failed to refresh tools from upstream", { namespace: config.namespace, error: err.message });
           }
-        });
-        return toolsChain;
-      });
+        }),
+      );
       // throwOnError on all three refreshes: a failed fetch must leave the
       // PREVIOUS inventory standing. Without it the resources/prompts fetchers
       // return [] on any transport error or LIST_TIMEOUT, so one blip mid-
@@ -1002,8 +1170,8 @@ async function connectToUpstreamOnce(
       // the try precisely so the throw skips both it and onListChanged --
       // matching what the tools branch already gets for free from
       // fetchToolsFromUpstream's rethrow.
-      client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
-        resourcesChain = resourcesChain.then(async () => {
+      client.setNotificationHandler(ResourceListChangedNotificationSchema, () =>
+        queueRefresh(resourcesRefresh, async () => {
           try {
             connection.resources = await fetchResourcesFromUpstream(client, config.namespace, { throwOnError: true });
             onListChanged(config.namespace);
@@ -1013,11 +1181,10 @@ async function connectToUpstreamOnce(
               error: err.message,
             });
           }
-        });
-        return resourcesChain;
-      });
-      client.setNotificationHandler(PromptListChangedNotificationSchema, () => {
-        promptsChain = promptsChain.then(async () => {
+        }),
+      );
+      client.setNotificationHandler(PromptListChangedNotificationSchema, () =>
+        queueRefresh(promptsRefresh, async () => {
           try {
             connection.prompts = await fetchPromptsFromUpstream(client, config.namespace, { throwOnError: true });
             onListChanged(config.namespace);
@@ -1027,12 +1194,15 @@ async function connectToUpstreamOnce(
               error: err.message,
             });
           }
-        });
-        return promptsChain;
-      });
+        }),
+      );
     }
 
-    const tools = await fetchToolsFromUpstream(client, config.namespace);
+    // allowMissingToolsCapability on the INITIAL fetch only: a resources-only
+    // or prompts-only upstream answers tools/list with -32601, which is a
+    // zero-tool server rather than a boot failure. The refresh path keeps the
+    // throw -- see fetchToolsFromUpstream.
+    const tools = await fetchToolsFromUpstream(client, config.namespace, { allowMissingToolsCapability: true });
     const resources = await fetchResourcesFromUpstream(client, config.namespace);
     const prompts = await fetchPromptsFromUpstream(client, config.namespace);
 
@@ -1063,7 +1233,13 @@ async function connectToUpstreamOnce(
     try {
       await client.close();
     } catch {}
-    throw err;
+    // Everything raised inside this try happens AFTER a successful handshake --
+    // the closedBeforeReady guard above and the tools/list rethrow both land
+    // here -- and a child that died mid-fetch has usually said why on stderr.
+    // withStderrTail attaches (and redacts) that tail, so the credential
+    // elicitation and the oam heap-cap hint get the same input they would have
+    // had if the child had died a moment earlier, before the handshake.
+    throw withStderrTail(err, stderrRing, resolvedServerEnv);
   }
 }
 
@@ -1102,7 +1278,7 @@ export interface FetchListOptions {
  *  prompts/list and tools/list alike; a server that paginates would
  *  otherwise have everything past page 1 silently dropped.
  *
- *  Three bounds keep a misbehaving server from holding activation hostage.
+ *  Four bounds keep a misbehaving server from holding activation hostage.
  *  Each page gets its own LIST_TIMEOUT via the caller's request options, so
  *  the page count is the only thing standing between one fetch and
  *  pages x LIST_TIMEOUT of wall time:
@@ -1111,8 +1287,11 @@ export interface FetchListOptions {
  *    warning fire);
  *  - a page that returns zero items but still hands back a cursor ends the
  *    loop -- that shape is an empty-page dribble, not pagination;
+ *  - a server that echoes back the cursor it was just sent (or hands back an
+ *    empty one) ends the loop too: the next request would re-fetch the page
+ *    just read, so every further round trip is a duplicate;
  *  - the page count is capped at MAX_LIST_PAGES, far below the item cap.
- *  The latter two log a warning so the operator can see the early stop. */
+ *  The last three log a warning so the operator can see the early stop. */
 async function fetchAllPages<T>(
   fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>,
   cap: number,
@@ -1122,8 +1301,25 @@ async function fetchAllPages<T>(
   let cursor: string | undefined;
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const { items, nextCursor } = await fetchPage(cursor);
-    all.push(...items);
+    // Appended one at a time rather than `all.push(...items)`: spreading a
+    // single page of ~100k+ entries blows the argument limit and throws
+    // RangeError, turning the documented log-and-truncate path for an absurd
+    // inventory into a hard activation failure.
+    for (const item of items) all.push(item);
     if (nextCursor === undefined || all.length > cap) return all;
+    if (nextCursor.length === 0 || nextCursor === cursor) {
+      // The server handed back the cursor it was just sent (or an empty one),
+      // so the next request would return the SAME page: every further round
+      // trip is a duplicate, and up to MAX_LIST_PAGES of them would be
+      // concatenated into the inventory. Stop with what we have.
+      log("warn", "Upstream repeated its pagination cursor; stopping pagination", {
+        namespace: context.namespace,
+        endpoint: context.endpoint,
+        pagesFetched: page + 1,
+        items: all.length,
+      });
+      return all;
+    }
     if (items.length === 0) {
       // A cursor on a zero-item page is a dribble, not pagination -- a
       // legitimate inventory always makes progress. Stop rather than burn
@@ -1227,7 +1423,36 @@ export async function fetchPromptsFromUpstream(
   }
 }
 
-export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {
+/** JSON-RPC "Method not found" (-32601), matched on the numeric code rather
+ *  than the message text: the SDK's McpError carries the code verbatim from
+ *  the wire while the human-readable half is whatever the server chose to
+ *  write, so text matching would both miss servers and catch tool errors that
+ *  merely mention the phrase. */
+function isMethodNotFound(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === -32601;
+}
+
+/** How a tools/list failure is reported. */
+export interface FetchToolsOptions {
+  /** INITIAL connect only: treat a -32601 from tools/list as a zero-tool
+   *  server rather than a failed activation. A resources-only or prompts-only
+   *  upstream (an McpServer with no tool registered) answers the method it
+   *  never implemented that way, and failing activation on it made such a
+   *  server impossible to load at all -- one wasted retry, one wasted oam->node
+   *  respawn, then a down-ranked namespace whose resources and prompts were
+   *  never proxied. NOT set on the list_changed refresh: returning [] there
+   *  would clear a live inventory the caller's catch currently preserves, and
+   *  a server that answered tools/list once does not stop implementing it. A
+   *  server that DECLARES tools and then errors still fails, whatever the
+   *  flag: only -32601 is forgiven. */
+  allowMissingToolsCapability?: boolean;
+}
+
+export async function fetchToolsFromUpstream(
+  client: Client,
+  namespace: string,
+  opts: FetchToolsOptions = {},
+): Promise<UpstreamToolDef[]> {
   let all: Awaited<ReturnType<typeof client.listTools>>["tools"];
   try {
     all = await fetchAllPages(
@@ -1239,6 +1464,10 @@ export async function fetchToolsFromUpstream(client: Client, namespace: string):
       { namespace, endpoint: "tools/list" },
     );
   } catch (err) {
+    if (opts.allowMissingToolsCapability && isMethodNotFound(err)) {
+      log("info", "Upstream does not implement tools/list; loading it as a zero-tool server", { namespace });
+      return [];
+    }
     const message = err instanceof Error ? err.message : String(err);
     throw new ActivationError(
       `"${namespace}" returned an error on tools/list: ${message}`,

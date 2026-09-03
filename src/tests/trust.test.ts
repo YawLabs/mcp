@@ -14,7 +14,17 @@
 // built with join() -- never a POSIX string literal -- because the SUT routes
 // through path.join, which yields backslashes on the Windows runner.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,7 +46,6 @@ import {
   readTrustStore,
   revokeTrust,
   TRUST_BYPASS_ENV,
-  TRUST_FILENAME,
   TRUST_SCHEMA_VERSION,
   TrustStoreUnreadableError,
   trustStatusFor,
@@ -70,13 +79,29 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-trust-"));
+  // realpathSync.NATIVE, and on the root: the SUT keys grants physically
+  // (findProjectConfigDir realpaths the project dir), so a logical fixture
+  // root grants under one key and looks up under another -- red across the
+  // whole suite on macOS, where tmpdir() is /var -> /private/var, and on any
+  // Windows account whose TEMP is an 8.3 short path. `.native` is the flavor
+  // that matters: the SUT resolves through fs.promises.realpath (libuv), which
+  // expands 8.3 names and junctions, while plain realpathSync is the JS walker
+  // and would not reproduce the same key on Windows. synthCwd is created
+  // INSIDE the resolved root, so it inherits the physical spelling.
+  synthHome = realpathSync.native(mkdtempSync(join(tmpdir(), "yaw-mcp-trust-")));
   synthCwd = mkdtempSync(join(synthHome, "cwd-"));
+  // captureStderr below asserts WARN-level lines. logger.ts resolves LOG_LEVEL
+  // per call (deliberately, so a host can flip it mid-session), so a developer
+  // shell or CI job exporting LOG_LEVEL=error emits nothing and the assertion
+  // compares undefined to the key it wanted -- a green-to-red flip with
+  // nothing to do with trust.ts. Pin the threshold those assertions depend on.
+  vi.stubEnv("LOG_LEVEL", "warn");
 });
 
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
   readFileErrors.clear();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -256,29 +281,12 @@ describe("loadLocalBundles project-trust gate", () => {
     expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
   });
 
-  it("denies an entry with no usable sha256 (a record is never a wildcard)", async () => {
-    // A record without a hash must never behave like "trust whatever is
-    // there" -- that would be precisely the bug the store exists to stop.
-    await writeTrustedProjectBundles(synthCwd, HOSTILE);
-    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as {
-      trusted: Record<string, { sha256?: string }>;
-    };
-    for (const key of Object.keys(raw.trusted)) delete raw.trusted[key].sha256;
-    writeFileSync(trustStorePath(synthHome), JSON.stringify(raw));
-    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
-  });
-
-  it("keeps the other grants when ONE entry is malformed", async () => {
-    // Per-entry robustness: one corrupt record must not silently revoke every
-    // project the user approved.
-    await writeTrustedProjectBundles(synthCwd, HOSTILE);
-    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as {
-      trusted: Record<string, unknown>;
-    };
-    raw.trusted[join(synthHome, "elsewhere", TRUST_FILENAME)] = { sha256: "not-a-hash" };
-    writeFileSync(trustStorePath(synthHome), JSON.stringify(raw));
-    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config?.servers).toHaveLength(1);
-  });
+  // The per-ENTRY shapes (a record with no usable sha256; one corrupt record
+  // among healthy ones) used to be spot-checked here with a single
+  // "config is null" / "still one server" assertion each. They are covered
+  // exhaustively -- every rejected shape, both directions, end to end through
+  // the loader -- by MALFORMED_RECORDS + expectOnlyKeepSurvives further down,
+  // so the weaker copies were removed rather than left to drift.
 
   it("YAW_MCP_TRUST_PROJECT=1 loads an unapproved project file", async () => {
     writeBundles(synthHome, GLOBAL_REAL);
@@ -306,11 +314,19 @@ describe("loadLocalBundles project-trust gate", () => {
   });
 
   it("does not gate a user-global file even when the trust store is malformed", async () => {
+    // The project file has to EXIST for this to say anything: with no project
+    // .yaw-mcp/ the probe returns before it ever opens the store, which made
+    // this the previous test again with an unread file dropped next to it.
+    // With one present the store IS read, comes back malformed, and the claim
+    // becomes real -- fail closed on the project file, untouched on the
+    // user's own.
     writeBundles(synthHome, GLOBAL_REAL);
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeBundles(synthCwd, HOSTILE);
     writeFileSync(trustStorePath(synthHome), "garbage");
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} });
     expect(r.config?.servers.map((s) => s.namespace)).toEqual(["github"]);
+    expect(r.path).toBe(projectBundlesPath(synthHome));
+    expect(r.warnings.some((w) => w.includes("trust store"))).toBe(true);
   });
 });
 
@@ -349,6 +365,71 @@ describe("trust store grant / revoke / list round-trip", () => {
     const res = await revokeTrust(join(synthCwd, "nope", "bundles.json"), { home: synthHome });
     expect(res.removed).toBe(false);
     expect(res.storeWasMalformed).toBe(false);
+  });
+
+  it("revokes a physically-keyed grant when the user spells the path logically", async () => {
+    // Every grant is keyed PHYSICALLY: `yaw-mcp trust` finds the project via
+    // findProjectConfigDir, which realpaths the project dir, so a checkout
+    // reached through a symlink / Windows junction / 8.3-short prefix is
+    // stored under its resolved spelling. `--revoke <path>` gets whatever the
+    // user typed. Matching only the lexical key therefore missed the row and
+    // printed "was not approved (nothing to do)" with exit 0 -- a false
+    // confirmation on a consent-WITHDRAWAL command, with the grant still live.
+    writeBundles(synthCwd, HOSTILE);
+    const link = join(synthHome, "link-to-project");
+    // "junction" so this needs no elevation on Windows; POSIX ignores the hint.
+    symlinkSync(synthCwd, link, "junction");
+
+    // Approve through the probe, which is where the physical spelling enters.
+    const probe = await probeProjectTrust({ home: synthHome, cwd: link, env: {} });
+    const physical = projectBundlesPath(synthCwd);
+    expect(probe.path).toBe(physical);
+    await grantTrust(physical, readFileSync(physical), { home: synthHome });
+
+    const logical = projectBundlesPath(link);
+    expect(logical).not.toBe(physical);
+    const res = await revokeTrust(logical, { home: synthHome });
+    expect(res.removed).toBe(true);
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+    // Gone from disk, and the project is gated again.
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+  });
+
+  it("clears BOTH rows when one bundles.json is keyed lexically AND physically", async () => {
+    // A store can hold both candidate keys for ONE file without any hand
+    // editing: findProjectConfigDir was purely lexical before it started
+    // realpath'ing the project dir, so a grant made from a symlinked checkout
+    // back then left a LEXICAL row, and the re-grant the key-derivation change
+    // forces afterwards adds the PHYSICAL one beside it. Revoking the first
+    // match only dropped one, printed "Revoked ... Restart to stop loading it"
+    // and exited 0 while the survivor kept the file trusted and loading -- the
+    // same false confirmation on a consent-WITHDRAWAL command that the physical
+    // candidate was added to fix, just one row further along.
+    writeBundles(synthCwd, HOSTILE);
+    const link = join(synthHome, "link-to-project");
+    symlinkSync(synthCwd, link, "junction");
+    const physical = projectBundlesPath(synthCwd);
+    const logical = projectBundlesPath(link);
+    expect(logical).not.toBe(physical);
+
+    const bytes = readFileSync(physical);
+    await grantTrust(logical, bytes, { home: synthHome });
+    await grantTrust(physical, bytes, { home: synthHome });
+    // Two genuinely distinct rows, both pinned to the same live file.
+    expect(await listTrusted({ home: synthHome })).toHaveLength(2);
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config?.servers).toHaveLength(1);
+
+    const res = await revokeTrust(logical, { home: synthHome });
+    expect(res.removed).toBe(true);
+    // Neither row survives -- in memory, and on disk.
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+    expect(Object.keys(raw.trusted)).toEqual([]);
+    // The claim the command makes: the project really stops loading. The probe
+    // keys PHYSICALLY, so the surviving physical row is exactly what used to
+    // keep this green while the revoke reported success.
+    expect((await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: {} })).config).toBeNull();
+    expect((await loadLocalBundles({ home: synthHome, cwd: link, env: {} })).config).toBeNull();
   });
 
   it("revoking against a malformed store reports it instead of rewriting it", async () => {
@@ -401,7 +482,12 @@ describe("trust store grant / revoke / list round-trip", () => {
     expect(store.entries).toEqual({});
   });
 
-  it("normalizes the store key so a forward-slash path matches a native one", async () => {
+  // Skipped where sep is already "/": slashPath would be the SAME string as
+  // nativePath there, so the test would assert nothing the plain round-trip
+  // above has not already covered. `resolve` only rewrites separators on
+  // win32, and it reads the REAL platform (a process.platform fake does not
+  // change what node:path does), so this branch is genuinely win32-only.
+  it.skipIf(sep === "/")("normalizes the store key so a forward-slash path matches a native one", async () => {
     // On Windows the SUT's path.join yields backslashes while a user (or a
     // pasted path) may hand us forward slashes; both must be one entry.
     writeBundles(synthCwd, HOSTILE);
@@ -491,9 +577,16 @@ describe("trust store grant / revoke / list round-trip", () => {
 // legacy grant is orphaned: the project re-prompts, revoke cannot find the
 // row, and re-granting creates exactly the duplicate `trust --list` row the
 // lowercasing set out to prevent. readTrustStore therefore folds every stored
-// key as it builds `entries`; the next write persists the folded form. The
-// fake platform must be held ACROSS the awaits (withPlatformAsync): the fold
-// runs inside readTrustStore, after the readFile resolves.
+// key as it builds `entries`; the next write persists the folded form.
+//
+// Two ways to reach another platform's fold, and the choice is not cosmetic.
+// READ-ONLY cases fake the global, held ACROSS the awaits (withPlatformAsync),
+// because trustStatusFor reads process.platform internally. Cases that WRITE
+// pass `platform` through the opts instead: a global fake also reaches
+// atomic-write's win32-only rename retry and writeTrustStore's POSIX chmod, so
+// a grant/revoke performed under `darwin` on the Windows runner takes the
+// POSIX write path and can flake on EPERM/EBUSY the moment a scanner touches
+// the temp file -- a failure of the harness, not of the fold under test.
 
 describe("legacy mixed-case store keys are folded at read time", () => {
   /** A store as an OLDER yaw-mcp wrote it: keys keep whatever casing the
@@ -523,36 +616,36 @@ describe("legacy mixed-case store keys are folded at read time", () => {
   });
 
   it("revoke finds and removes a legacy mixed-case row", async () => {
-    await withPlatformAsync("darwin", async () => {
-      writeBundles(synthCwd, HOSTILE);
-      const path = projectBundlesPath(synthCwd);
-      seedLegacyStore([{ key: path.toUpperCase(), sha256: hashTrustContent(readFileSync(path)), path }]);
+    // Writes: platform through the opts, real platform for the writer itself.
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    seedLegacyStore([{ key: path.toUpperCase(), sha256: hashTrustContent(readFileSync(path)), path }]);
 
-      const res = await revokeTrust(path, { home: synthHome });
-      expect(res.removed).toBe(true);
-      expect(await listTrusted({ home: synthHome })).toEqual([]);
-      // Gone from DISK too, not merely from this read's in-memory view.
-      const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
-      expect(Object.keys(raw.trusted)).toEqual([]);
-    });
+    const res = await revokeTrust(path, { home: synthHome, platform: "darwin" });
+    expect(res.removed).toBe(true);
+    expect(await listTrusted({ home: synthHome })).toEqual([]);
+    // Gone from DISK too, not merely from this read's in-memory view.
+    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+    expect(Object.keys(raw.trusted)).toEqual([]);
   });
 
   it("re-granting over a legacy row replaces it -- no duplicate list rows", async () => {
-    await withPlatformAsync("darwin", async () => {
-      writeBundles(synthCwd, HOSTILE);
-      const path = projectBundlesPath(synthCwd);
-      const bytes = readFileSync(path);
-      // A legacy row pinned to a STALE hash, as an upgrade-in-place sees it.
-      seedLegacyStore([{ key: path.toUpperCase(), sha256: "a".repeat(64), path }]);
+    writeBundles(synthCwd, HOSTILE);
+    const path = projectBundlesPath(synthCwd);
+    const bytes = readFileSync(path);
+    // A legacy row pinned to a STALE hash, as an upgrade-in-place sees it.
+    seedLegacyStore([{ key: path.toUpperCase(), sha256: "a".repeat(64), path }]);
 
-      await grantTrust(path, bytes, { home: synthHome });
-      const listed = await listTrusted({ home: synthHome });
-      expect(listed).toHaveLength(1);
-      expect(listed[0].sha256).toBe(hashTrustContent(bytes));
-      // The write migrated the key: only the folded form is on disk now.
-      const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
-      expect(Object.keys(raw.trusted)).toEqual([normalizeTrustKey(path)]);
-    });
+    await grantTrust(path, bytes, { home: synthHome, platform: "darwin" });
+    const listed = await listTrusted({ home: synthHome });
+    expect(listed).toHaveLength(1);
+    expect(listed[0].sha256).toBe(hashTrustContent(bytes));
+    // The write migrated the key: only the folded form is on disk now. The
+    // expected key is spelled with the SAME platform the grant used -- a
+    // mkdtemp suffix can carry uppercase, so the real-platform fold on a
+    // case-sensitive runner would not reproduce it.
+    const raw = JSON.parse(readFileSync(trustStorePath(synthHome), "utf8")) as { trusted: Record<string, unknown> };
+    expect(Object.keys(raw.trusted)).toEqual([normalizeTrustKey(path, "darwin")]);
   });
 
   it("last write wins when two legacy keys fold to one", async () => {
@@ -813,7 +906,9 @@ function replaceStoreRecord(targetPath: string, record: unknown): void {
   writeFileSync(storePath, JSON.stringify(raw));
 }
 
-/** Collect everything the logger writes to stderr while `fn` runs. */
+/** Collect everything the logger writes to stderr while `fn` runs. The
+ *  threshold those lines depend on is pinned in beforeEach (LOG_LEVEL=warn) --
+ *  see there. */
 async function captureStderr(fn: () => Promise<unknown>): Promise<Array<{ msg?: string; key?: string }>> {
   const chunks: string[] = [];
   const original = process.stderr.write.bind(process.stderr);
@@ -998,6 +1093,17 @@ describe("hashing and status helpers", () => {
     writeBundles(synthCwd, HOSTILE);
     const path = projectBundlesPath(synthCwd);
     expect(await isTrusted(path, readFileSync(path), { home: synthHome })).toBe(false);
+
+    // The escape hatch is a LOADER policy (local-bundles), not a claim that the
+    // file is trusted -- `trust --list` and doctor have to keep reporting the
+    // real state while it is on. This test was NAMED for that property but
+    // never set the variable, so nothing asserted it. isTrustBypassEnabled()
+    // confirms the hatch really is live for this process; isTrusted, which
+    // never consults the env at all, must still answer false.
+    vi.stubEnv(TRUST_BYPASS_ENV, "1");
+    expect(isTrustBypassEnabled()).toBe(true);
+    expect(await isTrusted(path, readFileSync(path), { home: synthHome })).toBe(false);
+
     await grantTrust(path, readFileSync(path), { home: synthHome });
     expect(await isTrusted(path, readFileSync(path), { home: synthHome })).toBe(true);
   });
@@ -1104,17 +1210,22 @@ describe("findShadowingProjectBundles is trust-aware", () => {
   });
 });
 
-// A "__proto__" key in the store file is dropped when the loader rebuilds
-// `entries` with plain assignment onto a fresh {} -- assignment hits
-// Object.prototype's inherited __proto__ setter instead of creating an own
-// key. Because the assigned value is an object, `entries` also ends up with
-// that record as its prototype. See src/json-key.ts.
-describe("a __proto__ store key survives the rebuild", () => {
+// What a "__proto__" key in the store file actually meets here is the READ-TIME
+// FOLD, not setJsonKey: normalizeTrustKey runs on the stored key BEFORE it is
+// assigned and always returns an absolute path, so the hostile key is renamed
+// out of existence (`<cwd>/__proto__` names nothing special) and never reaches
+// Object.prototype's inherited setter. This test pins THAT -- swap setJsonKey
+// at the assignment for `entries[k] = v` and it stays green, so it is not the
+// place that guard is verified. setJsonKey's own branch is exercised where keys
+// ARE used verbatim (exec-engine.test.ts's resolveArgs cases, grades-cache); in
+// trust.ts it is defence in depth for a future where the fold changes shape.
+// See src/json-key.ts.
+describe("a __proto__ store key cannot reach the prototype", () => {
   const SHA = "a".repeat(64);
 
-  it("keeps it as an own property without touching the prototype", async () => {
+  it("is folded into an ordinary absolute key, leaving the prototype intact", async () => {
     // Raw JSON text, not an object literal: `{ __proto__: ... }` in source
-    // SETS the prototype rather than creating an own key -- the very bug
+    // SETS the prototype rather than creating an own key -- the very shape
     // under test -- so a literal fixture would be empty and the test would
     // pass for the wrong reason.
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
@@ -1126,22 +1237,25 @@ describe("a __proto__ store key survives the rebuild", () => {
     const store = await readTrustStore(synthHome);
 
     expect(store.malformed).toBe(false);
-    // Read-time key folding resolves the hostile key into an absolute path,
-    // so today it cannot even NAME the prototype -- but the setJsonKey guard
-    // is what this test pins, so the prototype must be untouched regardless.
-    expect(Object.getPrototypeOf(store.entries)).toBe(Object.prototype);
+    // The key went in as the bare string and comes out as an absolute path --
+    // that rename is what makes the record inert.
     expect(Object.keys(store.entries)).toEqual([normalizeTrustKey("__proto__")]);
-    // Without the fix `entries` inherits the record's own fields, so a lookup
-    // for a key named "sha256" resolves to a string instead of undefined.
+    expect(Object.keys(store.entries)).not.toContain("__proto__");
+    expect(Object.getPrototypeOf(store.entries)).toBe(Object.prototype);
+    // Had the record landed on the prototype instead, `entries` would inherit
+    // its fields and a lookup for "sha256" would resolve to a string.
     expect(store.entries.sha256).toBeUndefined();
   });
 });
 
 // ---------------------------------------------------------------------------
-// A grant is a read-modify-write across an unbounded pause (trust-cmd renders
-// the argv and waits at a [y/N] prompt in between), so the store has to be
-// re-read at the write boundary or a concurrent grant from another terminal
-// is silently reverted.
+// A grant is a read-modify-write, so the store has to be re-read at the write
+// boundary or a concurrent grant from another terminal is silently reverted.
+// The window is grantTrust's OWN -- NOT the [y/N] prompt, which trust-cmd
+// renders and answers before calling in, so both reads land microseconds apart
+// -- but it is not empty (hashing, then the mkdir + atomic rename of the write
+// itself), and `now()` fires inside it, which is what lets these tests inject
+// another terminal's write without a production test hook.
 // ---------------------------------------------------------------------------
 
 describe("concurrent grants are merged, not lost", () => {
@@ -1201,22 +1315,55 @@ describe("concurrent grants are merged, not lost", () => {
 
 // ---------------------------------------------------------------------------
 // The newer-schema guard reads `version` as a number. A hand-edited string
-// version used to default to "current" and sail straight past it.
+// version used to default to "current" and sail straight past it -- and the
+// range check was one-SIDED, so a version BELOW the first schema (0, a
+// negative, a fraction) was likewise waved through as healthy and current.
 // ---------------------------------------------------------------------------
 
-describe("a non-numeric version is corrupt, not current", () => {
+describe("a version outside the schema range is corrupt, not current", () => {
   const SHA = "c".repeat(64);
 
-  it("denies a store whose version is the STRING '2' instead of assuming v1", async () => {
-    const projectPath = projectBundlesPath(synthCwd);
+  /** A store carrying one otherwise-valid grant under `version`. */
+  function seedVersionedStore(version: unknown, projectPath: string): void {
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(
       trustStorePath(synthHome),
       JSON.stringify({
-        version: "2",
+        version,
         trusted: { [normalizeTrustKey(projectPath)]: { path: projectPath, sha256: SHA, grantedAt: "" } },
       }),
     );
+  }
+
+  // 0 / negative / fractional name a schema that has never existed, so the
+  // file is corrupt rather than newer: "parse" (rebuildable by a later grant),
+  // not "schema" (a real store from a newer build, never overwritten). Reading
+  // them as v1 trusted a grant on the strength of a field that says it is not
+  // v1 -- the same hole the string case below closes from the other side.
+  for (const version of [0, -1, 1.5]) {
+    it(`denies a store whose version is ${version}`, async () => {
+      const projectPath = projectBundlesPath(synthCwd);
+      seedVersionedStore(version, projectPath);
+      const store = await readTrustStore(synthHome);
+      expect(store.malformed).toBe(true);
+      expect(store.malformedKind).toBe("parse");
+      expect(store.entries).toEqual({});
+      expect(trustStatusFor(projectPath, "anything", store)).toBe("store-unreadable");
+    });
+  }
+
+  it("still accepts the current schema version written explicitly", async () => {
+    // The other side of the range check: 1 is in range and stays healthy.
+    const projectPath = projectBundlesPath(synthCwd);
+    seedVersionedStore(TRUST_SCHEMA_VERSION, projectPath);
+    const store = await readTrustStore(synthHome);
+    expect(store.malformed).toBe(false);
+    expect(Object.keys(store.entries)).toEqual([normalizeTrustKey(projectPath)]);
+  });
+
+  it("denies a store whose version is the STRING '2' instead of assuming v1", async () => {
+    const projectPath = projectBundlesPath(synthCwd);
+    seedVersionedStore("2", projectPath);
     const store = await readTrustStore(synthHome);
     expect(store.malformed).toBe(true);
     expect(store.malformedKind).toBe("parse");

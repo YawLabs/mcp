@@ -115,9 +115,10 @@ export function parseAddArgs(
       case "--catalog": {
         const v = next();
         // Reject a following flag (e.g. `add slug --catalog --dry-run`, which
-        // would otherwise set catalogUrl="--dry-run" and drop the flag). A URL
-        // never starts with "--".
-        if (!v || v.startsWith("--")) return { ok: false, error: "--catalog requires a URL" };
+        // would otherwise set catalogUrl="--dry-run" and drop the flag). Single
+        // dash included, for the same reason the default case below rejects it:
+        // a URL never starts with "-".
+        if (!v || v.startsWith("-")) return { ok: false, error: "--catalog requires a URL" };
         opts.catalogUrl = v;
         break;
       }
@@ -125,7 +126,13 @@ export function parseAddArgs(
       case "--help":
         return { ok: false, error: ADD_USAGE, help: true };
       default:
-        if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${ADD_USAGE}` };
+        // Single dash included, not just "--": a mistyped SHORT flag (`add
+        // fetch -y`, `add -f fetch`) must be reported as an unknown flag
+        // instead of becoming a positional and failing later with the
+        // misleading "invalid slug" / "Expected exactly one server slug". Same
+        // posture parseRemoveArgs already takes, and no valid slug starts with
+        // "-" (SLUG_RE requires a leading alphanumeric).
+        if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${ADD_USAGE}` };
         positional.push(a);
     }
   }
@@ -285,6 +292,14 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       return { exitCode: 1, written: [] };
     }
     const previewNamespace = preview.namespace ?? namespace;
+    // Render the entry the run would WRITE, never the pre-merge object built
+    // above: an update folds onto whatever is already on disk (see
+    // mergeServerEntry), so the two differ on exactly the entries a user
+    // hand-edited -- a stored env value, a per-server override, and an
+    // explicit `"isActive": false` the add does NOT re-enable. Previewing the
+    // input described a file the run would never produce.
+    const previewEntry = preview.entry;
+    const previewPath = localBundlesPath(userConfigDir(home));
     if (preview.launchChanged) {
       printErr(
         `Note: this would CHANGE the entry's launch command:\n  from: ${preview.launchChanged.from}\n    to: ${preview.launchChanged.to}\nIf the existing entry is a different server you meant to keep, remove/re-add via the app or edit bundles.json instead.`,
@@ -306,9 +321,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
             ok: true,
             dryRun: true,
             namespace: previewNamespace,
-            path: localBundlesPath(userConfigDir(home)),
+            path: previewPath,
             replaced: preview.replaced,
-            entry: jsonEntry(entry),
+            entry: jsonEntry(previewEntry),
           },
           null,
           2,
@@ -320,8 +335,17 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
           ? `as namespace "${previewNamespace}"`
           : `keeping existing namespace "${previewNamespace}"`;
       print(`yaw-mcp add (dry-run): would ${preview.replaced ? "update" : "write"} ${server.name} ${nsNote}`);
-      print(`  command: ${entry.command} ${(entry.args ?? []).join(" ")}`);
-      if (entry.env) print(`  env keys: ${Object.keys(entry.env).join(", ")}`);
+      print(`  command: ${previewEntry.command} ${(previewEntry.args ?? []).join(" ")}`);
+      if (previewEntry.env) print(`  env keys: ${Object.keys(previewEntry.env).join(", ")}`);
+      // Same note the real run prints, in the conditional voice -- an add over
+      // a hand-disabled entry keeps it disabled (mergeServerEntry rule 3), so
+      // a preview that ended on the usual success line told the user this
+      // would make the server loadable when it would not.
+      if (previewEntry.isActive === false) {
+        print(
+          `Note: this entry is "isActive": false in ${previewPath}, so it would stay disabled and NOT load. Set it to true there to enable it.`,
+        );
+      }
     }
     return { exitCode: 0, written: [] };
   }
@@ -756,8 +780,13 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   }
 
   if (!res?.removed) {
-    // No-op exits 0 (like try-cleanup): "make it absent" succeeded.
-    print(`yaw-mcp remove: no server matching "${opts.target}" in ${res?.path ?? "bundles.json"} (nothing to do).`);
+    // No-op exits 0 (like try-cleanup): "make it absent" succeeded. The file is
+    // named from `path` above rather than off `res`: `candidates` is never
+    // empty, so the loop always ran and `res` is only nullable to the type
+    // checker -- and removeUserBundle derives the very same path from `home`,
+    // so a `res?.path ?? "bundles.json"` fallback could never fire and only
+    // documented an outcome that does not exist.
+    print(`yaw-mcp remove: no server matching "${opts.target}" in ${path} (nothing to do).`);
     // `list` reads the project-local bundles.json when present (it overrides
     // user-global), but `remove` only manages user-global -- so a server the
     // user just saw in `list` can be "not found" here. Explain when that's why.
@@ -796,6 +825,13 @@ export interface ListCommandOptions {
   json?: boolean;
   home?: string;
   cwd?: string;
+  /** Environment the command runs under. Only the project-trust gate inside
+   *  loadLocalBundles reads it (YAW_MCP_TRUST_PROJECT decides whether a project
+   *  bundles.json is honoured at all), but it must be threaded rather than left
+   *  to default inside the loader: `add` and `remove` deliberately inject theirs,
+   *  and an embedded or test caller that supplies an env expects THAT env to
+   *  decide which file `list` reads, not the real process's. */
+  env?: NodeJS.ProcessEnv;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Test hook: supply a grade cache instead of reading ~/.yaw-mcp/grades.json. */
@@ -855,7 +891,7 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
 
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
-  const loaded = await loadLocalBundles({ home, cwd });
+  const loaded = await loadLocalBundles({ home, cwd, env: opts.env ?? process.env });
   const servers = loaded.config?.servers ?? [];
 
   // Always surface load warnings so malformed-file problems aren't silently

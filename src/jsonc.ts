@@ -178,10 +178,16 @@ const FORMATTING_OPTIONS: FormattingOptions = {
  *
  *  Strips a leading UTF-8 BOM if present (Notepad on Windows defaults to
  *  BOM-prefixed UTF-8) so jsonc-parser sees clean bytes; we don't re-emit
- *  the BOM. */
+ *  the BOM.
+ *
+ *  Throws on an empty `entryName`. A path segment is a JSON key, and `""` is
+ *  not one the caller can ever have meant: jsonc-parser would happily write a
+ *  literal `"": value` entry into the user's config. The old guard only
+ *  rejected it when `containerPath` was ALSO empty, so `(['a'], '')` slipped
+ *  through and wrote that key one level down. */
 export function editJsoncEntry(src: string, containerPath: string[], entryName: string, value: unknown): string {
-  if (containerPath.length === 0 && entryName === "") {
-    throw new Error("editJsoncEntry: must specify at least one path segment");
+  if (entryName === "") {
+    throw new Error("editJsoncEntry: entryName must be a non-empty key");
   }
   const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
   const targetPath = [...containerPath, entryName];
@@ -197,10 +203,20 @@ export function editJsoncEntry(src: string, containerPath: string[], entryName: 
  *
  *  Same rationale as `editJsoncEntry`: a read-modify-write that goes through
  *  JSON.parse + JSON.stringify drops user comments; `jsonc-parser` emits a
- *  minimal text edit that only touches the target span. */
+ *  minimal text edit that only touches the target span.
+ *
+ *  ASYMMETRY, on purpose: the byte-for-byte guarantee covers the NO-OP path
+ *  only. On a real removal the leading UTF-8 BOM is stripped and NOT re-emitted
+ *  -- jsonc-parser's edit offsets are computed against the de-BOM'd text, so
+ *  the returned string starts at `{`. That is the same BOM loss the no-op path
+ *  was fixed to avoid, but here it rides along with a change the caller asked
+ *  for and is going to write back anyway, rather than manufacturing a phantom
+ *  one. Callers that must preserve a Notepad-saved BOM have to re-prepend it.
+ *
+ *  Throws on an empty `entryName`, for the same reason as `editJsoncEntry`. */
 export function removeJsoncEntry(src: string, containerPath: string[], entryName: string): string {
-  if (containerPath.length === 0 && entryName === "") {
-    throw new Error("removeJsoncEntry: must specify at least one path segment");
+  if (entryName === "") {
+    throw new Error("removeJsoncEntry: entryName must be a non-empty key");
   }
   const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
   const targetPath = [...containerPath, entryName];

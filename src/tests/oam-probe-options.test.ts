@@ -18,6 +18,8 @@
 // turning while a probe hangs".
 
 import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface SpawnCall {
@@ -95,6 +97,14 @@ const { OAM_PROBE_KILL_SIGNAL, OAM_PROBE_TIMEOUT_MS, probeOam, resetOamBinCache,
 
 describe("probeOam default runner", () => {
   const originalOamBin = process.env.OAM_BIN;
+  /** The OAM_BIN every case here runs with: an absolute path that CANNOT
+   *  exist. `spawn` is mocked, so nothing has to be on disk for the probe to
+   *  succeed -- but `binPath` is resolved against the REAL filesystem, and the
+   *  fixed "/usr/local/bin/oam" this used to carry is a path a macOS or Linux
+   *  developer with oam installed genuinely has, which turned the binPath
+   *  assertion below into a machine-dependent failure. Nothing is created, so
+   *  there is nothing to clean up. */
+  const missingBin = join(tmpdir(), `yaw-mcp-no-such-oam-${process.pid}`, "oam");
 
   beforeEach(() => {
     spawnCalls.length = 0;
@@ -109,7 +119,7 @@ describe("probeOam default runner", () => {
     exitCode = 0;
     exitSignal = null;
     resetOamBinCache();
-    process.env.OAM_BIN = "/usr/local/bin/oam";
+    process.env.OAM_BIN = missingBin;
   });
 
   afterEach(() => {
@@ -125,11 +135,15 @@ describe("probeOam default runner", () => {
     const probe = await probeOam();
 
     expect(spawnCalls).toHaveLength(1);
-    // Through winNormalize: OAM_BIN is backslash-converted on Windows so cmd
-    // does not read a leading "/usr" as a switch.
-    expect(spawnCalls[0].bin).toBe(winNormalize("/usr/local/bin/oam"));
+    // Through winNormalize: a forward-slash OAM_BIN is backslash-converted on
+    // Windows so cmd does not read a leading "/" as a switch.
+    expect(spawnCalls[0].bin).toBe(winNormalize(missingBin));
     expect(spawnCalls[0].args).toEqual(["--version"]);
     expect(spawnCalls[0].opts.stdio).toEqual(["ignore", "pipe", "ignore"]);
+    // Pinned too, because deleting it costs a console window flashing on every
+    // probe under a GUI-launched broker -- and the stdio assertion above would
+    // not notice.
+    expect(spawnCalls[0].opts.windowsHide).toBe(process.platform === "win32");
     expect(probe.version).toBe("9.9.9");
   });
 
@@ -138,10 +152,22 @@ describe("probeOam default runner", () => {
     // call blocked the loop outright, so nothing else could run until it
     // returned -- and with an unkillable child it never returned. Here the
     // probe is in flight and other work must still be scheduled and completed.
+    //
+    // Honest about what each assertion can catch. `otherWorkRan` alone cannot
+    // fail: the mocked spawn returns immediately and never blocks anything. It
+    // earns its place only PAIRED with `settled` below -- together they say the
+    // other work ran WHILE the probe was still outstanding, which is the actual
+    // claim. A regression to a synchronous probe does not fail either of them
+    // cleanly; it fails at the module boundary (this file's mock exports only
+    // `spawn`, so reaching for execFileSync throws) or by timing this test out.
     hangForever = true;
     vi.useFakeTimers();
 
-    const pending = probeOam();
+    let settled = false;
+    const pending = probeOam().then((p) => {
+      settled = true;
+      return p;
+    });
     let otherWorkRan = false;
     setTimeout(() => {
       otherWorkRan = true;
@@ -149,6 +175,7 @@ describe("probeOam default runner", () => {
 
     await vi.advanceTimersByTimeAsync(2);
     expect(otherWorkRan, "event loop was blocked by the probe").toBe(true);
+    expect(settled, "the probe settled before its deadline -- it was not in flight at all").toBe(false);
 
     // Now let the probe's own deadline expire.
     await vi.advanceTimersByTimeAsync(OAM_PROBE_TIMEOUT_MS);
@@ -227,6 +254,15 @@ describe("probeOam default runner", () => {
     // would all still pass -- while each broker start stalls the full 3s on the
     // deadline before degrading. `killed` being empty is what pins that: only
     // the timeout path attempts a kill.
+    //
+    // OAM_BIN is cleared for this one case. The beforeEach sets it purely to
+    // keep `binPath` off the real filesystem, but probeOam splits ENOENT on
+    // whether the name was OURS to guess: a path the USER named and that is not
+    // there is a broken configuration, tagged `failure`, while a bare `oam`
+    // missing from PATH is the routine node-only machine this test is about.
+    // The explicit half lives in oam-spawn-probe-log.test.ts; binPath is null
+    // on both paths, so nothing here depends on the variable being set.
+    delete process.env.OAM_BIN;
     const enoent = new Error("spawn oam ENOENT") as Error & { code?: string };
     enoent.code = "ENOENT";
     childError = enoent;
@@ -322,10 +358,11 @@ describe("probeOam default runner", () => {
 
     expect(probe.version).toBeNull();
     expect(probe.belowMin).toBe(false);
-    expect(probe.bin).toBe(winNormalize("/usr/local/bin/oam"));
+    expect(probe.bin).toBe(winNormalize(missingBin));
     expect(probe.failure).toBeNull();
-    // SPAWNABLE but not PERSISTABLE: this OAM_BIN does not exist on disk, so
-    // there is no absolute path to write into someone else's config -- and an
+    // SPAWNABLE but not PERSISTABLE: this OAM_BIN does not exist on disk (see
+    // missingBin -- it is a path chosen so that holds on every machine), so
+    // there is no absolute path to write into someone else's config, and an
     // entry pointing at nothing is worse than one running on node.
     expect(probe.binPath).toBeNull();
   });

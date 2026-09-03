@@ -99,6 +99,9 @@ export function findCmdMetacharToken(command: string, args: readonly string[]): 
 // Stored lowercase and matched case-insensitively: flag casing is a style
 // choice, not a semantic one, and a case-sensitive Set printed `--Token abc`
 // (or `--API-KEY=...`) with the secret fully in the clear.
+//
+// The exact set carries the short forms (`-p`) and the canonical spellings;
+// SECRET_FLAG_RE below is what covers everything else.
 const SECRET_FLAG_NAMES = new Set<string>([
   "--api-key",
   "--apikey",
@@ -110,6 +113,24 @@ const SECRET_FLAG_NAMES = new Set<string>([
   "-p",
 ]);
 
+/** Name-pattern fallback for secret-bearing flags outside the exact set.
+ *  An exact 8-name denylist is a leak-prevention control that fails open on
+ *  the first spelling nobody enumerated -- `--access-token`, `--client-secret`,
+ *  `--api_key`, `--bearer`, `--passwd`, `--credential` all printed their values
+ *  in the clear in the interactive preamble.
+ *
+ *  ANCHORED AT BOTH ENDS, and that is load-bearing: without the trailing
+ *  `[a-z0-9_-]*$` the pattern also matches `--token=abc` (the `=value` shape),
+ *  which sends it down the `--flag value` branch -- echoing the whole
+ *  `--token=abc` verbatim and redacting the innocent NEXT arg instead. The
+ *  anchor keeps `=` out, so the `=value` shape stays with the splitter below.
+ *
+ *  Deliberately over-matches (`--author`, `--credentials-file` redact too):
+ *  redaction is display-only -- the runner still receives the unredacted args
+ *  -- so a false positive costs one line of visibility while a false negative
+ *  prints a live credential. */
+const SECRET_FLAG_RE = /^--?[a-z0-9_-]*(token|secret|passw|apikey|api[-_]?key|auth|cred|bearer)[a-z0-9_-]*$/i;
+
 /**
  * Return a copy of `args` with the VALUE following any secret-bearing flag
  * replaced by "<redacted>". Two shapes are handled:
@@ -119,13 +140,14 @@ const SECRET_FLAG_NAMES = new Set<string>([
  * is the value, not the presence of the flag).
  * Flag matching is CASE-INSENSITIVE: `--Token` / `--API-KEY` redact exactly
  * like `--token` / `--api-key`. The flag name itself is echoed back with the
- * operator's original casing.
+ * operator's original casing. A flag outside the exact set still redacts when
+ * its NAME matches SECRET_FLAG_RE (`--access-token`, `--client_secret`, ...).
  *
  * Exported for tests -- the redaction is a leak-prevention control, so it is
  * asserted directly as well as through the `audit` preamble.
  */
 export function redactSecretArgs(args: readonly string[]): string[] {
-  const isSecretFlag = (s: string): boolean => SECRET_FLAG_NAMES.has(s.toLowerCase());
+  const isSecretFlag = (s: string): boolean => SECRET_FLAG_NAMES.has(s.toLowerCase()) || SECRET_FLAG_RE.test(s);
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i] ?? "";
@@ -413,7 +435,11 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     report = await runner(target);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log("error", "audit: compliance suite failed", { namespace, error: msg });
+    // DEBUG, not error: the prose line below carries the same facts and goes to
+    // the same stderr, so logging at error too put a raw JSON envelope directly
+    // in front of the human version of itself. Same double-report shape
+    // local-bundles.ts downgraded for its untrusted-project probe.
+    log("debug", "audit: compliance suite failed", { namespace, error: msg });
     printErr(`yaw-mcp audit: compliance suite failed for "${namespace}": ${msg}`);
     return { exitCode: 2, lines };
   }
@@ -441,7 +467,10 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     );
   } catch (err) {
     cacheError = err instanceof Error ? err.message : String(err);
-    log("error", "audit: grade cache write failed", { namespace, error: cacheError });
+    // DEBUG for the same reason as the runner failure above: `cacheError` is
+    // reported in prose on stderr at the end of this function (and in the
+    // --json payload), so an error-level envelope here only doubles it.
+    log("debug", "audit: grade cache write failed", { namespace, error: cacheError });
   }
 
   if (opts.json) {
@@ -453,6 +482,12 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
       grade: report.grade,
       score: report.score,
       gradedAt,
+      // The rubric that produced the letter. It is persisted to grades.json, so
+      // a --json consumer that omitted it could not tell an "A" graded under an
+      // older rubric from a current one -- the whole reason the field exists.
+      // OMITTED rather than null when the runner reported none, matching the
+      // cache entry (a pre-field entry simply has no key).
+      ...(report.suiteVersion !== undefined ? { suiteVersion: report.suiteVersion } : {}),
       cache: cachePath,
     };
     if (cacheError !== null) payload.cacheError = cacheError;

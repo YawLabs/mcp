@@ -80,6 +80,12 @@ export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}
   const run = await runTest(argv, err, await resolveComplianceSuiteSpec());
   if (!run) return 1;
 
+  // Cancelled by the operator (or a supervisor): there is no report to print
+  // and runTest has already said so on stderr. Hand back the 128 + signal
+  // status -- 130 for Ctrl-C, 143 for SIGTERM -- so a scripted caller can tell
+  // a cancellation from a `--min-grade` failure, which also exits non-zero.
+  if ("interrupted" in run) return run.code;
+
   printSummary(run.report, out);
 
   // Propagate the child's exit status. `--strict` and `--min-grade` are
@@ -202,6 +208,15 @@ function unquotableCharsFor(platform: NodeJS.Platform): string {
  * platform, so a target rejected for a `%` (win32-only) or a `'` (POSIX-only)
  * got an explanation naming nothing that was wrong with it. Installing npm is
  * still the primary remedy -- it removes the shell fallback entirely.
+ *
+ * The `offender === undefined` branch below is DEFENSIVE, not a production
+ * path: runTest -- the only production caller -- reaches here exactly when
+ * resolveNpxLaunch returned null, and the only way it returns null is
+ * quoteForShell refusing one of these same arguments, so the find always hits.
+ * The branch survives for direct callers (which is all its test exercises) and
+ * for a future resolveNpxLaunch that fails for some other reason, because
+ * rendering `JSON.stringify(undefined)` into the diagnostic would be strictly
+ * worse than one vaguer sentence.
  */
 export function formatLaunchFailure(npxArgs: string[], platform: NodeJS.Platform = process.platform): string {
   const offender = npxArgs.find((a) => quoteForShell(a, platform) === null);
@@ -347,10 +362,24 @@ function killTree(child: ChildProcess): void {
  *  a hang. */
 export const INTERRUPT_GRACE_MS = 3000;
 
-/** Exit status for a run the operator interrupted: the POSIX 128 + SIGINT(2)
- *  convention, so a shell / CI wrapper can tell "user cancelled" from a real
- *  compliance failure. */
+/** Exit status for a run the operator interrupted with Ctrl-C: the POSIX
+ *  128 + SIGINT(2) convention, so a shell / CI wrapper can tell "user
+ *  cancelled" from a real compliance failure. */
 export const INTERRUPT_EXIT_CODE = 130;
+
+/** Exit status for a run a supervisor terminated: 128 + SIGTERM(15). SIGTERM
+ *  shares SIGINT's handler -- one child, one teardown -- and reporting BOTH as
+ *  130 defeated the very discrimination these constants exist for: a wrapper
+ *  reading 130 as "the operator pressed Ctrl-C" got the same answer when
+ *  systemd or a CI runner killed the job. */
+export const TERMINATED_EXIT_CODE = 143;
+
+/** The 128 + signal status for whichever signal ended the run. Everything but
+ *  SIGTERM is an interrupt: SIGINT is the only other signal handled here, and
+ *  an absent signal (a direct call, not the process listener) means Ctrl-C. */
+export function signalExitCode(signal: NodeJS.Signals | undefined): number {
+  return signal === "SIGTERM" ? TERMINATED_EXIT_CODE : INTERRUPT_EXIT_CODE;
+}
 
 /**
  * Ctrl-C handling for one spawned child, as a cancellable pair.
@@ -370,6 +399,10 @@ export const INTERRUPT_EXIT_CODE = 130;
  * called from every path that settles the run -- a child that dies promptly, the
  * normal case, never reaches the fallback.
  *
+ * The forced exit reports 128 + the signal that arrived, not a fixed 130:
+ * node hands its signal listeners the signal name, so a SIGTERM teardown ends
+ * 143 even though it shares this handler with Ctrl-C.
+ *
  * Exported (with injectable clock/exit/kill seams) because the failure it
  * guards against is a killTree that does nothing, which cannot be provoked
  * through the real process signal path in a test.
@@ -381,16 +414,18 @@ export function createInterruptHandler(
     exit?: (code: number) => void;
     kill?: (c: ChildProcess) => void;
   } = {},
-): { onInterrupt: () => void; cancel: () => void } {
+): { onInterrupt: (signal?: NodeJS.Signals) => void; cancel: () => void } {
   const graceMs = opts.graceMs ?? INTERRUPT_GRACE_MS;
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const kill = opts.kill ?? killTree;
   let timer: ReturnType<typeof setTimeout> | undefined;
   return {
-    onInterrupt: (): void => {
+    onInterrupt: (signal?: NodeJS.Signals): void => {
       kill(child);
       // A repeat interrupt must not stack a second fallback timer; the first
-      // one is already counting down against the same child.
+      // one is already counting down against the same child. The FIRST signal
+      // also fixes the status -- a SIGTERM arriving after a Ctrl-C does not
+      // relabel a cancellation as a termination.
       if (timer !== undefined) return;
       timer = setTimeout(() => {
         try {
@@ -398,7 +433,7 @@ export function createInterruptHandler(
         } catch {
           // already exited, or never started -- the exit below is the point
         }
-        exit(INTERRUPT_EXIT_CODE);
+        exit(signalExitCode(signal));
       }, graceMs);
       // The fallback must not be the reason the process stays alive: if
       // everything else has finished, node should exit on its own.
@@ -421,7 +456,19 @@ interface ComplianceRun {
   code: number | null;
 }
 
-function runTest(args: string[], err: (s: string) => void, suiteSpec: string): Promise<ComplianceRun | null> {
+/** A run the operator cancelled before the child produced a usable report.
+ *  A distinct shape rather than a ComplianceRun with a missing report: the
+ *  caller must route it AROUND printSummary, which would throw on
+ *  `report.score.toFixed` -- the exact crash isRenderableReport exists to
+ *  prevent. `code` is the 128 + signal status (see signalExitCode). */
+interface InterruptedRun {
+  interrupted: true;
+  code: number;
+}
+
+type ComplianceOutcome = ComplianceRun | InterruptedRun;
+
+function runTest(args: string[], err: (s: string) => void, suiteSpec: string): Promise<ComplianceOutcome | null> {
   return new Promise((resolve) => {
     let settled = false;
     const fail = (message: string): void => {
@@ -464,8 +511,19 @@ function runTest(args: string[], err: (s: string) => void, suiteSpec: string): P
     // the promise settles so nothing leaks into the rest of the CLI, and the
     // handler's bounded fallback (see createInterruptHandler) is disarmed with
     // them so a run that ended normally never force-exits.
+    //
+    // The signal is recorded because installing these listeners SUPPRESSED
+    // node's default die-on-signal: without the record the killed child's
+    // close event landed in the "exited N without valid JSON output" branch,
+    // which reads as a tool malfunction and exits 1 -- indistinguishable from
+    // a genuine parse failure or a --min-grade gate failure. First signal
+    // wins, so a follow-up SIGTERM cannot relabel a cancellation.
     const interrupt = createInterruptHandler(child);
-    const onInterrupt = interrupt.onInterrupt;
+    let interruptedBy: NodeJS.Signals | undefined;
+    const onInterrupt = (signal: NodeJS.Signals): void => {
+      interruptedBy ??= signal;
+      interrupt.onInterrupt(signal);
+    };
     process.once("SIGINT", onInterrupt);
     process.once("SIGTERM", onInterrupt);
     const releaseSignals = (): void => {
@@ -518,6 +576,16 @@ function runTest(args: string[], err: (s: string) => void, suiteSpec: string): P
       settled = true;
       clearTimeout(timer);
       releaseSignals();
+      // A cancelled run has no usable report -- the child was killed
+      // mid-write, so the parse below is EXPECTED to fail. Say "interrupted"
+      // and hand back 128 + signal instead of a diagnostic that reads as a
+      // tool malfunction. Deliberately scoped to the report-failure branches:
+      // in the race where the child completed as the signal arrived, the
+      // parsed report and its --strict / --min-grade verdict still win.
+      const cancelled = (): void => {
+        err("\nmcp-compliance interrupted.\n");
+        resolve({ interrupted: true, code: signalExitCode(interruptedBy) });
+      };
       // mcp-compliance exits non-zero on --strict / --min-grade failures but
       // still writes a valid JSON report. Try parsing regardless of exit code,
       // and hand the code back so the caller can propagate it.
@@ -525,12 +593,20 @@ function runTest(args: string[], err: (s: string) => void, suiteSpec: string): P
       try {
         const parsed = JSON.parse(stdout) as ComplianceReport;
         if (!isRenderableReport(parsed)) {
+          if (interruptedBy !== undefined) {
+            cancelled();
+            return;
+          }
           err(`\nmcp-compliance returned unexpected JSON (exit ${code}).\n`);
           resolve(null);
           return;
         }
         resolve({ report: parsed, code });
       } catch {
+        if (interruptedBy !== undefined) {
+          cancelled();
+          return;
+        }
         err(`\nmcp-compliance exited ${code} without valid JSON output.\n`);
         resolve(null);
       }

@@ -39,17 +39,37 @@ export function findTool(tools: UpstreamToolDef[], toolName: string): UpstreamTo
 // tolerable for nested property trees; no maxDepth — schema shapes
 // are bounded in practice and truncating mid-schema would be worse
 // than a long response.
+//
+// Everything UpstreamToolDef carries is rendered, not just inputSchema:
+// `outputSchema` is exactly what an exec caller needs to write correct
+// `$ref` paths into a step's output, and `title` / `annotations` are what
+// the tool would present with once loaded. Dropping them made this surface
+// answer a narrower question than the one the caller asked.
 export function formatReadToolOutput(result: ReadToolResult): string {
   const { tool, server, loaded } = result;
   const lines: string[] = [];
-  lines.push(`Tool: ${server.namespace}_${tool.name}`);
+  // The namespaced name comes off the tool def rather than being rebuilt
+  // from `${namespace}_${name}` here: upstream.ts already derives it once,
+  // and a second copy of that rule drifts the moment the derivation changes.
+  lines.push(`Tool: ${tool.namespacedName}`);
   lines.push(`Server: ${server.name} (${server.namespace})`);
+  if (tool.title) {
+    lines.push(`Title: ${tool.title}`);
+  }
   if (tool.description) {
     lines.push(`Description: ${tool.description}`);
+  }
+  if (tool.annotations) {
+    lines.push(`Annotations: ${JSON.stringify(tool.annotations)}`);
   }
   lines.push("");
   lines.push("Input schema:");
   lines.push(JSON.stringify(tool.inputSchema ?? {}, null, 2));
+  if (tool.outputSchema) {
+    lines.push("");
+    lines.push("Output schema:");
+    lines.push(JSON.stringify(tool.outputSchema, null, 2));
+  }
   if (!loaded) {
     lines.push("");
     lines.push(

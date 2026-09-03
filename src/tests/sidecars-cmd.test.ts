@@ -5,13 +5,14 @@
 // exercised against the filesystem is the manifest that gets written, since
 // that is the contract npm consumes.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isRegistrySpec, type OamProbe } from "../oam-spawn.js";
 import {
   collectNonRegistrySpecs,
+  collectRangeSpecs,
   collectSidecarSpecs,
   installedPlatform,
   installedVersion,
@@ -110,6 +111,27 @@ describe("collectSidecarSpecs", () => {
       local({ namespace: "gitwin", command: "npx.cmd", args: ["-y", "github:owner/repo"] }),
     ]);
     expect(skipped).toEqual([{ namespace: "gitwin", spec: "github:owner/repo" }]);
+  });
+
+  it("passes over a version-range spec, which the oam rewrite refuses everywhere", () => {
+    // rewriteForOam stays on npx for a range (specConstraint -> "range"), so a
+    // package installed for one lands in a managed tree nothing ever reads,
+    // while "These versions are now fixed" claims the opposite for it. That is
+    // the install/spawn partition drift the module header says must not happen,
+    // so the range is reported by collectRangeSpecs instead of installed.
+    const servers = [
+      local({ namespace: "ranged", command: "npx", args: ["-y", "@yawlabs/postgres-mcp@^1.2.3"] }),
+      local({ namespace: "fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }),
+    ];
+
+    expect(collectSidecarSpecs(servers).map((s) => s.pkg)).toEqual(["@yawlabs/fetch-mcp"]);
+    expect(collectRangeSpecs(servers)).toEqual([{ namespace: "ranged", spec: "@yawlabs/postgres-mcp@^1.2.3" }]);
+
+    // An exact pin is NOT a range: the rewrite honours it whenever the on-disk
+    // copy declares that version, so the managed copy really is read for it.
+    const pinned = [local({ namespace: "pinned", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@1.2.3"] })];
+    expect(collectSidecarSpecs(pinned).map((s) => s.pkg)).toEqual(["@yawlabs/fetch-mcp"]);
+    expect(collectRangeSpecs(pinned)).toEqual([]);
   });
 
   it("skips an npx launch whose first positional is a flag", () => {
@@ -289,6 +311,23 @@ describe("parseSidecarsArgs", () => {
   });
 });
 
+/** Every key the `--json` document carries, on every path (SidecarsJson).
+ *
+ *  ONE fixture, because three tests below pin this contract: adding a field to
+ *  SidecarsJson was three hand-edits, and a partial update left whichever copy
+ *  was missed pinning a stale shape -- passing while the document had grown. */
+const JSON_KEYS = [
+  "root",
+  "installed",
+  "reason",
+  "error",
+  "updateError",
+  "markerError",
+  "unhosted",
+  "conflicts",
+  "skipped",
+].sort();
+
 describe("runSidecarsInstall", () => {
   let home: string;
 
@@ -369,9 +408,7 @@ describe("runSidecarsInstall", () => {
     // command prints it and this one used to drop it on the floor.
     expect(warnings.join("\n")).toContain("invalid JSON");
     // Same keys as every other path, so the document stays uniform.
-    expect(Object.keys(doc).sort()).toEqual(
-      ["root", "installed", "reason", "error", "updateError", "markerError", "unhosted", "conflicts", "skipped"].sort(),
-    );
+    expect(Object.keys(doc).sort()).toEqual(JSON_KEYS);
   });
 
   it("does not offer `yaw-mcp add` when the config exists but is broken", async () => {
@@ -469,6 +506,92 @@ describe("runSidecarsInstall", () => {
     expect(manifest.dependencies).toEqual({ "@yawlabs/fetch-mcp": "latest" });
   });
 
+  it("names the user-global config it installed from, with no shared-tree warning", async () => {
+    // The install list can come from either scope, and the managed tree is
+    // keyed on HOME alone -- so the command names the file it read. From the
+    // user-global file there is nothing to warn about: that IS the one config
+    // every project shares.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      runNpm: async () => 0,
+      out: () => {},
+      err: () => {},
+      oamProbe: noOam,
+    });
+
+    const text = res.lines.join("\n");
+    expect(text).toContain(`from ${join(home, ".yaw-mcp", "bundles.json")}`);
+    expect(text, "the user-global file is not a project shadowing the shared tree").not.toContain(
+      "shared by every project",
+    );
+  });
+
+  it("warns that a PROJECT config rewrites the tree every project shares", async () => {
+    // An install run in project A writes A's dependency set into the one
+    // directory every project shares, and npm prunes whatever B put there --
+    // after which B's broker resolves out of that tree, on A's versions, with
+    // nothing in B to say why. The in-config conflict note cannot see this: it
+    // compares specs WITHIN one config. Naming the source is the cheap half of
+    // the fix, and it is the half a loader normalisation change could silently
+    // drop (the comparison is against the user-global path).
+    const project = join(home, "proj");
+    mkdirSync(join(project, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(project, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          {
+            id: "1",
+            name: "F",
+            namespace: "fetch",
+            type: "local",
+            transport: "stdio",
+            command: "npx",
+            args: ["-y", "@yawlabs/fetch-mcp@latest"],
+          },
+        ],
+      }),
+    );
+    // The loader gates a project file on `yaw-mcp trust`; the documented CI
+    // escape hatch is what makes this reachable without a trust store fixture.
+    // runSidecarsInstall does not take an `env`, so it has to be the real one.
+    const priorBypass = process.env.YAW_MCP_TRUST_PROJECT;
+    process.env.YAW_MCP_TRUST_PROJECT = "1";
+    try {
+      const res = await runSidecarsInstall({
+        home,
+        cwd: project,
+        runNpm: async () => 0,
+        out: () => {},
+        err: () => {},
+        oamProbe: noOam,
+      });
+
+      const text = res.lines.join("\n");
+      // realpath, because the project walk resolves symlinks (macOS /tmp) while
+      // the user-global path is used verbatim.
+      expect(text).toContain(`from ${join(realpathSync(project), ".yaw-mcp", "bundles.json")}`);
+      expect(text).toContain("shared by every project on this machine");
+    } finally {
+      if (priorBypass === undefined) delete process.env.YAW_MCP_TRUST_PROJECT;
+      else process.env.YAW_MCP_TRUST_PROJECT = priorBypass;
+    }
+  });
+
   it("installs for a Windows-shaped `npx.cmd` server, same as bare npx", async () => {
     // The end-to-end half of the classifier test above: a bundles.json written
     // by hand on Windows (README documents hand-editing) can carry `npx.cmd`,
@@ -542,9 +665,74 @@ describe("runSidecarsInstall", () => {
         args: ["-y", "@yawlabs/fetch-mcp@latest"],
       },
     ]);
+    const verbs: string[] = [];
 
-    await runSidecarsInstall({ home, cwd: home, runNpm: async () => 1, out: () => {} });
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      runNpm: async (args) => {
+        verbs.push(args[0]);
+        return 1;
+      },
+    });
 
+    // Anchored to the failure it is ABOUT. A null marker also holds when the
+    // run never reached npm at all (an unreadable bundles.json, a manifest
+    // write that failed), so without these the test could keep passing while
+    // the branch it exists for was gone.
+    expect(verbs, "npm really ran, and npm is what refused").toEqual(["install"]);
+    expect(res.exitCode).toBe(1);
+    expect(res.lines.join("\n")).toContain("npm install failed");
+    expect(installedPlatform(home)).toBeNull();
+  });
+
+  it("keeps a marker-write failure non-fatal, and reports it on stderr and in --json", async () => {
+    // The tree IS installed at this point, so a marker that cannot be written
+    // must not undo it (exit 0) -- but it cannot be silent either, or doctor
+    // later calls a perfectly good tree "pre-marker" with no trail to why.
+    // A DIRECTORY where platform.json goes makes the publishing rename fail on
+    // every platform, standing in for the permission class.
+    writeBundles([
+      {
+        id: "1",
+        name: "F",
+        namespace: "fetch",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@yawlabs/fetch-mcp@latest"],
+      },
+    ]);
+    mkdirSync(sidecarsPlatformPath(home), { recursive: true });
+    const errs: string[] = [];
+    let out = "";
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      err: (s) => errs.push(s),
+      oamProbe: noOam,
+      runNpm: async () => {
+        const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+        return 0;
+      },
+    });
+
+    const doc = JSON.parse(out);
+    expect(res.exitCode, "the packages are on disk and usable").toBe(0);
+    expect(doc.error, "the install itself worked").toBeNull();
+    expect(doc.installed[0].version).toBe("0.3.6");
+    expect(doc.markerError, "the marker write is what failed").not.toBeNull();
+    // stderr as well as the document: `print` is suppressed under --json, so
+    // this is the only channel a human running it that way would see.
+    expect(errs.join("\n")).toContain("could not record the platform marker");
     expect(installedPlatform(home)).toBeNull();
   });
 
@@ -773,9 +961,7 @@ describe("runSidecarsInstall", () => {
     expect(res.exitCode).toBe(1);
     expect(npmCalled).toBe(false);
     const doc = JSON.parse(out);
-    expect(Object.keys(doc).sort()).toEqual(
-      ["root", "installed", "reason", "error", "updateError", "markerError", "unhosted", "conflicts", "skipped"].sort(),
-    );
+    expect(Object.keys(doc).sort()).toEqual(JSON_KEYS);
     expect(doc.error).toMatch(/manifest write failed/);
     expect(doc.installed).toEqual([]);
   });
@@ -785,17 +971,6 @@ describe("runSidecarsInstall", () => {
     // could not read `root` without first working out which path it hit. Pin
     // the shape: same keys whether the install worked, found nothing, or
     // failed.
-    const KEYS = [
-      "root",
-      "installed",
-      "reason",
-      "error",
-      "updateError",
-      "markerError",
-      "unhosted",
-      "conflicts",
-      "skipped",
-    ].sort();
     const npxServer = {
       id: "1",
       name: "F",
@@ -839,7 +1014,7 @@ describe("runSidecarsInstall", () => {
     const ok = await capture([npxServer], 0, landPackage);
 
     for (const doc of [empty, failed, emptyTree, ok]) {
-      expect(Object.keys(doc).sort()).toEqual(KEYS);
+      expect(Object.keys(doc).sort()).toEqual(JSON_KEYS);
       expect(typeof doc.root).toBe("string");
     }
     expect(empty.reason).toBe("no-npx-servers");
@@ -853,8 +1028,9 @@ describe("runSidecarsInstall", () => {
   });
 
   it("says so when nothing will read the tree it just filled", async () => {
-    // collectSidecarSpecs filters on `command === "npx"` and nothing else, but
-    // the managed tree is read ONLY by resolveNpmEntry on the oam rewrite path.
+    // collectSidecarSpecs filters on the npx launch SHAPE (nodeLaunchKind, per
+    // the classifier test above -- never `command === "npx"`) and nothing else,
+    // but the managed tree is read ONLY by resolveNpmEntry on the oam path.
     // A server pinned to the node runtime spawns through npx and never looks
     // there, so "These versions are now fixed" on its own tells the user their
     // servers are pinned when nothing has changed. `runtime: "node"` is checked
@@ -912,6 +1088,10 @@ describe("runSidecarsInstall", () => {
       oamProbe: async () => probeWith("oam"),
     });
 
+    // Anchor the negative to the success path: the note is printed right after
+    // this line, so an absent "Nothing reads these copies" means the verdict
+    // really was reached and was empty -- not that the run ended earlier.
+    expect(res.lines.join("\n")).toContain("These versions are now fixed");
     expect(res.lines.join("\n")).not.toContain("Nothing reads these copies");
   });
 
@@ -1011,18 +1191,30 @@ describe("runSidecarsInstall", () => {
     ]);
     let out = "";
 
-    await runSidecarsInstall({
+    const res = await runSidecarsInstall({
       home,
       cwd: home,
       json: true,
       out: (s) => {
         out += s;
       },
-      runNpm: async () => 0,
+      // A REAL success -- `[]` is jsonDocument's default for `unhosted` on
+      // every path, including manifest-write-failed and npm-failed, so without
+      // landing a package this asserted nothing about the verdict.
+      runNpm: async () => {
+        const dir = join(sidecarsNodeModules(home), "@yawlabs", "fetch-mcp");
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+        return 0;
+      },
       oamProbe: async () => probeWith("oam"),
     });
 
-    expect(JSON.parse(out).unhosted).toEqual([]);
+    const doc = JSON.parse(out);
+    expect(res.exitCode).toBe(0);
+    expect(doc.error).toBeNull();
+    expect(doc.installed[0].version).toBe("0.3.6");
+    expect(doc.unhosted).toEqual([]);
   });
 
   it("reports which spec won when a package is configured at two versions", async () => {

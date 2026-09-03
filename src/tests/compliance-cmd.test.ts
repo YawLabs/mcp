@@ -12,6 +12,7 @@ import {
   resolveComplianceSuiteSpec,
   resolveNpxLaunch,
   runComplianceCommand,
+  TERMINATED_EXIT_CODE,
 } from "../compliance-cmd.js";
 
 function captureIo() {
@@ -273,7 +274,15 @@ describe("resolveNpxLaunch", () => {
   it("the resolved launch actually spawns on this host", async () => {
     const launch = resolveNpxLaunch(["--version"]);
     expect(launch).not.toBeNull();
-    if (!launch || launch.shell) return; // no npx-cli.js here; nothing to smoke
+    // FAIL, don't skip. This used to be `if (!launch || launch.shell) return`,
+    // which fired on any host where npx-cli.js is not beside the node binary
+    // and left the whole case green with nothing smoked -- the only assertion
+    // that ever ran was one resolveNpxLaunch can hardly fail. A host that
+    // resolves only the shell fallback is precisely the broken-install case
+    // worth hearing about, not a reason to pass quietly.
+    expect(launch?.shell).toBe(false);
+    // Narrowing only: the assertion above has already failed if launch is null.
+    if (!launch) return;
     const code = await new Promise<number | null>((resolve, reject) => {
       const child = spawn(launch.command, launch.args, { stdio: ["ignore", "ignore", "ignore"] });
       child.on("error", reject);
@@ -315,10 +324,18 @@ describe("formatLaunchFailure", () => {
     expect(msg.split("\n")).toHaveLength(5);
   });
 
-  it("still explains itself if no single argument is to blame", () => {
+  it("still explains itself if no single argument is to blame (direct callers only)", () => {
+    // Not a production shape: runTest reaches formatLaunchFailure only when
+    // resolveNpxLaunch returned null, which happens only after quoteForShell
+    // refused one of these same arguments -- so an offender is always found on
+    // that path and this branch is defensive. Pinned anyway, because the
+    // alternative it guards against is rendering `undefined` into the
+    // diagnostic if resolveNpxLaunch ever gains another way to fail.
     const msg = formatLaunchFailure(["-y", "pkg"], "linux");
     expect(msg).toContain("Install npm");
     expect(msg).toContain("cannot be safely quoted");
+    // Nothing is echoed, precisely because nothing is to blame.
+    expect(msg).not.toContain("this argument");
   });
 
   it("names the trailing backslash and echoes the offending win32 path", () => {
@@ -604,7 +621,9 @@ describe("runComplianceCommand child exit propagation", () => {
     tests: [],
   };
 
-  async function runWithChildExit(exitCode: number | null) {
+  // `bytes` defaults to the fixture report above; the report-failure cases
+  // below hand it stdout the parse gate is meant to reject.
+  async function runWithChildExit(exitCode: number | null, bytes: Buffer = Buffer.from(JSON.stringify(report))) {
     vi.resetModules();
     vi.doMock("node:child_process", () => {
       const spawn = (): EventEmitter & { stdout: EventEmitter; pid: number; kill: () => boolean } => {
@@ -617,7 +636,7 @@ describe("runComplianceCommand child exit propagation", () => {
         child.pid = 4242;
         child.kill = () => true;
         setImmediate(() => {
-          child.stdout.emit("data", Buffer.from(JSON.stringify(report)));
+          child.stdout.emit("data", bytes);
           child.emit("close", exitCode);
         });
         return child;
@@ -652,6 +671,27 @@ describe("runComplianceCommand child exit propagation", () => {
   it("reports a signal death (null code) as 1", async () => {
     const r = await runWithChildExit(null);
     expect(r.code).toBe(1);
+  });
+
+  // isRenderableReport is exhaustively unit-tested; its only PRODUCTION caller
+  // was not. If the guard or its resolve(null) broke, an offline or
+  // misconfigured run would print a raw TypeError out of printSummary instead
+  // of a one-line diagnostic, and the CLI would die on an unhandled rejection
+  // rather than exit 1.
+  it("routes parseable-but-unrenderable JSON to the unexpected-JSON diagnostic", async () => {
+    // A string score is the crash case: printSummary calls score.toFixed(1).
+    const r = await runWithChildExit(0, Buffer.from(JSON.stringify({ ...report, score: "91.5" })));
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("mcp-compliance returned unexpected JSON (exit 0)");
+    // printSummary is never reached -- nothing at all lands on stdout.
+    expect(r.out).toBe("");
+  });
+
+  it("reports unparseable stdout with the child's exit code and prints no summary", async () => {
+    const r = await runWithChildExit(3, Buffer.from("not json"));
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("mcp-compliance exited 3 without valid JSON output");
+    expect(r.out).toBe("");
   });
 
   it("reassembles a multi-byte UTF-8 sequence split across two pipe chunks", async () => {
@@ -701,5 +741,184 @@ describe("runComplianceCommand child exit propagation", () => {
       vi.doUnmock("node:child_process");
       vi.resetModules();
     }
+  });
+});
+
+// A mock child with a deliberately UNDEFINED pid. Every case below reaches the
+// real killTree, and with no pid it takes the plain `child.kill()` path instead
+// of signalling a process group (POSIX) or shelling out to taskkill (win32)
+// against a pid this file invented.
+type MockChild = EventEmitter & { stdout: EventEmitter; pid: number | undefined; kill: () => boolean };
+
+/** doMock node:child_process with a spawn that hands the started child back to
+ *  the caller. Resolves the moment runTest spawns, so the test can drive
+ *  stdout, signals and close explicitly instead of racing setImmediate. */
+function mockSpawnedChild(onKill: () => void = () => {}): Promise<MockChild> {
+  let started: (c: MockChild) => void = () => {};
+  const child = new Promise<MockChild>((resolve) => {
+    started = resolve;
+  });
+  vi.resetModules();
+  vi.doMock("node:child_process", () => {
+    const spawn = (): MockChild => {
+      const c = new EventEmitter() as MockChild;
+      c.stdout = new EventEmitter();
+      c.pid = undefined;
+      c.kill = () => {
+        onKill();
+        return true;
+      };
+      started(c);
+      return c;
+    };
+    return { spawn, default: { spawn } };
+  });
+  return child;
+}
+
+// The two child guardrails -- a 5-minute wall-clock timeout and a 16 MB stdout
+// cap -- had never executed in a test, so the kill-and-resolve sequencing they
+// share (settled flag, clearTimeout, releaseSignals, killTree) was unverified
+// in the exact two paths that also call the real killTree.
+describe("runComplianceCommand child guardrails", () => {
+  it("kills a hung child and exits 1 when the wall-clock timeout fires", async () => {
+    let kills = 0;
+    const started = mockSpawnedChild(() => {
+      kills += 1;
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      // Fake timers only AFTER the dynamic import -- module resolution is real
+      // I/O, and so is the suite-spec read inside the command, which settles
+      // under fake timers because it is fs work rather than a timer.
+      vi.useFakeTimers();
+      const pending = mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      // Awaiting the spawned child proves the timeout below is already armed.
+      const child = await started;
+      // No stdout at all: the hung-server case the timeout exists for.
+      vi.advanceTimersByTime(5 * 60 * 1000);
+      expect(await pending).toBe(1);
+      expect(cap.err()).toBe("\nmcp-compliance timed out after 300s; killed.\n");
+      expect(cap.out()).toBe("");
+      expect(kills).toBe(1);
+      // A close arriving after the kill must not double-resolve or print a
+      // second diagnostic -- the settled flag is the only thing stopping it.
+      child.emit("close", null);
+      expect(cap.err()).toBe("\nmcp-compliance timed out after 300s; killed.\n");
+      expect(cap.out()).toBe("");
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("kills the child and exits 1 when stdout blows past the 16 MB cap", async () => {
+    let kills = 0;
+    const started = mockSpawnedChild(() => {
+      kills += 1;
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const pending = mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      const child = await started;
+      // One chunk past the cap: the guard counts running bytes per chunk, so it
+      // fires on arrival rather than buffering the whole stream to close.
+      child.stdout.emit("data", Buffer.alloc(17 * 1024 * 1024));
+      expect(await pending).toBe(1);
+      expect(cap.err()).toBe("\nmcp-compliance produced more than 16 MB of output; killed.\n");
+      expect(cap.out()).toBe("");
+      expect(kills).toBe(1);
+      child.emit("close", null);
+      expect(cap.err()).toBe("\nmcp-compliance produced more than 16 MB of output; killed.\n");
+      expect(cap.out()).toBe("");
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+});
+
+// Ctrl-C used to read as a malfunction of the tool. Installing the SIGINT
+// listener SUPPRESSES node's die-on-signal, so the killed child's close event
+// fell into the "exited N without valid JSON output" branch: the message named
+// nothing the operator had done, and the status was 1 -- indistinguishable
+// from a genuine parse failure or a --min-grade gate failure, which is exactly
+// the discrimination INTERRUPT_EXIT_CODE exists to provide.
+describe("runComplianceCommand cancellation", () => {
+  const report = {
+    grade: "F",
+    score: 12,
+    url: "https://example.com/mcp",
+    summary: { total: 10, passed: 2, failed: 8, required: 5, requiredPassed: 1 },
+    tests: [],
+  };
+
+  /** Invoke the listener runTest just registered, rather than
+   *  `process.emit(signal)`: emitting the real signal name on the test worker
+   *  would also wake vitest's own handlers. Ours is the most recent. */
+  function fireSignal(signal: NodeJS.Signals): void {
+    const listeners = process.listeners(signal);
+    const handler = listeners[listeners.length - 1];
+    expect(handler).toBeTypeOf("function");
+    handler(signal);
+  }
+
+  async function runCancelled(signal: NodeJS.Signals, bytes: Buffer, closeCode: number | null) {
+    const started = mockSpawnedChild();
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const pending = mod.runComplianceCommand(["https://example.com/mcp", "--min-grade", "A"], cap.io);
+      const child = await started;
+      if (bytes.length > 0) child.stdout.emit("data", bytes);
+      fireSignal(signal);
+      // The kill lands and the child closes, leaving whatever partial (or
+      // absent) stdout it had already written.
+      child.emit("close", closeCode);
+      return { code: await pending, out: cap.out(), err: cap.err() };
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  }
+
+  it("reports Ctrl-C as an interruption with the 130 status", async () => {
+    const r = await runCancelled("SIGINT", Buffer.from(""), null);
+    expect(r.code).toBe(INTERRUPT_EXIT_CODE);
+    expect(r.err).toBe("\nmcp-compliance interrupted.\n");
+    // The message this replaces named a malfunction, not a cancellation.
+    expect(r.err).not.toContain("without valid JSON output");
+    expect(r.out).toBe("");
+  });
+
+  it("treats a report truncated by the kill as a cancellation, not unexpected JSON", async () => {
+    // A child killed mid-write can leave stdout that still parses but fails the
+    // render gate. That is the same cancellation, not a broken suite.
+    const r = await runCancelled("SIGINT", Buffer.from(JSON.stringify({ grade: "A" })), null);
+    expect(r.code).toBe(INTERRUPT_EXIT_CODE);
+    expect(r.err).toBe("\nmcp-compliance interrupted.\n");
+    expect(r.err).not.toContain("unexpected JSON");
+  });
+
+  it("reports SIGTERM as 143 rather than the interrupt's 130", async () => {
+    // SIGTERM shares SIGINT's handler (one child, one teardown), so both used
+    // to end 130 -- a wrapper could not tell a supervisor kill from a Ctrl-C.
+    const r = await runCancelled("SIGTERM", Buffer.from(""), null);
+    expect(r.code).toBe(TERMINATED_EXIT_CODE);
+    expect(r.code).not.toBe(INTERRUPT_EXIT_CODE);
+    expect(r.err).toBe("\nmcp-compliance interrupted.\n");
+  });
+
+  it("keeps the child's real verdict when a complete report beat the signal", async () => {
+    // The race: the child finished as the signal arrived. A renderable report
+    // is still a result, and reporting 130 would swallow the --min-grade
+    // verdict its exit code carries.
+    const r = await runCancelled("SIGINT", Buffer.from(JSON.stringify(report)), 1);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("Compliance: F");
+    expect(r.err).toBe("");
   });
 });

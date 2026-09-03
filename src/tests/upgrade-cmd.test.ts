@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { quoteArgForDisplay, quoteShellArgIfNeeded } from "../auto-upgrade.js";
+import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
 import {
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
   fetchLatestVersion,
-  type InstallMethod,
   killProcessTree,
   localInstallRoot,
   npmGlobalPrefix,
@@ -15,11 +15,22 @@ import {
   runUpgrade,
 } from "../upgrade-cmd.js";
 
-/** An oam probe answer for runUpgrade's advisory floor line. Only the two
- *  fields the line reads are needed. */
+/** An oam probe answer for runUpgrade's advisory floor line. The note reads
+ *  only `version` and `belowMin`, but the hook takes oam-spawn's real OamProbe
+ *  -- the same object the un-injected path gets back from probeOam -- so a
+ *  fixture here cannot quietly drift from production's shape. */
 const oamProbe =
   (belowMin: boolean, version: string | null = "0.8.2") =>
-  async () => ({ version, belowMin });
+  async (): Promise<OamProbe> => ({
+    // bin/binPath are null exactly when the version is below the floor: that
+    // IS the below-min outcome (fall back to node), not an extra condition.
+    bin: belowMin ? null : "oam",
+    binPath: belowMin ? null : "/usr/local/bin/oam",
+    version,
+    belowMin,
+    failure: null,
+    failureDetail: null,
+  });
 
 function captureIO(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
   const out: string[] = [];
@@ -144,6 +155,13 @@ describe("detectInstallMethod", () => {
     expect(detectInstallMethod("C:\\dev\\repo\\packages\\lib\\node_modules\\@yawlabs\\mcp\\dist\\index.js")).toBe(
       "local-node-modules",
     );
+    // ...and the managed-Node marker must not re-open it either. It used to
+    // allow any number of free segments between the manager directory and
+    // `lib`, so a repo under an ancestor named `.local` (or `n`, or `fnm`)
+    // satisfied it and drove the same `npm install -g --prefix <repo>/packages`.
+    expect(
+      detectInstallMethod("/home/u/.local/share/myrepo/packages/lib/node_modules/@yawlabs/mcp/dist/index.js"),
+    ).toBe("local-node-modules");
   });
 
   it("still detects the real POSIX global prefixes after anchoring the lib marker", () => {
@@ -162,6 +180,10 @@ describe("detectInstallMethod", () => {
       "/home/u/.asdf/installs/nodejs/22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
       "/home/u/.local/lib/node_modules/@yawlabs/mcp/dist/index.js",
       "/home/u/.local/share/fnm/node-versions/v22.11.0/installation/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.fnm/node-versions/v22.11.0/installation/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.nodenv/versions/22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/home/u/.nvs/node/22.11.0/x64/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      "/opt/n-prefix/n/versions/node/22.11.0/lib/node_modules/@yawlabs/mcp/dist/index.js",
     ]) {
       expect(detectInstallMethod(p), p).toBe("global-npm");
     }
@@ -216,6 +238,91 @@ describe("detectInstallMethod", () => {
     expect(detectInstallMethod("/home/x/mcp/src/index.ts")).toBe("dev-checkout");
     // ...and the node_modules shape still wins.
     expect(detectInstallMethod("/usr/lib/node_modules/@yawlabs/mcp/dist/index.js")).not.toBe("dev-checkout");
+  });
+
+  // The canonical POSIX invocation does NOT hand us the package entrypoint: npm
+  // installs a bin SHIM and argv[1] is the shim's path. None of the markers
+  // above matches one, so every `yaw-mcp upgrade` on macOS/Linux classified
+  // `unknown` -- a real `npm prefix -g` subprocess on the startup path, then
+  // "Install: unknown" and a `--run` that refuses with exit 2.
+  describe("bin-shim resolution", () => {
+    /** A realpath stand-in: unit-test paths are fictional, so the real
+     *  realpathSync ENOENTs on every one of them. */
+    const resolves = (map: Record<string, string>) => (p: string) => {
+      const target: string | undefined = map[p];
+      if (target === undefined) throw new Error(`ENOENT: ${p}`);
+      return target;
+    };
+
+    it("resolves a global bin shim to the install it points at", () => {
+      expect(
+        detectInstallMethod(
+          "/usr/local/bin/yaw-mcp",
+          resolves({ "/usr/local/bin/yaw-mcp": "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js" }),
+        ),
+      ).toBe("global-npm");
+    });
+
+    it("resolves a project-local .bin shim to local-node-modules", () => {
+      expect(
+        detectInstallMethod(
+          "/proj/app/node_modules/.bin/yaw-mcp",
+          resolves({
+            "/proj/app/node_modules/.bin/yaw-mcp": "/proj/app/node_modules/@yawlabs/mcp/dist/index.js",
+          }),
+        ),
+      ).toBe("local-node-modules");
+    });
+
+    it("resolves an npx cache .bin shim to npx", () => {
+      expect(
+        detectInstallMethod(
+          "/home/u/.npm/_npx/abc123/node_modules/.bin/yaw-mcp",
+          resolves({
+            "/home/u/.npm/_npx/abc123/node_modules/.bin/yaw-mcp":
+              "/home/u/.npm/_npx/abc123/node_modules/@yawlabs/mcp/dist/index.js",
+          }),
+        ),
+      ).toBe("npx");
+    });
+
+    it("never resolves a path the literal markers already classified", () => {
+      // Order matters: pnpm's global store entry is ITSELF a symlink into
+      // `.pnpm/@yawlabs+mcp@<ver>/node_modules/@yawlabs/mcp`, whose resolved
+      // path misses the pnpm marker and lands on local-node-modules -- i.e.
+      // `--run` would `npm install` inside the pnpm store. Resolving only the
+      // `unknown` leftovers is what keeps that from happening.
+      const realpath = vi.fn(
+        () => "/home/u/.local/share/pnpm/.pnpm/@yawlabs+mcp@0.45.0/node_modules/@yawlabs/mcp/dist/index.js",
+      );
+      expect(
+        detectInstallMethod("/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js", realpath),
+      ).toBe("pnpm-global");
+      expect(realpath).not.toHaveBeenCalled();
+      // Same guarantee for the dev checkout, whose path really does exist on a
+      // contributor's box -- a junctioned checkout must not start re-classifying.
+      expect(detectInstallMethod("C:/Users/jeff/yaw/yaw_terminal/mcp/dist/index.js", realpath)).toBe("dev-checkout");
+      expect(realpath).not.toHaveBeenCalled();
+    });
+
+    it("keeps the literal answer when the path cannot be resolved", () => {
+      // Production degradation path: a shim that no longer exists (or an argv[1]
+      // we cannot stat) throws, and the literal `unknown` stands rather than
+      // taking the process down.
+      expect(detectInstallMethod("/opt/custom/yaw-mcp-launcher.js", resolves({}))).toBe("unknown");
+    });
+
+    it("spares the resolved global shim any `npm prefix -g` refinement", async () => {
+      // The refinement probe is a multi-second subprocess and the whole point of
+      // resolving the shim is that this install no longer needs it.
+      const method = detectInstallMethod(
+        "/usr/local/bin/yaw-mcp",
+        resolves({ "/usr/local/bin/yaw-mcp": "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js" }),
+      );
+      const npmPrefix = vi.fn(async () => "/usr/local");
+      expect(await refineInstallMethod(method, "/usr/local/bin/yaw-mcp", npmPrefix)).toBe("global-npm");
+      expect(npmPrefix).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -428,52 +535,66 @@ describe("localInstallRoot", () => {
 });
 
 describe("buildUpgradePlan", () => {
-  const method = (m: InstallMethod) => m;
-
   it("flags stale=true when current < latest", () => {
-    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("global-npm") });
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "global-npm" });
     expect(plan.stale).toBe(true);
     expect(plan.command).toBe("npm install -g @yawlabs/mcp@latest");
   });
 
   it("flags stale=false when current === latest", () => {
-    const plan = buildUpgradePlan({ current: "0.45.0", latest: "0.45.0", method: method("global-npm") });
+    const plan = buildUpgradePlan({ current: "0.45.0", latest: "0.45.0", method: "global-npm" });
     expect(plan.stale).toBe(false);
   });
 
   it("flags stale=false when latest is null (offline)", () => {
-    const plan = buildUpgradePlan({ current: "0.45.0", latest: null, method: method("global-npm") });
+    const plan = buildUpgradePlan({ current: "0.45.0", latest: null, method: "global-npm" });
     expect(plan.stale).toBe(false);
   });
 
+  it("ranks a prerelease below its release (0.45.0-rc.1 is stale against 0.45.0)", () => {
+    // The staleness check runs on oam-spawn's compareVersions, the package's
+    // one semver comparator -- this used to be a third private copy here whose
+    // prerelease branch nothing exercised. Prerelease precedence is the branch
+    // a triple-only comparator gets WRONG (it reads the two as equal, so an rc
+    // build is told it is current), which is why this case is the one pinned.
+    expect(buildUpgradePlan({ current: "0.45.0-rc.1", latest: "0.45.0", method: "global-npm" }).stale).toBe(true);
+    // ...and not the other way round: a release is never stale against its own rc.
+    expect(buildUpgradePlan({ current: "0.45.0", latest: "0.45.0-rc.1", method: "global-npm" }).stale).toBe(false);
+    // A git-tag-shaped "v" prefix is stripped before comparing, so it neither
+    // fails to parse (which would compare equal and hide a real upgrade) nor
+    // invents one.
+    expect(buildUpgradePlan({ current: "v0.40.0", latest: "0.45.0", method: "global-npm" }).stale).toBe(true);
+    expect(buildUpgradePlan({ current: "0.45.0", latest: "v0.45.0", method: "global-npm" }).stale).toBe(false);
+  });
+
   it("returns null command for npx (nothing to run)", () => {
-    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("npx") });
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "npx" });
     expect(plan.command).toBeNull();
     expect(plan.stale).toBe(true);
   });
 
   it("uses plain `npm install` for local node_modules", () => {
-    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("local-node-modules") });
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "local-node-modules" });
     expect(plan.command).toBe("npm install @yawlabs/mcp@latest");
   });
 
   it("uses the owning tool for pnpm/bun global stores", () => {
-    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("pnpm-global") }).command).toBe(
+    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "pnpm-global" }).command).toBe(
       "pnpm add -g @yawlabs/mcp@latest",
     );
-    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("bun-global") }).command).toBe(
+    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "bun-global" }).command).toBe(
       "bun add -g @yawlabs/mcp@latest",
     );
   });
 
   it("returns null command for the Yaw Terminal bundled copy (updates with the app)", () => {
-    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("bundled-app") });
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "bundled-app" });
     expect(plan.command).toBeNull();
     expect(plan.stale).toBe(true);
   });
 
   it("suggests git pull for dev checkouts", () => {
-    const plan = buildUpgradePlan({ current: "dev", latest: "0.45.0", method: method("dev-checkout") });
+    const plan = buildUpgradePlan({ current: "dev", latest: "0.45.0", method: "dev-checkout" });
     expect(plan.command).toContain("git pull");
     // dev is always non-stale because the version string doesn't parse.
     expect(plan.stale).toBe(false);
@@ -483,13 +604,13 @@ describe("buildUpgradePlan", () => {
     // Item 2: the default switch arm for unknown must return the npm -g
     // install command so an unrecognized install path still gives the
     // user a sensible copy-paste command.
-    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("unknown") });
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "unknown" });
     expect(plan.command).toBe("npm install -g @yawlabs/mcp@latest");
     expect(plan.stale).toBe(true);
   });
 
   it("returns null command for a standalone binary (replace the executable, no package manager)", () => {
-    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: method("binary") });
+    const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "binary" });
     expect(plan.command).toBeNull();
     expect(plan.stale).toBe(true);
   });
@@ -795,6 +916,57 @@ describe("runUpgrade", () => {
       expect(r3.exitCode).toBe(3);
       expect(io3.err.join("\n")).toContain(suggestion);
     });
+
+    // An unquotable prefix drops `--prefix` from BOTH the spawn argv and every
+    // printed suggestion -- npm's own resolution is the worse-but-safe fallback,
+    // and a mangled command line is not. Only win32 can refuse a value
+    // (cmd.exe expands %VAR% and breaks on a literal quote regardless of
+    // quoting), so opts.platform is the only way a POSIX runner reaches it.
+    it("drops --prefix entirely when the prefix cannot be quoted for win32's shell", async () => {
+      const unquotable = "C:\\pct%path";
+      expect(quoteShellArgIfNeeded(unquotable, "win32")).toBeNull();
+      expect(quoteArgForDisplay(unquotable, "win32")).toBeNull();
+
+      const io = captureIO();
+      const spawned: Array<{ cmd: string; args: string[] }> = [];
+      const r = await runUpgrade({
+        run: true,
+        platform: "win32",
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => unquotable,
+        spawnImpl: async (cmd, args) => {
+          spawned.push({ cmd, args });
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
+      // The printed line must fall back with the argv, not advertise a prefix
+      // the spawn did not pass.
+      const out = io.out.join("\n");
+      expect(out).toContain("  npm install -g @yawlabs/mcp@latest");
+      expect(out).not.toContain("--prefix");
+    });
+
+    it("--json falls back to the bare -g command for an unquotable win32 prefix", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        json: true,
+        platform: "win32",
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => "C:\\pct%path",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(1);
+      expect(JSON.parse(io.out.join("\n")).command).toBe("npm install -g @yawlabs/mcp@latest");
+    });
   });
 
   it("with --run, propagates the child exit code as 3 on failure", async () => {
@@ -895,6 +1067,80 @@ describe("runUpgrade", () => {
     const rootIdx = io.out.findIndex((l) => l.includes("in /proj/app:"));
     const cmdIdx = io.out.findIndex((l) => l.includes("npm install @yawlabs/mcp@latest"));
     expect(rootIdx).toBeLessThan(cmdIdx);
+  });
+
+  // A local install's command is only correct from the tree root: run anywhere
+  // else, `npm install @yawlabs/mcp@latest` writes a stray package.json +
+  // node_modules there and leaves the stale copy alone. Every surface that
+  // hands the command over therefore has to hand over the directory with it --
+  // the exit-1 listing above did, and these three did not.
+  describe("the install root travels with the command on every surface", () => {
+    const localArgv = "/proj/app/node_modules/@yawlabs/mcp/dist/index.js";
+
+    it("--json reports cwd alongside the command", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        json: true,
+        currentVersion: "0.40.0",
+        argvPath: localArgv,
+        fetchLatest: async () => "0.45.0",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(1);
+      expect(JSON.parse(io.out.join("\n"))).toMatchObject({
+        method: "local-node-modules",
+        command: "npm install @yawlabs/mcp@latest",
+        cwd: "/proj/app",
+      });
+    });
+
+    it("--json reports cwd: null for a method whose command runs anywhere", async () => {
+      const io = captureIO();
+      await runUpgrade({
+        json: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(JSON.parse(io.out.join("\n")).cwd).toBeNull();
+    });
+
+    it("the offline 'when you're back online' suggestion names the root", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        currentVersion: "0.40.0",
+        argvPath: localArgv,
+        fetchLatest: async () => null,
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      const rootIdx = io.out.findIndex((l) => l.includes("in /proj/app:"));
+      const cmdIdx = io.out.findIndex((l) => l.includes("npm install @yawlabs/mcp@latest"));
+      expect(rootIdx).toBeGreaterThanOrEqual(0);
+      expect(rootIdx).toBeLessThan(cmdIdx);
+    });
+
+    it("the exit-3 retry hint names the root the failed child ran in", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: localArgv,
+        fetchLatest: async () => "0.45.0",
+        spawnImpl: async () => 42,
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(3);
+      const rootIdx = io.err.findIndex((l) => l.includes("in /proj/app:"));
+      const cmdIdx = io.err.findIndex((l) => l.includes("npm install @yawlabs/mcp@latest"));
+      expect(rootIdx).toBeGreaterThanOrEqual(0);
+      expect(rootIdx).toBeLessThan(cmdIdx);
+    });
   });
 
   it("without --run on a dev checkout, prints the command and notes --run won't work", async () => {
@@ -1141,7 +1387,13 @@ describe("runUpgrade", () => {
     expect(didSpawn).toBe(false);
     // The retired-track hint NAMES the npm command, but only as something
     // the USER runs manually -- --run must still refuse to spawn anything.
-    expect(io.out.join("\n")).toContain("manual upgrade required");
+    //
+    // ...and the refusal goes to STDERR, like the dev-checkout / unknown one
+    // below. They are the same documented exit-2 class, and a script that
+    // redirects a stream to catch the refusal cannot be expected to know which
+    // non-runnable method it hit. The exit-1 listing above stays on stdout.
+    expect(io.err.join("\n")).toContain("manual upgrade required");
+    expect(io.out.join("\n")).not.toContain("manual upgrade required");
   });
 
   it("--json reports method: binary with a null command", async () => {
@@ -1183,6 +1435,11 @@ describe("runUpgrade", () => {
     expect(out).toContain("v0.8.2");
     expect(out).toContain("oam self-update");
     expect(out).toContain("run on node instead of oam");
+    // The floor the note NAMES has to be the floor the spawn path enforces.
+    // Pinning only the probe's own version left the interpolated MIN_OAM_VERSION
+    // free to be anything -- including a literal that stopped tracking the
+    // constant -- while the test stayed green.
+    expect(out).toContain(`below the v${MIN_OAM_VERSION} floor`);
   });
 
   it("says nothing about oam when it is absent or already at/above the floor", async () => {
@@ -1195,7 +1452,14 @@ describe("runUpgrade", () => {
       out: io.push,
       err: io.pushErr,
     });
-    expect(io.out.join("\n")).not.toContain("oam");
+    const out = io.out.join("\n");
+    // Assert on the advisory's own lines, not on the substring "oam": ordinary
+    // Windows output contains it ("AppData/Roaming"), so a bare
+    // not.toContain("oam") is a test that can fail for a reason it does not
+    // mean -- and, on a path without it, one that passes without checking much.
+    expect(out).not.toContain("oam self-update");
+    expect(out).not.toContain("floor yaw-mcp");
+    expect(out).not.toContain("instead of oam");
   });
 
   it("keeps the oam note out of --json (the snapshot stays machine-parseable)", async () => {
@@ -1245,6 +1509,122 @@ describe("runUpgrade", () => {
     expect(out).toContain("standalone binary");
     expect(out).toContain("retired in 0.70.3");
     expect(out).not.toContain("npx");
+  });
+
+  it("still prints the oam floor note when the registry is unreachable", async () => {
+    // The oam probe is LOCAL (`oam --version`); an unreachable npm registry
+    // says nothing about it. The note used to sit below the offline return, so
+    // the one user who cannot fix the yaw-mcp half right now was also the one
+    // never told their sidecars had already dropped from oam to node.
+    const io = captureIO();
+    const r = await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => null,
+      oamProbe: oamProbe(true, "0.8.2"),
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = io.out.join("\n");
+    expect(out).toMatch(/couldn't reach/i);
+    expect(out).toContain(`below the v${MIN_OAM_VERSION} floor`);
+    expect(out).toContain("oam self-update");
+  });
+
+  // Gaps the header's SCRIPTING TRAP note names but nothing exercised: the
+  // `unknown` method's two exit codes, the refinement probe reaching runUpgrade
+  // at all, and a fetchLatest that rejects rather than resolving null.
+  describe("the `unknown` install method", () => {
+    // No node_modules segment, no npx cache, no `<repo>/(dist|src)` checkout
+    // shape -- and no realpath to rescue it, since the path is fictional.
+    const unknownArgv = "/opt/custom/yaw-mcp-launcher.js";
+
+    it("exits 1 with 'Manual upgrade required' and never promises --run", async () => {
+      const io = captureIO();
+      const r = await runUpgrade({
+        currentVersion: "0.40.0",
+        argvPath: unknownArgv,
+        fetchLatest: async () => "0.45.0",
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(1);
+      const out = io.out.join("\n");
+      expect(out).toContain("Install: unknown");
+      expect(out).toContain("Manual upgrade required");
+      expect(out).not.toContain("to upgrade in place");
+      expect(out).toContain("npm install -g @yawlabs/mcp@latest");
+    });
+
+    it("refuses --run with exit 2 on stderr rather than mutating an install it cannot name", async () => {
+      const io = captureIO();
+      let didSpawn = false;
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: unknownArgv,
+        fetchLatest: async () => "0.45.0",
+        spawnImpl: async () => {
+          didSpawn = true;
+          return 0;
+        },
+        out: io.push,
+        err: io.pushErr,
+      });
+      // The 1 -> 2 transition the file header documents: a script that reads 1
+      // as "retry with --run" lands here forever, never on 0.
+      expect(r.exitCode).toBe(2);
+      expect(didSpawn).toBe(false);
+      const err = io.err.join("\n");
+      expect(err).toContain('a "unknown" install can\'t be upgraded automatically');
+      expect(err).toContain("npm install -g @yawlabs/mcp@latest");
+    });
+  });
+
+  it("wires opts.npmPrefix through to the refinement probe", async () => {
+    // npmGlobalPrefix short-circuits to null under vitest, so this hook is the
+    // ONLY way the second-chance classification is reachable from runUpgrade --
+    // and it is what rescues an exotic prefix (custom NPM_CONFIG_PREFIX, a new
+    // tool manager) that no path marker knows.
+    const io = captureIO();
+    const npmPrefix = vi.fn(async () => "/custom/prefix");
+    const r = await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/custom/prefix/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      npmPrefix,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(npmPrefix).toHaveBeenCalledTimes(1);
+    expect(r.exitCode).toBe(1);
+    const out = io.out.join("\n");
+    // Without the probe this path classifies local-node-modules and hands out a
+    // cwd-scoped `npm install` that would install into the global prefix's tree.
+    expect(out).toContain("Install: global-npm");
+    expect(out).toContain("npm install -g @yawlabs/mcp@latest");
+  });
+
+  it("treats a REJECTING fetchLatest exactly like an unreachable registry", async () => {
+    // fetchLatestVersion resolves null on every failure of its own, but the
+    // hook is caller-supplied: doctor's registryFetch shape can throw, and a
+    // throw here must degrade to the offline path rather than take the command
+    // down with a stack trace.
+    const io = captureIO();
+    const r = await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+      fetchLatest: async () => {
+        throw new Error("DNS went away");
+      },
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = io.out.join("\n");
+    expect(out).toMatch(/couldn't reach/i);
+    expect(out).toContain("npm install -g @yawlabs/mcp@latest");
   });
 });
 

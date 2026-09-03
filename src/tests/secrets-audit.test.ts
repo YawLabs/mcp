@@ -91,6 +91,39 @@ describe("appendAuditEvent + readAuditLog", () => {
     expect(spy).toHaveBeenCalled();
   });
 
+  it("fails open when the STEADY-STATE append path errors", async () => {
+    // The fail-open test above only forces the first-write (atomicWriteFile)
+    // path; every append after that takes appendFile instead, and a
+    // regression that let THAT throw past the single try/catch would break a
+    // server spawn. Create the log path as a DIRECTORY: existsSync() is true,
+    // so the append branch is taken, and appendFile then fails on it.
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(auditLogPath(home), { recursive: true });
+    await expect(appendAuditEvent({ server: "gh", secret: "x", event: "injected" }, home)).resolves.toBeUndefined();
+  });
+
+  it("fails open when the TRIM path errors", async () => {
+    // The third path past the same try/catch: the log exists and is over the
+    // cap, so appendFile succeeds and the failure comes from the trim's
+    // atomic rewrite. A spawn must survive that too.
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    const lines: string[] = [];
+    for (let i = 0; i < AUDIT_TAIL_CAP + 50; i++) {
+      lines.push(JSON.stringify({ ts: new Date().toISOString(), server: "s", secret: `n${i}`, event: "injected" }));
+    }
+    writeFileSync(auditLogPath(home), `${lines.join("\n")}\n`);
+
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile").mockRejectedValue(new Error("disk full"));
+    await expect(appendAuditEvent({ server: "s", secret: "x", event: "injected" }, home)).resolves.toBeUndefined();
+    // The rewrite really was attempted (and really did fail) -- otherwise
+    // "did not throw" would prove nothing about the trim path.
+    expect(spy).toHaveBeenCalled();
+    // The event itself still landed; only the trim was lost.
+    expect((await readAuditLog({ secret: "x" }, home)).map((e) => e.secret)).toEqual(["x"]);
+  });
+
   it("tail-caps the log to AUDIT_TAIL_CAP lines on append", async () => {
     // Pre-seed the file just over the cap, then one more append trims it.
     const { writeFileSync } = await import("node:fs");
@@ -110,6 +143,32 @@ describe("appendAuditEvent + readAuditLog", () => {
     // The newest event is retained; the oldest were trimmed.
     expect((events as AuditEvent[])[events.length - 1].secret).toBe("newest");
     expect(events.some((e) => e.secret === "n0")).toBe(false);
+  });
+
+  it("trims BELOW the cap so the next append does not rewrite the whole log", async () => {
+    // Trimming back to exactly AUDIT_TAIL_CAP leaves the file sitting on the
+    // trigger, so every subsequent append re-reads and atomically rewrites
+    // the whole ~400-500 KB log -- once per spawned secret, forever. The
+    // hysteresis gap is what amortizes that.
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(home, ".yaw-mcp"), { recursive: true });
+    const lines: string[] = [];
+    for (let i = 0; i < AUDIT_TAIL_CAP + 50; i++) {
+      lines.push(JSON.stringify({ ts: new Date().toISOString(), server: "s", secret: `n${i}`, event: "injected" }));
+    }
+    writeFileSync(auditLogPath(home), `${lines.join("\n")}\n`);
+
+    // This append trips the trim.
+    await appendAuditEvent({ server: "s", secret: "trigger", event: "injected" }, home);
+    // Strictly BELOW the cap, not equal to it -- that is the whole fix.
+    expect((await readAuditLog({}, home)).length).toBeLessThan(AUDIT_TAIL_CAP);
+
+    // ...so the very next append writes nothing but its own line.
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
+    await appendAuditEvent({ server: "s", secret: "after", event: "injected" }, home);
+    expect(spy.mock.calls.filter((c) => c[0] === auditLogPath(home))).toEqual([]);
+    expect(await readAuditLog({ secret: "after" }, home)).toHaveLength(1);
   });
 });
 

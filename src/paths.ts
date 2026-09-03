@@ -1,4 +1,4 @@
-import { access, realpath, stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "./logger.js";
@@ -63,13 +63,6 @@ export function userConfigDir(home: string = homedir()): string {
   return path.join(home, CONFIG_DIRNAME);
 }
 
-// Walks up from `start` looking for a `.yaw-mcp/` directory, stopping
-// just BEFORE $HOME (exclusive) or the filesystem root. Returns the
-// absolute path to the `.yaw-mcp/` directory, or null if none was found.
-//
-// Why exclusive of $HOME: a `.yaw-mcp/` sitting at $HOME is the
-// user-global scope (handled separately by userConfigDir). Returning
-// it here would double-load it as both project and user-global.
 function normalizeForCompare(p: string): string {
   // Case-fold on win32 AND darwin: both default to case-insensitive
   // filesystems (NTFS; APFS/HFS+ unless formatted case-sensitive), so a
@@ -161,8 +154,18 @@ async function ownedByCurrentUser(candidate: string): Promise<boolean> {
   }
 }
 
+// Walks up from `start` looking for a `.yaw-mcp/` directory, stopping
+// just BEFORE $HOME (exclusive) or the filesystem root. Returns the
+// absolute path to the `.yaw-mcp/` directory, or null if none was found.
+//
+// Why exclusive of $HOME: a `.yaw-mcp/` sitting at $HOME is the
+// user-global scope (handled separately by userConfigDir). Returning
+// it here would double-load it as both project and user-global.
 export async function findProjectConfigDir(start: string, home: string = homedir()): Promise<string | null> {
-  const homeFallback = home && home.length > 0 ? home : process.env.USERPROFILE || homedir();
+  // os.homedir() is already the USERPROFILE reader on win32, and it is this
+  // parameter's own default -- an empty explicit `home` just means "use the
+  // default after all".
+  const homeFallback = home && home.length > 0 ? home : homedir();
   // Bound and walk in PHYSICAL terms: when the logical $HOME is a symlink
   // to the cwd's physical prefix (/home -> /var/home, NFS automounts), the
   // lexical spelling of home and cwd never match, so boundedByHome would
@@ -199,8 +202,17 @@ export async function findProjectConfigDir(start: string, home: string = homedir
     if (boundedByHome && !isUnderHome(dir, homeResolved)) return null;
     const candidate = path.join(dir, CONFIG_DIRNAME);
     try {
-      await access(candidate);
-      if (normalizeForCompare(await realpathOrSelf(candidate)) === userConfigKey) {
+      // stat, not access: EXISTS is not enough. A regular FILE named
+      // `.yaw-mcp` (a stray note, a `touch` typo, an editor swap file) would
+      // otherwise be returned as the project config dir -- every later read
+      // under it fails with ENOTDIR, and because the walk stops at the first
+      // hit it also MASKS a real `.yaw-mcp/` further up. stat follows
+      // symlinks, so a junction or link pointing at a real directory still
+      // qualifies (the resolves-to-user-global check below handles aliasing).
+      const st = await stat(candidate);
+      if (!st.isDirectory()) {
+        log("debug", "Skipping a .yaw-mcp that exists but is not a directory", { candidate });
+      } else if (normalizeForCompare(await realpathOrSelf(candidate)) === userConfigKey) {
         // The candidate IS the user-global dir, reached through a symlink
         // or alias. Returning it here would double-load it as both project
         // and user-global scope; skip it and keep walking.
@@ -228,7 +240,7 @@ export async function findProjectConfigDir(start: string, home: string = homedir
       // than surfaced as an error, which means the walk may reach a
       // parent-directory config instead of stopping at the unreadable one.
       // The risk is low in practice (permission errors on .yaw-mcp/ itself
-      // are unusual), and the alternative -- treating access errors as
+      // are unusual), and the alternative -- treating the stat error as
       // fatal -- would break startup for the common ENOENT case. Callers
       // that need stricter semantics (e.g. readBundlesAt in local-bundles.ts)
       // handle their own permission errors explicitly.

@@ -1,17 +1,22 @@
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sidecarsRoot } from "../paths.js";
 import {
+  backgroundInstallOptions,
   buildRefreshPlan,
-  configuredRange,
+  loadSidecarSpecs,
   maybeRefreshSidecars,
+  mergeSidecarRefreshState,
+  parseSidecarRefreshState,
   SIDECAR_REFRESH_THROTTLE_MS,
   type SidecarRefreshDeps,
+  type SidecarRefreshState,
+  type SidecarRefreshStatePatch,
   sidecarRefreshStatePath,
 } from "../sidecar-refresh.js";
-import type { SidecarSpec } from "../sidecars-cmd.js";
+import { configuredRange, type SidecarSpec, sidecarsManifest } from "../sidecars-cmd.js";
 
 // =====================================================================
 // sidecar-refresh -- the startup check that keeps ~/.yaw-mcp/sidecars
@@ -300,8 +305,12 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
   const hasManagedSidecarsImpl = vi.fn(over.hasManagedSidecarsImpl ?? ((_home?: string): boolean => true));
   const specsImpl = vi.fn(over.specsImpl ?? (async (): Promise<SidecarSpec[]> => [spec("a-mcp")]));
   const nowImpl = vi.fn(over.nowImpl ?? ((): number => NOW));
-  const readStateImpl = vi.fn(over.readStateImpl ?? ((): { lastSidecarRefreshCheck?: number } | null => null));
-  const writeStateImpl = vi.fn(over.writeStateImpl ?? ((_patch: { lastSidecarRefreshCheck: number }): void => {}));
+  // Both typed from the module's own exported shapes rather than a hand-copied
+  // literal: the state is read-modify-written precisely so a key a newer build
+  // adds survives, and a local `{ lastSidecarRefreshCheck?: number }` here
+  // would drift from it with no type error to say so.
+  const readStateImpl = vi.fn(over.readStateImpl ?? ((): SidecarRefreshState | null => null));
+  const writeStateImpl = vi.fn(over.writeStateImpl ?? ((_patch: SidecarRefreshStatePatch): void => {}));
   const deps: SidecarRefreshDeps = {
     fetchLatestImpl,
     spawnRefreshImpl,
@@ -329,6 +338,19 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
   };
 }
 
+/** A throwaway home directory, deleted after the test that asked for it.
+ *
+ *  The two tests that exercise the DEFAULT impls need a real path on disk, and
+ *  mkdtempSync makes a real directory: called bare, each run left another pair
+ *  of them in the OS temp dir permanently. Registering them here keeps the
+ *  cleanup impossible to forget. */
+const tempHomes: string[] = [];
+function tempHome(): string {
+  const dir = mkdtempSync(join(tmpdir(), "yaw-sidecar-refresh-"));
+  tempHomes.push(dir);
+  return dir;
+}
+
 describe("maybeRefreshSidecars", () => {
   let prevOptOut: string | undefined;
 
@@ -340,6 +362,9 @@ describe("maybeRefreshSidecars", () => {
   afterEach(() => {
     if (prevOptOut === undefined) delete process.env.YAW_MCP_SIDECAR_REFRESH;
     else process.env.YAW_MCP_SIDECAR_REFRESH = prevOptOut;
+    // `force` because the point of those tests is that NOTHING was written
+    // into the directory, so it is usually still empty.
+    for (const dir of tempHomes.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
   it("does nothing when YAW_MCP_SIDECAR_REFRESH=0", async () => {
@@ -390,7 +415,12 @@ describe("maybeRefreshSidecars", () => {
     expect(h.specsImpl).not.toHaveBeenCalled();
     expect(h.fetchLatestImpl).not.toHaveBeenCalled();
     expect(h.spawnRefreshImpl).not.toHaveBeenCalled();
-    // Reddens if the comparison flips to `>` or the window shrinks to an hour.
+    // And the stamp is left ALONE. A throttled start performed no check, so it
+    // has nothing to record -- reddens if a refactor moves recordCheck into a
+    // `finally` or up above the throttle gate, which would make the window
+    // self-renewing: every start inside 24h would push the deadline out, and a
+    // user who opens a pane more than once a day would never refresh again.
+    expect(h.writeStateImpl).not.toHaveBeenCalled();
   });
 
   it("proceeds when the last check was 25 hours ago", async () => {
@@ -416,6 +446,10 @@ describe("maybeRefreshSidecars", () => {
     });
     await maybeRefreshSidecars(justInside.deps);
     expect(justInside.spawnRefreshImpl).not.toHaveBeenCalled();
+    // Same self-renewing-window mutation as in the hour-ago test: a suppressed
+    // start must not re-stamp, or the deadline would move on every pane start
+    // and the boundary this test pins would never be reached.
+    expect(justInside.writeStateImpl).not.toHaveBeenCalled();
   });
 
   it("proceeds on a FUTURE timestamp instead of sitting out the window", async () => {
@@ -457,17 +491,34 @@ describe("maybeRefreshSidecars", () => {
   });
 
   it("releases the lock when the background refresh fails asynchronously", async () => {
-    // defaultSpawnRefresh releases from a `finally`, so a rejected install
-    // still calls onDone. Modelled here by an impl that reports failure the
-    // same way.
+    // Shaped like defaultSpawnRefresh, because the point is its `finally`: an
+    // async body that REJECTS after maybeRefreshSidecars has already returned,
+    // with the failure swallowed by the same catch the real one has. An impl
+    // that merely defers onDone models no failure at all -- it would pass
+    // against a spawn wrapper with no error handling whatsoever, which is
+    // exactly the regression this test is supposed to catch.
+    const failed = vi.fn();
     const h = harness({
       spawnRefreshImpl: (_stale: SidecarSpec[], onDone: () => void) => {
-        setTimeout(onDone, 0);
+        void (async () => {
+          try {
+            await new Promise((_resolve, reject) => setTimeout(() => reject(new Error("npm exited 1")), 0));
+          } catch {
+            failed();
+          } finally {
+            onDone();
+          }
+        })();
       },
     });
     await maybeRefreshSidecars(h.deps);
-    await new Promise((r) => setTimeout(r, 1));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(failed).toHaveBeenCalledTimes(1);
     expect(h.release).toHaveBeenCalledTimes(1);
+    // The check itself completed, so the stamp lands regardless of how the
+    // install turned out -- a failing npm must not put every later startup
+    // into a retry against an npm that is already unhappy.
+    expect(h.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
   });
 
   it("releases the lock when the spawn throws SYNCHRONOUSLY", async () => {
@@ -604,7 +655,7 @@ describe("maybeRefreshSidecars", () => {
     // Pins the VITEST short-circuit on every default impl. Without it, a test
     // that forgot an injection would hit the real registry, write into the
     // user's real ~/.yaw-mcp, and could start a real `npm install`.
-    const home = mkdtempSync(join(tmpdir(), "yaw-sidecar-refresh-"));
+    const home = tempHome();
     await expect(maybeRefreshSidecars({ home, hasManagedSidecarsImpl: () => true })).resolves.toBeUndefined();
     expect(existsSync(sidecarRefreshStatePath(home))).toBe(false);
   });
@@ -617,7 +668,7 @@ describe("maybeRefreshSidecars", () => {
     // line naming a real path ("Skipping an untrusted .yaw-mcp/ dir outside
     // $HOME") during this suite. Assert the gate directly instead of through a
     // side effect a different guard already prevents.
-    const home = mkdtempSync(join(tmpdir(), "yaw-sidecar-refresh-"));
+    const home = tempHome();
     const specsImpl = vi.fn();
     const installedVersionImpl = vi.fn();
     const fetchLatestImpl = vi.fn();
@@ -660,5 +711,161 @@ describe("maybeRefreshSidecars", () => {
 
     const probed = h.installedVersionImpl.mock.calls.map((c) => c[0]);
     expect(probed).toEqual(["floats"]);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Which config scope the background refresh acts on.
+//
+// The managed tree is keyed on HOME alone and shared by every project on
+// the machine, while `serve` runs with whatever cwd the MCP client was
+// launched in. Planning against a project-local bundles.json and then
+// rewriting the shared manifest from it would npm-prune every other
+// project's servers out of the tree, silently -- so both halves force the
+// scope to $HOME, and both halves have to agree.
+// ---------------------------------------------------------------------
+
+describe("user-global scope", () => {
+  it("loads specs with cwd forced to the home dir, never process.cwd()", async () => {
+    // Reddens if the load reverts to `{ home }` (or to opts.cwd), which is what
+    // lets a project-local bundles.json decide the shared tree's contents.
+    // findProjectConfigDir stops just before $HOME when the walk starts there,
+    // so cwd=home is what resolves to "the user-global file only".
+    const load = vi.fn(async () => ({ config: null }));
+    await expect(loadSidecarSpecs(HOME, load)).resolves.toEqual([]);
+    expect(load).toHaveBeenCalledWith({ cwd: HOME, home: HOME });
+    expect(HOME).not.toBe(process.cwd());
+  });
+
+  it("collects the specs the loaded config carries", async () => {
+    // The other half of the same seam: a load failure is a clean no-op, and a
+    // successful one is fed through collectSidecarSpecs rather than used raw.
+    const load = vi.fn(async () => ({
+      config: { servers: [{ type: "local" as const, namespace: "a", command: "npx", args: ["-y", "a-mcp@latest"] }] },
+    }));
+    await expect(loadSidecarSpecs(HOME, load)).resolves.toEqual([
+      { pkg: "a-mcp", spec: "a-mcp@latest", namespaces: ["a"], conflicting: [] },
+    ]);
+
+    const boom = vi.fn(async () => {
+      throw new Error("bundles.json is on fire");
+    });
+    await expect(loadSidecarSpecs(HOME, boom)).resolves.toEqual([]);
+  });
+
+  it("installs with the same scope the plan was computed from, on silent channels", () => {
+    // The plan and the action MUST move together: a plan computed from the
+    // user-global config and an install performed from a project's would
+    // describe one tree and write another. Reddens if `cwd` is dropped here
+    // while loadSidecarSpecs keeps it -- the exact half-fix that reads as
+    // correct in a diff.
+    const opts = backgroundInstallOptions(HOME);
+    expect(opts.home).toBe(HOME);
+    expect(opts.cwd).toBe(HOME);
+    // And all three output channels are supplied rather than left to default:
+    // runSidecarsInstall's own defaults write the command's prose to stdout and
+    // stderr, and spawn npm with its output inherited -- from inside serve that
+    // is an "Installed:" table in the middle of the MCP client's stream.
+    expect(opts.out).toBeTypeOf("function");
+    expect(opts.err).toBeTypeOf("function");
+    expect(opts.runNpm).toBeTypeOf("function");
+  });
+});
+
+describe("configuredRange agrees with sidecarsManifest", () => {
+  // The two answer the same question for different halves of the feature: this
+  // module decides whether a spec is floating, sidecarsManifest writes the
+  // range npm then acts on. They are now ONE function -- configuredRange lives
+  // in sidecars-cmd (the module sidecar-refresh already imports, so no cycle)
+  // and sidecarsManifest calls it -- and this pins that it stays that way. A
+  // re-inlined derivation in the manifest reddens here rather than making the
+  // refresh skip a package it could move, or schedule one npm refuses to move,
+  // once a day, forever, with nothing on screen.
+  it.each([
+    ["latest"],
+    ["0.13.3"],
+    ["^1.2.0"],
+    ["~2.0.0"],
+    ["next"],
+    [""],
+  ])("derives the same range as the manifest for %j", (range) => {
+    const s = spec("@yawlabs/fetch-mcp", range);
+    const manifest = JSON.parse(sidecarsManifest([s])) as { dependencies: Record<string, string> };
+    expect(configuredRange(s)).toBe(manifest.dependencies["@yawlabs/fetch-mcp"]);
+  });
+});
+
+// ---------------------------------------------------------------------
+// The throttle-state file: parse and merge.
+//
+// Pure halves, split out of the read/write wrappers precisely so they can
+// be tested -- the wrappers themselves are short-circuited under VITEST, so
+// every branch below used to be unreachable from a test.
+// ---------------------------------------------------------------------
+
+describe("parseSidecarRefreshState", () => {
+  it("reads a well-formed document", () => {
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": 1700000000000}')).toEqual({
+      lastSidecarRefreshCheck: 1_700_000_000_000,
+    });
+  });
+
+  it("returns null for a document that is not a state object", () => {
+    // Every one of these reads as "never checked", which is the fail-open
+    // direction: the cost is one extra check, never a suppressed feature.
+    expect(parseSidecarRefreshState("")).toBeNull();
+    expect(parseSidecarRefreshState("{oh no")).toBeNull();
+    expect(parseSidecarRefreshState("null")).toBeNull();
+    expect(parseSidecarRefreshState("5")).toBeNull();
+    expect(parseSidecarRefreshState('"1700000000000"')).toBeNull();
+    // An array is typeof "object" too, and spreading one would turn its
+    // indices into state keys that the next write persists as {"0": ...}.
+    expect(parseSidecarRefreshState("[1,2]")).toBeNull();
+  });
+
+  it("drops a corrupt timestamp but keeps the document", () => {
+    // A hand-edited or torn file. NaN fails every comparison silently, so the
+    // honest reading of a broken stamp is "never checked" -- while anything
+    // else in the file is still someone's data.
+    expect(parseSidecarRefreshState("{}")).toEqual({});
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": "yesterday"}')).toEqual({});
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": null}')).toEqual({});
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": -1}')).toEqual({});
+    // JSON has no NaN or Infinity literal, but an overflowing exponent parses
+    // to Infinity -- a number, so `typeof at === "number"` alone lets it
+    // through. Number.isFinite is what stands between it and a throttle
+    // comparison that then never fires.
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": 1e400}')).toEqual({});
+  });
+
+  it("preserves a key a NEWER build wrote", () => {
+    // The forward-compat promise the state is read-modify-written for. Reddens
+    // if the parse goes back to rebuilding `{ lastSidecarRefreshCheck }` from
+    // scratch, which drops every other key on this build's next write.
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": 7, "lastNudgeShown": 42}')).toEqual({
+      lastSidecarRefreshCheck: 7,
+      lastNudgeShown: 42,
+    });
+    // Including when the known key is the broken one.
+    expect(parseSidecarRefreshState('{"lastSidecarRefreshCheck": "bad", "lastNudgeShown": 42}')).toEqual({
+      lastNudgeShown: 42,
+    });
+  });
+});
+
+describe("mergeSidecarRefreshState", () => {
+  it("stamps an absent or empty state", () => {
+    expect(mergeSidecarRefreshState(null, { lastSidecarRefreshCheck: 9 })).toEqual({ lastSidecarRefreshCheck: 9 });
+    expect(mergeSidecarRefreshState({}, { lastSidecarRefreshCheck: 9 })).toEqual({ lastSidecarRefreshCheck: 9 });
+  });
+
+  it("overwrites the known key and carries every other one through", () => {
+    // The round trip the whole split exists for: parse -> merge -> write must
+    // return a newer build's key unharmed while moving the timestamp.
+    const onDisk = parseSidecarRefreshState('{"lastSidecarRefreshCheck": 1, "lastNudgeShown": 42}');
+    expect(mergeSidecarRefreshState(onDisk, { lastSidecarRefreshCheck: 9 })).toEqual({
+      lastSidecarRefreshCheck: 9,
+      lastNudgeShown: 42,
+    });
   });
 });

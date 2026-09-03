@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   INSTALL_USAGE,
   mergeClientConfig,
@@ -24,7 +24,7 @@ import {
 } from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
-import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe, oamNoBinaryReason } from "../oam-spawn.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -44,6 +44,19 @@ afterEach(() => {
  *  (backslashes on a Windows runner) must be normalized before indexing into
  *  the written JSON. No-op on POSIX. */
 const projectsKey = (dir: string): string => dir.replace(/\\/g, "/");
+
+/** One of `--all`'s per-client header lines (`-- cursor (user) --`).
+ *
+ *  ASCII, and pinned as ASCII: install renders the separator with `--` today
+ *  (install-cmd.ts, the per-plan header in runInstallAll), for the same
+ *  Windows-console mojibake reason the sibling module it prints beside
+ *  documents at oam-spawn.ts:285-287 -- a box-drawing `──` written to a
+ *  console whose active codepage is not UTF-8 comes back as `ΓÇö`-class
+ *  garbage. Accepting BOTH spellings pinned neither, so reverting the code to
+ *  box-drawing kept the suite green. Matching the LINE shape (rather than the
+ *  separator token) is also what makes a header COUNT meaningful: counting
+ *  bare separator tokens double-counts, since every header carries two. */
+const CLIENT_HEADER_LINE = /^-- \S+ \(\w+\) --$/;
 
 function captureIo() {
   const out: string[] = [];
@@ -77,9 +90,11 @@ describe("parseInstallArgs", () => {
 
   it("--help returns ok:true with helpRequested so dispatcher routes to stdout+exit0", () => {
     // Parser shape changed: --help is now a SUCCESSFUL parse carrying
-    // helpRequested in options (was ok:false + help:true). The dispatcher
-    // in index.ts checks `parsed.ok && parsed.options.helpRequested` and
-    // prints USAGE to stdout + exit 0.
+    // helpRequested in options (was ok:false + help:true, a spelling whose
+    // `help` field is gone from the failure type entirely -- nothing set it
+    // and nothing read it). The dispatcher in index.ts checks
+    // `parsed.ok && parsed.options.helpRequested` and prints USAGE to
+    // stdout + exit 0.
     const r = parseInstallArgs(["--help"]);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.options.helpRequested).toBe(true);
@@ -113,7 +128,7 @@ describe("parseInstallArgs", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("parses --token, --os, --project-dir, --force, --skip, --dry-run, --no-yaw-mcp-config", () => {
+  it("parses --token, --os, --project-dir, --force, --dry-run, --no-yaw-mcp-config", () => {
     const r = parseInstallArgs([
       "cursor",
       "--token",
@@ -137,6 +152,16 @@ describe("parseInstallArgs", () => {
     }
   });
 
+  it("parses --skip", () => {
+    // Passed ALONE, never beside --force: the accepting `case "--skip"` branch
+    // had no positive test at all (the combined case above names the flag in
+    // its title but never in its argv), and pinning it next to --force would
+    // pin a pair the install path refuses.
+    const r = parseInstallArgs(["claude-code", "--skip"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.options.skip).toBe(true);
+  });
+
   it("rejects unknown flags", () => {
     const r = parseInstallArgs(["claude-code", "--bogus"]);
     expect(r.ok).toBe(false);
@@ -154,6 +179,32 @@ describe("parseInstallArgs", () => {
     const r = parseInstallArgs(["claude-code", "--project-dir", "--dry-run"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("--project-dir requires a value");
+  });
+
+  it("rejects a SINGLE-dash flag swallowed as a value, not just a double-dash one", () => {
+    // The guard tested `startsWith("--")`, so `install --token -h` set
+    // token="-h": the user got the deprecation warning for a flag they were
+    // trying to read the help for, and never got the help. `-h` is the one
+    // single-dash flag this parser accepts, which is exactly why it is the
+    // one that got eaten.
+    const token = parseInstallArgs(["claude-code", "--token", "-h"]);
+    expect(token.ok).toBe(false);
+    if (!token.ok) expect(token.error).toContain("--token requires a value");
+
+    const projectDir = parseInstallArgs(["claude-code", "--project-dir", "-h"]);
+    expect(projectDir.ok).toBe(false);
+    if (!projectDir.ok) expect(projectDir.error).toContain("--project-dir requires a value");
+  });
+
+  it("still accepts values that merely contain a dash", () => {
+    // The guard is about a LEADING dash. A token or a path with one inside it
+    // (`mcp_pat_a-b`, `/repos/my-project`) is an ordinary value.
+    const r = parseInstallArgs(["claude-code", "--token", "mcp_pat_a-b", "--project-dir", "my-project"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.token).toBe("mcp_pat_a-b");
+      expect(r.options.projectDir).toBe("my-project");
+    }
   });
 
   it("rejects more than one positional", () => {
@@ -335,6 +386,22 @@ describe("mergePermissionsAllow", () => {
     const allow = (merged.permissions as { allow: string[] }).allow;
     expect(allow).toEqual(["mcp__mcph__*", CLAUDE_CODE_ALLOW_PATTERN]);
   });
+
+  it("REPLACES a non-array permissions.allow rather than preserving it", () => {
+    // The one place this function does not keep what it found: `allow` is only
+    // read through Array.isArray, so a hand-edited string (or object, or null)
+    // is dropped for a fresh array carrying just our pattern -- which reads as
+    // a contradiction of the preserve-everything promise in its own doc
+    // comment. Pinned rather than argued: a client that ever accepts a
+    // non-array `allow` would make this silent data loss, and the pin is what
+    // fails when that day arrives. Sibling keys are still preserved, so the
+    // loss is scoped to the key this function manages.
+    const existing = { permissions: { allow: "Bash(git *)", deny: ["Bash(rm -rf *)"] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    const perms = merged.permissions as { allow: unknown[]; deny: string[] };
+    expect(perms.allow).toEqual([CLAUDE_CODE_ALLOW_PATTERN]);
+    expect(perms.deny).toEqual(["Bash(rm -rf *)"]);
+  });
 });
 
 /** Deterministic oam seams. `runInstall` probes the real machine by default,
@@ -417,6 +484,15 @@ const OAM_BROKEN = async (): Promise<OamProbe> => ({
   failureDetail: "oam --version timed out after 3000ms",
 });
 const OAM_ENTRY = "/opt/nm/@yawlabs/mcp/dist/index.js";
+/** A probe that must never run. The refusal tests below reach their exit
+ *  BEFORE runInstall probes oam, so they are hermetic by ORDERING alone --
+ *  reorder the probe above the refusal and those runs would spawn a real
+ *  `oam --version` against the host. Throwing turns that silent drift into a
+ *  failing test, and pins the contract the probe's own placement comment
+ *  states: a refused run never claims a runtime. */
+const OAM_PROBE_FORBIDDEN = (): never => {
+  throw new Error("refusal path must not probe oam");
+};
 
 describe("runInstall — settings.json merge edge cases (claude-code)", () => {
   it("preserves existing settings.json content when patching", async () => {
@@ -535,6 +611,42 @@ describe("runInstall — settings.json merge edge cases (claude-code)", () => {
     // The non-object file is left byte-for-byte untouched.
     expect(readFileSync(join(settingsDir, "settings.json"), "utf8")).toBe(contents);
     // settings.json is not in the written list (no patch applied).
+    expect(r.written).not.toContain(join(settingsDir, "settings.json"));
+  });
+
+  // The THIRD malformed branch, and the one neither case above reaches: the
+  // file parses AND is an object, so the patch is computed and attempted --
+  // and `editJsoncEntry` throws because `permissions` itself is not an object
+  // to hang an `allow` key off ("Can not add index to parent of type array").
+  // That throw is caught and reported as malformed with jsonc-parser's own
+  // message, so the same "could not patch" warning covers a shape the earlier
+  // branches never see.
+  it.each([
+    ["an array", '{ "permissions": [] }'],
+    ["a number", '{ "permissions": 7 }'],
+  ])("warns and skips the patch when settings.json `permissions` is %s", async (_label, contents) => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, "settings.json"), contents);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    // Best-effort patch: the launch entry still lands and the run exits 0.
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(join(synthHome, ".claude.json"));
+    // The skip is surfaced, naming the file and the by-hand fix.
+    expect(cap.stderr()).toMatch(/could not patch/);
+    expect(cap.stderr()).toMatch(/settings\.json/);
+    expect(cap.stderr()).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    // Left byte-for-byte alone rather than rewritten into a valid shape.
+    expect(readFileSync(join(settingsDir, "settings.json"), "utf8")).toBe(contents);
     expect(r.written).not.toContain(join(settingsDir, "settings.json"));
   });
 
@@ -737,6 +849,19 @@ describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", 
         expect(client.projects[synthCwd]).toBeUndefined();
       }
 
+      // The local-scope permissions file, written by this run as a side effect
+      // and asserted nowhere until now. It lands beside the PROJECT, not in the
+      // wrapper dir: resolveClaudeCodeSettingsPath sends local scope to
+      // <projectDir>/.claude/settings.local.json, which CLAUDE_CONFIG_DIR does
+      // not redirect (only user scope moves).
+      const localSettings = join(synthCwd, ".claude", "settings.local.json");
+      expect(existsSync(localSettings)).toBe(true);
+      expect(r.written).toContain(localSettings);
+      const localJson = JSON.parse(readFileSync(localSettings, "utf8"));
+      expect(localJson.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+      // ...and the user-scope settings file is NOT the one that got patched.
+      expect(existsSync(join(wrapperDir, "settings.json"))).toBe(false);
+
       // Home version not created.
       expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
     } finally {
@@ -905,39 +1030,10 @@ describe("runInstall — collision handling", () => {
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
-    // ~/.yaw-mcp/config.json should NOT have been written either, since we short-circuited.
+    // install never writes ~/.yaw-mcp/config.json on ANY path -- the token it
+    // carried is gone -- so this is a standing regression guard, not a
+    // consequence of the --skip short-circuit the test is about.
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
-  });
-
-  it("a home override is hermetic for claude-desktop on Windows (APPDATA never leaks in)", async () => {
-    // claude-desktop is the one client that lives under %APPDATA% rather
-    // than $HOME on Windows. The `home` test seam did not cover it: with
-    // a real APPDATA set, `runInstall({ os: "windows", home: synthHome,
-    // force: true })` resolved through process.env.APPDATA and would have
-    // overwritten the DEVELOPER'S real Claude Desktop config. appData now
-    // derives from an overridden home. Asserted via --dry-run so even a
-    // regression only reports the wrong path instead of writing to it.
-    const prev = process.env.APPDATA;
-    process.env.APPDATA = join(synthHome, "DECOY-real-appdata");
-    try {
-      const cap = captureIo();
-      const r = await runInstall({
-        clientId: "claude-desktop",
-        scope: "user",
-        os: "windows",
-        home: synthHome,
-        dryRun: true,
-        io: cap.io,
-        oamProbe: OAM_ABSENT,
-      });
-      expect(r.exitCode).toBe(0);
-      expect(r.wouldWrite).toHaveLength(1);
-      expect(r.wouldWrite[0]).toBe(join(synthHome, "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
-      expect(r.wouldWrite[0]).not.toContain("DECOY");
-    } finally {
-      if (prev === undefined) delete process.env.APPDATA;
-      else process.env.APPDATA = prev;
-    }
   });
 
   it("--skip --dry-run previews the SKIP, not an overwrite", async () => {
@@ -1012,7 +1108,7 @@ describe("runInstall — collision handling", () => {
       oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toContain("Kept existing env on the mcp entry: OAM_BIN");
+    expect(cap.stdout()).toContain(`Kept existing env on the ${ENTRY_NAME} entry: OAM_BIN`);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/x/oam" });
   });
@@ -1033,7 +1129,7 @@ describe("runInstall — collision handling", () => {
       oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toContain("Kept existing env on the mcp entry: OAM_BIN");
+    expect(cap.stdout()).toContain(`Kept existing env on the ${ENTRY_NAME} entry: OAM_BIN`);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].env).toEqual({ OAM_BIN: "/x/oam" });
   });
@@ -1057,6 +1153,86 @@ describe("runInstall — collision handling", () => {
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
   });
+
+  it("promptAnswer `abort` refuses with exit 1 and leaves the entry alone", async () => {
+    // The [a]bort answer is a REFUSAL, not a no-op success: it exits 1 so a
+    // wrapper script can tell "the user declined" from "nothing to do". Only
+    // the overwrite answer had coverage.
+    const initial = JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2);
+    writeFileSync(join(synthHome, ".claude.json"), initial);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      promptAnswer: "abort",
+      io: { ...cap.io, isTTY: true },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain("Aborted.");
+    expect(r.written).toEqual([]);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
+  });
+
+  it("promptAnswer `skip` exits 0 and leaves the entry alone", async () => {
+    // The interactive [s]kip answer -- also promptCollision's DEFAULT for a
+    // bare Enter -- lands on the same branch as the --skip flag, but by a
+    // different route through the decision ladder.
+    const initial = JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2);
+    writeFileSync(join(synthHome, ".claude.json"), initial);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      promptAnswer: "skip",
+      io: { ...cap.io, isTTY: true },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain(`Existing "${ENTRY_NAME}" entry left untouched.`);
+    expect(r.written).toEqual([]);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
+  });
+});
+
+// Its own describe, not a member of "collision handling": there is no
+// collision here (fresh synthetic home, --dry-run, claude-desktop) -- the
+// subject is the home override staying hermetic against the real APPDATA.
+describe("runInstall — home override hermeticity (claude-desktop on Windows)", () => {
+  it("a home override is hermetic for claude-desktop on Windows (APPDATA never leaks in)", async () => {
+    // claude-desktop is the one client that lives under %APPDATA% rather
+    // than $HOME on Windows. The `home` test seam did not cover it: with
+    // a real APPDATA set, `runInstall({ os: "windows", home: synthHome,
+    // force: true })` resolved through process.env.APPDATA and would have
+    // overwritten the DEVELOPER'S real Claude Desktop config. appData now
+    // derives from an overridden home. Asserted via --dry-run so even a
+    // regression only reports the wrong path instead of writing to it.
+    const prev = process.env.APPDATA;
+    process.env.APPDATA = join(synthHome, "DECOY-real-appdata");
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-desktop",
+        scope: "user",
+        os: "windows",
+        home: synthHome,
+        dryRun: true,
+        io: cap.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.wouldWrite).toHaveLength(1);
+      expect(r.wouldWrite[0]).toBe(join(synthHome, "AppData", "Roaming", "Claude", "claude_desktop_config.json"));
+      expect(r.wouldWrite[0]).not.toContain("DECOY");
+    } finally {
+      if (prev === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = prev;
+    }
+  });
 });
 
 describe("runInstall — malformed existing JSON", () => {
@@ -1073,6 +1249,33 @@ describe("runInstall — malformed existing JSON", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/not valid JSON/);
+  });
+
+  // The sibling branch: the bytes PARSE, so the "not valid JSON" refusal above
+  // never fires, but the root is not an object and there is nowhere to splice
+  // an entry. Refusal is by a different message ("is not a JSON object"), and
+  // the settings.json equivalent is already matrixed the same way.
+  it.each([
+    ["array", "[]"],
+    ["null", "null"],
+  ])("refuses a client config that parses but is not an object (%s)", async (_label, contents) => {
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, contents);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/not a JSON object/);
+    expect(cap.stderr()).not.toMatch(/not valid JSON/);
+    // Refusal means refusal: the file is byte-identical and nothing was written.
+    expect(readFileSync(clientPath, "utf8")).toBe(contents);
+    expect(r.written).toEqual([]);
   });
 });
 
@@ -1363,6 +1566,7 @@ describe("runInstall — Claude Desktop on Linux refused", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
     });
     expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/not available on linux/i);
@@ -1381,9 +1585,36 @@ describe("runInstall — mutually exclusive flags", () => {
       force: true,
       skip: true,
       io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
     });
     expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/mutually exclusive/);
+  });
+
+  it("--all --force --skip is refused ONCE with exit 2, not per client", async () => {
+    // The pair check has to sit ABOVE the --list/--all dispatch: run under
+    // --all it fired inside every per-client sub-install instead, so the user
+    // got "Installing into N clients", one refusal per planned client, and
+    // exit 1 as "N/N client installs failed" -- a runtime-failure code for
+    // what is a usage error, with the refusal restated N times.
+    const cap = captureIo();
+    const r = await runInstall({
+      all: true,
+      force: true,
+      skip: true,
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(2);
+    const stderr = cap.stderr();
+    const refusals = stderr.split("\n").filter((l) => /mutually exclusive/.test(l));
+    expect(refusals).toHaveLength(1);
+    // The run never starts: no per-client plan is announced, and nothing is written.
+    expect(cap.stdout()).not.toContain("Installing into");
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
   });
 
   it("--list + --all refused with exit 2", async () => {
@@ -1394,9 +1625,126 @@ describe("runInstall — mutually exclusive flags", () => {
       listOnly: true,
       all: true,
       io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
     });
     expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/mutually exclusive/);
+  });
+});
+
+describe("runInstall — --project-dir at a scope that resolves none", () => {
+  // Pins CURRENT behaviour: a `--project-dir` handed to a scope that reads no
+  // project directory is REFUSED at exit 2 with nothing written, rather than
+  // accepted-and-dropped. The refusal cannot live in the parser because the
+  // scope is only known once the client's default has resolved -- claude-code,
+  // claude-desktop and cursor all default to `user` (install-targets.ts) -- so
+  // it is the runner that has to reject it, and nothing exercised the branch.
+  // Load-bearing because the pre-refusal spelling was a SUCCESSFUL user-scope
+  // install at exit 0: whether refusing is the right call, or the flag should
+  // instead be ignored with a warning for a client that has no project scope,
+  // is a product question these tests only record the answer to.
+
+  it("claude-code (user) refuses at exit 2, writes nothing, and names the scopes that read it", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      // No explicit scope: claude-code DEFAULTS to user, which is the whole
+      // point -- the plain `install claude-code --project-dir /repo` a user
+      // types is the shape that used to quietly write ~/.claude.json.
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      // The refusal is ahead of the oam probe: a usage error must not pay for
+      // (or be able to fail on) a machine probe it never uses.
+      oamProbe: OAM_PROBE_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    // The user-scope file it would otherwise have written is untouched.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+    const stderr = cap.stderr();
+    expect(stderr).toMatch(/cannot honor --project-dir/);
+    // Both project-reading scopes are offered, in INSTALL_TARGETS order.
+    expect(stderr).toMatch(/--scope project \| local/);
+  });
+
+  it("claude-desktop refuses at exit 2 and says it has no project scope at all", async () => {
+    // The other half of the branch: with no project-reading scope to suggest,
+    // the fix line must say so rather than print an empty `--scope `.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-desktop",
+      // macos, so this is the not-available-on-linux refusal's sibling and not
+      // that refusal itself -- claude-desktop ships on macos and windows.
+      os: "macos",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([]);
+    expect(existsSync(join(synthHome, "Library", "Application Support", "Claude", "claude_desktop_config.json"))).toBe(
+      false,
+    );
+    const stderr = cap.stderr();
+    expect(stderr).toMatch(/cannot honor --project-dir/);
+    expect(stderr).toMatch(/has no project-directory scope/);
+    expect(stderr).not.toMatch(/--scope\s*$/m);
+  });
+});
+
+describe("runInstall — Windows %APPDATA% redirection", () => {
+  it("the write path and --list name the SAME redirected claude-desktop file", async () => {
+    // Windows lets %APPDATA% be redirected (roaming profile, folder
+    // redirection) away from `<home>\AppData\Roaming`, and Claude Desktop reads
+    // the redirected location. resolveInstallPath used to read
+    // process.env.APPDATA itself, but ONLY when the caller passed no `home` --
+    // which is the write path alone (runInstall threads opts.home straight
+    // through and there is no --home flag). Every reader resolves a home first
+    // (probeClientsAsync requires `home: string`), so `--list` and doctor
+    // reported the HOME-derived path while install wrote the redirected one.
+    // resolveAppData now owns the env read for BOTH surfaces.
+    const redirected = mkdtempSync(join(tmpdir(), "yaw-mcp-appdata-"));
+    // homedir() is the fallback on the no-`home` path both calls below take;
+    // stub it off the real machine so this stays hermetic.
+    vi.stubEnv("APPDATA", redirected);
+    vi.stubEnv("USERPROFILE", synthHome);
+    vi.stubEnv("HOME", synthHome);
+    try {
+      const expected = join(redirected, "Claude", "claude_desktop_config.json");
+      const capWrite = captureIo();
+      const w = await runInstall({
+        clientId: "claude-desktop",
+        scope: "user",
+        os: "windows",
+        io: capWrite.io,
+        oamProbe: OAM_ABSENT,
+      });
+      expect(w.exitCode).toBe(0);
+      expect(w.written).toEqual([expected]);
+      expect(existsSync(expected)).toBe(true);
+      // ...and NOT the HOME-derived spelling the readers used to name.
+      expect(existsSync(join(synthHome, "AppData", "Roaming", "Claude", "claude_desktop_config.json"))).toBe(false);
+
+      const capList = captureIo();
+      const l = await runInstall({ listOnly: true, os: "windows", io: capList.io });
+      expect(l.exitCode).toBe(0);
+      const row = l.messages.find((m) => m.includes("Claude Desktop"));
+      expect(row).toBeDefined();
+      // Same path, and read back as configured -- i.e. --list opened the file
+      // install just wrote instead of describing a different one as absent.
+      expect(row).toContain(expected);
+      expect(row).toMatch(/installed/);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(redirected, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1470,7 +1818,13 @@ describe("runInstall --list (read-only)", () => {
     expect(out).toMatch(/Claude Desktop\s+user\s+\(n\/a\)\s+unavailable/);
     // Nothing seeded, so every other client reads "not installed".
     expect(out).toContain("not installed");
-    expect(out).not.toContain("installed "); // "installed" word only appears in status heading/rows
+    // No row's STATUS is a bare `installed`. Asserted on the row SHAPE, not on
+    // the absence of the substring "installed " -- that only held because "not
+    // installed" happens to be the widest status (so a bare one is padded) and
+    // STATUS happens to be the last column; a wider status or a column reorder
+    // would have flipped it silently.
+    const installedRows = out.split("\n").filter((l) => /\binstalled\s*$/.test(l) && !/not installed/.test(l));
+    expect(installedRows).toHaveLength(0);
     expect(out).toContain("0/");
   });
 
@@ -1519,8 +1873,35 @@ describe("runInstall --list (read-only)", () => {
     expect(r.exitCode).toBe(0);
     const out = cap.stdout();
     expect(out).toMatch(/Claude Code\s+user\s+~[\\/].claude\.json\s+installed/);
-    // At least one scope is configured; headline reflects that.
-    expect(out).toMatch(/^\d+\/\d+ client scopes have yaw-mcp configured on linux\./m);
+    // EXACTLY one scope is configured (only claude-code user was seeded), and
+    // the headline counts it. `\d+/\d+` accepted `0/N` -- so the counter was
+    // never actually verified to count.
+    expect(out).toMatch(/^1\/\d+ client scopes have yaw-mcp configured on linux\./m);
+  });
+
+  it("reports `other-entries` when the config exists but carries no yaw-mcp entry", async () => {
+    // The fourth status, and the only one with no test: the file is there and
+    // parses, it just holds someone else's servers. It reads differently from
+    // `not installed` (nothing to lose) and from `malformed` (needs a fix) --
+    // install will splice into this file, preserving what is already in it.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { spend: { url: "https://x" } } }),
+      "utf8",
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toMatch(/Claude Code\s+user\s+~[\\/].claude\.json\s+other-entries/);
+    // Present-but-unconfigured does not count toward the headline.
+    expect(out).toMatch(/^0\/\d+ client scopes have yaw-mcp configured on linux\./m);
   });
 
   it("reports `malformed` for unparseable client config", async () => {
@@ -1575,6 +1956,60 @@ describe("runInstall --all", () => {
     expect(out).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // ~/.yaw-mcp/config.json is not part of an install any more.
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
+  });
+
+  it("--project-dir pulls the project-only client (vscode) into the plan", async () => {
+    // The other side of the "skip vscode" line above, and the untested half of
+    // runInstallAll's planner: a client with NO non-project scope is planned at
+    // its first scope only when --project-dir is passed.
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      all: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).not.toContain("skip vscode");
+    // Planned at its workspace scope, and the file lands under the project dir.
+    const vscodeConfig = join(synthCwd, ".vscode", "mcp.json");
+    expect(existsSync(vscodeConfig)).toBe(true);
+    expect(r.written).toContain(vscodeConfig);
+    const config = JSON.parse(readFileSync(vscodeConfig, "utf8"));
+    expect(config.servers[ENTRY_NAME]).toBeDefined();
+    // The user-scope clients are still installed alongside it.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
+    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
+  });
+
+  it("--dry-run aggregates every client's would-writes and writes nothing", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    // Every planned client's preview is folded into ONE list: claude-code's
+    // client config + its settings.json patch, plus cursor's config.
+    expect(r.wouldWrite).toContain(join(synthHome, ".claude.json"));
+    expect(r.wouldWrite).toContain(join(synthHome, ".claude", "settings.json"));
+    expect(r.wouldWrite).toContain(join(synthHome, ".cursor", "mcp.json"));
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(false);
+    // A preview leaves entries in place for the purposes of the runtime tip:
+    // wouldWrite is what feeds the "did this run leave an entry" gate, so the
+    // consolidated oam-absent note still prints on a dry run.
+    expect(cap.stdout()).toMatch(/Runtime: node \(oam is not installed/);
   });
 
   it("refuses with exit 1 when no clients are installable on the OS", async () => {
@@ -1677,6 +2112,10 @@ describe("runInstall — oam launch entry", () => {
     const r = await runInstall({
       clientId: "claude-code",
       scope: "user",
+      // Pinned like every sibling in this describe: without it the run takes
+      // the HOST's os, and the assertion below passes only because the oam
+      // entry happens to have no per-OS wrapping (the npx one does).
+      os: "linux",
       home: synthHome,
       io: cap.io,
       oamProbe: OAM_PRESENT,
@@ -1840,8 +2279,11 @@ describe("runInstall — oam launch entry", () => {
       expect(r.exitCode).toBe(0);
       const out = r.messages.join("\n");
       // More than one client must actually have been installed, or this pins
-      // nothing -- a single-client run would read as "once" either way.
-      expect(out.split("──").length - 1).toBeGreaterThan(1);
+      // nothing -- a single-client run would read as "once" either way. Counted
+      // by HEADER LINE: a `──` token count passes on a single-client run too,
+      // because each header carries two of them.
+      const headers = r.messages.filter((m) => CLIENT_HEADER_LINE.test(m));
+      expect(headers.length).toBeGreaterThan(1);
       expect(out.split(OAM_INSTALL_SH).length - 1).toBe(1);
     } finally {
       rmSync(allHome, { recursive: true, force: true });
@@ -1869,6 +2311,56 @@ describe("runInstall — oam launch entry", () => {
       expect(out).not.toContain(OAM_INSTALL_SH);
     } finally {
       rmSync(winHome, { recursive: true, force: true });
+    }
+  });
+
+  it("withholds the installer on a machine oam publishes no binary for", async () => {
+    // The absent note names an install one-liner, but oam ships no
+    // linux-arm64 (or freebsd, or...) asset and install.sh refuses outright --
+    // so on those machines the one-liner is a command that exits non-zero for
+    // a runtime the user never needed. Reachable only via the seam: the branch
+    // is gated on THIS machine's platform+arch, so on every runner that has a
+    // published binary it is dead code the note's own tests cannot see.
+    const hostInstaller = CURRENT_OS === "windows" ? OAM_INSTALL_PS1 : OAM_INSTALL_SH;
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      // CURRENT_OS, not a literal: the withhold branch only fires for the
+      // machine the run is ON -- asked about another OS, install has no arch
+      // to judge and must keep naming that OS's installer.
+      os: CURRENT_OS,
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      oamPublishesBinary: () => false,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = r.messages.join(" ");
+    expect(out).toContain("oam is not an option on this machine");
+    // One source for the wording, shared with doctor's OAM RUNTIME section.
+    expect(out).toContain(oamNoBinaryReason());
+    expect(out).not.toContain(hostInstaller);
+
+    // Same run on a machine that DOES have a binary still names the one-liner.
+    const publishedHome = mkdtempSync(join(tmpdir(), "yaw-mcp-install-published-"));
+    try {
+      const published = captureIo();
+      const withBinary = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: CURRENT_OS,
+        home: publishedHome,
+        io: published.io,
+        oamProbe: OAM_ABSENT,
+        oamPublishesBinary: () => true,
+      });
+      expect(withBinary.exitCode).toBe(0);
+      const publishedOut = withBinary.messages.join(" ");
+      expect(publishedOut).toContain(hostInstaller);
+      expect(publishedOut).not.toContain("oam is not an option on this machine");
+    } finally {
+      rmSync(publishedHome, { recursive: true, force: true });
     }
   });
 
@@ -2215,8 +2707,13 @@ describe("runInstall — returned messages match what was printed", () => {
     // Emitted by the --all layer itself; a second, locally-built array dropped
     // every one of these while the user saw them all on stdout/stderr.
     expect(trail).toContain(TOKEN_FLAG_DEPRECATION);
-    expect(trail).toMatch(/Installing into \d+ clients?…/);
-    expect(trail).toContain("── claude-code (user) ──");
+    // Pinned ASCII, both glyphs -- see CLIENT_HEADER_LINE. install renders the
+    // ellipsis as `...` and the header separator as `--` today, for the
+    // Windows-console mojibake reason documented at oam-spawn.ts:285-287.
+    // Accepting the box-drawing spelling alongside pinned neither: the code
+    // could revert to `──` / `…` with the suite still green.
+    expect(trail).toMatch(/Installing into \d+ clients?\.\.\./);
+    expect(trail).toMatch(/^-- claude-code \(user\) --$/m);
     expect(trail).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // ...and still carries each sub-install's own trail.
     expect(trail).toContain(`Wrote ${join(synthHome, ".claude.json")}`);
@@ -2323,6 +2820,54 @@ describe("runInstall — Runtime line ordering", () => {
     // Nothing is written, so nothing describes a runtime.
     expect(r.messages.join("\n")).not.toMatch(/Runtime:/);
     expect(cap.stdout()).not.toMatch(/Runtime:/);
+  });
+
+  it("refuses a collision WITHOUT first claiming a runtime", async () => {
+    // The malformed-JSON case above is only one of the refusals the Runtime
+    // chain used to precede. A collision refusal is the one a user actually
+    // meets repeatedly -- re-running install from a script or an agent shell
+    // (non-TTY) with an entry already in place -- and it produced the same
+    // shape: "Runtime: will run on oam ..." (or "Runtime: node (...)") above
+    // "already has a ... entry and stdin is not a TTY".
+    const initial = JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }, null, 2);
+    writeFileSync(join(synthHome, ".claude.json"), initial);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/stdin is not a TTY/);
+    expect(r.messages.join("\n")).not.toMatch(/Runtime:/);
+    expect(cap.stdout()).not.toMatch(/Runtime:/);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
+  });
+
+  it("leaves an entry alone under --skip WITHOUT describing the entry it did not write", async () => {
+    // Same class, exit 0: --skip writes nothing, so a Runtime line here
+    // describes the entry that WOULD have been written rather than the one
+    // left in place -- which is the reverse of what the transcript implies.
+    const initial = JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }, null, 2);
+    writeFileSync(join(synthHome, ".claude.json"), initial);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      skip: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain(`Existing "${ENTRY_NAME}" entry left untouched.`);
+    expect(r.messages.join("\n")).not.toMatch(/Runtime:/);
+    expect(cap.stdout()).not.toMatch(/Runtime:/);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
   });
 
   it("still prints the Runtime line on a run that goes on to write", async () => {

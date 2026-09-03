@@ -23,8 +23,8 @@ import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
-import { specConstraint } from "./oam-spawn.js";
-import { CONFIG_DIRNAME } from "./paths.js";
+import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
+import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
 // One prompt reader for the whole product -- see askYesNo at the bottom of
 // this file for why this crosses a command boundary.
 import { readAnswerFromTTY } from "./secrets-cmd.js";
@@ -134,6 +134,14 @@ export function parseTrustArgs(
     return { ok: false, error: `yaw-mcp trust: expected at most one path\n\n${TRUST_USAGE}` };
   }
   if (positional.length === 1) {
+    // An EMPTY operand is an argv error, not a path. `yaw-mcp trust --revoke
+    // "$REPO"` with $REPO unset expands to one empty argument, which used to
+    // parse as a path, fail the truthiness test in runTrustRevoke, and silently
+    // revoke the project found from CWD instead -- a different file than the
+    // command names, reported as a success.
+    if (positional[0].length === 0) {
+      return { ok: false, error: `yaw-mcp trust: empty path argument\n\n${TRUST_USAGE}` };
+    }
     // A bare path only means something for --revoke. Grant deliberately has
     // no path argument: you approve the project you are standing in, after
     // reading its commands -- not one named from memory.
@@ -185,9 +193,15 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
   const probe = await probeProjectTrust({ cwd, home, env });
 
   if (probe.status === "none") {
+    // A flat "no .yaw-mcp/ directory found" is a LIE in the case the user is
+    // most likely to hit it: findProjectConfigDir REJECTS a `.yaw-mcp/` outside
+    // $HOME whose ownership it cannot verify -- the default for every win32
+    // checkout on a second drive -- and reports that exactly like a tree with
+    // no `.yaw-mcp/` in it at all. Naming the skip is the difference between
+    // "there is nothing here" and "I am looking straight at one".
     printErr(
       probe.path === null
-        ? `yaw-mcp trust: no .yaw-mcp/ directory found by walking up from ${displaySafe(cwd)}. There is no project bundles.json to approve; your user-global ~/.yaw-mcp/bundles.json is always loaded.`
+        ? `yaw-mcp trust: no .yaw-mcp/ directory that yaw-mcp can use was found by walking up from ${displaySafe(cwd)}. One OUTSIDE your home directory is SKIPPED unless yaw-mcp can verify you own it -- set ${ALLOW_UNOWNED_ENV}=1 to trust this checkout, then re-run. Otherwise there is no project bundles.json to approve; your user-global ~/.yaw-mcp/bundles.json is always loaded.`
         : `yaw-mcp trust: no project bundles.json at ${displaySafe(probe.path)}. Nothing to approve.`,
     );
     return { exitCode: 1 };
@@ -402,7 +416,15 @@ function printStoreRefusal(
  *  the single argument it really is instead of blending into the line. */
 function renderLaunch(s: UpstreamServerConfig): string {
   if (s.type === "remote" || (!s.command && s.url)) return `HTTP ${displaySafe(s.url ?? "(no url)")}`;
-  const parts = [s.command ?? "", ...(s.args ?? [])].filter((p) => p.length > 0);
+  const command = s.command ?? "";
+  const args = s.args ?? [];
+  // EVERY arg is rendered, empty strings included -- displayArg quotes one as
+  // `""` so it is visible rather than a run of spaces. Dropping them made the
+  // line something other than the argv that will be spawned, which is this
+  // file's whole contract: `{"command":"sh","args":["-c",""]}` rendered as
+  // `$ sh -c`, and `sh -c` is a different command than `sh -c ""`. Only an
+  // ABSENT command is dropped -- there is no argv[0] to show.
+  const parts = command.length > 0 ? [command, ...args] : args;
   if (parts.length === 0) return "(no command)";
   return `$ ${parts.map((p) => displayArg(p)).join(" ")}`;
 }
@@ -458,10 +480,12 @@ export function displaySafe(s: string): string {
 /**
  * One argv token or env key name. Quoted on whitespace and quote characters
  * too, so `sh -c "curl ... | sh"` reads as the single argument it really is
- * instead of blending into the rest of the line.
+ * instead of blending into the rest of the line. An EMPTY token is quoted for
+ * the same reason: rendered bare it is invisible, so the line would show fewer
+ * arguments than the spawn actually passes.
  */
 export function displayArg(s: string): string {
-  return /[\s"']/.test(s) || DISPLAY_CONTROL_RE.test(s) ? quoteVisible(s) : s;
+  return s.length === 0 || /[\s"']/.test(s) || DISPLAY_CONTROL_RE.test(s) ? quoteVisible(s) : s;
 }
 
 // --- what the pin does NOT cover --------------------------------------------
@@ -500,14 +524,15 @@ function inRepoTokens(s: UpstreamServerConfig): string[] {
 }
 
 /** Package runners whose first non-flag operand names something fetched at
- *  spawn time. `sub` is the subcommand that has to be present first. */
-const REGISTRY_RUNNERS: Array<{ cmd: string; sub?: string }> = [
+ *  spawn time. `sub` is the subcommand that has to be present first; `python`
+ *  marks the runners that resolve a PEP 440 spec instead of an npm one. */
+const REGISTRY_RUNNERS: Array<{ cmd: string; sub?: string; python?: true }> = [
   { cmd: "npx" },
   { cmd: "bunx" },
-  { cmd: "uvx" },
+  { cmd: "uvx", python: true },
   { cmd: "pnpm", sub: "dlx" },
   { cmd: "npm", sub: "exec" },
-  { cmd: "pipx", sub: "run" },
+  { cmd: "pipx", sub: "run", python: true },
 ];
 
 /** Flags that take no value, so the token after them is still the operand.
@@ -550,6 +575,22 @@ function stripVersionPrefixV(spec: string): string {
   return /^v\d/.test(suffix) ? spec.slice(0, at + 1) + suffix.slice(1) : spec;
 }
 
+/** The `@suffix` of a package spec, or null when it carries none. Same cut as
+ *  stripVersionPrefixV above (and oam-spawn.ts:packageName): the "@" after the
+ *  possibly-scoped name. */
+function specVersionSuffix(spec: string): string | null {
+  const start = spec.startsWith("@") ? 1 : 0;
+  const at = spec.indexOf("@", start);
+  return at === -1 ? null : spec.slice(at + 1);
+}
+
+/** One complete PEP 440 release, as uv/pipx would resolve it. Deliberately
+ *  looser than npm's x.y.z: a two-component release (`1.0`) is COMPLETE in PEP
+ *  440, so `uvx pkg@1.0` names exactly one version even though npm's parser
+ *  calls the same suffix a partial range. Anything carrying a range operator
+ *  (`>=1`, `1.*`, `~=1.2`) fails to match and is reported as unpinned. */
+const PEP440_EXACT_RE = /^\d+(?:\.\d+)*(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?$/;
+
 /** The registry spec this entry would fetch, when it has no version pin. */
 function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
   const base =
@@ -574,12 +615,21 @@ function unversionedRegistrySpec(s: UpstreamServerConfig): string | null {
     break;
   }
   if (spec === null || spec.length === 0) return null;
-  // A local path / url / git ref is not a registry lookup (inRepoTokens or
-  // the closing text covers those).
-  if (spec.includes("://") || isAbsolute(spec) || /^\.{1,2}[\\/]/.test(spec)) return null;
+  // A local path / url / git ref is not a registry lookup at all (inRepoTokens
+  // or the closing text covers those). This is oam-spawn's OWN test rather than
+  // a second, weaker copy of it: the hand-rolled `://` + isAbsolute check let
+  // every protocol form through, so `github:owner/repo#<sha>` -- pinned to a
+  // COMMIT, a harder pin than any registry version -- was reported as
+  // "resolves to whatever the registry serves at spawn time".
+  if (!isRegistrySpec(spec)) return null;
   // uvx / pipx pin: `pkg==0.4.1` names one exact version (PEP 440 form).
   // A scope-free substring test is enough -- npm specs never carry `==`.
   if (spec.includes("==")) return null;
+  // The rest of the version rules below are npm's, and a PYTHON runner does not
+  // use them: `uvx pkg@1.0` is one exact release under PEP 440, while npm's
+  // x.y.z-or-nothing parser buckets `1.0` as a partial range -- so a pinned uv
+  // spec was reported as unpinned on the entries where the pin is real.
+  if (runner.python) return PEP440_EXACT_RE.test(specVersionSuffix(spec) ?? "") ? null : spec;
   // npm-style suffix: only an EXACT version is a pin. A dist-tag
   // (`@latest`, `@next`) or a range (`@^1.2.3`, `@*`) re-resolves against
   // the registry at spawn time exactly like a bare spec -- and `@latest`
@@ -694,8 +744,24 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
   for (const r of rows) print(fmt(cols.map(([, get]) => get(r))));
   print("");
   print(`${rows.length} approved in ${trustStorePath(home)}`);
-  if (rows.some((r) => r.status !== "ok")) {
+  // One footer line PER STATUS, because the loader treats the three differently
+  // and a single "not loaded -- re-approve" line was wrong for two of them. An
+  // UNREADABLE approved file is still honoured (projectFileIsHonoured: the path
+  // is in the store, so it is authoritative even when broken) -- it shadows the
+  // user-global file and yields no servers, which is the opposite of "not
+  // loaded" and is not fixed by re-approving. A MISSING one is honoured by
+  // nobody; the row is just stale bookkeeping.
+  const hasStatus = (s: ListStatus): boolean => rows.some((r) => r.status === s);
+  if (hasStatus("stale (content changed)")) {
     print("A stale entry is NOT loaded -- re-run `yaw-mcp trust` from that project to re-approve.");
+  }
+  if (hasStatus("missing (file not found)")) {
+    print("A missing entry loads nothing -- drop the row with `yaw-mcp trust --revoke <path>`.");
+  }
+  if (hasStatus("unreadable")) {
+    print(
+      "An unreadable entry is STILL honoured by the loader: an approved path yaw-mcp cannot read shadows your user-global ~/.yaw-mcp/bundles.json, so that project loads NO servers. Fix its permissions, or drop it with `yaw-mcp trust --revoke <path>`.",
+    );
   }
   return { exitCode: 0 };
 }
@@ -706,7 +772,12 @@ async function classifyRecord(path: string, sha256: string): Promise<ListStatus>
     return hashTrustContent(raw) === sha256 ? "ok" : "stale (content changed)";
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
-    return code === "ENOENT" || code === "EISDIR" ? "missing (file not found)" : "unreadable";
+    // ENOENT only. EISDIR is what the LOADER classifies as a read failure
+    // (readBundlesRawAt), and it honours an approved path that fails that way
+    // -- so calling it "missing (file not found)" here told the user the
+    // opposite of what the loader does with it, and pointed them at a remedy
+    // for a file that is very much present.
+    return code === "ENOENT" ? "missing (file not found)" : "unreadable";
   }
 }
 
@@ -748,8 +819,18 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
   const cwd = opts.cwd ?? process.cwd();
   const env = opts.env ?? process.env;
 
+  // The escape hatch outranks the store here exactly as it does on the grant
+  // and list paths: with it set the loader honours every project file, so a
+  // revoke changes nothing until the variable is unset.
+  const bypassed = isTrustBypassEnabled(env);
+
   let target: string;
-  if (opts.path) {
+  // `!== undefined`, not truthiness: an empty string is a PATH the caller
+  // named, not an absent one, and falling through to the cwd probe for it
+  // revoked a different file than the command asked about. parseTrustArgs
+  // rejects an empty operand outright; this is the same rule for the
+  // programmatic entry point.
+  if (opts.path !== undefined) {
     target = await resolveRevokeTarget(resolve(cwd, opts.path));
   } else {
     const probe = await probeProjectTrust({ cwd, home, env });
@@ -764,13 +845,27 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
 
   const res = await revokeTrust(target, { home });
   if (res.storeWasMalformed) {
-    const msg = `the trust store at ${res.storePath} is unreadable, so nothing is trusted and there was nothing to revoke`;
+    // The same three kinds --list and the grant path distinguish, with the same
+    // remedies. Collapsing them into "is unreadable, so nothing is trusted and
+    // there was nothing to revoke" was wrong for a NEWER-SCHEMA store -- the
+    // grants are real and still there, for the build that wrote them -- and it
+    // contradicted the "do NOT delete it" the other two surfaces print.
+    const store = await readTrustStore(home);
+    const fix =
+      store.malformedKind === "io"
+        ? "fix its permissions (do NOT delete it -- your approvals are still in there)"
+        : store.malformedKind === "schema"
+          ? "upgrade with `npm i -g @yawlabs/mcp@latest` (do NOT delete it -- your approvals are still in there)"
+          : "fix or delete it";
+    const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- nothing was revoked; ${fix}, then re-run`;
     if (opts.json) out(`${JSON.stringify({ ok: false, path: target, removed: false, error: msg }, null, 2)}\n`);
     else printErr(`yaw-mcp trust --revoke: ${msg}`);
     return { exitCode: 1 };
   }
   if (opts.json) {
-    out(`${JSON.stringify({ ok: true, path: target, removed: res.removed, storePath: res.storePath }, null, 2)}\n`);
+    out(
+      `${JSON.stringify({ ok: true, path: target, removed: res.removed, storePath: res.storePath, bypassed }, null, 2)}\n`,
+    );
     return { exitCode: 0 };
   }
   // A no-op revoke exits 0: "make it not approved" is satisfied either way
@@ -784,7 +879,16 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
   // repo directory just like a grant target can.
   print(`Revoked ${displaySafe(target)}`);
   print(`  removed from ${res.storePath}`);
-  print("Restart your MCP client (or yaw-mcp) to stop loading it.");
+  if (bypassed) {
+    // "Restart to stop loading it" would credit the revoke for something the
+    // escape hatch overrides: with the env var set the file keeps loading,
+    // approved or not. Same wording the grant path uses for the same reason.
+    print(
+      `NOTE: ${TRUST_BYPASS_ENV} is set, so this file KEEPS loading without approval. This revocation takes effect once the variable is unset.`,
+    );
+  } else {
+    print("Restart your MCP client (or yaw-mcp) to stop loading it.");
+  }
   return { exitCode: 0 };
 }
 

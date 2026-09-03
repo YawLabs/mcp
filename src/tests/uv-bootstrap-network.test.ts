@@ -145,24 +145,38 @@ describe("fetchWithRedirects redirect following", () => {
     const correctHash = createHash("sha256").update(finalBody).digest("hex");
     const shaBody = Buffer.from(`${correctHash}  archive.zip\n`);
 
-    // Call sequence: archive (302) -> archive redirect target (200) -> sha256 (200).
-    mockRequest
-      .mockResolvedValueOnce(
-        fakeResponse(302, Buffer.alloc(0), { location: "https://cdn.example.com/uv.zip" }) as never,
-      )
-      .mockResolvedValueOnce(fakeResponse(200, finalBody) as never)
-      .mockResolvedValueOnce(fakeResponse(200, shaBody) as never);
+    // URL-keyed, NOT a positional mockResolvedValueOnce chain: resolveUv runs
+    // Promise.all([fetchWithRedirects(archiveUrl), fetchWithRedirects(shaUrl)]),
+    // so the concurrent sha fetch consumed the queued archive 200 and the
+    // checksum never passed -- the very thing this test is named for went
+    // unasserted. Keying on the URL makes each fetch get its own response, and
+    // only the FIRST archive-URL hit redirects (the CDN target does not end in
+    // .sha256 either, so it correctly falls through to the archive branch).
+    let archiveHits = 0;
+    mockRequest.mockImplementation((url: unknown) => {
+      if (String(url).endsWith(".sha256")) return Promise.resolve(fakeResponse(200, shaBody) as never);
+      archiveHits++;
+      return Promise.resolve(
+        archiveHits === 1
+          ? (fakeResponse(302, Buffer.alloc(0), { location: "https://cdn.example.com/uv.zip" }) as never)
+          : (fakeResponse(200, finalBody) as never),
+      );
+    });
 
-    // After the checksum check passes, resolveUv tries to write the archive
-    // to disk. We don't need the full extract flow -- catching any error
-    // after the checksum stage is fine; we verify the mock call pattern.
-    await ensureUv().catch(() => {});
+    // The checksum gate sits directly downstream of the redirect follow, so
+    // "the rejection is NOT a checksum mismatch" is what proves the final 200's
+    // body came back intact -- an earlier hop's body or an empty buffer hashes
+    // differently and trips the gate. What actually fails here is the extract
+    // step: this file's spawn mock ENOENTs every child, so ensureUv rejects
+    // with that raw error, which resolveUv does not wrap.
+    const err = await ensureUv().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toContain("checksum mismatch");
 
-    // resolveUv calls Promise.all([fetchWithRedirects(archiveUrl), fetchWithRedirects(shaUrl)]),
-    // so both start concurrently. The interleaved call order is:
-    //   call[0] archiveUrl -> 302
-    //   call[1] shaUrl -> 200 (sha fetch, runs concurrently, resolves immediately)
-    //   call[2] redirect Location -> 200 (archive follow-through)
+    // Both fetches start concurrently, so the calls are:
+    //   archiveUrl -> 302
+    //   shaUrl -> 200 (sha fetch, runs concurrently, resolves immediately)
+    //   redirect Location -> 200 (archive follow-through)
     expect(mockRequest).toHaveBeenCalledTimes(3);
     const urls = mockRequest.mock.calls.map((c) => (c as [string, ...unknown[]])[0]);
     expect(urls).toContain("https://cdn.example.com/uv.zip");
@@ -189,11 +203,56 @@ describe("fetchWithRedirects too many redirects", () => {
 
 describe("fetchWithRedirects missing Location header", () => {
   it("throws when a 302 response has no Location header", async () => {
-    // 302 with no location field in headers.
-    mockRequest.mockResolvedValueOnce(fakeResponse(302, Buffer.alloc(0)) as never);
+    // URL-keyed so the concurrent sha fetch gets a well-formed 200 of its own.
+    // A single queued response left the sha fetch awaiting `undefined` and
+    // dying on a TypeError, so the asserted rejection only won by racing --
+    // here the Location-less 302 is the only thing that can reject.
+    const shaBody = Buffer.from(`${"0".repeat(64)}  archive.zip\n`);
+    mockRequest.mockImplementation((url: unknown) =>
+      Promise.resolve(
+        String(url).endsWith(".sha256")
+          ? (fakeResponse(200, shaBody) as never)
+          : (fakeResponse(302, Buffer.alloc(0)) as never),
+      ),
+    );
 
     const err = await ensureUv().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("Redirect without Location header");
+  });
+});
+
+// ── fetchWithRedirects: non-200 status ────────────────────────────────────
+
+describe("fetchWithRedirects non-200 status", () => {
+  it("throws 'failed: HTTP 404' when the release asset is missing", async () => {
+    // The likeliest real-world download failure: a UV_VERSION bump lands
+    // before Astral publishes the asset, or the triple has no asset at all.
+    mockRequest.mockImplementation(() => Promise.resolve(fakeResponse(404, Buffer.alloc(0)) as never));
+
+    const err = await ensureUv().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("failed: HTTP 404");
+  });
+});
+
+// ── fetchWithRedirects: undici idle timeouts -> one clear message ──────────
+
+describe("fetchWithRedirects timeout mapping", () => {
+  it.each([
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+  ])("maps %s to the 'uv download timed out' message", async (code) => {
+    // undici's headersTimeout/bodyTimeout surface as coded errors; both must
+    // come out as one actionable message rather than a raw undici code.
+    mockRequest.mockImplementation(() => {
+      const undiciErr = new Error("undici timeout (mocked)") as Error & { code: string };
+      undiciErr.code = code;
+      return Promise.reject(undiciErr);
+    });
+
+    const err = await ensureUv().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("uv download timed out");
   });
 });

@@ -101,9 +101,11 @@ export async function readGradesCache(home: string = homedir()): Promise<GradesC
  *  Rethrowing instead lands in audit-cmd's writeGrade catch, which
  *  reports grade-computed-but-cache-write-failed as exit 3. Only
  *  ENOENT/ENOTDIR mean "no cache yet" (same split as config-loader).
- *  A file that reads but does not PARSE still yields {} on both paths:
+ *  A file that reads but does not PARSE -- or parses to something that is
+ *  not a namespace -> grade object -- still yields {} on both paths:
  *  replacing a malformed cache with a rebuilt one is fine -- it is
- *  disposable derived data, and the read side already warned. */
+ *  disposable derived data, and both of those cases log a warning on the
+ *  way out, so the rebuild is never the user's only clue. */
 async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }): Promise<GradesCache> {
   const path = gradesCachePath(home);
   let raw: string;
@@ -124,7 +126,20 @@ async function readGradesCacheImpl(home: string, opts: { strictRead: boolean }):
     });
     return {};
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  // Warned about, not dropped in silence: a root that PARSES but is not a
+  // namespace->grade map (an array, a bare number, `null`) is exactly as
+  // corrupt as invalid JSON, and it is the same user staring at a `servers`
+  // listing with no grades in it. Saying nothing here while the parse failure
+  // above logs meant the identical symptom had a diagnostic in one case and
+  // nothing at all in the other. Both then rebuild the file on the next audit
+  // (see the strictRead note above), so the warning is the only trace.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    log("warn", "grades.json is not a JSON object of namespace -> grade; ignoring", {
+      path,
+      rootType: Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed,
+    });
+    return {};
+  }
   const out: GradesCache = {};
   for (const [ns, entry] of Object.entries(parsed as Record<string, unknown>)) {
     const validated = validateEntry(entry);

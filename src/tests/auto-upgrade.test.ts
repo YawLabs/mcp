@@ -255,10 +255,11 @@ describe("maybeAutoUpgrade", () => {
   });
 
   it("does NOT spawn for a stale bundled-app (asar.unpacked) argvPath -- distinct from generic no-spawn cases", async () => {
-    // Item 5: auto-upgrade.ts:155 -- the bundled-app branch logs and returns
-    // without calling spawnImpl. This is the same surface as npx/local/unknown
-    // but the code reaches it through the explicit bundled-app guard at line 155
-    // rather than the null-globalSpec fallthrough. Pin that branch explicitly.
+    // The bundled-app branch in maybeAutoUpgrade logs and returns without
+    // calling spawnImpl. Same observable surface as npx/local/unknown, but the
+    // code reaches it through the explicit `method === "bundled-app"` guard
+    // rather than the null-globalSpec fallthrough. Pin that branch by name --
+    // a line number cited here goes stale on the next edit above it.
     const spawnImpl = vi.fn();
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
@@ -288,7 +289,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, realpathSync: vi.fn((p: string) => p) };
 });
 
-import { existsSync, mkdtempSync, realpathSync, rmSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const mockRealpathSync = vi.mocked(realpathSync);
@@ -384,6 +385,15 @@ describe("detectRunningInstallPrefix", () => {
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("runAutoUpgrade: --prefix injection into spawn args", () => {
+  // Restoring the file-level identity realpath mock belongs in afterEach, not
+  // at the end of a test body: a failing assertion skips the rest of the body,
+  // so an in-body restore leaks a blanket realpath stub into every suite below
+  // and turns one red test into a cascade of unrelated ones.
+  afterEach(() => {
+    mockRealpathSync.mockReset();
+    mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
+  });
+
   it("adds --prefix to npm spawn args when detected prefix differs from the default", async () => {
     // Use a path whose dirname walk hits node_modules so
     // detectRunningInstallPrefix returns a non-null prefix. The mock
@@ -408,9 +418,28 @@ describe("runAutoUpgrade: --prefix injection into spawn args", () => {
     expect(args).toContain("@yawlabs/mcp@latest");
     // Ensure the exact whitelisted shape: install -g --prefix <dir> @yawlabs/mcp@latest
     expect(args).toEqual(["install", "-g", "--prefix", customPrefix, "@yawlabs/mcp@latest"]);
+  });
 
-    mockRealpathSync.mockReset();
-    mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
+  it("classifies a bin shim by its REALPATH, so a global install behind a shim still upgrades", async () => {
+    // `/usr/local/bin/yaw-mcp` is npm's own bin symlink -- the canonical POSIX
+    // global invocation. The literal path matches no install marker; only the
+    // resolved path says global-npm. Classified from the unresolved argv[1] it
+    // reads as "unknown", and the most ordinary global install there is never
+    // background-upgrades. The prefix walk resolves the same shim, so the
+    // upgrade lands in the tree the shim points into.
+    const shim = join(sep, "usr", "local", "bin", "yaw-mcp");
+    mockRealpathSync.mockImplementation((p) => (p === shim ? GLOBAL_NPM_PATH : String(p)));
+
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: shim,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+    expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS, RELEASE_LOCK);
   });
 });
 
@@ -468,6 +497,11 @@ import type { EventEmitter } from "node:events";
 const cp = vi.hoisted(() => ({
   calls: [] as Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }>,
   children: [] as Array<EventEmitter & { stdout: EventEmitter }>,
+  /** Set to make the mocked spawn throw SYNCHRONOUSLY (EACCES on the tool
+   *  binary, a bad cwd) instead of returning a child. Node really does throw
+   *  from spawn for those, and that path never reaches a close/error handler --
+   *  so it is the only way to exercise maybeAutoUpgrade's catch. */
+  throwOnSpawn: null as Error | null,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -476,9 +510,10 @@ vi.mock("node:child_process", async (importOriginal) => {
   return {
     ...actual,
     spawn: (cmd: string, args: string[], opts: Record<string, unknown>) => {
+      cp.calls.push({ cmd, args: [...args], opts: { ...opts } });
+      if (cp.throwOnSpawn) throw cp.throwOnSpawn;
       const child = new EE() as EventEmitter & { stdout: EventEmitter };
       child.stdout = new EE();
-      cp.calls.push({ cmd, args: [...args], opts: { ...opts } });
       cp.children.push(child);
       return child;
     },
@@ -515,6 +550,7 @@ function warnCalls(): Array<[string, string, Record<string, unknown> | undefined
 function resetSpawnRecorder(): void {
   cp.calls.length = 0;
   cp.children.length = 0;
+  cp.throwOnSpawn = null;
   mockLog.mockClear();
   mockRealpathSync.mockReset();
   mockRealpathSync.mockImplementation((p: Parameters<typeof mockRealpathSync>[0]) => String(p));
@@ -694,6 +730,52 @@ describe("defaultSpawn -- the real background upgrade child", () => {
       expect.stringContaining("upgrading the global install"),
       expect.objectContaining({ prefix: spaced }),
     );
+  });
+
+  it("releases the upgrade lock EXACTLY once when the child fires both error and close", async () => {
+    // defaultSpawn's finish() guard, which nothing else covers: every other
+    // test injects spawnImpl (so the real handlers never run) and
+    // defaultAcquireLock short-circuits to a no-op release under vitest. An
+    // ENOENT spawn fires BOTH handlers, and a second release unlinks whatever
+    // lock has been taken since -- including another process's.
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    const releaseSpy = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      acquireLockImpl: () => releaseSpy,
+    });
+
+    expect(cp.calls).toHaveLength(1);
+    // Still installing: the lock is held until the child settles.
+    expect(releaseSpy).not.toHaveBeenCalled();
+    const child = cp.children[0];
+    child.emit("error", new Error("spawn npm ENOENT"));
+    child.emit("close", 1);
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the lock (and warns) when the spawn throws synchronously", async () => {
+    // The other untested half of the lock lifecycle. A synchronous throw never
+    // reaches a close/error handler, so without the catch's release the lock
+    // would sit held for the full ten-minute stale window -- suppressing the
+    // next N startups' upgrade over a failure that already finished.
+    mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+    cp.throwOnSpawn = new Error("EACCES: permission denied, spawn npm");
+    const releaseSpy = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      acquireLockImpl: () => releaseSpy,
+    });
+
+    expect(releaseSpy).toHaveBeenCalledTimes(1);
+    const warns = warnCalls();
+    expect(warns).toHaveLength(1);
+    expect(warns[0][1]).toContain("could not start npm");
+    expect(warns[0][2]).toEqual({ error: "EACCES: permission denied, spawn npm" });
   });
 
   it("drops --prefix entirely when the path cannot be safely quoted on win32", async () => {
@@ -1123,9 +1205,27 @@ describe("acquireUpgradeLock", () => {
     expect(existsSync(lockFile())).toBe(true);
   });
 
+  it("never unlinks a lock another process has since taken (no steal cascade)", () => {
+    // The idempotence flag only sees THIS process's releases. If our lock goes
+    // stale and another process steals it, an unconditional unlink on release
+    // deletes the NEW holder's lock -- cascading the steal down the line, the
+    // exact outcome the idempotence guard is supposed to prevent. The release
+    // reads back the pid it wrote and leaves anything else alone.
+    const release = acquireUpgradeLock(dir);
+    const newHolder = `${process.pid + 1}\n`;
+    writeFileSync(lockFile(), newHolder); // stolen as stale, then retaken
+    release?.();
+
+    expect(existsSync(lockFile())).toBe(true);
+    expect(readFileSync(lockFile(), "utf8")).toBe(newHolder);
+    // ...and the new holder's lock is still honoured by the next caller.
+    expect(acquireUpgradeLock(dir)).toBeNull();
+  });
+
   it("steals a lock left behind by a killed process once it goes stale", () => {
     acquireUpgradeLock(dir);
-    // Backdate the file rather than advancing `now`: mtimeMs carries
+    // Backdate the FILE rather than steering the clock: acquireUpgradeLock
+    // reads Date.now() itself and takes no `now` argument. mtimeMs also carries
     // sub-millisecond precision while Date.now() is truncated, so a fixture
     // built as `Date.now() + STALE + 1` sits a fraction of a millisecond
     // INSIDE the threshold often enough to flake.
@@ -1185,7 +1285,9 @@ describe("maybeAutoUpgrade -- lock contention", () => {
   it("locks the DETECTED running prefix, not npm's configured one", async () => {
     // The lock has to live where the install actually lands, or two processes
     // installing into the same tree through different prefix names miss it.
-    const acquireLockImpl = vi.fn(() => () => {});
+    // With a prefix of its own to lock, the file keeps the plain default name
+    // (sidecar-refresh.ts hardcodes that name for its mtime heartbeat).
+    const acquireLockImpl = vi.fn((_dir: string, _lockName: string) => () => {});
     mockRealpathSync.mockReturnValueOnce(GLOBAL_NPM_PATH);
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
@@ -1194,6 +1296,115 @@ describe("maybeAutoUpgrade -- lock contention", () => {
       spawnImpl: vi.fn(),
       acquireLockImpl,
     });
-    expect(acquireLockImpl).toHaveBeenCalledWith(GLOBAL_NPM_PREFIX);
+    expect(acquireLockImpl).toHaveBeenCalledWith(GLOBAL_NPM_PREFIX, ".yaw-mcp-upgrade.lock");
+  });
+
+  it("scopes the tmpdir fallback lock by tool and user -- not one lock for the whole machine", async () => {
+    // pnpm/bun never get a detected prefix (that walk is global-npm only), so
+    // they fall back to tmpdir. With a fixed filename, pnpm, bun and a
+    // prefix-less global npm all contended on ONE
+    // `${tmpdir()}/.yaw-mcp-upgrade.lock` -- and on a shared POSIX box another
+    // user's lock could be neither taken (EEXIST, not ours) nor stolen (EPERM).
+    const acquireLockImpl = vi.fn((_dir: string, _lockName: string) => () => {});
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: PNPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+      acquireLockImpl,
+    });
+    const scopedName = `.yaw-mcp-upgrade-pnpm-${process.getuid?.() ?? "win"}.lock`;
+    expect(acquireLockImpl).toHaveBeenCalledWith(tmpdir(), scopedName);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// The two throttle memos. Both defaults short-circuit under vitest (same
+// guard as defaultAcquireLock -- no unit test may write a memo into a real
+// tmpdir or global prefix, or inherit one an earlier test left), so the
+// wiring is what these pin: WHEN each memo is consulted and recorded.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("maybeAutoUpgrade -- check + attempt throttles", () => {
+  beforeEach(resetSpawnRecorder);
+  afterEach(resetSpawnRecorder);
+
+  it("skips the registry probe entirely when a check ran recently", async () => {
+    // The lock is taken long AFTER the fetch, so it never covered it: without
+    // this memo every serve start hits registry.npmjs.org, and N panes starting
+    // at once means N requests.
+    const fetchLatestImpl = vi.fn(async () => "0.47.8");
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl,
+      spawnImpl,
+      checkedRecentlyImpl: () => true,
+    });
+
+    expect(fetchLatestImpl).not.toHaveBeenCalled();
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("records the check whichever way it went -- an unreachable registry must not re-probe every start", async () => {
+    const recordCheckImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => null,
+      spawnImpl: vi.fn(),
+      recordCheckImpl,
+    });
+    expect(recordCheckImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-spawn an upgrade already attempted at the same target version", async () => {
+    // A permanently failing install (EACCES on a sudo-installed global) would
+    // otherwise re-run a full `npm install -g` on every single serve start.
+    const spawnImpl = vi.fn();
+    const acquireLockImpl = vi.fn((_dir: string, _lockName: string) => () => {});
+    const attemptedRecentlyImpl = vi.fn((_dir: string, _lockName: string, _version: string) => true);
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+      acquireLockImpl,
+      attemptedRecentlyImpl,
+    });
+
+    expect(attemptedRecentlyImpl).toHaveBeenCalledWith(GLOBAL_NPM_PREFIX, ".yaw-mcp-upgrade.lock", "0.47.8");
+    expect(spawnImpl).not.toHaveBeenCalled();
+    // And no lock is taken for work we were never going to do -- holding it
+    // would make every other pane skip for nothing.
+    expect(acquireLockImpl).not.toHaveBeenCalled();
+  });
+
+  it("records the attempt (keyed on the target version) BEFORE spawning", async () => {
+    // Before, not after: the failures this memo exists for -- a torn-down
+    // process tree, a synchronous spawn throw -- never reach a completion
+    // handler that could record anything.
+    // Recorded as an order log rather than an assertion inside the spawn mock:
+    // a throw from there lands in maybeAutoUpgrade's own catch, which would
+    // turn a real ordering regression into a silent pass.
+    const order: string[] = [];
+    const recordAttemptImpl = vi.fn(() => {
+      order.push("record");
+    });
+    const spawnImpl = vi.fn(() => {
+      order.push("spawn");
+    });
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+      acquireLockImpl: () => () => {},
+      recordAttemptImpl,
+    });
+
+    expect(order).toEqual(["record", "spawn"]);
+    expect(recordAttemptImpl).toHaveBeenCalledWith(GLOBAL_NPM_PREFIX, ".yaw-mcp-upgrade.lock", "0.47.8");
   });
 });

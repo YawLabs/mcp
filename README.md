@@ -207,13 +207,17 @@ The project `.yaw-mcp/` is found by walking up from the cwd -- stopping just bef
 
 ```jsonc
 {
+  // optional -- gives editors key completion + inline validation
+  "$schema": "https://raw.githubusercontent.com/YawLabs/mcp/main/schemas/yaw-mcp.config.v1.json",
   "version": 1,                          // schema version; newer versions log a warning
   "servers": ["gh", "pg", "linear"],     // allow-list of namespaces (most-specific scope wins)
-  "blocked": ["prod-db"],                // deny-list (UNION across all scopes -- fail-safe on deny)
+  "blocked": ["prod_db"],                // deny-list (UNION across all scopes -- fail-safe on deny)
   "installNudge": true                   // opt-in: discover may suggest installing MCP servers for
                                          // CLIs found in your recent shell history (off by default)
 }
 ```
+
+That shape ships as a JSON Schema -- [`schemas/yaw-mcp.config.v1.json`](schemas/yaw-mcp.config.v1.json), served from the raw URL in the `$schema` line above -- so any editor that honors `$schema` completes the keys and flags a typo as you type. A namespace is `[a-z][a-z0-9_]{0,29}` (so `prod_db`, not `prod-db`); the schema rejects anything else, while the loader only warns and keeps loading.
 
 Malformed files log a warning and fall through (fail-open). yaw-mcp reads config at startup, so restart the client after editing; `mcp_connect_health` shows which files are applied.
 

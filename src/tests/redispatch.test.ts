@@ -55,6 +55,34 @@ describe("RedispatchTracker", () => {
     expect(t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude)).toBeNull();
   });
 
+  it("markReply grades the record for ITS namespace, not the newest dispatch", () => {
+    // Pins markReply's namespace filter. Two dispatches are live and the reply
+    // belongs to the OLDER one. With the filter deleted, markReply walks to the
+    // newest record and grades jira instead -- whose intent shares nothing with
+    // INTENT_B -- leaving github un-graded, so the real miss goes undetected.
+    const t = new RedispatchTracker();
+    t.push("github", tokenize(INTENT_A), 1000);
+    t.push("jira", tokenize("forecast rainfall humidity"), 1100);
+    t.markReply("github", true); // clean reply, then abandoned
+    const miss = t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude);
+    expect(miss).toEqual({ loser: "github" });
+  });
+
+  it("markUse protects the record for ITS namespace, not the newest dispatch", () => {
+    // Mirror of the above for markUse's namespace filter. The routing fault is
+    // github's, on a record github already graded clean, so it must protect
+    // github. With the filter deleted, markUse stops at the newest record
+    // (jira, which never replied), no-ops, and leaves github looking
+    // abandoned-clean -- a false miss booked against a server still in use.
+    const t = new RedispatchTracker();
+    t.push("github", tokenize(INTENT_A), 1000);
+    t.markReply("github", true); // graded clean reply
+    t.push("jira", tokenize("forecast rainfall humidity"), 1100);
+    t.markUse("github"); // routing fault on github -> still usage
+    const miss = t.detectMiss("gitlab", tokenize(INTENT_B), 2000, noExclude);
+    expect(miss).toBeNull();
+  });
+
   it("returns null when the new intent is dissimilar", () => {
     const t = new RedispatchTracker();
     t.push("github", tokenize(INTENT_A), 1000);
@@ -70,6 +98,37 @@ describe("RedispatchTracker", () => {
     t.markReply("github", true);
     // Shares only "list" -> below MIN_SHARED_TOKENS (3).
     const miss = t.detectMiss("calendar", tokenize("list meetings"), 2000, noExclude);
+    expect(miss).toBeNull();
+  });
+
+  it("does not fire when 3 shared tokens sit in two mostly-different intents (Jaccard floor)", () => {
+    // Isolates JACCARD_THRESHOLD from MIN_SHARED_TOKENS. Both intents keep 10
+    // tokens through tokenize's 3-char floor and share exactly {create, github,
+    // issue}: shared = 3 CLEARS the shared-token floor, but 3/17 = 0.18 is far
+    // below the 0.4 Jaccard floor. Deleting the Jaccard guard books this as a
+    // miss even though the two tasks have almost nothing in common.
+    const t = new RedispatchTracker();
+    t.push("github", tokenize("create github issue tracker board column label filter export archive"), 1000);
+    t.markReply("github", true);
+    const miss = t.detectMiss(
+      "gitlab",
+      tokenize("create github issue milestone summary digest weekly report team channel"),
+      2000,
+      noExclude,
+    );
+    expect(miss).toBeNull();
+  });
+
+  it("does not fire when a high Jaccard rests on only 2 shared tokens (shared-token floor)", () => {
+    // Isolates MIN_SHARED_TOKENS from JACCARD_THRESHOLD, which the
+    // single-common-word case above cannot: {list, issues} vs {list, open,
+    // issues} shares 2 of a 3-token union -> 0.67, well clear of the 0.4
+    // Jaccard floor, but 2 shared tokens is below the floor of 3. Deleting the
+    // shared-token guard books this as a miss.
+    const t = new RedispatchTracker();
+    t.push("github", tokenize("list issues"), 1000);
+    t.markReply("github", true);
+    const miss = t.detectMiss("calendar", tokenize("list open issues"), 2000, noExclude);
     expect(miss).toBeNull();
   });
 

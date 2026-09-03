@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CatalogServer, DEFAULT_CATALOG_URL, type FetchCatalog } from "../catalog.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
@@ -69,10 +70,23 @@ const CATALOG: CatalogServer[] = [
 const fetchCatalog = async (): Promise<CatalogServer[]> => CATALOG;
 
 /** Write the user-global ~/.yaw-mcp/bundles.json directly, for shapes `add`
- *  would never produce (control bytes in a name, a hand-edited entry). */
+ *  would never produce (control bytes in a name, a hand-edited entry).
+ *
+ *  THE one way to seed that file in this suite. It used to sit alongside a
+ *  dozen inline `mkdirSync` + `writeFileSync` pairs, half of them re-importing
+ *  node:fs dynamically despite the static import at the top -- three spellings
+ *  of one operation, each free to drift on the path or the JSON shape. Raw-text
+ *  fixtures (JSONC, deliberately malformed bytes) still go through
+ *  writeUserBundlesRaw below, which is the only other writer. */
 function writeUserBundles(content: unknown): void {
+  writeUserBundlesRaw(JSON.stringify(content));
+}
+
+/** Same file, byte-exact -- for content JSON.stringify cannot express: a JSONC
+ *  file with comments and trailing commas, or a deliberately malformed one. */
+function writeUserBundlesRaw(raw: string): void {
   mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-  writeFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), JSON.stringify(content));
+  writeFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), raw);
 }
 
 /** An UNAPPROVED project-local bundles.json under cwd. It shadows nothing
@@ -122,6 +136,23 @@ describe("parseAddArgs", () => {
   it("rejects unknown flags and extra positionals", () => {
     expect(parseAddArgs(["github", "--bogus"]).ok).toBe(false);
     expect(parseAddArgs(["a", "b"]).ok).toBe(false);
+  });
+  it("rejects a mistyped SHORT flag instead of treating it as the slug", () => {
+    // Only "--" prefixes used to be checked, so `-y` became a POSITIONAL and
+    // failed downstream as "Expected exactly one server slug" (or, alone, as an
+    // "invalid slug") -- neither of which names the real mistake. Same posture
+    // parseRemoveArgs already takes.
+    const r = parseAddArgs(["fetch", "-y"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Unknown flag: -y/);
+    const leading = parseAddArgs(["-f", "fetch"]);
+    expect(leading.ok).toBe(false);
+    if (!leading.ok) expect(leading.error).toMatch(/Unknown flag: -f/);
+  });
+  it("rejects --catalog followed by a SHORT flag too", () => {
+    const r = parseAddArgs(["github", "--catalog", "-y"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--catalog requires a URL/);
   });
   it("rejects --catalog followed by a flag instead of swallowing --dry-run as the URL", () => {
     const r = parseAddArgs(["github", "--catalog", "--dry-run"]);
@@ -205,6 +236,16 @@ describe("parseListArgs (help flag)", () => {
     const r = parseListArgs(["-h"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect((r as { help?: boolean }).help).toBe(true);
+  });
+
+  // `list` takes no positionals at all, so anything that isn't --json/-h/--help
+  // is a usage error rather than a silently-ignored argument. This used to be a
+  // lone assertion buried at the end of a runList --json test, where a failure
+  // read as a JSON-output regression.
+  it("rejects an unknown argument", () => {
+    const r = parseListArgs(["--bogus"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Unknown argument: --bogus/);
   });
 });
 
@@ -333,6 +374,36 @@ describe("runAdd", () => {
     expect(io.errText()).toMatch(/no server with slug/i);
   });
 
+  // SLUG_RE is the gate the case-handling suite at the bottom of this file
+  // leans on as established fact ("`add GA` is rejected at the gate") -- and it
+  // is exit 2 (usage error), not the exit 1 an unknown-but-well-formed slug
+  // gets, so the two failures stay distinguishable by a script. Nothing is
+  // fetched and nothing is written.
+  it("rejects a malformed slug with exit 2 before touching the catalog", async () => {
+    for (const slug of ["GA", "-leading-dash", "has space", "under_score", "a".repeat(65)]) {
+      const io = captureIO();
+      let fetched = false;
+      const r = await runAdd({
+        slug,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        fetchCatalog: async () => {
+          fetched = true;
+          return CATALOG;
+        },
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.written).toEqual([]);
+      expect(io.errText()).toMatch(/invalid slug/);
+      expect(fetched).toBe(false);
+    }
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config).toBeNull();
+  });
+
   it("does not write on --dry-run", async () => {
     const io = captureIO();
     const r = await runAdd({
@@ -394,6 +465,91 @@ describe("runAdd", () => {
     expect(parsed.entry.envKeys).toEqual(["TAILSCALE_API_KEY"]);
   });
 
+  // The TEXT dry-run is what a human actually reads, and none of its three
+  // shapes -- "would write", "would update", "keeping existing namespace" --
+  // had an assertion; only the --json envelope did. A regression there would
+  // have surfaced first as a user reporting a wrong namespace.
+  it("--dry-run text says 'would write' with the derived namespace and the launch line", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain('would write Fetch as namespace "fetch"');
+    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+  });
+
+  it("--dry-run text says 'would update' once the entry exists, and lists env KEY names only", async () => {
+    const base = { home: synthHome, cwd: synthCwd, env: {}, fetchCatalog, err: () => {} };
+    await runAdd({ ...base, slug: "tailscale", envOverrides: { TAILSCALE_API_KEY: "tskey-secret" }, out: () => {} });
+    const io = captureIO();
+    await runAdd({
+      ...base,
+      slug: "tailscale",
+      dryRun: true,
+      envOverrides: { TAILSCALE_API_KEY: "tskey-secret" },
+      out: (s) => io.out.push(s),
+    });
+    expect(io.text()).toContain('would update Tailscale as namespace "tailscale"');
+    expect(io.text()).toContain("env keys: TAILSCALE_API_KEY");
+    expect(io.text()).not.toContain("tskey-secret");
+  });
+
+  it("--dry-run text says it would KEEP a name-matched entry's namespace", async () => {
+    await upsertUserBundle(
+      { namespace: "legacy_gh", name: "GitHub", command: "x", args: [], isActive: true },
+      { home: synthHome },
+    );
+    const io = captureIO();
+    await runAdd({
+      slug: "github",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: () => {},
+    });
+    // The real run keeps legacy_gh, so the preview must not claim "github".
+    expect(io.text()).toContain('keeping existing namespace "legacy_gh"');
+    expect(io.text()).not.toContain('as namespace "github"');
+  });
+
+  it("--dry-run warns on stderr that it would CHANGE the launch command", async () => {
+    // A slug-less stored entry merges even when the command differs, and the
+    // real run reports that swap loudly -- the preview has to say the same
+    // thing, in the conditional "would" voice, or a user checking before
+    // committing sees nothing.
+    await upsertUserBundle(
+      { namespace: "fetch", name: "Fetch", command: "docker", args: ["run", "old/fetch"], isActive: true },
+      { home: synthHome },
+    );
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const note = io.errText();
+    expect(note).toContain("would CHANGE the entry's launch command");
+    expect(note).toContain("from: docker run old/fetch");
+    expect(note).toContain("to: npx -y @yawlabs/fetch-mcp");
+  });
+
   // A SET-BUT-EMPTY YAW_MCP_CATALOG_URL (a CI variable declared with no value,
   // a bare `export`) is not nullish, so the `??` here used to hand "" to the
   // catalog fetcher -- fetch("") throws a bare TypeError, and the friendly
@@ -416,6 +572,42 @@ describe("runAdd", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(urls).toEqual([DEFAULT_CATALOG_URL]);
+  });
+
+  // `--catalog <url>` beats YAW_MCP_CATALOG_URL, which beats the default. The
+  // precedence was only ever parse-tested (that the flag lands in
+  // options.catalogUrl), never run-tested -- so nothing pinned that runAdd
+  // reads the flag before the env var, the half that actually decides which
+  // catalog a user's `--catalog` invocation hits.
+  it("--catalog wins over YAW_MCP_CATALOG_URL, which wins over the default", async () => {
+    const urls: string[] = [];
+    const recordingFetch: FetchCatalog = async (url) => {
+      urls.push(url);
+      return CATALOG;
+    };
+    const base = {
+      home: synthHome,
+      cwd: synthCwd,
+      slug: "fetch",
+      dryRun: true,
+      fetchCatalog: recordingFetch,
+      out: () => {},
+      err: () => {},
+    };
+    await runAdd({ ...base, env: {}, catalogUrl: "https://flag.test/catalog.json" });
+    await runAdd({
+      ...base,
+      env: { YAW_MCP_CATALOG_URL: "https://env.test/catalog.json" },
+      catalogUrl: "https://flag.test/catalog.json",
+    });
+    await runAdd({ ...base, env: { YAW_MCP_CATALOG_URL: "https://env.test/catalog.json" } });
+    await runAdd({ ...base, env: {} });
+    expect(urls).toEqual([
+      "https://flag.test/catalog.json",
+      "https://flag.test/catalog.json",
+      "https://env.test/catalog.json",
+      DEFAULT_CATALOG_URL,
+    ]);
   });
 
   // The shadow verdict is trust-aware, and YAW_MCP_TRUST_PROJECT is its
@@ -498,12 +690,9 @@ describe("runAdd", () => {
 // all under an "Updated ..." success line. upsertUserBundle now folds the new
 // entry ONTO the stored one (mergeServerEntry).
 describe("runAdd re-add preserves user state", () => {
-  const rawFile = async (): Promise<Record<string, unknown>> => {
-    const { readFileSync } = await import("node:fs");
-    return JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8"));
-  };
-  const rawServers = async (): Promise<Array<Record<string, unknown>>> =>
-    (await rawFile()).servers as Array<Record<string, unknown>>;
+  const rawFile = (): Record<string, unknown> =>
+    JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8"));
+  const rawServers = (): Array<Record<string, unknown>> => rawFile().servers as Array<Record<string, unknown>>;
 
   it("keeps a stored --env value when a later add supplies none", async () => {
     const base = { home: synthHome, cwd: synthCwd, fetchCatalog, out: () => {}, err: () => {} };
@@ -524,7 +713,7 @@ describe("runAdd re-add preserves user state", () => {
     const entry = loaded.config?.servers.find((s) => s.namespace === "tailscale");
     expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-stored");
     // The ambient value is still never copied to disk.
-    expect(JSON.stringify(await rawFile())).not.toContain("tskey-ambient");
+    expect(JSON.stringify(rawFile())).not.toContain("tskey-ambient");
     // ...and the "read from your shell env and NOT persisted" note must not
     // fire when a value IS persisted -- it would be plainly false.
     expect(io.errText()).not.toMatch(/NOT persisted/);
@@ -539,29 +728,24 @@ describe("runAdd re-add preserves user state", () => {
   });
 
   it("keeps isActive:false, a runtime override, connectTimeoutMs and unknown fields", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(
-      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
-      JSON.stringify({
-        version: 1,
-        servers: [
-          {
-            id: "local-fetch",
-            namespace: "fetch",
-            name: "Fetch",
-            type: "local",
-            transport: "stdio",
-            command: "npx",
-            args: ["-y", "@yawlabs/fetch-mcp@0.1.0"],
-            isActive: false,
-            runtime: "oam",
-            connectTimeoutMs: 60000,
-            myOwnNote: "keep me",
-          },
-        ],
-      }),
-    );
+    writeUserBundles({
+      version: 1,
+      servers: [
+        {
+          id: "local-fetch",
+          namespace: "fetch",
+          name: "Fetch",
+          type: "local",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@yawlabs/fetch-mcp@0.1.0"],
+          isActive: false,
+          runtime: "oam",
+          connectTimeoutMs: 60000,
+          myOwnNote: "keep me",
+        },
+      ],
+    });
     const r = await runAdd({
       slug: "fetch",
       home: synthHome,
@@ -572,7 +756,7 @@ describe("runAdd re-add preserves user state", () => {
       err: () => {},
     });
     expect(r.exitCode).toBe(0);
-    const [entry] = await rawServers();
+    const [entry] = rawServers();
     // What the user set survives...
     expect(entry.isActive).toBe(false);
     expect(entry.runtime).toBe("oam");
@@ -588,17 +772,12 @@ describe("runAdd re-add preserves user state", () => {
     // loads, so the user restarts, sees nothing, and has no reason to
     // suspect the file. There is no `enable` verb, so the note must name the
     // edit that turns it on.
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(
-      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
-      JSON.stringify({
-        version: 1,
-        servers: [
-          { id: "local-fetch", namespace: "fetch", name: "Fetch", type: "local", command: "npx", isActive: false },
-        ],
-      }),
-    );
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { id: "local-fetch", namespace: "fetch", name: "Fetch", type: "local", command: "npx", isActive: false },
+      ],
+    });
     const io = captureIO();
     const r = await runAdd({
       slug: "fetch",
@@ -612,6 +791,74 @@ describe("runAdd re-add preserves user state", () => {
     expect(r.exitCode).toBe(0);
     expect(io.text()).toMatch(/stays disabled and will NOT load/);
     expect(io.text()).not.toMatch(/Restart your MCP client/);
+  });
+
+  // The dry run has to say the SAME thing about a hand-disabled entry. It
+  // rendered the pre-merge object it built from the catalog -- which always
+  // carries isActive:true -- so the preview ended on the ordinary success line
+  // and told the user the server would load, while the run it previewed keeps
+  // the entry disabled.
+  it("--dry-run says the entry would stay disabled, and previews the MERGED launch line", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        {
+          id: "local-fetch",
+          namespace: "fetch",
+          name: "Fetch",
+          type: "local",
+          command: "npx",
+          args: ["-y", "stale"],
+          isActive: false,
+        },
+      ],
+    });
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain('would update Fetch as namespace "fetch"');
+    expect(io.text()).toMatch(/would stay disabled and NOT load/);
+    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    // ...and a dry run still writes nothing: the stale entry is untouched.
+    expect(rawServers()[0].isActive).toBe(false);
+    expect(rawServers()[0].args).toEqual(["-y", "stale"]);
+  });
+
+  it("--dry-run --json reports the same merged entry the real run then writes", async () => {
+    const seed = {
+      version: 1,
+      servers: [
+        {
+          id: "local-fetch",
+          namespace: "fetch",
+          name: "Fetch",
+          type: "local",
+          command: "npx",
+          args: ["-y", "stale"],
+          isActive: false,
+        },
+      ],
+    };
+    writeUserBundles(seed);
+    const base = { slug: "fetch", home: synthHome, cwd: synthCwd, env: {}, json: true, fetchCatalog, err: () => {} };
+    const dryIo = captureIO();
+    await runAdd({ ...base, dryRun: true, out: (s) => dryIo.out.push(s) });
+    const realIo = captureIO();
+    await runAdd({ ...base, out: (s) => realIo.out.push(s) });
+    const dry = JSON.parse(dryIo.text());
+    const real = JSON.parse(realIo.text());
+    expect(dry.entry).toEqual(real.entry);
+    expect(dry.entry.isActive).toBe(false);
+    expect(dry.entry.args).toEqual(["-y", "@yawlabs/fetch-mcp"]);
   });
 
   it("still tells the user to restart when the entry is enabled", async () => {
@@ -642,35 +889,30 @@ describe("runAdd re-add preserves user state", () => {
       out: () => {},
       err: () => {},
     });
-    expect((await rawServers())[0].isActive).toBe(true);
+    expect(rawServers()[0].isActive).toBe(true);
   });
 
   it("--json reports the entry as written, not the pre-merge input", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     // isActive:false and the stale args exist only ON DISK -- the entry runAdd
     // builds carries isActive:true and the catalog's args -- so seeing the
     // former in --json can only come from the post-merge result. Asserted with
     // a NON-env field on purpose: the merged env is redacted (see below), so it
     // can no longer serve as the evidence that the merge was reported.
-    writeFileSync(
-      join(synthHome, CONFIG_DIRNAME, "bundles.json"),
-      JSON.stringify({
-        version: 1,
-        servers: [
-          {
-            id: "local-fetch",
-            namespace: "fetch",
-            name: "Fetch",
-            type: "local",
-            transport: "stdio",
-            command: "npx",
-            args: ["-y", "stale"],
-            isActive: false,
-          },
-        ],
-      }),
-    );
+    writeUserBundles({
+      version: 1,
+      servers: [
+        {
+          id: "local-fetch",
+          namespace: "fetch",
+          name: "Fetch",
+          type: "local",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "stale"],
+          isActive: false,
+        },
+      ],
+    });
     const io = captureIO();
     await runAdd({
       slug: "fetch",
@@ -741,18 +983,29 @@ describe("runRemove", () => {
     expect(loaded.config?.servers ?? []).toHaveLength(0);
   });
 
-  it("removes by namespace too", async () => {
-    await runAdd({
-      slug: "fetch",
+  it("removes by a namespace that is not also the slug", async () => {
+    // This used to pass target "fetch" -- which IS the slug, so the literal
+    // candidate matched and the namespace path was never reached: a copy of the
+    // test above it wearing a different name. An underscore namespace can only
+    // be reached as a LITERAL target (deriveNamespace("legacy_gh") strips the
+    // underscore to "legacygh"), so it pins the namespace form for real.
+    await upsertUserBundle(
+      { namespace: "legacy_gh", name: "GitHub", command: "x", args: [], isActive: true },
+      { home: synthHome },
+    );
+    const io = captureIO();
+    const r = await runRemove({
+      target: "legacy_gh",
       home: synthHome,
       cwd: synthCwd,
-      env: {},
-      fetchCatalog,
-      out: () => {},
-      err: () => {},
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
     });
-    const r = await runRemove({ target: "fetch", home: synthHome, force: true, out: () => {}, err: () => {} });
     expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Removed "legacy_gh"/);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers ?? []).toHaveLength(0);
   });
 
   it("is a no-op (exit 0) when the server is absent", async () => {
@@ -767,9 +1020,44 @@ describe("runRemove", () => {
     expect(io.text()).toMatch(/nothing to do/);
   });
 
-  it("rejects an invalid target", () => {
+  it("rejects a missing or duplicated positional", () => {
+    // Argument COUNT only -- the shape of the target itself is REMOVE_TARGET_RE's
+    // job and is asserted below. (This case was named "rejects an invalid
+    // target" while asserting neither.)
     expect(parseRemoveArgs([]).ok).toBe(false);
     expect(parseRemoveArgs(["a", "b"]).ok).toBe(false);
+  });
+
+  it("rejects a target whose SHAPE isn't a slug or namespace, without touching the file", async () => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    // REMOVE_TARGET_RE allows [a-z0-9] then [a-z0-9_-]; a dot, a slash and a
+    // trailing "*" are all shapes a shell or a typo can produce, and each must
+    // be a usage error (exit 2) rather than the exit-0 "nothing to do" that
+    // reads as "already gone".
+    for (const target of ["fetch.json", "yaw/fetch", "fetch*", "_fetch"]) {
+      const io = captureIO();
+      const r = await runRemove({
+        target,
+        home: synthHome,
+        cwd: synthCwd,
+        force: true,
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(io.errText()).toMatch(/isn't a valid slug or namespace/);
+      expect(io.text()).not.toMatch(/nothing to do/);
+    }
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.map((s) => s.namespace)).toEqual(["fetch"]);
   });
 });
 
@@ -901,6 +1189,58 @@ describe("runRemove confirmation gate", () => {
       expect(io.text()).toMatch(/Removed/);
       expect(await namespaces()).not.toContain("fetch");
     }
+  });
+
+  // Every other case here short-circuits askYesNo via `promptAnswer`, so the
+  // REAL readline path -- createInterface over the `io` streams, the
+  // trim+lowercase of what was typed, and the rl.close() in the finally -- had
+  // no coverage at all. These two drive it end to end. (close() is exercised
+  // implicitly: an interface left open would keep the run's handles alive.)
+  interface TypedRun {
+    exitCode: number;
+    /** Everything the interface wrote to the injected stdout. */
+    prompt: string;
+    out: string;
+    err: string;
+  }
+  const typeAnswer = async (typed: string): Promise<TypedRun> => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const prompt: string[] = [];
+    stdout.on("data", (c: Buffer) => prompt.push(c.toString("utf8")));
+    // Written before the read starts; readline drains the buffer once it attaches.
+    stdin.write(typed);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: { stdin, stdout },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    return { exitCode: r.exitCode, prompt: prompt.join(""), out: io.text(), err: io.errText() };
+  };
+
+  it("reads a typed answer off the io streams, trimmed and lowercased", async () => {
+    await addFetch();
+    const { exitCode, prompt, out } = await typeAnswer(" YES \n");
+    expect(exitCode).toBe(0);
+    // The question went to the INJECTED stdout, not the real process's.
+    expect(prompt).toContain('Remove "fetch"? [y/N]');
+    expect(out).toMatch(/Removed/);
+    expect(await namespaces()).not.toContain("fetch");
+  });
+
+  it("a typed decline off the io streams leaves bundles.json BYTE-identical", async () => {
+    await addFetch();
+    const before = bytes();
+    const { exitCode, prompt, err } = await typeAnswer("  N  \n");
+    expect(exitCode).toBe(1);
+    expect(prompt).toContain('Remove "fetch"? [y/N]');
+    expect(err).toMatch(/Aborted/);
+    expect(bytes().equals(before)).toBe(true);
   });
 
   it("a declined prompt (and a bare Enter) leaves bundles.json BYTE-identical", async () => {
@@ -1053,9 +1393,7 @@ describe("runRemove confirmation gate", () => {
     // loader rejects (no command / no url) is invisible to a validated preview,
     // yet removeUserBundle filters by namespace string and would delete it. A
     // validated lookup would let it through the gate unconfirmed.
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(bundlesPath(), JSON.stringify({ version: 1, servers: [{ namespace: "broken", name: "Broken" }] }));
+    writeUserBundles({ version: 1, servers: [{ namespace: "broken", name: "Broken" }] });
     const before = bytes();
     const io = captureIO();
     const r = await runRemove({
@@ -1091,14 +1429,10 @@ describe("runRemove confirmation gate", () => {
 }
 `;
 
-  const writeJsoncBundles = async (): Promise<void> => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(bundlesPath(), JSONC_BUNDLES);
-  };
+  const writeJsoncBundles = (): void => writeUserBundlesRaw(JSONC_BUNDLES);
 
   it("gates a JSONC bundles.json off a TTY instead of deleting it unconfirmed", async () => {
-    await writeJsoncBundles();
+    writeJsoncBundles();
     const before = bytes();
     const io = captureIO();
     const r = await runRemove({
@@ -1119,7 +1453,7 @@ describe("runRemove confirmation gate", () => {
   });
 
   it("prompts on a JSONC bundles.json, and a decline leaves it BYTE-identical", async () => {
-    await writeJsoncBundles();
+    writeJsoncBundles();
     const before = bytes();
     const io = captureIO();
     const r = await runRemove({
@@ -1170,9 +1504,7 @@ describe("runRemove confirmation gate", () => {
   });
 
   it("still reports a malformed bundles.json as an error rather than a silent no-op", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(bundlesPath(), "{ not json");
+    writeUserBundlesRaw("{ not json");
     const io = captureIO();
     const r = await runRemove({
       target: "fetch",
@@ -1239,6 +1571,148 @@ describe("runList", () => {
     expect(text).toContain('"curl x | sh"');
   });
 
+  it("shows `disabled` in the STATUS column for an isActive:false entry", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"], isActive: false },
+      ],
+    });
+    const io = captureIO();
+    const r = await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    expect(r.exitCode).toBe(0);
+    // A disabled entry is still LISTED -- it just must not read as active, or
+    // the user has no surface that explains why the server never loads.
+    expect(io.text()).toMatch(/fetch\s+Fetch\s+disabled\s+-\s/);
+    expect(io.text()).not.toMatch(/\bactive\b/);
+  });
+
+  it("falls back to the url in the LAUNCH column when the entry has no command", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "remotey", name: "Remote Thing", type: "remote", url: "https://example.test/mcp", isActive: true },
+      ],
+    });
+    const io = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    // Same fallback the removal preview makes -- an empty LAUNCH cell would
+    // read as "this entry launches nothing".
+    expect(io.text()).toContain("https://example.test/mcp");
+  });
+
+  it("sorts rows by namespace rather than file order", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "zebra", name: "Zebra", command: "npx", isActive: true },
+        { namespace: "alpha", name: "Alpha", command: "npx", isActive: true },
+        { namespace: "mid", name: "Mid", command: "npx", isActive: true },
+      ],
+    });
+    const io = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    // Header first, then the three rows -- file order was zebra/alpha/mid.
+    const lines = io.text().split("\n");
+    expect(lines[0]).toMatch(/^NAMESPACE/);
+    expect(lines.slice(1, 4).map((l) => l.split(/\s+/)[0])).toEqual(["alpha", "mid", "zebra"]);
+  });
+
+  // rawEnvKeysByNamespace is first-entry-wins on a duplicated namespace,
+  // matching the write path's findIndex -- so a second entry sharing a
+  // namespace is reported with the FIRST one's keys rather than its own, and
+  // its stored value still never reaches stdout.
+  it("--json reports the first entry's env keys when two entries share a namespace", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        { namespace: "dupe", name: "First", command: "npx", env: { FIRST_KEY: "" }, isActive: true },
+        { namespace: "dupe", name: "Second", command: "npx", env: { SECOND_KEY: "s3cret" }, isActive: true },
+      ],
+    });
+    const io = captureIO();
+    await runList({
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const parsed = JSON.parse(io.text());
+    expect(parsed.servers).toHaveLength(2);
+    expect(parsed.servers[0].envKeys).toEqual(["FIRST_KEY"]);
+    expect(parsed.servers[1].envKeys).toEqual(["FIRST_KEY"]);
+    expect(io.text()).not.toContain("s3cret");
+  });
+
+  // `list` used to call loadLocalBundles with no env at all, so the trust gate
+  // inside it read the ambient process.env while `add` and `remove` injected
+  // theirs -- an embedded or test caller supplying YAW_MCP_TRUST_PROJECT got a
+  // listing of the wrong FILE.
+  it("reads the INJECTED env for the project-trust bypass, not process.env", async () => {
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: () => {},
+      err: () => {},
+    });
+    writeUnapprovedProjectBundles({
+      version: 1,
+      servers: [{ namespace: "projectonly", name: "Project Only", command: "npx", isActive: true }],
+    });
+    const plain = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => plain.out.push(s),
+      err: (s) => plain.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    // Unapproved and no bypass: the project file is ignored, user-global wins.
+    expect(plain.text()).toContain("fetch");
+    expect(plain.text()).not.toContain("projectonly");
+
+    const bypassed = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      out: (s) => bypassed.out.push(s),
+      err: (s) => bypassed.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    // With the documented opt-out injected, the loader honours the project
+    // file -- and `list` has to read THAT env to agree with it.
+    expect(bypassed.text()).toContain("projectonly");
+    expect(bypassed.text()).not.toContain("fetch");
+  });
+
   it("emits JSON with --json", async () => {
     await runAdd({
       slug: "fetch",
@@ -1259,7 +1733,6 @@ describe("runList", () => {
     });
     const parsed = JSON.parse(io.text());
     expect(parsed.servers).toHaveLength(1);
-    expect(parseListArgs(["--bogus"]).ok).toBe(false);
   });
 
   // Same posture as `add --json` (jsonEntry): bundles.json entries can carry
@@ -1331,9 +1804,7 @@ describe("runList", () => {
 
   // Fix 3: malformed bundles.json -- warnings printed to stderr, not silently dropped
   it("prints load warnings to stderr when bundles.json is malformed (fix 3)", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
+    writeUserBundlesRaw("{ not json");
     const io = captureIO();
     const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
     expect(r.exitCode).toBe(0);
@@ -1343,9 +1814,7 @@ describe("runList", () => {
   });
 
   it("--json includes warnings array when bundles.json is malformed (fix 3)", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
+    writeUserBundlesRaw("{ not json");
     const io = captureIO();
     await runList({
       json: true,
@@ -1480,11 +1949,10 @@ describe("runList", () => {
   });
 
   it("reads the real grades.json when no reader override is supplied", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
     await addFetch();
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(
-      join(synthHome, ".yaw-mcp", "grades.json"),
+      join(synthHome, CONFIG_DIRNAME, "grades.json"),
       JSON.stringify({ fetch: { grade: "C", score: 71, gradedAt: "2026-01-01T00:00:00.000Z" } }),
     );
     const io = captureIO();
@@ -1499,10 +1967,9 @@ describe("runList", () => {
   });
 
   it("degrades to no overlay when grades.json is garbage", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
     await addFetch();
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "grades.json"), "{ not json");
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(synthHome, CONFIG_DIRNAME, "grades.json"), "{ not json");
     const io = captureIO();
     const r = await runList({
       json: true,
@@ -1518,9 +1985,7 @@ describe("runList", () => {
 
 describe("upsertUserBundle round-trip", () => {
   it("refuses to clobber a malformed bundles.json", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
+    writeUserBundlesRaw("{ not json");
     await expect(
       upsertUserBundle({ namespace: "x", name: "X", command: "npx", args: [], isActive: true }, { home: synthHome }),
     ).rejects.toThrow(/could not be parsed/);
@@ -1598,7 +2063,6 @@ describe("upsertUserBundle round-trip", () => {
     // "redis". Merging silently swapped the launch command AND overwrote
     // the stored slug -- after which `yaw-mcp remove redis-yawlabs` was an
     // exit-0 no-op. The app refuses; so does the CLI now.
-    const { readFileSync } = await import("node:fs");
     await upsertUserBundle(
       {
         namespace: "redis",
@@ -1610,7 +2074,7 @@ describe("upsertUserBundle round-trip", () => {
       } as Parameters<typeof upsertUserBundle>[0],
       { home: synthHome },
     );
-    const bundlesPath = join(synthHome, ".yaw-mcp", "bundles.json");
+    const bundlesPath = join(synthHome, CONFIG_DIRNAME, "bundles.json");
     const before = readFileSync(bundlesPath, "utf8");
     await expect(
       upsertUserBundle(
@@ -1686,7 +2150,6 @@ describe("upsertUserBundle round-trip", () => {
     // The preview must describe the run it previews: a dry-run that says
     // 'would write' with exit 0 while the real run refuses with exit 1 is
     // the same preview-contradicts-run class install's --skip --dry-run had.
-    const { readFileSync } = await import("node:fs");
     await upsertUserBundle(
       {
         namespace: "github",
@@ -1698,7 +2161,7 @@ describe("upsertUserBundle round-trip", () => {
       } as Parameters<typeof upsertUserBundle>[0],
       { home: synthHome },
     );
-    const bundlesPath = join(synthHome, ".yaw-mcp", "bundles.json");
+    const bundlesPath = join(synthHome, CONFIG_DIRNAME, "bundles.json");
     const before = readFileSync(bundlesPath, "utf8");
     const errLines: string[] = [];
     const r = await runAdd({
@@ -1784,14 +2247,12 @@ describe("upsertUserBundle round-trip", () => {
   });
 
   it("preserves a newer on-disk schema version on write [#4]", async () => {
-    const { writeFileSync, mkdirSync, readFileSync } = await import("node:fs");
-    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
-    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 2, servers: [] }));
+    writeUserBundles({ version: 2, servers: [] });
     await upsertUserBundle(
       { namespace: "github", name: "GitHub", command: "npx", args: [], isActive: true },
       { home: synthHome },
     );
-    const written = JSON.parse(readFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "utf8"));
+    const written = JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8"));
     expect(written.version).toBe(2); // not downgraded to 1
   });
 });
@@ -1852,7 +2313,6 @@ describe("runAdd env-at-rest [#3]", () => {
  *  trust-aware for exactly that reason -- warning about a file yaw-mcp is
  *  ignoring would send the user off to edit the wrong thing. */
 async function writeTrustedProjectBundles(content: unknown): Promise<void> {
-  const { writeFileSync, mkdirSync, readFileSync } = await import("node:fs");
   const { grantTrust } = await import("../trust.js");
   mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
   const path = join(synthCwd, CONFIG_DIRNAME, "bundles.json");
@@ -1904,9 +2364,7 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
   });
 
   it("stays quiet about an UNAPPROVED project file (it shadows nothing)", async () => {
-    const { writeFileSync, mkdirSync } = await import("node:fs");
-    mkdirSync(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
-    writeFileSync(join(synthCwd, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ servers: [] }));
+    writeUnapprovedProjectBundles();
     const io = captureIO();
     const r = await runRemove({
       target: "fetch",
@@ -1937,9 +2395,7 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
       out: () => {},
       err: () => {},
     });
-    const { writeFileSync: write, mkdirSync: mkdir } = await import("node:fs");
-    mkdir(join(synthCwd, CONFIG_DIRNAME), { recursive: true });
-    write(join(synthCwd, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ servers: [] }));
+    writeUnapprovedProjectBundles();
     const io = captureIO();
     const r = await runRemove({
       target: "fetch",

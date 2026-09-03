@@ -202,12 +202,55 @@ describe("closed-class stopwords in the query", () => {
           { name: "order_by_date", description: "Sort" },
           { name: "run_as_admin", description: "Elevate" },
           { name: "look_at_logs", description: "Tail" },
+          { name: "list_my_issues", description: "Mine" },
+          { name: "notify_me_on_reply", description: "Ping" },
         ],
       },
       ...corpus,
     ];
-    for (const word of ["to", "in", "of", "up", "on", "by", "as", "at", "a", "an", "it", "is", "or", "if", "no"]) {
+    // Every non-fragment entry of SUB_FLOOR_STOPWORDS, not a sample of them:
+    // a word left out of this list is a word whose stripping nothing pins.
+    const words = "a an as at by in of on to up if or so i he it me my us we am be is no".split(" ");
+    for (const word of words) {
       expect(rankServers(word, withPrepositionTools), `"${word}" must not score`).toEqual([]);
+    }
+  });
+
+  it("strips the fragments an apostrophe leaves behind", () => {
+    // splitTokens breaks on the apostrophe, so a contraction never reaches the
+    // ranker whole: don't -> don/t, it's -> it/s, we're -> we/re, I've -> i/ve,
+    // I'll -> i/ll, I'm -> i/m, I'd -> i/d. Those fragments clear the 1-char
+    // identifier floor, and in a corpus of identifiers a stray `s` or `re` is
+    // RARE, so its IDF is HIGH -- the exact shape of the `to` regression above.
+    const withFragmentTools = [
+      {
+        namespace: "misc",
+        name: "Misc",
+        description: "Assorted helpers",
+        tools: [
+          // One- and two-letter segments are ordinary in upstream tool names
+          // (seconds, date parts, lat/long, regex, trim, targets). The
+          // fragments have to be IN the corpus or this passes for the wrong
+          // reason: a term with no IDF entry is skipped before the stopword
+          // filter is ever consulted.
+          { name: "timeout_s_seconds", description: "Deadline" },
+          { name: "format_d_m_y", description: "Date parts" },
+          { name: "set_ll_position", description: "Latitude and longitude" },
+          { name: "search_re_pattern", description: "Regex" },
+          { name: "trim_t_prefix", description: "Trim" },
+          { name: "list_ve_targets", description: "Targets" },
+        ],
+      },
+      ...corpus,
+    ];
+    for (const fragment of ["d", "ll", "m", "re", "s", "t", "ve"]) {
+      expect(rankServers(fragment, withFragmentTools), `"${fragment}" must not score`).toEqual([]);
+    }
+    // End to end: the contractions those fragments come from are inert too.
+    // Every token here is a fragment or a stopword except the `don` of `don't`,
+    // which is absent from the corpus and so cannot score either.
+    for (const contraction of ["don't", "it's", "we're", "I've", "I'll", "I'm", "I'd"]) {
+      expect(rankServers(contraction, withFragmentTools), `"${contraction}" must not score`).toEqual([]);
     }
   });
 
@@ -303,6 +346,19 @@ describe("rankServers (corpus-wide BM25)", () => {
     const a = rankServers("", corpus);
     const b = rankServers("", corpus);
     expect(a).toEqual(b);
+
+    // ...and a corpus that GENUINELY ties, which is what the namespace
+    // tie-break in scoreAgainstIndex exists for. Both servers carry the same
+    // name field, the same field lengths and the same document frequency, so
+    // the scores are equal by construction; only the tie-break decides the
+    // order, and it must not be the order the caller happened to pass them in
+    // (config / install order, which changes on a reinstall).
+    const tied = rankServers("widget", [
+      { namespace: "zzz", name: "Widget", description: "", tools: [] },
+      { namespace: "aaa", name: "Widget", description: "", tools: [] },
+    ]);
+    expect(tied.map((r) => r.namespace)).toEqual(["aaa", "zzz"]);
+    expect(tied[0].score).toBe(tied[1].score);
   });
 
   it("does not rank a server that lacks both description and tools when query misses name", () => {
@@ -507,7 +563,9 @@ describe("ranking index cache", () => {
     // Tool names and descriptions come from third-party upstream servers over
     // JSON-RPC, where NUL and SOH are legal string content -- so any
     // "this character cannot occur" assumption in a delimiter scheme is
-    // supplied by the untrusted side. Length-prefixing removes the assumption.
+    // supplied by the untrusted side. serverSignature removes the assumption by
+    // escaping both bytes out of every field (ESC -> ESC ESC, SEP -> ESC SEP),
+    // so a bare separator in the signature is always a field boundary.
     const embedded = [{ namespace: "ns", name: "Name", description: "alpha\u0000beta\u0000", tools: [] }];
     const split = [{ namespace: "ns", name: "Name", description: "alpha", tools: [{ name: "beta", description: "" }] }];
     const a = rankServers("beta", embedded);
@@ -523,9 +581,14 @@ describe("ranking index cache", () => {
       { namespace: "alpha", name: "Alpha", description: "widget", tools: [] },
       { namespace: "bravo", name: "Bravo", description: "widget", tools: [] },
     ];
-    // Under a separator-joined index key this single server signs identically
-    // to the two-server corpus above, so it would be served a 2-doc index --
-    // wrong N, wrong IDF, and a ranked namespace the caller never passed in.
+    // This single server carries the two-server corpus's signature text,
+    // separators included, inside one description: under an index key that
+    // joined the RAW signatures it signs identically to the pair above and gets
+    // served their 2-doc index -- wrong N, wrong IDF, and a ranked namespace the
+    // caller never passed in. It cannot collide under the current key (a digest
+    // of the per-server digests, every element the same fixed width), so this is
+    // a canary against a regression back to a raw-signature join rather than a
+    // reproduction of a live bug.
     const forged = [
       {
         namespace: "alpha",
@@ -536,6 +599,9 @@ describe("ranking index cache", () => {
     ];
     rankServers("widget", two);
     expect(rankServers("widget", forged).map((r) => r.namespace)).toEqual(["alpha"]);
+    // A shared key would have reused the 2-doc index instead of building one,
+    // so asserting the build is what keeps the canary able to fail at all.
+    expect(relevanceCacheStats().indexBuilds).toBe(2);
   });
 
   it("still saturates term frequency after the counts refactor", () => {

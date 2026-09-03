@@ -187,9 +187,10 @@ describe("resolveCatalogSlug", () => {
   // A SET-BUT-EMPTY override is the YAW_MCP_CATALOG_URL="" shape (a CI
   // variable declared with no value, a bare `export`), and "" is not nullish
   // -- so the `??` fallbacks in `add` / `try` handed it straight through to
-  // fetch(""). That throws a bare TypeError, and defaultFetchCatalog's
-  // unwrapped-rethrow gate (`err.message.includes(url)`) is trivially true for
-  // the empty string, so even the friendly wrapper was skipped.
+  // fetch(""). That throws a bare TypeError, and the message-based rethrow
+  // gate defaultFetchCatalog used to carry (`err.message.includes(url)`) was
+  // trivially true for the empty string, so even the friendly wrapper was
+  // skipped.
   it("treats a set-but-empty (or whitespace-only) catalogUrl as unset", async () => {
     const fetchCatalog = vi.fn<FetchCatalog>().mockResolvedValue([{ slug: "s", install: { command: "npx s" } }]);
     await resolveCatalogSlug("s", { fetchCatalog, catalogUrl: "" });
@@ -297,8 +298,8 @@ describe("defaultFetchCatalog", () => {
   });
 
   it("does not re-wrap an error it already prefixed", async () => {
-    // The transport branch is discriminated by whether the message already
-    // carries the url, so an HTTP-status failure must pass through untouched
+    // The transport branch is discriminated by the marker class the module's
+    // own throws carry, so an HTTP-status failure must pass through untouched
     // rather than coming back as "could not reach ... (the Yaw MCP catalog
     // at ... returned HTTP 500.)".
     stubFetch(async () => ({ ok: false, status: 500, json: async () => ({}) }));
@@ -358,11 +359,33 @@ describe("defaultFetchCatalog", () => {
     }
   });
 
-  it("rethrows a transport failure as an Error", async () => {
+  it("wraps a causeless transport failure, still naming the catalog and the URL", async () => {
+    // undici usually hangs the real reason on `cause`; when it doesn't, the
+    // bare message is all there is to report -- but the WRAPPER still has to
+    // be there. Asserting only "fetch failed" passed whether the error came
+    // back wrapped or raw, so it could not fail for the thing it is about.
     stubFetch(async () => {
       throw new TypeError("fetch failed");
     });
-    await expect(defaultFetchCatalog()).rejects.toThrow("fetch failed");
+    await expect(defaultFetchCatalog()).rejects.toThrow(
+      `could not reach the Yaw MCP catalog at ${DEFAULT_CATALOG_URL} (fetch failed). Check your network, then retry.`,
+    );
+  });
+
+  it("wraps fetch's OWN url-parse failure, even though its message names the url", async () => {
+    // A malformed YAW_MCP_CATALOG_URL (scheme-less, a typo'd protocol) never
+    // reaches the network: fetch rejects with `TypeError: Failed to parse URL
+    // from <url>`. That message CONTAINS the url, so the old message-based
+    // rethrow gate (`err.message.includes(url)`) read it as an error this
+    // module had already worded and handed it straight back -- no "could not
+    // reach the Yaw MCP catalog" prefix and no cause detail, for a failure the
+    // user's own config caused. A marker class cannot mistake it that way.
+    stubFetch(async () => {
+      throw new TypeError("Failed to parse URL from cat.example/c.json");
+    });
+    await expect(defaultFetchCatalog("cat.example/c.json")).rejects.toThrow(
+      "could not reach the Yaw MCP catalog at cat.example/c.json (Failed to parse URL from cat.example/c.json).",
+    );
   });
 
   it("wraps a non-Error rejection in an Error", async () => {
@@ -388,16 +411,31 @@ describe("defaultFetchCatalog", () => {
       }));
     }
 
-    it("warns once the catalog is CATALOG_STALE_AFTER_DAYS old, naming the date and the age", async () => {
+    it("warns at EXACTLY CATALOG_STALE_AFTER_DAYS, naming the date and the age", async () => {
+      // The mark itself, not a day past it. The comparison is `ageDays <
+      // CATALOG_STALE_AFTER_DAYS`, so N days old is the first age that warns
+      // -- and a `<=` typo silences exactly that age and nothing else, which
+      // an assertion a day late cannot see.
       stubCatalog({ generated_at: GENERATED });
       const warned: string[] = [];
-      const now = () => Date.parse(GENERATED) + (CATALOG_STALE_AFTER_DAYS + 1) * DAY_MS;
+      const now = () => Date.parse(GENERATED) + CATALOG_STALE_AFTER_DAYS * DAY_MS;
       const servers = await defaultFetchCatalog(DEFAULT_CATALOG_URL, { warn: (l) => warned.push(l), now });
       // The note is advisory: the servers still resolve.
       expect(servers.map((s) => s.slug)).toEqual(["a"]);
       expect(warned).toEqual([
-        `yaw-mcp: note: the Yaw MCP catalog was generated 2026-01-01 (${CATALOG_STALE_AFTER_DAYS + 1} days ago); its entries may be out of date.`,
+        `yaw-mcp: note: the Yaw MCP catalog was generated 2026-01-01 (${CATALOG_STALE_AFTER_DAYS} days ago); its entries may be out of date.`,
       ]);
+    });
+
+    it("stays silent one millisecond below the mark", async () => {
+      // The other side of the same boundary: a tick short of N days floors to
+      // N-1 and must stay quiet. With the two together the comparison is
+      // pinned in both directions rather than only somewhere near it.
+      stubCatalog({ generated_at: GENERATED });
+      const warned: string[] = [];
+      const now = () => Date.parse(GENERATED) + CATALOG_STALE_AFTER_DAYS * DAY_MS - 1;
+      await defaultFetchCatalog(DEFAULT_CATALOG_URL, { warn: (l) => warned.push(l), now });
+      expect(warned).toEqual([]);
     });
 
     it("stays silent below the floor", async () => {

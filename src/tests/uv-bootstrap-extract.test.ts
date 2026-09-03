@@ -16,8 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //
 // Both gaps require process.platform === 'win32'. Everything external is
 // mocked (spawn, undici, cacheDir), so these run on every platform -- they
-// are NOT skipped on this win32 box or on the CI ubuntu/windows legs. We
-// stub process.platform/arch via Object.defineProperty (same technique the
+// are NOT skipped on a non-win32 host, and nothing here is gated on a runner
+// (this repo ships no CI workflows; the gates are local). We stub
+// process.platform/arch via Object.defineProperty (same technique the
 // unsupported-platform test in uv-bootstrap-fixes.test.ts uses).
 //
 // Own file (like the sibling uv-bootstrap-*.test.ts) because it needs a
@@ -47,10 +48,19 @@ vi.mock("undici", () => ({
 // "error" so onPath returns false and resolveUv proceeds to the download +
 // extract path. The extractArchive runCommand (cmd "powershell.exe") emits
 // "close" 0 so runCommand resolves and we can assert the captured -Command.
+//
+// extractMode.materializeBinary additionally makes that mocked Expand-Archive
+// drop a uv.exe into its -DestinationPath, so findBinary succeeds and control
+// reaches the winner-takes-all rename underneath it (the rename-race tests at
+// the bottom of this file). It stays OFF by default: the path-validation tests
+// above depend on an EMPTY extract dir yielding "uv binary not found".
 const spawnCalls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
+const extractMode = { materializeBinary: false };
 
 vi.mock("node:child_process", () => {
   const { EventEmitter } = require("node:events");
+  const nodeFs = require("node:fs");
+  const nodePath = require("node:path");
   return {
     spawn: (cmd: string, args: string[], opts: Record<string, unknown>) => {
       spawnCalls.push({ cmd, args: [...(args ?? [])], opts: { ...opts } });
@@ -59,6 +69,15 @@ vi.mock("node:child_process", () => {
       fake.stderr = new EventEmitter();
       fake.stdout = new EventEmitter();
       if (cmd === "powershell.exe") {
+        if (extractMode.materializeBinary) {
+          // Expand-Archive is mocked, so the destination stays empty unless we
+          // put the archive's payload there ourselves.
+          const dest = /-DestinationPath '(.+?)' -Force/.exec(String(args?.at(-1) ?? ""))?.[1];
+          if (dest) {
+            nodeFs.mkdirSync(dest, { recursive: true });
+            nodeFs.writeFileSync(nodePath.join(dest, "uv.exe"), "extracted-uv-bytes");
+          }
+        }
         // runCommand success: exit 0.
         setImmediate(() => fake.emit("close", 0));
       } else {
@@ -72,7 +91,7 @@ vi.mock("node:child_process", () => {
 
 import { request } from "undici";
 import { cacheDir } from "../paths.js";
-import { __resetUvBootstrap, ensureUv } from "../uv-bootstrap.js";
+import { __resetUvBootstrap, ensureUv, UV_VERSION } from "../uv-bootstrap.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -118,6 +137,8 @@ const mockCacheDir = vi.mocked(cacheDir);
 
 // Both fixtures live under os.tmpdir(); afterEach removes them.
 const APOSTROPHE_ROOT = path.join(os.tmpdir(), "yaw-mcp-O'Brien-extract-test");
+// Third fixture root, for the rename-race tests at the bottom of the file.
+const RENAME_ROOT = path.join(os.tmpdir(), "yaw-mcp-uv-rename-race-test");
 // Smart-quote roots keyed by code point (built at use time to avoid literal
 // smart-quote bytes floating in the file header).
 function smartRoot(codePoint: number): string {
@@ -145,6 +166,7 @@ function restorePlatform(): void {
 
 beforeEach(() => {
   spawnCalls.length = 0;
+  extractMode.materializeBinary = false;
   __resetUvBootstrap();
   mockCacheDir.mockReset();
   vi.mocked(request).mockReset();
@@ -152,9 +174,11 @@ beforeEach(() => {
 
 afterEach(async () => {
   restorePlatform();
+  extractMode.materializeBinary = false;
   __resetUvBootstrap();
-  // resolveUv writes/extracts under cacheDir()/uv/<version>; clean both roots.
+  // resolveUv writes/extracts under cacheDir()/uv/<version>; clean every root.
   await fs.rm(APOSTROPHE_ROOT, { recursive: true, force: true }).catch(() => {});
+  await fs.rm(RENAME_ROOT, { recursive: true, force: true }).catch(() => {});
   for (const cp of [0x2018, 0x2019, 0x201a, 0x201b]) {
     await fs.rm(smartRoot(cp), { recursive: true, force: true }).catch(() => {});
   }
@@ -195,9 +219,15 @@ describe("extractArchive apostrophe path (gap 12)", () => {
 // ── Gap 13: Unicode smart-quote is rejected BEFORE runCommand ──────────────
 describe("extractArchive smart-quote guard (gap 13)", () => {
   // U+2018 U+2019 U+201A U+201B -- every char the line-198 regex guards.
+  // The label is carried alongside the code point rather than formatted from
+  // it: a bare %s renders the NUMBER, so these titles used to read "U+8216"
+  // .. "U+8219" (decimal) for the hex code points they name.
   it.each([
-    0x2018, 0x2019, 0x201a, 0x201b,
-  ])("throws 'contains a newline or smart quote' and never spawns powershell for U+%s", async (codePoint) => {
+    { codePoint: 0x2018, hex: "2018" },
+    { codePoint: 0x2019, hex: "2019" },
+    { codePoint: 0x201a, hex: "201A" },
+    { codePoint: 0x201b, hex: "201B" },
+  ])("throws 'contains a newline or smart quote' and never spawns powershell for U+$hex", async ({ codePoint }) => {
     forceWin32();
     mockCacheDir.mockReturnValue(smartRoot(codePoint));
     serveGoodArchive();
@@ -209,5 +239,69 @@ describe("extractArchive smart-quote guard (gap 13)", () => {
     // The guard fires before runCommand, so no powershell.exe spawn happened.
     const psCall = spawnCalls.find((c) => c.cmd === "powershell.exe");
     expect(psCall, "smart-quote path must not reach Expand-Archive").toBeUndefined();
+  });
+});
+
+// ── Winner-takes-all rename: a lost race is success, an empty finalBin is not ─
+//
+// resolveUv's rename fallback is the only place a failed syscall is
+// deliberately treated as success, and it was untested. It lives in THIS file
+// because this is the only sibling whose spawn mock lets extractArchive
+// succeed (powershell.exe exits 0), which is what makes the rename reachable
+// at all; extractMode.materializeBinary supplies the extracted binary that
+// findBinary must locate just above it.
+describe("resolveUv rename race fallback", () => {
+  // forceWin32() pins arch to x64, so the install dir is fully determined.
+  const finalBinPath = (): string => path.join(RENAME_ROOT, "uv", UV_VERSION, "x86_64-pc-windows-msvc", "uv.exe");
+
+  // The concurrent winner installs finalBin and is EXECUTING it, so Win32
+  // refuses to replace the open image handle. Written from inside the mocked
+  // rename on purpose: a finalBin present BEFORE ensureUv() would be taken by
+  // resolveUv's cache-hit fast path and the rename would never run.
+  function mockRenameLosingTo(contents: string) {
+    return vi.spyOn(fs, "rename").mockImplementation(async () => {
+      const finalBin = finalBinPath();
+      await fs.mkdir(path.dirname(finalBin), { recursive: true });
+      await fs.writeFile(finalBin, contents);
+      const err = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+      err.code = "EPERM";
+      throw err;
+    });
+  }
+
+  it("resolves to finalBin when the rename fails but a good binary is already there", async () => {
+    forceWin32();
+    mockCacheDir.mockReturnValue(RENAME_ROOT);
+    serveGoodArchive();
+    extractMode.materializeBinary = true;
+
+    // Every racer verified the same UV_VERSION archive against the same
+    // published sha256, so a non-empty finalBin is a good binary: the lost
+    // race must read as success, not as a broken install.
+    const renameSpy = mockRenameLosingTo("winner-installed-uv-bytes");
+    try {
+      await expect(ensureUv()).resolves.toBe(finalBinPath());
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("rethrows the rename failure when finalBin is empty (nothing usable to fall back on)", async () => {
+    forceWin32();
+    mockCacheDir.mockReturnValue(RENAME_ROOT);
+    serveGoodArchive();
+    extractMode.materializeBinary = true;
+
+    // A zero-byte finalBin is a truncated/failed install, not a race winner --
+    // swallowing the error here would hand upstream.ts a path to an unusable
+    // binary and turn a clear failure into an inscrutable spawn error later.
+    const renameSpy = mockRenameLosingTo("");
+    try {
+      const err = await ensureUv().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain("EPERM");
+    } finally {
+      renameSpy.mockRestore();
+    }
   });
 });

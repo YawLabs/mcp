@@ -26,8 +26,8 @@
 // input either way — it is prose, not instructions yaw-mcp acts on.
 
 import { createReadStream } from "node:fs";
-import { formatShadowLine, resolveShadowedClis } from "./cli-shadows.js";
-import { probeProjectTrust } from "./local-bundles.js";
+import { formatShadowLine } from "./cli-shadows.js";
+import { probeProjectTrust, projectFileIsHonoured } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { findProjectConfigDir, guidePath, userConfigDir } from "./paths.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -158,10 +158,26 @@ export async function loadProjectGuide(cwd: string, home?: string, env?: NodeJS.
   // `.yaw-mcp/` this guide came from. Failure to probe is treated as
   // not-approved: the flag is advisory, and the quiet answer is the wrong
   // default for a visibility signal.
+  //
+  // The verdict comes from local-bundles' own projectFileIsHonoured rather
+  // than a re-implemented `bypassed || status === "trusted"`. That inline copy
+  // dropped the UNREADABLE-but-path-approved branch, so a bundles.json the user
+  // had approved and that later became unreadable was still honoured by
+  // loadLocalBundles while the sibling guide got flagged -- and `yaw-mcp doctor`
+  // printed a "not approved" notice about a directory the loader was loading.
+  // `bypassed` is still checked separately: projectFileIsHonoured answers about
+  // a FILE, so it is false for status "none" (no bundles.json at all), while
+  // YAW_MCP_TRUST_PROJECT means "treat this checkout as approved" whether or not
+  // a bundles.json sits beside the guide.
   const probe = await probeProjectTrust({ cwd, home, env }).catch(() => null);
-  const approved = probe !== null && (probe.bypassed || probe.status === "trusted");
+  const approved = probe !== null && (probe.bypassed || projectFileIsHonoured(probe));
   if (approved) return guide;
-  log("warn", "Loading a project YAW-MCP.md from an unapproved project dir", {
+  // DEBUG, not warn: projectGuideNotice renders these same facts as prose and
+  // `yaw-mcp doctor` prints it, so a warn envelope here put raw JSON on stderr
+  // in front of the human version of itself on every load inside an unapproved
+  // project -- the double-report shape local-bundles.ts downgraded for its own
+  // untrusted-project probe.
+  log("debug", "Loading a project YAW-MCP.md from an unapproved project dir", {
     path: guide.path,
     bundles: probe?.status ?? "unknown",
   });
@@ -224,12 +240,18 @@ function renderActiveServersSection(
   activeServers: Array<Pick<UpstreamServerConfig, "namespace" | "name" | "toolCache">> | undefined,
 ): string | null {
   if (!activeServers || activeServers.length === 0) return null;
-  const rows = activeServers
-    .filter((s) => resolveShadowedClis(s).length > 0)
-    .map((s) => {
-      const shadow = formatShadowLine(s);
-      return `- \`${s.namespace}\` (${s.name}) — ${shadow}`;
-    });
+  // One pass, one resolve per server. formatShadowLine already runs
+  // resolveShadowedClis internally, so filtering on a second resolveShadowedClis
+  // call did the same work twice per installed server -- and then interpolated
+  // its `string | null` result into the row template, leaving the filter as the
+  // only thing standing between the reader and a literal "null" in the guide.
+  // The null answer IS the filter here, so the two can no longer disagree.
+  const rows: string[] = [];
+  for (const s of activeServers) {
+    const shadow = formatShadowLine(s);
+    if (shadow === null) continue;
+    rows.push(`- \`${s.namespace}\` (${s.name}) — ${shadow}`);
+  }
   if (rows.length === 0) return null;
   return [
     "<!-- source: yaw-mcp (auto-generated from installed servers) -->",

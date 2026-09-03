@@ -339,6 +339,17 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
       if (typeof s.id !== "string" || s.id.length === 0) {
         return { ok: false, message: `step ${i}: \`id\` must be a non-empty string` };
       }
+      // `.`, `[` and `]` are the $ref path separators (see parseRefPath), so
+      // an id containing one can never be named by a ref: "a.b" parses as
+      // step "a" drilling into key "b", and the runtime error then blames a
+      // step id the request never declared. Refusing the id up front is the
+      // only place the mismatch is still explainable.
+      if (/[.[\]]/.test(s.id)) {
+        return {
+          ok: false,
+          message: `step ${i}: \`id\` "${s.id}" may not contain '.', '[' or ']' (they are $ref path separators)`,
+        };
+      }
       // The id becomes a key in the plain-object bindings map (server.ts:
       // `bindings[key] = ...`), where assigning "__proto__" hits
       // Object.prototype's setter instead of creating an own key: the step's
@@ -360,6 +371,18 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
     if (s.args !== undefined && (s.args === null || typeof s.args !== "object" || Array.isArray(s.args))) {
       return { ok: false, message: `step ${i}: \`args\` must be an object if provided` };
     }
+    // Unknown keys are a typo, not an extension point. A step written as
+    // `{tool, arguments: {...}}` (or `arg` / `input` / `params`) otherwise
+    // validates clean and dispatches the tool with `{}` -- a real call with
+    // every argument silently dropped. The advertised item schema carries a
+    // matching `additionalProperties: false` (meta-tools.ts), but the
+    // low-level Server never validates against it, so the check has to live
+    // here too.
+    for (const k of Object.keys(s)) {
+      if (k !== "id" && k !== "tool" && k !== "args") {
+        return { ok: false, message: `step ${i}: unknown key "${k}" (allowed: id, tool, args)` };
+      }
+    }
   }
   // Reject explicit ids that collide with another step's positional slot --
   // both would bind under the same key and the second overwrites the first.
@@ -375,15 +398,11 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
     if (typeof ret !== "string" || ret.length === 0) {
       return { ok: false, message: "`return` must be a non-empty step id string" };
     }
-    // Build the full set of valid binding keys: explicit ids AND positional
-    // fallback keys ("0", "1", ...) for steps that have no explicit id.
-    const allBindingKeys = new Set(seenIds);
-    for (let i = 0; i < steps.length; i++) {
-      const s = steps[i] as Record<string, unknown>;
-      if (typeof s.id !== "string" || s.id.length === 0) {
-        allBindingKeys.add(String(i));
-      }
-    }
+    // The full set of valid binding keys is explicit ids PLUS the positional
+    // fallback keys the loop above already collected -- every step that
+    // reached this point either carries a valid non-empty string id or has
+    // none at all, so `positionalSlots` is exactly the positional half.
+    const allBindingKeys = new Set([...seenIds, ...positionalSlots]);
     if (!allBindingKeys.has(ret)) {
       return { ok: false, message: `\`return\` references unknown step id "${ret}"` };
     }
@@ -397,4 +416,84 @@ export function validateExecRequest(req: unknown): { ok: true } | { ok: false; m
 // lookup expects.
 export function stepBindingKey(step: ExecStepInput, index: number): string {
   return typeof step.id === "string" && step.id.length > 0 ? step.id : String(index);
+}
+
+// Walk one step's args exactly as resolveArgsAt does, checking every `$ref`
+// against the keys bound by EARLIER steps. Returns the first problem as a
+// message, or null when the subtree is clean. Throws ExecDepthError past the
+// cap, mirroring the resolver so a too-deep tree is reported once, in the
+// same words, whichever walker sees it first.
+function checkRefsAt(node: unknown, bound: Set<string>, stepIndex: number, depth: number): string | null {
+  if (depth > MAX_REF_DEPTH) throw new ExecDepthError(MAX_REF_DEPTH);
+  if (isRefNode(node)) {
+    const raw = node.$ref;
+    const tokens = parseRefPath(raw);
+    if (!tokens) return `step ${stepIndex}: $ref "${raw}" is malformed`;
+    const head = tokens[0];
+    if (typeof head !== "string") {
+      // Same case resolveRef guards at runtime: a bracket-leading ref like
+      // "[0]" parses to a NUMBER first token, which names no producer step.
+      return `step ${stepIndex}: $ref "${raw}": missing step id (a bracket index cannot name a step)`;
+    }
+    if (!bound.has(head)) {
+      return `step ${stepIndex}: $ref "${raw}" names step "${head}" which has not run by then`;
+    }
+    return null;
+  }
+  if (Array.isArray(node)) {
+    for (const v of node) {
+      const problem = checkRefsAt(v, bound, stepIndex, depth + 1);
+      if (problem) return problem;
+    }
+    return null;
+  }
+  if (node !== null && typeof node === "object") {
+    for (const v of Object.values(node as Record<string, unknown>)) {
+      const problem = checkRefsAt(v, bound, stepIndex, depth + 1);
+      if (problem) return problem;
+    }
+    return null;
+  }
+  return null;
+}
+
+// Preflight every `{"$ref": ...}` in the pipeline BEFORE step 0 runs.
+//
+// Every producer key is known statically from the steps array, so an
+// unknown, forward (self or later), or malformed ref is decidable without
+// executing anything -- yet resolveRef only sees it at step N, after steps
+// 0..N-1 have already fired their real side effects. A one-character typo in
+// step 2 of `create issue -> comment on it` therefore costs a filed issue,
+// and the usual reaction (fix the ref, re-run the exec) files a second one.
+//
+// ORDERING CONTRACT: run this AFTER the meta-tool refusal pass over all
+// steps, never before it. What makes a meta-tool step illegal is the tool it
+// names, not its args, so a `{tool: "mcp_connect_exec", args: {x: {$ref:
+// "nope"}}}` step must report the meta-tool refusal -- a ref error there
+// sends the model off fixing arguments for a call exec will never make. That
+// is also why this is a separate function rather than part of
+// validateExecRequest, which server.ts runs first: exec-engine is
+// dependency-free by design and cannot ask what a meta-tool is.
+//
+// Rejects exactly the set of requests that would have thrown at runtime,
+// only earlier: `$ref`-shaped DATA (a JSON-Schema `{"$ref": "#/defs/X"}`
+// travelling as an argument) already matches isRefNode and already fails
+// during resolution, so no working pipeline loses.
+export function validateExecRefs(steps: ExecStepInput[]): { ok: true } | { ok: false; message: string } {
+  // Keys bound so far, built with stepBindingKey so a positional ref ("0",
+  // "1") to an unnamed step is accepted rather than falsely rejected.
+  const bound = new Set<string>();
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    try {
+      const problem = checkRefsAt(step.args, bound, i, 0);
+      if (problem) return { ok: false, message: problem };
+    } catch (err) {
+      if (err instanceof ExecDepthError) return { ok: false, message: `step ${i}: ${err.message}` };
+      throw err;
+    }
+    // Added AFTER the check, so a step referencing itself is a forward ref.
+    bound.add(stepBindingKey(step, i));
+  }
+  return { ok: true };
 }

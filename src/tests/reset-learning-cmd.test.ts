@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CONFIG_DIRNAME } from "../paths.js";
-import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
+import { STATE_FILENAME, STATE_SCHEMA_VERSION, TOOLCACHE_TTL_MS } from "../persistence.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "../reset-learning-cmd.js";
 
 // All tests use an isolated fake home dir so we never touch the real
@@ -80,10 +80,13 @@ describe("runResetLearning", () => {
   });
 
   it("reports real counts for a BOM-prefixed state file (Notepad save), like loadState reads it", async () => {
-    // persistence.ts strips U+FEFF before parsing; peekParsedCleanly used a
-    // bare JSON.parse, so a Notepad-saved state.json that loadState read
-    // FINE was reported "contents unreadable" and its real counts thrown
-    // away. Built in code -- never hand-type an escape into a fixture.
+    // persistence.ts strips U+FEFF before parsing, and the report's
+    // classification rides on loadStateClassified -- the SAME read+parse
+    // loadState performs. The regression this guards is the shape that
+    // preceded it: a separate peek helper with its own bare JSON.parse, which
+    // rejected the BOM, so a Notepad-saved state.json that loadState read FINE
+    // was reported "contents unreadable" and its real counts thrown away.
+    // Built in code -- never hand-type an escape into a fixture.
     const BOM = String.fromCharCode(0xfeff);
     writeFileSync(
       stateFile,
@@ -144,6 +147,35 @@ describe("runResetLearning", () => {
     const combined = io.out.join("");
     expect(combined).not.toContain("contents unreadable");
     expect(combined).toContain("tool caches removed:          0");
+  });
+
+  it("counts what the FILE held, not what survived sanitization", async () => {
+    // The report is about content the unlink destroyed, so it reads the
+    // pre-sanitization counts. Two of the rows below never make it into the
+    // loaded state -- the tool cache aged past TOOLCACHE_TTL_MS, the learning
+    // row carries a hand-edited negative lastUsedAt -- but they were really in
+    // the file and are really gone now. Counting the sanitized state instead
+    // reported "0 removed" for a file that plainly held them.
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: Date.now(),
+      learning: {
+        gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 },
+        handEdited: { dispatched: 3, succeeded: 1, lastUsedAt: -1 },
+      },
+      packHistory: [{ namespace: "gh", toolName: "listPrs", at: 1 }],
+      toolCache: {
+        expired: { tools: [{ name: "list_prs" }], learnedAt: Date.now() - TOOLCACHE_TTL_MS - 1000 },
+      },
+    };
+    writeFileSync(stateFile, JSON.stringify(payload), "utf8");
+    const io = captureIO();
+    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    expect(r.removed).toBe(true);
+    const combined = io.out.join("");
+    expect(combined).toContain("learning entries removed:     2");
+    expect(combined).toContain("pack history entries removed: 1");
+    expect(combined).toContain("tool caches removed:          1");
   });
 
   it("removes a malformed state file and reports it as unreadable (not 0 counts)", async () => {

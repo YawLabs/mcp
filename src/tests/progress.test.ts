@@ -1,7 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createProgressReporter } from "../progress.js";
 
 describe("createProgressReporter", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
   it("returns a no-op when no progressToken is present", () => {
     const send = vi.fn().mockResolvedValue(undefined);
     const report = createProgressReporter({ sendNotification: send, _meta: {} });
@@ -134,7 +139,17 @@ describe("createProgressReporter", () => {
     expect(second.total).toBeUndefined();
   });
 
-  it("swallows sendNotification rejection without throwing", async () => {
+  it("swallows a sendNotification rejection and reports it as a warn line", async () => {
+    // The rejection must not reach the caller -- and it must not vanish
+    // silently either: the reporter's .catch() logs it. An operator running
+    // the suite with LOG_LEVEL=error exported would mute that line, so pin
+    // the threshold instead of inheriting it.
+    vi.stubEnv("LOG_LEVEL", "warn");
+    const stderrWrites: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") stderrWrites.push(chunk);
+      return true;
+    });
     const send = vi.fn().mockRejectedValue(new Error("transport closed"));
     const report = createProgressReporter({
       sendNotification: send,
@@ -143,6 +158,22 @@ describe("createProgressReporter", () => {
     expect(() => report("x")).not.toThrow();
     // Let the microtask for the rejection resolve
     await new Promise((r) => setTimeout(r, 0));
+
+    let warned: Record<string, unknown> | undefined;
+    for (const line of stderrWrites) {
+      try {
+        const entry = JSON.parse(line.trim()) as Record<string, unknown>;
+        if (entry.msg === "Progress notification send failed") warned = entry;
+      } catch {
+        // Not a JSON log line. Nothing else writes to stderr inside this
+        // test, but a stray write must not crash the assertions below.
+      }
+    }
+    expect(warned).toBeDefined();
+    expect(warned?.level).toBe("warn");
+    // The rejection reason has to survive into the line: a bare "send
+    // failed" with no cause tells an operator nothing about the transport.
+    expect(warned?.error).toBe("transport closed");
   });
 
   it("accepts numeric progress tokens", () => {

@@ -44,11 +44,11 @@
 import { createHash } from "node:crypto";
 import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { setJsonKey } from "./json-key.js";
 import { log } from "./logger.js";
-import { userConfigDir } from "./paths.js";
+import { realpathOrSelf, userConfigDir } from "./paths.js";
 
 /** Canonical filename for the trust store, inside ~/.yaw-mcp/. */
 export const TRUST_FILENAME = "trusted.json";
@@ -168,10 +168,26 @@ export function trustStorePath(home: string = homedir()): string {
  * paths.ts:normalizeForCompare keeps its win32-only split; it compares
  * walk-up boundaries against $HOME, whose casing comes from the OS
  * consistently, so the duplicate-key failure cannot arise there.
+ *
+ * `platform` is a PARAMETER rather than a read of the global so a test can
+ * exercise another platform's folding branch without faking
+ * `process.platform` for the duration: that fake also reaches
+ * atomic-write.ts (whose rename retry is win32-only) and the POSIX chmod in
+ * writeTrustStore, which makes every grant/revoke performed under it flakier
+ * than the code being tested. Production callers never pass it.
+ *
+ * Deliberately LEXICAL and synchronous: no realpath. Every lookup goes
+ * through here -- including the read-time fold, once per stored entry, on
+ * every readTrustStore (i.e. at server startup) -- so a filesystem walk here
+ * would put N uninterruptible syscalls in the startup path (one dead UNC
+ * share or disconnected drive letter stalls the event loop) and would make
+ * the canonical key depend on live filesystem state. Where a physical
+ * spelling is genuinely needed it is resolved at that call site instead; see
+ * revokeKeyCandidates.
  */
-export function normalizeTrustKey(p: string): string {
+export function normalizeTrustKey(p: string, platform: NodeJS.Platform = process.platform): string {
   const resolved = resolve(p);
-  const caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin";
+  const caseInsensitiveFs = platform === "win32" || platform === "darwin";
   return caseInsensitiveFs ? resolved.toLowerCase() : resolved;
 }
 
@@ -242,8 +258,14 @@ function emptyStore(
  * write persists the folded form), on both platforms for free. When two
  * legacy keys fold together they name the same file on a case-insensitive
  * filesystem, so keeping both WOULD be the duplicate bug: last write wins.
+ *
+ * `platform` is forwarded verbatim to that fold; see normalizeTrustKey for
+ * why the platform is threaded instead of read off the global.
  */
-export async function readTrustStore(home: string = homedir()): Promise<TrustStore> {
+export async function readTrustStore(
+  home: string = homedir(),
+  platform: NodeJS.Platform = process.platform,
+): Promise<TrustStore> {
   const path = trustStorePath(home);
   let raw: string;
   try {
@@ -282,6 +304,17 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
     return emptyStore("parse", `${path} has a non-numeric "version" field; the store is corrupt`);
   }
   const version = typeof obj.version === "number" ? obj.version : TRUST_SCHEMA_VERSION;
+  // The range check is TWO-sided. A version above ours is a real store from a
+  // newer build ("schema" below -- denied and never overwritten), but 0, a
+  // negative, or a fraction names a schema that has never existed, so the file
+  // is corrupt rather than newer. Accepting those as "healthy, current" was
+  // the same hole the non-numeric check above closes: `"version": 0` was read
+  // with v1 semantics on the strength of a field that says it is not v1.
+  // "parse", like every other corrupt shape, so a later grant may rebuild it.
+  if (!Number.isInteger(version) || version < 1) {
+    log("warn", "Trust store has an out-of-range version; nothing is trusted", { path, version });
+    return emptyStore("parse", `${path} has an invalid "version" (${version}); the store is corrupt`);
+  }
   if (version > TRUST_SCHEMA_VERSION) {
     log("warn", "Trust store was written by a newer yaw-mcp; nothing is trusted", { path, version });
     return emptyStore(
@@ -317,7 +350,7 @@ export async function readTrustStore(home: string = homedir()): Promise<TrustSto
     // "__proto__" would silently drop the record AND repoint `entries`'
     // prototype at it (the fold makes that key absolute today, but the guard
     // must not depend on it staying that way).
-    setJsonKey(entries, normalizeTrustKey(key), {
+    setJsonKey(entries, normalizeTrustKey(key, platform), {
       path: typeof v.path === "string" && v.path.length > 0 ? v.path : key,
       sha256: v.sha256,
       grantedAt: typeof v.grantedAt === "string" ? v.grantedAt : "",
@@ -354,6 +387,14 @@ export function trustStatusFor(path: string, contents: Buffer | string, store: T
  * LOADER-level policy decision (see local-bundles.ts), not a claim that the
  * file is trusted -- keeping it out of here means `yaw-mcp trust --list`
  * and doctor keep reporting the real state even when the escape hatch is on.
+ * That property is pinned by trust.test.ts ("ignores the env escape hatch"),
+ * which sets the variable before asserting it changes nothing here.
+ *
+ * NO PRODUCTION CALLER TODAY: every in-repo consumer already holds a store
+ * (local-bundles, trust-cmd, doctor) and uses trustStatusFor to avoid a second
+ * read. It is kept as the one-shot form of the check for embedders and tests;
+ * if it is still unused when the module next changes shape, delete it rather
+ * than growing a caller to justify it.
  */
 export async function isTrusted(
   path: string,
@@ -399,19 +440,24 @@ async function writeTrustStore(home: string, entries: Record<string, TrustRecord
  *
  * The store is read TWICE: once up front so an unusable store is refused
  * before any work, and again immediately before the write so this grant is
- * merged onto whatever is on disk NOW. Without the second read the whole
- * operation was a read-modify-write across an unbounded gap (trust-cmd renders
- * the argv and waits at a [y/N] prompt in between), so two `yaw-mcp trust`
- * runs in different repos silently lost one grant -- last writer wins with a
- * snapshot taken minutes earlier.
+ * merged onto whatever is on disk NOW. The gap the second read closes is this
+ * function's OWN read-modify-write window -- NOT the [y/N] prompt, which
+ * trust-cmd renders and answers BEFORE calling in here, so both reads happen
+ * microseconds apart and after the user has decided. That window is small
+ * (hashing, then the mkdir + atomic rename inside the write) but not empty: a
+ * `yaw-mcp trust` run from another terminal landing inside it would otherwise
+ * be reverted by this call's older snapshot. A caller that does hold a store
+ * across a prompt of its own has to re-read it there; nothing in here can
+ * cover a gap it never sees.
  */
 export async function grantTrust(
   path: string,
   contents: Buffer | string,
-  opts: { home?: string; now?: () => number } = {},
+  opts: { home?: string; now?: () => number; platform?: NodeJS.Platform } = {},
 ): Promise<{ storePath: string; record: TrustRecord; storeWasMalformed: boolean }> {
   const home = opts.home ?? homedir();
-  const store = await readTrustStore(home);
+  const platform = opts.platform ?? process.platform;
+  const store = await readTrustStore(home, platform);
   refuseUnusableStore(home, store);
   const record: TrustRecord = {
     path: resolve(path),
@@ -421,11 +467,15 @@ export async function grantTrust(
   // Re-read and merge. The refusal is repeated on the fresh read: a store that
   // became unreadable (or was replaced by a newer-schema one) while we were
   // deciding must not be stamped over either.
-  const fresh = await readTrustStore(home);
+  const fresh = await readTrustStore(home, platform);
   refuseUnusableStore(home, fresh);
   // Only the "parse" case reaches here, where there is nothing to preserve.
   const entries = fresh.malformed ? {} : { ...fresh.entries };
-  entries[normalizeTrustKey(path)] = record;
+  // setJsonKey, not entries[k] = record, for the same reason the read fold
+  // uses it (see there): the guard must hold on its own rather than on
+  // normalizeTrustKey happening to return an absolute path. `path` is
+  // caller-supplied and this is the one write that names the key.
+  setJsonKey(entries, normalizeTrustKey(path, platform), record);
   const storePath = await writeTrustStore(home, entries);
   log("info", "Granted project bundles.json trust", { path: record.path, sha256: record.sha256 });
   // Either read seeing garbage means grants were dropped, so the caller's
@@ -448,10 +498,51 @@ function refuseUnusableStore(home: string, store: TrustStore): void {
 }
 
 /**
- * Drop consent for `path`. Returns removed:false when the path was not in
- * the store (a no-op revoke is a success -- "make it absent" happened) or
- * when the store is malformed (nothing is trusted anyway, and rewriting it
- * would destroy evidence the user may want to inspect).
+ * Every lookup key a revoke has to clear: the caller's own spelling, plus the
+ * PHYSICAL one (parent realpath'd, basename rejoined). A revoke removes ALL of
+ * them that are present, not the first hit -- both can name one bundles.json in
+ * the same store, and leaving either behind keeps the file trusted.
+ *
+ * Grants are keyed physically in practice. Every `yaw-mcp trust` grant reaches
+ * the store through findProjectConfigDir, which realpaths the project dir, so
+ * a checkout reached through a symlink, a Windows junction, or an 8.3-short
+ * prefix is stored under its RESOLVED spelling. `--revoke <path>` takes
+ * whatever the user typed, so a lexical-only key missed that row and the
+ * command answered "was not approved (nothing to do)" with exit 0 -- a false
+ * confirmation on a consent-WITHDRAWAL command, with the grant still live and
+ * the project's bundles.json still loading.
+ *
+ * Only the PARENT is resolved: a symlinked bundles.json must keep keying under
+ * the project that contains it, which is what a grant stores. realpathOrSelf,
+ * so a path whose target no longer exists degrades to the lexical key instead
+ * of throwing -- and the extra candidate can only ever find a row, never hide
+ * one, so this cannot make a trusted project untrusted.
+ *
+ * Confined to revoke on purpose. Doing the same inside normalizeTrustKey would
+ * put a synchronous realpath per entry in every store read -- server startup
+ * included -- and make the canonical key depend on live filesystem state.
+ */
+async function revokeKeyCandidates(p: string, platform: NodeJS.Platform): Promise<string[]> {
+  const lexical = normalizeTrustKey(p, platform);
+  const resolved = resolve(p);
+  const physical = normalizeTrustKey(join(await realpathOrSelf(dirname(resolved)), basename(resolved)), platform);
+  return physical === lexical ? [lexical] : [lexical, physical];
+}
+
+/**
+ * Drop consent for `path` -- EVERY row that names it, in one write, not just
+ * the first candidate key that matches (see revokeKeyCandidates). Returns
+ * removed:false when the path was not in the store (a no-op revoke is a
+ * success -- "make it absent" happened) or when the store is malformed.
+ *
+ * A malformed store is REPORTED rather than rewritten: nothing is trusted
+ * while it is unusable, so there is nothing for a revoke to remove, and
+ * rebuilding it would turn a withdrawal into a destructive write the user
+ * never asked for. That preservation is revoke-local, and deliberately so --
+ * grantTrust DOES rebuild over a parse-malformed store (it must, or the user
+ * could never grant anything again), so the damaged bytes survive only until
+ * the next `yaw-mcp trust` anywhere on the machine. Treat them as a file to
+ * inspect NOW, not as an archive.
  *
  * Like grantTrust, the store is re-read immediately before the write so a
  * concurrent grant from another terminal is preserved instead of being
@@ -459,23 +550,36 @@ function refuseUnusableStore(home: string, store: TrustStore): void {
  */
 export async function revokeTrust(
   path: string,
-  opts: { home?: string } = {},
+  opts: { home?: string; platform?: NodeJS.Platform } = {},
 ): Promise<{ storePath: string; removed: boolean; storeWasMalformed: boolean }> {
   const home = opts.home ?? homedir();
-  const store = await readTrustStore(home);
+  const platform = opts.platform ?? process.platform;
+  const store = await readTrustStore(home, platform);
   const storePath = trustStorePath(home);
   if (store.malformed) return { storePath, removed: false, storeWasMalformed: true };
-  const key = normalizeTrustKey(path);
+  const candidates = await revokeKeyCandidates(path, platform);
   // Object.hasOwn, not `in`: entries comes from JSON.parse and carries
   // Object.prototype, so `"toString" in entries` is true for every store.
   // normalizeTrustKey yields an absolute path today, which is why this was
   // never reachable -- the guard must not depend on that staying true.
-  if (!Object.hasOwn(store.entries, key)) return { storePath, removed: false, storeWasMalformed: false };
-  const fresh = await readTrustStore(home);
+  //
+  // filter, not find: ALL matching rows go, not just the first. One
+  // bundles.json can legitimately hold BOTH candidate keys -- findProjectConfigDir
+  // was purely lexical until it started realpath'ing the project dir, so a
+  // checkout reached through a symlink granted a lexical row then, and the
+  // re-grant every upgrade forces (the key derivation changed under it) adds
+  // the physical one beside it. Removing one and reporting "Revoked" left the
+  // survivor keeping the file trusted and loading -- a false confirmation on a
+  // consent-WITHDRAWAL command, the same class of bug the physical candidate
+  // was added to fix.
+  const keys = candidates.filter((c) => Object.hasOwn(store.entries, c));
+  if (keys.length === 0) return { storePath, removed: false, storeWasMalformed: false };
+  const fresh = await readTrustStore(home, platform);
   if (fresh.malformed) return { storePath, removed: false, storeWasMalformed: true };
-  if (!Object.hasOwn(fresh.entries, key)) return { storePath, removed: false, storeWasMalformed: false };
+  const present = keys.filter((k) => Object.hasOwn(fresh.entries, k));
+  if (present.length === 0) return { storePath, removed: false, storeWasMalformed: false };
   const entries = { ...fresh.entries };
-  delete entries[key];
+  for (const k of present) delete entries[k];
   await writeTrustStore(home, entries);
   log("info", "Revoked project bundles.json trust", { path: resolve(path) });
   return { storePath, removed: true, storeWasMalformed: false };

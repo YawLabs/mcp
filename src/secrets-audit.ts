@@ -30,6 +30,15 @@ export const SECRETS_AUDIT_FILENAME = "secrets-audit.log";
  *  the file stays small (~hundreds of KB at the cap). */
 export const AUDIT_TAIL_CAP = 5000;
 
+/** How far below the cap a trim cuts. The gap is HYSTERESIS, and it is the
+ *  whole point: trimming back to exactly AUDIT_TAIL_CAP leaves the file at
+ *  the trigger threshold, so the very next append is over the cap again and
+ *  re-reads plus atomically rewrites the whole ~400-500 KB log -- forever,
+ *  once per spawned secret. Cutting 500 lines deeper amortizes that rewrite
+ *  over ~500 appends. The READ cap is unchanged (a trim still triggers only
+ *  above AUDIT_TAIL_CAP); this only decides how much is kept once one runs. */
+const AUDIT_TRIM_TO = AUDIT_TAIL_CAP - 500;
+
 export type AuditEventKind = "injected" | "missing";
 
 export interface AuditEvent {
@@ -96,8 +105,8 @@ export async function appendAuditEvent(input: AuditEventInput, home: string = ho
  *  so 64 leaves headroom while staying a valid lower bound. */
 const MIN_AUDIT_LINE_BYTES = 64;
 
-/** Trim the log to the last AUDIT_TAIL_CAP lines if it has grown past it.
- *  Best-effort and swallowed by the caller's try/catch. */
+/** Trim the log to the last AUDIT_TRIM_TO lines once it has grown past
+ *  AUDIT_TAIL_CAP. Best-effort and swallowed by the caller's try/catch. */
 async function trimToTailCap(path: string): Promise<void> {
   // Cheap size gate first: a file smaller than cap * MIN_AUDIT_LINE_BYTES
   // cannot hold more than AUDIT_TAIL_CAP of our lines, so skip the read
@@ -112,7 +121,9 @@ async function trimToTailCap(path: string): Promise<void> {
   // Split on newlines; the trailing "" after the final newline is dropped.
   const lines = raw.split("\n").filter((l) => l.length > 0);
   if (lines.length <= AUDIT_TAIL_CAP) return;
-  const kept = lines.slice(lines.length - AUDIT_TAIL_CAP);
+  // Cut to AUDIT_TRIM_TO, not to the cap: landing exactly ON the trigger
+  // makes every later append rewrite the whole file. See AUDIT_TRIM_TO.
+  const kept = lines.slice(lines.length - AUDIT_TRIM_TO);
   // Rewrite via atomicWriteFile (temp + rename, born 0o600): the swap is
   // atomic, so a concurrent appendFile from another yaw-mcp process can no
   // longer interleave at the byte level to leave a garbled half-line. The

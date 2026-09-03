@@ -17,6 +17,11 @@ describe("log() spread-order: envelope fields win over data keys", () => {
 
   beforeEach(() => {
     stderrWrites = [];
+    // log() resolves LOG_LEVEL per call, so a developer shell or CI runner
+    // exporting LOG_LEVEL=warn (or error) would suppress the info lines these
+    // tests read back -- two would fail and the warn-level one would pass
+    // vacuously. Pin the threshold below every level used here.
+    vi.stubEnv("LOG_LEVEL", "debug");
     _originalWrite = process.stderr.write.bind(process.stderr);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
@@ -27,6 +32,7 @@ describe("log() spread-order: envelope fields win over data keys", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it("envelope level/msg/ts survive when data carries the same keys", () => {
@@ -80,6 +86,10 @@ describe("log() failure containment", () => {
 
   beforeEach(() => {
     stderrWrites = [];
+    // Same reason as the describe above: these assert on emitted lines at
+    // warn / error / info, so an inherited LOG_LEVEL must not decide the
+    // threshold.
+    vi.stubEnv("LOG_LEVEL", "debug");
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       else if (Buffer.isBuffer(chunk)) stderrWrites.push(chunk.toString("utf8"));

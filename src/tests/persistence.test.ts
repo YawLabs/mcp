@@ -137,6 +137,24 @@ describe("persistence.loadState", () => {
     expect(Object.keys(s.learning)).toEqual(["good"]);
   });
 
+  it("sanitizeLearning rejects a JSON array outright, like sanitizeToolCache does", async () => {
+    // Object.entries on an array yields "0"/"1" keys, so a hand-edited
+    // `"learning": [...]` used to land as namespaces literally named 0 and 1 --
+    // rows that can never match a real namespace but persist forever.
+    const payload = {
+      version: STATE_SCHEMA_VERSION,
+      savedAt: 0,
+      learning: [
+        { dispatched: 2, succeeded: 1, lastUsedAt: 10 },
+        { dispatched: 5, succeeded: 5, lastUsedAt: 20 },
+      ],
+      packHistory: [],
+    };
+    writeFileSync(file, JSON.stringify(payload), "utf8");
+    const s = await loadState(file);
+    expect(s.learning).toEqual({});
+  });
+
   it("sanitizeLearning rejects an entry with negative lastUsedAt", async () => {
     // persistence.ts sanitizeLearning: lastUsedAt < 0 must be rejected (dropped).
     const payload = {
@@ -233,6 +251,45 @@ describe("persistence.loadState", () => {
       const c = await loadStateClassified(file);
       expect(c.parsedCleanly).toBe(false);
       expect(c.state).toEqual(emptyState());
+    });
+
+    it("reports rawCounts from the FILE, before the sanitizers drop anything", async () => {
+      // What the file HELD, not what survived: reset-learning reports on
+      // content it is about to delete, and the sanitized state would tell the
+      // user "0 removed" about rows that were plainly there.
+      writeFileSync(
+        file,
+        JSON.stringify({
+          version: STATE_SCHEMA_VERSION,
+          savedAt: 0,
+          learning: {
+            gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 },
+            handEdited: { dispatched: 1, succeeded: 1, lastUsedAt: -1 },
+          },
+          packHistory: [
+            { namespace: "gh", toolName: "t", at: 1 },
+            { namespace: "", toolName: "t", at: 2 },
+          ],
+          toolCache: { expired: { tools: [{ name: "t" }], learnedAt: Date.now() - TOOLCACHE_TTL_MS - 1000 } },
+        }),
+        "utf8",
+      );
+      const c = await loadStateClassified(file);
+      expect(c.rawCounts).toEqual({ learning: 2, packHistory: 2, toolCache: 1 });
+      // The sanitized state is the narrower view, and still is.
+      expect(Object.keys(c.state.learning)).toEqual(["gh"]);
+      expect(c.state.packHistory).toHaveLength(1);
+      expect(c.state.toolCache).toEqual({});
+    });
+
+    it("reports all-zero rawCounts for a missing file and for one it could not parse", async () => {
+      expect((await loadStateClassified(join(dir, "absent.json"))).rawCounts).toEqual({
+        learning: 0,
+        packHistory: 0,
+        toolCache: 0,
+      });
+      writeFileSync(file, "{ not json", "utf8");
+      expect((await loadStateClassified(file)).rawCounts).toEqual({ learning: 0, packHistory: 0, toolCache: 0 });
     });
 
     it("classifies a BOM-prefixed file as clean, matching loadState's own strip", async () => {

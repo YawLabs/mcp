@@ -1,5 +1,6 @@
-// The probe's DEBUG diagnostic for an oam whose --version says nothing
-// parsable.
+// What probeOam SAYS about a binary it could not use: the DEBUG diagnostic for
+// an oam whose --version says nothing parsable, and the warn for an OAM_BIN
+// naming a path that does not exist.
 //
 // Its own file for the same reason oam-pin-notice-debug.test.ts has one: the
 // level has to be raised before oam-spawn's import graph is built, and a
@@ -8,13 +9,15 @@
 // setting it before the import is correct either way, and this file must not
 // depend on which of the two the logger is doing.)
 
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Set BEFORE the dynamic import below.
 const priorLogLevel = process.env.LOG_LEVEL;
 process.env.LOG_LEVEL = "debug";
 
-const { MIN_OAM_VERSION, probeOam, resetOamBinCache } = await import("../oam-spawn.js");
+const { MIN_OAM_VERSION, probeOam, resetOamBinCache, winNormalize } = await import("../oam-spawn.js");
 
 // Put it back: vitest gives each FILE a fresh module registry, not a fresh
 // process.env, so a worker reused for a later file would otherwise inherit
@@ -68,5 +71,77 @@ describe("probeOam version-gate diagnostics", () => {
     // from.
     const lines = await captureLines(() => probeOam(async () => `oam ${MIN_OAM_VERSION}\n`));
     expect(lines.filter((l) => String(l.msg ?? "").includes("no parsable version"))).toEqual([]);
+  });
+});
+
+/** The error `spawn` raises for a command that is not there, tagged the way
+ *  node tags it -- the path is part of the message, which is what makes the
+ *  failureDetail below name the stale OAM_BIN. */
+function enoent(bin: string): Error {
+  const err = new Error(`spawn ${bin} ENOENT`) as Error & { code?: string };
+  err.code = "ENOENT";
+  return err;
+}
+
+describe("probeOam ENOENT: absence vs a stale OAM_BIN", () => {
+  const priorOamBin = process.env.OAM_BIN;
+  /** An absolute path that cannot exist. `run` is injected, so nothing has to
+   *  be on disk -- but the point of the case is that this path is NOT there. */
+  const missingBin = join(tmpdir(), `yaw-mcp-no-such-oam-${process.pid}`, "oam");
+
+  beforeEach(() => resetOamBinCache());
+
+  afterEach(() => {
+    resetOamBinCache();
+    if (priorOamBin === undefined) delete process.env.OAM_BIN;
+    else process.env.OAM_BIN = priorOamBin;
+  });
+
+  it("reports a configured-but-missing OAM_BIN as a failure, not as absence", async () => {
+    // Classifying this as absence produced the "reinstall software you already
+    // have" loop: doctor said "not installed" and handed over the installer,
+    // running it changed nothing because OAM_BIN still wins, and the next
+    // doctor said "not installed" again. `failure` is what routes it to
+    // "installed but UNUSABLE" plus the OAM_BIN-pointing fix line instead.
+    process.env.OAM_BIN = missingBin;
+
+    let probe: Awaited<ReturnType<typeof probeOam>> | undefined;
+    const lines = await captureLines(async () => {
+      probe = await probeOam(async (bin) => {
+        throw enoent(bin);
+      });
+    });
+
+    expect(probe?.bin, "a missing binary must still fall back to node").toBeNull();
+    expect(probe?.failure).toBe("spawn");
+    // The stale path itself, so the report names what to fix rather than
+    // telling the user to set a variable that is already set -- wrongly.
+    expect(probe?.failureDetail).toContain(winNormalize(missingBin));
+
+    const note = lines.find((l) => String(l.msg ?? "").includes("OAM_BIN points at a path that does not exist"));
+    expect(note, "a stale OAM_BIN was swallowed silently").toBeDefined();
+    // Warn, not debug: unlike an absent `oam`, this one the user has to fix.
+    expect(note?.level).toBe("warn");
+    expect(note?.bin).toBe(winNormalize(missingBin));
+  });
+
+  it("stays silent, and unclassified, when oam is simply not installed", async () => {
+    // The other side of the split, and the reason it is a split at all: with
+    // no OAM_BIN the name was ours to guess, so ENOENT is the routine
+    // node-only machine. A warn here would fire on every one of them.
+    delete process.env.OAM_BIN;
+
+    let probe: Awaited<ReturnType<typeof probeOam>> | undefined;
+    const lines = await captureLines(async () => {
+      probe = await probeOam(async (bin) => {
+        throw enoent(bin);
+      });
+    });
+
+    expect(probe?.bin).toBeNull();
+    expect(probe?.failure).toBeNull();
+    expect(probe?.failureDetail).toBeNull();
+    // Nothing at all, at debug level -- not merely nothing about OAM_BIN.
+    expect(lines, "an absent oam is not an event worth a log line").toEqual([]);
   });
 });

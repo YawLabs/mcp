@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { resolveNamespaces } from "../server.js";
 
-// These helpers are exported from server.ts so the tests exercise the
-// REAL implementations. They used to be module-private, and this file kept
-// hand-copied re-implementations of each one -- which passed happily while
-// the production code drifted, since nothing tied the copy to the original.
+// resolveNamespaces is exported from server.ts so these tests exercise the
+// REAL implementation. It used to be module-private, and this file kept a
+// hand-copied re-implementation -- which passed happily while the production
+// code drifted, since nothing tied the copy to the original.
 
 describe("resolveNamespaces", () => {
   it("returns single server as array", () => {

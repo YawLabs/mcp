@@ -113,6 +113,47 @@ describe("formatReadToolOutput", () => {
     });
     expect(text).toContain("Input schema:\n{}");
   });
+
+  it("uses the tool's own namespacedName rather than rebuilding it", () => {
+    // upstream.ts derives namespacedName once; rebuilding `${ns}_${name}`
+    // here would be a second copy of that rule, free to drift from it.
+    const text = formatReadToolOutput({
+      tool: makeTool({ namespacedName: "gh_actions_create_issue" }),
+      server: makeServer(),
+      loaded: true,
+    });
+    expect(text).toContain("Tool: gh_actions_create_issue");
+  });
+
+  it("renders outputSchema, title and annotations when the tool carries them", () => {
+    // outputSchema is what an exec caller needs to write correct $ref paths
+    // into a step's output, so dropping it made read_tool answer a narrower
+    // question than the one asked.
+    const text = formatReadToolOutput({
+      tool: makeTool({
+        title: "Create Issue",
+        outputSchema: { type: "object", properties: { number: { type: "integer" } } },
+        annotations: { readOnlyHint: false, destructiveHint: false },
+      }),
+      server: makeServer(),
+      loaded: true,
+    });
+    expect(text).toContain("Title: Create Issue");
+    expect(text).toContain("Output schema:");
+    expect(text).toContain('"number"');
+    expect(text).toContain('Annotations: {"readOnlyHint":false,"destructiveHint":false}');
+  });
+
+  it("omits the output-schema, title and annotation lines when the tool has none", () => {
+    const text = formatReadToolOutput({
+      tool: makeTool(),
+      server: makeServer(),
+      loaded: true,
+    });
+    expect(text).not.toContain("Output schema:");
+    expect(text).not.toContain("Title:");
+    expect(text).not.toContain("Annotations:");
+  });
 });
 
 describe("formatToolNotFound", () => {

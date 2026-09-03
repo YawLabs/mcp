@@ -370,5 +370,12 @@ describe("PackDetector", () => {
     expect(chains).toHaveLength(1);
     expect(chains[0].frequency).toBe(2);
     expect(new Set(chains[0].namespaces)).toEqual(new Set(["gh", "linear"]));
+    // What "most recent" means once the clock has moved backwards is a real
+    // decision, not an accident: detectChains keeps the LARGEST lastAt
+    // (`burst.lastAt > prev.lastSeenAt`), so the pre-jump burst wins even
+    // though the post-jump burst is the one that ran last. Pinned so a change
+    // to that tie-break -- e.g. "latest burst wins" -- shows up here instead of
+    // silently reordering recency ranking for every user whose clock stepped.
+    expect(chains[0].lastSeenAt).toBe(t0 + 5_000);
   });
 });

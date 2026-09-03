@@ -34,7 +34,20 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
+// The rename-retry backoff is 10 + 50 + 100 ms of REAL sleeping per exhausted
+// budget, which the win32 retry tests (and, on a Windows runner, the
+// rename-onto-a-directory test) paid on every run for ~380 ms of pure wall
+// time. Fake timers cannot reach it -- node:timers/promises does not route
+// through globalThis.setTimeout -- so the sleep itself is the spy: it records
+// the backoff schedule and resolves immediately. Asserting on those recorded
+// delays pins MORE than the real sleep did.
+vi.mock("node:timers/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:timers/promises")>();
+  return { ...actual, setTimeout: vi.fn(async () => undefined) };
+});
+
 import { chmod, mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 
 /**
  * Run `fn` with process.platform reporting a POSIX value.
@@ -250,6 +263,34 @@ describe("atomicWriteFile", () => {
     expect(chmoddedPaths()).not.toContain(resolve(dir));
   });
 
+  it("skips mode preservation entirely on win32", async () => {
+    // The other half of every asPosix test above. POSIX bits are meaningless
+    // on Windows and stat reports a synthetic 0o666/0o444, so preserving them
+    // would birth the tmp file at a mode that means nothing and chmod it to
+    // match. The guard makes the target's mode go unread: with
+    // `process.platform !== "win32"` deleted, stat WOULD be called here and
+    // the write would carry a bogus mode -- nothing else in this file notices.
+    const file = join(dir, "win32-preserve.json");
+    writeFileSync(file, '{"a":1}', "utf8");
+    await asWin32(() => atomicWriteFile(file, '{"a":2}'));
+    expect(readFileSync(file, "utf8")).toBe('{"a":2}');
+    expect(birthOptions(file)).toEqual({ encoding: "utf8" });
+    expect(stat).not.toHaveBeenCalled();
+    expect(chmoddedPaths()).toEqual([]);
+  });
+
+  it("ignores dirMode on win32 (plain recursive mkdir, no chmod)", async () => {
+    // Same shape for the directory chain: mkdirpWithMode short-circuits to a
+    // bare recursive mkdir, so no mode reaches mkdir(2) and no directory is
+    // chmodded afterwards.
+    const parent = join(dir, "win32-dirmode", "deeper");
+    const file = join(parent, "vault.json");
+    await asWin32(() => atomicWriteFile(file, '{"s":1}', "utf8", undefined, 0o700));
+    expect(readFileSync(file, "utf8")).toBe('{"s":1}');
+    expect(vi.mocked(mkdir).mock.calls).toEqual([[parent, { recursive: true }]]);
+    expect(chmoddedPaths()).toEqual([]);
+  });
+
   it("leaves the original file untouched and rethrows when the parent path is a regular file", async () => {
     // Mechanism: mkdir(parent, {recursive:true}) THROWS EEXIST when
     // `parent` already exists as a REGULAR FILE -- recursive:true only
@@ -302,6 +343,9 @@ describe("atomicWriteFile", () => {
     await asWin32(() => atomicWriteFile(file, '{"ok":1}'));
     expect(readFileSync(file, "utf8")).toBe('{"ok":1}');
     expect(vi.mocked(rename)).toHaveBeenCalledTimes(3);
+    // Backed off between attempts, in the documented schedule -- the third
+    // attempt succeeded, so the 100 ms step was never reached.
+    expect(vi.mocked(delay).mock.calls.map((c) => c[0])).toEqual([10, 50]);
     // No orphan tmp files after the eventual success.
     expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
   });
@@ -317,6 +361,8 @@ describe("atomicWriteFile", () => {
       await expect(atomicWriteFile(file, "x")).rejects.toThrow("EPERM");
     });
     expect(mocked).toHaveBeenCalledTimes(4);
+    // The whole backoff schedule was spent before the final attempt.
+    expect(vi.mocked(delay).mock.calls.map((c) => c[0])).toEqual([10, 50, 100]);
     expect(existsSync(file)).toBe(false);
     expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
   });
@@ -338,6 +384,26 @@ describe("atomicWriteFile", () => {
   });
 });
 
+/** Whether this runner can create a symlink at all -- Windows refuses without
+ *  Developer Mode / SeCreateSymbolicLinkPrivilege. Probed ONCE, in a temp dir
+ *  of its own, so the two tests below can report SKIPPED rather than each
+ *  bailing with a bare `return` that vitest scores as a PASS: the severed-link
+ *  regression they exist for would otherwise read as covered on every Windows
+ *  box that cannot make links. */
+function symlinksAvailable(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "yaw-mcp-atomic-symlink-probe-"));
+  try {
+    symlinkSync(join(probe, "target.txt"), join(probe, "link.txt"), "file");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+const SYMLINKS_AVAILABLE = symlinksAvailable();
+
 // Regression: rename() publishes at the path it is handed, so renaming the
 // tmp file onto a SYMLINK replaced the link with a regular file. A
 // ~/.yaw-mcp/state.json symlinked into a dotfiles checkout was therefore
@@ -356,25 +422,13 @@ describe("atomicWriteFile with a symlinked target", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  /** Create `link` -> `target`, or return false where the platform refuses
-   *  (Windows without Developer Mode / SeCreateSymbolicLink). Nothing to pin
-   *  there, so the caller skips rather than failing on an environment gap. */
-  function trySymlink(target: string, link: string): boolean {
-    try {
-      symlinkSync(target, link, "file");
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  it("writes THROUGH the link and leaves it a symlink", async () => {
+  it.skipIf(!SYMLINKS_AVAILABLE)("writes THROUGH the link and leaves it a symlink", async () => {
     const realDir = join(dir, "dotfiles");
     mkdirSync(realDir);
     const real = join(realDir, "state.json");
     writeFileSync(real, '{"v":1}', "utf8");
     const link = join(dir, "state.json");
-    if (!trySymlink(real, link)) return;
+    symlinkSync(real, link, "file");
 
     await atomicWriteFile(link, '{"v":2}');
 
@@ -389,9 +443,9 @@ describe("atomicWriteFile with a symlinked target", () => {
     expect(readdirSync(realDir).filter((f) => f.includes(".tmp-"))).toEqual([]);
   });
 
-  it("publishes at the link path when the link dangles (no real file to write through)", async () => {
+  it.skipIf(!SYMLINKS_AVAILABLE)("publishes at the link path when the link dangles (no real file)", async () => {
     const link = join(dir, "dangling.json");
-    if (!trySymlink(join(dir, "missing", "state.json"), link)) return;
+    symlinkSync(join(dir, "missing", "state.json"), link, "file");
 
     await atomicWriteFile(link, '{"v":3}');
 

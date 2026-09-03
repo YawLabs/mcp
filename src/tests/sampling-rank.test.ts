@@ -1,6 +1,8 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { describe, expect, it, vi } from "vitest";
 import {
+  AGGRESSIVE_AMBIGUITY_THRESHOLD,
+  BEST_OF_N_TEMPERATURE,
   bestOfNViaSampling,
   buildCandidates,
   buildTiebreakPrompt,
@@ -8,7 +10,9 @@ import {
   MAX_SAMPLES,
   parseRouteEffort,
   parseTiebreakResponse,
+  SAMPLING_TIEBREAK_RATIO,
   SAMPLING_TIMEOUT_MS,
+  sampleCountForEffort,
   shouldSample,
   shouldTiebreak,
 } from "../sampling-rank.js";
@@ -48,6 +52,20 @@ describe("shouldTiebreak", () => {
         { namespace: "b", score: 0 },
       ]),
     ).toBe(false);
+  });
+
+  it("honors an explicit ratio (the tuning seam no production caller passes)", () => {
+    // shouldSample always takes the SAMPLING_TIEBREAK_RATIO default, so the
+    // `ratio` parameter has no production caller -- exercised here so a
+    // threshold sweep can lower the bar without editing the module, and so the
+    // parameter is not silently dead weight.
+    const ranked = [
+      { namespace: "a", score: 1 },
+      { namespace: "b", score: 0.8 },
+    ];
+    expect(shouldTiebreak(ranked)).toBe(false);
+    expect(shouldTiebreak(ranked, SAMPLING_TIEBREAK_RATIO)).toBe(false);
+    expect(shouldTiebreak(ranked, 0.75)).toBe(true);
   });
 });
 
@@ -264,8 +282,44 @@ describe("parseRouteEffort", () => {
   });
 
   it("falls back to auto for unknown values", () => {
-    expect(parseRouteEffort("turbo")).toBe("auto");
-    expect(parseRouteEffort("1")).toBe("auto");
+    // Explicit `undefined` fallback: an unrecognized value now re-resolves
+    // against YAW_MCP_ROUTE_EFFORT (see below), so leaving the second argument
+    // off would make this assertion depend on the runner's environment.
+    expect(parseRouteEffort("turbo", undefined)).toBe("auto");
+    expect(parseRouteEffort("1", undefined)).toBe("auto");
+  });
+
+  it("re-resolves an unrecognized value against the environment before defaulting", () => {
+    // server.ts passes dispatch's per-call `routeEffort` argument first and
+    // only reaches YAW_MCP_ROUTE_EFFORT when that argument is ABSENT, so a
+    // typo'd argument used to mask the env var and silently downgrade an
+    // aggressive deployment to auto for that call.
+    expect(parseRouteEffort("aggresive", "aggressive")).toBe("aggressive");
+    expect(parseRouteEffort("aggresive", "off")).toBe("off");
+    // Both unrecognized -> the documented "auto" default, unchanged.
+    expect(parseRouteEffort("aggresive", "turbo")).toBe("auto");
+    expect(parseRouteEffort("aggresive", undefined)).toBe("auto");
+    // A recognized per-call value still wins outright, including "auto".
+    expect(parseRouteEffort("off", "aggressive")).toBe("off");
+    expect(parseRouteEffort("auto", "aggressive")).toBe("auto");
+  });
+
+  it("does not consult the environment for an absent or empty value", () => {
+    // The caller has already collapsed "argument absent" into `raw` (it passes
+    // routeEffort ?? process.env.YAW_MCP_ROUTE_EFFORT), so re-reading the env
+    // for an absent value would resurrect a setting the caller deliberately
+    // resolved away -- and would make this function environment-dependent for
+    // every other caller.
+    vi.stubEnv("YAW_MCP_ROUTE_EFFORT", "aggressive");
+    try {
+      expect(parseRouteEffort(undefined)).toBe("auto");
+      expect(parseRouteEffort("")).toBe("auto");
+      // ...but an unrecognized value picks the env setting up when no explicit
+      // fallback is passed.
+      expect(parseRouteEffort("aggresive")).toBe("aggressive");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -306,6 +360,26 @@ describe("computeAmbiguity", () => {
     ]);
     expect(a).toBeLessThan(0.15);
     expect(a).toBeGreaterThanOrEqual(0);
+  });
+
+  it("normalizes by the top-K size, so k moves the value on identical data", () => {
+    // The entropy half is divided by log(topK.length). Same three candidates,
+    // different K: log(3) vs log(2). Nothing else in the suite notices a change
+    // to the k=3 default, and that default decides how often "aggressive" pays
+    // for a best-of-N fan-out -- so pin it by value, and exercise the `k`
+    // parameter that has no production caller while we are here.
+    const three = [
+      { namespace: "a", score: 1 },
+      { namespace: "b", score: 0.2 },
+      { namespace: "c", score: 0.05 },
+    ];
+    const atThree = computeAmbiguity(three); // default k = 3
+    const atTwo = computeAmbiguity(three, 2);
+    expect(atThree).toBeGreaterThan(0.54);
+    expect(atThree).toBeLessThan(0.56);
+    expect(atTwo).toBeGreaterThan(0.64);
+    expect(atTwo).toBeLessThan(0.66);
+    expect(atThree).toBeLessThan(atTwo);
   });
 
   it("stays within [0,1]", () => {
@@ -356,22 +430,28 @@ describe("shouldSample", () => {
     expect(shouldSample(clear, "auto")).toBe(false);
   });
 
-  it("auto preserves the 0.9 top-2 tiebreak exactly (no entropy-driven over-sampling)", () => {
+  it("auto preserves the SAMPLING_TIEBREAK_RATIO top-2 tiebreak exactly (no entropy-driven over-sampling)", () => {
     // The entropy blend would push these into sampling; the auto path must
-    // NOT, since auto mirrors the historical second/top >= 0.9 gate.
-    for (const r of [0.5, 0.7, 0.88, 0.89]) {
+    // NOT, since auto mirrors the historical second/top >= ratio gate. The
+    // relative assertions below document that intent, but relative alone is
+    // self-referential -- 0.81/0.85/0.88/0.95 all keep them green while the
+    // DEFAULT dispatch path changes how often it spends a client-LLM
+    // round-trip. So pin the constant by value too, the same way the k=3
+    // default is pinned above; a deliberate retune must edit this line.
+    expect(SAMPLING_TIEBREAK_RATIO).toBe(0.9);
+    for (const r of [0.5, 0.7, SAMPLING_TIEBREAK_RATIO - 0.02, SAMPLING_TIEBREAK_RATIO - 0.01]) {
       const ranked = [
         { namespace: "a", score: 1 },
         { namespace: "b", score: r },
       ];
       expect(shouldSample(ranked, "auto"), `ratio ${r} should not sample under auto`).toBe(false);
     }
-    // ...but a runner-up at >= 0.9 of the leader does sample.
+    // ...but a runner-up at exactly the ratio does sample.
     expect(
       shouldSample(
         [
           { namespace: "a", score: 1 },
-          { namespace: "b", score: 0.9 },
+          { namespace: "b", score: SAMPLING_TIEBREAK_RATIO },
         ],
         "auto",
       ),
@@ -384,10 +464,43 @@ describe("shouldSample", () => {
     expect(shouldSample(clear, "aggressive")).toBe(false);
   });
 
+  it("the aggressive gate tracks the top-K SIZE, not just the top-2 shape (k=3 default)", () => {
+    // Identical top-2 shape, one extra candidate: computeAmbiguity's entropy
+    // normalizer moves from log(2) to log(3) and the same ranking crosses back
+    // under the bar. That is the whole behavioral consequence of the k=3
+    // default -- with k=2 the three-candidate case would sample too, spending
+    // a best-of-3 fan-out on a ranking the current code treats as decided.
+    // Asserted against AGGRESSIVE_AMBIGUITY_THRESHOLD, not a hardcoded 0.6.
+    const two = [
+      { namespace: "a", score: 1 },
+      { namespace: "b", score: 0.2 },
+    ];
+    const three = [...two, { namespace: "c", score: 0.05 }];
+    expect(computeAmbiguity(two)).toBeGreaterThan(AGGRESSIVE_AMBIGUITY_THRESHOLD);
+    expect(computeAmbiguity(three)).toBeLessThan(AGGRESSIVE_AMBIGUITY_THRESHOLD);
+    expect(shouldSample(two, "aggressive")).toBe(true);
+    expect(shouldSample(three, "aggressive")).toBe(false);
+  });
+
   it("never samples with a single candidate at any effort", () => {
     const one = [{ namespace: "a", score: 1 }];
     expect(shouldSample(one, "auto")).toBe(false);
     expect(shouldSample(one, "aggressive")).toBe(false);
+  });
+});
+
+describe("sampleCountForEffort", () => {
+  it("maps each effort to its best-of-N width", () => {
+    // The only thing that makes "aggressive" cost more than "auto". Both
+    // regressions are silent and billing-visible: auto -> 3 triples
+    // client-LLM createMessage calls on the DEFAULT dispatch path, and
+    // aggressive -> 1 voids the best-of-3 the tool schema advertises.
+    expect(sampleCountForEffort("auto")).toBe(1);
+    expect(sampleCountForEffort("aggressive")).toBe(3);
+    // "off" documents intent rather than guarding behavior: shouldSample
+    // returns false for "off" so this branch is never reached in production,
+    // and bestOfNViaSampling clamps a 0 back up to 1 anyway.
+    expect(sampleCountForEffort("off")).toBe(0);
   });
 });
 
@@ -432,6 +545,44 @@ describe("bestOfNViaSampling", () => {
     const out = await bestOfNViaSampling(server, "intent", candidates, 0);
     expect(out).toBe("github");
     expect(createMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("fans out to exactly sampleCountForEffort(effort) calls", async () => {
+    // The composition the effort dial actually buys: aggressive -> 3 client-LLM
+    // round-trips, auto -> 1. (dispatch.test.ts covers the same wiring through
+    // handleDispatch, where the effort is resolved from the argument/env.)
+    const createMessage = vi.fn().mockResolvedValue({ content: { type: "text", text: "github" } });
+    const server = mockServer({ sampling: {} }, createMessage);
+    await bestOfNViaSampling(server, "intent", candidates, sampleCountForEffort("aggressive"));
+    expect(createMessage).toHaveBeenCalledTimes(3);
+    createMessage.mockClear();
+    await bestOfNViaSampling(server, "intent", candidates, sampleCountForEffort("auto"));
+    expect(createMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks for a temperature only when it actually fans out", async () => {
+    // N byte-identical requests to a deterministic client come back N identical
+    // answers, so the majority vote is unanimous by construction and best-of-3
+    // costs 3x for one sample's information. n=1 stays on the client's own
+    // default, so the "auto" path is unchanged by the dial.
+    const seen: Array<Record<string, unknown>> = [];
+    const createMessage = vi.fn().mockImplementation(async (params: unknown) => {
+      seen.push(params as Record<string, unknown>);
+      return { content: { type: "text", text: "github" } };
+    });
+    const server = mockServer({ sampling: {} }, createMessage);
+
+    await bestOfNViaSampling(server, "intent", candidates, 3);
+    expect(seen).toHaveLength(3);
+    for (const params of seen) {
+      expect(params.temperature).toBe(BEST_OF_N_TEMPERATURE);
+    }
+    expect(BEST_OF_N_TEMPERATURE).toBeGreaterThan(0);
+
+    seen.length = 0;
+    await bestOfNViaSampling(server, "intent", candidates, 1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toHaveProperty("temperature");
   });
 
   it("majority-votes across N samples", async () => {
@@ -503,6 +654,41 @@ describe("bestOfNViaSampling", () => {
         expect(o.signal?.aborted).toBe(true);
       }
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not warn when its OWN abort is what killed a sample", async () => {
+    // The teardown above aborts every in-flight sample once the race resolves,
+    // so on the timeout path each pending request rejects AFTER the function
+    // has already returned. Warning there emits up to MAX_SAMPLES lines per
+    // timed-out dispatch that blame the client LLM for yaw-mcp's own
+    // cancellation -- the operator reads a healthy client as failing.
+    vi.useFakeTimers();
+    vi.stubEnv("LOG_LEVEL", "debug"); // a warn WOULD be written if one happened
+    const writes: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") writes.push(chunk);
+      else if (Buffer.isBuffer(chunk)) writes.push(chunk.toString("utf8"));
+      return true;
+    });
+    try {
+      const createMessage = vi.fn().mockImplementation(
+        (_params: unknown, options: { signal: AbortSignal }) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options.signal.addEventListener("abort", () => reject(new Error("aborted by yaw-mcp")));
+          }),
+      );
+      const server = mockServer({ sampling: {} }, createMessage as unknown as (params: unknown) => Promise<unknown>);
+      const resultPromise = bestOfNViaSampling(server, "intent", candidates, 3);
+      await vi.advanceTimersByTimeAsync(SAMPLING_TIMEOUT_MS + 100);
+      expect(await resultPromise).toBeNull();
+      // Let the aborted samples' rejections land in sampleOnce's catch.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writes.join("")).not.toContain("Best-of-N sample failed");
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
       vi.useRealTimers();
     }
   });

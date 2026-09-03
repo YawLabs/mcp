@@ -41,33 +41,33 @@ import {
 } from "../oam-spawn.js";
 
 describe("winNormalize", () => {
-  it("converts forward slashes to backslashes on Windows (cmd-safe)", async () => {
+  it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
     expect(winNormalize("C:/Users/jeff/oam/target/release/oam.exe", "win32")).toBe(
       "C:\\Users\\jeff\\oam\\target\\release\\oam.exe",
     );
   });
-  it("leaves an already-backslash path untouched on Windows", async () => {
+  it("leaves an already-backslash path untouched on Windows", () => {
     expect(winNormalize("C:\\Users\\jeff\\oam.exe", "win32")).toBe("C:\\Users\\jeff\\oam.exe");
   });
-  it("leaves a bare binary name untouched", async () => {
+  it("leaves a bare binary name untouched", () => {
     expect(winNormalize("oam.exe", "win32")).toBe("oam.exe");
   });
-  it("is a no-op off Windows", async () => {
+  it("is a no-op off Windows", () => {
     expect(winNormalize("/usr/local/bin/oam", "linux")).toBe("/usr/local/bin/oam");
   });
 });
 
 describe("packageName", () => {
-  it("strips @latest from a scoped package", async () => {
+  it("strips @latest from a scoped package", () => {
     expect(packageName("@yawlabs/tailscale-mcp@latest")).toBe("@yawlabs/tailscale-mcp");
   });
-  it("strips a semver from an unscoped package", async () => {
+  it("strips a semver from an unscoped package", () => {
     expect(packageName("server-memory@1.2.3")).toBe("server-memory");
   });
-  it("leaves a bare scoped name untouched", async () => {
+  it("leaves a bare scoped name untouched", () => {
     expect(packageName("@yawlabs/npmjs-mcp")).toBe("@yawlabs/npmjs-mcp");
   });
-  it("leaves a bare unscoped name untouched", async () => {
+  it("leaves a bare unscoped name untouched", () => {
     expect(packageName("cowsay")).toBe("cowsay");
   });
 });
@@ -103,9 +103,10 @@ describe("specConstraint", () => {
 });
 
 // Guards the on-disk lookup: a git/path spec is not a package NAME, and
-// resolveNpmEntry would happily look one up as if it were. sidecars-cmd.ts
-// carries a copy for a different purpose (a manifest dependency key); this
-// pins the behaviour so the follow-up dedupe has something to hold onto.
+// resolveNpmEntry would happily look one up as if it were. sidecars-cmd.ts and
+// default-runtime.ts import this rather than carrying their own copies (the
+// dedupe has happened), so this is the single place the rule is pinned and all
+// three surfaces move together when it changes.
 describe("isRegistrySpec", () => {
   it("accepts plain registry specs", () => {
     for (const ok of ["@yawlabs/fetch-mcp", "@yawlabs/fetch-mcp@latest", "cowsay", "server-memory@1.2.3"]) {
@@ -121,16 +122,16 @@ describe("isRegistrySpec", () => {
 });
 
 describe("parseOamVersion", () => {
-  it("extracts x.y.z from the canonical `oam X.Y.Z` output", async () => {
+  it("extracts x.y.z from the canonical `oam X.Y.Z` output", () => {
     expect(parseOamVersion("oam 0.6.0\n")).toBe("0.6.0");
   });
-  it("extracts a bare x.y.z", async () => {
+  it("extracts a bare x.y.z", () => {
     expect(parseOamVersion("1.2.3")).toBe("1.2.3");
   });
-  it("returns null when no version is present", async () => {
+  it("returns null when no version is present", () => {
     expect(parseOamVersion("oam dev build")).toBeNull();
   });
-  it("keeps a prerelease suffix, which an x.y.z-only capture silently dropped", async () => {
+  it("keeps a prerelease suffix, which an x.y.z-only capture silently dropped", () => {
     // Dropping it went wrong twice at once: the rc compared EQUAL to a 0.8.3
     // floor and was hosted, and doctor plus every oamVersion log line named a
     // release the machine does not have -- so a bug found on the rc gets filed
@@ -138,7 +139,7 @@ describe("parseOamVersion", () => {
     expect(parseOamVersion("oam 0.8.3-rc.1\n")).toBe("0.8.3-rc.1");
     expect(parseOamVersion("oam 0.9.0-dev.7")).toBe("0.9.0-dev.7");
   });
-  it("keeps build metadata but stops at ordinary trailing punctuation", async () => {
+  it("keeps build metadata but stops at ordinary trailing punctuation", () => {
     expect(parseOamVersion("oam 1.2.3+abc.1")).toBe("1.2.3+abc.1");
     // The suffix groups require a literal "-"/"+", so a version at the end of a
     // sentence does not swallow the period.
@@ -157,6 +158,35 @@ describe("probeOam min-version gate", () => {
     expect(probe.belowMin).toBe(false);
   });
 
+  it("resolves binPath beside the version, which is what `install` persists", async () => {
+    // The one production wiring from the probe to that field: install-targets'
+    // buildLaunchEntry drops a non-absolute path back to npx, so a binPath that
+    // stopped being resolved here would make `install` write the npx entry
+    // while printing "Runtime: node (oam X runs here, but its absolute path
+    // could not be resolved ... Set OAM_BIN ...)" -- sending the user to fix an
+    // env var that is not the problem. Nothing else asserted this field on the
+    // usable path, so the whole suite stayed green through that.
+    const dir = mkdtempSync(join(tmpdir(), "probebin-"));
+    const bin = join(dir, "oam");
+    writeFileSync(bin, "");
+    // Load-bearing off Windows only, where resolveBinAbsolute requires X_OK.
+    chmodSync(bin, 0o755);
+    const savedOamBin = process.env.OAM_BIN;
+    process.env.OAM_BIN = bin;
+    try {
+      const probe = await probeOam(async () => `oam ${MIN_OAM_VERSION}\n`);
+      expect(probe.binPath).toBe(winNormalize(bin, process.platform));
+      // Both fields answer with the same string here: the absolute branch hands
+      // back what it was given and winNormalize is idempotent. They diverge
+      // only for a bare name, which is the case the field exists for.
+      expect(probe.bin).toBe(probe.binPath);
+    } finally {
+      if (savedOamBin === undefined) delete process.env.OAM_BIN;
+      else process.env.OAM_BIN = savedOamBin;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects the version immediately below the floor, whatever its shape", async () => {
     // Patch-level comparison decides this boundary whenever MIN_OAM_VERSION
     // ends in a non-zero patch -- a comparator that only weighed major.minor
@@ -167,11 +197,19 @@ describe("probeOam min-version gate", () => {
     // The `.0` branch used to `return` before its first expect, which made the
     // whole test a green no-op the moment the floor bumped to a `.0` patch --
     // and the module's own policy says the floor moves on EVERY oam release.
-    // The boundary below a `.0` patch is simply in the previous minor, so
-    // assert THAT instead of asserting nothing: either way the test still
-    // fails if the comparator stops looking past major.minor.
+    // The boundary below a `.0` patch is simply in the previous minor (and
+    // below a `x.0.0` floor, the previous major), so assert THAT instead of
+    // asserting nothing: either way the test still fails if the comparator
+    // stops looking past major.minor.
     const [maj, min, patch] = MIN_OAM_VERSION.split(".").map(Number);
-    const justBelow = patch === 0 ? `${maj}.${min - 1}.99` : `${maj}.${min}.${patch - 1}`;
+    const justBelow =
+      patch !== 0 ? `${maj}.${min}.${patch - 1}` : min !== 0 ? `${maj}.${min - 1}.99` : `${maj - 1}.99.99`;
+    // The derivation is arithmetic on a constant that moves, and a bad one is
+    // not version-shaped at all: a `-1` minor at a `x.0.0` floor, or NaN at a
+    // prerelease floor. compareVersions returns 0 for anything it cannot parse,
+    // so without this the failure lands on the gate assertion below and reads
+    // as a comparator bug. Fail at the derivation instead.
+    expect(compareVersions(justBelow, MIN_OAM_VERSION), `derived ${justBelow} is not below the floor`).toBeLessThan(0);
     const probe = await probeOam(async () => `oam ${justBelow}\n`);
     expect(probe.belowMin, `${justBelow} was admitted against a ${MIN_OAM_VERSION} floor`).toBe(true);
     expect(probe.bin).toBeNull();
@@ -450,7 +488,14 @@ describe("resolveBinAbsolute", () => {
 
   // POSIX-only for the reason above: a colon-joined PATH cannot carry a
   // drive-lettered fixture path, so this can only be exercised where absolute
-  // paths are POSIX-shaped. It still runs on the Linux/macOS CI legs.
+  // paths are POSIX-shaped.
+  //
+  // NOTHING RUNS THIS TODAY. There are no CI legs -- this repo ships no
+  // workflows, and release.sh runs `npm test` on the releasing machine, which
+  // is Windows. So this and the X_OK test below are gates for a POSIX
+  // developer's local run, not covered branches: treat the ':' split and the
+  // X_OK enforcement as unverified by the suite until either a POSIX leg
+  // exists or the executable check becomes injectable the way `platform` is.
   it.skipIf(process.platform === "win32")("splits PATH on ':' off Windows, and needs no PATHEXT", () => {
     const { dir, cleanup } = binDir("oam");
     const other = mkdtempSync(join(tmpdir(), "resolvebin-empty-"));
@@ -466,6 +511,14 @@ describe("resolveBinAbsolute", () => {
     const { dir, cleanup } = binDir("oam");
     try {
       expect(resolveBinAbsolute(join(dir, "oam"), {}, "linux")).toBe(join(dir, "oam"));
+      // The win32 half the title promises, which nothing used to assert: the
+      // SAME file spelled with forward slashes -- what an OAM_BIN copied out of
+      // a POSIX-shaped config carries -- comes back backslashed. Spelled
+      // forward-slash deliberately: a Windows runner's own fixture path is
+      // already backslashed, so handing that in makes winNormalize a no-op and
+      // the assertion answers itself.
+      const forward = join(dir, "oam").replace(/\\/g, "/");
+      expect(resolveBinAbsolute(forward, {}, "win32")).toBe(winNormalize(forward, "win32"));
       expect(resolveBinAbsolute("C:/nope/oam.exe", {}, "win32")).toBeNull();
     } finally {
       cleanup();
@@ -507,11 +560,18 @@ describe("resolveBinAbsolute", () => {
         // the file, which is exactly why the old existsSync-only search returned
         // it. A "." entry is the everyday spelling of the same thing.
         expect(resolveBinAbsolute("oam", { PATH: rel, PATHEXT: ".exe" }, "win32")).toBeNull();
-        // A quoted-EMPTY entry is the same failure by another route: it survives
-        // the filter(Boolean) empty-entry guard because the quotes make the
-        // string non-empty, and then join("", bin) collapses to the bare bin.
-        expect(resolveBinAbsolute(join(rel, "oam.exe"), { PATH: '""' }, "win32")).toBeNull();
       }
+      // A quoted-EMPTY entry is the same failure by another route: it survives
+      // the filter(Boolean) empty-entry guard because the quotes make the
+      // string non-empty, and then join("", bin) collapses to the bare bin,
+      // which the isAbsolute guard inside the loop is what rejects.
+      //
+      // The bin is a BARE name on purpose. This used to pass `join(rel,
+      // "oam.exe")`, which carries a separator -- and a relative name with a
+      // separator is refused by the earlier guard, before the PATH loop this
+      // comment describes is ever reached. It also needs no relative form, so
+      // it sits outside the block above and runs on every platform.
+      expect(resolveBinAbsolute("oam.exe", { PATH: '""', PATHEXT: ".exe" }, "win32")).toBeNull();
       // The same directory in ABSOLUTE form still resolves: the skip is about
       // the shape of the PATH entry, not about this directory.
       expect(resolveBinAbsolute("oam", { PATH: dir, PATHEXT: ".exe" }, "win32")).toBe(
@@ -602,28 +662,28 @@ describe("rewriteForOam", () => {
     resolveEntry: (p: string, want: string | null) => (want === null || want === version ? `/pkgs/${p}/x.js` : null),
   });
 
-  it("rewrites `npx -y <pkg>@latest` to `oam run <resolved entry>`", async () => {
+  it("rewrites `npx -y <pkg>@latest` to `oam run <resolved entry>`", () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/npmjs-mcp@latest"], oam)).toEqual({
       command: "oam",
       args: ["run", "/pkgs/@yawlabs/npmjs-mcp/dist/index.js"],
     });
   });
 
-  it("rewrites `node <entry>` to `oam run <entry>`", async () => {
+  it("rewrites `node <entry>` to `oam run <entry>`", () => {
     expect(rewriteForOam("node", ["/srv/index.js"], oam)).toEqual({
       command: "oam",
       args: ["run", "/srv/index.js"],
     });
   });
 
-  it("forwards extra args after `--`", async () => {
+  it("forwards extra args after `--`", () => {
     expect(rewriteForOam("node", ["/srv/index.js", "--port", "1"], oam)).toEqual({
       command: "oam",
       args: ["run", "/srv/index.js", "--", "--port", "1"],
     });
   });
 
-  it("turns oam's concurrent type-checker off for a TypeScript entry", async () => {
+  it("turns oam's concurrent type-checker off for a TypeScript entry", () => {
     // `oam run` defaults to `--check warn`, so a rewritten `node server.ts`
     // spawns tsgo alongside the sidecar and writes its diagnostics to the
     // child's stderr -- which is what lands in the 500-char failure tail when
@@ -648,35 +708,35 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("stays on node when the first arg is a node flag, not the entry", async () => {
+  it("stays on node when the first arg is a node flag, not the entry", () => {
     expect(rewriteForOam("node", ["--enable-source-maps", "/srv/index.js"], oam)).toEqual({
       command: "node",
       args: ["--enable-source-maps", "/srv/index.js"],
     });
   });
 
-  it("leaves docker untouched (not Node-based)", async () => {
+  it("leaves docker untouched (not Node-based)", () => {
     expect(rewriteForOam("docker", ["run", "-i", "img"], oam)).toEqual({
       command: "docker",
       args: ["run", "-i", "img"],
     });
   });
 
-  it("leaves uv untouched (handled by resolveUvSpawn)", async () => {
+  it("leaves uv untouched (handled by resolveUvSpawn)", () => {
     expect(rewriteForOam("uv", ["tool", "run", "x"], oam)).toEqual({
       command: "uv",
       args: ["tool", "run", "x"],
     });
   });
 
-  it("falls back to the original command when oam is unavailable", async () => {
+  it("falls back to the original command when oam is unavailable", () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/npmjs-mcp"], { oamBin: null, resolveEntry: () => "/x" })).toEqual({
       command: "npx",
       args: ["-y", "@yawlabs/npmjs-mcp"],
     });
   });
 
-  it("keeps a server's own --yes, stripping only the flags npx itself consumes", async () => {
+  it("keeps a server's own --yes, stripping only the flags npx itself consumes", () => {
     // The filter used to run over the WHOLE arg list, so a `--yes` meant for
     // the SERVER was eaten -- the oam launch and the npx fallback then handed
     // the child different argv, which is the one thing a rewrite billed as
@@ -687,7 +747,7 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("stays on npx when there is no positional at all", async () => {
+  it("stays on npx when there is no positional at all", () => {
     // A hand-edited bundles.json can carry `npx -y` with nothing after it.
     // findIndex returns -1 there, and the guard has to hold rather than
     // treating `undefined` as the package name.
@@ -695,13 +755,13 @@ describe("rewriteForOam", () => {
     expect(rewriteForOam("npx", [], oam)).toEqual({ command: "npx", args: [] });
   });
 
-  it("falls back to npx when the package can't be resolved on disk", async () => {
+  it("falls back to npx when the package can't be resolved on disk", () => {
     expect(rewriteForOam("npx", ["-y", "@yawlabs/not-installed"], { oamBin: "oam", resolveEntry: () => null })).toEqual(
       { command: "npx", args: ["-y", "@yawlabs/not-installed"] },
     );
   });
 
-  it("rewrites a launch that names its interpreter by absolute path", async () => {
+  it("rewrites a launch that names its interpreter by absolute path", () => {
     // These used to be skipped outright, so oam silently did nothing for them
     // while README claimed only non-Node launches were left alone.
     expect(rewriteForOam("/usr/local/bin/node", ["/srv/index.js"], oam)).toEqual({
@@ -718,7 +778,7 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("leaves a look-alike launcher untouched", async () => {
+  it("leaves a look-alike launcher untouched", () => {
     // Basename matching must not become substring matching: `nodemon` is not
     // node, and rewriting it to `oam run` would drop the file watcher.
     expect(rewriteForOam("nodemon", ["/srv/index.js"], oam)).toEqual({
@@ -727,7 +787,7 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("hosts a pinned spec only when the resolved copy declares that version", async () => {
+  it("hosts a pinned spec only when the resolved copy declares that version", () => {
     // `oam run <entry>` runs whatever is at that path, so a version-agnostic
     // lookup turned `npx -y pkg@0.2.0` into "run whatever copy is newest" -- a
     // config that pinned against a major jump getting the major jump anyway.
@@ -737,7 +797,7 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("stays on npx when no on-disk copy declares the pinned version", async () => {
+  it("stays on npx when no on-disk copy declares the pinned version", () => {
     // npx is not a mere fallback here -- it is the only thing that can honour
     // the pin, because it re-resolves the spec against the registry.
     // buildLaunchEntry refuses the oam path for the broker's own pinned spec
@@ -748,7 +808,7 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("stays on npx for a version RANGE, which it cannot evaluate", async () => {
+  it("stays on npx for a version RANGE, which it cannot evaluate", () => {
     // `^1.2.3` is satisfiable by more than one version, and checking it would
     // mean a semver range parser. Treating it like a tag would let an on-disk
     // 0.9.0 answer a `^1.2.3` request.
@@ -758,14 +818,14 @@ describe("rewriteForOam", () => {
     });
   });
 
-  it("still hosts a tag spec, where newest-on-disk is the closest answer", async () => {
+  it("still hosts a tag spec, where newest-on-disk is the closest answer", () => {
     expect(rewriteForOam("npx", ["-y", "some-mcp@next"], oam)).toEqual({
       command: "oam",
       args: ["run", "/pkgs/some-mcp/dist/index.js"],
     });
   });
 
-  it("stays on npx for a git or path spec, which is not a package name", async () => {
+  it("stays on npx for a git or path spec, which is not a package name", () => {
     // `./local-server` fed to the resolver becomes a lookup for a TOP-LEVEL
     // package called `local-server` (path.join eats the "."), so on a machine
     // that happens to have one published by that name the server would be
@@ -782,7 +842,7 @@ describe("rewriteForOam", () => {
 });
 
 describe("npxCacheNodeModules", () => {
-  it("derives sibling npx-cache node_modules from a path under _npx", async () => {
+  it("derives sibling npx-cache node_modules from a path under _npx", () => {
     const root = mkdtempSync(join(tmpdir(), "npxcache-"));
     const npx = join(root, "_npx");
     // The broker itself is fetched into cache "aaa"; "bbb" is a sibling
@@ -799,12 +859,26 @@ describe("npxCacheNodeModules", () => {
     }
   });
 
-  it("returns [] for a path not under an npx cache", async () => {
+  it("returns [] for a path not under an npx cache", () => {
     expect(npxCacheNodeModules(pathToFileURL(join(tmpdir(), "plain", "index.js")).href)).toEqual([]);
   });
 
-  it("returns [] for a non-file URL", async () => {
+  it("returns [] for a non-file URL", () => {
     expect(npxCacheNodeModules("not-a-url")).toEqual([]);
+  });
+
+  it("returns [] when the _npx root itself cannot be read", () => {
+    // The path HAS an `_npx` segment -- so the marker matches and the readdir
+    // is actually attempted -- but the cache root is gone: `npm cache clean`
+    // during a long-lived broker's life, or a pruned/unreadable directory.
+    // readdirSync throws ENOENT there, and the catch is what keeps that a
+    // quiet node fallback instead of an unhandled throw on the connect path.
+    const root = mkdtempSync(join(tmpdir(), "npxcache-gone-"));
+    const selfUrl = pathToFileURL(
+      join(root, "_npx", "aaa", "node_modules", "@yawlabs", "mcp", "dist", "index.js"),
+    ).href;
+    rmSync(root, { recursive: true, force: true });
+    expect(npxCacheNodeModules(selfUrl)).toEqual([]);
   });
 });
 
@@ -871,13 +945,31 @@ describe("npmCacheDir", () => {
   // precedence over every npmrc -- so it has to be cleared or these assertions
   // measure the runner instead of the resolver.
   const savedEnv = process.env.npm_config_cache;
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  let fakeHome = "";
   beforeEach(() => {
     delete process.env.npm_config_cache;
+    // ...and the resolver's FIRST candidate is the runner's own `~/.npmrc`,
+    // which outranks every fixture npmrc below. A single `cache=` line there --
+    // exactly what `npm config set cache` writes -- answers before any fixture
+    // and fails 11 of the 12 assertions in this describe. homedir() reads HOME
+    // (POSIX) / USERPROFILE (Windows) on every call, so pointing both at an
+    // empty temp dir is enough; the `~/` expansion test still agrees, because
+    // source and test both go through homedir().
+    fakeHome = mkdtempSync(join(tmpdir(), "npmcache-home-"));
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;
     resetNpmCacheDir();
   });
   afterEach(() => {
     if (savedEnv === undefined) delete process.env.npm_config_cache;
     else process.env.npm_config_cache = savedEnv;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    if (fakeHome) rmSync(fakeHome, { recursive: true, force: true });
     resetNpmCacheDir();
   });
 
@@ -914,6 +1006,11 @@ describe("npmCacheDir", () => {
     try {
       expect(npmCacheDir(a.url)).toBe(join(tmpdir(), "cache-A"));
       expect(npmCacheDir(b.url)).toBe(join(tmpdir(), "cache-B"));
+      // Delete a's npmrc BEFORE re-asking. With the fixture still on disk a
+      // fresh re-read answers "cache-A" too, so the assertion could not tell a
+      // memo from a re-read -- it passed with the memoization deleted. Gone,
+      // the only way back to "cache-A" is the map.
+      a.cleanup();
       expect(npmCacheDir(a.url)).toBe(join(tmpdir(), "cache-A")); // still cached
     } finally {
       a.cleanup();
@@ -1137,19 +1234,27 @@ describe("resolveNpmEntry", () => {
    * Deriving the path from the json keeps the two in step when a case changes
    * its bin shape. A manifest with neither bin nor main gets no file, which is
    * deliberate: that is the exports-only package the fall-through test needs.
+   *
+   * EVERY declared bin gets a file, not just the first. packageEntry picks
+   * `bin[unscoped] ?? bin[name] ?? the first one`, and writing only the first
+   * made the other two tiers unbuildable here: the file the lookup selected
+   * would not exist, packageEntry's existsSync would reject it, and the case
+   * would collapse into "the package was not found" -- so a source that
+   * dropped the tiers for a plain first-bin passed every test in this file.
    */
   function writeManifest(dir: string, json: Record<string, unknown>): void {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "package.json"), JSON.stringify(json));
     const bin = json.bin;
-    let rel: string | undefined;
-    if (typeof bin === "string") rel = bin;
-    else if (bin && typeof bin === "object") rel = Object.values(bin as Record<string, string>)[0];
-    else if (typeof json.main === "string") rel = json.main;
-    if (rel === undefined) return;
-    const entry = join(dir, rel);
-    mkdirSync(dirname(entry), { recursive: true });
-    writeFileSync(entry, "");
+    const rels: string[] = [];
+    if (typeof bin === "string") rels.push(bin);
+    else if (bin && typeof bin === "object") rels.push(...Object.values(bin as Record<string, string>));
+    else if (typeof json.main === "string") rels.push(json.main);
+    for (const rel of rels) {
+      const entry = join(dir, rel);
+      mkdirSync(dirname(entry), { recursive: true });
+      writeFileSync(entry, "");
+    }
   }
 
   function writePkg(npx: string, pkg: string, json: Record<string, unknown>): string {
@@ -1186,6 +1291,40 @@ describe("resolveNpmEntry", () => {
       expect(resolveNpmEntry("@modelcontextprotocol/server-memory", brokerUrl, null, null)).toBe(
         join(dir, "dist", "index.js"),
       );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("prefers the bin keyed by the UNSCOPED name over the first declared one", async () => {
+    // Tier 1 of `bin[unscoped] ?? bin[name] ?? first`. Every other scoped
+    // fixture in this file declares exactly ONE bin, where tiers 1 and 3 are
+    // the same file -- so a source that dropped the keyed lookup for a plain
+    // Object.values(bin)[0] passed all of them. Here they disagree.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = writePkg(npx, "@yawlabs/fetch-mcp", {
+      name: "@yawlabs/fetch-mcp",
+      // Declared FIRST, so a first-bin pick answers with the wrong file.
+      bin: { "other-tool": "dist/other.js", "fetch-mcp": "dist/index.js" },
+    });
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null)).toBe(join(dir, "dist", "index.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("takes the bin keyed by the package's FULL name before falling to the first", async () => {
+    // Tier 2, the middle rung, which nothing else exercised: a scoped package
+    // whose bin key is the whole `@scope/name`. Deleting it would silently
+    // demote every such package to whichever bin happens to be declared first.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = writePkg(npx, "@yawlabs/fetch-mcp", {
+      name: "@yawlabs/fetch-mcp",
+      bin: { "other-tool": "dist/other.js", "@yawlabs/fetch-mcp": "dist/full.js" },
+    });
+    try {
+      expect(resolveNpmEntry("@yawlabs/fetch-mcp", brokerUrl, null, null)).toBe(join(dir, "dist", "full.js"));
     } finally {
       cleanup();
     }
@@ -1454,8 +1593,13 @@ describe("resolveNpmEntry", () => {
       writeResolvablePkg(dir, version);
       return dir;
     };
-    // Hashes deliberately unsorted, and none is the broker's own cache ("aaa"),
-    // so the durable loop misses and the version-picking loop actually runs.
+    // Hashes deliberately unsorted, so `from` is right only if bestRoot is
+    // assigned alongside best rather than following directory order. None of
+    // them is the broker's own cache ("aaa"), but that is incidental now: an
+    // own `_npx` copy is a cache copy like any other and never enters the
+    // take-outright durable loop -- which is what the sibling test above ("lets
+    // a higher version in a sibling cache beat a copy in the broker's OWN _npx
+    // dir") exists to pin.
     mk("aaa0", "0.1.0");
     const newest = mk("zzz9", "0.3.6");
     mk("mmm5", "0.3.3");
@@ -1625,7 +1769,11 @@ describe("probeOam timeout", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
 
-  it("declares a probe timeout matching the uv onPath budget", async () => {
+  it("declares a 3s probe timeout, the literal uv's onPath budget also uses", async () => {
+    // A LITERAL pin, not the cross-module relationship the old title claimed:
+    // uv-bootstrap's onPath hard-codes its own `3_000` rather than importing
+    // this constant, so the two budgets can drift with nothing failing. Keeping
+    // them equal is a manual job until one of them exports the number.
     expect(OAM_PROBE_TIMEOUT_MS).toBe(3_000);
   });
 
@@ -1894,7 +2042,7 @@ describe("probeOam hardening", () => {
 });
 
 describe("MIN_OAM_VERSION freshness floor", () => {
-  it("is at least 0.12.1 (bump this literal when you bump the floor)", () => {
+  it("is at least 0.13.0 (bump this literal when you bump the floor)", () => {
     // POLICY (see the constant's doc): the floor tracks the LATEST oam
     // release, bumped with every release. This literal-floor pin mirrors
     // the UV_VERSION freshness test in uv-bootstrap.test.ts: every other
@@ -1906,7 +2054,7 @@ describe("MIN_OAM_VERSION freshness floor", () => {
     // Catching a NEW upstream release still takes the release checklist --
     // a network-dependent freshness gate is deliberately out (see the
     // doctor-cmd stance on network in tests).
-    expect(compareVersions(MIN_OAM_VERSION, "0.12.1")).toBeGreaterThanOrEqual(0);
+    expect(compareVersions(MIN_OAM_VERSION, "0.13.1")).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -1927,13 +2075,44 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
     });
   }
 
-  it("warns once per process, not once per opted-in server", async () => {
-    await primeAbsent();
+  /** Start capturing stderr, one entry per write. The array is LIVE -- it keeps
+   *  filling as the logger writes -- because several cases here assert between
+   *  calls rather than once at the end. The spy is dropped by this describe's
+   *  afterEach (vi.restoreAllMocks).
+   *
+   *  Deliberately raw chunks, not the parsed envelopes captureNotices and
+   *  captureStderr return elsewhere in this file: everything here is a
+   *  substring match on one warn, so parsing would only add a way to fail. */
+  function captureStderrLines(): string[] {
     const lines: string[] = [];
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
       lines.push(String(chunk));
       return true;
     });
+    return lines;
+  }
+
+  it("stays silent when oam is only the default, not an opt-in", async () => {
+    // `optedIn` false is "nothing configured, oam is merely the default" -- the
+    // stock config on every node-only machine. Dropping the `optedIn &&` from
+    // the gate would print "a server opted in to oam but oam is not installed",
+    // with install commands attached, once per broker boot to users who never
+    // opted into anything -- on the stderr MCP clients surface, for a broker
+    // that is spawned per client session.
+    await primeAbsent();
+    const lines = captureStderrLines();
+    await resolveOamSpawn("node", ["a.js"], false);
+    expect(lines.filter((l) => l.includes("opted in to oam"))).toHaveLength(0);
+    // ...and the silence did not spend the once-per-process flag: the gate
+    // short-circuits on optedIn BEFORE setting it, so a genuine opt-in
+    // immediately afterwards still gets its one warn.
+    await resolveOamSpawn("node", ["b.js"], true);
+    expect(lines.filter((l) => l.includes("opted in to oam"))).toHaveLength(1);
+  });
+
+  it("warns once per process, not once per opted-in server", async () => {
+    await primeAbsent();
+    const lines = captureStderrLines();
     // A broker hosting a dozen opted-in servers must not print this a dozen
     // times on every boot.
     await resolveOamSpawn("node", ["a.js"]);
@@ -1951,11 +2130,7 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
     // user to install oam while doctor reported the same server as
     // `not-node-command`, and claimed a node fallback that never happens.
     await primeAbsent();
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
-      return true;
-    });
+    const lines = captureStderrLines();
     await resolveOamSpawn("docker", ["run", "-i", "x/mcp"]);
     await resolveOamSpawn("uvx", ["some-mcp"]);
     await resolveOamSpawn("python", ["-m", "server"]);
@@ -1967,11 +2142,7 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
 
   it("stays silent when oam is present", async () => {
     await probeOam(async () => "oam 99.0.0");
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
-      return true;
-    });
+    const lines = captureStderrLines();
     await resolveOamSpawn("node", ["a.js"]);
     expect(lines.filter((l) => l.includes("oam is not installed"))).toHaveLength(0);
   });
@@ -1987,11 +2158,7 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
       e.code = "EACCES";
       throw e;
     });
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
-      return true;
-    });
+    const lines = captureStderrLines();
     // Three servers, one line: the flag is shared with the absent case because
     // both are the same event to the user (asked for oam, got node).
     await resolveOamSpawn("node", ["a.js"]);
@@ -2012,11 +2179,7 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
     // The absent case is unchanged; this pins that the new branch did not
     // capture it. (A timeout is a FAILURE and lands in the branch above.)
     await primeAbsent();
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
-      return true;
-    });
+    const lines = captureStderrLines();
     await resolveOamSpawn("node", ["a.js"]);
     expect(lines.filter((l) => l.includes("oam is installed and unusable"))).toHaveLength(0);
     expect(lines.filter((l) => l.includes("oamjs.org/install.sh"))).toHaveLength(1);
@@ -2030,11 +2193,7 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
       e.code = "ETIMEDOUT";
       throw e;
     });
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
-      return true;
-    });
+    const lines = captureStderrLines();
     await resolveOamSpawn("node", ["a.js"]);
     const warnings = lines.filter((l) => l.includes("oam is installed and unusable"));
     expect(warnings).toHaveLength(1);
@@ -2046,11 +2205,7 @@ describe("resolveOamSpawn — unavailable-oam warning", () => {
     // Two warnings for one condition would be noise; belowMin already reports
     // both versions, which is strictly more actionable.
     await probeOam(async () => "oam 0.0.1");
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
-      lines.push(String(chunk));
-      return true;
-    });
+    const lines = captureStderrLines();
     await resolveOamSpawn("node", ["a.js"]);
     expect(lines.filter((l) => l.includes("opted in to oam but oam is not installed"))).toHaveLength(0);
   });
@@ -2097,6 +2252,22 @@ describe("isOamCommand / isOamLaunch", () => {
     expect(isOamLaunch("sh", ["-c", `'/opt/my oam/oam' run x.js`])).toBe(false);
     expect(isOamLaunch("sh", ["-c", "   "])).toBe(false);
     expect(isOamLaunch("sh", ["-c"])).toBe(false);
+  });
+
+  it("under-reports a COMBINED shell switch, and reads a payload with no -c at all", () => {
+    // The payload lookup is `args[indexOf("-c") + 1]`, falling back to args[0].
+    // `bash -lc "<script>"` -- the shape GUI MCP clients write to get a login
+    // PATH -- packs the switches into ONE argv entry, so indexOf misses and the
+    // fallback answers with "-lc", which is not a command. It therefore reports
+    // node for an entry that plainly launches oam. Pinned as the same
+    // deliberate under-report as a quoted path containing a space: recovering
+    // it means parsing shell switch clusters, and being wrong in the direction
+    // that never CLAIMS oam is the safe half.
+    expect(isOamLaunch("bash", ["-lc", "oam run x.js"])).toBe(false);
+    // The no-`-c` fallback taken on its own terms: args[0] IS the script, so a
+    // payload passed without a switch still reads correctly, either way.
+    expect(isOamLaunch("sh", ["oam run x.js"])).toBe(true);
+    expect(isOamLaunch("sh", ["npx -y @yawlabs/mcp@latest"])).toBe(false);
   });
 
   it("judges a non-shell command on itself, never on its arguments", () => {

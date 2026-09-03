@@ -58,7 +58,19 @@ export type FetchCatalog = (url: string) => Promise<CatalogServer[]>;
  * (e.g. `npx -y @yawlabs/aws-mcp`, or `docker run -i --rm -e FOO ghcr.io/...`),
  * but a bundles.json entry needs command and args separate. Mirror of the
  * app's tokenizeCommand (yaw-install-handler.ts) and the website's
- * (catalog/index.html), so all three produce identical splits.
+ * (catalog/index.html), so all three produce identical splits for every
+ * BALANCED line -- which is every line a healthy catalog carries.
+ *
+ * ONE deliberate divergence: the unbalanced-quote throw below. Neither the
+ * app's copy nor the website's has it -- there an unterminated quote simply
+ * runs to end-of-line and the mangled token is kept -- so a quote-broken
+ * install line is silently accepted by the app and hard-fails here. That is
+ * an app-works/CLI-fails split of the kind the module header says this file
+ * exists to prevent, and it is accepted anyway: writing the mangled argv into
+ * bundles.json only moves the failure to spawn time, where it reads as a
+ * missing binary rather than as a bad catalog entry. A line that trips this
+ * is a CATALOG bug -- fix the install line rather than matching the app by
+ * dropping the check.
  */
 export function tokenizeCommand(cmd: string): string[] {
   const out: string[] = [];
@@ -135,9 +147,12 @@ export interface CatalogFetchDeps {
  * `export YAW_MCP_CATALOG_URL=` line, a blank .env entry -- is not nullish, so
  * every `??` fallback upstream of here (add, try) handed "" straight through.
  * fetch("") then throws a bare `TypeError: Failed to parse URL from`, AND the
- * unwrapped-rethrow gate in defaultFetchCatalog (`err.message.includes(url)`)
- * is trivially TRUE for the empty string, so the raw TypeError was rethrown
- * without even the friendly "could not reach the Yaw MCP catalog" wrapper.
+ * message-based rethrow gate defaultFetchCatalog used to carry
+ * (`err.message.includes(url)`) was trivially TRUE for the empty string, so
+ * the raw TypeError came back without even the friendly "could not reach the
+ * Yaw MCP catalog" wrapper. That gate is a marker CLASS now (CatalogError), so
+ * the wrapper holds even for a URL fetch itself refuses to parse -- but the
+ * normalization still belongs here: "" is not a URL to attempt at all.
  *
  * Normalizing at this boundary (rather than at each call site) is what makes
  * the rule hold for every caller, including ones outside this repo's CLI.
@@ -146,6 +161,18 @@ export interface CatalogFetchDeps {
 function normalizeCatalogUrl(url: string | undefined): string {
   return url !== undefined && url.trim() !== "" ? url : DEFAULT_CATALOG_URL;
 }
+
+/** Marks an error defaultFetchCatalog worded ITSELF -- every one of them
+ *  already names the catalog and the URL, so the transport wrapper must
+ *  rethrow them untouched rather than describing them a second time.
+ *
+ *  A marker class, not a message test. The old gate asked whether the message
+ *  contained the url, which is also true of fetch's OWN URL-parse failure
+ *  (`TypeError: Failed to parse URL from <url>`) -- so a malformed
+ *  YAW_MCP_CATALOG_URL was rethrown raw, skipping the friendly wrapper and the
+ *  `cause` detail this module promises for EVERY failure mode. The class
+ *  cannot false-positive that way: only throws written here carry it. */
+class CatalogError extends Error {}
 
 /** Fetch + shape-validate the catalog. Bounded by FETCH_TIMEOUT_MS. Throws a
  *  friendly Error on network / parse / shape failure. Injectable for tests. */
@@ -162,7 +189,7 @@ export async function defaultFetchCatalog(
   try {
     const res = await fetch(url, { signal: ac.signal, headers: { accept: "application/json" } });
     if (!res.ok) {
-      throw new Error(`the Yaw MCP catalog at ${url} returned HTTP ${res.status}.`);
+      throw new CatalogError(`the Yaw MCP catalog at ${url} returned HTTP ${res.status}.`);
     }
     // A 200 whose body isn't JSON is the captive-portal / corporate-proxy
     // shape: the request "succeeded" and returned an HTML login page. Left
@@ -178,15 +205,18 @@ export async function defaultFetchCatalog(
     } catch (parseErr) {
       if (parseErr instanceof Error && parseErr.name === "AbortError") throw parseErr;
       const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-      throw new Error(`the Yaw MCP catalog at ${url} did not return valid JSON (${msg}).`);
+      throw new CatalogError(`the Yaw MCP catalog at ${url} did not return valid JSON (${msg}).`);
     }
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
-      throw new Error(`timed out fetching the Yaw MCP catalog at ${url}.`);
+      throw new CatalogError(`timed out fetching the Yaw MCP catalog at ${url}.`);
     }
     // Anything thrown ABOVE already carries the "catalog at <url>" prefix, so
-    // rethrow those untouched -- the url test is what tells them apart.
-    if (err instanceof Error && err.message.includes(url)) throw err;
+    // rethrow those untouched -- the marker CLASS is what tells them apart. A
+    // message test (`err.message.includes(url)`) also matched fetch's own
+    // `Failed to parse URL from <url>`, which is precisely a failure that
+    // needs the wrapper below rather than a raw rethrow.
+    if (err instanceof CatalogError) throw err;
     // Everything else is a TRANSPORT failure raised by fetch itself: offline,
     // DNS, connection refused, TLS, a proxy that drops the connection. undici
     // reports every one of them as a bare `TypeError: fetch failed`, which
@@ -197,13 +227,15 @@ export async function defaultFetchCatalog(
     // `cause` (ECONNREFUSED, ENOTFOUND, ...); surface it.
     const cause = err instanceof Error && err.cause instanceof Error ? err.cause.message : null;
     const detail = cause ?? (err instanceof Error ? err.message : String(err));
-    throw new Error(`could not reach the Yaw MCP catalog at ${url} (${detail}). Check your network, then retry.`);
+    throw new CatalogError(
+      `could not reach the Yaw MCP catalog at ${url} (${detail}). Check your network, then retry.`,
+    );
   } finally {
     clearTimeout(timer);
   }
   const servers = (body as { servers?: unknown } | null)?.servers;
   if (!Array.isArray(servers)) {
-    throw new Error(`the Yaw MCP catalog at ${url} was not in the expected shape.`);
+    throw new CatalogError(`the Yaw MCP catalog at ${url} was not in the expected shape.`);
   }
   warnIfCatalogStale(body, deps);
   return servers.filter(
@@ -247,10 +279,16 @@ export async function resolveCatalogSlug(
     throw new Error(`catalog entry "${slug}" has no install command.`);
   }
   const tokens = tokenizeCommand(cmdStr);
-  if (tokens.length === 0) {
+  const [command, ...args] = tokens;
+  // Guard the COMMAND token, not the token count. `tokens.length === 0` cannot
+  // happen here -- cmdStr is already non-blank, and every non-blank line yields
+  // at least one token -- while the degenerate case that CAN happen slipped
+  // through it: a quoted-empty launch line (`"" -y foo`, or a bare `""`)
+  // tokenizes to a first token of "", which was written into bundles.json as a
+  // server with no command at all and then failed opaquely at spawn time.
+  if (!command) {
     throw new Error(`catalog entry "${slug}" install command was empty.`);
   }
-  const [command, ...args] = tokens;
 
   const requiredEnvKeys = Array.isArray(entry.requiredEnv)
     ? entry.requiredEnv

@@ -321,12 +321,28 @@ if (subcommand === "compliance") {
                                MCP elicitation prompts for it instead, for
                                that session only. Manage entries with
                                \`yaw-mcp secrets\`.
+    YAW_MCP_VAULT_PASSPHRASE_NEW  The NEW passphrase for \`yaw-mcp secrets
+                               rotate\`, so a re-wrap can run without a TTY.
+                               Read only by \`rotate\`; without it (and
+                               without a TTY to confirm on) rotate fails
+                               rather than picking one for you.
     YAW_MCP_TRUST_PROJECT         Set to \`1\` to skip the consent check on a
                                project-local .yaw-mcp/bundles.json and load
                                it unconditionally. FOR CI/AUTOMATION ONLY --
                                it lets any repo you run yaw-mcp inside spawn
                                arbitrary commands as you. Default: the file
                                must be approved with \`yaw-mcp trust\`.
+    YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS
+                               Set to \`1\` to accept a .yaw-mcp/ directory
+                               found outside $HOME whose owner cannot be
+                               verified (every win32 checkout, since there
+                               is no cheap ownership probe there). FOR
+                               CI/AUTOMATION ONLY -- an unowned directory
+                               on a writable volume lets a third party
+                               inject YAW-MCP.md guidance into your model
+                               context and apply config.json allow/block
+                               lists. Default: such candidates are skipped
+                               with a warning.
     YAW_MCP_DISABLE_PERSISTENCE   Disable cross-session learning state.
     YAW_MCP_FOUNDRY               Set to \`1\` to OPT IN to harvesting dispatch
                                traces to ~/.yaw-mcp/foundry.jsonl for routing
@@ -355,6 +371,24 @@ if (subcommand === "compliance") {
     MCP_LIST_TIMEOUT              Milliseconds to wait for a server's tool/
                                resource/prompt inventory calls after the
                                handshake (default 15000).
+    MCP_CALL_TIMEOUT              Milliseconds to wait for a single proxied
+                               tools/call (default 60000, the SDK's own
+                               bound) -- the last leg of a request that had
+                               no override. Raise it for a server that is
+                               legitimately slow (browser automation, a
+                               large query, a cold first call): a timeout is
+                               booked as an upstream error, so a healthy but
+                               slow server is otherwise down-ranked in the
+                               reliability lines \`discover\` renders.
+    CLAUDE_CONFIG_DIR             Claude Code's config directory, honored by
+                               \`yaw-mcp install claude-code\` so a non-default
+                               location is written instead of ~/.claude. Read
+                               only at install time; it is Claude Code's knob,
+                               not yaw-mcp's.
+    LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
+                               stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
+                               (default info). \`debug\` is what to set when
+                               asking why a server did not load.
 
   Config resolution (highest precedence first) -- for the \`servers\` allow-list
   and \`blocked\` deny-list:
@@ -386,10 +420,16 @@ if (subcommand === "compliance") {
   // so guard with typeof and fall back to "dev".
   process.stdout.write(`yaw-mcp ${typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev"}\n`);
   process.exitCode = 0;
-} else if (subcommand && !subcommand.startsWith("-")) {
+} else if (subcommand !== undefined && !subcommand.startsWith("-")) {
   // Bare positional first arg that isn't a known subcommand — almost
   // always a typo. Surface a "did you mean?" instead of falling through
   // to runServer, which would then fail opaquely on the missing token.
+  //
+  // The test is `!== undefined`, NOT truthiness: `yaw-mcp ""` passes an
+  // empty first argument, which is a bare positional with no leading dash
+  // and belongs here. Under the old truthy guard it fell through to the
+  // else branch and was reported as `unknown flag ""` -- naming the wrong
+  // category for an argument that has no dash in it at all.
   const suggestions = suggestSubcommand(subcommand);
   const hint =
     suggestions.length > 0
@@ -417,14 +457,30 @@ if (subcommand === "compliance") {
   } else {
     // Startup failure path. runServer() registers a last-resort
     // unhandledRejection handler (see below) BEFORE its first await, so a
-    // fatal startup rejection -- an unreadable config dir, a transport
-    // that fails to connect -- would otherwise be swallowed by that
+    // fatal startup rejection would otherwise be swallowed by that
     // handler: logged as a JSON line, no server started, and the process
     // exiting 0 as if all was well. Attaching a real catch here
     // restores the "print the error and exit 1" contract. It only covers
     // the startup promise; a genuine POST-startup rejection (an orphaned
     // upstream connect that rejects late) still lands on the handler
     // inside runServer, which logs and keeps the server running.
+    //
+    // Be honest about how narrow that is. The two failure modes this
+    // comment used to name cannot reach here:
+    //   * an unreadable config dir -- loadYawMcpConfig is fail-open by
+    //     construction. readConfigAt turns EVERY read/parse error into a
+    //     warning and returns null, and both the legacy-path migration and
+    //     the project-dir walk-up carry their own .catch().
+    //   * a transport that fails to connect -- server.start() is
+    //     fire-and-forget below with its OWN .catch(), which logs "Fatal
+    //     startup error" and calls process.exit(1) directly. It never
+    //     rejects the promise this catch is attached to.
+    // What DOES land here is a throw in runServer's own body before that
+    // hand-off: process.cwd() raising ENOENT on a deleted working dir
+    // inside loadYawMcpConfig, or the ConnectServer constructor throwing.
+    // The branch is a cheap net for those, not the config/transport guard
+    // it was once described as. Startup-failure behavior is otherwise
+    // owned by the server.start() catch.
     //
     // Same buffered-write reasoning as dispatch(): set process.exitCode
     // instead of calling process.exit(), so the stderr write is drained
@@ -473,8 +529,15 @@ async function runServer(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    const forceExit = setTimeout(() => process.exit(1), 10_000);
-    if (forceExit.unref) forceExit.unref();
+    // Deliberately REF'd. This watchdog exists for exactly one case -- a
+    // server.shutdown() that never settles -- and an unref'd timer stops
+    // holding the event loop open, so in that case Node would either exit
+    // on its own (whatever else is pending decides) or hang forever, and
+    // the force-exit would never fire: the guard was disarmed precisely
+    // when it was needed. It costs nothing on the healthy path, because
+    // the process.exit(0) below runs the moment shutdown resolves and
+    // takes the pending timer with it.
+    setTimeout(() => process.exit(1), 10_000);
     await server.shutdown();
     process.exit(0);
   };

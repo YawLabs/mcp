@@ -1,9 +1,13 @@
 // The managed-tree half of the pinned-sidecar notice, which logs at DEBUG.
 //
-// Split into its own file because logger.ts resolves LOG_LEVEL ONCE at module
-// load, so the level has to be raised before the import graph is built -- the
-// same module-scoped constraint that gives oam-probe-options.test.ts and the
-// uv-bootstrap mocks their own files.
+// Split into its own file because LOG_LEVEL is process-wide and this file
+// raises it: a file-scoped assignment keeps every OTHER case in the suite at
+// the default level, which is the level users actually run at. NOT because the
+// logger latches it -- logger.ts resolves LOG_LEVEL per call (see the note at
+// the top of it), so raising the level before the import graph is built is not
+// required. It is still where the assignment belongs, for the same reason the
+// sibling oam-spawn-probe-log.test.ts gives: this file must not encode which
+// of the two the logger is doing.
 //
 // The sibling oam-spawn.test.ts asserts that a managed hit says nothing at the
 // default level, which is the user-facing behaviour. This is the other half:
@@ -27,9 +31,13 @@ const { resetPinnedSidecarLog, resolveNpmEntry } = await import("../oam-spawn.js
 
 // Put it back. vitest's `isolate` gives each FILE a fresh module registry, not
 // a fresh process.env, so a worker reused for a later file would otherwise
-// inherit debug -- and the sibling oam-spawn.test.ts asserts that the managed
-// notice is SILENT, which is exactly what a leak would break. Ordering makes
-// that flaky rather than reliably red, which is worse.
+// inherit debug. No assertion is known to break on that today -- the sibling
+// managed-notice silence check an earlier version of this note pointed at is
+// immune, because captureNotices in oam-spawn.test.ts drops debug lines
+// explicitly rather than leaning on the default level. The restore stays
+// anyway: a process-wide setting that outlives the file setting it fails by
+// worker scheduling when it fails at all, which is flaky rather than reliably
+// red, and that is the expensive kind of red.
 afterAll(() => {
   if (priorLogLevel === undefined) delete process.env.LOG_LEVEL;
   else process.env.LOG_LEVEL = priorLogLevel;

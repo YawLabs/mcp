@@ -60,10 +60,24 @@ export interface KdfParams {
   p: number;
 }
 
-/** What a vault created by THIS build is written with. A vault that records
- *  no `kdf` (every vault written before the field existed) is read under
- *  exactly these values, which is what those vaults were created with. */
+/** What a vault created by THIS build is written with. Free to move upward as
+ *  hardware gets faster: every vault created or rotated from now on records
+ *  the parameters it was written under, and a vault that records NONE is read
+ *  under LEGACY_KDF below -- never under this. */
 export const DEFAULT_KDF: KdfParams = { N: 1 << 15, r: 8, p: 1 };
+
+/** The parameters every KDF-LESS vault was derived under -- schema v1, written
+ *  before `kdf` was recorded in the file, when the cost factor was a
+ *  compile-time constant with exactly these values.
+ *
+ *  This is a HISTORICAL FACT, not a policy knob: THESE VALUES MUST NEVER
+ *  CHANGE. unlock() reads a vault with no `kdf` under them, so editing them
+ *  re-keys every such vault still in the wild and reports "wrong passphrase
+ *  for this vault" for a passphrase that is perfectly correct -- the exact
+ *  lockout the recorded-KDF design exists to prevent. Raise DEFAULT_KDF
+ *  instead; that only affects vaults written from now on. Frozen so a stray
+ *  mutation cannot do it either. */
+export const LEGACY_KDF: Readonly<KdfParams> = Object.freeze({ N: 1 << 15, r: 8, p: 1 });
 
 /** Per-field bounds accepted for vault-supplied KDF parameters. These alone
  *  do NOT imply the memory ceiling: scrypt allocates roughly 128 * N * r
@@ -132,13 +146,18 @@ export function normalizePassphrase(passphrase: string): string {
 
 /** Derive a 32-byte key from a passphrase + salt via scrypt.
  *
- *  `params` defaults to DEFAULT_KDF -- a caller reading an existing vault
- *  MUST pass the parameters recorded in it. `normalize` is only turned off
- *  for the legacy un-normalized retry described in normalizePassphrase. */
+ *  `params` defaults to LEGACY_KDF, NOT DEFAULT_KDF: the only vault whose
+ *  parameters a caller can legitimately omit is one that recorded none, and
+ *  every such vault was written under LEGACY_KDF. Defaulting to DEFAULT_KDF
+ *  would re-key those vaults the day the default is raised. A caller reading
+ *  any other existing vault MUST pass the parameters recorded in it, and a
+ *  caller CREATING a vault must pass DEFAULT_KDF explicitly. `normalize` is
+ *  only turned off for the legacy un-normalized retry described in
+ *  normalizePassphrase. */
 export async function deriveKey(
   passphrase: string,
   salt: Buffer,
-  params: KdfParams = DEFAULT_KDF,
+  params: KdfParams = LEGACY_KDF,
   normalize = true,
 ): Promise<Buffer> {
   return scryptCallWithMaxmem(normalize ? normalizePassphrase(passphrase) : passphrase, salt, KEY_LEN, params);

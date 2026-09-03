@@ -124,7 +124,10 @@ describe("validateEntry -- exercised via readGradesCache", () => {
   ];
 
   for (const { label, entry } of cases) {
-    it(`returns false (entry dropped) for: ${label}`, async () => {
+    // validateEntry returns CachedGrade | null, never a boolean -- name the
+    // observable instead: the namespace is absent from the map readGradesCache
+    // hands back.
+    it(`drops the entry for: ${label}`, async () => {
       writeGradesFile(synthHome, JSON.stringify({ ns: entry }));
       const result = await readGradesCache(synthHome);
       expect(result).toEqual({});
@@ -144,7 +147,7 @@ describe("validateEntry -- exercised via readGradesCache", () => {
     expect(result.ceiling?.score).toBe(100);
   });
 
-  it("returns true (entry kept) for a valid entry with grade letter lowercased in JSON", async () => {
+  it("keeps a valid entry whose grade letter is lowercased in JSON", async () => {
     // grade.toUpperCase() is applied inside validateEntry -- lowercase input should work
     writeGradesFile(synthHome, JSON.stringify({ ns: { grade: "b", score: 75, gradedAt: "2026-06-01T00:00:00.000Z" } }));
     const result = await readGradesCache(synthHome);

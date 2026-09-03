@@ -57,6 +57,7 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  resolveAppDataDir,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -86,8 +87,8 @@ import {
   STATE_FILENAME,
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
-import { listKeys, loadVault, SECRET_REF_RE, vaultPath } from "./secrets-vault.js";
-import { buildRefreshPlan } from "./sidecar-refresh.js";
+import { collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
+import { buildRefreshPlan, isSidecarRefreshDisabled } from "./sidecar-refresh.js";
 import {
   collectSidecarSpecs,
   hasManagedSidecars,
@@ -475,6 +476,52 @@ export function parseDoctorArgs(
   return { ok: true, options: { json: argv.includes("--json") } };
 }
 
+/** Everything both doctor paths collect BEFORE they diverge into printing or
+ *  JSON assembly: the option defaults, the config load, the project-trust
+ *  fold, and the CLAUDE_CONFIG_DIR override.
+ *
+ *  Shared rather than copied. The text and --json paths ran these same lines
+ *  verbatim, so a fix to one was easy to miss in the other -- which is exactly
+ *  how the two surfaces drifted before (the --json path skipped the trial GC
+ *  entirely). Anything that must be identical on both paths belongs here. */
+async function collectDoctorBase(opts: DoctorOptions): Promise<{
+  cwd: string;
+  home: string;
+  appData: string | undefined;
+  os: InstallOS;
+  env: NodeJS.ProcessEnv;
+  timestamp: string;
+  config: ResolvedConfig;
+  trustProbe: ProjectTrustProbe | null;
+  claudeConfigDir: string | undefined;
+}> {
+  const cwd = opts.cwd ?? process.cwd();
+  const home = opts.home ?? homedir();
+  // Keep the %APPDATA%-based claude-desktop path inside a synthetic home
+  // whenever home is overridden (test seam hermeticity; see ProbeOptions), and
+  // otherwise read the ambient %APPDATA% -- the shared helper, so doctor names
+  // the same claude_desktop_config.json that install writes on a box where
+  // %APPDATA% is redirected away from <home>\AppData\Roaming.
+  const appData = resolveAppDataDir({ home: opts.home, env: opts.env });
+  const os = opts.os ?? CURRENT_OS;
+  const env = opts.env ?? process.env;
+  const timestamp = new Date().toISOString();
+
+  const config = await loadYawMcpConfig({ cwd, home, env });
+  // Project-trust gate (see trust.ts). Folded into config.warnings so it
+  // renders in WARNINGS (text) / `.warnings` (json), hits the always-on stderr
+  // stream, and drives the exit-2 gate like every other warning.
+  const trustProbe = await probeProjectTrust({ cwd, home, env }).catch(() => null);
+  const trustWarning = projectTrustWarning(trustProbe);
+  if (trustWarning) config.warnings = [...config.warnings, trustWarning];
+
+  // Honor CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
+  // when run inside a wrapper (Yaw Mode, dev container with the env set).
+  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+
+  return { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir };
+}
+
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
   if (opts.json) return runDoctorJson(opts);
 
@@ -485,26 +532,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     write(`${s}\n`);
   };
 
-  const cwd = opts.cwd ?? process.cwd();
-  const home = opts.home ?? homedir();
-  // Keep the %APPDATA%-based claude-desktop path inside a synthetic home
-  // whenever home is overridden (test seam hermeticity; see ProbeOptions).
-  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
-  const os = opts.os ?? CURRENT_OS;
-  const env = opts.env ?? process.env;
+  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir } = await collectDoctorBase(opts);
 
-  print(`yaw-mcp doctor -- ${new Date().toISOString()}`);
+  print(`yaw-mcp doctor -- ${timestamp}`);
   print(`yaw-mcp version: ${VERSION}`);
   print(`platform: ${os}`);
   print("");
-
-  const config = await loadYawMcpConfig({ cwd, home, env });
-  // Project-trust gate (see trust.ts). Folded into config.warnings so it
-  // renders in WARNINGS, hits the always-on stderr stream, and drives the
-  // exit-2 gate like every other warning.
-  const trustProbe = await probeProjectTrust({ cwd, home, env }).catch(() => null);
-  const trustWarning = projectTrustWarning(trustProbe);
-  if (trustWarning) config.warnings = [...config.warnings, trustWarning];
 
   print("CONFIG FILES");
   if (config.loadedFiles.length === 0) {
@@ -594,10 +627,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   const trialWarnings = await renderTrialsSection({ home, print, now: opts.now });
   if (trialWarnings.length > 0) config.warnings = [...config.warnings, ...trialWarnings];
 
-  // Probe every supported client/scope combo on the current OS. Honor
-  // CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
-  // when run inside a wrapper (Yaw Mode, dev container with the env set).
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Probe every supported client/scope combo on the current OS, against the
+  // CLAUDE_CONFIG_DIR-aware paths collectDoctorBase resolved.
   const clients = probeClients({ home, os, cwd, claudeConfigDir, appData });
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
@@ -717,22 +748,10 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const lines: string[] = [];
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
 
-  const cwd = opts.cwd ?? process.cwd();
-  const home = opts.home ?? homedir();
-  // Keep the %APPDATA%-based claude-desktop path inside a synthetic home
-  // whenever home is overridden (test seam hermeticity; see ProbeOptions).
-  const appData = opts.home !== undefined ? join(opts.home, "AppData", "Roaming") : undefined;
-  const os = opts.os ?? CURRENT_OS;
-  const env = opts.env ?? process.env;
-
-  const timestamp = new Date().toISOString();
-  const config = await loadYawMcpConfig({ cwd, home, env });
-  // Same project-trust fold as the text path, so `doctor --json` reports the
-  // gate in `.warnings` and exits 2 identically.
-  const trustProbe = await probeProjectTrust({ cwd, home, env }).catch(() => null);
-  const trustWarning = projectTrustWarning(trustProbe);
-  if (trustWarning) config.warnings = [...config.warnings, trustWarning];
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Same collection prologue as the text path -- option defaults, config load,
+  // project-trust fold, CLAUDE_CONFIG_DIR -- so `doctor --json` reports the
+  // gate in `.warnings` and exits 2 identically. See collectDoctorBase.
+  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir } = await collectDoctorBase(opts);
 
   // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
   // `doctor` and `doctor --json` have the SAME persistent side effects
@@ -988,18 +1007,25 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // once, which is exactly where the drift hurts: doctor is the
 // paste-into-a-ticket surface. Deliberate exclusions when diffing against
 // --help: DISABLE_PERSISTENCE stays in the STATE section (richer context
-// there); YAW_MCP_TRUST_PROJECT in the trust gate; YAW_MCP_CATALOG_URL
-// and YAW_MCP_BASE_URL are endpoint overrides, not behavior toggles, and
-// stay out. YAW_MCP_VAULT_PASSPHRASE is excluded for a stronger reason than
-// any of those: this list prints RAW VALUES, and that one is itself a
-// credential -- putting it here would paste the user's vault passphrase into
-// every support ticket. It is reported as a boolean by the SECRET VAULT
-// section instead (see VaultStatus.passphraseSet), so the drift check above
-// should read it as covered, not missing.
+// there); YAW_MCP_TRUST_PROJECT and YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS in the
+// trust gate; YAW_MCP_CATALOG_URL and YAW_MCP_BASE_URL are endpoint overrides,
+// not behavior toggles, and stay out. YAW_MCP_VAULT_PASSPHRASE and
+// YAW_MCP_VAULT_PASSPHRASE_NEW are excluded for a stronger reason than any of
+// those: this list prints RAW VALUES, and those two are themselves
+// credentials -- putting either here would paste the user's vault passphrase
+// into every support ticket. Vault state is reported as a boolean by the
+// SECRET VAULT section instead (see VaultStatus.passphraseSet), so the drift
+// check should read them as covered, not missing.
+//
+// The lockstep is PINNED, not just asked for: the "env table lockstep with
+// `yaw-mcp --help`" suite in doctor-cmd.test.ts reads the help table straight
+// out of index.ts and fails on a var added to either side without the other
+// (the exclusions above are that suite's allow-list, so widening one means
+// widening the other deliberately). Exported for it.
 //
 // The "default when unset" hint next to each unset value is the most
 // useful bit — without it users don't know what the omission means.
-const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string }> = [
+export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string }> = [
   { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
   { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
   { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
@@ -1086,15 +1112,12 @@ async function collectVaultStatus(opts: {
     // nothing, so the vault section stays silent about remotes rather than
     // sending the user to unlock a vault that was never in the path.
     if (s.type === "remote") continue;
-    const names = new Set<string>();
-    for (const value of Object.values(s.env ?? {})) {
-      if (typeof value !== "string") continue;
-      // SECRET_REF_RE carries /g and is module-shared, so matchAll against it
-      // directly would leave a lastIndex other callers trip over. Own copy per
-      // value, same as meta-tools.ts and upstream.ts do.
-      const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
-      for (const m of value.matchAll(re)) if (m[1]) names.add(m[1]);
-    }
+    // secrets-vault's shared scanner, not a local matchAll over SECRET_REF_RE:
+    // that object carries /g and is module-shared, so scanning against it
+    // directly leaves a lastIndex other callers trip over. This loop used to be
+    // a hand copy of collectSecretRefNames re-deriving that rule, as did
+    // meta-tools.ts's and upstream.ts's.
+    const names = collectSecretRefNames(s.env);
     if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
   }
 
@@ -1354,13 +1377,13 @@ async function collectOamRuntimeStatus(opts: {
   } catch {
     // Intentionally empty -- see above.
   }
-  // Same opt-out parse as maybeRefreshSidecars'. Without it every eligible
-  // stale package is described as one the background refresher will carry
-  // forward, which is simply false on a machine where the user turned the
-  // refresher off -- exactly the reader who most needs to be told to run
-  // `sidecars install` by hand.
-  const refreshOptOut = opts.env.YAW_MCP_SIDECAR_REFRESH;
-  const refreshDisabled = refreshOptOut === "0" || refreshOptOut?.toLowerCase() === "false";
+  // maybeRefreshSidecars' own opt-out predicate, called rather than re-spelled:
+  // without it every eligible stale package is described as one the background
+  // refresher will carry forward, which is simply false on a machine where the
+  // user turned the refresher off -- exactly the reader who most needs to be
+  // told to run `sidecars install` by hand. Doctor takes the environment as
+  // input, which is why the helper accepts one instead of reading process.env.
+  const refreshDisabled = isSidecarRefreshDisabled(opts.env);
   // Who filled the tree vs who is asking. npm resolves native bindings for the
   // node that RUNS the install, so a marker from another platform/arch means
   // the versions above can be present, current, and still fail at spawn here.
@@ -1544,7 +1567,11 @@ function renderProjectGuideSection(opts: { guide: GuideFile | null; print: (s?: 
 function renderStateSection(opts: {
   filePath: string;
   disabled: boolean;
-  /** State loaded once by the caller; null iff persistence is disabled. */
+  /** State loaded once by the caller, or null. Null does NOT mean "persistence
+   *  is disabled": both callers also pass null when the peek says the file is
+   *  missing, malformed, an unreadable version, or unreadable at all -- they
+   *  only call loadState on a peek they can use. Read `disabled` / `peek` for
+   *  which of those it is. */
   persisted: Awaited<ReturnType<typeof loadState>> | null;
   /** Peek result hoisted to the caller to avoid re-reading state.json. */
   peek: StatePeek | null;
@@ -1576,8 +1603,11 @@ function renderStateSection(opts: {
     print("");
     return;
   }
-  // persisted is non-null here: the caller only passes null when
-  // persistence is disabled, which the `disabled` branch above handled.
+  // persisted can still be null here even though the malformed / stale-version
+  // / unreadable peeks returned above: the text path only loads state on an
+  // "ok" peek, so a MISSING file arrives as null. That is the same thing to a
+  // reader as a file that exists but has never been saved, and both take the
+  // "no persisted state yet" line below.
   if (!persisted || persisted.savedAt === 0) {
     print("  (no persisted state yet -- will be created on the first tool call)");
   } else {
@@ -1644,7 +1674,10 @@ function statePeekDetail(peek: StatePeek): string | null {
 // qualifies — no point printing an empty header.
 function renderReliabilitySection(opts: {
   disabled: boolean;
-  /** State loaded once by the caller; null iff persistence is disabled. */
+  /** State loaded once by the caller, or null. Null covers persistence being
+   *  disabled AND every unusable-file case (missing, malformed, unreadable
+   *  version, unreadable), which is why the guard below tests `persisted`
+   *  rather than trusting `disabled` alone. */
   persisted: Awaited<ReturnType<typeof loadState>> | null;
   print: (s?: string) => void;
 }): void {
@@ -2026,7 +2059,13 @@ function classifyProbeContent(
       if (typeof command === "string") {
         if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
         const entryArgs = (entry as { args?: unknown }).args;
-        const args = Array.isArray(entryArgs) ? (entryArgs as string[]) : [];
+        // FILTERED to strings, not cast to them. A hand-edited config whose
+        // args carry a number or a null parses fine, but every consumer below
+        // (isOamLaunch, oamRunEntryPath) calls string methods on each token --
+        // so the old `as string[]` threw a TypeError into this function's outer
+        // catch and reported a perfectly parseable file as "exists but JSON is
+        // malformed", sending the user to fix a syntax error that isn't there.
+        const args = Array.isArray(entryArgs) ? entryArgs.filter((a): a is string => typeof a === "string") : [];
         launchRuntime = isOamLaunch(command, args) ? "oam" : "node";
         // A BARE oam command is the one shape the absolute-path check above
         // cannot see, and it is the shape older installs actually wrote. It
@@ -2289,8 +2328,10 @@ function readTailLines(path: string, n: number): string[] {
 // leading env-var assignments (`FOO=bar CMD=quux cmd arg`), launcher
 // wrappers (`sudo` / `env` / `nohup` / `nice` / ...), path-style
 // invocations (`/usr/local/bin/npm` → `npm`) and a Windows executable
-// suffix (`npm.cmd` → `npm`). Returns null for lines we can't
-// confidently parse (pipes, command substitution, assignments only).
+// suffix (`npm.cmd` → `npm`), and lowercasing the result (`NPM` → `npm`)
+// so it matches the lowercase-keyed tables in cli-shadows.ts. Returns null
+// for lines we can't confidently parse (pipes, command substitution,
+// assignments only).
 function extractLeadingBinary(command: string): string | null {
   let rest = command.trimStart();
   if (!rest) return null;
@@ -2327,12 +2368,15 @@ function extractLeadingBinary(command: string): string | null {
   // Strip path prefix — we match on the binary name.
   const slash = Math.max(first.lastIndexOf("/"), first.lastIndexOf("\\"));
   const name = slash === -1 ? first : first.slice(slash + 1);
-  // Strip a Windows executable suffix. PowerShell / cmd history records what
-  // the user typed, and on Windows that is routinely `npm.cmd audit` or
-  // `gh.exe pr list` -- neither of which matches the shadow map, whose keys
-  // are bare binary names. Case-insensitive: PATHEXT is upper-case by
-  // convention and `NPM.CMD` is the same program.
-  return name.replace(/\.(exe|cmd|bat)$/i, "");
+  // Strip a Windows executable suffix, then lowercase. PowerShell / cmd
+  // history records what the user typed, and on Windows that is routinely
+  // `npm.cmd audit`, `gh.EXE pr list` or plain `NPM audit` -- none of which
+  // matches the shadow map, whose keys are bare lowercase binary names and are
+  // compared exactly. Both tables in cli-shadows.ts push that normalization
+  // onto the caller, and this is the caller. Lowercasing the whole name (not
+  // just the suffix) is safe because ShadowHit.cli is only displayed and
+  // looked up, never executed.
+  return name.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
 }
 
 // Version compare, delegated to oam-spawn's `compareVersions` -- the canonical
