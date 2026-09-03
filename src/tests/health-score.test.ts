@@ -302,32 +302,93 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     expect(scrubForWarning("SLACK_BOT_TOKEN: n/a")).toBe("SLACK_BOT_TOKEN: n/a");
   });
 
-  it("does not invert a diagnostic whose first word is not an enumerated absence word", () => {
-    // The enumerated list only ever covered the FIRST whitespace-delimited
-    // token of the phrasings someone happened to list, so every other prose
-    // shape inverted exactly the same way. The real invariant is "this value
-    // is prose, not a credential": purely alphabetic, short, and followed by
-    // more word text on the line. The last one is zod v4's .parse(process.env)
-    // output -- the dominant config-validation shape in TS MCP servers.
+  it("hides rather than inverts a diagnostic, whatever its phrasing", () => {
+    // The invariant is that no output ever reads as "credential present but
+    // rejected". A first token on the ABSENCE_VALUE safe-list keeps its clause,
+    // so the common phrasings still read; anything else is redacted WHOLE.
+    // Hidden is the accepted cost -- inverted is the bug.
     expect(scrubForWarning("SLACK_BOT_TOKEN: must be provided")).toBe("SLACK_BOT_TOKEN: must be provided");
-    expect(scrubForWarning("API_KEY: environment variable not found")).toBe("API_KEY: environment variable not found");
-    expect(scrubForWarning("api_key: value is empty")).toBe("api_key: value is empty");
     expect(scrubForWarning("Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined")).toBe(
       "Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined",
     );
+    // Not on the safe-list, so the clause goes in full. The point is what does
+    // NOT happen: no "<redacted> variable not found" tail asserting a value.
+    expect(scrubForWarning("API_KEY: environment variable not found")).toBe("API_KEY: <redacted>");
+    expect(scrubForWarning("api_key: value is empty")).toBe("api_key: <redacted>");
+    // The property that actually matters, over every phrasing above.
+    for (const line of [
+      "SLACK_BOT_TOKEN: must be provided",
+      "API_KEY: environment variable not found",
+      "api_key: value is empty",
+      "GITHUB_TOKEN: not set",
+      "Config error: GITHUB_TOKEN: Invalid input: expected string, received undefined",
+    ]) {
+      expect(scrubForWarning(line)).not.toMatch(/<redacted>\s+\S/);
+    }
   });
 
-  it("gates only a value that is prose, never one that could be a credential", () => {
-    // Both gates are anchored, so neither can be used to smuggle a real value
-    // past the scrubber: a digit or any punctuation fails the prose gate, and
-    // prefixing with "not" / "none" does not satisfy the anchored absence gate.
+  it("cannot be used to smuggle a value past the scrubber", () => {
+    // ABSENCE_VALUE is anchored, so prefixing a real value with "not" / "none"
+    // does not satisfy it, and nothing about the value's SHAPE buys an
+    // exemption any more -- length, alphabet and position are all irrelevant.
     expect(scrubForWarning("GITHUB_TOKEN=notasecret123")).toBe("GITHUB_TOKEN=<redacted>");
     expect(scrubForWarning("api_key=noneofyourbusiness42")).toBe("api_key=<redacted>");
-    // Alphabetic but too long to be prose -- 13+ chars fails the gate.
     expect(scrubForWarning("api_key=correcthorsebatterystaple then 502")).toBe("api_key=<redacted> then 502");
-    // Short and alphabetic, but it ENDS the clause: a NAME=value dump, not a
-    // sentence, so it is redacted WHOLE rather than left visible.
     expect(scrubForWarning("token=hunter")).toBe("token=<redacted>");
+    // Machine config formats put whitespace after the separator too, which is
+    // what attempt 3 read as prose -- these all leaked at 7b72e4a.
+    expect(scrubForWarning("api_key: abcdef")).toBe("api_key: <redacted>");
+    expect(scrubForWarning("MYSQL_PASSWORD: swordfish")).toBe("MYSQL_PASSWORD: <redacted>");
+    expect(scrubForWarning("X-Api-Key: abcdefghijkl")).toBe("X-Api-Key: <redacted>");
+    expect(scrubForWarning("API_KEY = supersecret")).toBe("API_KEY = <redacted>");
+    expect(scrubForWarning("api_key:\tabcdef")).toBe("api_key:\t<redacted>");
+    expect(scrubForWarning("token:   hunterxx")).toBe("token:   <redacted>");
+  });
+
+  it("redacts a quoted value in either quote style, body only", () => {
+    // The old separator knew only the double quote, so a single-quoted value
+    // never matched at all and leaked whole -- Python reprs, shell export,
+    // single-quoted YAML. Quotes are explicit bounds: redact the body, keep
+    // the quotes, and never spill into the neighbouring key.
+    expect(scrubForWarning('{"token":"abcdef","x":1}')).toBe('{"token":"<redacted>","x":1}');
+    expect(scrubForWarning("{'token': 'abc123secret'}")).toBe("{'token': '<redacted>'}");
+    expect(scrubForWarning("export API_KEY='s3cr3t'")).toBe("export API_KEY='<redacted>'");
+  });
+
+  it("redacts every pair on a line, not just the first", () => {
+    // remoteFailureDetail collapses an error to ONE line, so a tail that runs
+    // past the next NAME= swallows it. Each pair has to stand on its own.
+    expect(scrubForWarning("PASSWORD=letmein API_KEY=zzzzzzzzzz")).toBe("PASSWORD=<redacted> API_KEY=<redacted>");
+    expect(scrubForWarning("PASSWORD=letmein API_KEY=zzzzzzzzzz HOME=/root")).toBe(
+      "PASSWORD=<redacted> API_KEY=<redacted> HOME=/root",
+    );
+    expect(scrubForWarning("spawn failed: password=hunter, api_key=abcdef123456")).toBe(
+      "spawn failed: password=<redacted>, api_key=<redacted>",
+    );
+    // A whole-clause redaction still stops at a dash-run, so the actionable
+    // half of the message survives.
+    expect(scrubForWarning("api_key: abcdef -- upstream returned 502")).toBe(
+      "api_key: <redacted> -- upstream returned 502",
+    );
+  });
+
+  it("names a non-bearer auth scheme instead of redacting the scheme word", () => {
+    // Rule 1 knew only bearer/basic, so any other scheme fell through to rule
+    // 2, which captured the SCHEME WORD as the value and left the token.
+    expect(scrubForWarning("Authorization: Token abc123def456")).toBe("Authorization: <redacted>");
+    expect(scrubForWarning("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9")).toBe("Authorization: <redacted>");
+  });
+
+  it("stays linear on a long collapsed line", () => {
+    // The unbounded prefix group was O(n^2) against a hyphen-joined run: 784 ms
+    // on 64 KB, and the message is stored, so it recurred on every discover().
+    const kebab = `token=${"a-".repeat(32_000)}`;
+    const pairs = "token=abc123 ".repeat(20_000);
+    for (const input of [kebab, pairs]) {
+      const t0 = performance.now();
+      scrubForWarning(input);
+      expect(performance.now() - t0, `${input.length} bytes`).toBeLessThan(2000);
+    }
   });
 
   it("redacts a machine-written pair even when more text follows on the line", () => {

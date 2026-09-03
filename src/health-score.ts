@@ -140,72 +140,64 @@ const SECRET_KEY_NAMES =
   "api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|" +
   "private[-_]?key|secret|password|passwd|pwd|token|authorization|auth|credential|signature|sig";
 
-// A VALUE that is PROSE is a DIAGNOSTIC, not a credential, and redacting it
-// inverts what upstream said. The value class at rule 2 stops at the first
-// whitespace, so a redaction consumes only the first word and the rest of the
-// sentence survives: "GITHUB_TOKEN: not set" became "GITHUB_TOKEN: <redacted>
-// set", flipping the reading from "credential absent" to "credential present
-// but rejected". The same inversion hit every other diagnostic phrasing --
-// "SLACK_BOT_TOKEN: must be provided", "API_KEY: environment variable not
-// found", "api_key: value is empty", and zod's "GITHUB_TOKEN: Invalid input:
-// expected string, received undefined". These are exactly the lines a
-// spawn/config failure produces, and they reach the user through
-// activationFailures -> the discover() warn line. Over-scrubbing is an
-// equal-and-opposite regression to leaking (see the header above), and an
-// INVERTED diagnostic is worse than a hidden one.
+// REDACT WHOLE, DO NOT CLASSIFY. Three attempts tried to tell a diagnostic
+// value from a credential and each was wrong in a different direction:
 //
-// So the invariant is "this value is prose, not a credential" -- NOT "this
-// value is one of N enumerated words", which only ever covered the first word
-// of the first phrasing anyone happened to list.
+//   1. An enumerated absence-word list matched only the FIRST whitespace-
+//      delimited token, so every phrasing nobody listed still inverted:
+//      "SLACK_BOT_TOKEN: must be provided" -> "<redacted> be provided".
+//   2. Asking whether TEXT FOLLOWS on the line exempted a value whenever
+//      anything word-shaped came later -- a second pair, a JSON sibling, a
+//      query parameter, even the marker rule 1 had just inserted. It leaked
+//      real secrets and rescanned the line per match (796 ms on 260 KB).
+//   3. Gating on the SEPARATOR assumed a space after the colon means prose.
+//      Every machine config format puts one there -- YAML, TOML, INI, spaced
+//      .env, column-aligned and header dumps -- so "api_key: abcdef" and
+//      "MYSQL_PASSWORD: swordfish" leaked whole.
 //
-// The discriminator is the SEPARATOR, not the surrounding text. That is the
-// third attempt at this gate and the reason for it is worth recording, because
-// the two obvious approaches are both wrong:
+// The lesson is that the distinction is NOT DECIDABLE from the text: `abcdef`
+// and `missing` are the same shape in the same position. So this revision
+// stops guessing and makes every redaction WHOLE, because the damage was
+// never the redaction -- it was the PARTIAL one. A surviving tail ("<redacted>
+// set") reads as "credential present but rejected" when the truth is
+// "credential absent", and this header has always held that an INVERTED
+// diagnostic is worse than a hidden one.
 //
-//   * An enumerated absence-word list only matches the first whitespace-
-//     delimited token, so every phrasing nobody thought of ("must be
-//     provided", zod's "Invalid input: ...") still inverted.
-//   * Testing whether TEXT FOLLOWS on the line exempts a value whenever
-//     anything word-shaped appears later -- a second name=value pair, a JSON
-//     sibling key, a query parameter, even the <redacted> marker rule 1 just
-//     inserted. That un-redacted real secrets ("password=hunter host=db",
-//     "?api_key=deadbeef&user=bob"), worst on remoteFailureDetail, which
-//     collapses an error to ONE line so every pair but the last has a tail.
-//     It also cost a line-length rescan per match: 796 ms on 260 KB vs 11 ms.
+// What that means per shape:
 //
-// A separator carries the intent directly, in constant time. Machines write
-// NAME=value and "name": "value" -- compact, or quoted. Humans writing a
-// sentence put a space after the colon: "GITHUB_TOKEN: not set". So:
+//   quoted value    -- explicit bounds, so redact the BODY and keep the
+//                      quotes. BOTH quote styles: the old separator knew only
+//                      the double quote, so a single-quoted value never
+//                      matched and leaked whole (Python reprs, shell export).
+//   compact NAME=v  -- the value is unambiguously ONE token. Redact it and
+//                      leave the rest of the line alone.
+//   NAME: <space>   -- where the value ends is undecidable, so redact to the
+//                      end of the clause. The tail stops at a dash-run and at
+//                      the next NAME=/NAME: pair, so " -- upstream returned
+//                      502" survives and a following pair is still redacted
+//                      on its own.
 //
-//   PROSE_SEPARATOR -- whitespace AFTER the = or :, and NO quote anywhere in
-//                   the separator. A quote means the value was machine-quoted;
-//                   no trailing space means a compact dump. Either way, redact.
-//   PROSE_VALUE  -- the value is purely alphabetic and short, so it cannot be
-//                   a strong credential. Any digit, any punctuation, or more
-//                   than 12 chars fails it, which keeps GITHUB_TOKEN=
-//                   notasecret123 and api_key=noneofyourbusiness42 blanked.
+// ABSENCE_VALUE is the ONE safe-list and the only judgement left, because it
+// is the only one that needs none: no credential is literally the word
+// "unset". It keeps the clause intact so the common diagnostics still read.
 //
-// ABSENCE_VALUE stays as a separator-independent fast path, so the bare-absence
-// case survives even in a compact dump ("GITHUB_TOKEN=unset"). Anchored on
-// purpose -- it gates only a value that is nothing BUT the absence word.
+// Accepted cost, stated plainly: a diagnostic whose first value token is not
+// on that list is now HIDDEN rather than shown -- "API_KEY: environment
+// variable not found" becomes "API_KEY: <redacted>". That is the deliberate
+// trade. Widening the list to recover those lines is attempt 1 again.
 //
-// A value that fails the gates is redacted WHOLE: the gates never CREATE a
-// partial redaction, which is the inversion itself. (The value class below
-// stops at a quote or a delimiter, so `token=abc'def` has always redacted to
-// `token=<redacted>'def`. That is a value-class question, older than these
-// gates, and deliberately not folded in here.)
-//
-// Residual risk, stated plainly: a SHORT ALL-ALPHABETIC secret written with a
-// space after the colon ("token: hunter") stays visible. That is bounded -- a
-// value with no digit and no punctuation in 12 chars is not a strong
-// credential -- and the 120-char cap below still applies.
-const ABSENCE_VALUE = /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank|nil|n\/a)$/i;
-const PROSE_VALUE = /^[A-Za-z]{1,12}$/;
-const PROSE_SEPARATOR = /^[^"]*[=:]\s+$/;
+// (The value class below stops at a quote or delimiter, so `token=abc'def`
+// still yields `token=<redacted>'def`. That is a value-class question older
+// than these gates and deliberately not folded in here.)
+const ABSENCE_VALUE =
+  /^(?:not|no|missing|unset|undefined|null|none|empty|required|absent|blank|nil|n\/a|must|invalid|expected|cannot|failed)$/i;
 
 const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...groups: string[]) => string }> = [
   // 1. An HTTP `Authorization: Bearer <blob>` / `Basic <blob>` header value.
-  { re: /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: () => REDACTED },
+  // Scheme list is not just bearer/basic: any other scheme fell through to
+  // rule 2, which then captured the SCHEME WORD as the value and left the
+  // token itself in the clear ("Authorization: Token abc123def456").
+  { re: /\b(?:bearer|basic|token|apikey|api-key|digest|key|hmac)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: () => REDACTED },
   // 2. A secret-ish key followed by = or : and a value -- a query string, a
   //    JSON body, a header dump, or a Python repr ({'token': 'abc'}).
   //
@@ -230,10 +222,40 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   //    line to decide; that was both wrong (any later word exempted the value)
   //    and quadratic on a long collapsed line.
   {
-    re: new RegExp(`\\b((?:[A-Za-z0-9]+[-_])*(?:${SECRET_KEY_NAMES}))("?\\s*[=:]\\s*"?)([^\\s,;&"'}\\]<]+)`, "gi"),
-    replace: (match, name, sep, value) => {
-      if (ABSENCE_VALUE.test(value)) return match;
-      if (PROSE_SEPARATOR.test(sep) && PROSE_VALUE.test(value)) return match;
+    // The prefix repetition is BOUNDED. `(?:[A-Za-z0-9]+[-_])*` is O(n^2)
+    // against a long hyphen-joined run, because `\b` matches at every hyphen so
+    // the scan restarts per position: 784 ms on a 64 KB kebab chain, 12.4 s at
+    // 100 KB, and the message is stored, so it recurs on every discover().
+    // Nothing real has 8 prefix segments of 32 chars.
+    re: new RegExp(
+      `\\b((?:[A-Za-z0-9]{1,32}[-_]){0,8}(?:${SECRET_KEY_NAMES}))` +
+        `(["']?\\s*[=:][ \\t]*)` +
+        // The tail stops at a dash-run (so " -- upstream returned 502" survives
+        // as its own clause) and at the next NAME=/NAME: pair -- without that
+        // second guard the tail swallowed the following pair, and
+        // "PASSWORD=letmein API_KEY=zzz" redacted only the first of the two.
+        `(?:'([^'\\n]*)'|"([^"\\n]*)"|([^\\s,;&"'}\\]<]+)` +
+        `((?:[ \\t]+(?!-)(?![A-Za-z0-9_-]+["']?[ \\t]*[=:])[^\\s,;&"'}\\]<]+)*))`,
+      "gi",
+    ),
+    replace: (_match, name, sep, single, double, bare, tail) => {
+      // A quoted value has explicit bounds, so redact the BODY and keep the
+      // quotes. Both quote styles: the old separator knew only `"`, so a
+      // single-quoted value failed to match at all and leaked whole -- Python
+      // reprs, shell `export`, single-quoted YAML.
+      if (single !== undefined) return `${name}${sep}'${REDACTED}'`;
+      if (double !== undefined) return `${name}${sep}"${REDACTED}"`;
+      // The only safe-list. Keeps the clause intact so the diagnostic reads.
+      if (ABSENCE_VALUE.test(bare)) return `${name}${sep}${bare}${tail}`;
+      // Compact separator: the value is unambiguously ONE token, so redact it
+      // and leave the rest of the line alone.
+      if (!/[ \t]$/.test(sep)) return `${name}${sep}${REDACTED}${tail}`;
+      // Whitespace separator: where the value ends is NOT decidable. Three
+      // attempts tried (enumerated absence words, then "does text follow?",
+      // then the separator shape) and each one either inverted a diagnostic or
+      // exempted a real credential, because `abcdef` and `missing` are the same
+      // shape. So stop classifying and redact the whole clause: a partial
+      // redaction is what inverts the meaning, and hiding beats inverting.
       return `${name}${sep}${REDACTED}`;
     },
   },
