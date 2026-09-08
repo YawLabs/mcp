@@ -717,3 +717,69 @@ describe("loadYawMcpConfig — installNudge flag", () => {
     expect(r.warnings.some((x) => x.includes("'installNudge'"))).toBe(false);
   });
 });
+
+describe("blockedTools", () => {
+  it("loads tool names that NAMESPACE_RE would reject", async () => {
+    // The entry validator is parameterized precisely because these are wire
+    // tool names, not namespaces: NAMESPACE_RE is lowercase-only and caps at
+    // 30 characters, which real tool names routinely exceed.
+    writeConfig(synthHome, "config.json", {
+      blockedTools: ["gh_delete_repo", "pg_drop_*", "srv_a_very_long_tool_name_that_exceeds_thirty"],
+    });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blockedTools).toEqual(["gh_delete_repo", "pg_drop_*", "srv_a_very_long_tool_name_that_exceeds_thirty"]);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it("unions across scopes so a project config can add a deny but never subtract one", async () => {
+    writeConfig(synthHome, "config.json", { blockedTools: ["gh_delete_repo"] });
+    writeConfig(synthCwd, "config.json", { blockedTools: ["pg_drop_table"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect([...(r.blockedTools ?? [])].sort()).toEqual(["gh_delete_repo", "pg_drop_table"]);
+  });
+
+  it("warns on an entry that could never match a tool", async () => {
+    writeConfig(synthHome, "config.json", { blockedTools: ["GH Delete"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("is not a valid tool name"))).toBe(true);
+    // A WARNING, never a drop: dropping would empty the array, hit the
+    // fall-through, and silently promote a specific scope's deny into the
+    // parent scope's allow-all.
+    expect(r.blockedTools).toEqual(["GH Delete"]);
+  });
+
+  it("warns that a meta-tool cannot be blocked", async () => {
+    writeConfig(synthHome, "config.json", { blockedTools: ["mcp_connect_exec"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("names a yaw-mcp meta-tool"))).toBe(true);
+  });
+
+  it("warns that an entry with no separator cannot be a wire name", async () => {
+    // Almost always someone trying to block a whole server in the wrong key.
+    writeConfig(synthHome, "config.json", { blockedTools: ["github"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("no '_' separator") && w.includes("use 'blocked'"))).toBe(true);
+  });
+
+  it("refuses a bare wildcard", async () => {
+    // A deny that matches everything is far likelier a mistake than an
+    // intent, and `blocked` is how a server gets turned off.
+    writeConfig(synthHome, "config.json", { blockedTools: ["*"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("is not a valid tool name"))).toBe(true);
+  });
+
+  it("leaves the namespace warning wording untouched for servers and blocked", async () => {
+    // The two validators are separate; this pins that parameterizing one did
+    // not reword the other.
+    writeConfig(synthHome, "config.json", { blocked: ["GitHub"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.warnings.some((w) => w.includes("is not a valid namespace") && w.includes("'GitHub'"))).toBe(true);
+  });
+
+  it("is undefined when no scope sets it", async () => {
+    writeConfig(synthHome, "config.json", { servers: ["gh"] });
+    const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
+    expect(r.blockedTools).toBeUndefined();
+  });
+});

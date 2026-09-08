@@ -48,6 +48,11 @@ export interface LoadedConfigFile {
   version?: number;
   servers?: string[];
   blocked?: string[];
+  /** Per-TOOL deny-list, holding flattened `<namespace>_<tool>` wire names
+   *  with an optional single trailing `*`. A different axis from `blocked`,
+   *  which names whole servers and is evaluated at SPAWN; these are evaluated
+   *  at CALL. */
+  blockedTools?: string[];
   /** Opt-in flag for the shadow-driven install nudge. Off (undefined)
    *  by default; only `true` enables it. See install-nudge.ts. */
   installNudge?: boolean;
@@ -58,6 +63,10 @@ export interface ResolvedConfig {
   servers?: string[];
   /** Deny-list (union across all scopes that set it). */
   blocked?: string[];
+  /** Per-tool deny-list, union across every scope that sets it -- the same
+   *  merge as `blocked`, and for the same reason: a project config may ADD a
+   *  deny, never subtract one. Undefined when no scope sets it. */
+  blockedTools?: string[];
   /** Opt-in: enable the shadow-driven install nudge in discover. Resolved
    *  most-specific-scope-wins (local > project > global). Undefined when no
    *  scope sets it (treated as off). The env var YAW_MCP_INSTALL_NUDGE=1
@@ -109,6 +118,7 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "version",
   "servers",
   "blocked",
+  "blockedTools",
   "installNudge",
 ]);
 
@@ -150,7 +160,49 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
  *  isAllowed, so a `servers:[123]` at a specific scope would otherwise
  *  silently shadow a valid parent scope's allow-list with allow-all. A
  *  genuinely empty [] is preserved as-is (an explicit "no filter"). */
-function filterStringArray(raw: unknown, field: string, path: string, warnings: string[]): string[] | undefined {
+/** Per-entry shape check. Parameterized because `servers`/`blocked` hold
+ *  NAMESPACES while `blockedTools` holds flattened `<namespace>_<tool>` wire
+ *  names, which NAMESPACE_RE rejects outright -- it is lowercase-only and caps
+ *  at 30 characters, which real tool names routinely exceed. Returns the
+ *  warning text, or null when the entry is fine. */
+type EntryValidator = (entry: string, field: string, path: string) => string | null;
+
+const namespaceEntry: EntryValidator = (entry, field, path) =>
+  NAMESPACE_RE.test(entry)
+    ? null
+    : `${path}: '${field}' entry '${entry}' is not a valid namespace (a lowercase letter followed by [a-z0-9_]) -- it can never match an installed server.`;
+
+/** A flattened wire tool name, optionally ending in a single `*` wildcard.
+ *  A bare `*` is refused: a deny that matches everything is far more likely a
+ *  mistake than an intent, and `blocked` is the way to turn a server off. */
+const TOOL_ENTRY_RE = /^[A-Za-z0-9_.:-]+\*?$/;
+
+const toolEntry: EntryValidator = (entry, field, path) => {
+  if (!TOOL_ENTRY_RE.test(entry)) {
+    return `${path}: '${field}' entry '${entry}' is not a valid tool name (letters, digits, '_', '.', ':', '-', with an optional single trailing '*') -- it can never match a tool.`;
+  }
+  // Meta-tools are the broker's own control surface: blocking one would
+  // disable the mechanism the user manages the block WITH, and the call gate
+  // deliberately runs after the meta-tool branches, so an entry naming one
+  // could never fire. Say so rather than leaving a line that does nothing.
+  if (entry.startsWith("mcp_connect_")) {
+    return `${path}: '${field}' entry '${entry}' names a yaw-mcp meta-tool, which cannot be blocked -- remove it, or block the upstream server with 'blocked'.`;
+  }
+  // Without a separator the entry cannot be a `<namespace>_<tool>` wire name,
+  // so it is almost always someone trying to block a whole server here.
+  if (!entry.includes("_")) {
+    return `${path}: '${field}' entry '${entry}' has no '_' separator, so it cannot be a '<namespace>_<tool>' name -- to block a whole server use 'blocked'.`;
+  }
+  return null;
+};
+
+function filterStringArray(
+  raw: unknown,
+  field: string,
+  path: string,
+  warnings: string[],
+  validate: EntryValidator = namespaceEntry,
+): string[] | undefined {
   if (!Array.isArray(raw)) {
     // A PRESENT but non-array value (`"servers": "github"` -- the plausible
     // hand-edit for "lock this session to one server") used to be dropped in
@@ -188,11 +240,8 @@ function filterStringArray(raw: unknown, field: string, path: string, warnings: 
   // exists to prevent. NAMESPACE_RE is imported from local-bundles.ts rather
   // than re-spelled so the validator and the installer pin one definition.
   for (const s of strings) {
-    if (!NAMESPACE_RE.test(s)) {
-      warnings.push(
-        `${path}: '${field}' entry '${s}' is not a valid namespace (a lowercase letter followed by [a-z0-9_]) -- it can never match an installed server.`,
-      );
-    }
+    const problem = validate(s, field, path);
+    if (problem) warnings.push(problem);
   }
   // All entries invalid (non-empty array that filtered to []): treat as
   // unset so the resolver falls through to the parent scope instead of
@@ -282,6 +331,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
 
   const servers = filterStringArray(obj.servers, "servers", path, warnings);
   const blocked = filterStringArray(obj.blocked, "blocked", path, warnings);
+  const blockedTools = filterStringArray(obj.blockedTools, "blockedTools", path, warnings, toolEntry);
   // Only a literal boolean is honored — a non-boolean (string "true",
   // number 1) is ignored rather than coerced, so a typo can't silently
   // flip on a privacy-sensitive nudge.
@@ -296,7 +346,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
     );
   }
 
-  return { path, scope, version, servers, blocked, installNudge };
+  return { path, scope, version, servers, blocked, blockedTools, installNudge };
 }
 
 /** Merge servers (allow-list): most specific scope wins. */
@@ -320,13 +370,13 @@ function pickInstallNudge(files: LoadedConfigFile[]): boolean | undefined {
 }
 
 /** Merge blocked (deny-list): union across all scopes that declare it. */
-function unionBlocked(files: LoadedConfigFile[]): string[] | undefined {
+function unionStringField(files: LoadedConfigFile[], field: "blocked" | "blockedTools"): string[] | undefined {
   const set = new Set<string>();
   let touched = false;
   for (const f of files) {
-    if (f.blocked) {
+    if (f[field]) {
       touched = true;
-      for (const b of f.blocked) set.add(b);
+      for (const b of f[field]) set.add(b);
     }
   }
   return touched ? [...set] : undefined;
@@ -405,7 +455,8 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
 
   return {
     servers: pickServers(loadedFiles),
-    blocked: unionBlocked(loadedFiles),
+    blocked: unionStringField(loadedFiles, "blocked"),
+    blockedTools: unionStringField(loadedFiles, "blockedTools"),
     installNudge: pickInstallNudge(loadedFiles),
     projectConfigDir,
     loadedFiles,
@@ -428,13 +479,18 @@ export interface Profile {
   userPath?: string;
   servers?: string[];
   blocked?: string[];
+  /** Per-tool denies, carried so a refusal can name the file that declares
+   *  one and `mcp_connect_health` can show the policy. */
+  blockedTools?: string[];
 }
 
 /** Derive a Profile from a ResolvedConfig, or null if no allow/deny
  *  rules are set anywhere. Display-only: it condenses which files
  *  contributed into `path` (+ `userPath`) for `handleHealth()`. */
 export function toProfile(config: ResolvedConfig): Profile | null {
-  if (config.servers === undefined && config.blocked === undefined) return null;
+  if (config.servers === undefined && config.blocked === undefined && config.blockedTools === undefined) {
+    return null;
+  }
   const byScope = new Map<ConfigScope, LoadedConfigFile>();
   for (const f of config.loadedFiles) byScope.set(f.scope, f);
 
@@ -455,6 +511,7 @@ export function toProfile(config: ResolvedConfig): Profile | null {
     path: primary.path,
     servers: config.servers,
     blocked: config.blocked,
+    blockedTools: config.blockedTools,
   };
   if (primary !== global && global) {
     result.userPath = global.path;

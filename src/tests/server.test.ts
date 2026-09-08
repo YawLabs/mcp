@@ -4874,6 +4874,172 @@ describe("per-tool filter rollback on a failed activation", () => {
   });
 });
 
+describe("blockedTools deny gate", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  const withDeny = (priv: ReturnType<typeof getPrivate>, entries: string[], userPath?: string) => {
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: entries, ...(userPath ? { userPath } : {}) };
+  };
+
+  it("refuses a denied tool by name and names the file to edit", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    const result = await priv.handleToolCall("gh_delete_repo", {});
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('Tool "gh_delete_repo" is blocked');
+    expect(text).toContain("/h/.yaw-mcp/config.json");
+    // The model is told to report the block, not to work around it -- a
+    // refusal that only says "no" invites a shell command instead.
+    expect(text).toContain("instead of routing around it");
+  });
+
+  it("brands the refusal as a routing fault so no upstream is blamed for it", async () => {
+    // handleExec books a persisted 0.0 reliability outcome against the
+    // upstream for any step result that is NOT branded, and routes stay
+    // complete for a blocked tool -- so an unbranded refusal would punish a
+    // healthy server for the user's own policy.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    expect(isRoutingFaultResult(await priv.handleToolCall("gh_delete_repo", {}))).toBe(true);
+  });
+
+  it("refuses before the upstream is ever spawned", async () => {
+    // The gate sits before the deferred-activation branch, which calls
+    // activateOne and starts the configured command with its vault-resolved
+    // env. Enforcement that arrives after the side effect is not
+    // enforcement, so this asserts on connectToUpstream, not on the text.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.toolCache.set("gh", [{ name: "delete_repo" }]);
+    withDeny(priv, ["gh_delete_repo"]);
+    vi.mocked(connectToUpstream).mockClear();
+
+    const result = await priv.handleToolCall("gh_delete_repo", {});
+    expect(result.isError).toBe(true);
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("matches a trailing-star entry as a prefix, and nothing else", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "pg", name: "Postgres" })]);
+    withDeny(priv, ["pg_drop_*"]);
+
+    expect((await priv.handleToolCall("pg_drop_table", {})).isError).toBe(true);
+    expect((await priv.handleToolCall("pg_drop_", {})).isError).toBe(true);
+    const allowed = await priv.handleToolCall("pg_select", {});
+    expect(String(allowed.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("does not match a bare tool name across servers", async () => {
+    // `<namespace>_<tool>` cannot be unambiguously re-split, since a
+    // namespace may itself contain `_`. So a bare entry is read as
+    // namespace `create`, tool `issue` -- and must not silently deny every
+    // server's create_issue.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["create_issue"]);
+
+    const result = await priv.handleToolCall("gh_create_issue", {});
+    expect(String(result.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("never blocks a meta-tool, even when one is listed", async () => {
+    // The gate runs after every meta-tool branch on purpose: blocking one
+    // would disable the surface the user manages the block with.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["mcp_connect_discover"]);
+
+    const result = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(result.isError).toBeFalsy();
+    expect(String(result.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("names both files when the deny could have come from either scope", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"], "/h/.yaw-mcp/global.json");
+
+    const text = (await priv.handleToolCall("gh_delete_repo", {})).content[0].text;
+    expect(text).toContain("whichever of");
+    expect(text).toContain("blockedTools merges across scopes");
+  });
+
+  it("changes nothing when no deny is configured", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.profile = null;
+
+    const result = await priv.handleToolCall("gh_delete_repo", {});
+    expect(String(result.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("annotates a blocked tool in the dormant list rather than hiding it", () => {
+    // This list describes what the SERVER offers. A tool silently missing
+    // from it reads as a yaw-mcp bug rather than as the user's own policy.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.toolCache.set("gh", [{ name: "create_issue" }, { name: "delete_repo" }]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    expect(priv.handleDiscover().content[0].text).toContain("known tools: create_issue, delete_repo [blocked]");
+  });
+
+  it("refuses an exec pipeline before any step runs", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    return priv
+      .handleExec({
+        steps: [
+          { id: "s1", tool: "gh_list_repos", args: {} },
+          { id: "s2", tool: "gh_delete_repo", args: {} },
+        ],
+      })
+      .then((result: { isError?: boolean; content: Array<{ text: string }> }) => {
+        expect(result.isError).toBe(true);
+        const text = result.content[0].text;
+        expect(text).toContain('step "s2"');
+        expect(text).toContain("no step ran.");
+        // Plain text, not the {ok, failedStep, partial} envelope: the SHAPE
+        // is the phase marker, and a preflight refusal borrowing the
+        // envelope would assert the pipeline ran.
+        expect(text).not.toContain("partial");
+      });
+  });
+
+  it("reports the meta-tool refusal for a step that is both a meta-tool and denied", () => {
+    // Ordering contract: what makes a step illegal is the tool it names.
+    // Meta-tools are unblockable at the gate, so a "blocked" message here
+    // would describe a refusal that could never happen.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["mcp_connect_exec"]);
+
+    return priv
+      .handleExec({ steps: [{ id: "s1", tool: "mcp_connect_exec", args: {} }] })
+      .then((result: { content: Array<{ text: string }> }) => {
+        expect(result.content[0].text).toContain("cannot be called from exec");
+        expect(result.content[0].text).not.toContain("blockedTools");
+      });
+  });
+});
+
 describe("discover cache invalidation", () => {
   let server: ConnectServer;
 

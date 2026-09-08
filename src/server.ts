@@ -745,6 +745,11 @@ export class ConnectServer {
         this.toolFilters,
         resolveToolExposure(),
         this.sessionActivated,
+        // Hidden here, refused at the gate, but still ROUTED: dropping the
+        // route instead would make a call by name return `Unknown tool`,
+        // which reads as a typo and sends the model hunting for a name that
+        // is right there.
+        (wireName) => this.isToolDenied(wireName),
       ),
     }));
 
@@ -1592,6 +1597,32 @@ export class ConnectServer {
       return this.attachGuideNudge(await this.handleSecretsReport(serverArg));
     }
 
+    // Per-tool deny gate. Runs here, and the position is the property:
+    // AFTER every meta-tool branch, so the control surface the user manages
+    // the block WITH can never be blocked; and BEFORE the route snapshot,
+    // because the deferred branch below calls activateOne, which spawns the
+    // upstream's configured command with its vault-resolved env. A gate one
+    // block later would start the process and inject the credential before
+    // refusing -- enforcement that arrives after the side effect.
+    //
+    // The refusal is BRANDED as a routing fault. handleExec books a persisted
+    // 0.0 reliability outcome against the upstream for any step result that is
+    // not branded, and routes stay complete for a blocked tool -- so an
+    // unbranded refusal would punish a perfectly healthy server for the user's
+    // own policy. The exec preflight normally keeps this path unreachable from
+    // exec, but that is a UX layer a refactor could reorder.
+    if (this.isToolDenied(name)) {
+      return brandRoutingFault({
+        content: [
+          {
+            type: "text",
+            text: `Tool "${name}" is blocked by the "blockedTools" list in ${this.blockedToolsSource()}. Report the block to the user instead of routing around it (a shell command, another server); if it should be callable, the entry must be removed and this MCP client restarted.`,
+          },
+        ],
+        isError: true,
+      });
+    }
+
     // Snapshot routes at method entry. rebuildRoutes() may fire during
     // the auto-reconnect awaits below (via onUpstreamListChanged from
     // any other connection, or via trackUsageAndAutoDeactivate on a
@@ -2049,6 +2080,42 @@ export class ConnectServer {
   // rather than by a number the model has to guess.
   private static readonly DISCOVER_TOOL_NAME_CAP = 5;
 
+  /** Is this flattened wire tool name denied by the resolved `blockedTools`?
+   *
+   *  Matched literally and case-sensitively against `<namespace>_<tool>` -- the
+   *  exact string tools/list advertises, buildToolRoutes keys on, the client
+   *  sends, and an exec step names. A single trailing `*` is a prefix match.
+   *
+   *  Namespace flattening means (ns `gh`, tool `actions_list`) and
+   *  (ns `gh_actions`, tool `list`) both render `gh_actions_list`, so a deny on
+   *  that string covers whichever upstream won the route collision. That is the
+   *  safe direction and is deliberately not disambiguated: a deny matching more
+   *  than the user pictured fails closed, one matching less fails open. */
+  private isToolDenied(wireName: string): boolean {
+    const denies = this.profile?.blockedTools;
+    if (!denies || denies.length === 0) return false;
+    for (const entry of denies) {
+      if (entry.endsWith("*")) {
+        if (wireName.startsWith(entry.slice(0, -1))) return true;
+      } else if (wireName === entry) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Which file the user has to edit. `blockedTools` merges across scopes, so
+   *  when both a project and a user-global config contributed we cannot say
+   *  which one carries THIS entry without re-reading them -- name both rather
+   *  than guess, since sending someone to the wrong file is worse than sending
+   *  them to two. */
+  private blockedToolsSource(): string {
+    if (!this.profile) return "your yaw-mcp config";
+    return this.profile.userPath
+      ? `whichever of ${this.profile.path} / ${this.profile.userPath} declares it (blockedTools merges across scopes)`
+      : this.profile.path;
+  }
+
   private handleDiscover(
     context?: string,
     focusNamespace?: string,
@@ -2411,6 +2478,15 @@ export class ConnectServer {
     const exposure = resolveToolExposure();
     const isAdvertised = (namespace: string): boolean => exposure === "full" || this.sessionActivated.has(namespace);
 
+    // One predicate behind every count that claims to describe tools/list.
+    // A tool hidden by a filter and a tool hidden by a deny both leave the
+    // advertised set, so both leave these numbers -- the difference between
+    // them is what happens on a CALL, not on a list.
+    const visibleTools = <T extends { name: string }>(namespace: string, tools: T[]): T[] => {
+      const f = this.toolFilters.get(namespace);
+      return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
+    };
+
     // The SESSION token total, computed over every live connection rather than
     // accumulated inside the card loop below. Two reasons, one new and one
     // pre-existing. New: the loop can now render a single focused server, and a
@@ -2430,8 +2506,7 @@ export class ConnectServer {
     for (const conn of this.connections.values()) {
       const ns = conn.config.namespace;
       if (conn.status !== "connected" || !isAdvertised(ns)) continue;
-      const f = this.toolFilters.get(ns);
-      const visible = f ? conn.tools.filter((t) => f.has(t.name)) : conn.tools;
+      const visible = visibleTools(ns, conn.tools);
       if (visible.length > 0) totalContextTokens += estimateFromConnectedTools(visible).tokens;
     }
 
@@ -2442,7 +2517,10 @@ export class ConnectServer {
       // still shown as the denominator so the model sees what's hidden.
       const filter = this.toolFilters.get(server.namespace);
       const total = connection?.tools.length ?? 0;
-      const exposed = connection ? (filter ? connection.tools.filter((t) => filter.has(t.name)).length : total) : 0;
+      const exposed = connection ? visibleTools(server.namespace, connection.tools).length : 0;
+      // The suffix still fires on a FILTER only: it reads `filtered: K of N`,
+      // which describes the model's own narrowing. A deny is the user's
+      // policy and is reported on the tool, not as a filter the model set.
       const filterSuffix = connection && filter ? ` (filtered: ${exposed} of ${total})` : "";
       const status = connection
         ? connection.status === "error"
@@ -2466,7 +2544,7 @@ export class ConnectServer {
       // total, which describes context actually spent.
       let costLabel = "";
       if (connection && connection.tools.length > 0) {
-        const visible = filter ? connection.tools.filter((t) => filter.has(t.name)) : connection.tools;
+        const visible = visibleTools(server.namespace, connection.tools);
         if (visible.length > 0) {
           const sample = estimateFromConnectedTools(visible);
           costLabel = ` — ${formatCostLabel(sample)}`;
@@ -2555,10 +2633,15 @@ export class ConnectServer {
             // cap depends on existing.
             const cap = focused ? cached.length : ConnectServer.DISCOVER_TOOL_NAME_CAP;
             const shown = cached.slice(0, cap);
+            // Annotated, not omitted. This list describes what the SERVER
+            // offers, and a tool quietly missing from it reads as a yaw-mcp
+            // bug rather than as the policy the user themselves wrote.
+            const label = (t: { name: string }): string =>
+              this.isToolDenied(`${server.namespace}_${t.name}`) ? `${t.name} [blocked]` : t.name;
             const hidden = cached.length - shown.length;
             if (hidden > 0) omittedToolNames = true;
             const more = hidden > 0 ? ` (+${hidden} more)` : "";
-            lines.push(`    known tools: ${shown.map((t) => t.name).join(", ")}${more}`);
+            lines.push(`    known tools: ${shown.map(label).join(", ")}${more}`);
           }
         }
       }
@@ -2654,8 +2737,7 @@ export class ConnectServer {
     const totalTools = Array.from(this.connections.values()).reduce((sum, c) => {
       const ns = c.config.namespace;
       if (c.status !== "connected" || !isAdvertised(ns)) return sum;
-      const f = this.toolFilters.get(ns);
-      return sum + (f ? c.tools.filter((t) => f.has(t.name)).length : c.tools.length);
+      return sum + visibleTools(ns, c.tools).length;
     }, 0);
     const tokenSummary = totalContextTokens > 0 ? ` (~${totalContextTokens.toLocaleString()} tokens)` : "";
     lines.push(`\n${activeCount} loaded in this session, ${totalTools} tools in context${tokenSummary}.`);
@@ -4659,6 +4741,25 @@ export class ConnectServer {
           {
             type: "text",
             text: `exec: step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    // Blocked tools next, for the same reason and in the same shape: a step
+    // naming a denied tool can never run, and finding that out at step 4 costs
+    // the side effects of steps 1 through 3. Plain text, because the SHAPE is
+    // the phase marker -- `exec: ...` means nothing ran, while the
+    // {ok, failedStep, error, partial} envelope means execution started.
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (!this.isToolDenied(step.tool)) continue;
+      const key = stepBindingKey(step, i);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `exec: step "${key}": tool "${step.tool}" is blocked by the "blockedTools" list in ${this.blockedToolsSource()}; no step ran.`,
           },
         ],
         isError: true,

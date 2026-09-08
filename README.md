@@ -230,6 +230,21 @@ Malformed files log a warning and fall through (fail-open). yaw-mcp reads config
 
 Drop a `YAW-MCP.md` next to `config.json` in either `.yaw-mcp/` and yaw-mcp surfaces it via a `yaw-mcp://guide` MCP resource. The `discover`/`dispatch` descriptions tell the model to read it first, so project routing conventions ("use the `gh` server, not bash") and credential guidance stick without restating them each session. A user guide (`~/.yaw-mcp/YAW-MCP.md`) and a project guide are concatenated with the project one last; a missing file is skipped silently.
 
+### Blocking individual tools
+
+`blocked` turns a whole server off. `blockedTools` turns off individual tools on servers you otherwise want:
+
+```jsonc
+// .yaw-mcp/config.json
+{ "blockedTools": ["gh_delete_repo", "pg_drop_*"] }
+```
+
+Entries are the flattened `<namespace>_<tool>` names that appear in the tool list, matched literally and case-sensitively, with an optional single trailing `*` for a prefix match. A bare `*` is refused, and a bare tool name does not match across servers -- `<namespace>_<tool>` cannot be split back apart reliably, because a namespace may itself contain `_`. The broker's own `mcp_connect_*` tools cannot be blocked.
+
+The two keys act on different events. `blocked` is checked when a server would start; `blockedTools` is checked when a tool would be called, which is also what makes it cover a tool reached inside an `mcp_connect_exec` pipeline. A pipeline naming a blocked tool is refused before any step runs, rather than failing partway through. Denies merge across config scopes, so a project config can add one but never remove one, and there is no allow-list counterpart.
+
+A blocked tool is withheld from the tool list, so the model does not see it as an option, but it keeps its route: calling it by name returns an explicit refusal rather than an unknown-tool error that reads like a typo. `discover` still shows it in a server's known-tools line, marked `[blocked]`, since that line describes what the server offers.
+
 ## Local secret vault
 
 Rather than putting credentials in a client config, keep a value in an encrypted file on your own machine and reference it with a `${secret:NAME}` placeholder. A **local** server takes it in `env`, which becomes the child process's environment:
