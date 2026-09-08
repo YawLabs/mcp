@@ -16,6 +16,8 @@
 // at once. Static strings would drift on a codebase that's been
 // shipping a subcommand a day.
 
+import { INSTALL_TARGETS } from "./install-targets.js";
+
 export type CompletionShell = "bash" | "zsh" | "fish" | "powershell";
 
 export interface CompletionCommandOptions {
@@ -70,7 +72,9 @@ interface SubcommandSpec {
   flags: string[];
 }
 
-const INSTALL_CLIENTS = ["claude-code", "claude-desktop", "cursor", "vscode"] as const;
+// Derived from the target table, not a hand-kept copy: a fourth list of the
+// same ids is a fourth place to forget when a client is added.
+const INSTALL_CLIENTS = INSTALL_TARGETS.map((t) => t.clientId);
 
 // Single source of truth for shell completion across bash/zsh/fish/powershell.
 // MUST cover every dispatched subcommand in KNOWN_SUBCOMMANDS (src/subcommands.ts)

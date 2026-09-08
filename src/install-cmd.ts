@@ -345,7 +345,7 @@ export interface InstallResult {
 }
 
 const USAGE =
-  "Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode> [--scope user|project|local]\n" +
+  "Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli> [--scope user|project|local]\n" +
   "                       [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                       [--force | --skip] [--dry-run]\n" +
   "       yaw-mcp install --list  (detect clients; no writes)\n" +
@@ -1537,6 +1537,18 @@ export function parseInstallArgs(argv: string[]):
       return {
         ok: false,
         error: `yaw-mcp install: --all chooses each client's scope itself and cannot honor --scope. Install the client you want at a specific scope individually.\n${USAGE}`,
+      };
+    }
+    // The same class once more, and newly reachable: every client in
+    // INSTALL_TARGETS now carries a user scope, so --all plans every one of
+    // them at user scope and hands `projectDir: undefined` to each
+    // sub-install. The flag would parse, print nothing and change nothing.
+    // (Before VS Code gained a user scope it was the one client --all could
+    // only reach WITH this flag, which is why it used to be honored.)
+    if (opts.all && opts.projectDir) {
+      return {
+        ok: false,
+        error: `yaw-mcp install: --all installs every client at its user scope, so --project-dir would be dropped. Write a workspace file directly: \`yaw-mcp install vscode --scope project --project-dir <path>\`.\n${USAGE}`,
       };
     }
     return { ok: true, options: opts as InstallCommandOptions };

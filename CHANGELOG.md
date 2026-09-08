@@ -33,6 +33,22 @@ Header values are validated with the runtime's own `Headers` parser, one key at 
 
 `doctor`'s SECRET VAULT section skipped remote entries entirely, behind a ten-line comment arguing that listing one would invent a cause: a remote "starts fine and gets a 401 from the far end". That was true and is now the opposite of true, since a remote with header refs genuinely does refuse to connect while the vault is locked. It scans `headers` for a remote and `env` for a local one -- the map that actually resolves in each case -- and the empty line now reads `no server env or header references ${secret:NAME}`. `mcp_connect_secrets` scans both maps for the same reason: it used to report that a remote needed no secrets while that server was refusing to connect over one. The `yaw-mcp trust` approval preview gained a `headers:` line beside `env:`, key names only, because approving a project `bundles.json` now authorizes yaw-mcp to send a vault secret to whatever URL that file names, while the preview showed a remote as a bare `HTTP <url>`.
 
+**Added -- Windsurf and Gemini CLI, and a VS Code user scope**
+
+`install` covered four clients. It now covers six, and stops refusing one of the four it already had: VS Code was wired workspace-only, so `install --all` printed `skip vscode` on every machine, which reads as a product that does not support your editor. It now writes the user-profile `mcp.json` that `MCP: Open User Configuration` opens, keeping the workspace file as a second scope. Windsurf and Gemini CLI are new rows in the same table -- appended, never inserted, because auto-detection returns the first usable slot in array order and treats Claude Code being first as an invariant.
+
+The rows carry what the docs actually say rather than what is convenient. Windsurf reads one cross-platform file and has no workspace config, and its note names the UI path to the raw config so a wrong path is self-diagnosing on the first install. Gemini CLI merges a user file with a project one, project winning, and `mcpServers` is a top-level key there, distinct from the sibling `mcp` object holding its own discovery knobs. The Linux VS Code path is hardcoded to `~/.config` rather than honouring `$XDG_CONFIG_HOME`, which is a real gap on a box that sets it; the path resolver reads no environment by design, since that purity is what stops install, `--list`, `doctor` and `try` naming four different files.
+
+**Fixed -- `try` wrote a file the client it detected does not read**
+
+`try` derived its scope from a hardcoded `clientId === "vscode" ? "project" : "user"` while auto-detection returns the first usable (client, SCOPE) slot. Those agreed only while VS Code had no user scope. The moment it gained one, a VS-Code-only machine would detect the user slot and then write `<cwd>/.vscode/mcp.json` -- a different file, possibly in a directory that is not a workspace at all.
+
+Auto-detection now returns the scope it found alongside the id, and the trial follows it. That also preserves a safety feature the naive fix would have removed: a repo shipping a committed `.vscode/mcp.json` is detected on the workspace slot, and a trial carrying an inline token into a commit-to-share file still demands `--yes` and still warns. With an explicit `--client` there is no detected slot, so a user scope is preferred and the table decides the fallback.
+
+**Changed -- `install --all --project-dir` is refused instead of ignored**
+
+Every client now has a user scope, so `--all` plans all of them there and hands no project directory to any sub-install: the flag would parse, print nothing and change nothing. It was previously the only way `--all` could reach VS Code, which is why it was honoured. This file already refuses `--all --scope` and `--list --scope` on the same reasoning -- a flag that is accepted and dropped reads as honoured -- and the refusal names the command that does write a workspace file, so it redirects rather than dead-ends.
+
 **Added -- `blockedTools`, a per-tool deny list enforced where the call happens**
 
 `blocked` has always been able to turn a whole server off, which is the wrong granularity for the common case: the server is one you want, and one or two of its tools are not. `blockedTools` names individual tools by the flattened `<namespace>_<tool>` string the tool list advertises, with an optional single trailing `*` for a prefix match, merged as a union across config scopes exactly like `blocked` -- so a project config can add a deny and never subtract one.

@@ -175,7 +175,8 @@ if (subcommand === "compliance") {
     install <client>         Connect one MCP client to yaw-mcp. This wires the
                              aggregator into the client; it does NOT add a
                              server (for that, see \`add\` below). <client> is
-                             one of: claude-code, claude-desktop, cursor, vscode.
+                             one of: claude-code, claude-desktop, cursor, vscode,
+                             windsurf, gemini-cli.
     install --list           List which MCP clients are installed on this
                              machine (read-only; no writes).
     install --all            Configure every installed MCP client in one go.

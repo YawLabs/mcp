@@ -54,14 +54,14 @@ Servers auto-unload after ~10 tool calls to other servers, so context stays clea
 ### One command (recommended)
 
 ```bash
-npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode>
+npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli>
 ```
 
 This edits the chosen client's config (correct path + JSON shape for your OS) to launch yaw-mcp. On Windows it wraps `npx` in `cmd /c` (without which MCP clients hit `ENOENT` on the `npx.cmd` shim). Run it once per client.
 
 Useful flags:
 
-- `--scope user|project|local` -- which file to write (Claude Code + Cursor support project/local; VS Code is workspace-only; Claude Desktop is user-only).
+- `--scope user|project|local` -- which file to write. Claude Code and Cursor support project and local; VS Code and Gemini CLI support user and project; Claude Desktop and Windsurf are user-only.
 - `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
 - `--force` / `--skip` -- overwrite or leave an existing `mcp` entry (otherwise prompts on a TTY, refuses off-TTY).
 

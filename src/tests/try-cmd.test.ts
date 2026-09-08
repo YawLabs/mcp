@@ -1773,8 +1773,8 @@ describe("runTry — auto-detected client (no --client)", () => {
   });
 });
 
-describe("runTry — vscode has no user scope", () => {
-  it("writes the trial into .vscode/mcp.json under the cwd, keyed on `servers`", async () => {
+describe("runTry -- an explicitly named client with nothing configured", () => {
+  it("writes the trial into VS Code's USER file, keyed on `servers`", async () => {
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
@@ -1788,19 +1788,21 @@ describe("runTry — vscode has no user scope", () => {
       fetchExplore: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
-    // vscode flips the scope to "project", so the trial lands in a WORKSPACE
-    // file that is routinely committed. With no inline secret there is
-    // nothing to publish, so no --yes is needed and nothing is said about it.
+    // Trials are user-scoped by design, and VS Code now has a user scope, so
+    // an explicitly named client with nothing configured lands in the private
+    // profile file rather than in a workspace file that gets committed. With
+    // no inline secret there is nothing to publish either way.
     expect(cap.errText()).toBe("");
-    const workspacePath = join(synthCwd, ".vscode", "mcp.json");
-    expect(existsSync(workspacePath)).toBe(true);
-    const config = JSON.parse(readFileSync(workspacePath, "utf8"));
+    const userPath = join(synthHome, ".config", "Code", "User", "mcp.json");
+    expect(existsSync(userPath)).toBe(true);
+    expect(existsSync(join(synthCwd, ".vscode", "mcp.json"))).toBe(false);
+    const config = JSON.parse(readFileSync(userPath, "utf8"));
     // VS Code's top-level key is `servers`, not `mcpServers`.
     expect(config.servers["yaw-mcp-try-demo"].command).toBe("npx");
     expect(config.mcpServers).toBeUndefined();
     const marker = JSON.parse(readFileSync(trialMarkerPath("demo", synthHome), "utf8")) as TrialMarker;
     expect(marker.clientName).toBe("vscode");
-    expect(marker.clientPath).toBe(workspacePath);
+    expect(marker.clientPath).toBe(userPath);
     expect(marker.containerPath).toEqual(["servers"]);
   });
 });
@@ -1856,7 +1858,9 @@ describe("runTry -- inline secret bound for a project-scope (commit-to-share) fi
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
-      clientId: "vscode",
+      // No --client, like the case above: the seeded workspace file is the
+      // only client config that exists, so auto-detect lands on that SLOT and
+      // the trial follows it there.
       dryRun: true,
       home: synthHome,
       cwd: synthCwd,
@@ -1877,7 +1881,7 @@ describe("runTry -- inline secret bound for a project-scope (commit-to-share) fi
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
-      clientId: "vscode",
+      // No --client, for the same reason as the two cases above.
       yes: true,
       home: synthHome,
       cwd: synthCwd,

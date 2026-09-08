@@ -502,13 +502,18 @@ async function defaultFetchExplore(slug: string, catalogUrl?: string): Promise<E
  *  whether the config directory can be written. A client whose directory is
  *  read-only is still selected here and fails later, at the write, with a
  *  path in the message. */
+/** The (client, scope) slot `try` should write into. Returning the SCOPE as
+ *  well as the id is what keeps the write in the file the probe actually
+ *  found: a user with only a committed `.vscode/mcp.json` is detected on the
+ *  workspace slot, and answering with the id alone left the caller to guess
+ *  the scope from a hardcoded client list. */
 async function autoDetectClient(opts: {
   home: string;
   os: InstallOS;
   cwd: string;
   claudeConfigDir: string | undefined;
   appData?: string;
-}): Promise<InstallClientId> {
+}): Promise<{ clientId: InstallClientId; scope: InstallScope | null }> {
   const probes = await probeClientsAsync({
     home: opts.home,
     os: opts.os,
@@ -520,15 +525,17 @@ async function autoDetectClient(opts: {
   // doctor could read (the user is actively using it, and `try` will be able
   // to splice into it).
   for (const p of probes) {
-    if (probeUsable(p)) return p.clientId;
+    if (probeUsable(p)) return { clientId: p.clientId, scope: p.scope };
   }
   // Second: any client that's available on this OS (config file not
   // yet created -- we'll create it). claude-code is availableOn every
   // InstallOS (see INSTALL_TARGETS), so it is always present and never
   // `unavailable` -- this loop always returns it (first in probe order)
   // when nothing else matches, which IS the claude-code fallback.
+  // Nothing is configured yet, so there is no slot to inherit a scope from:
+  // null means 'the caller picks', which is the user-scope preference below.
   for (const p of probes) {
-    if (!p.unavailable) return p.clientId;
+    if (!p.unavailable) return { clientId: p.clientId, scope: null };
   }
   // Unreachable: the loop above always returns (claude-code is available on
   // every OS). Throw rather than return a redundant literal so a future
@@ -594,24 +601,38 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
 
   // Step 2: pick a client (explicit > auto-detect).
-  const clientId =
-    opts.clientId ??
-    (await autoDetectClient({
-      home,
-      os,
-      cwd,
-      claudeConfigDir,
-      appData,
-    }));
+  const detected = opts.clientId ? null : await autoDetectClient({ home, os, cwd, claudeConfigDir, appData });
+  const clientId = opts.clientId ?? (detected as { clientId: InstallClientId }).clientId;
 
   // Step 3: resolve the config file path (user scope; project scope
   // requires extra flags we don't expose in `try` -- trials are
   // user-scoped by design).
-  // VS Code has no user scope -- only workspace. Fall back to project
-  // scope when targeting vscode; the user must be inside the workspace, and
-  // a secret-bearing entry then needs --yes (step 5b), because that file is
+  // Prefer a user scope, falling back to the client's first scope when it has
+  // none -- trials are user-scoped by design, and a project-scoped fallback
+  // then needs --yes for a secret-bearing entry (step 5b) because that file is
   // commit-to-share config.
-  const scope: InstallScope = clientId === "vscode" ? "project" : "user";
+  //
+  // Derived from the target table rather than from a hardcoded client id: this
+  // used to read `clientId === "vscode" ? "project" : "user"`, which was true
+  // only while VS Code had no user scope. autoDetectClient returns the id of
+  // the first usable probe SLOT, so the moment VS Code gained one, that line
+  // would have detected the user slot and then written the workspace file --
+  // a different file, possibly in a directory that is not a workspace at all.
+  // The slot auto-detect actually found wins. That is what keeps a trial in
+  // the file the user is already using -- a repo shipping .vscode/mcp.json
+  // and no personal config is detected on the WORKSPACE slot, and writing a
+  // trial (possibly carrying an inline token) into a committed file is a
+  // hazard step 5b exists to warn about. Deriving the scope from the client
+  // id instead would silently move that write to the user file and lose the
+  // warning with it.
+  //
+  // With an explicit --client there is no detected slot, so prefer a user
+  // scope and fall back to the client's first: trials are user-scoped by
+  // design, and the table decides which clients can honour that.
+  const tryTarget = INSTALL_TARGETS.find((t) => t.clientId === clientId);
+  const scope: InstallScope =
+    detected?.scope ??
+    (tryTarget?.scopes.some((sc) => sc.scope === "user") ? "user" : (tryTarget?.scopes[0].scope ?? "user"));
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
   try {

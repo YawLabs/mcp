@@ -2604,40 +2604,32 @@ describe("runInstall --all", () => {
     // Cursor user → ~/.cursor/mcp.json exists.
     expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
     // Claude Desktop is unavailable on linux, so skipped — no claude_desktop_config.
-    // VS Code requires project-dir (user-scope unsupported); it's reported as skipped.
+    // VS Code is no longer skipped: it has a user scope now, which is the
+    // whole point -- it was the one supported client --all visibly refused.
     const out = cap.stdout();
-    expect(out).toContain("skip vscode");
+    expect(out).not.toContain("skip vscode");
+    expect(existsSync(join(synthHome, ".config", "Code", "User", "mcp.json"))).toBe(true);
+    // And the two new clients ride the same table-driven planner.
+    expect(existsSync(join(synthHome, ".codeium", "windsurf", "mcp_config.json"))).toBe(true);
+    expect(existsSync(join(synthHome, ".gemini", "settings.json"))).toBe(true);
     expect(out).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // ~/.yaw-mcp/config.json is not part of an install any more.
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
-  it("--project-dir pulls the project-only client (vscode) into the plan", async () => {
-    // The other side of the "skip vscode" line above, and the untested half of
-    // runInstallAll's planner: a client with NO non-project scope is planned at
-    // its first scope only when --project-dir is passed.
-    const cap = captureIo();
-    const r = await runInstall({
-      os: "linux",
-      home: synthHome,
-      cwd: synthCwd,
-      projectDir: synthCwd,
-      all: true,
-      io: cap.io,
-      oamProbe: OAM_ABSENT,
-    });
-    expect(r.exitCode).toBe(0);
-    const out = cap.stdout();
-    expect(out).not.toContain("skip vscode");
-    // Planned at its workspace scope, and the file lands under the project dir.
-    const vscodeConfig = join(synthCwd, ".vscode", "mcp.json");
-    expect(existsSync(vscodeConfig)).toBe(true);
-    expect(r.written).toContain(vscodeConfig);
-    const config = JSON.parse(readFileSync(vscodeConfig, "utf8"));
-    expect(config.servers[ENTRY_NAME]).toBeDefined();
-    // The user-scope clients are still installed alongside it.
-    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
-    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
+  it("--project-dir is refused rather than silently dropped", async () => {
+    // Every client carries a user scope now, so --all plans them all there and
+    // hands `projectDir: undefined` to each sub-install: the flag would parse,
+    // print nothing and change nothing. This file refuses that class twice
+    // already -- a flag that is accepted and dropped reads as honored.
+    const r = parseInstallArgs(["--all", "--project-dir", "/tmp/x"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("--all installs every client at its user scope");
+      // The error names the command that DOES write a workspace file, so the
+      // refusal is a redirect rather than a dead end.
+      expect(r.error).toContain("--scope project --project-dir");
+    }
   });
 
   it("--dry-run aggregates every client's would-writes and writes nothing", async () => {
@@ -3624,13 +3616,23 @@ describe("runInstall — --project-dir resolution", () => {
 });
 
 describe("runInstall --all — an all-refused run", () => {
-  // Both user-scope clients (claude-code, cursor) already carry an entry, and
-  // stdin is not a TTY with no --force/--skip: every sub-install refuses.
+  // EVERY client --all plans on linux already carries an entry, and stdin is
+  // not a TTY with no --force/--skip: every sub-install refuses. Seeding only
+  // some of them makes this an all-refused run in name only -- the run would
+  // succeed for the rest and the assertions below would be measuring a
+  // partially-successful run.
   const seedBothColliding = (): void => {
     const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
+    const vscodeSeeded = { servers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
     mkdirSync(join(synthHome, ".cursor"), { recursive: true });
     writeFileSync(join(synthHome, ".cursor", "mcp.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".config", "Code", "User"), { recursive: true });
+    writeFileSync(join(synthHome, ".config", "Code", "User", "mcp.json"), JSON.stringify(vscodeSeeded), "utf8");
+    mkdirSync(join(synthHome, ".codeium", "windsurf"), { recursive: true });
+    writeFileSync(join(synthHome, ".codeium", "windsurf", "mcp_config.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".gemini"), { recursive: true });
+    writeFileSync(join(synthHome, ".gemini", "settings.json"), JSON.stringify(seeded), "utf8");
   };
 
   it("returns a trail with only the CONSOLIDATED refusal, not the swallowed per-client ones", async () => {
