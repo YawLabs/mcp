@@ -1525,7 +1525,11 @@ export class ConnectServer {
       // the BM25 tokenizer -- surfacing as a raw JSON-RPC internal error
       // instead of a tool result.
       return this.attachGuideNudge(
-        await this.handleDiscoverWithAutoWarm(typeof args.context === "string" ? args.context : undefined, progress),
+        await this.handleDiscoverWithAutoWarm(
+          typeof args.context === "string" ? args.context : undefined,
+          progress,
+          typeof args.server === "string" ? args.server : undefined,
+        ),
       );
     }
     if (name === META_TOOLS.dispatch.name) {
@@ -2029,23 +2033,49 @@ export class ConnectServer {
   // the score, and the line would just be chat noise.
   private static readonly MARKETPLACE_HINT_THRESHOLD = 5;
 
-  private handleDiscover(context?: string): { content: Array<{ type: string; text: string }> } {
-    return this.buildDiscoverOutput(context, /* warmedNamespace */ null);
+  // How many cached tool names a dormant server's `known tools:` line shows.
+  //
+  // That line was the single largest thing discover printed: on a 30-server
+  // install the tool names alone were 20,536 of the body's 22,712 bytes --
+  // 90% of a ~5,700-token reply, from the meta-tool whose entire purpose is
+  // keeping tools OUT of context. Capping at 5 removes about three quarters
+  // of it while leaving enough names to recognise what a server is for.
+  //
+  // A compile-time constant, deliberately not an env dial: the cap is a
+  // component of the rendered body, so a tunable one would have to be
+  // threaded into discoverCacheKey (whose comments already record three bugs
+  // from exactly that omission), and no correct value differs from this one.
+  // The recovery path is `server:` focus, which is bounded by one server
+  // rather than by a number the model has to guess.
+  private static readonly DISCOVER_TOOL_NAME_CAP = 5;
+
+  private handleDiscover(
+    context?: string,
+    focusNamespace?: string,
+  ): { content: Array<{ type: string; text: string }> } {
+    return this.buildDiscoverOutput(context, /* warmedNamespace */ null, focusNamespace);
   }
 
   private async handleDiscoverWithAutoWarm(
     context?: string,
     progress?: ProgressReporter,
+    // Focus is a RENDER concern only: it never reaches the ranker, the
+    // auto-activate thresholds or the prewarm claim below. So
+    // `discover(context: "...", server: "pg")` can render only pg's card
+    // while the banner reports that gh was auto-loaded -- correct, because
+    // the banner announces a session state change the model must know about,
+    // and suppressing it would hide an activation.
+    focusNamespace?: string,
   ): Promise<{ content: Array<{ type: string; text: string }> }> {
-    if (!context || !isAutoActivateEnabled()) return this.handleDiscover(context);
+    if (!context || !isAutoActivateEnabled()) return this.handleDiscover(context, focusNamespace);
 
     const activeServers = this.getProfiledActiveServers();
-    if (activeServers.length === 0) return this.handleDiscover(context);
+    if (activeServers.length === 0) return this.handleDiscover(context, focusNamespace);
 
     // Use the same ranker dispatch uses so discover + dispatch pick the
     // same winner for the same intent.
     const ranked = await this.twoStageRank(context, activeServers);
-    if (ranked.length === 0) return this.handleDiscover(context);
+    if (ranked.length === 0) return this.handleDiscover(context, focusNamespace);
 
     // Only auto-warm if one candidate dominates: top score clears the
     // floor and either stands alone or beats the runner-up by the
@@ -2059,7 +2089,7 @@ export class ConnectServer {
       top.score >= minScore &&
       (second === undefined || top.score / (second.score || 1e-6) >= margin);
 
-    if (!topWinsDecisively || !top) return this.handleDiscover(context);
+    if (!topWinsDecisively || !top) return this.handleDiscover(context, focusNamespace);
 
     // Already connected -- nothing to SPAWN, but under gateway exposure
     // "connected" is not "advertised": a prewarm-claimed winner, or one
@@ -2087,7 +2117,7 @@ export class ConnectServer {
         // tools/list surface moved.
         await this.notifyAllListsChanged();
       }
-      return this.buildDiscoverOutput(context, top.namespace);
+      return this.buildDiscoverOutput(context, top.namespace, focusNamespace);
     }
 
     progress?.(`Auto-warming top candidate "${top.namespace}"`);
@@ -2111,7 +2141,7 @@ export class ConnectServer {
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
     // banner below must name the server twoStageRank picked, which is
     // not necessarily the head of the list the output renders.
-    const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
+    const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null, focusNamespace);
     if (result.ok) return output;
 
     // Auto-warm failed. Say WHY, in the same response: result.message carries
@@ -2150,7 +2180,11 @@ export class ConnectServer {
     this.discoverCache = null;
   }
 
-  private discoverCacheKey(context: string | undefined, warmedNamespace: string | null): string {
+  private discoverCacheKey(
+    context: string | undefined,
+    warmedNamespace: string | null,
+    focusNamespace: string | undefined,
+  ): string {
     const activeNamespaces = [...this.connections.entries()]
       .filter(([, c]) => c.status === "connected")
       .map(([ns]) => ns)
@@ -2175,20 +2209,26 @@ export class ConnectServer {
     // component changes, so without it a discover inside the 3s TTL would
     // still call the freshly-activated server "not advertised".
     const advertisedSignature = [...this.sessionActivated].sort().join(",");
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}`;
+    // Focus decides WHICH cards the body renders, so it is a key component
+    // for the same reason the three above it are. Without it a
+    // `discover(server: "gh")` followed inside the 3s TTL by
+    // `discover(server: "pg")` replays gh's card labelled as pg's -- and the
+    // back-to-back double call is exactly the pattern this memo exists for.
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}`;
   }
 
   private buildDiscoverOutput(
     context: string | undefined,
     warmedNamespace: string | null,
+    focusNamespace?: string,
   ): { content: Array<{ type: string; text: string }> } {
-    const key = this.discoverCacheKey(context, warmedNamespace);
+    const key = this.discoverCacheKey(context, warmedNamespace, focusNamespace);
     const now = Date.now();
     const cached = this.discoverCache;
     if (cached && cached.key === key && cached.expires > now) {
       return cached.result;
     }
-    const result = this.buildDiscoverOutputImpl(context, warmedNamespace);
+    const result = this.buildDiscoverOutputImpl(context, warmedNamespace, focusNamespace);
     this.discoverCache = { key, result, expires: now + ConnectServer.DISCOVER_CACHE_TTL_MS };
     return result;
   }
@@ -2196,12 +2236,66 @@ export class ConnectServer {
   private buildDiscoverOutputImpl(
     context: string | undefined,
     warmedNamespace: string | null,
+    focusNamespace?: string,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
       return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
     }
 
-    const activeServers = this.getProfiledActiveServers();
+    const allProfiled = this.getProfiledActiveServers();
+
+    // Focus resolution. getProfiledActiveServers filters on isActive and the
+    // project profile ONLY, so a namespace missing from it but present in the
+    // config is disabled or profile-blocked -- there is no third state, and in
+    // particular it is never compliance-blocked: discover deliberately LISTS a
+    // below-grade server with an inline annotation rather than hiding it, which
+    // is why this must not route through the spawn gate.
+    let focused: UpstreamServerConfig | undefined;
+    if (focusNamespace !== undefined) {
+      focused = allProfiled.find((srv) => srv.namespace === focusNamespace);
+      if (!focused) {
+        const configured = this.config.servers.find((srv) => srv.namespace === focusNamespace);
+        if (configured && configured.isActive === false) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `"${focusNamespace}" is installed but disabled ("isActive": false in ~/.yaw-mcp/bundles.json). Call mcp_connect_discover with no arguments to list what is available.`,
+              },
+            ],
+          };
+        }
+        if (configured) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `"${focusNamespace}" is not allowed by the project profile in effect.`,
+              },
+            ],
+          };
+        }
+        const near = closestNames(
+          focusNamespace,
+          allProfiled.map((srv) => srv.namespace),
+          1,
+        )[0];
+        return {
+          content: [
+            {
+              type: "text",
+              text: near
+                ? `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Did you mean: ${near}?`
+                : `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover with no arguments to list what is available.`,
+            },
+          ],
+        };
+      }
+    }
+
+    // Every advisory block below reads the FULL profiled set (ranking, packs,
+    // overlaps, the marketplace threshold); only the card loop narrows.
+    const activeServers = focused ? [focused] : allProfiled;
 
     // Score and sort using corpus-wide BM25 when context is provided.
     // Servers that don't match any query term simply fall out of the
@@ -2248,7 +2342,7 @@ export class ConnectServer {
     // sees the short answer before the long list. Without this block
     // the relevance signal is easy to skim past — the per-server lines
     // carry a numeric score but no summary of WHY each matched.
-    if (context) {
+    if (context && !focused) {
       const matchedServers = sorted.filter((s) => {
         const score = scores.get(s.namespace);
         return score !== undefined && score > 0;
@@ -2296,7 +2390,7 @@ export class ConnectServer {
         if (b.frequency !== a.frequency) return b.frequency - a.frequency;
         return b.lastSeenAt - a.lastSeenAt;
       });
-    if (actionablePacks.length > 0) {
+    if (actionablePacks.length > 0 && !focused) {
       lines.push("Recurring packs (activate together — seen before):");
       for (const pack of actionablePacks.slice(0, 3)) {
         const nsJson = JSON.stringify(pack.namespaces);
@@ -2317,7 +2411,30 @@ export class ConnectServer {
     const exposure = resolveToolExposure();
     const isAdvertised = (namespace: string): boolean => exposure === "full" || this.sessionActivated.has(namespace);
 
+    // The SESSION token total, computed over every live connection rather than
+    // accumulated inside the card loop below. Two reasons, one new and one
+    // pre-existing. New: the loop can now render a single focused server, and a
+    // loop-derived total would report that one server's cost as the session's.
+    // Pre-existing: the loop's guard was `connection && tools.length > 0` with no
+    // status check, while the `totalTools` reduce that feeds the same sentence
+    // requires status "connected" -- so an advertised connection that had errored
+    // rendered "0 tools in context (~1,234 tokens)". Both counts now agree on
+    // what is in context: connected, advertised, post-filter.
+    // Set when a known-tools line was capped or dropped, so the footer that
+    // explains the recovery path appears only when there is something to
+    // recover. Deliberately NOT set for a server with an empty cache: it
+    // omitted nothing.
+    let omittedToolNames = false;
+
     let totalContextTokens = 0;
+    for (const conn of this.connections.values()) {
+      const ns = conn.config.namespace;
+      if (conn.status !== "connected" || !isAdvertised(ns)) continue;
+      const f = this.toolFilters.get(ns);
+      const visible = f ? conn.tools.filter((t) => f.has(t.name)) : conn.tools;
+      if (visible.length > 0) totalContextTokens += estimateFromConnectedTools(visible).tokens;
+    }
+
     for (const server of sorted) {
       const connection = this.connections.get(server.namespace);
       // Apply per-tool filter to the advertised count so discover matches
@@ -2352,7 +2469,6 @@ export class ConnectServer {
         const visible = filter ? connection.tools.filter((t) => filter.has(t.name)) : connection.tools;
         if (visible.length > 0) {
           const sample = estimateFromConnectedTools(visible);
-          if (isAdvertised(server.namespace)) totalContextTokens += sample.tokens;
           costLabel = ` — ${formatCostLabel(sample)}`;
         }
       } else {
@@ -2422,10 +2538,43 @@ export class ConnectServer {
       if (!connection) {
         const cached = server.toolCache;
         if (cached && cached.length > 0) {
-          const toolNames = cached.map((t) => t.name).join(", ");
-          lines.push(`    known tools: ${toolNames}`);
+          // In the RANKED shape, a server the query did not match at all
+          // contributes nothing but noise here -- its card still names it, its
+          // type and its tool count, which is what the model needs to know it
+          // exists. rankServers only emits entries scoring above zero, so a
+          // non-matching namespace is ABSENT from the map rather than mapped to
+          // 0; `?? 0` is what makes the test fire at all. Bare `context`
+          // truthiness, matching every other branch in this function, so
+          // discover("") stays on the unranked path here too.
+          const dropped = focused === undefined && Boolean(context) && (scores.get(server.namespace) ?? 0) <= 0;
+          if (dropped) {
+            omittedToolNames = true;
+          } else {
+            // A focused call is bounded by one server and was explicitly asked
+            // for, so it renders the full list -- that is the recovery path the
+            // cap depends on existing.
+            const cap = focused ? cached.length : ConnectServer.DISCOVER_TOOL_NAME_CAP;
+            const shown = cached.slice(0, cap);
+            const hidden = cached.length - shown.length;
+            if (hidden > 0) omittedToolNames = true;
+            const more = hidden > 0 ? ` (+${hidden} more)` : "";
+            lines.push(`    known tools: ${shown.map((t) => t.name).join(", ")}${more}`);
+          }
         }
       }
+    }
+
+    // One short footer rather than a per-line pointer: the recovery hint is
+    // 75 bytes if repeated on every truncated server (2,250 across 30) versus
+    // 11 bytes for the marker plus one 112-byte line. Only when something was
+    // actually omitted -- an unconditional footer would move text that existing
+    // discover fixtures, all of them under the cap, never expected to move.
+    if (omittedToolNames && !focused) {
+      lines.push(
+        context
+          ? `\nTool lists show the first ${ConnectServer.DISCOVER_TOOL_NAME_CAP} names, for matching servers only; call mcp_connect_discover(server: "<namespace>") for one server's full list.`
+          : `\nTool lists show the first ${ConnectServer.DISCOVER_TOOL_NAME_CAP} names; call mcp_connect_discover(server: "<namespace>") for one server's full list.`,
+      );
     }
 
     // Overlapping tools block — detect bare tool names that appear in
@@ -2435,7 +2584,7 @@ export class ConnectServer {
     // alphabetical tie-break) to keep output bounded. Suppressed entirely
     // when no overlaps exist.
     const overlaps = computeToolOverlaps(this.connections.values());
-    if (overlaps.length > 0) {
+    if (!focused && overlaps.length > 0) {
       lines.push("\nOverlapping tools (same bare name in multiple servers):");
       const top = overlaps.slice(0, 5);
       for (let i = 0; i < top.length; i++) {
@@ -2462,7 +2611,7 @@ export class ConnectServer {
     // mergeToolCache clone per server on every uncached discover.
     const allInstalled = activeServers.map((s) => s.namespace);
     const bundleGaps = topPartialBundles(allInstalled, 3);
-    if (bundleGaps.length > 0) {
+    if (!focused && bundleGaps.length > 0) {
       lines.push("\nBundle completions (install to unlock curated stacks):");
       for (const { bundle, have, missing } of bundleGaps) {
         lines.push(`  ${bundle.id} — have: ${have.join(", ")}; add: ${missing.join(", ")}`);
@@ -2470,7 +2619,7 @@ export class ConnectServer {
     }
 
     const inactive = this.config.servers.filter((s) => !s.isActive);
-    if (inactive.length > 0) {
+    if (!focused && inactive.length > 0) {
       lines.push("\nDisabled servers:");
       for (const server of inactive) {
         lines.push(`  ${server.namespace} — ${server.name} ("isActive": false in bundles.json)`);
@@ -2482,7 +2631,10 @@ export class ConnectServer {
     // on (env or config); otherwise this is a no-op and the output above
     // is byte-identical to a build without the feature. See
     // buildInstallCandidatesLines + install-nudge.ts.
-    lines.push(...this.buildInstallCandidatesLines(activeServers));
+    // Gated on the CALL rather than on its output: this runs the offline
+    // shell-history scan and then records a per-CLI nudge cooldown, so
+    // suppressing only the lines would burn a nudge the user never saw.
+    if (!focused) lines.push(...this.buildInstallCandidatesLines(allProfiled));
 
     // Count CONNECTED connections only, the same slot definition the
     // concurrent-load cap uses (evaluateCapFor). An error-state entry is an
@@ -2519,7 +2671,7 @@ export class ConnectServer {
     // one-line pointer at the public catalog. No API is hit — the catalog
     // is a static browsable surface, so this is a URL hint, not a full
     // meta-tool.
-    if (this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
+    if (!focused && this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
       lines.push(
         "Browse the catalog at https://yaw.sh/mcp/catalog/ and add servers with `yaw-mcp add <slug>` — they land in ~/.yaw-mcp/bundles.json and load on the next client restart.",
       );

@@ -32,7 +32,7 @@ Your MCP client (Claude Code, Cursor, ...)
 | Meta-tool | What it does |
 |-----------|--------------|
 | `mcp_connect_dispatch` | Describe a task in plain English; picks the best server, loads its tools, exposes them in one call. The fast path. |
-| `mcp_connect_discover` | List available servers, optionally ranked by a context string. Auto-loads the top match when one clearly wins. |
+| `mcp_connect_discover` | List available servers, optionally ranked by a context string. Auto-loads the top match when one clearly wins. Tool-name lists are capped at five per server; pass `server` for one server's full list. |
 | `mcp_connect_activate` / `deactivate` | Load / unload specific servers by namespace. |
 | `mcp_connect_read_tool` | Return one tool's schema without loading its server. |
 | `mcp_connect_exec` | Run a short declarative pipeline of tool calls in one round-trip (`{"$ref": "<step>[.path]"}` splices prior outputs; no eval, max 16 steps). |

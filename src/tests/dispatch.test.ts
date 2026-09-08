@@ -478,6 +478,45 @@ describe("handleDiscoverWithAutoWarm", () => {
     expect(result.content[0].text).toContain('Auto-loaded "gh"');
   });
 
+  it("focuses the render without changing which namespace auto-warms", async () => {
+    // The executable form of "the top match auto-load behaviour must not
+    // change". `server:` is a RENDER concern and never reaches the ranker, so
+    // a focused call can render only fs's card while the banner reports that
+    // gh was auto-loaded. That is correct rather than confusing: the banner
+    // announces a session state change the model has to know about, and
+    // suppressing it would hide an activation. Without this test, the focus
+    // parameter passes within arm's reach of twoStageRank uncovered.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({
+          id: "gh-id",
+          namespace: "gh",
+          name: "GitHub",
+          description: "Repos, issues, and pull requests on GitHub",
+        }),
+        makeServerConfig({
+          id: "fs-id",
+          namespace: "fs",
+          name: "Filesystem",
+          description: "Read and write local files",
+        }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "create_issue" }]),
+    );
+
+    const result = await priv.handleDiscoverWithAutoWarm("file a github issue", undefined, "fs");
+    expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("gh");
+    expect(priv.sessionActivated.has("gh")).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('Auto-loaded "gh"');
+    expect(text).toContain("Filesystem");
+    expect(text).not.toContain("GitHub");
+  });
+
   it("does not auto-activate when no context is provided", async () => {
     const priv = getPrivate(server);
     priv.config = {

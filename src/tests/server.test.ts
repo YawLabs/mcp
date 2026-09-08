@@ -261,6 +261,177 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toContain("known tools: create_issue, list_prs");
     });
 
+    describe("discover bounds its tool lists", () => {
+      const eight = (prefix: string) => Array.from({ length: 8 }, (_, i) => ({ name: `${prefix}_${i + 1}` }));
+
+      it("truncates a dormant server's tool list and says how many are hidden", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.toolCache.set("gh", eight("t"));
+
+        const text = priv.handleDiscover().content[0].text;
+        // The number is pinned, not matched loosely: an off-by-one in the hidden
+        // count is exactly what a regex would let through.
+        expect(text).toContain("known tools: t_1, t_2, t_3, t_4, t_5 (+3 more)");
+        expect(text).not.toContain("t_6");
+      });
+
+      it("leaves a server at or below the cap byte-identical", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.toolCache.set("gh", [{ name: "a" }, { name: "b" }, { name: "c" }, { name: "d" }, { name: "e" }]);
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("known tools: a, b, c, d, e");
+        expect(text).not.toContain("(+");
+        expect(text).not.toContain("Tool lists show");
+      });
+
+      it("renders the recovery footer once, not once per truncated server", () => {
+        // Counting the LINE is the whole point of a short per-server marker plus
+        // one footer: repeating the hint on every server was the shape this
+        // rejected, at 75 bytes a line instead of 11.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "pg", name: "Postgres" }),
+          makeServerConfig({ namespace: "sl", name: "Slack" }),
+        ]);
+        priv.toolCache.set("gh", eight("g"));
+        priv.toolCache.set("pg", eight("p"));
+        priv.toolCache.set("sl", eight("s"));
+
+        const text = priv.handleDiscover().content[0].text;
+        const footers = text.split("\n").filter((l: string) => l.startsWith("Tool lists show the first"));
+        expect(footers).toHaveLength(1);
+        expect(footers[0]).toContain("mcp_connect_discover(server:");
+      });
+
+      it("renders the cap from the constant rather than a literal", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.toolCache.set("gh", eight("t"));
+
+        const cap = (ConnectServer as unknown as { DISCOVER_TOOL_NAME_CAP: number }).DISCOVER_TOOL_NAME_CAP;
+        expect(priv.handleDiscover().content[0].text).toContain(`first ${cap} names`);
+      });
+
+      it("drops the known-tools line for a server the query did not match", () => {
+        // rankServers only emits entries scoring above zero, so a non-matching
+        // namespace is ABSENT from the score map rather than mapped to 0 -- the
+        // `?? 0` in the drop rule is what makes this fire at all.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub", description: "github issues and pull requests" }),
+          makeServerConfig({ namespace: "redis", name: "Redis", description: "redis cache keys" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }, { name: "list_prs" }]);
+        priv.toolCache.set("redis", [{ name: "redis_get" }, { name: "redis_set" }]);
+
+        const text = priv.handleDiscover("github issues").content[0].text;
+        expect(text).toContain("create_issue");
+        // Its card is still there; only the tool names are gone.
+        expect(text).toContain("redis");
+        expect(text).not.toContain("redis_get");
+        expect(text).toContain("for matching servers only");
+      });
+
+      it("keeps every known-tools line in the unranked shape", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "redis", name: "Redis" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+        priv.toolCache.set("redis", [{ name: "redis_get" }]);
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("create_issue");
+        expect(text).toContain("redis_get");
+      });
+    });
+
+    describe("discover server: focus", () => {
+      it("renders one card with the full, uncapped tool list", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "pg", name: "Postgres" }),
+        ]);
+        priv.toolCache.set(
+          "gh",
+          Array.from({ length: 12 }, (_, i) => ({ name: `t_${i + 1}` })),
+        );
+        priv.toolCache.set("pg", [{ name: "query" }]);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        expect(text).toContain("t_12");
+        expect(text).not.toContain("(+");
+        expect(text).not.toContain("Tool lists show");
+        expect(text).not.toContain("Postgres");
+      });
+
+      it("suppresses the cross-server advisory blocks", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "old", name: "Old Server", isActive: false }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        for (const block of [
+          "Disabled servers:",
+          "Bundle completions",
+          "Recurring packs",
+          "Overlapping tools",
+          "https://yaw.sh/mcp/catalog/",
+        ]) {
+          expect(text).not.toContain(block);
+        }
+      });
+
+      it("suggests a close installed name on an unknown namespace", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+        expect(priv.handleDiscover(undefined, "gh-x").content[0].text).toContain("Did you mean: gh?");
+      });
+
+      it("distinguishes a disabled server from one that is not installed", () => {
+        // Two different problems with two different fixes: one is a JSON edit,
+        // the other is an install. getProfiledActiveServers filters on isActive
+        // and the profile only, so these are the only two states a miss can be.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "old", name: "Old Server", isActive: false })]);
+
+        const disabled = priv.handleDiscover(undefined, "old").content[0].text;
+        expect(disabled).toContain('"isActive": false');
+        expect(disabled).not.toContain("is not in ~/.yaw-mcp/bundles.json");
+
+        const absent = priv.handleDiscover(undefined, "zzz").content[0].text;
+        expect(absent).toContain("is not in ~/.yaw-mcp/bundles.json");
+      });
+
+      it("re-renders when only the focus changes inside the cache window", () => {
+        // The cache key's fourth omission bug, pre-empted: two focused calls
+        // inside the 3s TTL differ in nothing else, so without focus in the key
+        // the second replays the first server's card under the second's name.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "pg", name: "Postgres" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+        priv.toolCache.set("pg", [{ name: "query" }]);
+
+        expect(priv.handleDiscover(undefined, "gh").content[0].text).toContain("GitHub");
+        const second = priv.handleDiscover(undefined, "pg").content[0].text;
+        expect(second).toContain("Postgres");
+        expect(second).not.toContain("GitHub");
+      });
+    });
+
     it("surfaces a token-cost estimate per server line", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([
