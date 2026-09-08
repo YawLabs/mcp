@@ -3015,6 +3015,25 @@ describe("connectToUpstream remote headers", () => {
     expect(String((err as Error).message)).not.toContain("supersecretvalue");
   });
 
+  it("redacts a header value echoed back in a POST-HANDSHAKE failure", async () => {
+    // The pre-handshake case is covered above. This is the same leak one phase
+    // later, and it was open: withStderrTail redacts only the tail it appends
+    // and returns the error untouched when there is no tail -- which is always
+    // on a remote, since nothing writes the stderr ring there. So a tools/list
+    // failure carried the SDK's `Error POSTing to endpoint: <body>` verbatim
+    // into the log AND into the activate result the model reads.
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientListTools = () =>
+      Promise.reject(new Error("Error POSTing to endpoint: your header was Bearer supersecretvalue"));
+
+    const err = await connectToUpstream(
+      makeRemoteConfig({ headers: { Authorization: "Bearer supersecretvalue" } }),
+    ).catch((e: unknown) => e);
+
+    expect(String((err as Error).message)).toContain("***Authorization***");
+    expect(String((err as Error).message)).not.toContain("supersecretvalue");
+  });
+
   it("redacts a value sitting past the 200-character detail cap", async () => {
     // Scrub BEFORE truncating: a secret past the cut has to be REMOVED, not
     // merely hidden by a slice a later change could widen.

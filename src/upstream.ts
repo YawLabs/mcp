@@ -590,6 +590,31 @@ function remoteFailureDetail(err: unknown, resolved: Record<string, string>): st
  *  server.ts's instanceof branches behave exactly as before -- the tail and the
  *  appended reason are additive. Remote connections never populate the ring,
  *  so this is a no-op for them. */
+/** Redact resolved secret values out of an ActivationError's own MESSAGE.
+ *
+ *  withStderrTail below redacts only the tail it APPENDS, and returns the
+ *  error untouched when there is no tail -- which is always, for a remote,
+ *  since nothing writes the stderr ring on that branch. That left the whole
+ *  post-handshake path unredacted: a `tools/list` failure carries the SDK's
+ *  `Error POSTing to endpoint: <response body>` verbatim, so a gateway that
+ *  echoes the request headers in a 401 body put the bearer token into an
+ *  error that is logged to stderr AND returned to the model in the activate
+ *  result. The pre-handshake branch was already covered; this is the same
+ *  leak one phase later.
+ *
+ *  Applied unconditionally rather than only for remotes: on a local server
+ *  the same map holds the child's resolved env, so an upstream that echoes an
+ *  injected value in a JSON-RPC error leaks it identically.
+ *
+ *  Category, tail and cause are carried over verbatim so the oam boot-probe
+ *  downgrade gate and server.ts's instanceof branches are unaffected. */
+function redactActivationMessage(err: unknown, env: Record<string, string>): unknown {
+  if (!(err instanceof ActivationError)) return err;
+  const safe = redactSecretsInOutput(err.message, env);
+  if (safe === err.message) return err;
+  return new ActivationError(safe, err.category, err.stderrTail, err.cause);
+}
+
 function withStderrTail(err: unknown, stderrRing: string, env: Record<string, string>): unknown {
   if (!(err instanceof ActivationError) || err.stderrTail) return err;
   const trimmed = stderrRing.trim();
@@ -1344,7 +1369,13 @@ async function connectToUpstreamOnce(
     // withStderrTail attaches (and redacts) that tail, so the credential
     // elicitation and the oam heap-cap hint get the same input they would have
     // had if the child had died a moment earlier, before the handshake.
-    throw withStderrTail(err, stderrRing, resolvedServerEnv);
+    //
+    // The message itself is redacted FIRST, and separately: withStderrTail
+    // scrubs only the tail it appends and returns the error untouched when
+    // there is no tail -- which is always, on a remote. Without this the
+    // response body of a post-handshake failure reached the log and the model
+    // verbatim, carrying whatever header the far end echoed back.
+    throw withStderrTail(redactActivationMessage(err, resolvedServerEnv), stderrRing, resolvedServerEnv);
   }
 }
 

@@ -131,13 +131,18 @@ interface Assignment {
   raw: string;
 }
 
-export function parseSetArgs(argv: string[]): { ok: true; options: SetCommandOptions } | { ok: false; error: string } {
+export function parseSetArgs(
+  argv: string[],
+): { ok: true; options: SetCommandOptions } | { ok: false; error: string; help?: boolean } {
   const opts: SetCommandOptions = { assignments: [] };
   const positional: string[] = [];
   for (const a of argv) {
     if (a === "--json") opts.json = true;
     else if (a === "--force" || a === "-y" || a === "--yes") opts.force = true;
-    else if (a === "--help" || a === "-h") return { ok: false, error: SET_USAGE };
+    // help:true so the dispatcher routes usage to STDOUT and exits 0. Without
+    // it, `yaw-mcp set --help` printed to stderr and exited 2 -- a help request
+    // answered as an error.
+    else if (a === "--help" || a === "-h") return { ok: false, error: SET_USAGE, help: true };
     else if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${SET_USAGE}` };
     else positional.push(a);
   }
@@ -147,6 +152,36 @@ export function parseSetArgs(argv: string[]): { ok: true; options: SetCommandOpt
   if (opts.assignments.length === 0) {
     return { ok: false, error: `yaw-mcp set: nothing to set -- pass at least one key=value.\n${SET_USAGE}` };
   }
+  return { ok: true, options: opts };
+}
+
+/** `enable` / `disable` take a TARGET and no assignment -- the verb IS the
+ *  assignment. They cannot share parseSetArgs, which requires at least one
+ *  `key=value` and so rejected every legitimate invocation of both verbs.
+ *  They keep their own usage text for the same reason: SET_USAGE documents an
+ *  argument these do not take. */
+export function parseToggleArgs(
+  argv: string[],
+  enabled: boolean,
+): { ok: true; options: SetCommandOptions & { enabled: boolean } } | { ok: false; error: string; help?: boolean } {
+  const usage = enabled ? ENABLE_USAGE : DISABLE_USAGE;
+  const verb = enabled ? "enable" : "disable";
+  const opts: SetCommandOptions & { enabled: boolean } = { enabled, assignments: [] };
+  const positional: string[] = [];
+  for (const a of argv) {
+    if (a === "--json") opts.json = true;
+    else if (a === "--help" || a === "-h") return { ok: false, error: usage, help: true };
+    else if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${usage}` };
+    else positional.push(a);
+  }
+  if (positional.length === 0) return { ok: false, error: usage };
+  if (positional.length > 1) {
+    return {
+      ok: false,
+      error: `yaw-mcp ${verb}: expected exactly one server, got ${positional.length}.\n${usage}`,
+    };
+  }
+  opts.target = positional[0];
   return { ok: true, options: opts };
 }
 
@@ -323,8 +358,10 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     );
     if (droppingEnv.length > 0 && !opts.force) {
       const names = droppingEnv.map((a) => a.key).join(", ");
-      print(`This clears a stored value on "${namespace}": ${names}`);
-      print("  Re-adding the server will not bring it back.");
+      // stderr, not stdout: this is a diagnostic about a prompt, and stdout
+      // has to stay a single parseable line under --json.
+      printErr(`This clears a stored value on "${namespace}": ${names}`);
+      printErr("  Re-adding the server will not bring it back.");
       if (!isInteractive(opts)) {
         printErr(`yaw-mcp set: refusing to clear ${names} without a confirmation -- stdin/stdout is not a TTY.`);
         printErr("  Re-run with --force (or -y).");
@@ -354,6 +391,11 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     // the pre-run map both times, so the second clear still believed a sibling
     // survived and left an empty `"env": {}` husk behind.
     const liveEnv: Record<string, unknown> = { ...((entry.env as Record<string, unknown> | undefined) ?? {}) };
+    // Same reason, for the scalars: the loop below used to compare against
+    // the pre-run entry while the TEXT it edits accumulates, so `set gh
+    // runtime=oam runtime=node` decided the second edit was redundant and
+    // left oam on disk while reporting node.
+    const liveScalars: Record<string, unknown> = { ...entry };
 
     for (const a of assignments) {
       if (a.field === "env") {
@@ -394,7 +436,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       // defaults it), so `set gh isActive=true` on an entry that never carried
       // the key is a semantic no-op. Writing it anyway would report a change
       // and dirty the file to say what it already said.
-      const current = a.field === "isActive" && entry.isActive === undefined ? true : entry[a.field];
+      const current = a.field === "isActive" && liveScalars.isActive === undefined ? true : liveScalars[a.field];
       if (current === a.value) {
         applied.push(`${a.field}: already ${render(a.value)}`);
         jsonUnchanged.push({ field: a.field });
@@ -406,6 +448,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
         continue;
       }
       text = editJsoncPath(text, ["servers", idx, a.field], a.value);
+      liveScalars[a.field] = a.value;
       applied.push(`${a.field}: ${render(current)} -> ${render(a.value)}`);
       jsonChanges.push({
         field: a.field,

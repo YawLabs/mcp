@@ -1807,110 +1807,63 @@ describe("runTry -- an explicitly named client with nothing configured", () => {
   });
 });
 
-describe("runTry -- inline secret bound for a project-scope (commit-to-share) file", () => {
-  // The auto-detect scenario: a repo ships .vscode/mcp.json, the developer
-  // has the token exported and no personal client config, and `yaw-mcp try`
-  // picks vscode -- whose only scope is the workspace file -- and copies the
-  // token inline into a file `git add -A` sweeps up. Nothing used to say so:
-  // the only secret-location note was the ambient-only one, and the 0600
-  // chmod protects local perms, not version control.
+describe("runTry -- a trial never lands in a commit-to-share file when a private one exists", () => {
+  // The auto-detect scenario this group was written for: a repo ships
+  // .vscode/mcp.json, the developer has the token exported and no personal
+  // client config, and `try` picks vscode. It used to write the trial -- and
+  // an inline token with it -- into the committed workspace file, which is why
+  // the --yes refusal below exists.
+  //
+  // VS Code now has a USER scope, and `try` prefers one whenever the client
+  // has it: the trial still works (VS Code reads both files) and nothing lands
+  // in git. So the hazard is avoided rather than warned about, which is the
+  // better outcome -- and the refusal machinery stays for a project-only
+  // client, which the shipped table no longer has.
   const workspacePath = (): string => join(synthCwd, ".vscode", "mcp.json");
+  const userPath = (): string => join(synthHome, ".config", "Code", "User", "mcp.json");
 
   function seedWorkspaceConfig(): void {
     mkdirSync(join(synthCwd, ".vscode"), { recursive: true });
     writeFileSync(workspacePath(), JSON.stringify({ servers: { existing: { command: "x" } } }));
   }
 
-  it("refuses without --yes, names the file, the key and the hazard, and writes nothing", async () => {
+  it("writes an inline secret to the private user file, not the committed workspace one", async () => {
     seedWorkspaceConfig();
     const before = readFileSync(workspacePath(), "utf8");
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
-      // No --client: auto-detect lands on vscode because its workspace file
-      // is the only client config that exists.
+      // No --client: auto-detect finds the workspace file, but the scope
+      // resolution prefers VS Code's user scope over the slot it was found on.
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
-      env: { FOO_TOKEN: "ambient-secret" },
+      env: {},
+      envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
-    expect(r.exitCode).toBe(1);
-    expect(r.written).toEqual([]);
-    // The workspace file is byte-identical and no marker was dropped.
+
+    // No --yes needed, because nothing commit-to-share is being written.
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(userPath());
+    // The committed file is untouched, byte for byte.
     expect(readFileSync(workspacePath(), "utf8")).toBe(before);
-    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
-    const err = cap.errText();
-    expect(err).toContain(workspacePath());
-    expect(err).toMatch(/commit/i);
-    expect(err).toContain("FOO_TOKEN");
-    expect(err).not.toContain("ambient-secret");
-    expect(err).toContain("--yes");
-    // The way out that keeps the secret off the shared file.
-    expect(err).toMatch(/--client claude-code/);
-    expect(cap.text()).not.toMatch(/Trial wired/);
-  });
-
-  it("refuses under --dry-run too, so the preview never promises a write the real run declines", async () => {
-    seedWorkspaceConfig();
-    const cap = captureIO();
-    const r = await runTry({
-      slug: "demo",
-      // No --client, like the case above: the seeded workspace file is the
-      // only client config that exists, so auto-detect lands on that SLOT and
-      // the trial follows it there.
-      dryRun: true,
-      home: synthHome,
-      cwd: synthCwd,
-      os: "linux",
-      env: {},
-      envOverrides: { FOO_TOKEN: "secret" },
-      out: cap.pushOut,
-      err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-    });
-    expect(r.exitCode).toBe(1);
-    expect(cap.text()).not.toMatch(/would write/);
-    expect(cap.errText()).toContain("--yes");
-  });
-
-  it("writes it with --yes, still warning on stderr", async () => {
-    seedWorkspaceConfig();
-    const cap = captureIO();
-    const r = await runTry({
-      slug: "demo",
-      // No --client, for the same reason as the two cases above.
-      yes: true,
-      home: synthHome,
-      cwd: synthCwd,
-      os: "linux",
-      env: {},
-      envOverrides: { FOO_TOKEN: "secret" },
-      out: cap.pushOut,
-      err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.written).toContain(workspacePath());
-    const config = JSON.parse(readFileSync(workspacePath(), "utf8"));
+    const config = JSON.parse(readFileSync(userPath(), "utf8"));
     expect(config.servers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
-    expect(config.servers.existing).toBeDefined();
-    // --yes lifts the refusal, not the warning: the user is still told where
-    // the plaintext value now lives.
-    const err = cap.errText();
-    expect(err).toContain(workspacePath());
-    expect(err).toContain("FOO_TOKEN");
-    expect(err).not.toContain("refusing");
-    expect(cap.text()).toMatch(/Trial wired/);
   });
 
-  it("never asks a user-scope target for --yes", async () => {
+  it("does not warn about a commit-to-share file it did not write to", async () => {
+    // The hazard warning is gated on the SCOPE, not on the secret: with the
+    // write going to the private user file there is nothing to publish and
+    // nothing to warn about. Asserting the silence is what pins the two halves
+    // together -- a warning here would mean the scope preference regressed and
+    // the trial had gone back into the committed file.
+    seedWorkspaceConfig();
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
-      clientId: "claude-code",
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
@@ -1921,11 +1874,10 @@ describe("runTry -- inline secret bound for a project-scope (commit-to-share) fi
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
-    expect(cap.errText()).not.toContain("--yes");
-    expect(cap.errText()).not.toMatch(/commit/i);
+    expect(cap.errText()).not.toContain("Committing that file publishes the value");
+    expect(cap.errText()).not.toContain("refusing to write it without --yes");
   });
 });
-
 describe("runTry — previous marker the real peel refuses", () => {
   it("warns on stderr, leaves the other file untouched, and still wires the new trial", async () => {
     // The dry-run twin of this is covered above; this is the REAL run, whose

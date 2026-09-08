@@ -742,10 +742,13 @@ describe("blockedTools", () => {
     writeConfig(synthHome, "config.json", { blockedTools: ["GH Delete"] });
     const r = await loadYawMcpConfig({ cwd: synthCwd, home: synthHome, env: {} });
     expect(r.warnings.some((w) => w.includes("is not a valid tool name"))).toBe(true);
-    // A WARNING, never a drop: dropping would empty the array, hit the
-    // fall-through, and silently promote a specific scope's deny into the
-    // parent scope's allow-all.
-    expect(r.blockedTools).toEqual(["GH Delete"]);
+    // DROPPED as well as warned about, unlike servers/blocked. Those two fall
+    // through to a parent scope when they empty, so dropping there would
+    // promote a specific scope's deny into the parent's allow-all. blockedTools
+    // has no allow-list counterpart and no fall-through, so keeping a rejected
+    // entry only made the warning a lie -- a bare `*` was reported as
+    // unmatchable and then enforced by the gate as deny-everything.
+    expect(r.blockedTools).toEqual([]);
   });
 
   it("warns that a meta-tool cannot be blocked", async () => {

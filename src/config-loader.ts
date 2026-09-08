@@ -202,6 +202,17 @@ function filterStringArray(
   path: string,
   warnings: string[],
   validate: EntryValidator = namespaceEntry,
+  // Whether a REJECTED entry is dropped as well as warned about.
+  //
+  // False for servers/blocked, where dropping would empty the array, hit the
+  // fall-through below, and silently promote a specific scope's deny into the
+  // parent's allow-all -- the bug this function exists to prevent.
+  //
+  // True for blockedTools, which has no allow-list counterpart and so no
+  // fall-through to corrupt. Keeping a rejected entry there made the warning
+  // a lie in the one case that matters: a bare `*` is reported as unmatchable
+  // and then enforced by the gate's prefix match as deny-everything.
+  dropInvalid = false,
 ): string[] | undefined {
   if (!Array.isArray(raw)) {
     // A PRESENT but non-array value (`"servers": "github"` -- the plausible
@@ -239,15 +250,21 @@ function filterStringArray(
   // deny-all into the parent scope's allow-all -- the exact bug this function
   // exists to prevent. NAMESPACE_RE is imported from local-bundles.ts rather
   // than re-spelled so the validator and the installer pin one definition.
+  const kept: string[] = [];
   for (const s of strings) {
     const problem = validate(s, field, path);
     if (problem) warnings.push(problem);
+    if (!problem || !dropInvalid) kept.push(s);
   }
   // All entries invalid (non-empty array that filtered to []): treat as
   // unset so the resolver falls through to the parent scope instead of
   // resolving to an empty (allow-all) list that shadows it.
   if (strings.length === 0 && raw.length > 0) return undefined;
-  return strings;
+  // An all-invalid blockedTools resolves to an EMPTY list rather than to
+  // undefined: unlike servers/blocked there is no parent scope to fall
+  // through to, and `deny nothing` is the honest reading of `every entry you
+  // wrote is unusable`.
+  return kept;
 }
 
 async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]): Promise<LoadedConfigFile | null> {
@@ -331,7 +348,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
 
   const servers = filterStringArray(obj.servers, "servers", path, warnings);
   const blocked = filterStringArray(obj.blocked, "blocked", path, warnings);
-  const blockedTools = filterStringArray(obj.blockedTools, "blockedTools", path, warnings, toolEntry);
+  const blockedTools = filterStringArray(obj.blockedTools, "blockedTools", path, warnings, toolEntry, true);
   // Only a literal boolean is honored — a non-boolean (string "true",
   // number 1) is ignored rather than coerced, so a typo can't silently
   // flip on a privacy-sensitive nudge.

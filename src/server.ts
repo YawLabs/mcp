@@ -2096,7 +2096,13 @@ export class ConnectServer {
     if (!denies || denies.length === 0) return false;
     for (const entry of denies) {
       if (entry.endsWith("*")) {
-        if (wireName.startsWith(entry.slice(0, -1))) return true;
+        const prefix = entry.slice(0, -1);
+        // A bare `*` is inert here as well as refused at load. Defence in
+        // depth on a claim three surfaces make -- the README, the JSON schema
+        // and the loader warning all promise a bare wildcard cannot match --
+        // and an empty prefix would otherwise deny EVERY tool, which is the
+        // one wrong answer that fails closed hard enough to look broken.
+        if (prefix !== "" && wireName.startsWith(prefix)) return true;
       } else if (wireName === entry) {
         return true;
       }
@@ -3163,7 +3169,12 @@ export class ConnectServer {
           // just means we re-learn next time.
           this.scheduleStateSave();
 
-          const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
+          // The same predicate tools/list uses. Announcing the raw inventory
+          // told the model a denied tool had just been loaded, and the next
+          // call to it was refused by the gate -- the one advertised-surface
+          // claim the deny did not already cover.
+          const visible = connection.tools.filter((t) => !this.isToolDenied(t.namespacedName));
+          const toolNames = visible.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
           // server isn't permanently demoted for a transient past failure.
           this.activationFailures.delete(namespace);
@@ -3171,7 +3182,7 @@ export class ConnectServer {
             ok: true,
             isChanged: true,
             serverId: serverConfig.id,
-            message: `Loaded "${namespace}" — ${connection.tools.length} tools: ${toolNames}`,
+            message: `Loaded "${namespace}" — ${visible.length} tools: ${toolNames}`,
           };
         } catch (err) {
           lastError = err;

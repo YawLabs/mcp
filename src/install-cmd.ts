@@ -230,7 +230,11 @@ export interface BundlesSummary {
 export async function summarizeBundles(opts: { home?: string; cwd?: string }): Promise<BundlesSummary> {
   const home = opts.home ?? homedir();
   const loaded = await loadLocalBundles({ home, cwd: opts.cwd ?? process.cwd() });
-  const count = loaded.config?.servers.length ?? 0;
+  // ENABLED entries only. The loader keeps a disabled one in the array, but
+  // the broker filters on isActive before it serves anything -- so counting
+  // the raw length told a user with every server disabled that yaw-mcp "serves
+  // it through this entry", which it does not.
+  const count = (loaded.config?.servers ?? []).filter((srv) => srv.isActive !== false).length;
   const state: BundlesState =
     loaded.config === null && loaded.path !== null ? "unreadable" : count > 0 ? "servers" : "empty";
   return { state, count, path: loaded.path ?? localBundlesPath(userConfigDir(home)), warnings: loaded.warnings };
@@ -292,6 +296,11 @@ function logInstallTail(
     );
   }
   if (!bundles) return;
+  // Every state, not just `unreadable`: an untrusted project bundles.json is
+  // dropped by the trust gate and yields `empty` PLUS the warning that names
+  // `yaw-mcp trust`, which is the only line explaining why the servers the
+  // user can see are not being served.
+  for (const w of bundles.warnings) err(`warning: ${w}`);
   if (bundles.state === "servers") {
     log(
       `Servers: ${bundles.count} configured in ${bundles.path} -- yaw-mcp serves ${bundles.count === 1 ? "it" : "them"} through this entry.`,
@@ -299,9 +308,6 @@ function logInstallTail(
     return;
   }
   if (bundles.state === "unreadable") {
-    // The one state whose warnings are printed: they name the defect the user
-    // has to fix. stderr, so stdout stays the report.
-    for (const w of bundles.warnings) err(`warning: ${w}`);
     log(`Servers: could not read ${bundles.path} -- yaw-mcp will start with nothing to serve.`);
     log("  The `warning:` line above says what is wrong; `yaw-mcp list` prints the same detail.");
     return;

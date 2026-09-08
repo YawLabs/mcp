@@ -626,13 +626,17 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // id instead would silently move that write to the user file and lose the
   // warning with it.
   //
-  // With an explicit --client there is no detected slot, so prefer a user
-  // scope and fall back to the client's first: trials are user-scoped by
-  // design, and the table decides which clients can honour that.
+  // ...but only when the client has NO user scope of its own. Inheriting a
+  // project slot unconditionally went too far: claude-code and cursor both
+  // have a user scope, so a checkout carrying a committed .mcp.json would
+  // put the trial into a commit-to-share file for them too, which is exactly
+  // what "trials are user-scoped by design" rules out. A user scope wins
+  // whenever one exists; the detected slot decides only for a client that
+  // cannot honour that (today: none, after VS Code gained one -- so this is
+  // the branch that keeps the rule true if a project-only client is added).
   const tryTarget = INSTALL_TARGETS.find((t) => t.clientId === clientId);
-  const scope: InstallScope =
-    detected?.scope ??
-    (tryTarget?.scopes.some((sc) => sc.scope === "user") ? "user" : (tryTarget?.scopes[0].scope ?? "user"));
+  const hasUserScope = tryTarget?.scopes.some((sc) => sc.scope === "user") ?? false;
+  const scope: InstallScope = hasUserScope ? "user" : (detected?.scope ?? tryTarget?.scopes[0].scope ?? "user");
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
   try {

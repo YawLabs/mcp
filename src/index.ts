@@ -7,7 +7,7 @@ import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
-import { parseSetArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
+import { parseSetArgs, parseToggleArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
 import { log } from "./logger.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "./reset-learning-cmd.js";
 import { parseSearchArgs, runSearch } from "./search-cmd.js";
@@ -163,16 +163,12 @@ if (subcommand === "compliance") {
 } else if (subcommand === "set") {
   run("set", parseSetArgs(process.argv.slice(3)), runSet);
 } else if (subcommand === "enable" || subcommand === "disable") {
-  // enable/disable are `set <target> isActive=<bool>` with a fixed
-  // assignment, so they share one parser and one writer -- a second copy of
-  // the target resolution is a second thing to keep in step with `remove`.
-  const enabled = subcommand === "enable";
-  const parsedToggle = parseSetArgs(process.argv.slice(3));
-  run(
-    subcommand,
-    parsedToggle.ok ? { ok: true as const, options: { ...parsedToggle.options, enabled } } : parsedToggle,
-    runEnableDisable,
-  );
+  // enable/disable share the WRITER with `set` -- they ARE `isActive=<bool>`,
+  // and one target resolution is one thing to keep in step with `remove` --
+  // but NOT the parser. parseSetArgs requires at least one `key=value`, so
+  // routing these through it rejected every legitimate invocation of both
+  // verbs with the wrong usage text.
+  run(subcommand, parseToggleArgs(process.argv.slice(3), subcommand === "enable"), runEnableDisable);
 } else if (subcommand === "list") {
   run("list", parseListArgs(process.argv.slice(3)), runList);
 } else if (subcommand === "secrets") {
