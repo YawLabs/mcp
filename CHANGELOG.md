@@ -4,6 +4,32 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased -- an authenticated remote server can actually authenticate
 
+**Fixed -- three ways a credential could still reach a log, and two verbs that never ran**
+
+Written up together because they were found together: an adversarial review of everything below, whose findings were each re-checked by an independent verifier before anything was changed.
+
+The header redaction added below covered only half the path it needed to. It scrubbed the connect failure, but everything raised *after* a successful handshake went through a helper that redacts the stderr tail it appends and returns the error untouched when there is no tail -- which is always, for a remote. So a `tools/list` failure carried the far end's response body verbatim into the log and into the model's context. Reproduced against a real gateway that accepts `initialize` and then answers 401 with the request headers echoed back. The error message is now redacted in its own right, which also closes the same gap for a local server whose child echoes an injected value.
+
+Redaction was also matching the wrong string. The documented shape is `"Authorization": "Bearer ${secret:linear}"`, so what got registered was `Bearer <token>` -- and a gateway that answers `{"error":"invalid_api_key","key":"<token>"}` echoes the token alone, which that does not match. The decrypted values are now registered too, keyed by secret name, so a hit reads as `***linear***` and names the secret to rotate.
+
+And `yaw-mcp secrets audit` could claim a secret was injected into a server that never received it: header validation ran after the resolve, and the resolve audits what it decrypts. The check now runs ahead of the audit write, so a rejected value records nothing.
+
+Separately, `yaw-mcp enable` and `yaw-mcp disable` never worked at all. Both were routed through the `set` parser, which requires at least one `key=value`, so every documented invocation died with the wrong usage text and exit 2. They have their own parser now. `set --help` also printed to stderr and exited 2; all three now print usage to stdout and exit 0.
+
+**Fixed -- four places that reported something other than what happened**
+
+`read_tool` was the one model-facing surface the tool deny did not cover: on a dormant server it returned a schema and told the model to activate and call a tool the gate would refuse. It now refuses in the gate's own words.
+
+A `discover(context, server)` call whose `server` does not resolve was returning a bare miss -- but the auto-load has already run by then, so the model was left holding tools it was never told about. The miss now carries the banner.
+
+`set` never checked whether a project `bundles.json` was shadowing its write. A project file replaces the user-global one on load, so the edit was real on disk and invisible in the session; `add` and `remove` both warn about this, and `set` was the worst of the three to leave silent, because there is no new entry to go looking for. It also emitted its confirmation prompt on stdout, which broke `--json`.
+
+`install` counted disabled servers when reporting how many it will serve, and printed loader warnings in only one of three states -- dropping the line that names `yaw-mcp trust` when a project file is untrusted.
+
+**Fixed -- a bare `*` in `blockedTools` denied every tool**
+
+The README, the JSON schema and the loader's own warning all say a bare wildcard is refused. It was warned about and then enforced as deny-everything by the prefix match. The loader now drops an entry it rejects (safe for this key, which has no allow-list counterpart to fall through to), and the gate treats an empty prefix as inert.
+
 **Added -- `headers` on a remote entry, resolved through the vault**
 
 Every authenticated remote (HTTP or SSE) MCP server was unreachable, and nothing said so usefully. Both transports were constructed with a URL and no options at all, so no credential could be attached under any configuration; a token parked in the entry's `env` went nowhere, because `resolveServerEnv` runs only on the local spawn path. The connect went out bare, the far end answered 401, and the failure read as "server down". The code knew: the comment above that branch said outright that header injection was the real fix and that the warning below it was only the missing diagnostic.
@@ -69,9 +95,13 @@ The rows carry what the docs actually say rather than what is convenient. Windsu
 
 Auto-detection now returns the scope it found alongside the id, and the trial follows it. That also preserves a safety feature the naive fix would have removed: a repo shipping a committed `.vscode/mcp.json` is detected on the workspace slot, and a trial carrying an inline token into a commit-to-share file still demands `--yes` and still warns. With an explicit `--client` there is no detected slot, so a user scope is preferred and the table decides the fallback.
 
-**Changed -- `install --all --project-dir` is refused instead of ignored**
+**Changed -- what `--project-dir` means when you do not also pass `--scope`**
 
-Every client now has a user scope, so `--all` plans all of them there and hands no project directory to any sub-install: the flag would parse, print nothing and change nothing. It was previously the only way `--all` could reach VS Code, which is why it was honoured. This file already refuses `--all --scope` and `--list --scope` on the same reasoning -- a flag that is accepted and dropped reads as honoured -- and the refusal names the command that does write a workspace file, so it redirects rather than dead-ends.
+Two changes in one place, both consequences of VS Code gaining a user scope.
+
+For a single client, `--project-dir` alone now selects the project scope when exactly one scope reads a project directory. Without that, giving VS Code a user scope silently broke `yaw-mcp install vscode --project-dir <dir>`: the default flipped to user, and the existing guard then refused the flag that had been the only way to write a workspace file. Where a client has one project-reading scope, the flag names it unambiguously. Claude Code has two (project and local), so it keeps refusing and lists both -- choosing there would be a guess about which file you meant.
+
+For `--all`, the flag is now refused rather than ignored. Every client has a user scope, so `--all` plans them all there and hands no project directory to any sub-install: the flag would parse, print nothing and change nothing. This file already refuses `--all --scope` and `--list --scope` on the same reasoning -- a flag that is accepted and dropped reads as honoured -- and the refusal names the command that does write a workspace file.
 
 **Added -- `blockedTools`, a per-tool deny list enforced where the call happens**
 
