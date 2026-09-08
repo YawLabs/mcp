@@ -452,10 +452,30 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
-  // Pick a default scope sensibly: prefer user-global where supported,
-  // else fall back to the first scope the client supports (vscode → project).
-  const scope: InstallScope =
-    opts.scope ?? (target.scopes.find((s) => s.scope === "user") ? "user" : target.scopes[0].scope);
+  // Pick a default scope sensibly: prefer user-global where supported, else
+  // fall back to the first scope the client supports.
+  //
+  // An explicit --project-dir with no --scope picks the client's project scope
+  // instead, but ONLY when exactly one scope reads a project directory.
+  //
+  // Why the flag is read at all: giving VS Code a user scope flipped its
+  // default from project to user, and the guard below then refused the flag
+  // that had been the only way to write a workspace file -- a working command
+  // broken by a change meant to add one. Where a client has a single
+  // project-reading scope, `--project-dir` names it unambiguously.
+  //
+  // Why only when unambiguous: claude-code has TWO (project and local), and
+  // choosing between them would be a guess about which file the user meant.
+  // That client keeps the refusal below, which lists both and asks -- the
+  // behaviour its own test records as a deliberate answer to this question.
+  const projectScopes = target.scopes.filter((s) => s.requiresProjectDir);
+  const defaultScope: InstallScope =
+    opts.projectDir !== undefined && projectScopes.length === 1
+      ? projectScopes[0].scope
+      : target.scopes.find((s) => s.scope === "user")
+        ? "user"
+        : target.scopes[0].scope;
+  const scope: InstallScope = opts.scope ?? defaultScope;
   const scopeSpec = target.scopes.find((s) => s.scope === scope);
   if (!scopeSpec) {
     err(

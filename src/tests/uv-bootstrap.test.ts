@@ -195,48 +195,56 @@ describe("resolveUvSpawn with uv present", () => {
   // immediately before asserting, making the branch under test and the
   // test's precondition one measurement. The exact-command assertions are
   // preserved rather than widened, which is the whole point of them.
+  //
+  // The guard SKIPS rather than returning. An early `return` leaves vitest
+  // printing a green check for a body that asserted nothing -- the exact shape
+  // the header comment above says `it.skipIf` was adopted to remove, and a
+  // systematic probe failure would have shown as five passes. `ctx.skip`
+  // renders the reason and counts in the "skipped" summary, so the honest
+  // signal survives.
+  const SKIP_REASON = "onPath('uv') missed under load -- probe disagreement, not a regression";
   async function uvReachable(): Promise<boolean> {
     return onPath("uv");
   }
 
-  it.skipIf(!UV_PRESENT)("returns the bare `uv` when uv is on PATH", async () => {
-    if (!(await uvReachable())) return;
+  it.skipIf(!UV_PRESENT)("returns the bare `uv` when uv is on PATH", async (ctx) => {
+    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
     const result = await resolveUvSpawn("uv", ["--version"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["--version"]);
   });
 
-  it.skipIf(!UV_PRESENT)("rewrites uvx to `uv tool run` when uv is reachable", async () => {
+  it.skipIf(!UV_PRESENT)("rewrites uvx to `uv tool run` when uv is reachable", async (ctx) => {
     // uvx is sugar for `uv tool run`. Previously we passed uvx
     // through unchanged when uv was on PATH, which broke when uv.exe
     // was reachable but uvx.exe wasn't (Windows PATHEXT cases, or
     // partial installs). Always-rewriting means the spawn target is
     // always uv, which we've already confirmed is reachable.
-    if (!(await uvReachable())) return;
+    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
     const result = await resolveUvSpawn("uvx", ["mcp-server-fetch"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run", "mcp-server-fetch"]);
   });
 
-  it.skipIf(!UV_PRESENT)("preserves additional args when rewriting uvx", async () => {
-    if (!(await uvReachable())) return;
+  it.skipIf(!UV_PRESENT)("preserves additional args when rewriting uvx", async (ctx) => {
+    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
     const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"]);
   });
 
-  it.skipIf(!UV_PRESENT)("rewrites uvx with empty args", async () => {
-    if (!(await uvReachable())) return;
+  it.skipIf(!UV_PRESENT)("rewrites uvx with empty args", async (ctx) => {
+    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
     const result = await resolveUvSpawn("uvx", []);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run"]);
   });
 
-  it.skipIf(!UV_PRESENT)("recognises bare names with a Windows executable extension, any casing", async () => {
+  it.skipIf(!UV_PRESENT)("recognises bare names with a Windows executable extension, any casing", async (ctx) => {
     // `"command": "uvx.exe"` is an ordinary config shape on Windows; exact
     // string equality used to pass it through untouched -- no bootstrap when
     // uv was missing, and no `uv tool run` rewrite.
-    if (!(await uvReachable())) return;
+    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
     const exe = await resolveUvSpawn("uvx.exe", ["mcp-server-fetch"]);
     expect(exe.command).toBe("uv");
     expect(exe.args).toEqual(["tool", "run", "mcp-server-fetch"]);

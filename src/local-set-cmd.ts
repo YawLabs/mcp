@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { editJsoncPath, parseJsonc } from "./jsonc.js";
-import { deriveNamespace, localBundlesPath, withBundlesLock } from "./local-bundles.js";
+import { deriveNamespace, findShadowingProjectBundles, localBundlesPath, withBundlesLock } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 import { MAX_TIMEOUT_MS } from "./upstream.js";
@@ -106,6 +106,15 @@ export interface SetCommandOptions {
   json?: boolean;
   force?: boolean;
   home?: string;
+  /** For the shadow check only -- `set` always writes the user-global file.
+   *  A project bundles.json fully REPLACES that file on load, so an edit made
+   *  while one is in effect is real on disk and invisible in the session. */
+  cwd?: string;
+  /** Passed explicitly to the shadow check rather than defaulted inside it:
+   *  the verdict is trust-aware and YAW_MCP_TRUST_PROJECT is the documented
+   *  bypass, so reading process.env there would answer for a different
+   *  environment than the one this command was told to run under. */
+  env?: NodeJS.ProcessEnv;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Test seams, mirroring RemoveCommandOptions. */
@@ -490,6 +499,19 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       if (stillDisabled && !isActiveTouched) {
         print(
           `Note: "${namespace}" is "isActive": false, so it will NOT load. Run \`yaw-mcp enable ${namespace}\` to turn it on.`,
+        );
+      }
+      // A project bundles.json REPLACES the user-global file on load rather
+      // than merging with it, so an edit made while one is in effect is real on
+      // disk and invisible in the session. `add` and `remove` both say so; a
+      // `set` that reported success and changed nothing observable was the
+      // worst of the three, because there is no new entry to go looking for.
+      const shadow = await findShadowingProjectBundles(opts.cwd ?? process.cwd(), home, opts.env ?? process.env).catch(
+        () => null,
+      );
+      if (shadow) {
+        printErr(
+          `Note: ${shadow} overrides your user-global bundles.json, so this change won't take effect until you make it there or remove that file.`,
         );
       }
       print("Restart your MCP client (or yaw-mcp) to apply.");

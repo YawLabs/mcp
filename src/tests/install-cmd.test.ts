@@ -2351,6 +2351,34 @@ describe("runInstall — --project-dir at a scope that resolves none", () => {
     expect(stderr).toMatch(/has no project-directory scope/);
     expect(stderr).not.toMatch(/--scope\s*$/m);
   });
+
+  it("vscode (one project-reading scope) HONORS the flag instead of refusing", async () => {
+    // The other side of the rule, and the reason it exists. VS Code gained a
+    // user scope, which flipped its default and made this exact command --
+    // previously the only way to write a workspace file -- refuse. With
+    // exactly one scope that reads a project directory, `--project-dir` names
+    // it unambiguously, so it is honoured rather than rejected.
+    //
+    // claude-code above keeps refusing precisely because it has TWO such
+    // scopes (project and local): there, choosing would be a guess.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "vscode",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(r.exitCode).toBe(0);
+    const workspaceFile = join(synthCwd, ".vscode", "mcp.json");
+    expect(existsSync(workspaceFile)).toBe(true);
+    expect(r.written).toContain(workspaceFile);
+    // And the user-scope file it would have defaulted to is NOT written.
+    expect(existsSync(join(synthHome, ".config", "Code", "User", "mcp.json"))).toBe(false);
+  });
 });
 
 describe("runInstall — Windows %APPDATA% redirection", () => {

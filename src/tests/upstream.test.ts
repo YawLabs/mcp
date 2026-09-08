@@ -1039,6 +1039,7 @@ describe("resolveServerEnv", () => {
       resolved: { API_KEY: resolvedValue },
       missing: [],
       malformed: [],
+      values: {},
     });
 
     // Connect will fail -- we only need resolveServerEnv to complete without throwing.
@@ -1089,6 +1090,7 @@ describe("resolveServerEnv", () => {
       resolved: { API_KEY: "${secret:MISSING_NAME}" },
       missing: ["MISSING_NAME"],
       malformed: [],
+      values: {},
     });
 
     const config = makeLocalConfig({ env: { API_KEY: "${secret:MISSING_NAME}" } });
@@ -1116,6 +1118,7 @@ describe("resolveServerEnv", () => {
       resolved: { API_KEY: "${secret:MISSING_NAME}", OTHER: "resolved-cleartext" },
       missing: ["MISSING_NAME"],
       malformed: [],
+      values: {},
     });
 
     const config = makeLocalConfig({
@@ -1204,6 +1207,7 @@ describe("resolveServerEnv", () => {
       resolved: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" },
       missing: ["MISSING_NAME"],
       malformed: [{ display: "<malformed ref> ${secret:gh ...", auditName: "<malformed ref> gh" }],
+      values: {},
     });
     const config = makeLocalConfig({ env: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" } });
     await expect(connectToUpstream(config)).rejects.toThrow(
@@ -1229,7 +1233,12 @@ describe("resolveServerEnv", () => {
     process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { MY_SECRET: {} } } as any);
     vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
-    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { API_KEY: "cleartext" }, missing: [], malformed: [] });
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { API_KEY: "cleartext" },
+      missing: [],
+      malformed: [],
+      values: {},
+    });
     _sdkBehavior.clientConnect = () => Promise.reject(new Error("transport error"));
 
     const config = makeLocalConfig({ env: { API_KEY: "${secret:MY_SECRET}" } });
@@ -1289,7 +1298,12 @@ describe("resolveServerEnv", () => {
     const fakeKey = Buffer.from("fakekey");
     vi.mocked(loadVault).mockResolvedValue(fakeVault);
     vi.mocked(unlock).mockResolvedValue(fakeKey);
-    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [], malformed: [] });
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { TOKEN: "cleartext" },
+      missing: [],
+      malformed: [],
+      values: {},
+    });
 
     const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
     await connectToUpstream(config).catch(() => {});
@@ -1308,7 +1322,12 @@ describe("resolveServerEnv", () => {
     const fakeVault = { version: 1, salt: "abc", entries: { MY_TOKEN: {} } } as any;
     vi.mocked(loadVault).mockResolvedValue(fakeVault);
     vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
-    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [], malformed: [] });
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { TOKEN: "cleartext" },
+      missing: [],
+      malformed: [],
+      values: {},
+    });
 
     const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
     await connectToUpstream(config).catch(() => {});
@@ -2907,6 +2926,7 @@ describe("connectToUpstream remote headers", () => {
       resolved: { Authorization: "Bearer real-token" },
       missing: [],
       malformed: [],
+      values: {},
     } as any);
 
     await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:gh}" } })).catch(() => {});
@@ -2967,6 +2987,7 @@ describe("connectToUpstream remote headers", () => {
       resolved: { Authorization: "line1\nline2" },
       missing: [],
       malformed: [],
+      values: {},
     } as any);
 
     const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "${secret:pem}" } })).catch(
@@ -2978,6 +2999,11 @@ describe("connectToUpstream remote headers", () => {
     expect((err as Error).message).toContain('header "Authorization"');
     expect((err as Error).message).not.toContain("line1");
     expect(_sdkBehavior.remoteConstructions).toEqual([]);
+    // And the audit does not claim the secret was injected. The check runs
+    // INSIDE resolveServerEnv, ahead of the audit write, because a check that
+    // ran after it left `yaw-mcp secrets audit` reporting a value delivered to
+    // a server that never received it and for which no transport was built.
+    expect(vi.mocked(appendAuditEvent)).not.toHaveBeenCalledWith(expect.objectContaining({ event: "injected" }));
   });
 
   it("accepts a resolved value whose only defect is a trailing newline", async () => {
@@ -2992,11 +3018,40 @@ describe("connectToUpstream remote headers", () => {
       resolved: { Authorization: "Bearer tok\n" },
       missing: [],
       malformed: [],
+      values: {},
     } as any);
 
     await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "${secret:gh}" } })).catch(() => {});
 
     expect(_sdkBehavior.remoteConstructions).toHaveLength(1);
+  });
+
+  it("redacts the BARE token when the header only embedded it", async () => {
+    // The documented shape is `"Authorization": "Bearer ${secret:linear}"`, so
+    // the composed value is `Bearer <token>`. A gateway that answers with
+    // `{"error":"invalid_api_key","key":"<token>"}` echoes the token ALONE,
+    // which the composed string does not match -- the redactor replaces exact
+    // substrings. The decrypted values now ride in the map beside the composed
+    // ones, keyed by secret NAME, so a hit also names the secret to rotate.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({ entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { Authorization: "Bearer lin_api_9fJ2sQx1TvB" },
+      missing: [],
+      malformed: [],
+      values: { linear: "lin_api_9fJ2sQx1TvB" },
+    } as any);
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(new Error('Error POSTing to endpoint: {"error":"invalid_api_key","key":"lin_api_9fJ2sQx1TvB"}'));
+
+    const err = await connectToUpstream(
+      makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:linear}" } }),
+    ).catch((e: unknown) => e);
+
+    expect(String((err as Error).message)).not.toContain("lin_api_9fJ2sQx1TvB");
+    expect(String((err as Error).message)).toContain("***linear***");
   });
 
   it("redacts a resolved header value the server echoes back in its failure body", async () => {

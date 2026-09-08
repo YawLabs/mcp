@@ -92,6 +92,52 @@ describe("runSet -- comment preservation", () => {
   });
 });
 
+describe("runSet -- a project file that shadows the write", () => {
+  it("warns that the edit will not take effect", async () => {
+    // A project bundles.json REPLACES the user-global file on load rather than
+    // merging with it, so an edit made while one is in effect is real on disk
+    // and invisible in the session. `add` and `remove` both say so; `set` was
+    // the worst of the three to leave silent, because there is no new entry to
+    // go looking for -- just a reported success that changed nothing.
+    writeBundles(SAMPLE);
+    const projectDir = mkdtempSync(join(synthHome, "proj-"));
+    mkdirSync(join(projectDir, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(projectDir, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({ version: 1, servers: [{ namespace: "other", name: "Other", command: "npx" }] }),
+    );
+
+    const cap = capture();
+    const r = await runSet({
+      target: "gh",
+      assignments: ["isActive=false"],
+      home: synthHome,
+      cwd: projectDir,
+      // The shadow verdict is trust-aware; this is the documented bypass, and
+      // passing it explicitly is why the option exists.
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      ...cap,
+    });
+
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).toContain("overrides your user-global bundles.json");
+  });
+
+  it("stays quiet when no project file is in effect", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runSet({
+      target: "gh",
+      assignments: ["isActive=false"],
+      home: synthHome,
+      cwd: synthHome,
+      env: {},
+      ...cap,
+    });
+    expect(cap.errText()).not.toContain("overrides your user-global");
+  });
+});
+
 describe("runSet -- scalar fields", () => {
   it("sets, clears and reports each scalar", async () => {
     writeBundles(SAMPLE);

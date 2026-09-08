@@ -92,6 +92,19 @@ export class VaultPassphraseRequiredError extends Error {
   }
 }
 
+/** A resolved value the caller's own shape check rejected -- today, a header
+ *  value that cannot be a legal HTTP header value.
+ *
+ *  Carries only the KEY. The message deliberately does not quote the value:
+ *  it is a decrypted secret, and the runtime's own `Headers` TypeError quotes
+ *  it, which is why that error is caught and discarded rather than wrapped. */
+export class InvalidResolvedValueError extends Error {
+  constructor(public readonly key: string) {
+    super(`invalid resolved value for "${key}"`);
+    this.name = "InvalidResolvedValueError";
+  }
+}
+
 /** Vault passphrase captured from an in-session MCP elicitation.
  *
  *  Held in a module variable and NOT written back to `process.env`, which is
@@ -197,8 +210,24 @@ export async function resolveServerEnv(
   // and tests match on that text (see the VaultPassphraseRequiredError doc
   // above, and src/tests/server.test.ts's verbatim assertion).
   subject: string = "server env",
+  /** Shape check on the RESOLVED values, run before anything is audited.
+   *  Returns the offending KEY name, or undefined when every value is usable.
+   *  Exists so a caller that will reject a value can do so before the audit
+   *  claims the secret was injected. */
+  validate?: (resolved: Record<string, string>) => string | undefined,
+  /** Receives every DECRYPTED value keyed by secret name, so the caller can
+   *  redact the bare token as well as the string it was composed into. Not
+   *  called when the map carries no refs -- there is nothing to decrypt. */
+  onSecretValues?: (values: Record<string, string>) => void,
 ): Promise<Record<string, string>> {
-  if (!hasSecretRefs(env)) return env;
+  // A ref-free map skips the vault entirely, so there is nothing to audit and
+  // nothing decrypted -- but the caller's shape check still has to run, or an
+  // unusable LITERAL value would sail past it.
+  if (!hasSecretRefs(env)) {
+    const bad = validate?.(env);
+    if (bad) throw new InvalidResolvedValueError(bad);
+    return env;
+  }
   const refKeys = Object.entries(env)
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
     .map(([k]) => k);
@@ -255,7 +284,24 @@ export async function resolveServerEnv(
       "invalid",
     );
   }
-  const { resolved, missing, malformed } = resolveSecretRefs(env, vault, key);
+  const { resolved, missing, malformed, values } = resolveSecretRefs(env, vault, key);
+  // Hand the caller every decrypted value, keyed by secret NAME, so it can arm
+  // the redactor with those as well as the composed strings. `resolved` holds
+  // `Bearer <token>` for the documented `"Bearer ${secret:linear}"` shape, so
+  // an upstream echoing only the bare token matched nothing -- the redactor
+  // replaces exact substrings. A callback rather than a return field or a
+  // module variable: the return type is consumed in several places, and a
+  // module variable would be shared across concurrent connects.
+  onSecretValues?.(values);
+
+  // Caller-supplied shape check on the RESOLVED values, run before the audit
+  // below. The remote branch uses it to reject a value that cannot be an HTTP
+  // header: without it, that refusal happened after resolveServerEnv returned,
+  // so the audit had already written "injected" for a secret that reached no
+  // request and no transport. Nothing is recorded on this path -- the value was
+  // decrypted and then discarded, which is neither "injected" nor "missing".
+  const invalid = missing.length === 0 && malformed.length === 0 ? validate?.(resolved) : undefined;
+
   // Audit which secrets were consumed for this spawn -- NAME + namespace
   // only, never a value. Wrapped in try/catch (and each append is itself
   // fail-open) so a broken audit log can never block the spawn.
@@ -266,14 +312,20 @@ export async function resolveServerEnv(
   // first, then refuse. recordResolveAudit itself suppresses "injected" on
   // the refusal path -- nothing reaches a child env when the spawn is
   // refused, so "injected" would be a lie (see its doc comment).
-  try {
-    await recordResolveAudit(namespace, env, missing, malformed);
-  } catch (auditErr) {
-    log("warn", "Failed to record secret-resolve audit (non-fatal)", {
-      namespace,
-      error: auditErr instanceof Error ? auditErr.message : String(auditErr),
-    });
+  if (!invalid) {
+    try {
+      await recordResolveAudit(namespace, env, missing, malformed);
+    } catch (auditErr) {
+      log("warn", "Failed to record secret-resolve audit (non-fatal)", {
+        namespace,
+        error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+      });
+    }
   }
+  // Thrown after the audit decision above so the two orderings stay in one
+  // place; the caller turns the key name into its own error, where the config
+  // pointer lives.
+  if (invalid) throw new InvalidResolvedValueError(invalid);
   // A malformed ref refuses exactly like an absent name -- the literal must
   // never reach a child -- but it is reported in its own clause and in its
   // bounded `display` form: `missing` holds NAMES, while a malformed span is a
@@ -948,8 +1000,15 @@ async function connectToUpstreamOnce(
       });
     }
 
-    const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace);
-    resolvedServerEnv = serverEnv;
+    // The bare decrypted values ride alongside the composed ones in the
+    // redaction map. A child that echoes only the token -- not the whole
+    // `Bearer <token>` string it was spliced into -- would otherwise match
+    // nothing, the redactor being exact-substring.
+    let secretValues: Record<string, string> = {};
+    const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace, undefined, undefined, (v) => {
+      secretValues = v;
+    });
+    resolvedServerEnv = { ...serverEnv, ...secretValues };
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
@@ -1028,26 +1087,47 @@ async function connectToUpstreamOnce(
     const rawHeaders = config.headers ?? {};
     let requestHeaders: Record<string, string> | undefined;
     if (Object.keys(rawHeaders).length > 0) {
-      const resolvedHeaders = await resolveServerEnv(rawHeaders, config.namespace, "remote server headers");
-      // Assigning into the redaction map is what arms redactSecretsInOutput
-      // for this branch -- see remoteFailureDetail.
-      resolvedServerEnv = resolvedHeaders;
-
       // Validate with the runtime's own parser rather than a hand-rolled
       // regex, one key at a time so the refusal can name WHICH header. The
-      // TypeError that `Headers` throws QUOTES the offending value, which
-      // here is the secret, so it is caught and discarded rather than
-      // wrapped. A merely trailing newline is fine (Headers strips leading
-      // and trailing HTTP whitespace), which matters because
-      // `yaw-mcp secrets set --stdin` is documented as raw and multi-line.
-      const probe = new Headers();
-      for (const [name, value] of Object.entries(resolvedHeaders)) {
-        try {
-          probe.append(name, value);
-        } catch {
+      // TypeError that `Headers` throws QUOTES the offending value, which here
+      // is the secret, so it is caught and discarded rather than wrapped. A
+      // merely trailing newline is fine (Headers strips leading and trailing
+      // HTTP whitespace), which matters because `yaw-mcp secrets set --stdin`
+      // is documented as raw and multi-line.
+      //
+      // Passed INTO resolveServerEnv rather than run after it: the resolve
+      // audits what it decrypted, so a check that ran afterwards left the log
+      // claiming the secret was injected into a server that never received it
+      // and for which no transport was ever built.
+      const validateHeaders = (resolved: Record<string, string>): string | undefined => {
+        const probe = new Headers();
+        for (const [name, value] of Object.entries(resolved)) {
+          try {
+            probe.append(name, value);
+          } catch {
+            return name;
+          }
+        }
+        return undefined;
+      };
+
+      let resolvedHeaders: Record<string, string>;
+      let headerSecretValues: Record<string, string> = {};
+      try {
+        resolvedHeaders = await resolveServerEnv(
+          rawHeaders,
+          config.namespace,
+          "remote server headers",
+          validateHeaders,
+          (v) => {
+            headerSecretValues = v;
+          },
+        );
+      } catch (err) {
+        if (err instanceof InvalidResolvedValueError) {
           throw new ActivationError(
             withConfigPointer(
-              `Server "${config.namespace}" has an invalid value for header "${name}" -- an HTTP header value cannot contain a line break or a control character (the value is not shown).`,
+              `Server "${config.namespace}" has an invalid value for header "${err.key}" -- an HTTP header value cannot contain a line break or a control character (the value is not shown).`,
               config,
             ),
             "unknown",
@@ -1055,7 +1135,15 @@ async function connectToUpstreamOnce(
             undefined,
           );
         }
+        throw err;
       }
+      // Assigning into the redaction map is what arms redactSecretsInOutput
+      // for this branch -- see remoteFailureDetail. The bare decrypted values
+      // go in beside the composed headers: the documented shape is
+      // `"Authorization": "Bearer ${secret:linear}"`, and a gateway that
+      // answers with `{"error":"invalid_api_key","key":"<token>"}` echoes only
+      // the token, which the composed string does not match.
+      resolvedServerEnv = { ...resolvedHeaders, ...headerSecretValues };
       requestHeaders = resolvedHeaders;
     }
 

@@ -2122,6 +2122,25 @@ export class ConnectServer {
       : this.profile.path;
   }
 
+  /** read_tool's answer for a denied tool.
+   *
+   *  A schema is an invitation to call, and on a dormant server read_tool ends
+   *  by telling the model to activate and invoke -- so returning one for a
+   *  tool the gate will refuse sends the model down a path that cannot work.
+   *  It refuses in the gate's own words instead, which is also the wording
+   *  that names the file to edit. */
+  private deniedToolRead(wireName: string): { content: Array<{ type: string; text: string }>; isError: boolean } {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Tool "${wireName}" is blocked by the "blockedTools" list in ${this.blockedToolsSource()}. Its schema is withheld because a call would be refused. Report the block to the user instead of routing around it.`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
   private handleDiscover(
     context?: string,
     focusNamespace?: string,
@@ -2323,46 +2342,41 @@ export class ConnectServer {
     // particular it is never compliance-blocked: discover deliberately LISTS a
     // below-grade server with an inline annotation rather than hiding it, which
     // is why this must not route through the spawn gate.
+    // A focus MISS still has to report an auto-load that already happened.
+    // handleDiscoverWithAutoWarm never validates the focus: by the time the
+    // body is rendered it may have spawned a server, put it in sessionActivated
+    // and fired tools/list_changed. Returning a bare miss would leave the model
+    // holding tools it was never told about -- the one thing the banner exists
+    // to prevent. Same wording and same dash as the banner below, so the two
+    // cannot drift.
+    const warmPrefix = warmedNamespace ? `Auto-loaded "${warmedNamespace}" — top match for your query.\n\n` : "";
+    const focusMiss = (text: string): { content: Array<{ type: string; text: string }> } => ({
+      content: [{ type: "text", text: `${warmPrefix}${text}` }],
+    });
+
     let focused: UpstreamServerConfig | undefined;
     if (focusNamespace !== undefined) {
       focused = allProfiled.find((srv) => srv.namespace === focusNamespace);
       if (!focused) {
         const configured = this.config.servers.find((srv) => srv.namespace === focusNamespace);
         if (configured && configured.isActive === false) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `"${focusNamespace}" is installed but disabled ("isActive": false in ~/.yaw-mcp/bundles.json). Call mcp_connect_discover with no arguments to list what is available.`,
-              },
-            ],
-          };
+          return focusMiss(
+            `"${focusNamespace}" is installed but disabled ("isActive": false in ~/.yaw-mcp/bundles.json). Call mcp_connect_discover with no arguments to list what is available.`,
+          );
         }
         if (configured) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `"${focusNamespace}" is not allowed by the project profile in effect.`,
-              },
-            ],
-          };
+          return focusMiss(`"${focusNamespace}" is not allowed by the project profile in effect.`);
         }
         const near = closestNames(
           focusNamespace,
           allProfiled.map((srv) => srv.namespace),
           1,
         )[0];
-        return {
-          content: [
-            {
-              type: "text",
-              text: near
-                ? `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Did you mean: ${near}?`
-                : `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover with no arguments to list what is available.`,
-            },
-          ],
-        };
+        return focusMiss(
+          near
+            ? `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Did you mean: ${near}?`
+            : `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover with no arguments to list what is available.`,
+        );
       }
     }
 
@@ -4311,6 +4325,7 @@ export class ConnectServer {
           isError: true,
         };
       }
+      if (this.isToolDenied(tool.namespacedName)) return this.deniedToolRead(tool.namespacedName);
       return {
         content: [
           {
@@ -4373,6 +4388,7 @@ export class ConnectServer {
           isError: true,
         };
       }
+      if (this.isToolDenied(tool.namespacedName)) return this.deniedToolRead(tool.namespacedName);
       return {
         content: [
           {

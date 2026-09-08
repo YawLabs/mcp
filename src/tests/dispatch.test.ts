@@ -517,6 +517,35 @@ describe("handleDiscoverWithAutoWarm", () => {
     expect(text).not.toContain("GitHub");
   });
 
+  it("still reports the auto-load when the focus namespace does not resolve", async () => {
+    // The miss returns early, and it used to return a bare "not in
+    // bundles.json" line. But the auto-warm has already run by then: a server
+    // was spawned, added to sessionActivated and announced via
+    // tools/list_changed. Dropping the banner leaves the model holding tools it
+    // was never told about -- the one thing the banner exists to prevent.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({
+          id: "gh-id",
+          namespace: "gh",
+          name: "GitHub",
+          description: "Repos, issues, and pull requests on GitHub",
+        }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [{ name: "create_issue" }]),
+    );
+
+    const result = await priv.handleDiscoverWithAutoWarm("file a github issue", undefined, "nope");
+    expect(priv.sessionActivated.has("gh")).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('Auto-loaded "gh"');
+    expect(text).toContain('"nope" is not in ~/.yaw-mcp/bundles.json');
+  });
+
   it("does not auto-activate when no context is provided", async () => {
     const priv = getPrivate(server);
     priv.config = {
