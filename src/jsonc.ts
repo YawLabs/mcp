@@ -231,3 +231,37 @@ export function removeJsoncEntry(src: string, containerPath: string[], entryName
   if (edits.length === 0) return src;
   return applyEdits(debommed, edits);
 }
+
+/** Set (or, with `undefined`, delete) the value at an arbitrary JSON path,
+ *  preserving comments. Unlike editJsoncEntry / removeJsoncEntry above,
+ *  `path` may contain NUMERIC segments, so it can address an array element --
+ *  which is what a bundles.json server is (`["servers", 3, "isActive"]`).
+ *  Those two are typed `containerPath: string[]` and cannot: a numeric index
+ *  passed as a string segment falls through jsonc-parser's setProperty to its
+ *  final else branch and throws `Can not add index to parent of type array`.
+ *
+ *  Returns the input unchanged, byte for byte and BOM included, when the edit
+ *  is a no-op -- same contract, and same reason, as removeJsoncEntry.
+ *
+ *  TWO THINGS TO KNOW BEFORE USING IT.
+ *
+ *  Edits CANNOT be batched against one source text. jsonc-parser re-parses on
+ *  every call and returns offsets into the text it was handed, so two edits
+ *  computed against the same input corrupt each other. Apply them one at a
+ *  time, each against the result of the last.
+ *
+ *  Deleting under a MISSING intermediate object throws rather than no-opping:
+ *  with an undefined value the walk breaks with no parent and hits
+ *  `Can not delete in empty document`. Check the container exists first. */
+export function editJsoncPath(src: string, path: Array<string | number>, value: unknown): string {
+  if (path.length === 0) {
+    throw new Error("editJsoncPath: path must not be empty");
+  }
+  if (path.some((seg) => seg === "")) {
+    throw new Error("editJsoncPath: path segments must be non-empty");
+  }
+  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const edits = modify(debommed, path, value, { formattingOptions: FORMATTING_OPTIONS });
+  if (edits.length === 0) return src;
+  return applyEdits(debommed, edits);
+}

@@ -230,6 +230,20 @@ Malformed files log a warning and fall through (fail-open). yaw-mcp reads config
 
 Drop a `YAW-MCP.md` next to `config.json` in either `.yaw-mcp/` and yaw-mcp surfaces it via a `yaw-mcp://guide` MCP resource. The `discover`/`dispatch` descriptions tell the model to read it first, so project routing conventions ("use the `gh` server, not bash") and credential guidance stick without restating them each session. A user guide (`~/.yaw-mcp/YAW-MCP.md`) and a project guide are concatenated with the project one last; a missing file is skipped silently.
 
+### Changing a server without editing JSON
+
+```bash
+yaw-mcp set github isActive=false           # or: yaw-mcp disable github
+yaw-mcp set github runtime=oam              # host it on the oam runtime
+yaw-mcp set github connectTimeoutMs=60000   # slower handshake, this server only
+yaw-mcp set github env.GITHUB_TOKEN='${secret:gh}'   # point at the vault
+yaw-mcp set github env.OLD_VAR=             # remove one variable
+```
+
+Only the entry you name is rewritten, so comments and formatting elsewhere in `bundles.json` survive -- unlike `add` and `remove`, which rewrite the whole file. `enable` and `disable` are the same edit as `set <server> isActive=true|false`.
+
+Settable: `isActive`, `runtime`, `connectTimeoutMs`, `description`, and one `env.KEY` at a time. Everything else is refused, including `command`, `args` and `url` -- those decide which program yaw-mcp launches as you, and belong to `add`/`remove` or a deliberate edit. A trailing `=` clears a field; clearing a stored env value asks first, since it does not come back.
+
 ### Blocking individual tools
 
 `blocked` turns a whole server off. `blockedTools` turns off individual tools on servers you otherwise want:

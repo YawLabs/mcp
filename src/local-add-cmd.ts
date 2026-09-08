@@ -422,7 +422,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       // would make the server loadable when it would not.
       if (previewEntry.isActive === false) {
         print(
-          `Note: this entry is "isActive": false in ${previewPath}, so it would stay disabled and NOT load. Set it to true there to enable it.`,
+          `Note: this entry is "isActive": false, so it would stay disabled and NOT load. Run \`yaw-mcp enable ${previewEntry.namespace}\` to turn it on.`,
         );
       }
     }
@@ -495,11 +495,10 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     // re-enabling it (mergeServerEntry rule 3). That is deliberate, but it
     // makes the usual "restart to pick it up" line WRONG: a disabled entry
     // never loads, so the user restarts, sees nothing, and has no reason to
-    // suspect the file. There is no `enable` verb to point at, so name the
-    // edit that actually turns it on.
+    // suspect the file. Name the verb that turns it on.
     if (written.isActive === false) {
       print(
-        `Note: this entry is "isActive": false in ${res.path}, so it stays disabled and will NOT load. Set it to true there to enable it.`,
+        `Note: this entry is "isActive": false, so it stays disabled and will NOT load. Run \`yaw-mcp enable ${finalNamespace}\` to turn it on.`,
       );
     } else {
       print("Restart your MCP client (or yaw-mcp) to pick it up.");

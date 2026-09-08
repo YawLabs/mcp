@@ -33,6 +33,18 @@ Header values are validated with the runtime's own `Headers` parser, one key at 
 
 `doctor`'s SECRET VAULT section skipped remote entries entirely, behind a ten-line comment arguing that listing one would invent a cause: a remote "starts fine and gets a 401 from the far end". That was true and is now the opposite of true, since a remote with header refs genuinely does refuse to connect while the vault is locked. It scans `headers` for a remote and `env` for a local one -- the map that actually resolves in each case -- and the empty line now reads `no server env or header references ${secret:NAME}`. `mcp_connect_secrets` scans both maps for the same reason: it used to report that a remote needed no secrets while that server was refusing to connect over one. The `yaw-mcp trust` approval preview gained a `headers:` line beside `env:`, key names only, because approving a project `bundles.json` now authorizes yaw-mcp to send a vault secret to whatever URL that file names, while the preview showed a remote as a bare `HTTP <url>`.
 
+**Added -- `set`, `enable` and `disable`, so a per-server field is a command rather than a hand edit**
+
+Nothing could change a per-server field from the CLI. `add` wrote an entry, `remove` deleted one, and everything between was a hand edit of a file that `add` and `remove` then rewrite wholesale -- dropping the comments the user had put in it. Two `add` messages admitted as much, telling the reader to go set `isActive` themselves, because there was no verb to point at. Both now name one.
+
+`set` splices rather than rewrites, through a new comment-preserving primitive that can address an array element. The existing pair could not: both are typed to a string key path, and a bundles.json server lives at an index, which the underlying parser refuses as a string segment. Only the entry named is touched; every other entry, and every comment, keeps its bytes.
+
+The settable list is deliberately short -- `isActive`, `runtime`, `connectTimeoutMs`, `description`, and one `env.KEY` at a time. Not `command`, `args`, `url`, `namespace`, `transport` or `type`: those decide which program yaw-mcp spawns as the user, and they belong to `add`/`remove` or to a deliberate edit, not to a one-line set whose argument lands in shell history. Values are typed by the FIELD rather than by the shape of the text, so `description=true` stores the word while `isActive=true` stores the boolean.
+
+Two behaviours worth knowing. A `connectTimeoutMs` above the ceiling is refused rather than accepted, because the connect path caps silently and would otherwise store a number it then replaces. And clearing an env value asks first, since that is the one edit here that loses something: setting or overwriting shows the previous value in the transcript, but a cleared one does not come back. Off a terminal that confirmation cannot be asked, so the clear is refused rather than assumed.
+
+`enable` and `disable` are delegations to `set <target> isActive=true|false` rather than copies, so the target resolution cannot drift from the one `remove` uses.
+
 **Added -- Windsurf and Gemini CLI, and a VS Code user scope**
 
 `install` covered four clients. It now covers six, and stops refusing one of the four it already had: VS Code was wired workspace-only, so `install --all` printed `skip vscode` on every machine, which reads as a product that does not support your editor. It now writes the user-profile `mcp.json` that `MCP: Open User Configuration` opens, keeping the workspace file as a second scope. Windsurf and Gemini CLI are new rows in the same table -- appended, never inserted, because auto-detection returns the first usable slot in array order and treats Claude Code being first as an invariant.

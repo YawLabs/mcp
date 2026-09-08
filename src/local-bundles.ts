@@ -856,7 +856,7 @@ const BUNDLES_LOCK_POLL_MS = 20;
  *  (acquireUpgradeLock probes the recorded pid), so a crashed Yaw Terminal or
  *  `serve` never blocks an add/remove; what reaches the give-up path is a
  *  live-but-stuck holder, and "delete that lock file" is advice for that. */
-async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+export async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
   const dir = userConfigDir(home);
   // O_EXCL cannot create the sidecar in a dir that does not exist yet, and
   // acquireUpgradeLock reads that ENOENT as "no lock possible, proceed" --

@@ -7,6 +7,7 @@ import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
+import { parseSetArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
 import { log } from "./logger.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "./reset-learning-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
@@ -156,6 +157,19 @@ if (subcommand === "compliance") {
   run("add", parseAddArgs(process.argv.slice(3)), runAdd);
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
+} else if (subcommand === "set") {
+  run("set", parseSetArgs(process.argv.slice(3)), runSet);
+} else if (subcommand === "enable" || subcommand === "disable") {
+  // enable/disable are `set <target> isActive=<bool>` with a fixed
+  // assignment, so they share one parser and one writer -- a second copy of
+  // the target resolution is a second thing to keep in step with `remove`.
+  const enabled = subcommand === "enable";
+  const parsedToggle = parseSetArgs(process.argv.slice(3));
+  run(
+    subcommand,
+    parsedToggle.ok ? { ok: true as const, options: { ...parsedToggle.options, enabled } } : parsedToggle,
+    runEnableDisable,
+  );
 } else if (subcommand === "list") {
   run("list", parseListArgs(process.argv.slice(3)), runList);
 } else if (subcommand === "secrets") {
@@ -189,6 +203,13 @@ if (subcommand === "compliance") {
                              bundles.json. Shows the server and the command it
                              launches, then confirms; --force skips the prompt
                              (and is required when there is no TTY to ask on).
+    set <target> k=v ...     Change per-server fields in bundles.json without
+                             hand-editing it: isActive, runtime,
+                             connectTimeoutMs, description, env.KEY.
+                             Comments in the file survive. --json for JSON.
+    enable <target>          Mark a server loadable ("isActive": true).
+    disable <target>         Keep a server out of the loaded set without
+                             removing it, and without dropping its stored env.
     list                     List the servers yaw-mcp loads locally.
     trust                    Approve this project's .yaw-mcp/bundles.json so
                              yaw-mcp loads it. A project file is usually
