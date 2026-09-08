@@ -33,6 +33,18 @@ Header values are validated with the runtime's own `Headers` parser, one key at 
 
 `doctor`'s SECRET VAULT section skipped remote entries entirely, behind a ten-line comment arguing that listing one would invent a cause: a remote "starts fine and gets a 401 from the far end". That was true and is now the opposite of true, since a remote with header refs genuinely does refuse to connect while the vault is locked. It scans `headers` for a remote and `env` for a local one -- the map that actually resolves in each case -- and the empty line now reads `no server env or header references ${secret:NAME}`. `mcp_connect_secrets` scans both maps for the same reason: it used to report that a remote needed no secrets while that server was refusing to connect over one. The `yaw-mcp trust` approval preview gained a `headers:` line beside `env:`, key names only, because approving a project `bundles.json` now authorizes yaw-mcp to send a vault secret to whatever URL that file names, while the preview showed a remote as a bare `HTTP <url>`.
 
+**Added -- `yaw-mcp search`, and a did-you-mean when an exact slug misses**
+
+`add` took an exact slug and nothing else. A user who did not already know the slug had two options: guess, or open a catalog URL that is not clickable from a terminal -- and a miss printed that same URL, which is a dead end in the place it was printed. Worse, the question `add` answers only by refusing is the one worth asking first: what credentials does this thing need?
+
+`search` answers it. It matches slug, name, tags, category and description, and prints each result with its runtime, tool count and required credential KEYS. With no query it lists the catalog. It writes nothing, and says so.
+
+Matching is tiered -- exact slug, then prefix, then substring or tag or category, then description -- so a server whose prose merely mentions the word never outranks the one named by it. Multiple words AND rather than OR, because typing more words means narrowing; an OR would widen the result set with every extra word. An entry's rank is the WORST tier across its words, so matching one word exactly and another only in prose is a prose match.
+
+A missed slug now suggests the closest real ones, computed from the catalog `add` had already fetched, so the suggestion costs no extra request. Real matches are offered first and the edit-distance fallback runs only when there are none -- deliberately not merged. A union would put an unrelated two-edit neighbour beside the answer the user actually wanted, and a wrong suggestion next to a right one is worse than a right one alone. A description-only hit is never suggested either: it is not a plausible correction for a slug someone typed.
+
+A search with no results exits 0 rather than following grep's convention. Nothing found is an answer, and a non-zero code would make a shell `&&` chain treat a successful search as a failure.
+
 **Added -- `set`, `enable` and `disable`, so a per-server field is a command rather than a hand edit**
 
 Nothing could change a per-server field from the CLI. `add` wrote an entry, `remove` deleted one, and everything between was a hand edit of a file that `add` and `remove` then rewrite wholesale -- dropping the comments the user had put in it. Two `add` messages admitted as much, telling the reader to go set `isActive` themselves, because there was no verb to point at. Both now name one.

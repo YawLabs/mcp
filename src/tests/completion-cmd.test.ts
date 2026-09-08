@@ -14,6 +14,7 @@ import { parseInstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
 import { parseSetArgs } from "../local-set-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
+import { parseSearchArgs } from "../search-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
 import { parseSidecarsArgs } from "../sidecars-cmd.js";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
@@ -436,6 +437,7 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   install: parseInstallArgs,
   add: parseAddArgs,
   remove: parseRemoveArgs,
+  search: parseSearchArgs,
   set: parseSetArgs,
   // enable/disable share set's parser: they ARE `set <target> isActive=<bool>`.
   enable: parseSetArgs,

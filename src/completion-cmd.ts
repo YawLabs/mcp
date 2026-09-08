@@ -124,6 +124,12 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   // but does not complete is invisible to anyone who found the CLI by
   // pressing Tab.
   {
+    name: "search",
+    description: "Search the public MCP catalog",
+    positional: [["<text>"]],
+    flags: ["--json", "--limit", "--catalog", "--help"],
+  },
+  {
     name: "set",
     description: "Change a per-server field in bundles.json",
     positional: [["<slug-or-namespace>"], ["<key=value>"]],

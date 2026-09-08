@@ -17,11 +17,14 @@ const DEFAULT_CATALOG_URL = "https://yaw.sh/data/mcp-catalog.json";
 /** Exported so the timeout test advances its fake clock by THIS value rather
  *  than a literal that silently desyncs the day the constant moves. */
 export const FETCH_TIMEOUT_MS = 10_000;
+
 /** The slug shape `add` and `try` gate on BEFORE touching the catalog:
  *  lowercase letters, digits and dashes, leading alphanumeric, 64 chars at
  *  most. One exported definition, because each verb used to carry a private
  *  copy and the two could only stay identical by accident; the catalog is
  *  the thing a slug names, so its resolver owns the shape. */
+import { suggestCatalogSlugs } from "./catalog-search.js";
+
 export const CATALOG_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -166,7 +169,7 @@ export interface CatalogFetchDeps {
  * the rule hold for every caller, including ones outside this repo's CLI.
  * Whitespace-only is treated the same way: it can never be a URL.
  */
-function normalizeCatalogUrl(url: string | undefined): string {
+export function normalizeCatalogUrl(url: string | undefined): string {
   return url !== undefined && url.trim() !== "" ? url : DEFAULT_CATALOG_URL;
 }
 
@@ -268,9 +271,15 @@ export async function resolveCatalogSlug(
   const servers = await fetchCatalog(url);
   const entry = servers.find((s) => s.slug === slug);
   if (!entry) {
-    throw new Error(
-      `no server with slug "${slug}" in the Yaw MCP catalog. Browse https://yaw.sh/mcp/catalog/ for the list.`,
-    );
+    // The catalog is already fetched, so the suggestion costs nothing extra.
+    // A miss that only names a URL is a dead end in a terminal: the link is
+    // not clickable, and the user cannot see the list without leaving.
+    const near = suggestCatalogSlugs(slug, servers, 3);
+    const hint =
+      near.length > 0
+        ? ` Did you mean: ${near.join(", ")}? Or run \`yaw-mcp search ${slug}\`.`
+        : ` Run \`yaw-mcp search ${slug}\` to look for it, or browse https://yaw.sh/mcp/catalog/.`;
+    throw new Error(`no server with slug "${slug}" in the Yaw MCP catalog.${hint}`);
   }
 
   const install = entry.install ?? {};

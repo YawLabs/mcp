@@ -10,6 +10,7 @@ import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemov
 import { parseSetArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
 import { log } from "./logger.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "./reset-learning-cmd.js";
+import { parseSearchArgs, runSearch } from "./search-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
@@ -157,6 +158,8 @@ if (subcommand === "compliance") {
   run("add", parseAddArgs(process.argv.slice(3)), runAdd);
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
+} else if (subcommand === "search") {
+  run("search", parseSearchArgs(process.argv.slice(3)), runSearch);
 } else if (subcommand === "set") {
   run("set", parseSetArgs(process.argv.slice(3)), runSet);
 } else if (subcommand === "enable" || subcommand === "disable") {
@@ -203,6 +206,9 @@ if (subcommand === "compliance") {
                              bundles.json. Shows the server and the command it
                              launches, then confirms; --force skips the prompt
                              (and is required when there is no TTY to ask on).
+    search [<text>]          Search the public catalog by name, tag, category
+                             or description, and show what each match needs
+                             before you add it. --json, --limit <n>.
     set <target> k=v ...     Change per-server fields in bundles.json without
                              hand-editing it: isActive, runtime,
                              connectTimeoutMs, description, env.KEY.

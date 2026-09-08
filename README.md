@@ -230,6 +230,16 @@ Malformed files log a warning and fall through (fail-open). yaw-mcp reads config
 
 Drop a `YAW-MCP.md` next to `config.json` in either `.yaw-mcp/` and yaw-mcp surfaces it via a `yaw-mcp://guide` MCP resource. The `discover`/`dispatch` descriptions tell the model to read it first, so project routing conventions ("use the `gh` server, not bash") and credential guidance stick without restating them each session. A user guide (`~/.yaw-mcp/YAW-MCP.md`) and a project guide are concatenated with the project one last; a missing file is skipped silently.
 
+### Finding a server
+
+```bash
+yaw-mcp search sql              # slug, name, tags, category, description
+yaw-mcp search                  # list the whole catalog
+yaw-mcp search sql --json       # machine-readable
+```
+
+Each match prints its runtime, tool count and the credentials it needs by name, so you know what an `add` will ask for before you run it. Nothing is written; `yaw-mcp add <slug>` is what installs. A slug that misses now suggests the closest real one rather than only naming a URL.
+
 ### Changing a server without editing JSON
 
 ```bash
