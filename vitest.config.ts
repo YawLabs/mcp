@@ -18,6 +18,15 @@ const TIMING_SENSITIVE = [
   "src/tests/error-category.test.ts",
   "src/tests/install-targets.test.ts",
   "src/tests/uv-bootstrap.test.ts",
+  // Squarely the second class above: 55 cases that each spawn a real bash to
+  // run release.sh against a fixture, ~176 s of subprocess time, and no
+  // explicit per-test timeout -- so every one of them is measured against the
+  // 30 s default. One case spawns TWICE inside that single budget. Standalone
+  // the file passes with room; in the parallel group it intermittently dies
+  // during collection with a stack-trace error rather than an assertion, which
+  // is the shape a contended subprocess deadline takes rather than a real
+  // regression.
+  "src/tests/release-sh.test.ts",
 ];
 
 export default defineConfig({

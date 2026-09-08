@@ -65,6 +65,8 @@ Useful flags:
 - `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
 - `--force` / `--skip` -- overwrite or leave an existing `mcp` entry (otherwise prompts on a TTY, refuses off-TTY).
 
+After it writes, install reports two things it did **not** change. First, how many servers `~/.yaw-mcp/bundles.json` gives yaw-mcp to serve -- and when that is none, the `yaw-mcp add <slug>` step to take *before* restarting the client, since yaw-mcp reads that file once at startup. Second, how many other MCP servers were already configured in the client file it just edited; those keep launching directly from the client, and installing yaw-mcp does not move them behind the broker. The count is a number, never the server names. Under `--all` the bundles.json line prints once for the run, while the per-client count prints under each client.
+
 Or do every detected client at once:
 
 ```bash
