@@ -230,7 +230,7 @@ Drop a `YAW-MCP.md` next to `config.json` in either `.yaw-mcp/` and yaw-mcp surf
 
 ## Local secret vault
 
-Rather than putting credentials in a client config, keep a value in an encrypted file on your own machine and reference it from any server's `env` with a `${secret:NAME}` placeholder:
+Rather than putting credentials in a client config, keep a value in an encrypted file on your own machine and reference it with a `${secret:NAME}` placeholder. A **local** server takes it in `env`, which becomes the child process's environment:
 
 ```jsonc
 "env": {
@@ -239,7 +239,16 @@ Rather than putting credentials in a client config, keep a value in an encrypted
 }
 ```
 
-At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env. If the passphrase is absent or a name isn't stored, the spawn is **refused** -- the literal `${secret:NAME}` is never passed through, since some servers would treat the placeholder as a real token. The value never leaves your machine.
+A **remote** (HTTP/SSE) server takes it in `headers`, which are sent on every request the transport makes:
+
+```jsonc
+{ "namespace": "linear", "type": "remote", "url": "https://mcp.linear.app/mcp",
+  "headers": { "Authorization": "Bearer ${secret:linear}" } }
+```
+
+The two are the local and remote halves of one mechanism: same vault, same placeholder, same refusal. `env` on a remote entry is ignored (it warns and tells you to use `headers`), and `headers` on a local entry is ignored the same way. A header name is dropped at load, with a warning, if its value is blank, if the name is not a valid HTTP header name, or if it is `Mcp-Session-Id` or `Mcp-Protocol-Version` in any casing -- the transport sets those, and a duplicate would corrupt the session rather than override it.
+
+When the server starts -- a spawn for a local one, a connect for a remote one -- if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env or onto the request headers. If the passphrase is absent or a name isn't stored, the start is **refused** -- the literal `${secret:NAME}` is never passed through, since some servers would treat the placeholder as a real token. The value never leaves your machine, and it is stripped out of error text before that text reaches a log or the model.
 
 **Where the passphrase comes from.** Three ways, in the order you'll meet them:
 

@@ -98,6 +98,21 @@ describe("computeSecretsReport (names only, never values)", () => {
     expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: ["missing_one"], malformed: [] }]);
   });
 
+  it("scans a remote server headers, not just env", () => {
+    // A remote carries its credential in headers, which resolve through the
+    // same vault and refuse the connect the same way. Scanning env alone
+    // reported "this server needs no secrets" about one that will not connect.
+    const servers = [
+      { namespace: "linear", headers: { Authorization: "Bearer ${secret:lin}" } },
+      { namespace: "both", env: { A: "${secret:gh}" }, headers: { Authorization: "${secret:missing_one}" } },
+    ];
+    const rows = computeSecretsReport(servers, new Set(["gh", "lin"]));
+    expect(rows).toEqual([
+      { server: "linear", injectedSecrets: ["lin"], missing: [], malformed: [] },
+      { server: "both", injectedSecrets: ["gh"], missing: ["missing_one"], malformed: [] },
+    ]);
+  });
+
   it("names a reference the strict regex cannot parse in its own `malformed` column", () => {
     // resolveServerEnv refuses the spawn over a malformed ref exactly as over
     // a missing name, but the report scans with the strict regex, so until

@@ -13,6 +13,20 @@ export interface UpstreamServerConfig {
   args?: string[];
   env?: Record<string, string>;
   url?: string;
+  /**
+   * REMOTE ONLY -- HTTP request headers sent on every request the transport
+   * makes (the GET event stream, every POST, and the DELETE), for both the
+   * streamable-http and SSE transports. Values may carry `${secret:NAME}`
+   * refs, resolved through the same vault path `env` uses and fail-CLOSED in
+   * exactly the same way: a locked vault, a missing name or a malformed ref
+   * refuses the connect rather than sending the literal.
+   *
+   * Ignored (with a warn) on a local entry, where `env` is the equivalent.
+   * Unlike `env` there is no ambient fallback for a header -- nothing
+   * inherits one from the shell -- so a blank value would claim a credential
+   * is configured while sending nothing, and is dropped at load.
+   */
+  headers?: Record<string, string>;
   isActive: boolean;
   /**
    * Per-server connect timeout in milliseconds, as set in bundles.json.

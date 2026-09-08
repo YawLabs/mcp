@@ -334,7 +334,7 @@ export interface SecretsReportRow {
  * malformed spans) out. Servers with no references at all are omitted.
  */
 export function computeSecretsReport(
-  servers: Array<{ namespace: string; env?: Record<string, string> }>,
+  servers: Array<{ namespace: string; env?: Record<string, string>; headers?: Record<string, string> }>,
   vaultKeys: Set<string>,
 ): SecretsReportRow[] {
   const rows: SecretsReportRow[] = [];
@@ -348,12 +348,19 @@ export function computeSecretsReport(
     // which reads as "this server needs no secrets". collectSecretRefNames owns
     // the fresh-instance rule for every name-only caller (upstream.ts's spawn
     // audit and doctor's vault section are the others).
-    const referenced = collectSecretRefNames(server.env);
+    // Scan env AND headers as one map. A remote server carries its refs in
+    // headers, which resolve through the same vault and refuse the connect
+    // the same way, so scanning env alone reported "this server needs no
+    // secrets" about one that will not connect. A name colliding between the
+    // two is harmless: both collectors read only the `${secret:NAME}` refs out
+    // of VALUES, and a report row is per-server, not per-key.
+    const scanned = { ...(server.env ?? {}), ...(server.headers ?? {}) };
+    const referenced = collectSecretRefNames(scanned);
     // The strict scanner above cannot see a reference a typo has put outside
     // SECRET_REF_RE, while resolveServerEnv refuses the spawn over it. Without
     // this column the report said "gh: injected" about a server that will not
     // start, and said nothing at all about one whose only ref is the typo.
-    const malformed = collectMalformedSecretRefs(server.env);
+    const malformed = collectMalformedSecretRefs(scanned);
     if (referenced.size === 0 && malformed.length === 0) continue;
     const injectedSecrets: string[] = [];
     const missing: string[] = [];

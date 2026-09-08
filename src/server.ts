@@ -4164,7 +4164,11 @@ export class ConnectServer {
     const vault = await loadVault(vaultPath()).catch(() => null);
     const vaultKeys = new Set(vault ? listKeys(vault) : []);
 
-    let servers = this.getProfiledActiveServers().map((s) => ({ namespace: s.namespace, env: s.env }));
+    let servers = this.getProfiledActiveServers().map((s) => ({
+      namespace: s.namespace,
+      env: s.env,
+      headers: s.headers,
+    }));
     if (serverArg) servers = servers.filter((s) => s.namespace === serverArg);
 
     const rows = computeSecretsReport(servers, vaultKeys);

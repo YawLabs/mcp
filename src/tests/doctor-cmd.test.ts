@@ -3353,14 +3353,14 @@ describe("runDoctor — SECRET VAULT", () => {
     expect(txt).toContain("gh: ${secret:gh}");
   });
 
-  it("ignores a REMOTE server's secret refs, which the vault never serves", async () => {
-    // A remote entry's env is never sent anywhere -- upstream.ts logs
-    // "Ignoring env on a remote server" and connects unauthenticated, so
-    // resolveServerEnv never runs for one. Listing it would put it under the
-    // "these servers FAIL TO START while the vault is locked" note, which is
-    // false: it starts fine and gets a 401 from the far end. A diagnostic that
-    // invents a cause sends the user to unlock a vault that was never in the
-    // path.
+  it("ignores a REMOTE server's ENV refs, which are still sent nowhere", async () => {
+    // A remote entry's env goes nowhere -- upstream.ts logs "Ignoring env on a
+    // remote server" and connects without it -- so resolveServerEnv never runs
+    // over that map and no passphrase changes the outcome. Listing it would
+    // put the server under the "these FAIL TO START while the vault is locked"
+    // note, which is false for an env ref: it starts fine and gets a 401 from
+    // the far end. Its HEADERS are the map that does resolve; see the case
+    // below.
     writeVault({ tok: { iv: "x", ciphertext: "y", authTag: "z" } });
     writeYawMcpConfig(synthHome, "bundles.json", {
       version: 1,
@@ -3378,10 +3378,40 @@ describe("runDoctor — SECRET VAULT", () => {
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
-    expect(txt).toContain("refs:       no server env references ${secret:NAME}");
+    expect(txt).toContain("refs:       no server env or header references ${secret:NAME}");
     expect(txt).not.toContain("FAIL TO START");
     // And it is not counted as a missing secret either -- nothing consumes it.
     expect(txt).not.toContain("referenced but not stored");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("lists a REMOTE server's HEADER refs, which the vault does serve", async () => {
+    // The mirror of the case above, and the reason the old blanket remote skip
+    // had to go. Headers resolve through resolveServerEnv and fail CLOSED, so
+    // a remote carrying one genuinely does refuse to connect while the vault
+    // is locked -- exactly what the FAIL TO START note promises. Skipping it
+    // would now assert the opposite of what happens.
+    writeVault({ tok: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [
+        {
+          id: "remote-id",
+          name: "Remote",
+          namespace: "remote",
+          type: "remote",
+          url: "https://example.invalid/mcp",
+          headers: { Authorization: "Bearer ${secret:tok}" },
+        },
+      ],
+    });
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("remote: ${secret:tok}");
+    expect(txt).toContain("FAIL TO START");
+    // Informational only -- the vault section never moves the exit code, since
+    // an unset passphrase is the normal state for a terminal run.
     expect(r.exitCode).toBe(0);
   });
 

@@ -1332,24 +1332,24 @@ async function collectVaultStatus(opts: {
   const refs: VaultStatus["refs"] = [];
   const malformed: VaultStatus["malformed"] = [];
   for (const s of opts.servers) {
-    // LOCAL servers only. A remote entry's env is never sent anywhere --
-    // upstream.ts logs "Ignoring env on a remote server" and connects
-    // unauthenticated -- so resolveServerEnv never runs for one and no
-    // passphrase changes its outcome. Listing it here would put it under the
-    // "these servers FAIL TO START while the vault is locked" note, which is
-    // simply untrue of a remote: it starts fine and gets a 401 from the far
-    // end. A diagnostic that invents a cause is worse than one that says
-    // nothing, so the vault section stays silent about remotes rather than
-    // sending the user to unlock a vault that was never in the path.
-    if (s.type === "remote") continue;
+    // Scan the map resolveServerEnv ACTUALLY runs over for this entry kind:
+    // `env` for a local server, `headers` for a remote one. A remote's env is
+    // still sent nowhere (upstream.ts warns and connects without it), but its
+    // headers now resolve through the vault and fail CLOSED -- so a remote
+    // carrying header refs genuinely does fail to start while the vault is
+    // locked, which is exactly what the note below this section promises.
+    // This loop used to skip remotes entirely, behind a comment arguing that
+    // listing one would invent a cause; that argument was right then and is
+    // the opposite of the truth now.
+    const scanned = s.type === "remote" ? s.headers : s.env;
     // secrets-vault's shared scanner, not a local matchAll over SECRET_REF_RE:
     // that object carries /g and is module-shared, so scanning against it
     // directly leaves a lastIndex other callers trip over. This loop used to be
     // a hand copy of collectSecretRefNames re-deriving that rule, as did
     // meta-tools.ts's and upstream.ts's.
-    const names = collectSecretRefNames(s.env);
+    const names = collectSecretRefNames(scanned);
     if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
-    const malformedRefs = collectMalformedSecretRefs(s.env);
+    const malformedRefs = collectMalformedSecretRefs(scanned);
     if (malformedRefs.length > 0) malformed.push({ namespace: s.namespace, refs: malformedRefs });
   }
 
@@ -1405,7 +1405,7 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
   }
   print(`  passphrase: ${status.passphraseSet ? "set in this environment" : "not set in this environment"}`);
   if (status.refs.length === 0) {
-    print("  refs:       no server env references ${secret:NAME}");
+    print("  refs:       no server env or header references ${secret:NAME}");
   } else {
     print("  refs:");
     for (const r of status.refs) {
@@ -1461,6 +1461,10 @@ interface OamRuntimeStatus {
     namespace: string;
     command: string | undefined;
     env: Record<string, string> | undefined;
+    /** Remote-only request headers. Carried because collectVaultStatus scans
+     *  THIS map for a remote entry -- it is the one resolveServerEnv runs
+     *  over there -- and without it the scan cannot see the field at all. */
+    headers: Record<string, string> | undefined;
     type: "local" | "remote";
     info: ServerRuntimeInfo;
   }>;
@@ -1578,6 +1582,7 @@ async function collectOamRuntimeStatus(opts: {
     namespace: s.namespace,
     command: s.command,
     env: s.env,
+    headers: s.headers,
     type: s.type,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));

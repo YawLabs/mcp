@@ -189,16 +189,25 @@ export function vaultPassphrase(): string | undefined {
 export async function resolveServerEnv(
   env: Record<string, string>,
   namespace: string,
+  // What this map IS, in the operator's words -- the only thing that differs
+  // between a local server's env and a remote server's headers, both of which
+  // resolve through this exact function. It is ONE parameter rather than two
+  // (a noun and a capitalized noun) so the two spellings cannot drift apart.
+  // The default reproduces the previous message bytes EXACTLY: callers, logs
+  // and tests match on that text (see the VaultPassphraseRequiredError doc
+  // above, and src/tests/server.test.ts's verbatim assertion).
+  subject: string = "server env",
 ): Promise<Record<string, string>> {
   if (!hasSecretRefs(env)) return env;
   const refKeys = Object.entries(env)
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
     .map(([k]) => k);
+  const lead = subject.charAt(0).toUpperCase() + subject.slice(1);
   const passphrase = vaultPassphrase();
   if (typeof passphrase !== "string" || passphrase.length === 0) {
-    log("warn", "Server env carries ${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set", { keys: refKeys });
+    log("warn", `${lead} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, { keys: refKeys });
     throw new VaultPassphraseRequiredError(
-      "vault locked: server env references ${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set",
+      `vault locked: ${subject} references \${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set`,
       namespace,
       refKeys,
       "missing",
@@ -218,7 +227,7 @@ export async function resolveServerEnv(
     throw new Error(`vault unreadable: ${msg}`);
   }
   if (!vault) {
-    throw new Error("vault locked: server env references ${secret:...} but no vault exists yet");
+    throw new Error(`vault locked: ${subject} references \${secret:...} but no vault exists yet`);
   }
   // A passphrase that does not open the vault is a question for the user, not
   // a dead end -- so it throws the SAME typed error as no passphrase at all,
@@ -543,14 +552,27 @@ function categorizeSpawnError(err: unknown): ActivationFailureCategory {
  *  error code (-32000 and friends) is not a status and must not be printed as
  *  one. Truncated because a streamable-http failure can carry a whole HTML
  *  error page from `response.text()`. */
-function remoteFailureDetail(err: unknown): string {
+function remoteFailureDetail(err: unknown, resolved: Record<string, string>): string {
   const parts: string[] = [];
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code === "number" && code >= 100 && code <= 599) parts.push(`HTTP ${code}`);
   const cause = err instanceof Error ? err.cause : undefined;
   const message = cause instanceof Error ? cause.message : err instanceof Error ? err.message : String(err);
   if (message) parts.push(message);
-  return parts.join(": ").replace(/\s+/g, " ").trim().slice(0, 200);
+  // Redact BEFORE the whitespace collapse and BEFORE the 200-char cut, and
+  // both orderings are load-bearing. redactSecretsInOutput matches exact
+  // substrings, so a resolved value containing a newline stops matching once
+  // /\s+/g has flattened it; and a secret sitting past the cut has to be
+  // REMOVED rather than merely hidden -- the same scrub-then-truncate
+  // reasoning health-score.ts already spells out for its own truncation.
+  //
+  // This is the remote leak path, and it is the whole reason the resolved
+  // headers are assigned into resolvedServerEnv: the stderr ring is empty for
+  // a remote, so nothing else on this branch ever reaches the redactor. A
+  // gateway that echoes the request headers in its 401 body would otherwise
+  // put the bearer token into an ActivationError that is logged, recorded in
+  // activationFailures, AND rendered into discover() output for the model.
+  return redactSecretsInOutput(parts.join(": "), resolved).replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
 /** Attach the child's stderr tail to an ActivationError raised AFTER the
@@ -792,6 +814,12 @@ async function connectToUpstreamOnce(
   // before they're embedded in ActivationError / logs. The original
   // config.env still carries `${secret:NAME}` literals; the child sees
   // the cleartext and may echo it on failure.
+  //
+  // On a REMOTE entry this same map holds the resolved request HEADERS,
+  // keyed by header name (so a leaked bearer token redacts to
+  // `***Authorization***`). A remote has no child and therefore no stderr
+  // ring: its leak path is the HTTP response body that remoteFailureDetail
+  // lifts out of the SDK error, which is why that function takes this map.
   let resolvedServerEnv: Record<string, string> = {};
   // The command that is ACTUALLY handed to the transport, post uv/oam rewrite.
   // config.command is what the operator typed (`npx`, `uvx`); the process that
@@ -884,6 +912,17 @@ async function connectToUpstreamOnce(
     // child. A ref-free env skips the vault entirely and passes through
     // unchanged. The throw is a plain Error, so the oam boot-probe
     // downgrade below deliberately does not retry it.
+    // Mirror image of the remote branch's env warning below. A local server
+    // has no HTTP request to put a header on, so `headers` here is the same
+    // silent drop this field exists to fix, pointing the other way. Keys
+    // only in the structured field -- never values.
+    if (config.headers && Object.keys(config.headers).length > 0) {
+      log("warn", "Ignoring headers on a local server: headers apply only to remote (HTTP/SSE) upstreams", {
+        namespace: config.namespace,
+        keys: Object.keys(config.headers),
+      });
+    }
+
     const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace);
     resolvedServerEnv = serverEnv;
     const stdioTransport = new StdioClientTransport({
@@ -904,17 +943,21 @@ async function connectToUpstreamOnce(
       throw new Error("url is required for remote servers");
     }
 
-    // Remote entries never spawn a child, so there is no process env to fill:
-    // resolveServerEnv runs only in the local branch above, and nothing here
-    // turns `env` into request headers. A `${secret:TOKEN}` sitting in a
-    // remote entry's env therefore gets NEITHER auth NOR a failure -- the
-    // connect just goes out unauthenticated and the server answers 401. Say
-    // so once, at connect, rather than leaving the operator to infer it.
-    // (Header injection is the real fix; this is the missing diagnostic.)
+    // Remote entries never spawn a child, so there is no process env to fill
+    // and `env` still goes nowhere -- but the credential now has a home:
+    // `headers`, resolved through the same vault a few lines below. An entry
+    // that still carries its token in `env` would connect unauthenticated and
+    // get a 401, so the warning stays and now names the fix.
+    //
+    // The PREFIX of this message is load-bearing: callers and tests filter on
+    // "Ignoring env on a remote server". Append to it, never reword it.
+    // It stays a WARN rather than becoming an error deliberately -- an
+    // existing entry with a stale `env` block still connects to whatever
+    // works today, and an upgrade must not turn that into a hard failure.
     if (config.env && Object.keys(config.env).length > 0) {
       log(
         "warn",
-        "Ignoring env on a remote server: env (and ${secret:...} refs in it) is never sent to remote upstreams",
+        'Ignoring env on a remote server: env (and ${secret:...} refs in it) is never sent to remote upstreams -- put the credential in "headers" instead',
         { namespace: config.namespace, keys: Object.keys(config.env) },
       );
     }
@@ -949,10 +992,64 @@ async function connectToUpstreamOnce(
         err,
       );
     }
+    // Resolve the headers AFTER the url parse, not before. A malformed url is
+    // a permanent config error; resolving first would fire a vault-passphrase
+    // elicitation round-trip (up to a 60s modal in the client) before
+    // reporting a failure no passphrase could ever fix.
+    //
+    // Fail-CLOSED exactly like the local env path: a locked vault, a missing
+    // name or a malformed ref THROWS here and no transport is ever
+    // constructed, so the literal `${secret:NAME}` can never reach a request.
+    const rawHeaders = config.headers ?? {};
+    let requestHeaders: Record<string, string> | undefined;
+    if (Object.keys(rawHeaders).length > 0) {
+      const resolvedHeaders = await resolveServerEnv(rawHeaders, config.namespace, "remote server headers");
+      // Assigning into the redaction map is what arms redactSecretsInOutput
+      // for this branch -- see remoteFailureDetail.
+      resolvedServerEnv = resolvedHeaders;
+
+      // Validate with the runtime's own parser rather than a hand-rolled
+      // regex, one key at a time so the refusal can name WHICH header. The
+      // TypeError that `Headers` throws QUOTES the offending value, which
+      // here is the secret, so it is caught and discarded rather than
+      // wrapped. A merely trailing newline is fine (Headers strips leading
+      // and trailing HTTP whitespace), which matters because
+      // `yaw-mcp secrets set --stdin` is documented as raw and multi-line.
+      const probe = new Headers();
+      for (const [name, value] of Object.entries(resolvedHeaders)) {
+        try {
+          probe.append(name, value);
+        } catch {
+          throw new ActivationError(
+            withConfigPointer(
+              `Server "${config.namespace}" has an invalid value for header "${name}" -- an HTTP header value cannot contain a line break or a control character (the value is not shown).`,
+              config,
+            ),
+            "unknown",
+            undefined,
+            undefined,
+          );
+        }
+      }
+      requestHeaders = resolvedHeaders;
+    }
+
+    // Pass the PLAIN OBJECT the operator wrote, not the probe Headers
+    // instance, and pass `undefined` when there is nothing to send so the
+    // zero-header path stays byte-identical to before this field existed.
+    //
+    // requestInit is correct for BOTH transports and is all that is needed:
+    // the SSE transport's _commonHeaders merges requestInit.headers into the
+    // initial GET stream as well as every POST, despite a stale doc comment
+    // saying it only customizes POSTs. Deliberately NOT eventSourceInit --
+    // supplying that hands the SDK a fetch that wins over the header-injecting
+    // one -- and deliberately not authProvider, which is the interactive
+    // OAuth flow and would try to open a browser from inside a stdio server.
+    const transportOpts = requestHeaders ? { requestInit: { headers: requestHeaders } } : undefined;
     if (config.transport === "sse") {
-      transport = new SSEClientTransport(url);
+      transport = new SSEClientTransport(url, transportOpts);
     } else {
-      transport = new StreamableHTTPClientTransport(url);
+      transport = new StreamableHTTPClientTransport(url, transportOpts);
     }
   }
 
@@ -1007,7 +1104,7 @@ async function connectToUpstreamOnce(
       // APPENDED: on its own it reads as "server down" for failures that are
       // nothing of the kind (401, 404, ENOTFOUND, a self-signed certificate),
       // and the SDK error carrying the truth was discarded entirely.
-      const detail = timedOut ? "" : remoteFailureDetail(err);
+      const detail = timedOut ? "" : remoteFailureDetail(err, resolvedServerEnv);
       message = timedOut
         ? `Remote server at ${config.url} did not respond within ${connectTimeoutMs / 1000}s. Verify the URL is reachable.`
         : `Remote server at ${config.url} refused the connection.${detail ? ` ${detail}` : ""}`;

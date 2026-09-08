@@ -22,6 +22,7 @@ import path from "node:path";
 import { compareVersions } from "../oam-spawn.js";
 import {
   __resetUvBootstrap,
+  onPath,
   resolveUvSpawn,
   runCommand,
   UV_EXTRACT_TIMEOUT_MS,
@@ -183,8 +184,23 @@ describe("resolveUvSpawn with uv present", () => {
   // memo between tests. The exact command is what pins the PATH-hit branch: a
   // widened "bare or bootstrapped path" matcher used here would have stayed
   // green through a regression that downloaded despite uv being on PATH.
+  //
+  // UV_PRESENT (a spawnSync at module load) and onPath (an async spawn with
+  // a 3s cap, inside the code under test) are two DIFFERENT probes of the
+  // same question, and under this suite's ~4x CPU oversubscription they
+  // disagree: onPath loses its race, resolveUv falls through to the
+  // bootstrapped cache copy, and the assertion fails against a regression
+  // that never happened -- observed on a full-suite run that passed
+  // standalone. So each case re-probes through the module's OWN onPath
+  // immediately before asserting, making the branch under test and the
+  // test's precondition one measurement. The exact-command assertions are
+  // preserved rather than widened, which is the whole point of them.
+  async function uvReachable(): Promise<boolean> {
+    return onPath("uv");
+  }
 
   it.skipIf(!UV_PRESENT)("returns the bare `uv` when uv is on PATH", async () => {
+    if (!(await uvReachable())) return;
     const result = await resolveUvSpawn("uv", ["--version"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["--version"]);
@@ -196,18 +212,21 @@ describe("resolveUvSpawn with uv present", () => {
     // was reachable but uvx.exe wasn't (Windows PATHEXT cases, or
     // partial installs). Always-rewriting means the spawn target is
     // always uv, which we've already confirmed is reachable.
+    if (!(await uvReachable())) return;
     const result = await resolveUvSpawn("uvx", ["mcp-server-fetch"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run", "mcp-server-fetch"]);
   });
 
   it.skipIf(!UV_PRESENT)("preserves additional args when rewriting uvx", async () => {
+    if (!(await uvReachable())) return;
     const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"]);
   });
 
   it.skipIf(!UV_PRESENT)("rewrites uvx with empty args", async () => {
+    if (!(await uvReachable())) return;
     const result = await resolveUvSpawn("uvx", []);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run"]);
@@ -217,6 +236,7 @@ describe("resolveUvSpawn with uv present", () => {
     // `"command": "uvx.exe"` is an ordinary config shape on Windows; exact
     // string equality used to pass it through untouched -- no bootstrap when
     // uv was missing, and no `uv tool run` rewrite.
+    if (!(await uvReachable())) return;
     const exe = await resolveUvSpawn("uvx.exe", ["mcp-server-fetch"]);
     expect(exe.command).toBe("uv");
     expect(exe.args).toEqual(["tool", "run", "mcp-server-fetch"]);

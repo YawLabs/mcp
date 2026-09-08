@@ -279,7 +279,7 @@ export async function resolveCatalogSlug(
   // tokenize a URL into a broken entry. Matches the app's resolveSlug.
   if (install.url || install.type === "remote" || /^(remote|https?|sse|url)$/.test(runtime)) {
     throw new Error(
-      `"${slug}" is a remote (HTTP) server, which has no stdio command to spawn. Add it by hand to ~/.yaw-mcp/bundles.json with "type": "remote" and its "url".`,
+      `"${slug}" is a remote (HTTP) server, which has no stdio command to spawn. Add it by hand to ~/.yaw-mcp/bundles.json with "type": "remote", its "url", and a "headers" block for any auth token (values may use \${secret:NAME}).`,
     );
   }
   const cmdStr = typeof install.command === "string" ? install.command.trim() : "";

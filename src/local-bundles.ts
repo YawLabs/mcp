@@ -97,6 +97,20 @@ export function localBundlesPath(configDir: string): string {
  *  instead of maintaining an independent copy that drifts from the loader's. */
 export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 
+/** RFC 7230 header-name token charset. Validated at LOAD rather than left to
+ *  the transport, because a bad name reaching `new Headers()` throws a
+ *  TypeError that quotes the offending VALUE -- which for these is a
+ *  credential. Rejecting the name here keeps the secret out of every error
+ *  path. Exported so tests pin the loader's own definition. */
+export const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/** Header names the MCP transport owns and a user entry must not set. Lowercase;
+ *  matching is case-insensitive. Deliberately NOT including `authorization`
+ *  (it is the whole point of the feature) or `content-type` / `accept`, which
+ *  the SDK sets after merging, so a user value there is cleanly overridden
+ *  rather than corrupted. */
+export const RESERVED_HEADER_NAMES = new Set(["mcp-session-id", "mcp-protocol-version"]);
+
 /** Coerce a raw entry from bundles.json into a strict UpstreamServerConfig.
  *  Returns null when required fields are missing or malformed so the loader
  *  can skip the entry with a warning instead of crashing the whole load. */
@@ -147,6 +161,54 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
         ) as Record<string, string>)
       : undefined;
   const url = typeof e.url === "string" ? e.url : undefined;
+
+  // Remote-only HTTP request headers (types.ts). Every rejection here WARNS,
+  // following the connectTimeoutMs precedent below rather than env's silent
+  // filtering: a header exists to fix an authentication failure the user is
+  // already staring at, so dropping one without a word leaves the same 401
+  // firing with nothing saying the setting was thrown away.
+  //
+  // Blank values are dropped for a DIFFERENT reason than env's. An env "" is
+  // `add`'s marker for "required, nothing stored, comes from the shell", and
+  // loading it would clobber the inherited value. A header has no ambient
+  // fallback and no writer seeds one, so a blank header simply claims a
+  // credential is configured while sending nothing.
+  let headers: Record<string, string> | undefined;
+  if (e.headers !== undefined) {
+    if (typeof e.headers !== "object" || e.headers === null || Array.isArray(e.headers)) {
+      warnings.push(`bundles.json: ignoring 'headers' on "${namespace}" (expected an object of string values)`);
+    } else {
+      const kept: Record<string, string> = {};
+      for (const [name, value] of Object.entries(e.headers as Record<string, unknown>)) {
+        if (typeof value !== "string" || value.trim() === "") {
+          warnings.push(`bundles.json: ignoring header "${name}" on "${namespace}" (empty value)`);
+          continue;
+        }
+        if (!HTTP_HEADER_NAME_RE.test(name)) {
+          warnings.push(`bundles.json: ignoring header "${name}" on "${namespace}" (not a valid HTTP header name)`);
+          continue;
+        }
+        // The MCP transport owns these two. The SDK merges caller headers
+        // LAST into `new Headers({ ...transportHeaders, ...callerHeaders })`,
+        // and Headers COMBINES a case-differing duplicate rather than
+        // replacing it -- `{"mcp-session-id":"a","Mcp-Session-Id":"b"}` reads
+        // back as "a, b". So a user header under any casing of these names
+        // corrupts the session id AFTER a successful initialize, and every
+        // later request fails against a URL that just worked. Refused at
+        // load, case-insensitively, because the failure is silent corruption
+        // rather than a matter of preference.
+        if (RESERVED_HEADER_NAMES.has(name.toLowerCase())) {
+          warnings.push(
+            `bundles.json: ignoring header "${name}" on "${namespace}" (reserved -- the MCP transport sets it)`,
+          );
+          continue;
+        }
+        kept[name] = value;
+      }
+      if (Object.keys(kept).length > 0) headers = kept;
+    }
+  }
+
   const description = typeof e.description === "string" ? e.description : undefined;
   // Per-server runtime override. "oam" hosts the server on the oam runtime
   // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`).
@@ -207,6 +269,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     args,
     env,
     url,
+    headers,
     isActive,
     connectTimeoutMs,
     description,

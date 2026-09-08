@@ -2,6 +2,41 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## Unreleased -- an authenticated remote server can actually authenticate
+
+**Added -- `headers` on a remote entry, resolved through the vault**
+
+Every authenticated remote (HTTP or SSE) MCP server was unreachable, and nothing said so usefully. Both transports were constructed with a URL and no options at all, so no credential could be attached under any configuration; a token parked in the entry's `env` went nowhere, because `resolveServerEnv` runs only on the local spawn path. The connect went out bare, the far end answered 401, and the failure read as "server down". The code knew: the comment above that branch said outright that header injection was the real fix and that the warning below it was only the missing diagnostic.
+
+A remote entry now takes `headers`, an object of request headers sent on every request the transport makes -- the initial GET event stream, every POST, and the DELETE, on both transports. Values may carry `${secret:NAME}` refs and resolve through the same vault `env` does, with the same fail-closed refusal: a locked vault, a missing name or a malformed ref refuses the connect *before any transport is constructed*, so the literal placeholder can never travel as a credential.
+
+```jsonc
+{ "namespace": "linear", "type": "remote", "url": "https://mcp.linear.app/mcp",
+  "headers": { "Authorization": "Bearer ${secret:linear}" } }
+```
+
+Only `requestInit` is passed. Not `eventSourceInit`: supplying it hands the SDK a `fetch` that wins over its own header-injecting one, and the SDK's own docs note it also suppresses the Authorization attach. Not `authProvider` either -- that is the interactive OAuth flow, which on a missing token tries to open a browser, and there is no browser inside a stdio MCP server. A static credential is a header.
+
+**Fixed -- a resolved header value can no longer leak into an error the model reads**
+
+The remote branch had no redaction at all, because the map `redactSecretsInOutput` consumes was only ever filled on the local path. That was harmless while remotes carried no secrets and is not harmless now: `remoteFailureDetail` lifts the SDK's error verbatim, which for a failed POST is `Error POSTing to endpoint: <response body>`. A gateway that echoes request headers in its 401 body would have put the bearer token into an `ActivationError` that is logged, recorded in `activationFailures`, and rendered into `discover()` output for the model. The resolved headers are now assigned into that map, and the redaction runs before the whitespace collapse and before the 200-character cut -- before the collapse because the matcher is exact-substring and a multi-line value stops matching once flattened, and before the cut because a secret past the boundary has to be removed rather than merely hidden.
+
+**Two decisions worth stating.**
+
+`env` on a remote entry stays a warning rather than becoming an error. It has never done anything there, and an upgrade that turned an existing, working entry into a hard failure would cost more than the clarity is worth. The warning now names `headers` as the fix.
+
+`Mcp-Session-Id` and `Mcp-Protocol-Version` are refused at load, case-insensitively. The SDK merges caller headers last into `new Headers({ ...transportHeaders, ...callerHeaders })`, and `Headers` *combines* a case-differing duplicate instead of replacing it: `{"mcp-session-id":"a","Mcp-Session-Id":"b"}` reads back as `"a, b"`. So a user header under any casing of those names would corrupt the session id after a successful initialize, and every later request would fail against a URL that had just worked. That is silent corruption, not a preference, so it is refused with a warning rather than honoured.
+
+Header values are validated with the runtime's own `Headers` parser, one key at a time so the refusal can name which header is wrong. The `TypeError` it throws quotes the offending value -- which here is the credential -- so it is caught and discarded, and the message names only the key. A merely trailing newline is fine, since `Headers` strips surrounding whitespace; that matters because `secrets set --stdin` is documented as raw and multi-line, so a pasted PEM is a storable value that cannot be a header.
+
+**Changed -- `doctor`, `trust` and `mcp_connect_secrets` stopped disagreeing with all of the above**
+
+`doctor`'s SECRET VAULT section skipped remote entries entirely, behind a ten-line comment arguing that listing one would invent a cause: a remote "starts fine and gets a 401 from the far end". That was true and is now the opposite of true, since a remote with header refs genuinely does refuse to connect while the vault is locked. It scans `headers` for a remote and `env` for a local one -- the map that actually resolves in each case -- and the empty line now reads `no server env or header references ${secret:NAME}`. `mcp_connect_secrets` scans both maps for the same reason: it used to report that a remote needed no secrets while that server was refusing to connect over one. The `yaw-mcp trust` approval preview gained a `headers:` line beside `env:`, key names only, because approving a project `bundles.json` now authorizes yaw-mcp to send a vault secret to whatever URL that file names, while the preview showed a remote as a bare `HTTP <url>`.
+
+**Fixed -- two `uv` tests that only failed under a loaded machine**
+
+`resolveUvSpawn`'s PATH-hit tests probed for `uv` once at module load with `spawnSync`, then asserted that a later `resolveUvSpawn` call returns the bare `uv`. Those are two different probes: the real one inside `onPath` carries a 3-second cap, and under the suite's roughly 4x CPU oversubscription it loses that race, falls through to the bootstrapped cache copy, and fails an assertion nothing had regressed. They now re-probe through the module's own `onPath` immediately before asserting, so the branch under test and the test's own precondition are the same measurement. The discrimination is unchanged -- a widened "bare or bootstrapped" matcher would have stayed green through a regression that downloaded despite `uv` being on PATH, which is exactly what these tests exist to catch.
+
 ## 0.79.1 -- `classifyError` stops scanning bodies that cannot match, and two timing assertions stop flaking the release
 
 **Fixed -- a release died on a perf tripwire that nothing had regressed**

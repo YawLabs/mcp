@@ -119,7 +119,11 @@ const _sdkBehavior = {
   // declare.
   clientConstructions: [] as Array<{ capabilities: Record<string, unknown> }>,
   // Remote transport constructions (SSE vs streamable HTTP), in order.
-  remoteConstructions: [] as Array<{ kind: "sse" | "http"; url: string }>,
+  // `opts` is the transport's second argument. It is `undefined` on every
+  // pre-headers case, and the two existing construction assertions use
+  // toEqual, which ignores undefined-valued properties -- so recording it
+  // leaves them green. Do NOT convert those to toStrictEqual.
+  remoteConstructions: [] as Array<{ kind: "sse" | "http"; url: string; opts?: any }>,
   stderrEmitter: null as EventEmitter | null,
   // The {command,args,env} the stdio transport was last constructed with --
   // lets a test assert what actually gets spawned (e.g. the oam-rewritten cmd).
@@ -204,14 +208,14 @@ vi.mock("../default-runtime.js", () => ({
 // Each construction is recorded so the remote-config tests can assert WHICH
 // transport the `transport: "sse"` switch selected.
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: function MockSSE(url: URL) {
-    _sdkBehavior.remoteConstructions.push({ kind: "sse", url: String(url) });
+  SSEClientTransport: function MockSSE(url: URL, opts?: unknown) {
+    _sdkBehavior.remoteConstructions.push({ kind: "sse", url: String(url), opts });
     return {};
   },
 }));
 vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
-  StreamableHTTPClientTransport: function MockHTTP(url: URL) {
-    _sdkBehavior.remoteConstructions.push({ kind: "http", url: String(url) });
+  StreamableHTTPClientTransport: function MockHTTP(url: URL, opts?: unknown) {
+    _sdkBehavior.remoteConstructions.push({ kind: "http", url: String(url), opts });
     return {};
   },
 }));
@@ -2813,6 +2817,242 @@ describe("connectToUpstream remote-entry diagnostics", () => {
     await connectToUpstream(makeRemoteConfig({ transport: "streamable-http" })).catch(() => {});
     await connectToUpstream(makeRemoteConfig()).catch(() => {});
     expect(warnings().some((m) => m.includes('transport "stdio"'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Remote request headers -- the feature that makes an authenticated remote
+// server reachable at all. Before it, both transports were constructed with no
+// options, so every credentialed remote got a 401 with nothing explaining why.
+// These cases pin the three properties that matter: the headers reach BOTH
+// transports, a `${secret:}` ref resolves through the vault and fails CLOSED
+// (no transport is ever built), and a resolved value never leaks into an error.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream remote headers", () => {
+  let stderr: { restore: () => void; writes: string[] };
+
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("fetch failed"));
+    _sdkBehavior.remoteConstructions = [];
+    resetListHooks();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+    vi.mocked(log).mockClear();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    clearSessionVaultPassphrase();
+    stderr = captureStderr();
+  });
+
+  afterEach(() => {
+    stderr.restore();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    clearSessionVaultPassphrase();
+    vi.clearAllMocks();
+  });
+
+  function warnings(): string[] {
+    return vi
+      .mocked(log)
+      .mock.calls.filter((c) => c[0] === "warn")
+      .map((c) => String(c[1]));
+  }
+
+  it("passes the configured headers to the streamable-http transport as requestInit.headers", async () => {
+    const headers = { Authorization: "Bearer literal-token", "X-Tenant": "acme" };
+    await connectToUpstream(makeRemoteConfig({ headers })).catch(() => {});
+
+    expect(_sdkBehavior.remoteConstructions).toHaveLength(1);
+    const opts = _sdkBehavior.remoteConstructions[0].opts;
+    expect(opts.requestInit.headers).toEqual(headers);
+    // requestInit and nothing else. eventSourceInit would hand the SDK a fetch
+    // that WINS over its own header-injecting one, and authProvider is the
+    // interactive OAuth flow -- it tries to open a browser, which is
+    // meaningless inside a stdio MCP server. Either would silently defeat this.
+    expect(opts).not.toHaveProperty("eventSourceInit");
+    expect(opts).not.toHaveProperty("authProvider");
+    expect(opts).not.toHaveProperty("fetch");
+  });
+
+  it("passes the same headers to the SSE transport", async () => {
+    // The SSE transport's requestInit doc comment claims it only customizes
+    // POSTs. That is stale: _commonHeaders merges requestInit.headers and is
+    // called for the initial GET event stream too, so one option covers both
+    // transports and both request kinds.
+    const headers = { Authorization: "Bearer literal-token" };
+    await connectToUpstream(makeRemoteConfig({ transport: "sse", headers })).catch(() => {});
+
+    expect(_sdkBehavior.remoteConstructions).toEqual([
+      { kind: "sse", url: "https://mcp.example.test/mcp", opts: { requestInit: { headers } } },
+    ]);
+  });
+
+  it("constructs both transports with no options when no headers are configured", async () => {
+    // Pins the zero-header path as byte-identical to before the field existed:
+    // an entry that sets nothing must not start receiving an empty requestInit.
+    await connectToUpstream(makeRemoteConfig()).catch(() => {});
+    await connectToUpstream(makeRemoteConfig({ transport: "sse", headers: {} })).catch(() => {});
+
+    expect(_sdkBehavior.remoteConstructions.map((c) => c.opts)).toEqual([undefined, undefined]);
+  });
+
+  it("resolves a ${secret:NAME} header through the vault before the transport is built", async () => {
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({ entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { Authorization: "Bearer real-token" },
+      missing: [],
+      malformed: [],
+    } as any);
+
+    await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:gh}" } })).catch(() => {});
+
+    // The RAW map goes to the vault; the RESOLVED one goes to the transport.
+    expect(vi.mocked(resolveSecretRefs).mock.calls[0][0]).toEqual({ Authorization: "Bearer ${secret:gh}" });
+    expect(_sdkBehavior.remoteConstructions[0].opts.requestInit.headers).toEqual({
+      Authorization: "Bearer real-token",
+    });
+  });
+
+  it("refuses the connect and builds no transport when the vault is locked", async () => {
+    // The fail-CLOSED case, and the reason the resolve happens before the
+    // transport exists: a literal `${secret:...}` must never travel as a
+    // credential to the far end.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:gh}" } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(VaultPassphraseRequiredError);
+    const vaultErr = err as VaultPassphraseRequiredError;
+    expect(vaultErr.reason).toBe("missing");
+    expect(vaultErr.refKeys).toEqual(["Authorization"]);
+    // The subject names headers, not "server env" -- the local wording would
+    // send the operator to the wrong block of their bundles.json.
+    expect(vaultErr.message).toContain("remote server headers references");
+    expect(_sdkBehavior.remoteConstructions).toEqual([]);
+  });
+
+  it("refuses the connect when a referenced name is not in the vault", async () => {
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({ entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: {}, missing: ["gh"], malformed: [] } as any);
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:gh}" } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(String((err as Error).message)).toContain("missing or undecryptable secret refs: gh");
+    expect(_sdkBehavior.remoteConstructions).toEqual([]);
+  });
+
+  it("rejects a resolved header value that cannot be an HTTP header value, without echoing it", async () => {
+    // `new Headers()` throws a TypeError that QUOTES the offending value, and
+    // here that value is the credential -- so the refusal is built by hand and
+    // names only the key. A realistic source: `secrets set --stdin` is
+    // documented as raw and multi-line, so a pasted PEM is a storable value
+    // that cannot be a header.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({ entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { Authorization: "line1\nline2" },
+      missing: [],
+      malformed: [],
+    } as any);
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "${secret:pem}" } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect((err as ActivationError).category).toBe("unknown");
+    expect((err as Error).message).toContain('header "Authorization"');
+    expect((err as Error).message).not.toContain("line1");
+    expect(_sdkBehavior.remoteConstructions).toEqual([]);
+  });
+
+  it("accepts a resolved value whose only defect is a trailing newline", async () => {
+    // Headers strips leading and trailing HTTP whitespace, so refusing on a
+    // bare /\n/ over the raw value would reject most `--stdin` secrets. The
+    // runtime's own parser is the arbiter here, not a hand-rolled regex.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({ entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { Authorization: "Bearer tok\n" },
+      missing: [],
+      malformed: [],
+    } as any);
+
+    await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "${secret:gh}" } })).catch(() => {});
+
+    expect(_sdkBehavior.remoteConstructions).toHaveLength(1);
+  });
+
+  it("redacts a resolved header value the server echoes back in its failure body", async () => {
+    // The remote leak path is the RESPONSE BODY, not stderr: a gateway that
+    // echoes request headers in its 401 would otherwise put the bearer token
+    // into an ActivationError that is logged, recorded in activationFailures,
+    // AND rendered into discover() output for the model to read.
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(new Error("Error POSTing to endpoint: your header was Bearer supersecretvalue"));
+
+    const err = await connectToUpstream(
+      makeRemoteConfig({ headers: { Authorization: "Bearer supersecretvalue" } }),
+    ).catch((e: unknown) => e);
+
+    expect(String((err as Error).message)).toContain("***Authorization***");
+    expect(String((err as Error).message)).not.toContain("supersecretvalue");
+  });
+
+  it("redacts a value sitting past the 200-character detail cap", async () => {
+    // Scrub BEFORE truncating: a secret past the cut has to be REMOVED, not
+    // merely hidden by a slice a later change could widen.
+    const secret = "supersecretvalue-past-the-cap";
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(new Error(`Error POSTing to endpoint: ${"x".repeat(400)} ${secret}`));
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: secret } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(String((err as Error).message)).not.toContain(secret);
+  });
+
+  it("still warns about env on a remote, and now points at headers", async () => {
+    await connectToUpstream(makeRemoteConfig({ env: { TOKEN: "x" }, headers: { Authorization: "y" } })).catch(() => {});
+
+    const warned = warnings().filter((m) => m.includes("Ignoring env on a remote server"));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('put the credential in "headers" instead');
+  });
+
+  it("does not warn about env when only headers are set", async () => {
+    await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "y" } })).catch(() => {});
+    expect(warnings().filter((m) => m.includes("Ignoring env on a remote server"))).toHaveLength(0);
+  });
+
+  it("warns and drops headers on a LOCAL server, and never puts them in the child env", async () => {
+    // The mirror image of the remote env warning: a local server has no HTTP
+    // request to carry a header, so silence here would be the same bug this
+    // field exists to fix, pointing the other way.
+    await connectToUpstream(makeLocalConfig({ headers: { Authorization: "Bearer nope" } })).catch(() => {});
+
+    const warned = warnings().filter((m) => m.includes("Ignoring headers on a local server"));
+    expect(warned).toHaveLength(1);
+    const call = vi.mocked(log).mock.calls.find((c) => String(c[1]).includes("Ignoring headers on a local server"));
+    expect(call?.[2]).toMatchObject({ namespace: "test", keys: ["Authorization"] });
+    expect(_sdkBehavior.lastStdioArgs?.env).not.toHaveProperty("Authorization");
   });
 });
 
