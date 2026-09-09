@@ -59,6 +59,7 @@ import {
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  isCancelledResult,
   isRoutingFaultResult,
   type PromptRoute,
   type ResourceRoute,
@@ -1854,6 +1855,14 @@ export class ConnectServer {
       // every fault emitter attaches), not by text: an upstream error that
       // happens to contain a marker phrase must still be booked.
       const routingFault = result.isError === true && isRoutingFaultResult(result);
+      // A client-cancelled call is the OTHER kind of non-observation. It is
+      // not yaw-mcp's fault (so not a routing fault) and not the upstream's
+      // (so not an error to book): the user withdrew the request while a
+      // healthy server was still working on it. Same structural brand check
+      // as above, for the same reason -- the abort rejects as -32001, which a
+      // real MCP_CALL_TIMEOUT also does, so text and code cannot separate them.
+      const cancelled = result.isError === true && isCancelledResult(result);
+      const nonObservation = routingFault || cancelled;
       // A routing fault is a NON-observation for health, not a success: it
       // must skip totalCalls and totalLatencyMs as well as errorCount.
       // Booking the call without the error would dilute a genuinely flaky
@@ -1861,7 +1870,7 @@ export class ConnectServer {
       // totalCalls), push totalCalls past the observation floor with zero
       // real upstream observations, and drag average latency toward the
       // fault's near-0ms -- the opposite bias, not neutrality.
-      if (connForHealth && !routingFault) {
+      if (connForHealth && !nonObservation) {
         connForHealth.health.totalCalls++;
         connForHealth.health.totalLatencyMs += latencyMs;
         if (result.isError) {
@@ -1912,7 +1921,7 @@ export class ConnectServer {
       // cross-session reliability block in handleHealth all read — activation
       // success is deliberately NOT counted here (see handleDispatch). Exec
       // steps defer it (opts.deferLearning) for step-level attribution.
-      if (!opts?.deferLearning && !routingFault) {
+      if (!opts?.deferLearning && !nonObservation) {
         const reward = computeOutcomeReward(result);
         this.learning.recordOutcome(route.namespace, reward);
         this.scheduleStateSave();
@@ -4730,7 +4739,12 @@ export class ConnectServer {
         // emitters attach), not by text -- an upstream error that happens to
         // contain a marker phrase must still count against the upstream.
         const routingFault = isRoutingFaultResult(stepResult);
-        if (stepNs && !routingFault) {
+        // A cancelled step is the same non-observation as in handleToolCall:
+        // exec forwards the downstream signal, so aborting a pipeline rejects
+        // its in-flight step, and blaming the server for a call the user
+        // withdrew would dock a healthy namespace on every cancel.
+        const stepCancelled = isCancelledResult(stepResult);
+        if (stepNs && !routingFault && !stepCancelled) {
           // Invalid-params is recognized either by the transport-level code
           // tag ("[code=-32602]") OR by classifyError on a structured isError
           // body (the common MCP self-validation pattern, which carries no

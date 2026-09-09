@@ -2436,6 +2436,55 @@ describe("ConnectServer", () => {
       expect(conn.health.lastErrorMessage).toBeUndefined();
     });
 
+    it("books nothing against a healthy server when the client cancels the call", async () => {
+      // Measured against the pre-fix build: one Esc press on a slow-but-healthy
+      // server left mcp_connect_health reporting "calls: 1, errors: 1 (100%)"
+      // with the user's own cancel reason stored as the server's last error,
+      // and persisted recordOutcome(ns, 0.0) down-ranking it in dispatch and
+      // discover for every later session. The call is a non-observation: the
+      // user withdrew it while the server was still working normally.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      const controller = new AbortController();
+      conn.client.callTool = vi.fn().mockImplementation(async () => {
+        controller.abort("user pressed Esc");
+        throw Object.assign(new Error("MCP error -32001: user pressed Esc"), { code: -32001 });
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      const recordOutcome = vi.spyOn(priv.learning, "recordOutcome");
+
+      const result = await priv.handleToolCall("gh_create_issue", {}, { signal: controller.signal });
+
+      expect(result.isError).toBe(true);
+      // Health is untouched -- not "booked without the error", which would
+      // dilute a genuinely flaky server's rate toward 0 instead of leaving it.
+      expect(conn.health.totalCalls).toBe(0);
+      expect(conn.health.errorCount).toBe(0);
+      expect(conn.health.lastErrorMessage).toBeUndefined();
+      // And nothing is written to the cross-session record either.
+      expect(recordOutcome).not.toHaveBeenCalled();
+    });
+
+    it("still books a genuine -32001 timeout, which looks identical apart from the signal", async () => {
+      // The guard keys on the abort, not the error code -- so a real timeout
+      // carrying the same -32001 must still count against the server.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockRejectedValue(Object.assign(new Error("MCP error -32001: Request timed out"), { code: -32001 }));
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("gh_create_issue", {}, { signal: new AbortController().signal });
+      expect(result.isError).toBe(true);
+      expect(conn.health.totalCalls).toBe(1);
+      expect(conn.health.errorCount).toBe(1);
+    });
+
     it("tracks error health on failed tool calls", async () => {
       const priv = getPrivate(server);
       const conn = makeConnection("gh", ["create_issue"]);

@@ -8,6 +8,7 @@ import {
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  isCancelledResult,
   isRoutingFaultResult,
   type PromptRoute,
   type ResourceRoute,
@@ -1080,6 +1081,51 @@ describe("routeToolCall — request options", () => {
     // each one to collect notifications no client asked for.
     expect(opts.onprogress).toBeUndefined();
     expect(opts.signal).toBeUndefined();
+  });
+
+  it("brands a call the client cancelled, instead of rendering it as an upstream error", async () => {
+    // The SDK aborts the pending request and rejects with McpError
+    // RequestTimeout (-32001) -- byte-identical in shape to a genuine
+    // MCP_CALL_TIMEOUT -- so neither the code nor the text can tell a
+    // cancellation from a real upstream stall. The downstream signal can.
+    const controller = new AbortController();
+    const conn = makeConnection("gh", ["create_issue"]);
+    (conn as any).client = {
+      callTool: async () => {
+        controller.abort("user pressed Esc");
+        throw Object.assign(new Error("MCP error -32001: user pressed Esc"), { code: -32001 });
+      },
+    };
+    const connections = new Map([["gh", conn]]);
+    const result = await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections, {
+      signal: controller.signal,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(isCancelledResult(result)).toBe(true);
+    // The user withdrew the call; it must not read as the server failing.
+    expect(result.content[0].text).toContain("cancelled by the client");
+    expect(result.content[0].text).not.toContain("-32001");
+    // And it is NOT a routing fault -- that brand means yaw-mcp's own failure,
+    // and conflating the two would blur what each one tells an operator.
+    expect(isRoutingFaultResult(result)).toBe(false);
+  });
+
+  it("still reports a genuine timeout as an upstream error when nothing was cancelled", async () => {
+    // The discriminator is the signal, not the code -- so an identical -32001
+    // with no abort must keep counting against the server.
+    const conn = makeConnection("gh", ["create_issue"]);
+    (conn as any).client = {
+      callTool: () => Promise.reject(Object.assign(new Error("MCP error -32001: Request timed out"), { code: -32001 })),
+    };
+    const connections = new Map([["gh", conn]]);
+    const result = await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections, {
+      signal: new AbortController().signal,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(isCancelledResult(result)).toBe(false);
+    expect(result.content[0].text).toContain("[code=-32001]");
   });
 
   it("does not set resetTimeoutOnProgress, so progress cannot extend the ceiling", async () => {

@@ -539,6 +539,24 @@ export function brandRoutingFault<T extends object>(result: T): T {
   return result;
 }
 
+const CANCELLED_BRAND: unique symbol = Symbol("yaw-mcp:cancelled");
+
+/** Mark a result as "the DOWNSTREAM client withdrew this call".
+ *
+ *  Distinct from the routing-fault brand on purpose. A routing fault is
+ *  yaw-mcp's own failure; this is neither yaw-mcp's nor the upstream's. What
+ *  the two share -- and all the health/learning gate actually needs -- is that
+ *  the call is a NON-OBSERVATION about the upstream server. */
+export function brandCancelled<T extends object>(result: T): T {
+  Object.defineProperty(result, CANCELLED_BRAND, { value: true, enumerable: false });
+  return result;
+}
+
+/** True when the downstream client cancelled the call (see brandCancelled). */
+export function isCancelledResult(result: unknown): boolean {
+  return typeof result === "object" && result !== null && (result as Record<symbol, unknown>)[CANCELLED_BRAND] === true;
+}
+
 /** True when `result` was constructed by yaw-mcp's own routing layer
  *  (see brandRoutingFault). Never true for upstream-produced results. */
 export function isRoutingFaultResult(result: unknown): boolean {
@@ -690,6 +708,26 @@ export async function routeToolCall(
       err && typeof err === "object" && "code" in err && typeof (err as { code: unknown }).code === "number"
         ? (err as { code: number }).code
         : undefined;
+
+    // A cancelled call is not evidence about this server. The SDK aborts the
+    // pending request and rejects with McpError RequestTimeout (-32001) --
+    // byte-identical in shape to a genuine MCP_CALL_TIMEOUT -- so the error
+    // cannot be told apart by its code or its text. The downstream signal can:
+    // it is aborted only because the CLIENT withdrew the request (an explicit
+    // notifications/cancelled, or its own deadline).
+    //
+    // Without this, pressing Esc on a slow-but-healthy server booked
+    // errorCount++ and a persisted recordOutcome(ns, 0.0), permanently
+    // down-ranking a server that was answering normally, and left a
+    // timeout-shaped lastErrorMessage in mcp_connect_health for a call the
+    // user chose to stop.
+    if (options?.signal?.aborted) {
+      log("info", "Tool call cancelled by the client", { tool: toolName, namespace: route.namespace });
+      return brandCancelled({
+        content: [{ type: "text", text: `Call to ${toolName} was cancelled by the client.` }],
+        isError: true,
+      });
+    }
     // The log line is scrubbed; the tool result is not. Third-party servers
     // routinely echo args and secrets in error text (URLs with api_key=,
     // request bodies, tracebacks with locals -- see error-category.ts), and
