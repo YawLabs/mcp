@@ -606,12 +606,19 @@ export function uvLaunchKind(command: string): "uv" | "uvx" | null {
 // actual spawn target always `uv`, which we've already verified is
 // reachable (either because onPath("uv") said so, or we just
 // downloaded it).
-export async function resolveUvSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
-  const kind = uvLaunchKind(command);
-  if (kind === null) return { command, args };
-
-  const uvBin = await ensureUv();
-
+/** The rewrite half of resolveUvSpawn, as a PURE function of the launch kind,
+ *  the resolved uv binary and the args.
+ *
+ *  Split out because it is what the rewrite tests are actually about, and
+ *  reaching it through resolveUvSpawn dragged in ensureUv -- a live 3s spawn
+ *  probe. That made those tests depend on the machine: they SKIPPED entirely
+ *  on a host without uv (protecting nothing on exactly the hosts the rewrite
+ *  exists for), and under full-suite contention the probe timed out, ensureUv
+ *  fell through to a cached binary, and the assertion on the bare "uv" failed
+ *  -- four different tests across four runs, each passing in isolation.
+ *
+ *  Nothing here needs to know how uvBin was found, which is the point. */
+export function buildUvSpawn(kind: "uv" | "uvx", uvBin: string, args: string[]): { command: string; args: string[] } {
   if (kind === "uvx") {
     // Always rewrite to `uv tool run`. Works regardless of whether
     // uvBin is the literal "uv" (PATH) or an absolute path
@@ -623,6 +630,13 @@ export async function resolveUvSpawn(command: string, args: string[]): Promise<{
   // the absolute path to our managed binary; either way, the spawn
   // target resolves correctly.
   return { command: uvBin, args };
+}
+
+export async function resolveUvSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
+  const kind = uvLaunchKind(command);
+  if (kind === null) return { command, args };
+
+  return buildUvSpawn(kind, await ensureUv(), args);
 }
 
 // Test hook — resets the memoized promise so a unit test can exercise
