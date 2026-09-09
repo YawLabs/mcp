@@ -512,13 +512,48 @@ describe("runAdd", () => {
     mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
     writeFileSync(
       join(synthHome, CONFIG_DIRNAME, "secrets.json"),
-      JSON.stringify({ salt: Buffer.alloc(16).toString("base64"), entries: { realkey: {} } }),
+      // A FULL entry shape. `{ realkey: {} }` looks like it would do -- the
+      // check reads names only -- but loadVault throws VaultEntryCorruptError
+      // on an entry missing iv/ciphertext/authTag, and danglingSecretRefs
+      // swallows that into []. The test then passed because the vault was
+      // unreadable, not because the name was found: green for the opposite
+      // reason to the one it claimed.
+      JSON.stringify({
+        salt: Buffer.alloc(16).toString("base64"),
+        entries: { realkey: { iv: "x", ciphertext: "y", authTag: "z" } },
+      }),
     );
     const io2 = captureIO();
     await runAdd({
       slug: "linear",
       url: "https://mcp.example.test/mcp",
       headers: { Authorization: "Bearer ${secret:realkey}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("stays silent when the vault itself is unreadable, leaving that to doctor", async () => {
+    // Deliberate, and worth pinning because it is the reason the test above
+    // needs a valid entry: a corrupt vault makes loadVault throw, and this
+    // check swallows it rather than failing an otherwise-good add. It does
+    // mean one malformed entry hides the warning for every ref -- acceptable
+    // because `yaw-mcp doctor` reports an unreadable vault explicitly, and
+    // guessing here would be worse.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "secrets.json"),
+      JSON.stringify({ salt: Buffer.alloc(16).toString("base64"), entries: { broken: {} } }),
+    );
+    const io2 = captureIO();
+    await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:definitelyabsent}" },
       home: synthHome,
       cwd: synthCwd,
       env: {},
