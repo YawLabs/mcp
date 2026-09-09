@@ -115,10 +115,23 @@ function archiveExt(): "zip" | "tar.gz" {
 // PATHEXT on Windows and symlinks on Unix). 3s cap guards against a
 // wedged shim. Exported for the timeout-path test; production callers
 // stay inside this module.
-export async function onPath(cmd: string): Promise<boolean> {
+/** How long a single `<cmd> --version` probe gets before it is inconclusive. */
+export const PATH_PROBE_TIMEOUT_MS = 3_000;
+
+/** What one probe actually observed.
+ *
+ *  "unknown" exists because a TIMEOUT is not evidence of absence, and
+ *  collapsing the two is what made a loaded machine send the broker to the
+ *  ~20MB bootstrap download while uv sat on PATH the whole time. This module's
+ *  own history says the same thing from the other direction: a shell-less
+ *  probe was tried and reverted for false-negativing on Windows shims and
+ *  causing exactly that download. */
+export type PathProbe = "present" | "absent" | "unknown";
+
+async function probePath(cmd: string): Promise<PathProbe> {
   return new Promise((resolve) => {
     let settled = false;
-    const settle = (v: boolean) => {
+    const settle = (v: PathProbe) => {
       if (settled) return;
       settled = true;
       resolve(v);
@@ -144,7 +157,7 @@ export async function onPath(cmd: string): Promise<boolean> {
         env: stripInternalSecretsFromEnv(process.env),
       });
     } catch {
-      settle(false);
+      settle("absent");
       return;
     }
 
@@ -165,19 +178,29 @@ export async function onPath(cmd: string): Promise<boolean> {
       } catch {
         /* already gone */
       }
-      settle(false);
-    }, 3_000);
+      // NOT "absent": nothing was learned. The caller decides what an
+      // inconclusive probe is worth.
+      settle("unknown");
+    }, PATH_PROBE_TIMEOUT_MS);
     timer.unref?.();
 
     child.on("error", () => {
       clearTimeout(timer);
-      settle(false);
+      // ENOENT and friends ARE evidence: the command is not runnable here.
+      settle("absent");
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      settle(code === 0);
+      settle(code === 0 ? "present" : "absent");
     });
   });
+}
+
+/** Is `cmd` runnable from PATH? An inconclusive probe reads as false, which is
+ *  the historical contract; callers that care about the difference (resolveUv)
+ *  use probePath directly. */
+export async function onPath(cmd: string): Promise<boolean> {
+  return (await probePath(cmd)) === "present";
 }
 
 // GitHub release URLs redirect to objects.githubusercontent.com.
@@ -447,7 +470,30 @@ export function ensureUv(): Promise<string> {
 }
 
 async function resolveUv(): Promise<string> {
-  if (await onPath("uv")) return "uv";
+  // Retry ONLY an inconclusive probe. A clean "absent" (ENOENT, non-zero exit)
+  // is a real answer and goes straight to the bootstrap, so the common
+  // uv-not-installed path pays nothing for this. A timeout is not an answer:
+  // under a loaded machine the 3s budget lapses while uv sits on PATH, and
+  // treating that as absence silently swapped the user's uv for a cached copy
+  // -- or spent a ~20MB download to install one they already had. The second
+  // probe costs at most one more 3s window, and only in the ambiguous case.
+  let probe = await probePath("uv");
+  if (probe === "unknown") {
+    log("warn", "uv PATH probe timed out; retrying once before falling back", {
+      timeoutMs: PATH_PROBE_TIMEOUT_MS,
+    });
+    probe = await probePath("uv");
+  }
+  if (probe === "present") return "uv";
+  if (probe === "unknown") {
+    // Still no answer. Fall through to the cache/bootstrap, because that is
+    // the promise this module exists for -- but say so, because the fallback
+    // is otherwise indistinguishable from "you do not have uv", and it pins
+    // the choice for the rest of the process (see the memo in ensureUv).
+    log("warn", "uv PATH probe inconclusive twice; using the managed copy for this session", {
+      timeoutMs: PATH_PROBE_TIMEOUT_MS,
+    });
+  }
 
   const target = uvTarget();
   if (!target) {
