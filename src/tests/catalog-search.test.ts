@@ -33,6 +33,15 @@ const CATALOG = [
   },
 ] as unknown as CatalogServer[];
 
+// A malformed third-party entry sitting next to a well-formed one. Both of the
+// junk fields are the wrong type -- `tags` a bare string where an array was
+// expected, `category` a number -- which is exactly the shape tagsOf and
+// categoryOf read defensively for.
+const WRONG_TYPES = [
+  { slug: "ok", name: "OK", description: "fine", tags: "notanarray", category: 42 },
+  { slug: "good", name: "Good", description: "real", tags: ["notanarray"], category: "data" },
+] as unknown as CatalogServer[];
+
 const slugs = (q: string): string[] => matchCatalog(q, CATALOG).map((m) => m.entry.slug);
 
 describe("matchCatalog", () => {
@@ -93,6 +102,25 @@ describe("matchCatalog", () => {
     ] as unknown as CatalogServer[];
     expect(matchCatalog("ok", junk).map((m) => m.entry.slug)).toEqual(["ok"]);
   });
+
+  it("reads tags defensively on a query that cannot match the slug or the name", () => {
+    // Guards the Array.isArray read in tagsOf. The test above queries "ok",
+    // which tierFor answers on its FIRST line (token === slug) and returns
+    // from before tags is ever touched -- so it proves nothing about this arm.
+    // A token carried only by a well-formed entry's TAG forces tierFor past
+    // the slug and name arms and into tagsOf on the entry whose `tags` is a
+    // bare string, where an unguarded .filter throws mid-search.
+    expect(matchCatalog("notanarray", WRONG_TYPES).map((m) => [m.entry.slug, m.tier])).toEqual([["good", 2]]);
+  });
+
+  it("reads category defensively on a query that cannot match the slug or the name", () => {
+    // Same shape one arm further down, for the string guard in categoryOf: the
+    // malformed entry's tags read to [] so the category arm actually runs, and
+    // `category: 42` reaching .toLowerCase() unguarded throws. The well-formed
+    // entry still has to come back at tier 2 -- a search must not be taken out
+    // by a neighbouring entry's bad field.
+    expect(matchCatalog("data", WRONG_TYPES).map((m) => [m.entry.slug, m.tier])).toEqual([["good", 2]]);
+  });
 });
 
 describe("suggestCatalogSlugs", () => {
@@ -126,5 +154,23 @@ describe("suggestCatalogSlugs", () => {
   it("respects the limit, and returns nothing for a limit of zero", () => {
     expect(suggestCatalogSlugs("sql", CATALOG, 1)).toEqual(["sqlite"]);
     expect(suggestCatalogSlugs("sql", CATALOG, 0)).toEqual([]);
+  });
+
+  it("sanitises the slug list before handing it to the typo fallback", () => {
+    // This is the did-you-mean path `add` takes on a miss, against catalog
+    // JSON nobody validated, on an ERROR path -- the worst possible place to
+    // throw. closestNames lowercases every candidate it is given, so a null
+    // entry, a slug-less entry or a numeric slug reaching it would replace the
+    // friendly no-such-slug message with a stack trace.
+    const junk = [
+      null,
+      { name: "no slug" },
+      { slug: 7, name: "Seven" },
+      { slug: "postgres", name: "Postgres", description: "Run SQL queries." },
+    ] as unknown as CatalogServer[];
+    expect(suggestCatalogSlugs("postgress", junk, 3)).toEqual(["postgres"]);
+    // And with nothing left once the junk is filtered out, still an empty list
+    // rather than a throw.
+    expect(suggestCatalogSlugs("postgress", junk.slice(0, 3), 3)).toEqual([]);
   });
 });

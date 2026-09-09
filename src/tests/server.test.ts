@@ -431,6 +431,35 @@ describe("ConnectServer", () => {
         expect(second).not.toContain("GitHub");
       });
 
+      it("keeps the focused server's tool list when the context does not match it", () => {
+        // The known-tools drop rule is
+        // `focused === undefined && Boolean(context) && (score ?? 0) <= 0`, and
+        // nothing else in the suite passes BOTH context and server. Only that
+        // first conjunct stops a focused card from dropping the very list it
+        // was asked to expand: gh scores zero against a query about redis, so
+        // without it discover({context, server: "gh"}) renders one card with no
+        // tools on it at all -- and focus suppresses the recovery footer that
+        // would otherwise tell the model where they went.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub", description: "github issues and pull requests" }),
+          makeServerConfig({ namespace: "redis", name: "Redis", description: "redis cache keys" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }, { name: "list_prs" }]);
+        priv.toolCache.set("redis", [{ name: "redis_get" }]);
+
+        const text = priv.handleDiscover("redis cache keys", "gh").content[0].text;
+
+        expect(text).toContain("known tools: create_issue, list_prs");
+        // gh really did score zero -- rankServers omits a non-matching
+        // namespace, so no per-server relevance suffix is rendered for it. A
+        // match would make the assertion above vacuous. Matched on the open
+        // paren: the ranked HEADER says "ranked by relevance:" either way.
+        expect(text).not.toContain("(relevance:");
+        // Focus still bounds the render to the one card that was asked for.
+        expect(text).not.toContain("Redis");
+      });
+
       it("keeps the co-usage peer that the full listing shows", () => {
         // Focus exists to EXPAND one card, so that card must never be less
         // informative than the same one in the full listing. The co-usage map
@@ -4886,6 +4915,55 @@ describe("read_tool honors the same policy gates as activate", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Tool: gh_create_issue");
   });
+
+  it("withholds the schema of a denied tool on the already-loaded fast path", async () => {
+    // A schema is an invitation to call, and read_tool's own output ends by
+    // telling the model to invoke -- so handing one back for a tool the gate
+    // will refuse sends it down a path that cannot work. The fast path returns
+    // before any spawn, so this is the one place the refusal has to come from
+    // the live tool list rather than from a transient connect.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "delete_repo"]));
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo"] };
+
+    const result = await priv.handleReadTool("gh", "delete_repo");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Its schema is withheld because a call would be refused");
+    // REPLACES the schema rather than annotating it -- a refusal still
+    // carrying the input contract would be the invitation it exists to remove.
+    expect(result.content[0].text).not.toContain("Input schema");
+    // Named in the gate's own words, so the model can say which file to edit.
+    expect(result.content[0].text).toContain("/h/.yaw-mcp/config.json");
+    // Per-tool, not per-server: the same server's allowed tool still reads.
+    const allowed = await priv.handleReadTool("gh", "create_issue");
+    expect(allowed.isError).toBeUndefined();
+    expect(allowed.content[0].text).toContain("Input schema");
+  });
+
+  it("withholds it on the transient-connect path too, and still tears the child down", async () => {
+    // The slow path only learns the tool is denied AFTER the transient spawn --
+    // the upstream tool list is what resolves the name -- so the refusal
+    // returns from inside the try block. Leaving the child behind would promote
+    // "read a blocked tool" into "activate", which is the one thing this
+    // meta-tool exists to avoid.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo"] };
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "delete_repo"]));
+
+    const result = await priv.handleReadTool("gh", "delete_repo");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Its schema is withheld because a call would be refused");
+    expect(result.content[0].text).not.toContain("Input schema");
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
+    // Transient means transient: the refusal must not leave the namespace
+    // loaded, or the next read_tool would take the fast path on a session the
+    // client never activated.
+    expect(priv.connections.has("gh")).toBe(false);
+  });
 });
 
 describe("per-tool filter rollback on a failed activation", () => {
@@ -5094,6 +5172,79 @@ describe("blockedTools deny gate", () => {
 
     const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
     expect(text).toContain("already loaded with 1 tools");
+  });
+
+  it("withholds a denied tool from the advertised tools/list", async () => {
+    // The other half of the gate, from the SERVER side. setupHandlers passes
+    // isToolDenied into buildToolList as its deny predicate, so a denied tool
+    // never reaches the client's catalog at all. Dropping that argument
+    // re-advertises a tool every call to which is refused, which reads as a
+    // broken server rather than as the user's own policy.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "delete_repo"]));
+    withDeny(priv, ["gh_delete_repo"]);
+    // Gateway is the default exposure and the one this wiring has to hold
+    // under; an exported YAW_MCP_TOOL_EXPOSURE would otherwise decide which
+    // buildToolList branch the assertion lands on.
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
+    try {
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+      expect(await listedUpstreamToolNames(priv)).toEqual(["gh_create_issue"]);
+      // Hidden, not unrouted -- the comment at the call site is explicit that
+      // the route survives, so calling the name lands on the block message
+      // instead of "Unknown tool", which reads as a typo.
+      expect(priv.toolRoutes.has("gh_delete_repo")).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("counts filter AND deny against the raw upstream total in discover", async () => {
+    // `exposed` is visibleTools (in the filter, not denied) while `total` stays
+    // the raw upstream count, so the suffix reads K of N. The two sibling tests
+    // each populate only ONE of the maps -- the filter test carries no deny,
+    // and the deny test runs against a dormant server that has no filter -- so
+    // the conjunction itself was never exercised. Counting either half alone
+    // reports 3 here.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["a", "b", "c", "d"]));
+    withDeny(priv, ["gh_c"]);
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["a", "b", "c"] });
+
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("loaded (2 tools) (filtered: 2 of 4)");
+    expect(text).toContain("1 loaded in this session, 2 tools in context");
+    // And the number is not merely internally consistent: it is what tools/list
+    // actually carries, which is the claim the count exists to make.
+    expect(await listedUpstreamToolNames(priv)).toEqual(["gh_a", "gh_b"]);
+  });
+
+  it("reports a load whose deny covers every tool as a 0-tool success", async () => {
+    // Activation genuinely succeeded: the child spawned, the connection is
+    // registered, it holds a cap slot and the namespace is advertised -- there
+    // is simply nothing left to advertise. The message renders from
+    // visibleTools, so it counts and names none. Pinned verbatim, dangling
+    // separator included, because that empty list is the ONLY signal the model
+    // gets that the load was a no-op; a future message that explains the deny
+    // should fail here and be re-pinned rather than drift unnoticed.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_*"]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar"]));
+
+    const result = await priv.handleActivate(["gh"]);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe('Loaded "gh" — 0 tools: ');
+    // Not rolled back: the cap slot and the child are really spent.
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(priv.sessionActivated.has("gh")).toBe(true);
+    // ...and the advertised surface agrees with the count it just reported.
+    expect(await listedUpstreamToolNames(priv)).toEqual([]);
   });
 
   it("refuses an exec pipeline before any step runs", () => {

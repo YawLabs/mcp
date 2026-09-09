@@ -1075,6 +1075,81 @@ describe("resolveServerEnv", () => {
     expect(_sdkBehavior.lastStdioArgs?.env?.API_KEY).not.toContain("${secret:");
   });
 
+  // The two halves of `resolvedServerEnv = { ...serverEnv, ...secretValues }`
+  // on the LOCAL branch. Every other case in this file hands resolveSecretRefs
+  // back `values: {}`, so the spread was dead weight in the suite: dropping it
+  // failed nothing, and spreading it into the SPAWN env too failed nothing
+  // either. One test per direction.
+
+  it("redacts the BARE token a child echoes on stderr, not just the composed env value", async () => {
+    // The local mirror of the remote bare-token case. `AUTH: "Bearer ${secret:gh}"`
+    // resolves to the COMPOSED string, so a child that prints only the token
+    // ("invalid token: ghp_...") matches nothing -- redactSecretsInOutput is
+    // exact-substring. The decrypted values ride into the redaction map beside
+    // the composed env, keyed by secret NAME, which is also why the tail names
+    // `***gh***` (the vault entry to rotate) and not `***AUTH***`.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { gh: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    const token = "ghp_AbCdEfGhIjKlMnOpQrStUvWx12345678";
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { AUTH: `Bearer ${token}` },
+      missing: [],
+      malformed: [],
+      values: { gh: token },
+    });
+
+    _sdkBehavior.clientConnect = () => {
+      // Emitted synchronously so the ring is populated before the catch runs,
+      // the same timing the redactSecretsInOutput suite above relies on.
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`invalid token: ${token}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    const err = (await connectToUpstream(makeLocalConfig({ env: { AUTH: "Bearer ${secret:gh}" } })).catch(
+      (e: unknown) => e,
+    )) as ActivationError;
+
+    expect(err).toBeInstanceOf(ActivationError);
+    // Both surfaces: the tail is what server.ts scans and the CLI prints, the
+    // message is what reaches the model in the activate result.
+    expect(err.stderrTail).not.toContain(token);
+    expect(err.message).not.toContain(token);
+    expect(err.stderrTail).toContain("***gh***");
+  });
+
+  it("keeps the bare decrypted values OUT of the child env -- they exist only for the redactor", async () => {
+    // The other direction of the same line. The transport is built from
+    // `serverEnv` alone; only the REDACTION map gets the values spread in.
+    // Spreading them into the spawn env as well would hand every child a
+    // second copy of the credential under the vault's own entry name -- a
+    // variable the operator never declared and cannot see in bundles.json,
+    // and one that outlives whatever narrowing the composed value gave it.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { gh: {} } } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    const token = "ghp_AbCdEfGhIjKlMnOpQrStUvWx12345678";
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { AUTH: `Bearer ${token}` },
+      missing: [],
+      malformed: [],
+      values: { gh: token },
+    });
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("transport error"));
+
+    await connectToUpstream(makeLocalConfig({ env: { AUTH: "Bearer ${secret:gh}" } })).catch(() => {});
+
+    const childEnv = _sdkBehavior.lastStdioArgs?.env;
+    // The declared key still arrives, composed, exactly as before.
+    expect(childEnv).toMatchObject({ AUTH: `Bearer ${token}` });
+    // The secret NAME is not an env var. Checked as a key, not by value: the
+    // token legitimately appears inside AUTH.
+    expect(childEnv).not.toHaveProperty("gh");
+    expect(Object.keys(childEnv ?? {})).not.toContain("gh");
+  });
+
   it("throws when secret NAME is missing from vault", async () => {
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";

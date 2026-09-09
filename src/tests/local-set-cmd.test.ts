@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseSetArgs, runEnableDisable, runSet } from "../local-set-cmd.js";
 
@@ -224,6 +225,55 @@ describe("runSet -- env", () => {
     expect(cap.text()).not.toContain("new");
   });
 
+  it("stores an env value TRIMMED", async () => {
+    // Padding is what shell quoting adds, never what the user meant to store:
+    // a credential with a leading space is exported with that space and fails
+    // at the far end for a reason nothing in the transcript explains. Nothing
+    // in the product passes an env value with surrounding whitespace, so the
+    // trim is invisible until it stops happening.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["env.GITHUB_TOKEN=  padded  "], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "padded", OTHER: "o" });
+  });
+
+  it("reads a whitespace-only value as the CLEAR, not as a stored blank", async () => {
+    // The sharp edge of the trim above, and the reason it is worth pinning. In
+    // a script `env.TOKEN="$VAL"` with VAL unset expands to a QUOTED run of
+    // spaces, which trims to "" and takes the irreversible-clear path -- so the
+    // same line under --force silently drops the stored credential instead of
+    // storing a blank. Both halves are asserted: off a TTY the confirmation
+    // gate catches it and writes nothing, and with --force nothing does.
+    // Storing the blank instead would be no better (the loader drops blank env
+    // values, so the key would be written and could never take effect), which
+    // is why the rule is pinned rather than "fixed" in either direction.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const gated = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=   "],
+      home: synthHome,
+      isTTY: false,
+      ...cap,
+    });
+    expect(gated.exitCode).toBe(2);
+    expect(cap.errText()).toContain("This clears a stored value");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(SAMPLE);
+
+    const cap2 = capture();
+    const forced = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=   "],
+      home: synthHome,
+      force: true,
+      ...cap2,
+    });
+    expect(forced.exitCode).toBe(0);
+    expect(cap2.text()).toContain("env.GITHUB_TOKEN: cleared");
+    expect(read().servers[0].env).toEqual({ OTHER: "o" });
+  });
+
   it("clears one variable with --force, keeping the others", async () => {
     writeBundles(SAMPLE);
     const cap = capture();
@@ -286,6 +336,33 @@ describe("runSet -- env", () => {
     expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "t", OTHER: "o" });
   });
 
+  it("performs the clear when the confirmation is ACCEPTED", async () => {
+    // The accept branch is the entire reason the gate exists, and it was the
+    // one branch nothing covered: every clear that reaches a write elsewhere in
+    // this file passes --force, and the prompt itself was exercised only for
+    // the decline. So a gate that took the yes and then wrote nothing -- or
+    // wrote and reported the wrong key -- passed the suite. askYesNo trims and
+    // lowercases, so the spellings a user actually types have to land on the
+    // same branch; "Y" is what catches a dropped .toLowerCase().
+    for (const answer of ["y", "yes", "Y"]) {
+      writeBundles(SAMPLE);
+      const cap = capture();
+      const r = await runSet({
+        target: "gh",
+        assignments: ["env.GITHUB_TOKEN="],
+        home: synthHome,
+        promptAnswer: answer,
+        ...cap,
+      });
+      expect(r.exitCode, answer).toBe(0);
+      // Reported as written AND actually gone from disk -- the value is the
+      // one thing here that does not come back.
+      expect(r.written, answer).toEqual([bundlesPath()]);
+      expect(read().servers[0].env, answer).toEqual({ OTHER: "o" });
+      expect(cap.text(), answer).toContain("env.GITHUB_TOKEN: cleared");
+    }
+  });
+
   it("does not confirm a SET, only a clear", async () => {
     // Overwriting is recoverable in the sense that matters: the transcript
     // shows what changed, and the old value was already on disk.
@@ -298,6 +375,80 @@ describe("runSet -- env", () => {
       ...capture(),
     });
     expect(r.exitCode).toBe(0);
+  });
+});
+
+describe("runSet -- the clear prompt over a real readline", () => {
+  // `promptAnswer` and `--force` both short-circuit askYesNo before it builds
+  // an interface, so every other test of this gate skips the readline path and
+  // its `finally { rl.close() }` entirely. These two drive it for real over a
+  // PassThrough pair, the way the sibling `remove` suite does.
+  //
+  // The two outcomes print the SAME word on DIFFERENT streams -- a cancel is a
+  // diagnostic (stderr), a decline is the command's own result (stdout, which
+  // has to stay one parseable line under --json). That split is what a
+  // refactor collapsing the two branches into one silently breaks, so each
+  // test asserts the stream it does NOT land on as well.
+
+  it("Ctrl+C at the prompt is a cancel: 'Aborted.' on STDERR, exit 130, bytes untouched", async () => {
+    // Distinct from EOF below: readline owns the keypress and closes the
+    // interface with no process-level signal, so reading that close as "" would
+    // turn a cancel into the decline -- exit 1 where every other prompt in the
+    // product exits 130. terminal:true is what makes readline own the keypress,
+    // as it does on a TTY; ETX is built from its code so no control byte sits
+    // in this source file.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const pending = runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN="],
+      home: synthHome,
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+      ...cap,
+    });
+    // Let the interface attach before the keypress lands.
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(r.exitCode).toBe(130);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain("Aborted.");
+    expect(cap.text()).not.toContain("Aborted.");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(SAMPLE);
+  });
+
+  it("EOF at the prompt is a decline: 'Aborted.' on STDOUT, exit 1, bytes untouched", async () => {
+    // A piped stdin that runs dry (or Ctrl+D) leaves rl.question() pending
+    // forever unless the wrapper aborts it, and a clear that HANGS on EOF is
+    // worse than one that refuses: the process ends by event-loop drain at
+    // status 0, so a wrapper reading $? takes the non-answer for a success.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const prompt: string[] = [];
+    stdout.on("data", (c: Buffer) => prompt.push(c.toString("utf8")));
+    // Ended with nothing written: the interface attaches and sees EOF at once.
+    stdin.end();
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN="],
+      home: synthHome,
+      isTTY: true,
+      io: { stdin, stdout },
+      ...cap,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    // The question went to the INJECTED stdout, not the real process's.
+    expect(prompt.join("")).toContain('Clear GITHUB_TOKEN on "gh"? [y/N]');
+    expect(cap.text()).toContain("Aborted.");
+    expect(cap.errText()).not.toContain("Aborted.");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(SAMPLE);
   });
 });
 

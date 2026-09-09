@@ -822,6 +822,70 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     expect(resolved.B).toBe("prefix-value-x-suffix");
     expect(resolved.C).toBe("value-x");
   });
+
+  // -------------------------------------------------------------------
+  // `values` -- the third return field, and the SOLE data source for
+  // upstream.ts's bare-token redaction. Every test above reads `resolved`,
+  // `missing` or `malformed`; nothing exercised this one, and on the
+  // consumer side every upstream.test.ts case MOCKS resolveSecretRefs and
+  // hands back a literal. Producer and consumer were verified on opposite
+  // sides of a mock, so a change to the shape here broke nothing.
+  // -------------------------------------------------------------------
+
+  it("returns the decrypted values keyed by SECRET NAME, not by the env key they were spliced into", async () => {
+    // The documented shape is `"Authorization": "Bearer ${secret:linear}"`, so
+    // `resolved` only ever holds the COMPOSED string and a gateway echoing the
+    // token alone matches nothing (the redactor is exact-substring). Keying
+    // this map by the env/header key instead of the secret name would also
+    // mislabel the `***NAME***` the redactor prints, pointing the reader at
+    // the wrong credential to rotate.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "linear", "lin_api_9fJ2sQx1TvB");
+    vault = setSecret(vault, key, "gh", "ghp_AbCdEfGh12345678");
+    const { resolved, values } = resolveSecretRefs(
+      { Authorization: "Bearer ${secret:linear}", GITHUB_TOKEN: "${secret:gh}" },
+      vault,
+      key,
+    );
+    expect(values).toEqual({ linear: "lin_api_9fJ2sQx1TvB", gh: "ghp_AbCdEfGh12345678" });
+    // Not a re-index of `resolved`: the env keys must be absent, and the
+    // linear value here is the BARE token, without the "Bearer " it was
+    // composed into.
+    expect(Object.keys(values)).not.toContain("Authorization");
+    expect(resolved.Authorization).toBe(`Bearer ${values.linear}`);
+  });
+
+  it("keeps a secret in `values` exactly once when two env keys reference it", async () => {
+    // The second reference is served by the `decrypted.has(name)` short-circuit,
+    // and `values` is built from that same cache -- so a repeat must neither
+    // drop the entry nor duplicate it under a second key. A cache hit that
+    // stopped handing back the plaintext would leave `resolved.B` carrying the
+    // literal while `values` still advertised the token as redactable, which
+    // is the redaction map claiming to cover a string that was never sent.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "x", "value-x-long-enough");
+    const { resolved, values } = resolveSecretRefs({ A: "${secret:x}", B: "prefix-${secret:x}" }, vault, key);
+    expect(Object.keys(values)).toEqual(["x"]);
+    expect(resolved.A).toBe(values.x);
+    expect(resolved.B).toBe(`prefix-${values.x}`);
+  });
+
+  it("still reports the values it DID decrypt when a sibling ref is missing", async () => {
+    // The refusal path is where the redaction map matters most: resolveServerEnv
+    // throws, and the message it builds (plus the stderr tail the caller
+    // attaches) can quote whatever the resolve handed back. Emptying `values`
+    // on a non-empty `missing` -- a tempting "the spawn was refused, so return
+    // nothing" simplification -- would leave the one token that DID decrypt
+    // unredactable in exactly that error.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "gh", "ghp_AbCdEfGh12345678");
+    const { missing, values } = resolveSecretRefs({ GOOD: "${secret:gh}", BAD: "${secret:absent}" }, vault, key);
+    expect(missing).toEqual(["absent"]);
+    expect(values).toEqual({ gh: "ghp_AbCdEfGh12345678" });
+  });
 });
 
 // ---------------------------------------------------------------------
