@@ -1307,7 +1307,13 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   // repainted this table in the user's terminal, and a `sh -c "a | b"` arg
   // joined by a bare space read as separate tokens. NAMESPACE is skipped on
   // purpose: NAMESPACE_RE (local-bundles.ts) already restricts it to
-  // [a-z0-9_], and GRADE is a validated A-F letter from grades.json.
+  // [a-z0-9_]. GRADE is NOT exempt: it reads as a validated A-F letter, but
+  // validateEntry (local-bundles.ts) accepts any non-blank string from
+  // bundles.json and only trims and uppercases it -- neither of which touches
+  // an ESC byte -- deliberately, so compliance.ts can report an unrecognized
+  // grade instead of silently treating it as ungraded. bundles.json is a file
+  // a repo can ship, so that cell carries the same untrusted-string risk as
+  // NAME.
   const cols: Array<[string, (s: UpstreamServerConfig) => string]> = [
     ["NAMESPACE", (s) => s.namespace],
     ["NAME", (s) => displaySafe(s.name)],
@@ -1315,7 +1321,7 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
     // "-" for never-audited, matching the GRADE column this ported from.
     // LAUNCH stays last: it's the only variable-width cell, so anything after
     // it would be ragged.
-    ["GRADE", (s) => s.complianceGrade ?? "-"],
+    ["GRADE", (s) => (s.complianceGrade ? displaySafe(s.complianceGrade) : "-")],
     [
       "LAUNCH",
       (s) =>

@@ -76,6 +76,20 @@ export interface UpstreamServerConfig {
   runtime?: "oam" | "node";
 }
 
+/** Does this entry take its credentials in HTTP headers rather than a spawned
+ *  process env?
+ *
+ *  One predicate, because three surfaces have to agree on it and they each
+ *  used to answer it their own way. `type` is the discriminator upstream.ts
+ *  itself branches on (`config.type === "local"`), and `transport` is NOT: a
+ *  remote entry is allowed to declare `transport: "stdio"` in bundles.json,
+ *  and upstream.ts warns and connects over HTTP anyway. Reading transport
+ *  here would call that entry local and go looking for its secrets in an
+ *  `env` that is never sent anywhere. */
+export function isHeaderCredentialedEntry(entry: { type?: string }): boolean {
+  return entry.type === "remote";
+}
+
 export interface ConnectConfig {
   servers: UpstreamServerConfig[];
   configVersion: string;

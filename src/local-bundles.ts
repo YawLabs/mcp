@@ -1009,6 +1009,22 @@ function mergeServerEntry(
     merged[k] = v;
   }
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
+  // The other direction: an entry converted TO remote must shed the stdio
+  // launch it no longer uses. Nothing here is gated on `incoming.command`,
+  // because a remote entry literal does not carry one -- and gating the
+  // cleanup on a key the incoming shape never has is what left `add x --url`
+  // over an existing stdio entry holding a stale `command`, `args`, and a
+  // plaintext `env` credential. `list` then rendered the dead npx line as
+  // that server's launch, for a server that actually connects over HTTPS.
+  const convertedToRemote = typeof incoming.url === "string" && incoming.command === undefined;
+  if (convertedToRemote) {
+    delete merged.command;
+    delete merged.args;
+    // `env` goes with them. A remote entry spawns no process, so upstream.ts
+    // warns and ignores it; leaving it behind keeps a credential in
+    // bundles.json that nothing will ever use and no surface will explain.
+    delete merged.env;
+  }
   if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
     delete merged.url;
     // `headers` belongs to the remote shape exactly as `url` does, so it goes
@@ -1023,7 +1039,11 @@ function mergeServerEntry(
 
   const storedEnv = envStrings(base.env);
   const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
-  if (storedEnv || incomingEnv) {
+  // Skipped entirely on a conversion to remote. This block rebuilds `env`
+  // from the STORED entry, so it undoes the delete above and puts the stdio
+  // credential straight back -- the delete alone looked right and changed
+  // nothing on disk.
+  if (!convertedToRemote && (storedEnv || incomingEnv)) {
     const env: Record<string, string> = {};
     // Carry the stored env forward, MINUS any blank seed the incoming entry no
     // longer lists. A blank value is not data -- it is `add`'s "this key is
@@ -1246,7 +1266,10 @@ function resolveUpsertTarget(
   // command/args rendered it as "" and a "nothing stored" guard then
   // swallowed the note, while the merge carried the stale url along.
   let launchChanged: LaunchChange | undefined;
-  if (typeof stored.slug !== "string" && typeof incoming.command === "string") {
+  // Either shape counts as a launch: `command` for stdio, `url` for remote.
+  // Gating on `command` alone meant a stdio -> remote conversion changed
+  // where the server actually connects and printed no note at all.
+  if (typeof stored.slug !== "string" && (typeof incoming.command === "string" || typeof incoming.url === "string")) {
     const from = launchShapeOf(stored);
     const to = launchShapeOf(incoming);
     if (!sameLaunch(from, to)) launchChanged = { from, to };

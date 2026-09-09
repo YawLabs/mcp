@@ -7,6 +7,7 @@ import { type CatalogServer, DEFAULT_CATALOG_URL, type FetchCatalog } from "../c
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
 import { deriveNamespace, loadLocalBundles, removeUserBundle, upsertUserBundle } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+import type { UpstreamServerConfig } from "../types.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -19,6 +20,11 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
 });
+
+// A grade cell carrying a real ESC, as a repo-shipped bundles.json could.
+// Built from a char code so the literal never sits in this file (where a
+// stray copy-paste would put a control byte into source).
+const ESCAPE_GRADE = `${String.fromCharCode(27)}[2J${String.fromCharCode(27)}[H`;
 
 function captureIO(): { out: string[]; err: string[]; text: () => string; errText: () => string } {
   const out: string[] = [];
@@ -508,6 +514,63 @@ describe("runAdd", () => {
     expect(entry?.command).toBe("npx");
     expect(entry?.url).toBeUndefined();
     expect(entry?.headers).toBeUndefined();
+  });
+
+  it("drops the stored launch and env when a local entry is converted to remote", async () => {
+    // The mirror of the test above, which is the direction that was covered.
+    // A remote entry literal carries no `command`, and the merge's launch
+    // cleanup was gated on the incoming entry HAVING one -- so converting the
+    // other way left the dead npx launch and its plaintext credential on disk
+    // while the server actually connected over HTTPS.
+    const io2 = captureIO();
+    const common = {
+      slug: "mytool",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, command: "npx -y old-mcp", envOverrides: { OLD_TOKEN: "LOCAL-SECRET" } });
+    await runAdd({ ...common, url: "https://a.test/mcp", headers: { Authorization: "Bearer LIVE-TOKEN" } });
+
+    const raw = readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8");
+    expect(raw).not.toContain("LOCAL-SECRET");
+    expect(raw).not.toContain("old-mcp");
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("remote");
+    expect(entry?.url).toBe("https://a.test/mcp");
+    expect(entry?.command).toBeUndefined();
+    expect(entry?.args).toBeUndefined();
+    expect(entry?.env).toBeUndefined();
+  });
+
+  it("reports the launch swap when a slug-less entry is converted to remote [#1]", async () => {
+    // The mirror of "a slug-less namespace match merges but reports the launch
+    // swap LOUDLY". launchChanged was gated on the INCOMING entry carrying a
+    // `command`, which a remote entry literal never does -- so this direction
+    // changed where the server actually connects and printed nothing at all.
+    await upsertUserBundle(
+      // App-shaped: no slug field at all.
+      { namespace: "mytool", name: "MyTool", command: "docker", args: ["run", "old/tool"], isActive: true },
+      { home: synthHome },
+    );
+    const errLines: string[] = [];
+    await runAdd({
+      slug: "mytool",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      url: "https://a.test/mcp",
+      out: () => {},
+      err: (s: string) => errLines.push(s),
+    });
+    const errText = errLines.join("");
+    expect(errText).toContain("launch command changed");
+    expect(errText).toContain("docker run old/tool");
+    expect(errText).toContain("https://a.test/mcp");
   });
 
   it("writes a remote entry from --url, with headers and no command", async () => {
@@ -2403,6 +2466,38 @@ describe("runList", () => {
       gradesReader: async () => ({}),
     });
     expect(io.text()).toMatch(/fetch\s+Fetch\s+active\s+-\s/);
+  });
+
+  it("neuters control bytes in a GRADE that came from bundles.json", async () => {
+    // GRADE reads like a validated A-F letter, but validateEntry accepts any
+    // non-blank string from bundles.json and only trims and uppercases it --
+    // neither of which touches an ESC. bundles.json is a file a repo can
+    // ship, so an entry carrying a clear-screen escape would wipe the
+    // screen and home the cursor in the middle of the table it is a cell of.
+    await upsertUserBundle(
+      {
+        namespace: "evil",
+        name: "Evil",
+        command: "npx",
+        args: ["-y", "x"],
+        isActive: true,
+        complianceGrade: ESCAPE_GRADE as UpstreamServerConfig["complianceGrade"],
+      },
+      { home: synthHome },
+    );
+    const io = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    const text = io.text();
+    expect(text).toContain("evil");
+    // The raw ESC never reaches the terminal; displaySafe renders it visibly.
+    expect(text).not.toContain(ESCAPE_GRADE);
+    expect(text.includes(String.fromCharCode(27))).toBe(false);
   });
 
   it("reads the real grades.json when no reader override is supplied", async () => {

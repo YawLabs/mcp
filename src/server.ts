@@ -72,7 +72,8 @@ import {
 import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
-import { type RankableServer, rankServers, tokenize, tokenizeQuery } from "./relevance.js";
+import { type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
+import { type CapContent, capContent, resolveMaxResultBytes } from "./result-cap.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
   firstResultText,
@@ -89,7 +90,13 @@ import {
   shouldSample,
 } from "./sampling-rank.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
-import { type CapDecision, evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
+import {
+  type CapDecision,
+  evaluateServerCap,
+  type LoadedSlot,
+  resolveServerCap,
+  resolveToolTokenCap,
+} from "./server-cap.js";
 import { maybeRefreshSidecars } from "./sidecar-refresh.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import {
@@ -659,6 +666,12 @@ export class ConnectServer {
   // field (not static) so tests can override per-instance without
   // poisoning other instances or re-importing the module.
   private serverCap = resolveServerCap();
+  // Off by default (0). When ops arm it, it gates activation on the ESTIMATED
+  // token cost of the loaded tool surface rather than the server count -- the
+  // dimension the count cap has always claimed to bound. Read once at
+  // construction, like serverCap, so a mid-session env change can't move the
+  // ceiling under a decision already in flight.
+  private toolTokenCap = resolveToolTokenCap();
 
   // Delay before runActivateOne's single retry. One fixed step, not
   // exponential backoff. An instance field (not a literal at the call site)
@@ -1547,8 +1560,14 @@ export class ConnectServer {
       // survive the `!context` falsiness check and throw a TypeError inside
       // the BM25 tokenizer -- surfacing as a raw JSON-RPC internal error
       // instead of a tool result.
-      return this.attachGuideNudge(
-        await this.handleDiscoverWithAutoWarm(typeof args.context === "string" ? args.context : undefined, progress),
+      // Ticked like every other observation meta-tool. Auto-warm is safe
+      // under it: runActivateOne resets the namespace it just loaded to zero
+      // idle, so the tick below ages everything EXCEPT the server discover
+      // just decided was the relevant one.
+      return this.observed(
+        this.attachGuideNudge(
+          await this.handleDiscoverWithAutoWarm(typeof args.context === "string" ? args.context : undefined, progress),
+        ),
       );
     }
     if (name === META_TOOLS.dispatch.name) {
@@ -1587,16 +1606,25 @@ export class ConnectServer {
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.health.name) {
-      return this.attachGuideNudge(this.handleHealth());
+      return this.observed(this.attachGuideNudge(this.handleHealth()));
     }
     if (name === META_TOOLS.read_tool.name) {
       const serverArg = typeof args.server === "string" ? args.server : "";
       const toolArg = typeof args.tool === "string" ? args.tool : "";
       const result = await this.handleReadTool(serverArg, toolArg, progress);
-      return this.attachGuideNudge(result);
+      return this.observed(this.attachGuideNudge(result));
     }
     if (name === META_TOOLS.suggest.name) {
-      return this.attachGuideNudge(this.handleSuggest());
+      return this.observed(this.attachGuideNudge(this.handleSuggest()));
+    }
+    if (name === META_TOOLS.findTool.name) {
+      // typeof guard like every sibling arg: the low-level Server does not
+      // validate input against inputSchema, so a non-string query from a
+      // misbehaving client would otherwise reach the tokenizer and throw a
+      // raw TypeError out as a JSON-RPC internal error.
+      const q = typeof args.query === "string" ? args.query : "";
+      const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? args.limit : undefined;
+      return this.observed(this.attachGuideNudge(this.handleFindTool(q, limit)));
     }
     if (name === META_TOOLS.exec.name) {
       const result = await this.handleExec(args, extra?.signal);
@@ -1604,11 +1632,11 @@ export class ConnectServer {
     }
     if (name === META_TOOLS.bundles.name) {
       const action = args.action === "match" ? "match" : "list";
-      return this.attachGuideNudge(this.handleBundles(action));
+      return this.observed(this.attachGuideNudge(this.handleBundles(action)));
     }
     if (name === META_TOOLS.secrets.name) {
       const serverArg = typeof args.server === "string" ? args.server : undefined;
-      return this.attachGuideNudge(await this.handleSecretsReport(serverArg));
+      return this.observed(this.attachGuideNudge(await this.handleSecretsReport(serverArg)));
     }
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during
@@ -1912,6 +1940,39 @@ export class ConnectServer {
           // content through untouched rather than failing the call.
           log("warn", "pruneContent failed", { error: err?.message });
         }
+      }
+
+      // Hard ceiling, applied AFTER pruning and to EVERY result -- error and
+      // structured included, where the prune pass deliberately stands down.
+      // Pruning is a savings pass that gives up when the win is marginal, so
+      // it bounds nothing: a tool returning a whole log file walks through it
+      // untouched. This is the one door in the broker that was never watched,
+      // and a single oversized reply undoes every other budget in the process.
+      //
+      // The cut is LOUD by construction (capContent appends a marker saying
+      // what was dropped), because a silently truncated log reads to the model
+      // as a complete one. structuredContent is NOT capped -- the proxy passes
+      // it through verbatim and cutting one side of a structured/text pair
+      // would make the two disagree -- so a structured-output tool can still
+      // return an unbounded payload. Named here rather than implied.
+      try {
+        const maxBytes = resolveMaxResultBytes();
+        if (maxBytes > 0 && Array.isArray(result.content)) {
+          const cr = capContent(result.content as CapContent[], maxBytes);
+          if (cr.capped) {
+            result.content = cr.content as typeof result.content;
+            log("warn", "Tool result exceeded the size ceiling and was cut", {
+              namespace: route.namespace,
+              tool: route.originalName,
+              bytesRaw: cr.bytesRaw,
+              maxBytes,
+            });
+          }
+        }
+      } catch (err: any) {
+        // Same posture as the pruner above: a ceiling that throws must not
+        // fail the user's call.
+        log("warn", "capContent failed", { error: err?.message });
       }
       // Cross-session learning signal — GRADED, not binary. recordOutcome
       // records both the dispatch (denominator) and a quality-weighted
@@ -2770,7 +2831,11 @@ export class ConnectServer {
     for (const [ns, conn] of this.connections) {
       const ownDeadSlot = ns === namespace && conn.status === "error";
       if ((conn.status === "connected" || ownDeadSlot) && !this.prewarmNamespaces.has(ns)) {
-        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        loadedSlots.push({
+          namespace: ns,
+          idleCount: this.idleCallCounts.get(ns) ?? 0,
+          tokens: this.estimateTokensFor(ns),
+        });
         counted.add(ns);
       }
     }
@@ -2778,11 +2843,38 @@ export class ConnectServer {
       // Skip self (not reserved yet), anything already counted as a
       // live connection, and prewarm-claimed reservations.
       if (ns !== namespace && !counted.has(ns) && !this.prewarmNamespaces.has(ns)) {
-        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        loadedSlots.push({
+          namespace: ns,
+          idleCount: this.idleCallCounts.get(ns) ?? 0,
+          tokens: this.estimateTokensFor(ns),
+        });
         counted.add(ns);
       }
     }
-    return evaluateServerCap(namespace, loadedSlots, this.serverCap);
+    return evaluateServerCap(namespace, loadedSlots, this.serverCap, {
+      tokenCap: this.toolTokenCap,
+      candidateTokens: this.estimateTokensFor(namespace),
+    });
+  }
+
+  /** Estimated tool-surface tokens for one namespace, live if it is
+   *  connected and from the cache if it is not.
+   *
+   *  Returns undefined when neither source has a tool list -- an unknown, not
+   *  a zero. evaluateServerCap treats the two differently on purpose: a zero
+   *  claims the server is free and would let an unmeasured 60-tool upstream
+   *  slip under a token ceiling, while an undefined simply leaves the token
+   *  dimension out of the decision for that slot. A candidate with no
+   *  estimate cannot be refused by the token cap at all, which is the right
+   *  way to fail: the count cap still applies, and a guess is not grounds to
+   *  refuse a load. */
+  private estimateTokensFor(namespace: string): number | undefined {
+    const conn = this.connections.get(namespace);
+    if (conn && conn.tools.length > 0) return estimateFromConnectedTools(conn.tools).tokens;
+    const config = (this.config?.servers ?? []).find((s) => s.namespace === namespace);
+    const cache = config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
+    if (!cache || cache.length === 0) return undefined;
+    return estimateFromToolCache(cache).tokens;
   }
 
   // The policy gates every SPAWN path shares, in one place and one order:
@@ -3448,6 +3540,12 @@ export class ConnectServer {
     // Set when this call INSTALLED a filter, so a failed activation can put
     // the previous state back. `prev: undefined` means "there was none".
     let installedFilter: { namespace: string; prev: Set<string> | undefined } | null = null;
+    // The namespace this call asked to FILTER, whether or not the filter is
+    // new. Distinct from installedFilter, which is only set when the surface
+    // actually moved -- re-sending the same filter changes nothing and leaves
+    // that null, and keying the unmatched-name note on it meant a model that
+    // repeated its typo was told about it exactly once and then never again.
+    let filterRequestedFor: string | null = null;
     if (toolsFilter && namespaces.length === 1) {
       const ns = namespaces[0];
       // Dedup + drop empty strings. If the resulting set is empty we
@@ -3461,6 +3559,7 @@ export class ConnectServer {
           filtersChanged = true;
         }
       } else {
+        filterRequestedFor = ns;
         // Compare sets by size + membership to decide whether the
         // tools/list surface actually moved. Prevents a spurious
         // list_changed notification when the same filter is re-sent.
@@ -3531,6 +3630,10 @@ export class ConnectServer {
           if (installedFilter.prev) this.toolFilters.set(namespace, installedFilter.prev);
           else this.toolFilters.delete(namespace);
           installedFilter = null;
+          // Rolled back, so there is no filter left to report unmatched names
+          // against -- and the server never came up, so its tool list is
+          // unknown anyway.
+          filterRequestedFor = null;
           // The surface never actually moved, so don't announce that it did.
           filtersChanged = false;
         }
@@ -3558,10 +3661,52 @@ export class ConnectServer {
       await this.notifyAllListsChanged();
     }
 
+    // A filter name that matched NOTHING is a silent hole otherwise. The
+    // filter narrows the advertised list by name (proxy.ts), so a typo or a
+    // guessed-at tool name simply produces a smaller list -- the model asked
+    // for `create_issu`, got a server advertising nothing, and was told
+    // "Loaded gh". It then reasons about why its tool "is not working" with
+    // no way to discover that the name was never real.
+    //
+    // Reported in the REPLY, not only the log: the model is the one that has
+    // to correct the name, and it cannot read stderr.
+    if (filterRequestedFor) {
+      const ns = filterRequestedFor;
+      const unmatched = this.unmatchedFilterNames(ns);
+      if (unmatched.length > 0) {
+        const conn = this.connections.get(ns);
+        const offered = conn ? conn.tools.map((t) => t.name) : [];
+        const plural = unmatched.length === 1;
+        const lead = `Note: the ${plural ? "tool" : "tools"} you asked to keep ${plural ? "does" : "do"} not exist on "${ns}": ${unmatched.join(", ")}.`;
+        const fix =
+          offered.length > 0
+            ? ` That server offers: ${offered.join(", ")}. Re-run mcp_connect_activate with a name from that list, or omit "tools" to advertise all of them.`
+            : " It advertises no tools at all right now, so the filter hides nothing that exists.";
+        results.push(lead + fix);
+      }
+    }
+
     return {
       content: [{ type: "text", text: results.join("\n") }],
       isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
     };
+  }
+
+  /** Filter names for `namespace` that match no tool the server actually
+   *  offers. Empty when there is no filter, or when the tool list is unknown
+   *  -- an unknown list cannot falsify a name, and guessing would report a
+   *  real tool as missing on every cold server. */
+  private unmatchedFilterNames(namespace: string): string[] {
+    const filter = this.toolFilters.get(namespace);
+    if (!filter || filter.size === 0) return [];
+    const conn = this.connections.get(namespace);
+    const known =
+      conn && conn.status === "connected"
+        ? conn.tools.map((t) => t.name)
+        : (this.toolCache.get(namespace) ?? []).map((t) => t.name);
+    if (known.length === 0) return [];
+    const have = new Set(known);
+    return [...filter].filter((n) => !have.has(n)).sort();
   }
 
   // Background refinement of a just-recorded heuristic reward via the optional
@@ -3924,6 +4069,39 @@ export class ConnectServer {
     await this.trackUsageForNamespaces([calledNamespace]);
   }
 
+  /** Age every loaded server by one and run the reaper, crediting none.
+   *
+   *  The idle clock used to advance only on PROXIED calls, so a session that
+   *  spoke exclusively to the broker -- discover, find_tool, health, secrets --
+   *  never ticked at all, and six upstream child processes stayed spawned for
+   *  as long as the client stayed connected. Nothing was ever "idle" because
+   *  nothing was ever counted.
+   *
+   *  Only the observation meta-tools go through here. `activate` and
+   *  `deactivate` do not: they ARE the loaded set, and activate resets the
+   *  namespace it just loaded. `dispatch` and `exec` do not: they route to
+   *  real servers and tick through their own paths, exec deliberately once
+   *  for a whole pipeline.
+   *
+   *  A server evicted this way is not lost -- it keeps its learned toolCache,
+   *  stays advertised as a deferred route, and re-activates lazily on the
+   *  first call to one of its tools. The cost of being wrong here is one
+   *  re-spawn, which is the trade the reaper already makes everywhere else. */
+  private async trackObservation(): Promise<void> {
+    // The empty array is the whole point: `called` is empty, so no namespace
+    // is credited and every connected one ages by one.
+    await this.trackUsageForNamespaces([]);
+  }
+
+  /** Run `result`, then charge the session one idle tick. Awaits the handler
+   *  FIRST -- read_tool can connect a server for the length of the call, and
+   *  ticking before it returns would age a set the handler is still changing. */
+  private async observed<T>(result: T | Promise<T>): Promise<T> {
+    const resolved = await result;
+    await this.trackObservation();
+    return resolved;
+  }
+
   // Idle bookkeeping for one logical unit of work. A direct tool call names
   // exactly one namespace; an exec pipeline names every namespace its steps
   // touched and ticks the rest ONCE, so a long pipeline can't age (and evict)
@@ -4208,7 +4386,15 @@ export class ConnectServer {
     const vault = await loadVault(vaultPath()).catch(() => null);
     const vaultKeys = new Set(vault ? listKeys(vault) : []);
 
-    let servers = this.getProfiledActiveServers().map((s) => ({ namespace: s.namespace, env: s.env }));
+    // `type` and `headers` ride along so computeSecretsReport can pick the
+    // channel that server actually uses. Dropping them here is what made the
+    // report blind to every remote server's credentials.
+    let servers = this.getProfiledActiveServers().map((s) => ({
+      namespace: s.namespace,
+      type: s.type,
+      env: s.env,
+      headers: s.headers,
+    }));
     if (serverArg) servers = servers.filter((s) => s.namespace === serverArg);
 
     const rows = computeSecretsReport(servers, vaultKeys);
@@ -4342,6 +4528,92 @@ export class ConnectServer {
   // observed in this session. Observation only — never activates
   // anything. Ranked by frequency primarily, with recency as a tiebreak
   // so the hottest-most-recent pattern sits at the top.
+  /** Cap on what find_tool returns when the caller names no limit.
+   *
+   *  A number, not "everything that matched": the point of the tool is to
+   *  spend less context than activating servers to look, and a bare term
+   *  against a 30-server setup can match a hundred tools. Ten is enough to
+   *  choose from and small enough that the reply stays cheap. */
+  private static readonly FIND_TOOL_DEFAULT_LIMIT = 10;
+  private static readonly FIND_TOOL_MAX_LIMIT = 50;
+
+  /** Search every configured server's tools by what they do.
+   *
+   *  Reads only what is already known -- live tool lists for loaded servers,
+   *  cached names and descriptions for the rest -- so it contacts nothing and
+   *  activates nothing. That is the whole point: the caller who knows the
+   *  capability but not its home previously had to activate servers to look,
+   *  which is the context cost this broker exists to avoid.
+   *
+   *  A loaded server's match carries its input schema, because it is already
+   *  in memory and free. A cold server's does not, and the reply SAYS so per
+   *  match rather than leaving the model to infer it -- a silently absent
+   *  schema reads as "this tool takes no arguments", which is a worse answer
+   *  than "activate it to see". */
+  private handleFindTool(query: string, limit?: number): { content: Array<{ type: string; text: string }> } {
+    const servers = this.getProfiledActiveServers();
+    if (servers.length === 0) {
+      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
+    }
+    if (query.trim() === "") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: 'find_tool needs a query describing what the tool should do, e.g. { "query": "create a github issue" }.',
+          },
+        ],
+      };
+    }
+
+    const cap = Math.max(
+      1,
+      Math.min(limit ?? ConnectServer.FIND_TOOL_DEFAULT_LIMIT, ConnectServer.FIND_TOOL_MAX_LIMIT),
+    );
+    const ranked = rankTools(
+      query,
+      servers.map((s) => this.rankableFor(s)),
+    );
+    if (ranked.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No configured server has a tool matching "${query}". Use mcp_connect_discover to see what is available, or \`yaw-mcp add <slug>\` to install a server that does.`,
+          },
+        ],
+      };
+    }
+
+    const shown = ranked.slice(0, cap);
+    const lines: string[] = [`Tools matching "${query}" (${shown.length} of ${ranked.length}):`, ""];
+    for (const hit of shown) {
+      const connection = this.connections.get(hit.namespace);
+      const live = connection?.status === "connected" ? connection.tools.find((t) => t.name === hit.name) : undefined;
+      lines.push(`  ${hit.namespace}_${hit.name}${live ? " [loaded]" : ""}`);
+      if (hit.description) lines.push(`    ${hit.description}`);
+      if (live) {
+        lines.push(`    input schema: ${JSON.stringify(live.inputSchema)}`);
+      } else {
+        lines.push(`    schema not loaded -- activate "${hit.namespace}", or use mcp_connect_read_tool.`);
+      }
+    }
+    if (ranked.length > shown.length) {
+      lines.push("", `${ranked.length - shown.length} more match; raise "limit" to see them.`);
+    }
+    // The namespaces behind the shown matches, in first-appearance order, so
+    // the model can act without re-deriving them from the lines above.
+    const namespaces = [...new Set(shown.map((h) => h.namespace))];
+    const primary = namespaces[0];
+    const alsoTry = namespaces.slice(1);
+    lines.push(
+      "",
+      alsoTry.length > 0
+        ? `To use one: mcp_connect_activate with server "${primary}" (or ${alsoTry.join(", ")}).`
+        : `To use one: mcp_connect_activate with server "${primary}".`,
+    );
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
   private handleSuggest(): { content: Array<{ type: string; text: string }> } {
     const detected = this.packDetector.detectChains();
     if (detected.length === 0) {

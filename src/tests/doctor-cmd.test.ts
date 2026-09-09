@@ -3326,7 +3326,7 @@ describe("runDoctor — SECRET VAULT", () => {
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
     expect(txt).toContain("SECRET VAULT");
-    expect(txt).toContain("malformed:  refs the spawn is REFUSED over");
+    expect(txt).toContain("malformed:  refs the connection is REFUSED over");
     expect(txt).toContain("gh: <malformed ref> ${secret:gh ...");
 
     const cap2 = captureOut();
@@ -3353,7 +3353,7 @@ describe("runDoctor — SECRET VAULT", () => {
     expect(txt).toContain("gh: ${secret:gh}");
   });
 
-  it("ignores a REMOTE server's secret refs, which the vault never serves", async () => {
+  it("ignores a REMOTE server's ENV refs, which the vault never serves", async () => {
     // A remote entry's env is never sent anywhere -- upstream.ts logs
     // "Ignoring env on a remote server" and connects unauthenticated, so
     // resolveServerEnv never runs for one. Listing it would put it under the
@@ -3385,6 +3385,38 @@ describe("runDoctor — SECRET VAULT", () => {
     expect(r.exitCode).toBe(0);
   });
 
+  it("reports a REMOTE server's HEADER refs, which the vault does serve", async () => {
+    // The other half of the rule above, and the half that was missing. A
+    // remote server takes its credential in `headers`, and upstream.ts
+    // resolves that map through the same fail-closed resolveServerEnv
+    // immediately before it builds the transport -- so a locked vault really
+    // does refuse the connect. Skipping every remote entry left the surface
+    // that exists to pre-empt a missing credential silent about the only
+    // channel a remote server has.
+    writeVault({ other: { iv: "x", ciphertext: "y", authTag: "z" } });
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [
+        {
+          id: "notion-id",
+          name: "Notion",
+          namespace: "notion",
+          type: "remote",
+          url: "https://example.invalid/mcp",
+          headers: { Authorization: "Bearer ${secret:NOTION_TOKEN}" },
+        },
+      ],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("notion: ${secret:NOTION_TOKEN}");
+    // And counted against the vault's key list, so the operator is told the
+    // name is absent BEFORE the connect fails over it.
+    expect(txt).toContain("NOTION_TOKEN");
+    expect(txt).toContain("DO NOT CONNECT");
+  });
+
   it("explains the locked-vault failure without moving the exit code", async () => {
     // The whole point of the section: refs present, no passphrase in this env
     // -- those servers WILL fail to spawn, and the fix has to be spelled out.
@@ -3394,7 +3426,7 @@ describe("runDoctor — SECRET VAULT", () => {
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
     expect(txt).toContain("passphrase: not set in this environment");
-    expect(txt).toContain("FAIL TO START");
+    expect(txt).toContain("DO NOT CONNECT");
     expect(txt).toContain("YAW_MCP_VAULT_PASSPHRASE");
     // Names WHERE to set it -- the trap is putting it in the upstream
     // server's env, where it is stripped before the child ever sees it.

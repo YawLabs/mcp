@@ -112,6 +112,7 @@ import {
 } from "./sidecars-cmd.js";
 import { TRUST_BYPASS_ENV } from "./trust.js";
 import { formatTtl, gcExpiredTrials, scanTrials, type TrialGcFailure, trialGcFailureWarning } from "./try-cmd.js";
+import { isHeaderCredentialedEntry } from "./types.js";
 import {
   BINARY_RETIRED_HINT,
   buildUpgradePlan,
@@ -1238,10 +1239,12 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // useful bit — without it users don't know what the omission means.
 export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string }> = [
   { name: "YAW_MCP_SERVER_CAP", defaultHint: "default 6" },
+  { name: "YAW_MCP_TOOL_TOKEN_CAP", defaultHint: "token ceiling off" },
   { name: "YAW_MCP_MIN_COMPLIANCE", defaultHint: "filter inactive" },
   { name: "YAW_MCP_AUTO_LOAD", defaultHint: "auto-load inactive" },
   { name: "YAW_MCP_AUTO_ACTIVATE", defaultHint: "default on" },
   { name: "YAW_MCP_PRUNE_RESPONSES", defaultHint: "pruning active" },
+  { name: "YAW_MCP_MAX_RESULT_BYTES", defaultHint: "default 100000" },
   { name: "YAW_MCP_DEFAULT_RUNTIME", defaultHint: "oam when installed" },
   { name: "YAW_MCP_TOOL_EXPOSURE", defaultHint: "gateway" },
   { name: "YAW_MCP_AUTO_UPGRADE", defaultHint: "default on" },
@@ -1332,24 +1335,29 @@ async function collectVaultStatus(opts: {
   const refs: VaultStatus["refs"] = [];
   const malformed: VaultStatus["malformed"] = [];
   for (const s of opts.servers) {
-    // LOCAL servers only. A remote entry's env is never sent anywhere --
-    // upstream.ts logs "Ignoring env on a remote server" and connects
-    // unauthenticated -- so resolveServerEnv never runs for one and no
-    // passphrase changes its outcome. Listing it here would put it under the
-    // "these servers FAIL TO START while the vault is locked" note, which is
-    // simply untrue of a remote: it starts fine and gets a 401 from the far
-    // end. A diagnostic that invents a cause is worse than one that says
-    // nothing, so the vault section stays silent about remotes rather than
-    // sending the user to unlock a vault that was never in the path.
-    if (s.type === "remote") continue;
+    // Which map carries this server's credentials, not whether to look at
+    // all. A local server's is `env`; a remote server's is `headers`, and
+    // upstream.ts resolves it through the SAME fail-closed resolveServerEnv
+    // immediately before it builds the transport -- so a locked vault refuses
+    // a remote connect exactly as it refuses a local spawn.
+    //
+    // This used to `continue` on every remote, justified by "a remote entry's
+    // env is never sent anywhere". That half is still true and is why `env`
+    // is not read here for a remote: upstream.ts logs "Ignoring env on a
+    // remote server". But it was written before headers existed as a channel,
+    // and skipping the whole entry left the one surface that exists to
+    // pre-empt a missing credential silent about the only way a remote server
+    // can carry one.
+    const credentials = isHeaderCredentialedEntry(s) ? s.headers : s.env;
+    if (credentials === undefined) continue;
     // secrets-vault's shared scanner, not a local matchAll over SECRET_REF_RE:
     // that object carries /g and is module-shared, so scanning against it
     // directly leaves a lastIndex other callers trip over. This loop used to be
     // a hand copy of collectSecretRefNames re-deriving that rule, as did
     // meta-tools.ts's and upstream.ts's.
-    const names = collectSecretRefNames(s.env);
+    const names = collectSecretRefNames(credentials);
     if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
-    const malformedRefs = collectMalformedSecretRefs(s.env);
+    const malformedRefs = collectMalformedSecretRefs(credentials);
     if (malformedRefs.length > 0) malformed.push({ namespace: s.namespace, refs: malformedRefs });
   }
 
@@ -1416,14 +1424,16 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
   // missing name, so it gets the same prominence -- and its own remedy: the
   // fix is the typo in bundles.json, not the vault.
   if (status.malformed.length > 0) {
-    print("  malformed:  refs the spawn is REFUSED over (fix the typo in bundles.json):");
+    print("  malformed:  refs the connection is REFUSED over (fix the typo in bundles.json):");
     for (const m of status.malformed) {
       print(`    ${m.namespace}: ${m.refs.join(", ")}`);
     }
   }
   if (status.refs.length > 0 && !status.passphraseSet) {
-    print("  note:       the servers above FAIL TO START while the vault is locked -- yaw-mcp");
-    print("              refuses the spawn rather than passing the literal placeholder through.");
+    print("  note:       the servers above DO NOT CONNECT while the vault is locked -- yaw-mcp");
+    print("              refuses the spawn (local) or the connect (remote, whose credentials");
+    print("              ride in `headers`) rather than putting the literal placeholder on the");
+    print("              wire.");
     print("              Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's OWN env (the `env` block of");
     print("              the yaw-mcp entry in your MCP client config), NOT in the upstream");
     print("              server's -- it is stripped from every child env. A client that");
@@ -1461,6 +1471,9 @@ interface OamRuntimeStatus {
     namespace: string;
     command: string | undefined;
     env: Record<string, string> | undefined;
+    /** A REMOTE server's credential channel -- the vault section reads this
+     *  where it reads `env` for a local one. See isHeaderCredentialedEntry. */
+    headers: Record<string, string> | undefined;
     type: "local" | "remote";
     info: ServerRuntimeInfo;
   }>;
@@ -1578,6 +1591,7 @@ async function collectOamRuntimeStatus(opts: {
     namespace: s.namespace,
     command: s.command,
     env: s.env,
+    headers: s.headers,
     type: s.type,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));

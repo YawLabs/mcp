@@ -38,6 +38,7 @@ export const KNOWN_SUBCOMMANDS = [
   "audit",
   "foundry",
   "install",
+  "uninstall",
   "add",
   "remove",
   "list",

@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type CapDecision, DEFAULT_SERVER_CAP, evaluateServerCap, resolveServerCap } from "../server-cap.js";
+import {
+  type CapDecision,
+  DEFAULT_SERVER_CAP,
+  DEFAULT_TOOL_TOKEN_CAP,
+  evaluateServerCap,
+  resolveServerCap,
+  resolveToolTokenCap,
+} from "../server-cap.js";
 
 /** Narrow a decision to its refusal arm and hand back the message.
  *  CapDecision is a discriminated union — `message` rides the refusal arm
@@ -174,5 +181,141 @@ describe("evaluateServerCap", () => {
     // the self-allowance server.ts leans on so an auto-reconnect of an
     // error-state connection is not refused at a full cap.
     expect(evaluateServerCap("dead", withDeadSlot, 2)).toEqual({ allow: true });
+  });
+});
+
+describe("resolveToolTokenCap", () => {
+  const orig = process.env.YAW_MCP_TOOL_TOKEN_CAP;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.YAW_MCP_TOOL_TOKEN_CAP;
+    else process.env.YAW_MCP_TOOL_TOKEN_CAP = orig;
+  });
+
+  it("is off unless ops arms it", () => {
+    delete process.env.YAW_MCP_TOOL_TOKEN_CAP;
+    expect(resolveToolTokenCap({} as NodeJS.ProcessEnv)).toBe(DEFAULT_TOOL_TOKEN_CAP);
+    expect(DEFAULT_TOOL_TOKEN_CAP).toBe(0);
+  });
+
+  it("reads a plain digit run", () => {
+    expect(resolveToolTokenCap({ YAW_MCP_TOOL_TOKEN_CAP: "8000" } as NodeJS.ProcessEnv)).toBe(8000);
+  });
+
+  it("falls back to off rather than a silently smaller ceiling on a typo", () => {
+    // parseInt would read "0x2000" as 0 -- which is the DISABLE sentinel, so
+    // the typo would remove the ceiling while looking like it set one. Both
+    // land on the documented default instead.
+    expect(resolveToolTokenCap({ YAW_MCP_TOOL_TOKEN_CAP: "0x2000" } as NodeJS.ProcessEnv)).toBe(0);
+    expect(resolveToolTokenCap({ YAW_MCP_TOOL_TOKEN_CAP: "8e3" } as NodeJS.ProcessEnv)).toBe(0);
+    expect(resolveToolTokenCap({ YAW_MCP_TOOL_TOKEN_CAP: "  " } as NodeJS.ProcessEnv)).toBe(0);
+  });
+});
+
+describe("token ceiling", () => {
+  const slot = (namespace: string, tokens?: number, idleCount = 0) => ({ namespace, idleCount, tokens });
+
+  it("does nothing when the ceiling is unarmed", () => {
+    const loaded = [slot("a", 9_000), slot("b", 9_000)];
+    expect(evaluateServerCap("c", loaded, 6, { candidateTokens: 9_000 })).toEqual({ allow: true });
+  });
+
+  it("does nothing when the candidate could not be estimated", () => {
+    // An unmeasured candidate is an unknown, not a free one. Refusing on a
+    // guess would block a load the count cap was happy to admit.
+    const loaded = [slot("a", 9_000)];
+    expect(evaluateServerCap("c", loaded, 6, { tokenCap: 10_000 })).toEqual({ allow: true });
+  });
+
+  it("refuses a load that would cross the ceiling", () => {
+    const loaded = [slot("a", 6_000)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 6, { tokenCap: 10_000, candidateTokens: 5_000 }));
+    expect(msg).toContain("~11000");
+    expect(msg).toContain("~10000-token ceiling");
+    expect(msg).toContain("by ~1000");
+    expect(msg).toContain("YAW_MCP_TOOL_TOKEN_CAP");
+  });
+
+  it("admits a load that lands exactly on the ceiling", () => {
+    const loaded = [slot("a", 6_000)];
+    expect(evaluateServerCap("c", loaded, 6, { tokenCap: 10_000, candidateTokens: 4_000 })).toEqual({ allow: true });
+  });
+
+  it("refuses under the count cap when the surface is too big", () => {
+    // The whole reason the second dimension exists: one slot used, five free,
+    // and the loaded surface is already what the model cannot reason about.
+    const loaded = [slot("huge", 40_000)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 6, { tokenCap: 20_000, candidateTokens: 500 }));
+    expect(msg).toContain('Cannot load "c"');
+    expect(msg).toContain("huge");
+  });
+
+  it("names the most expensive server first, not the most idle", () => {
+    // The count-cap message sorts by idleness because a slot is a slot there.
+    // Over a TOKEN budget the cheapest way back under it is the biggest
+    // server, which here is the LEAST idle one.
+    const loaded = [slot("small", 500, 9), slot("big", 30_000, 0)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 6, { tokenCap: 20_000, candidateTokens: 100 }));
+    expect(msg.indexOf('"big"')).toBeLessThan(msg.indexOf('"small"'));
+  });
+
+  it("omits the token figure for a slot that was never estimated", () => {
+    const loaded = [slot("known", 30_000), slot("unmeasured", undefined, 3)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 6, { tokenCap: 20_000, candidateTokens: 100 }));
+    expect(msg).toContain('"unmeasured" (idle 3)');
+    expect(msg).not.toContain("~0 tokens");
+  });
+
+  it("prints a measured zero, because that IS the answer", () => {
+    // Distinct from the case above: a connected upstream advertising no tools
+    // really does cost nothing, and saying so is what tells the model that
+    // dropping it will not free any budget.
+    const loaded = [slot("empty", 0, 2), slot("known", 30_000)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 6, { tokenCap: 20_000, candidateTokens: 100 }));
+    expect(msg).toContain('"empty" (idle 2, ~0 tokens)');
+  });
+
+  it("still self-allows a namespace already holding a slot", () => {
+    // Re-admitting something already loaded costs nothing, so it must clear
+    // the token ceiling for the same reason it clears the count cap.
+    const loaded = [slot("a", 90_000)];
+    expect(evaluateServerCap("a", loaded, 6, { tokenCap: 1_000, candidateTokens: 90_000 })).toEqual({ allow: true });
+  });
+
+  it("applies with the count cap disabled", () => {
+    // cap===0 turns the COUNT gate off; it must not turn an armed token
+    // ceiling off with it.
+    const loaded = [slot("a", 30_000)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 0, { tokenCap: 20_000, candidateTokens: 100 }));
+    expect(msg).toContain("token ceiling");
+  });
+
+  it("allows freely when both dimensions are disabled", () => {
+    const loaded = [slot("a", 30_000), slot("b", 30_000)];
+    expect(evaluateServerCap("c", loaded, 0, { tokenCap: 0, candidateTokens: 30_000 })).toEqual({ allow: true });
+  });
+
+  it("counts an un-estimated loaded slot as nothing rather than guessing", () => {
+    const loaded = [slot("a", undefined), slot("b", 5_000)];
+    expect(evaluateServerCap("c", loaded, 6, { tokenCap: 10_000, candidateTokens: 5_000 })).toEqual({ allow: true });
+  });
+
+  it("prefers the token refusal over the count refusal when both would fire", () => {
+    const loaded = [slot("a", 9_000), slot("b", 9_000)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 2, { tokenCap: 10_000, candidateTokens: 5_000 }));
+    expect(msg).toContain("token ceiling");
+    expect(msg).not.toContain("concurrent cap");
+  });
+
+  it("still reports the count refusal when only the count is exceeded", () => {
+    const loaded = [slot("a", 100), slot("b", 100)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 2, { tokenCap: 10_000, candidateTokens: 100 }));
+    expect(msg).toContain("2-server concurrent cap");
+  });
+
+  it("shows the token cost in the count-cap refusal so the model can pick a victim", () => {
+    const loaded = [slot("a", 4_000, 1), slot("b", 300, 5)];
+    const msg = expectRefusal(evaluateServerCap("c", loaded, 2));
+    expect(msg).toContain("~4000 tokens");
+    expect(msg).toContain("idle 5");
   });
 });

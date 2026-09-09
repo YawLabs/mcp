@@ -10,7 +10,7 @@ import {
 } from "../completion-cmd.js";
 import { parseDoctorArgs } from "../doctor-cmd.js";
 import { parseFoundryArgs } from "../foundry-cmd.js";
-import { parseInstallArgs } from "../install-cmd.js";
+import { parseInstallArgs, parseUninstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
@@ -274,9 +274,13 @@ describe("renderScript — fish", () => {
       );
       expect(line).not.toContain("__fish_seen_subcommand_from");
     }
-    // `--scope` belongs to install alone: no other subcommand's guard offers it.
-    expect(flagLines.filter((l) => l.endsWith(" -l scope"))).toEqual([
+    // `--scope` belongs to install and its subtract side alone -- no OTHER
+    // subcommand's guard offers it. Pinned as the exact set rather than a
+    // containment check, so a third subcommand growing a --scope has to come
+    // update this line.
+    expect(flagLines.filter((l) => l.endsWith(" -l scope")).sort()).toEqual([
       'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand install" -l scope',
+      'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand uninstall" -l scope',
     ]);
   });
 
@@ -431,6 +435,7 @@ function simulatePowershell(script: string, tokens: string[], wordToComplete: st
 type ProbeResult = { ok: true } | { ok: false; error: string };
 const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   install: parseInstallArgs,
+  uninstall: parseUninstallArgs,
   add: parseAddArgs,
   remove: parseRemoveArgs,
   list: parseListArgs,
