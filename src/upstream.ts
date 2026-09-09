@@ -545,10 +545,16 @@ function htmlEscapeVariants(base: string): string[] {
  *  Two bases, then a transform per base:
  *
  *  - RAW and TRIMMED. undici strips leading and trailing HTTP whitespace from
- *    every header value, so a vault entry keeping the newline `yaw-mcp secrets
- *    set --stdin` preserves (that path is documented as raw) is SENT as
- *    `Bearer tok` while the map holds `Bearer tok\n`. A child that reads an
- *    injected var usually trims it before echoing it back too.
+ *    every header value, so a vault entry carrying edge whitespace is SENT as
+ *    `Bearer tok` while the map holds `Bearer tok ` -- and the exact-substring
+ *    match then finds nothing in the echo. Reachable shapes, checked rather
+ *    than assumed: a LEADING space (nothing strips it), a trailing SPACE, and
+ *    a doubled trailing newline. Note what is NOT one -- `secrets set --stdin`
+ *    strips a single trailing newline itself (secrets-cmd.ts, the piped-stdin
+ *    branch: `.replace(/\r?\n$/, "")`), so the tidiest-looking example is the
+ *    one that path cannot produce; it strips ONE, so a doubled newline still
+ *    arrives here. A child that reads an injected var usually trims it before
+ *    echoing it back too.
  *
  *  - JSON-ESCAPED, the one that matters most. MCP servers speak JSON-RPC and
  *    the common Node loggers (pino, winston) default to JSON lines, so a value
@@ -560,9 +566,10 @@ function htmlEscapeVariants(base: string): string[] {
  *    byte-for-byte. `JSON.stringify(v).slice(1, -1)` is exactly what the value
  *    looks like embedded IN a JSON string, minus the quotes the document adds.
  *
- *  - PERCENT-ENCODED. `+`, `/` and `=` are exactly the characters
- *    encodeURIComponent rewrites and exactly the ones a base64-shaped
- *    credential is made of, so a gateway that bounces the failed request
+ *  - PERCENT-ENCODED. encodeURIComponent rewrites 24 printable-ASCII
+ *    characters; the three that fall INSIDE the base64 alphabet are `+`, `/`
+ *    and `=`, which is what makes a base64-shaped credential the shape worth
+ *    covering here. So a gateway that bounces the failed request
  *    through a login redirect, or quotes back the query string it received,
  *    echoes %2B / %2F / %3D and matches nothing.
  *
@@ -585,10 +592,14 @@ function htmlEscapeVariants(base: string): string[] {
  *    most of which is ordinary configuration, and a case-insensitive pass would
  *    replace a Windows path or a URL merely MENTIONED in the output in another
  *    case -- costing the reader the path the error was actually about while
- *    hiding no credential. Hex is the carve-out because a >=8-char hex run
- *    cannot collide with prose, and because folding it is lossless: the echo IS
- *    the credential. For a mixed-alphabet token the folded echo is not the
- *    credential anyway, so the trade lands the same way twice.
+ *    hiding no credential. Hex is the carve-out because folding it is LOSSLESS,
+ *    so the folded echo IS still the credential; for a mixed-alphabet token it
+ *    is not, and there is nothing to recover. The gate is /^[0-9a-f]+$/i, which
+ *    also admits digit-only runs -- a date, a timestamp -- and those DO collide
+ *    with prose. Harmless rather than fixed: for a digit-only value both folds
+ *    are the identity, so they add no variant the raw match did not already
+ *    carry. It is the losslessness that earns the carve-out, not any claim that
+ *    hex cannot appear in ordinary text.
  *
  *  NOT EXHAUSTIVE. The gap is other ENCODERS of shapes already in the list, not
  *  shapes nobody thought of, so the four above are "the common encoders" rather
@@ -627,8 +638,10 @@ function htmlEscapeVariants(base: string): string[] {
  *    so they would be guesses paid for on every call.
  *
  *  The floor (SECRET_MATCH_MIN_LENGTH) is enforced HERE as well as in the
- *  caller's replace loop, and the two are not redundant. Every transform above
- *  LENGTHENS its base, so a floor checked only at match time is a floor on the
+ *  caller's replace loop, and the two are not redundant. No transform above
+ *  SHORTENS its base (several are the identity on a value with nothing to
+ *  escape, and the hex fold is equal-length by construction), so a floor
+ *  checked only at match time is a floor on the
  *  ENCODED string rather than on the credential: a 7-char config snippet the
  *  design deliberately skips clears the bar as a 9-char JSON escape, and a
  *  6-char path clears it percent-encoded -- and the redactor then mangles
