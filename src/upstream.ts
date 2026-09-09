@@ -540,16 +540,42 @@ export class ActivationError extends Error {
  */
 function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
+  // A value can reach the wire TRIMMED while this map holds it untrimmed, and
+  // exact-substring matching then misses the echo entirely. undici strips
+  // leading and trailing HTTP whitespace from every header value, so a vault
+  // entry keeping the newline `yaw-mcp secrets set --stdin` preserves (that
+  // path is documented as raw) is SENT as `Bearer tok` while the map holds
+  // `Bearer tok\n` -- neither the composed entry nor the bare one matches what
+  // a gateway echoes back, and the token lands verbatim in the
+  // ActivationError. So emit the trimmed form as an EXTRA entry under the same
+  // key, which keeps the message naming the entry to rotate. Fixed here rather
+  // than at the header call site because this is the choke point every caller
+  // goes through and the local/stdio path meets the same shape: a child that
+  // reads an injected var usually trims it before echoing it back.
+  //
+  // trim(), not a trailing-only cut -- leading whitespace is stripped
+  // identically. A variant is a plain extra entry, so the >=8-char floor in
+  // the loop below governs it exactly as it governs the original: trimming can
+  // drop a value under the floor, and that floor is what keeps the regex off
+  // unrelated substrings. Deliberately NOT re-checked here -- a second copy of
+  // the same threshold is one more place to forget when it moves.
+  const entries: Array<[string, string]> = [];
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== "string") continue;
+    entries.push([k, v]);
+    const trimmed = v.trim();
+    if (trimmed !== v) entries.push([k, trimmed]);
+  }
   // Replace longest values first. When one secret value is a substring of
   // another (e.g. a token and that same token with a suffix), a short-first
   // pass can redact the inner value and leave a real-secret suffix exposed.
   // Descending-by-length order guarantees the containing value is redacted
-  // whole before any of its substrings is considered.
-  const entries = Object.entries(env).sort(
-    ([, a], [, b]) => (typeof b === "string" ? b.length : 0) - (typeof a === "string" ? a.length : 0),
-  );
+  // whole before any of its substrings is considered. The trimmed variants
+  // sort in this same pass, so each is a strictly shorter entry that cannot
+  // jump ahead of a value containing it.
+  entries.sort(([, a], [, b]) => b.length - a.length);
   for (const [k, v] of entries) {
-    if (typeof v !== "string" || v.length < 8) continue;
+    if (v.length < 8) continue;
     // Skip values that are themselves an unresolved ${secret:...} literal.
     if (v.startsWith("${secret:") && v.endsWith("}")) continue;
     // Escape regex metacharacters in the secret value.

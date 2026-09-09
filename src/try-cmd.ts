@@ -453,10 +453,11 @@ async function readTrialMarker(markerPath: string): Promise<{ marker: TrialMarke
  *  differs between them:
  *   - "removed":    the entry was present and the file was rewritten (or, with
  *                   `dryRun`, would have been).
- *   - "absent":     nothing to do (no file, empty file, entry already gone).
- *   - "not-object": valid JSON that is NOT an object, so there is no container
- *                   to name the entry in and no peel is possible. The GC
- *                   refuses to unlink the marker on this; try-cleanup warns
+ *   - "absent":     nothing to do (no file, empty file, entry already gone, or
+ *                   a container on the way down that cannot hold it).
+ *   - "not-object": the whole FILE is valid JSON that is NOT an object, so it
+ *                   is not a client config at all and no peel is possible. The
+ *                   GC refuses to unlink the marker on this; try-cleanup warns
  *                   and carries on.
  *  Read/parse/write errors propagate to the caller's own catch. */
 async function peelEntryFromConfig(
@@ -470,6 +471,38 @@ async function peelEntryFromConfig(
   if (raw.trim().length === 0) return "absent";
   const parsed = parseJsonc(raw);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "not-object";
+  // Walk containerPath ourselves BEFORE handing it to removeJsoncEntry.
+  // jsonc-parser cannot delete under a missing intermediate -- the walk breaks
+  // with no parent and it throws "Can not delete in empty document" (the same
+  // trap editJsoncPath documents in jsonc.ts) -- so removeJsoncEntry's "no-op
+  // when the path does not exist" contract only holds once every container on
+  // the way down is really there. The check belongs HERE, on the caller side,
+  // because only the caller knows what a missing container MEANS: the user
+  // pulled the trial entry and the now-empty mcpServers block (or, at
+  // claude-code local scope, the whole projects[<dir>] block) out by hand, so
+  // there is provably no entry left to peel. Letting the throw out reported
+  // that as a peel FAILURE -- doctor told the user the trial was still wired
+  // into a file that held no trial entry, kept the marker, and re-failed on
+  // every later sweep, so its exit 2 never cleared.
+  //
+  // A container that EXISTS but is not an object (mcpServers set to 5, to a
+  // string, to an array) is "absent" for the same reason: a non-object cannot
+  // hold a key, so the entry is not in the file either and no future peel
+  // could ever succeed. Reporting it as a failure would warn "still wired in"
+  // about an entry that is not there, forever. Only the whole FILE not being
+  // an object stays "not-object" above -- there the marker is naming something
+  // that is not a client config at all, which is worth keeping the marker over
+  // rather than claiming a clean sweep.
+  //
+  // Own properties only, so this walk sees exactly what jsonc-parser's walk
+  // over the parse tree will see: an inherited member is not a container in
+  // the text.
+  let container = parsed as Record<string, unknown>;
+  for (const segment of containerPath) {
+    const child = Object.hasOwn(container, segment) ? container[segment] : undefined;
+    if (typeof child !== "object" || child === null || Array.isArray(child)) return "absent";
+    container = child as Record<string, unknown>;
+  }
   const next = removeJsoncEntry(raw, containerPath, entryName);
   if (next === raw) return "absent";
   if (dryRun) return "removed";

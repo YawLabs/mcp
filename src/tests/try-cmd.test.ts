@@ -1435,6 +1435,172 @@ describe("scanTrials + gcExpiredTrials", () => {
   });
 });
 
+describe("gcExpiredTrials -- the container itself was deleted by hand", () => {
+  const baseNow = 1_700_000_000_000;
+
+  /** An expired marker pointing at `containerPath` inside `clientPath`. Same
+   *  shape the sweep above uses; only the two fields under test vary. */
+  function writeExpiredMarker(clientPath: string, containerPath: string[]): string {
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "old",
+      name: "Old MCP",
+      expiresAt: baseNow - 1,
+      clientPath,
+      clientName: "claude-code",
+      containerPath,
+      entryName: "yaw-mcp-try-old",
+      createdAt: baseNow - 3_600_000,
+    };
+    const markerPath = trialMarkerPath("old", synthHome);
+    writeFileSync(markerPath, JSON.stringify(marker));
+    return markerPath;
+  }
+
+  it("clears the marker with no warning when the mcpServers block is gone", async () => {
+    // The user pulled the trial entry AND the now-empty mcpServers block out
+    // by hand. jsonc-parser cannot delete under a missing intermediate -- it
+    // throws "Can not delete in empty document" -- which the sweep used to
+    // report as a peel failure saying the trial was STILL WIRED IN, over a
+    // file that provably holds no trial entry at all. The marker then survived
+    // every sweep and doctor exited 2 on that warning forever.
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ numStartups: 3 });
+    writeFileSync(clientPath, before);
+    const markerPath = writeExpiredMarker(clientPath, ["mcpServers"]);
+
+    const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.failures).toEqual([]);
+    // Self-healed: the marker is gone, so the next doctor run is quiet.
+    expect(existsSync(markerPath)).toBe(false);
+    // Nothing to peel means nothing written -- the file is left as found.
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+    // jsonc-parser's internal wording must never reach a user-facing surface.
+    expect(JSON.stringify(result)).not.toContain("Can not delete in empty document");
+  });
+
+  it("clears the marker when a claude-code local-scope projects[dir] block is gone", async () => {
+    // Same defect one level deeper: at claude-code local scope containerPath
+    // is ["projects", <cwd>, "mcpServers"], and deleting the whole
+    // projects[<cwd>] block leaves the walk breaking on the MIDDLE segment.
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ projects: {} });
+    writeFileSync(clientPath, before);
+    const markerPath = writeExpiredMarker(clientPath, ["projects", synthCwd, "mcpServers"]);
+
+    const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+  });
+
+  // DECISION: a container key that EXISTS but is not an object is treated the
+  // same as a missing one -- "absent", swept clean. A number, a string, an
+  // array or a null cannot hold a key, so the trial entry provably is not in
+  // the file, and that is the only outcome that keeps doctor's claim TRUE.
+  // Reporting "not-object" here would warn "still wired in" about an entry
+  // that is not there and would keep the marker forever, since nothing can
+  // ever make that peel succeed.
+  for (const [label, container] of [
+    ["a number", "5"],
+    ["a string", '"nope"'],
+    ["an array", "[]"],
+    ["null", "null"],
+  ] as const) {
+    it(`clears the marker when the container key holds ${label}`, async () => {
+      const clientPath = join(synthHome, ".claude.json");
+      const before = `{"mcpServers":${container}}`;
+      writeFileSync(clientPath, before);
+      const markerPath = writeExpiredMarker(clientPath, ["mcpServers"]);
+
+      const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+      expect(result.cleared).toBe(1);
+      expect(result.failed).toBe(0);
+      expect(result.failures).toEqual([]);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(readFileSync(clientPath, "utf8")).toBe(before);
+      expect(JSON.stringify(result)).not.toContain("Can not add index to parent");
+    });
+  }
+
+  it("still peels a container that DOES hold the entry, comments and siblings intact", async () => {
+    // The guard above must not swallow the real peel. A nested containerPath
+    // exercises every walk step, and the comment proves the removal still
+    // routes through the comment-preserving jsonc edit rather than a
+    // parse + stringify round trip.
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(
+      clientPath,
+      [
+        "{",
+        '  "projects": {',
+        `    ${JSON.stringify(synthCwd)}: {`,
+        '      "mcpServers": {',
+        "        // hand-written note the user wants kept",
+        '        "keep": { "command": "y" },',
+        '        "yaw-mcp-try-old": { "command": "npx", "args": ["-y", "@old/mcp"] }',
+        "      }",
+        "    }",
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const markerPath = writeExpiredMarker(clientPath, ["projects", synthCwd, "mcpServers"]);
+
+    const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(existsSync(markerPath)).toBe(false);
+    const text = readFileSync(clientPath, "utf8");
+    expect(text).not.toContain("yaw-mcp-try-old");
+    expect(text).toContain("hand-written note the user wants kept");
+    expect(text).toContain('"keep"');
+  });
+
+  it("try-cleanup reports a clean removal instead of leaking the parser error", async () => {
+    // The user-initiated path shares the same peel. Before the fix it printed
+    // "warning -- couldn't strip ... (Can not delete in empty document)",
+    // handing jsonc-parser's internal wording straight to the user about a
+    // file that holds no trial entry.
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ numStartups: 3 });
+    writeFileSync(clientPath, before);
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "demo",
+      name: "Demo MCP",
+      expiresAt: baseNow + 3_600_000,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-demo",
+      createdAt: baseNow,
+    };
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(marker));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, out: cap.pushOut, err: cap.pushErr });
+
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toBe("");
+    expect(cap.errText()).not.toContain("Can not delete");
+    expect(cap.text()).toMatch(/cleaned up/);
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+});
+
 describe("runTryCleanup — marker field validation", () => {
   const baseMarker = (): Record<string, unknown> => ({
     schemaVersion: 1,

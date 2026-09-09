@@ -949,6 +949,116 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).toContain("***OUTER_TOKEN***");
   });
 
+  it("redacts a value the wire TRIMMED when the map holds it untrimmed", async () => {
+    // `yaw-mcp secrets set --stdin` is documented as raw, so a vault entry
+    // routinely keeps the trailing newline the shell put there. Whatever
+    // consumes it strips that back off -- undici trims every header value, and
+    // a child that reads the var usually trims too -- so the token echoed back
+    // is the TRIMMED form, which exact-substring matching against the
+    // untrimmed map value misses entirely. Before the trimmed variant was
+    // emitted the token landed verbatim in the message, in the tail, and in
+    // the activate result the model reads.
+    const stored = "ghp_AbCdEfGhIjKlMnOpQrSt1234\n";
+    const onWire = stored.trim();
+    const config = makeLocalConfig({ env: { MY_TOKEN: stored } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`authentication failed: ${onWire}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(onWire);
+    expect(err!.message).not.toContain(onWire);
+    // Named, not merely blanked: the reader still learns which credential to
+    // rotate, and the absence assertions cannot pass on an empty message.
+    expect(err!.stderrTail).toContain("***MY_TOKEN***");
+    expect(err!.message).toContain("***MY_TOKEN***");
+  });
+
+  it("redacts a trimmed value whose whitespace was LEADING, not trailing", async () => {
+    // Headers strips leading and trailing HTTP whitespace alike, so a value
+    // padded on the front reaches the wire trimmed for exactly the same
+    // reason. A trailing-only cut would leave this one in the clear.
+    const stored = "  ghp_LeAdInGwHiTeSpAcE1234";
+    const onWire = stored.trim();
+    const config = makeLocalConfig({ env: { MY_TOKEN: stored } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`authentication failed: ${onWire}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(onWire);
+    expect(err!.stderrTail).toContain("***MY_TOKEN***");
+  });
+
+  it("keeps longest-first ordering once the trimmed variants join the list", async () => {
+    // The added variants must not break the invariant the sort exists for.
+    // Padded INNER trims down to a prefix of OUTER; if that shorter variant
+    // ran first it would redact the inside of OUTER and leave OUTER's real
+    // suffix exposed -- the exact failure the descending sort prevents.
+    const innerValue = " ghp_AbCdEfGh12345678 ";
+    const outerValue = `${innerValue.trim()}_SUFFIX_9999`;
+    const config = makeLocalConfig({ env: { INNER_TOKEN: innerValue, OUTER_TOKEN: outerValue } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`authentication failed: ${outerValue}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(outerValue);
+    expect(err!.stderrTail).not.toContain("_SUFFIX_9999");
+    expect(err!.stderrTail).toContain("***OUTER_TOKEN***");
+  });
+
+  it("does not emit a trimmed variant that falls under the 8-char floor", async () => {
+    // The floor is what keeps the regex off unrelated substrings, and trimming
+    // can drop a value under it: nine characters of which four are padding.
+    // The variant has to clear the same bar the original does, or the redactor
+    // starts mangling ordinary output.
+    const config = makeLocalConfig({ env: { SHORT: "  abc12  " } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from("error: abc12 is invalid"));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain("abc12 is invalid");
+    expect(err!.stderrTail).not.toContain("***SHORT***");
+  });
+
   it("rewrites an UNRESOLVED ${secret:NAME} literal to ${secret:***} rather than naming the env key", async () => {
     // Defense in depth: a ref that reached the child unresolved (or was echoed
     // back by it) still names a vault entry, which is not something to publish
@@ -3126,6 +3236,43 @@ describe("connectToUpstream remote headers", () => {
     ).catch((e: unknown) => e);
 
     expect(String((err as Error).message)).not.toContain("lin_api_9fJ2sQx1TvB");
+    expect(String((err as Error).message)).toContain("***linear***");
+  });
+
+  it("redacts a vault secret stored with a trailing newline, which the wire strips off", async () => {
+    // `secrets set --stdin` is documented as raw, so a token piped in from a
+    // shell keeps the newline the shell added. undici strips leading and
+    // trailing HTTP whitespace from every header value, so the gateway sees --
+    // and echoes back -- the TRIMMED token while the redaction map holds the
+    // untrimmed one. Exact-substring matching then missed BOTH the composed
+    // entry and the bare one, and the token went verbatim into an
+    // ActivationError that is logged to stderr, recorded in activationFailures
+    // and rendered into the activate/discover result the model reads.
+    //
+    // Asserted on the message rather than on stderrTail because a remote never
+    // populates the stderr ring -- the tail side of this leak is covered in
+    // the redactSecretsInOutput suite, on the local path that does.
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({ entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { Authorization: "Bearer lin_api_9fJ2sQx1TvB\n" },
+      missing: [],
+      malformed: [],
+      values: { linear: "lin_api_9fJ2sQx1TvB\n" },
+    } as any);
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(new Error('Error POSTing to endpoint: {"error":"invalid_api_key","key":"lin_api_9fJ2sQx1TvB"}'));
+
+    const err = await connectToUpstream(
+      makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:linear}" } }),
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(String((err as Error).message)).not.toContain("lin_api_9fJ2sQx1TvB");
+    // Names the vault entry to rotate, so this cannot pass by the detail being
+    // empty or the whole message having been swallowed.
     expect(String((err as Error).message)).toContain("***linear***");
   });
 
