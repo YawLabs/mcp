@@ -3192,6 +3192,11 @@ describe("ConnectServer", () => {
       expect(text).not.toContain("pr 199");
       expect(text.match(/PR #0 body/g)).toHaveLength(1);
       expect(JSON.parse(text).steps).toBeUndefined();
+      // stepKeys must SURVIVE the drop -- it is the caller's only remaining
+      // record of which steps ran, including the side-effecting one it would
+      // have to name in a follow-up `return`. Asserting only that `steps` is
+      // gone would stay green if a refactor emitted a bare {ok, result}.
+      expect(JSON.parse(text).stepKeys).toEqual(["a", "b"]);
       // And it is dramatically smaller than the un-selected form would be.
       expect(text.length).toBeLessThan(bigList.length / 10);
     });
@@ -3225,6 +3230,40 @@ describe("ConnectServer", () => {
       expect(parsed.result).toBe("commented");
       // The irreplaceable part of the side effect survives.
       expect(parsed.steps.a).toEqual({ number: 4242, url: "https://x.test/i/4242" });
+    });
+
+    it("does not let a large RETURNED value evict a small binding the caller cannot rebuild", async () => {
+      // The budget is measured over what would be DROPPED, not over every
+      // binding. Counting the returned value buys nothing -- it rides in
+      // `result` either way -- and counting it broke the exact case the budget
+      // exists for: create_issue (tiny, irreplaceable) then a large fetch that
+      // uses it, returning the large one. Measured on the old predicate: 5,067
+      // bytes weighed in order to discard 51 bytes of issue number, while the
+      // 5,000-byte value was transmitted regardless.
+      const priv = getPrivate(server);
+      const big = JSON.stringify({ body: "x".repeat(5000) });
+      const conn = makeConnection("gh", ["create_issue", "fetch_big"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: '{"number":4242}' }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: big }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "a", tool: "gh_create_issue", args: {} },
+          { id: "b", tool: "gh_fetch_big", args: { n: { $ref: "a.number" } } },
+        ],
+        return: "b",
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      // The big value the caller asked for is delivered...
+      expect(parsed.result).toEqual({ body: "x".repeat(5000) });
+      // ...and the tiny one it cannot get back a second time is still here,
+      // because dropping it would have saved 51 bytes on a 5 KB response.
+      expect(parsed.steps.a).toEqual({ number: 4242 });
     });
 
     it("fails the whole pipeline and surfaces partial outputs when a step errors", async () => {

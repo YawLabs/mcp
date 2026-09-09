@@ -4829,9 +4829,19 @@ export class ConnectServer {
     // is small, and fall back to names only once echoing it is the cost this
     // change was made to avoid. `stepKeys` is present on both explicit-return
     // shapes, so "which steps ran" never depends on the size.
+    //
+    // Measured over the bindings that would actually be DROPPED, not over all
+    // of them. The returned value rides in `result` either way, so counting it
+    // buys nothing and actively breaks the case this budget exists for: on
+    // `a = create_issue(); b = fetch_big(a.id); return b`, a large `b` pushed
+    // the total over the ceiling and took the tiny, irreplaceable `a` with it
+    // -- 5,067 bytes measured to discard 51 bytes of issue number, while `b`
+    // was transmitted regardless. The cost being avoided is the EXTRA payload
+    // of echoing what the caller skipped, so that is what gets weighed.
+    const skipped = Object.fromEntries(Object.entries(bindings).filter(([k]) => k !== returnKey));
     const body = !explicitReturn
       ? { ok: true, result: finalResult, steps: bindings }
-      : JSON.stringify(bindings).length > EXEC_ECHO_BUDGET_BYTES
+      : JSON.stringify(skipped).length > EXEC_ECHO_BUDGET_BYTES
         ? { ok: true, result: finalResult, stepKeys }
         : { ok: true, result: finalResult, stepKeys, steps: bindings };
 

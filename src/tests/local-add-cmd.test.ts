@@ -481,6 +481,35 @@ describe("runAdd", () => {
     expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
   });
 
+  it("drops the stored headers when a remote entry is converted back to local", async () => {
+    // Through two real runAdd calls against a real bundles.json, because the
+    // bug is what ends up ON DISK. `headers` belongs to the remote shape
+    // exactly as `url` does, and the merge dropped only the url -- so the
+    // converted stdio entry kept a live bearer token it can never send, in
+    // plaintext, in a file the user now believes describes a local server.
+    const io2 = captureIO();
+    const common = {
+      slug: "mytool",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, url: "https://a.test/mcp", headers: { Authorization: "Bearer LIVE-TOKEN" } });
+    await runAdd({ ...common, command: "npx -y new-mcp" });
+
+    const raw = readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8");
+    expect(raw).not.toContain("LIVE-TOKEN");
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("local");
+    expect(entry?.command).toBe("npx");
+    expect(entry?.url).toBeUndefined();
+    expect(entry?.headers).toBeUndefined();
+  });
+
   it("writes a remote entry from --url, with headers and no command", async () => {
     const io = captureIO();
     const r = await runAdd({

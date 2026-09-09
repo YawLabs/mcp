@@ -1011,6 +1011,14 @@ function mergeServerEntry(
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
   if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
     delete merged.url;
+    // `headers` belongs to the remote shape exactly as `url` does, so it goes
+    // with it. Dropping only the url left a converted entry holding a live
+    // credential it can never send: after `add x --url ... --header
+    // 'Authorization: Bearer <token>'` then `add x --command "npx -y ..."`,
+    // the stdio entry still carried the bearer token, in plaintext, in a file
+    // the user now believes describes a local server -- and it would silently
+    // come back into use if they ever converted the entry to remote again.
+    delete merged.headers;
   }
 
   const storedEnv = envStrings(base.env);
