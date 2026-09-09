@@ -880,6 +880,20 @@ async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T
  * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
  * valid string (never null), so callers don't need a failure branch.
  */
+/** Does this entry connect over HTTP rather than spawning a process?
+ *
+ *  The `type` field alone is not enough: validateEntry defaults anything
+ *  without an explicit `"type": "remote"` to "local", so a hand-written
+ *  url+headers entry that omits the field reads as local and its headers --
+ *  the only credential it has -- get treated as a channel nothing uses. The
+ *  url fallback is the same shape test renderLaunch and pinGaps in
+ *  trust-cmd.ts already apply, spelled once here so the surfaces that decide
+ *  WHICH map carries a credential (doctor's vault section, add's dangling-ref
+ *  check) cannot drift from each other or from the connector. */
+export function isRemoteEntry(entry: { type?: string; command?: string; url?: string }): boolean {
+  return entry.type === "remote" || (!entry.command && entry.url !== undefined);
+}
+
 export function deriveNamespace(name: string): string {
   let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (ns.length === 0) return "server";
@@ -1009,6 +1023,21 @@ function mergeServerEntry(
     merged[k] = v;
   }
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
+  // The mirror of the rule below, and it has to exist for the same reason:
+  // the two launch shapes are exclusive, and half-converting leaves an entry
+  // whose renderers disagree with what it does. Without this, `add <name>
+  // --url ...` over a stdio entry wrote type:"remote" WITH the stale command
+  // and args -- and since every renderer prefers command, `list` then showed
+  // an npx launch line for a server that connects over HTTP, while the
+  // launch-change note printed above it announced the swap. The note was
+  // right; the write was half-done.
+  if (typeof incoming.url === "string" && incoming.command === undefined) {
+    delete merged.command;
+    delete merged.args;
+    // The stdio transport goes too: it belongs to the shape being replaced,
+    // and upstream warns about a remote entry declaring it.
+    if (merged.transport === "stdio") delete merged.transport;
+  }
   if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
     delete merged.url;
     // `headers` belongs to the remote shape exactly as `url` does, so it goes

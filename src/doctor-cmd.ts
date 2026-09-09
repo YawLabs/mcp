@@ -68,6 +68,7 @@ import {
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import {
+  isRemoteEntry,
   loadLocalBundles,
   type ProjectTrustProbe,
   probeProjectTrust,
@@ -1293,7 +1294,7 @@ export interface VaultStatus {
   passphraseSet: boolean;
   /** Servers whose configured env carries `${secret:NAME}` refs. */
   refs: Array<{ namespace: string; secretNames: string[] }>;
-  /** Local servers whose env carries a `${secret:` the strict regex cannot
+  /** Servers whose credential map carries a ${secret:...} span that does not parse (env for a local server, headers for a remote one).
    *  parse (a space in the name, a missing `}`), each as secrets-vault's
    *  bounded display form of the span -- never the raw env value.
    *  resolveServerEnv refuses these spawns exactly as it does a missing name,
@@ -1347,7 +1348,7 @@ async function collectVaultStatus(opts: {
     // never sends) is what the old blanket `if (s.type === "remote") continue`
     // was avoiding -- correctly, until `headers` existed. Now the fix is to
     // pick the right map rather than to skip the server.
-    const refSource = s.type === "remote" ? s.headers : s.env;
+    const refSource = isRemoteEntry(s) ? s.headers : s.env;
     // secrets-vault's shared scanner, not a local matchAll over SECRET_REF_RE:
     // that object carries /g and is module-shared, so scanning against it
     // directly leaves a lastIndex other callers trip over. This loop used to be
@@ -1411,7 +1412,11 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
   }
   print(`  passphrase: ${status.passphraseSet ? "set in this environment" : "not set in this environment"}`);
   if (status.refs.length === 0) {
-    print("  refs:       no server env or headers reference ${secret:NAME}");
+    // Says what was actually scanned. "no server env or headers reference"
+    // claimed BOTH maps were read on every server, which the shape-selective
+    // scan above does not do -- a ref sitting in the map its shape skips made
+    // that sentence flatly false.
+    print("  refs:       no server references ${secret:NAME} on the channel it uses (env local, headers remote)");
   } else {
     print("  refs:");
     for (const r of status.refs) {
@@ -1422,7 +1427,7 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
   // missing name, so it gets the same prominence -- and its own remedy: the
   // fix is the typo in bundles.json, not the vault.
   if (status.malformed.length > 0) {
-    print("  malformed:  refs the spawn is REFUSED over (fix the typo in bundles.json):");
+    print("  malformed:  refs the spawn or connect is REFUSED over (fix the typo in bundles.json):");
     for (const m of status.malformed) {
       print(`    ${m.namespace}: ${m.refs.join(", ")}`);
     }
@@ -1473,6 +1478,12 @@ interface OamRuntimeStatus {
     /** Remote-only, and the reason the vault section reads it: a remote entry
      *  spawns nothing, so its credentials ride here rather than in `env`. */
     headers: Record<string, string> | undefined;
+    /** Carried for isRemoteEntry's benefit, not to be printed. validateEntry
+     *  defaults a `type`-less entry to "local", so the url is the only thing
+     *  left that distinguishes a hand-written url+headers entry from a real
+     *  local one -- without it the shape test reads that entry as local and
+     *  silently ignores the only credential it has. */
+    url: string | undefined;
     type: "local" | "remote";
     info: ServerRuntimeInfo;
   }>;
@@ -1591,6 +1602,7 @@ async function collectOamRuntimeStatus(opts: {
     command: s.command,
     env: s.env,
     headers: s.headers,
+    url: s.url,
     type: s.type,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));

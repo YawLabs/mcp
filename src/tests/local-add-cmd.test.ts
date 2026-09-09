@@ -537,6 +537,76 @@ describe("runAdd", () => {
     expect(io2.err.join("")).not.toContain("not stored in your vault");
   });
 
+  it("ignores a remote entry's stale env refs, which upstream never reads", async () => {
+    // Unioning env and headers looked harmless and was not: converting an
+    // entry to remote leaves its env behind, and warning about a ref in it
+    // invents a cause -- upstream logs "Ignoring env on a remote server" and
+    // connects anyway, so nothing is refused over it. This is the same
+    // failure doctor's vault section is written to avoid, and the two would
+    // have contradicted each other on the same file.
+    const io2 = captureIO();
+    const common = {
+      slug: "ent",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, command: "npx -y m", envOverrides: { TOK: "${secret:absent}" } });
+    const file = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { servers: Array<Record<string, unknown>> };
+    for (const srv of parsed.servers) delete srv.slug;
+    writeFileSync(file, JSON.stringify(parsed));
+
+    io2.err.length = 0;
+    await runAdd({ ...common, url: "https://x.test/mcp" });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("warns about a MALFORMED ref, which is the typo half of the case it exists for", async () => {
+    // A missing name and an unparseable span fail identically at resolve
+    // time. Reporting only the half that still parses would miss the mistyped
+    // name this warning was added to catch.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "typo",
+      url: "https://c.test/mcp",
+      headers: { Authorization: "Bearer ${secret:my token}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    const err = io2.err.join("");
+    expect(err).toContain("not a parseable");
+    // Bounded display form, never the raw span: an unterminated ${secret: runs
+    // to the end of a value that can itself be a credential.
+    expect(err).toContain("<malformed ref>");
+    expect(err).not.toContain("my token}");
+  });
+
+  it("names the command SHAPE when several secrets are missing, not just the first", async () => {
+    // "Store them with `secrets set aa`" hands over a command that stores one
+    // of the names it just listed, with nothing saying a second run is needed.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "multi",
+      command: "npx -y m",
+      envOverrides: { A: "${secret:aa}", B: "${secret:bb}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    const err = io2.err.join("");
+    expect(err).toContain("aa, bb");
+    expect(err).toContain("secrets set <name>");
+    expect(err).not.toContain("secrets set aa`");
+  });
+
   it("stays silent when the vault itself is unreadable, leaving that to doctor", async () => {
     // Deliberate, and worth pinning because it is the reason the test above
     // needs a valid entry: a corrupt vault makes loadVault throw, and this
