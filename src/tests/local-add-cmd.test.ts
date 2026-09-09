@@ -487,6 +487,204 @@ describe("runAdd", () => {
     expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
   });
 
+  it("warns when a header references a secret the vault does not hold", async () => {
+    // Otherwise the refusal surfaces in the user's MCP client at the next
+    // session, far from the command that caused it. A warning, not a refusal:
+    // storing the secret after wiring the server is a reasonable order.
+    const io2 = captureIO();
+    const r = await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:nope}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const err = io2.err.join("");
+    expect(err).toContain("nope");
+    expect(err).toContain("not stored in your vault");
+    expect(err).toContain("yaw-mcp secrets set nope");
+  });
+
+  it("stays quiet when the referenced secret IS stored", async () => {
+    // The other half: a warning that fires on a correctly-configured entry is
+    // noise that trains the user to ignore it.
+    // A minimal on-disk vault. The check reads NAMES only (listKeys), never a
+    // value, so an entry needs no real ciphertext -- and writing the file
+    // directly keeps this test off the passphrase/KDF path it is not about.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "secrets.json"),
+      // A FULL entry shape. `{ realkey: {} }` looks like it would do -- the
+      // check reads names only -- but loadVault throws VaultEntryCorruptError
+      // on an entry missing iv/ciphertext/authTag, and danglingSecretRefs
+      // swallows that into []. The test then passed because the vault was
+      // unreadable, not because the name was found: green for the opposite
+      // reason to the one it claimed.
+      JSON.stringify({
+        salt: Buffer.alloc(16).toString("base64"),
+        entries: { realkey: { iv: "x", ciphertext: "y", authTag: "z" } },
+      }),
+    );
+    const io2 = captureIO();
+    await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:realkey}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("ignores a remote entry's stale env refs, which upstream never reads", async () => {
+    // Unioning env and headers looked harmless and was not: converting an
+    // entry to remote leaves its env behind, and warning about a ref in it
+    // invents a cause -- upstream logs "Ignoring env on a remote server" and
+    // connects anyway, so nothing is refused over it. This is the same
+    // failure doctor's vault section is written to avoid, and the two would
+    // have contradicted each other on the same file.
+    const io2 = captureIO();
+    const common = {
+      slug: "ent",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, command: "npx -y m", envOverrides: { TOK: "${secret:absent}" } });
+    const file = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { servers: Array<Record<string, unknown>> };
+    for (const srv of parsed.servers) delete srv.slug;
+    writeFileSync(file, JSON.stringify(parsed));
+
+    io2.err.length = 0;
+    await runAdd({ ...common, url: "https://x.test/mcp" });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("warns about a MALFORMED ref, which is the typo half of the case it exists for", async () => {
+    // A missing name and an unparseable span fail identically at resolve
+    // time. Reporting only the half that still parses would miss the mistyped
+    // name this warning was added to catch.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "typo",
+      url: "https://c.test/mcp",
+      headers: { Authorization: "Bearer ${secret:my token}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    const err = io2.err.join("");
+    expect(err).toContain("not a parseable");
+    // Bounded display form, never the raw span: an unterminated ${secret: runs
+    // to the end of a value that can itself be a credential.
+    expect(err).toContain("<malformed ref>");
+    expect(err).not.toContain("my token}");
+  });
+
+  it("names the command SHAPE when several secrets are missing, not just the first", async () => {
+    // "Store them with `secrets set aa`" hands over a command that stores one
+    // of the names it just listed, with nothing saying a second run is needed.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "multi",
+      command: "npx -y m",
+      envOverrides: { A: "${secret:aa}", B: "${secret:bb}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    const err = io2.err.join("");
+    expect(err).toContain("aa, bb");
+    expect(err).toContain("secrets set <name>");
+    expect(err).not.toContain("secrets set aa`");
+  });
+
+  it("stays silent when the vault itself is unreadable, leaving that to doctor", async () => {
+    // Deliberate, and worth pinning because it is the reason the test above
+    // needs a valid entry: a corrupt vault makes loadVault throw, and this
+    // check swallows it rather than failing an otherwise-good add. It does
+    // mean one malformed entry hides the warning for every ref -- acceptable
+    // because `yaw-mcp doctor` reports an unreadable vault explicitly, and
+    // guessing here would be worse.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "secrets.json"),
+      JSON.stringify({ salt: Buffer.alloc(16).toString("base64"), entries: { broken: {} } }),
+    );
+    const io2 = captureIO();
+    await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:definitelyabsent}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("is silent about a vault it cannot read, rather than guessing", async () => {
+    // No vault at all is the ordinary first-run state; failing or nagging
+    // there would fire on every add before the user has stored anything.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "plain",
+      command: "npx -y plain-mcp",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("says so out loud when a --url add converts a slug-less stdio entry", async () => {
+    // The note is what stops someone's one-click-installed server being turned
+    // into a remote endpoint silently. It used to be gated on the INCOMING
+    // entry having a command, so it fired for remote -> stdio and never for
+    // stdio -> remote -- the direction that only became reachable when
+    // `add --url` shipped.
+    const io2 = captureIO();
+    const common = {
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, slug: "appadded", command: "npx -y old-mcp" });
+    // Emulate an app-written entry: no slug, which is the weaker identity
+    // signal the note exists to protect.
+    const file = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { servers: Array<Record<string, unknown>> };
+    for (const srv of parsed.servers) delete srv.slug;
+    writeFileSync(file, JSON.stringify(parsed));
+
+    io2.err.length = 0;
+    await runAdd({ ...common, slug: "appadded", url: "https://c.test/mcp" });
+    const err = io2.err.join("");
+    expect(err).toContain("launch command changed");
+    expect(err).toContain("npx -y old-mcp");
+    expect(err).toContain("HTTP https://c.test/mcp");
+  });
+
   it("drops the stored headers when a remote entry is converted back to local", async () => {
     // Through two real runAdd calls against a real bundles.json, because the
     // bug is what ends up ON DISK. `headers` belongs to the remote shape

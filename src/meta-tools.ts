@@ -9,7 +9,7 @@
 import { MAX_EXEC_STEPS } from "./exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { collectMalformedSecretRefs, collectSecretRefNames } from "./secrets-vault.js";
-import { isHeaderCredentialedEntry } from "./types.js";
+import { isRemoteEntry } from "./types.js";
 
 // Numbers the descriptions below quote to the model, interpolated from the
 // constants that actually enforce them rather than retyped. learning.ts
@@ -377,11 +377,11 @@ export function computeSecretsReport(
     // the fresh-instance rule for every name-only caller (upstream.ts's spawn
     // audit and doctor's vault section are the others).
     // A remote server's credentials ride in `headers`, not `env` -- see
-    // isHeaderCredentialedEntry. Scanning `env` for one meant every remote
+    // isRemoteEntry. Scanning `env` for one meant every remote
     // server was omitted from this report, which reads as "needs no
     // secrets" about the exact server whose activation is about to be
     // refused fail-closed for a missing name.
-    const credentials = isHeaderCredentialedEntry(server) ? server.headers : server.env;
+    const credentials = isRemoteEntry(server) ? server.headers : server.env;
     const referenced = collectSecretRefNames(credentials);
     // The strict scanner above cannot see a reference a typo has put outside
     // SECRET_REF_RE, while resolveServerEnv refuses the spawn over it. Without

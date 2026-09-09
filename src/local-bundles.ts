@@ -880,6 +880,13 @@ async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T
  * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
  * valid string (never null), so callers don't need a failure branch.
  */
+// Re-exported, not redefined. The predicate lives in types.ts alongside the
+// UpstreamServerConfig it describes, so meta-tools can read it without
+// importing this module's fs/lock/auto-upgrade dependency chain -- and so the
+// CLI surfaces that import it from here cannot drift from the one the
+// secrets report uses.
+export { isRemoteEntry } from "./types.js";
+
 export function deriveNamespace(name: string): string {
   let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (ns.length === 0) return "server";
@@ -1009,17 +1016,21 @@ function mergeServerEntry(
     merged[k] = v;
   }
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
-  // The other direction: an entry converted TO remote must shed the stdio
-  // launch it no longer uses. Nothing here is gated on `incoming.command`,
-  // because a remote entry literal does not carry one -- and gating the
-  // cleanup on a key the incoming shape never has is what left `add x --url`
-  // over an existing stdio entry holding a stale `command`, `args`, and a
-  // plaintext `env` credential. `list` then rendered the dead npx line as
-  // that server's launch, for a server that actually connects over HTTPS.
+  // The mirror of the rule below, and it has to exist for the same reason:
+  // the two launch shapes are exclusive, and half-converting leaves an entry
+  // whose renderers disagree with what it does. Without this, `add <name>
+  // --url ...` over a stdio entry wrote type:"remote" WITH the stale command
+  // and args -- and since every renderer prefers command, `list` then showed
+  // an npx launch line for a server that connects over HTTP, while the
+  // launch-change note printed above it announced the swap. The note was
+  // right; the write was half-done.
   const convertedToRemote = typeof incoming.url === "string" && incoming.command === undefined;
   if (convertedToRemote) {
     delete merged.command;
     delete merged.args;
+    // The stdio transport goes too: it belongs to the shape being replaced,
+    // and upstream warns about a remote entry declaring it.
+    if (merged.transport === "stdio") delete merged.transport;
     // `env` goes with them. A remote entry spawns no process, so upstream.ts
     // warns and ignores it; leaving it behind keeps a credential in
     // bundles.json that nothing will ever use and no surface will explain.
@@ -1265,11 +1276,17 @@ function resolveUpsertTarget(
   // to hand-add a remote server -- counts as a change too: joining only
   // command/args rendered it as "" and a "nothing stored" guard then
   // swallowed the note, while the merge carried the stale url along.
+  //
+  // The gate asks whether the incoming entry has a launch at all, not whether
+  // it is a stdio one. Keying on `incoming.command` meant the note fired for
+  // remote -> stdio but never for stdio -> remote: `add <name> --url ...` over
+  // an app-added stdio entry exited 0 with a bare "Updated" line, silently
+  // converting someone's one-click-installed server into a remote endpoint --
+  // the exact swap this note exists to make loud, in the direction that
+  // became reachable when `add --url` shipped.
   let launchChanged: LaunchChange | undefined;
-  // Either shape counts as a launch: `command` for stdio, `url` for remote.
-  // Gating on `command` alone meant a stdio -> remote conversion changed
-  // where the server actually connects and printed no note at all.
-  if (typeof stored.slug !== "string" && (typeof incoming.command === "string" || typeof incoming.url === "string")) {
+  const incomingHasLaunch = typeof incoming.command === "string" || typeof incoming.url === "string";
+  if (typeof stored.slug !== "string" && incomingHasLaunch) {
     const from = launchShapeOf(stored);
     const to = launchShapeOf(incoming);
     if (!sameLaunch(from, to)) launchChanged = { from, to };

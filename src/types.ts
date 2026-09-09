@@ -76,18 +76,27 @@ export interface UpstreamServerConfig {
   runtime?: "oam" | "node";
 }
 
-/** Does this entry take its credentials in HTTP headers rather than a spawned
- *  process env?
+/** Does this entry connect over HTTP rather than spawning a process?
  *
- *  One predicate, because three surfaces have to agree on it and they each
- *  used to answer it their own way. `type` is the discriminator upstream.ts
- *  itself branches on (`config.type === "local"`), and `transport` is NOT: a
- *  remote entry is allowed to declare `transport: "stdio"` in bundles.json,
- *  and upstream.ts warns and connects over HTTP anyway. Reading transport
- *  here would call that entry local and go looking for its secrets in an
- *  `env` that is never sent anywhere. */
-export function isHeaderCredentialedEntry(entry: { type?: string }): boolean {
-  return entry.type === "remote";
+ *  Which decides WHICH map carries its credentials: a local server's ride in
+ *  `env`, substituted into the child at spawn; a remote server's ride in
+ *  `headers`, resolved immediately before the transport is built. Reading the
+ *  wrong one either invents a cause or hides a real one.
+ *
+ *  `type` alone is not enough. validateEntry (local-bundles.ts) defaults
+ *  anything without an explicit `"type": "remote"` to "local", so a
+ *  hand-written url+headers entry that omits the field reads as local and its
+ *  headers -- the only credential it has -- get treated as a channel nothing
+ *  uses. The url fallback is the same shape test renderLaunch and pinGaps in
+ *  trust-cmd.ts already apply.
+ *
+ *  It lives here, in the module that owns UpstreamServerConfig and imports
+ *  nothing at runtime, so every surface that has to agree on the answer can
+ *  reach it: local-bundles re-exports it for the CLI, and meta-tools reads it
+ *  for the secrets report without taking on the bundles loader's whole
+ *  dependency chain. */
+export function isRemoteEntry(entry: { type?: string; command?: string; url?: string }): boolean {
+  return entry.type === "remote" || (!entry.command && entry.url !== undefined);
 }
 
 export interface ConnectConfig {

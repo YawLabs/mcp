@@ -29,6 +29,7 @@ import {
   deriveNamespace,
   findShadowingProjectBundles,
   formatBundleCollision,
+  isRemoteEntry,
   type LaunchChange,
   loadLocalBundles,
   localBundlesPath,
@@ -38,6 +39,7 @@ import {
 } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
+import { collectMalformedSecretRefs, collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
 // control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
@@ -344,11 +346,82 @@ function ambientOnlyRequiredKeys(
  *  and it used to return before either note, so `add --dry-run` said nothing
  *  about the ambient var the server would depend on, nor about the project
  *  file that would shadow the write. stderr so both survive --json. */
+/** What this entry's ${secret:...} references will do at spawn or connect:
+ *  which names the vault does not hold, and which spans do not parse at all.
+ *
+ *  Reads ONE map, chosen by shape. Unioning env and headers looked harmless
+ *  and was not: a remote entry's env is ignored outright by upstream, so
+ *  warning about a ref in it invents a cause -- the same failure doctor's
+ *  vault section is written to avoid, and a re-add that converts an entry can
+ *  leave a stale env behind for it to fire on. The mirror (headers on a local
+ *  entry) is never read either.
+ *
+ *  Malformed spans count as well as missing names. They fail identically at
+ *  resolve time, and a mistyped name is exactly what this warning exists to
+ *  catch -- reporting only the half that still parses would miss the typo
+ *  class it was written for.
+ *
+ *  Names are read WITHOUT the passphrase: listKeys reads them off the file,
+ *  and only a value needs unlocking, so this works in the ordinary shell where
+ *  no passphrase is set. Any read problem yields nothing rather than a guess;
+ *  `yaw-mcp doctor` is the surface that reports an unreadable vault properly. */
+async function danglingSecretRefs(
+  entry: Partial<UpstreamServerConfig>,
+  home: string,
+): Promise<{ missing: string[]; malformed: string[] }> {
+  const refSource = isRemoteEntry(entry) ? entry.headers : entry.env;
+  const malformed = collectMalformedSecretRefs(refSource);
+  const referenced = collectSecretRefNames(refSource);
+  if (referenced.size === 0) return { missing: [], malformed };
+  try {
+    const vault = await loadVault(vaultPath(home));
+    const stored = new Set(vault ? listKeys(vault) : []);
+    return { missing: [...referenced].filter((n) => !stored.has(n)).sort(), malformed };
+  } catch {
+    return { missing: [], malformed };
+  }
+}
+
 async function printPostWriteNotes(
   printErr: (s: string) => void,
-  opts: { ambientOnly: string[]; cwd: string; home: string; env: NodeJS.ProcessEnv; dryRun: boolean },
+  opts: {
+    ambientOnly: string[];
+    cwd: string;
+    home: string;
+    env: NodeJS.ProcessEnv;
+    dryRun: boolean;
+    dangling: { missing: string[]; malformed: string[] };
+  },
 ): Promise<void> {
   const { ambientOnly, dryRun } = opts;
+  // A ${secret:NAME} the vault does not hold is a spawn/connect refusal
+  // waiting to happen, and the user finds out in their MCP client at the next
+  // session -- far from the command that caused it. Says so here instead, in
+  // the same breath as the write. A WARNING rather than a refusal: storing the
+  // secret after wiring the server is a perfectly reasonable order, and the
+  // catalog path's required-env gate already refuses the case where the value
+  // is genuinely mandatory up front.
+  if (opts.dangling.missing.length > 0) {
+    const names = opts.dangling.missing;
+    const one = names.length === 1;
+    // The plural branch names the COMMAND SHAPE, not the first secret. Saying
+    // "Store them with `secrets set aa`" hands the user a command that stores
+    // exactly one of the names it just listed, and nothing tells them a second
+    // run is needed. doctor's equivalent line already gets this right.
+    const remedy = one ? `\`yaw-mcp secrets set ${names[0]}\`` : "`yaw-mcp secrets set <name>`, once per name";
+    printErr(
+      `Note: ${names.join(", ")} ${one ? "is" : "are"} referenced by this entry but not stored in your vault; the server will be refused until ${one ? "it is" : "they are"} set. Store ${one ? "it" : "each"} with ${remedy}.`,
+    );
+  }
+  if (opts.dangling.malformed.length > 0) {
+    // Reported in the bounded `display` form, never raw: a malformed span is a
+    // slice of an env or header VALUE (an unterminated `${secret:` runs to the
+    // end of it), so the raw text can carry the very credential the typo was
+    // meant to reference.
+    printErr(
+      `Note: ${opts.dangling.malformed.join(", ")} is not a parseable \${secret:NAME} reference; the server will be refused until the typo is fixed in bundles.json.`,
+    );
+  }
   if (ambientOnly.length > 0) {
     const one = ambientOnly.length === 1;
     const verb = dryRun ? "would be" : one ? "was" : "were";
@@ -663,6 +736,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     }
     await printPostWriteNotes(printErr, {
       ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, previewEntry, env),
+      // Previewed from the entry the run WOULD write, so --dry-run reports the
+      // same dangling refs the real run would.
+      dangling: await danglingSecretRefs(previewEntry, home),
       cwd,
       home,
       env,
@@ -747,6 +823,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // entry, never the pre-merge input.
   await printPostWriteNotes(printErr, {
     ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, written, env),
+    // From the entry as WRITTEN, not from the flags: a re-add merges with what
+    // was already on disk, so the stored refs are what will actually resolve.
+    dangling: await danglingSecretRefs(written, home),
     cwd,
     home,
     env,
