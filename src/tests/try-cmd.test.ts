@@ -209,15 +209,31 @@ describe("parseTryArgs", () => {
     // exactly the desync it was written to catch. Order is asserted too: the
     // line is a map over the table, so it should read in table order.
     const marker = "--client <name>";
-    const clientLine = TRY_USAGE.split("\n").find((l) => l.includes(marker)) ?? "";
-    const listed = clientLine
-      .slice(clientLine.indexOf(marker) + marker.length)
+    const lines = TRY_USAGE.split("\n");
+    const start = lines.findIndex((l) => l.includes(marker));
+    // The list WRAPS to the flag column once it outgrows 80 columns, and a
+    // continued line ends in "|" -- so collect until one does not.
+    const chunk = [lines[start].slice(lines[start].indexOf(marker) + marker.length)];
+    while (chunk[chunk.length - 1].trimEnd().endsWith("|")) chunk.push(lines[start + chunk.length]);
+    const listed = chunk
+      .join(" ")
       .split("|")
       .map((t) => t.trim())
       .filter(Boolean);
     expect(listed).toEqual(INSTALL_TARGETS.map((t) => t.clientId));
     for (const target of INSTALL_TARGETS) {
       expect(parseTryArgs(["demo", "--client", target.clientId]).ok).toBe(true);
+    }
+  });
+
+  it("keeps every --help line inside 80 columns", () => {
+    // The derived client list is what outgrew the block: six ids on one line
+    // render at 93 columns while every other line here fits 80, so an
+    // 80-column terminal soft-wrapped it back to column 0 and broke the
+    // two-column layout. wrapToUsageColumn is what holds the width; this is
+    // what notices when a seventh target pushes some line over again.
+    for (const line of TRY_USAGE.split("\n")) {
+      expect(line.length, line).toBeLessThanOrEqual(80);
     }
   });
 });

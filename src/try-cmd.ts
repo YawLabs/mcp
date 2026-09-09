@@ -87,6 +87,34 @@ import { CONFIG_DIRNAME } from "./paths.js";
 // hand-kept copy of it: the literal four-client list here outlived the
 // windsurf and gemini-cli additions, so both were ACCEPTED by the parser and
 // named nowhere a user could find them. Interpolating leaves one list to keep.
+
+/** The flag column every continuation line in TRY_USAGE hangs from. */
+const USAGE_INDENT = " ".repeat(23);
+
+/** Wrap the derived client list to the flag column. Six clientIds on one line
+ *  render at 93 columns while every other line in TRY_USAGE fits 80, so an
+ *  80-column terminal soft-wrapped the list back to column 0 and broke the
+ *  two-column layout the whole block is written in. Wrapping HERE rather than
+ *  hand-splitting the literal keeps the list derived: a seventh target still
+ *  cannot desync it, it just wraps. A continued line ends in "|" so the reader
+ *  (and the test that parses this back) can tell the list is not finished. */
+function wrapToUsageColumn(parts: string[], width = 80): string {
+  const lines: string[] = [];
+  let current = "";
+  parts.forEach((part, i) => {
+    const candidate = current === "" ? part : `${current} | ${part}`;
+    // Reserve the trailing " |" unless this is the last item on the last line.
+    const rendered = USAGE_INDENT.length + candidate.length + (i === parts.length - 1 ? 0 : 2);
+    if (rendered > width && current !== "") {
+      lines.push(`${current} |`);
+      current = part;
+    } else {
+      current = candidate;
+    }
+  });
+  lines.push(current);
+  return lines.join(`\n${USAGE_INDENT}`);
+}
 export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   Wire a one-off trial of an MCP server into your AI client. No account
@@ -94,7 +122,7 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
   it on a timer -- once --ttl has elapsed it is removed by the next
   \`yaw-mcp doctor\` run. Run \`yaw-mcp try-cleanup <slug>\` to remove it now.
 
-  --client <name>      ${INSTALL_TARGETS.map((t) => t.clientId).join(" | ")}
+  --client <name>      ${wrapToUsageColumn(INSTALL_TARGETS.map((t) => t.clientId))}
                        (default: auto-detect, prefers the first installed
                        client in the order probed by \`yaw-mcp install --list\`)
   --ttl <duration>     How long the trial lives before doctor GCs it
