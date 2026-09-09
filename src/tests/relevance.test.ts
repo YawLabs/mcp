@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { rankServers, relevanceCacheKeyBytes, relevanceCacheStats, resetRelevanceCache } from "../relevance.js";
+import {
+  rankServers,
+  rankTools,
+  relevanceCacheKeyBytes,
+  relevanceCacheStats,
+  resetRelevanceCache,
+} from "../relevance.js";
 
 // Single-server score. A `scoreRelevance` export used to do exactly this,
 // documented as being "kept for legacy callers" that never existed outside
@@ -651,5 +657,91 @@ describe("ranking index cache", () => {
     expect(relevanceCacheStats().indexBuilds).toBe(2);
     // ...and the untouched server's fields still come from the cache.
     expect(relevanceCacheStats().docBuilds).toBe(3);
+  });
+});
+
+describe("rankTools (tools across servers)", () => {
+  const gh = {
+    namespace: "gh",
+    name: "GitHub",
+    description: "Repos, issues, pull requests",
+    tools: [
+      { name: "create_issue", description: "Open a new issue on a repository" },
+      { name: "list_pull_requests", description: "List open pull requests" },
+    ],
+  };
+  const pg = {
+    namespace: "pg",
+    name: "Postgres",
+    description: "SQL database access",
+    tools: [{ name: "query", description: "Run a read-only SQL query" }],
+  };
+
+  it("returns nothing when no server is configured", () => {
+    expect(rankTools("create an issue", [])).toEqual([]);
+  });
+
+  it("returns nothing when the query tokenizes to nothing", () => {
+    expect(rankTools("   ", [gh, pg])).toEqual([]);
+  });
+
+  it("finds a tool on a server the query never names", () => {
+    const hits = rankTools("create issue", [gh, pg]);
+    expect(hits[0]).toMatchObject({ namespace: "gh", name: "create_issue" });
+  });
+
+  it("splits an identifier so a bare term hits the joined name", () => {
+    // `create_issue` tokenizes to create/issue AND the joined form, so a
+    // caller who knows only one half still lands on it.
+    const hits = rankTools("issue", [gh, pg]);
+    expect(hits.map((h) => h.name)).toContain("create_issue");
+  });
+
+  it("matches on description alone when the name carries nothing", () => {
+    const hits = rankTools("sql", [gh, pg]);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ namespace: "pg", name: "query" });
+  });
+
+  it("ranks a name hit above a description-only hit", () => {
+    const servers = [
+      { namespace: "a", name: "A", tools: [{ name: "resize", description: "unrelated" }] },
+      { namespace: "b", name: "B", tools: [{ name: "unrelated", description: "resize an image" }] },
+    ];
+    const hits = rankTools("resize", servers);
+    expect(hits.map((h) => h.namespace)).toEqual(["a", "b"]);
+    expect(hits[0].score).toBeGreaterThan(hits[1].score);
+  });
+
+  it("does not carry a tool on a namespace hit alone", () => {
+    // "gh" matches the namespace but nothing in either tool -- a namespace
+    // match must not manufacture a hit out of an otherwise-zero tool.
+    expect(rankTools("gh", [gh])).toEqual([]);
+  });
+
+  it("breaks a namespace tie toward the server the query named", () => {
+    const other = { ...gh, namespace: "forge", name: "Forge" };
+    const hits = rankTools("gh create issue", [other, gh]);
+    expect(hits[0].namespace).toBe("gh");
+  });
+
+  it("orders ties by namespace then name so repeat calls agree", () => {
+    const a = { namespace: "b", name: "B", tools: [{ name: "run", description: "x" }] };
+    const b = { namespace: "a", name: "A", tools: [{ name: "run", description: "x" }] };
+    const first = rankTools("run", [a, b]).map((h) => `${h.namespace}_${h.name}`);
+    const second = rankTools("run", [b, a]).map((h) => `${h.namespace}_${h.name}`);
+    expect(first).toEqual(["a_run", "b_run"]);
+    expect(second).toEqual(first);
+  });
+
+  it("carries the description through to the caller", () => {
+    const hits = rankTools("create issue", [gh]);
+    expect(hits[0].description).toBe("Open a new issue on a repository");
+  });
+
+  it("survives a server with no tools at all", () => {
+    const bare = { namespace: "empty", name: "Empty", description: "nothing yet", tools: [] };
+    expect(() => rankTools("anything", [bare, gh])).not.toThrow();
+    expect(rankTools("create issue", [bare, gh])).toHaveLength(1);
   });
 });

@@ -1,0 +1,147 @@
+import { describe, expect, it } from "vitest";
+import { type CapContent, capContent, DEFAULT_MAX_RESULT_BYTES, resolveMaxResultBytes } from "../result-cap.js";
+
+const text = (s: string): CapContent => ({ type: "text", text: s });
+
+describe("resolveMaxResultBytes", () => {
+  it("defaults to the documented ceiling", () => {
+    expect(resolveMaxResultBytes({} as NodeJS.ProcessEnv)).toBe(DEFAULT_MAX_RESULT_BYTES);
+    expect(DEFAULT_MAX_RESULT_BYTES).toBe(100_000);
+  });
+
+  it("reads a plain digit run", () => {
+    expect(resolveMaxResultBytes({ YAW_MCP_MAX_RESULT_BYTES: "4096" } as NodeJS.ProcessEnv)).toBe(4096);
+  });
+
+  it("takes 0 as the disable sentinel", () => {
+    expect(resolveMaxResultBytes({ YAW_MCP_MAX_RESULT_BYTES: "0" } as NodeJS.ProcessEnv)).toBe(0);
+  });
+
+  it("falls back to the ceiling rather than DISABLING it on a typo", () => {
+    // The failure that matters: parseInt reads all three of these as 0, which
+    // is the disable sentinel -- so a typo would silently remove the ceiling
+    // while looking like it set one.
+    for (const raw of ["0x1000", "100_000", "1e5", "abc", "  "]) {
+      expect(resolveMaxResultBytes({ YAW_MCP_MAX_RESULT_BYTES: raw } as NodeJS.ProcessEnv)).toBe(
+        DEFAULT_MAX_RESULT_BYTES,
+      );
+    }
+  });
+});
+
+describe("capContent", () => {
+  it("passes an ordinary result through untouched, by reference", () => {
+    const content = [text("hello"), text("world")];
+    const r = capContent(content, 100_000);
+    expect(r.capped).toBe(false);
+    expect(r.content).toBe(content);
+  });
+
+  it("is a no-op when the ceiling is disabled, however large the result", () => {
+    const content = [text("x".repeat(5_000_000))];
+    const r = capContent(content, 0);
+    expect(r.capped).toBe(false);
+    expect(r.content).toBe(content);
+  });
+
+  it("is a no-op on empty content", () => {
+    const r = capContent([], 10);
+    expect(r.capped).toBe(false);
+    expect(r.content).toEqual([]);
+  });
+
+  it("cuts an oversized result and says so", () => {
+    const r = capContent([text("x".repeat(50_000))], 4_000);
+    expect(r.capped).toBe(true);
+    const notice = r.content[r.content.length - 1];
+    expect(notice?.text).toContain("over the 4000-byte ceiling");
+    expect(notice?.text).toContain("TRUNCATED");
+    expect(notice?.text).toContain("Do not treat what you received as the whole answer");
+  });
+
+  it("keeps the kept bytes under the ceiling", () => {
+    const r = capContent([text("x".repeat(50_000))], 4_000);
+    expect(r.bytesKept).toBeLessThanOrEqual(4_000);
+    expect(r.bytesRaw).toBeGreaterThan(40_000);
+  });
+
+  it("keeps whole leading blocks and drops the tail", () => {
+    const r = capContent([text("head"), text("y".repeat(50_000)), text("tail")], 4_000);
+    expect(r.content[0]?.text).toBe("head");
+    // The middle block is cut, and the block after it is gone.
+    expect(r.content.some((c) => c.text === "tail")).toBe(false);
+    expect(r.content[r.content.length - 1]?.text).toContain("content block(s) were dropped");
+  });
+
+  it("does not split a multi-byte character", () => {
+    // The budget has to make the cut land MID-SEQUENCE or this proves
+    // nothing: with two-byte characters and an even text budget the slice
+    // lands on a boundary by luck. 2001 is odd, and capContent subtracts an
+    // even envelope allowance from it, so the byte cut falls between the two
+    // halves of an "é" -- which a naive Buffer.subarray decodes to U+FFFD and
+    // hands the model as a corrupted final token.
+    const r = capContent([text("é".repeat(5_000))], 2_001);
+    expect(r.capped).toBe(true);
+    const cut = r.content[0]?.text ?? "";
+    expect(cut).not.toContain("�");
+    // Every kept character survived whole.
+    expect([...cut].every((ch) => ch === "é")).toBe(true);
+  });
+
+  it("drops a non-text block whole rather than cutting it in half", () => {
+    const image: CapContent = { type: "image", data: "A".repeat(50_000), mimeType: "image/png" };
+    const r = capContent([text("caption"), image], 4_000);
+    expect(r.capped).toBe(true);
+    expect(r.content.some((c) => c.type === "image")).toBe(false);
+    expect(r.content[0]?.text).toBe("caption");
+  });
+
+  it("drops a block it cannot even measure", () => {
+    // A cyclic block cannot be serialized, so its size is unknown. Treating
+    // an unmeasurable block as free would let exactly the payload this
+    // ceiling exists to stop through on every call.
+    const cyclic: CapContent = { type: "resource" };
+    (cyclic as Record<string, unknown>).self = cyclic;
+    const r = capContent([text("fine"), cyclic], 100_000);
+    expect(r.capped).toBe(true);
+    expect(r.content.some((c) => c.type === "resource")).toBe(false);
+  });
+
+  it("still emits the notice when the budget is too small to keep any text", () => {
+    const r = capContent([text("z".repeat(10_000))], 10);
+    expect(r.capped).toBe(true);
+    expect(r.content).toHaveLength(1);
+    expect(r.content[0]?.text).toContain("has been CUT");
+  });
+
+  it("names the ops escape hatch so the ceiling is not a dead end", () => {
+    const r = capContent([text("q".repeat(50_000))], 1_000);
+    expect(r.content[r.content.length - 1]?.text).toContain("YAW_MCP_MAX_RESULT_BYTES");
+  });
+
+  it("tells the model how to get the rest rather than only that it is missing", () => {
+    const r = capContent([text("q".repeat(50_000))], 4_000);
+    const notice = r.content[r.content.length - 1]?.text ?? "";
+    expect(notice).toContain("narrower arguments");
+    expect(notice).toContain("mcp_connect_exec");
+  });
+
+  it("reports the true raw size, not the kept size", () => {
+    const r = capContent([text("w".repeat(30_000)), text("w".repeat(30_000))], 4_000);
+    expect(r.bytesRaw).toBeGreaterThan(60_000);
+    expect(r.content[r.content.length - 1]?.text).toContain(String(r.bytesRaw));
+  });
+
+  it("does not cap a result that sits exactly on the ceiling", () => {
+    // Measured PER BLOCK, the way capContent sums it. Measuring the array
+    // instead adds two bytes for the brackets, which put this fixture two
+    // under the ceiling -- where an off-by-one in the comparison is
+    // invisible.
+    const one = text("a".repeat(100));
+    const size = Buffer.byteLength(JSON.stringify(one), "utf8");
+    expect(capContent([one], size).capped).toBe(false);
+    // And one byte under it does cap, which pins the boundary from the other
+    // side.
+    expect(capContent([one], size - 1).capped).toBe(true);
+  });
+});

@@ -98,6 +98,53 @@ describe("computeSecretsReport (names only, never values)", () => {
     expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: ["missing_one"], malformed: [] }]);
   });
 
+  it("reads a REMOTE server's credentials from headers, not env", () => {
+    // The only channel a remote server has. It spawns no process, so
+    // upstream.ts warns and ignores its `env` -- but it resolves `headers`
+    // through the SAME fail-closed resolveServerEnv immediately before it
+    // builds the transport. Scanning `env` for one omitted the server
+    // entirely, which reads as "needs no secrets" about the exact server
+    // whose connect is about to be refused for a missing name.
+    const servers = [
+      {
+        namespace: "notion",
+        type: "remote",
+        headers: { Authorization: "Bearer ${secret:NOTION_TOKEN}" },
+      },
+    ];
+    const rows = computeSecretsReport(servers, new Set(["OTHER"]));
+    expect(rows).toEqual([{ server: "notion", injectedSecrets: [], missing: ["NOTION_TOKEN"], malformed: [] }]);
+  });
+
+  it("ignores a remote server's env, which is never sent anywhere", () => {
+    // Not merely unused -- reporting it would promise a credential the
+    // transport will never carry.
+    const servers = [{ namespace: "notion", type: "remote", env: { TOKEN: "${secret:NEVER_SENT}" } }];
+    expect(computeSecretsReport(servers, new Set())).toEqual([]);
+  });
+
+  it("still reads env for a local server that also carries headers", () => {
+    // `headers` is meaningless on a local entry, and reading it there would
+    // invent a requirement the spawn does not have.
+    const servers = [
+      {
+        namespace: "gh",
+        type: "local",
+        env: { GITHUB_TOKEN: "${secret:gh}" },
+        headers: { Authorization: "Bearer ${secret:IGNORED}" },
+      },
+    ];
+    const rows = computeSecretsReport(servers, new Set(["gh"]));
+    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [], malformed: [] }]);
+  });
+
+  it("names a malformed ref in a remote server's headers", () => {
+    const servers = [{ namespace: "notion", type: "remote", headers: { A: "${secret:notion token}" } }];
+    const rows = computeSecretsReport(servers, new Set());
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.malformed.length).toBeGreaterThan(0);
+  });
+
   it("names a reference the strict regex cannot parse in its own `malformed` column", () => {
     // resolveServerEnv refuses the spawn over a malformed ref exactly as over
     // a missing name, but the report scans with the strict regex, so until

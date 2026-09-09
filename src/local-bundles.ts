@@ -880,19 +880,12 @@ async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T
  * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
  * valid string (never null), so callers don't need a failure branch.
  */
-/** Does this entry connect over HTTP rather than spawning a process?
- *
- *  The `type` field alone is not enough: validateEntry defaults anything
- *  without an explicit `"type": "remote"` to "local", so a hand-written
- *  url+headers entry that omits the field reads as local and its headers --
- *  the only credential it has -- get treated as a channel nothing uses. The
- *  url fallback is the same shape test renderLaunch and pinGaps in
- *  trust-cmd.ts already apply, spelled once here so the surfaces that decide
- *  WHICH map carries a credential (doctor's vault section, add's dangling-ref
- *  check) cannot drift from each other or from the connector. */
-export function isRemoteEntry(entry: { type?: string; command?: string; url?: string }): boolean {
-  return entry.type === "remote" || (!entry.command && entry.url !== undefined);
-}
+// Re-exported, not redefined. The predicate lives in types.ts alongside the
+// UpstreamServerConfig it describes, so meta-tools can read it without
+// importing this module's fs/lock/auto-upgrade dependency chain -- and so the
+// CLI surfaces that import it from here cannot drift from the one the
+// secrets report uses.
+export { isRemoteEntry } from "./types.js";
 
 export function deriveNamespace(name: string): string {
   let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
@@ -1031,12 +1024,17 @@ function mergeServerEntry(
   // an npx launch line for a server that connects over HTTP, while the
   // launch-change note printed above it announced the swap. The note was
   // right; the write was half-done.
-  if (typeof incoming.url === "string" && incoming.command === undefined) {
+  const convertedToRemote = typeof incoming.url === "string" && incoming.command === undefined;
+  if (convertedToRemote) {
     delete merged.command;
     delete merged.args;
     // The stdio transport goes too: it belongs to the shape being replaced,
     // and upstream warns about a remote entry declaring it.
     if (merged.transport === "stdio") delete merged.transport;
+    // `env` goes with them. A remote entry spawns no process, so upstream.ts
+    // warns and ignores it; leaving it behind keeps a credential in
+    // bundles.json that nothing will ever use and no surface will explain.
+    delete merged.env;
   }
   if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
     delete merged.url;
@@ -1052,7 +1050,11 @@ function mergeServerEntry(
 
   const storedEnv = envStrings(base.env);
   const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
-  if (storedEnv || incomingEnv) {
+  // Skipped entirely on a conversion to remote. This block rebuilds `env`
+  // from the STORED entry, so it undoes the delete above and puts the stdio
+  // credential straight back -- the delete alone looked right and changed
+  // nothing on disk.
+  if (!convertedToRemote && (storedEnv || incomingEnv)) {
     const env: Record<string, string> = {};
     // Carry the stored env forward, MINUS any blank seed the incoming entry no
     // longer lists. A blank value is not data -- it is `add`'s "this key is

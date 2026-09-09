@@ -6689,3 +6689,333 @@ describe("discover match summary", () => {
     expect(summary).not.toContain("list_commits");
   });
 });
+
+describe("find_tool", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  // A cold server whose tool list is known only from the persisted cache --
+  // the case find_tool exists for. Nothing here is connected.
+  const cold = (namespace: string, tools: Array<{ name: string; description?: string }>) =>
+    makeServerConfig({ namespace, name: namespace, toolCache: tools });
+
+  it("refuses an empty query instead of returning the whole catalog", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }])]);
+    const result = await priv.handleToolCall("mcp_connect_find_tool", { query: "   " });
+    expect(result.content[0].text).toContain("needs a query");
+    expect(result.content[0].text).not.toContain("create_issue");
+  });
+
+  it("coerces a non-string query rather than throwing out of the tokenizer", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }])]);
+    // The low-level Server does not validate against inputSchema, so this
+    // shape really can arrive from a misbehaving client.
+    const result = await priv.handleToolCall("mcp_connect_find_tool", { query: 42 });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("needs a query");
+  });
+
+  it("says so plainly when nothing is installed", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([]);
+    const result = await priv.handleToolCall("mcp_connect_find_tool", { query: "create an issue" });
+    expect(result.content[0].text).toContain("yaw-mcp add");
+  });
+
+  it("finds a tool on a server that has never been loaded", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "create_issue", description: "Open a new issue" }]),
+      cold("pg", [{ name: "query", description: "Run SQL" }]),
+    ]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("gh_create_issue");
+    expect(text).not.toContain("pg_query");
+    // Nothing was contacted: a cold hit must SAY its schema is unavailable
+    // rather than omit the line, which reads as "takes no arguments".
+    expect(text).toContain("schema not loaded");
+  });
+
+  it("carries the input schema for a hit on a loaded server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue", description: "Open a new issue" }])]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("[loaded]");
+    expect(text).toContain("input schema");
+    expect(text).not.toContain("schema not loaded");
+  });
+
+  it("reports no match without inventing one", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue", description: "Open a new issue" }])]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "resize an image" })).content[0].text;
+    expect(text).toContain("No configured server has a tool matching");
+    expect(text).not.toContain("gh_create_issue");
+  });
+
+  it("caps at the default limit and says how many were withheld", async () => {
+    const priv = getPrivate(server);
+    const many = Array.from({ length: 14 }, (_, i) => ({ name: `issue_op_${i}`, description: "issue work" }));
+    priv.config = makeConfig([cold("gh", many)]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue" })).content[0].text;
+    expect(text).toContain("(10 of 14)");
+    expect(text).toContain("4 more match");
+  });
+
+  it("honours an explicit limit", async () => {
+    const priv = getPrivate(server);
+    const many = Array.from({ length: 14 }, (_, i) => ({ name: `issue_op_${i}`, description: "issue work" }));
+    priv.config = makeConfig([cold("gh", many)]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 3 })).content[0].text;
+    expect(text).toContain("(3 of 14)");
+    expect(text).toContain("11 more match");
+  });
+
+  it("clamps a hostile limit to the ceiling rather than dumping the catalog", async () => {
+    const priv = getPrivate(server);
+    const many = Array.from({ length: 80 }, (_, i) => ({ name: `issue_op_${i}`, description: "issue work" }));
+    priv.config = makeConfig([cold("gh", many)]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 9999 })).content[0].text;
+    expect(text).toContain("(50 of 80)");
+  });
+
+  it("clamps a zero or negative limit up to one", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }, { name: "close_issue" }])]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 0 })).content[0].text;
+    expect(text).toContain("(1 of 2)");
+  });
+
+  it("names the namespace to activate, and the runners-up", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "create_issue", description: "issue" }]),
+      cold("linear", [{ name: "issue_create", description: "issue" }]),
+    ]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("mcp_connect_activate");
+    expect(text).toMatch(/server "(gh|linear)"/);
+    expect(text).toContain("(or ");
+  });
+
+  it("does not offer runners-up when every hit is on one server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }, { name: "close_issue" }])]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue" })).content[0].text;
+    expect(text).toContain('server "gh"');
+    expect(text).not.toContain("(or ");
+  });
+
+  it("skips a server the active profile excludes", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "create_issue", description: "issue" }]),
+      cold("linear", [{ name: "issue_create", description: "issue" }]),
+    ]);
+    priv.profile = { servers: ["gh"] };
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("gh_create_issue");
+    expect(text).not.toContain("linear_issue_create");
+  });
+
+  it("prefers the in-session tool cache over the persisted one", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "stale_tool", description: "old" }])]);
+    priv.toolCache.set("gh", [{ name: "create_issue", description: "Open a new issue" }]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("gh_create_issue");
+    expect(text).not.toContain("stale_tool");
+  });
+});
+
+describe("observation meta-tools advance the idle clock", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "");
+    server = new ConnectServer();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  // Every meta-tool that only READS. The clock used to advance solely on
+  // proxied calls, so a session that spoke exclusively to the broker never
+  // ticked at all and held every child process for as long as the client
+  // stayed connected.
+  const OBSERVATIONS: Array<[string, Record<string, unknown>]> = [
+    ["mcp_connect_health", {}],
+    ["mcp_connect_suggest", {}],
+    ["mcp_connect_find_tool", { query: "anything" }],
+    ["mcp_connect_bundles", { action: "list" }],
+    ["mcp_connect_discover", {}],
+  ];
+
+  for (const [name, args] of OBSERVATIONS) {
+    it(`${name} ages every loaded server by one`, async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+      priv.idleCallCounts.set("gh", 0);
+
+      await priv.handleToolCall(name, args);
+      expect(priv.idleCallCounts.get("gh")).toBe(1);
+    });
+  }
+
+  it("credits nothing, so no server is spared by an observation", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("slack", makeConnection("slack"));
+    priv.idleCallCounts.set("gh", 3);
+    priv.idleCallCounts.set("slack", 0);
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.idleCallCounts.get("gh")).toBe(4);
+    expect(priv.idleCallCounts.get("slack")).toBe(1);
+  });
+
+  it("reaps a server that crosses the threshold on meta traffic alone", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.idleCallCounts.set("gh", resolveIdleThreshold() - 1);
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("does not add a phantom entry to the recent-call history", async () => {
+    // The adaptive threshold is computed from that history. An observation
+    // credits no namespace, so it must not push a record -- doing so would
+    // let meta traffic buy a server extra patience it never earned.
+    const priv = getPrivate(server);
+    priv.connections.set("gh", makeConnection("gh"));
+    const before = priv.recentToolCalls.length;
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.recentToolCalls.length).toBe(before);
+  });
+
+  it("does not age the server activate just loaded", async () => {
+    // activate is NOT an observation: it IS the loaded set. runActivateOne
+    // resets the namespace it loads, so an activate immediately followed by a
+    // discover leaves the fresh server at zero, not one.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.idleCallCounts.set("gh", 0);
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(priv.idleCallCounts.get("gh") ?? 0).toBe(0);
+  });
+
+  it("does not age anything on deactivate", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("slack", makeConnection("slack"));
+    priv.idleCallCounts.set("slack", 2);
+
+    await priv.handleToolCall("mcp_connect_deactivate", { server: "gh" });
+    expect(priv.idleCallCounts.get("slack")).toBe(2);
+  });
+});
+
+describe("activate reports a tool filter name that matches nothing", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  const withGh = (priv: any) => {
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("gh", ["create_issue", "list_issues"]));
+  };
+
+  it("names the tool that does not exist, and what the server does offer", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    const text = r.content[0].text;
+    expect(text).toContain("create_issu");
+    expect(text).toContain("does not exist");
+    expect(text).toContain("create_issue");
+    expect(text).toContain("list_issues");
+  });
+
+  it("says nothing when every requested name is real", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issue"] });
+    expect(r.content[0].text).not.toContain("does not exist");
+  });
+
+  it("says nothing when no filter was requested", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(r.content[0].text).not.toContain("does not exist");
+  });
+
+  it("repeats the warning when the same bad filter is re-sent", async () => {
+    // The second call changes nothing, so the surface does not move -- but
+    // the model repeating its typo still needs to be told, every time.
+    const priv = getPrivate(server);
+    withGh(priv);
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    expect(r.content[0].text).toContain("does not exist");
+  });
+
+  it("lists several bad names in one note, sorted", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", {
+      server: "gh",
+      tools: ["zebra", "alpha", "create_issue"],
+    });
+    const text = r.content[0].text;
+    expect(text).toContain("alpha, zebra");
+    expect(text).toContain("tools you asked to keep");
+  });
+
+  it("uses singular wording for one bad name", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["nope"] });
+    expect(r.content[0].text).toContain("the tool you asked to keep does not exist");
+  });
+
+  it("stays silent when the server's tool list is unknown", async () => {
+    // An unknown list cannot falsify a name. Guessing would report a real
+    // tool as missing on every cold server.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("gh", []));
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["anything"] });
+    expect(r.content[0].text).not.toContain("does not exist");
+  });
+
+  it("stays silent when the activation failed and the filter was rolled back", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn failed"));
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    expect(r.content[0].text).not.toContain("does not exist");
+    expect(priv.toolFilters.has("gh")).toBe(false);
+  });
+});

@@ -9,6 +9,7 @@
 import { MAX_EXEC_STEPS } from "./exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { collectMalformedSecretRefs, collectSecretRefNames } from "./secrets-vault.js";
+import { isRemoteEntry } from "./types.js";
 
 // Numbers the descriptions below quote to the model, interpolated from the
 // constants that actually enforce them rather than retyped. learning.ts
@@ -182,6 +183,33 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  findTool: {
+    name: "mcp_connect_find_tool",
+    description:
+      'Search for a TOOL across every configured server by what it DOES, when you do not know which server has it. Ranks tool names and descriptions from all servers -- loaded and not -- and returns the matches with the namespace to activate. Nothing is loaded and no server is contacted, so this costs no context beyond the reply. Use it when the capability is clear but its home is not ("something that can resize an image", "a way to list pull requests"); use `mcp_connect_dispatch` instead when you want the right server LOADED in one step, and `mcp_connect_read_tool` when you already know both the server and the tool and just want its schema. A match on a loaded server carries its full input schema; a match on a server that has never been loaded carries name and description only, from cache -- activate it, or call `mcp_connect_read_tool`, to see the arguments.',
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query: {
+          type: "string",
+          description:
+            'What the tool should DO, in plain words -- "create a github issue", "query postgres", "resize an image". Matched against every configured server tool name and description.',
+        },
+        limit: {
+          type: "number",
+          description: "Maximum matches to return. Default 10.",
+        },
+      },
+      required: ["query"],
+    },
+    annotations: {
+      title: "Find a Tool",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
   suggest: {
     name: "mcp_connect_suggest",
     description:
@@ -334,7 +362,7 @@ export interface SecretsReportRow {
  * malformed spans) out. Servers with no references at all are omitted.
  */
 export function computeSecretsReport(
-  servers: Array<{ namespace: string; env?: Record<string, string> }>,
+  servers: Array<{ namespace: string; type?: string; env?: Record<string, string>; headers?: Record<string, string> }>,
   vaultKeys: Set<string>,
 ): SecretsReportRow[] {
   const rows: SecretsReportRow[] = [];
@@ -348,12 +376,18 @@ export function computeSecretsReport(
     // which reads as "this server needs no secrets". collectSecretRefNames owns
     // the fresh-instance rule for every name-only caller (upstream.ts's spawn
     // audit and doctor's vault section are the others).
-    const referenced = collectSecretRefNames(server.env);
+    // A remote server's credentials ride in `headers`, not `env` -- see
+    // isRemoteEntry. Scanning `env` for one meant every remote
+    // server was omitted from this report, which reads as "needs no
+    // secrets" about the exact server whose activation is about to be
+    // refused fail-closed for a missing name.
+    const credentials = isRemoteEntry(server) ? server.headers : server.env;
+    const referenced = collectSecretRefNames(credentials);
     // The strict scanner above cannot see a reference a typo has put outside
     // SECRET_REF_RE, while resolveServerEnv refuses the spawn over it. Without
     // this column the report said "gh: injected" about a server that will not
     // start, and said nothing at all about one whose only ref is the typo.
-    const malformed = collectMalformedSecretRefs(server.env);
+    const malformed = collectMalformedSecretRefs(credentials);
     if (referenced.size === 0 && malformed.length === 0) continue;
     const injectedSecrets: string[] = [];
     const missing: string[] = [];
