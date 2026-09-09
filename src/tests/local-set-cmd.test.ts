@@ -301,6 +301,80 @@ describe("runSet -- env", () => {
   });
 });
 
+describe("runSet -- an env this command cannot edit", () => {
+  // `set` exists to service a hand-edited bundles.json, so the file shape it is
+  // likeliest to meet is one a human typed wrong. The loader TOLERATES a
+  // non-object env (it ignores it, so the entry still loads), which is exactly
+  // what lets a bad one survive long enough to reach this command -- and
+  // jsonc-parser answered it with `Can not add index to parent of type null`, a
+  // parser internal naming no file, no field and no remedy. A CLI whose whole
+  // job is servicing hand edits has to NAME the shape instead.
+  const withEnv = (envLiteral: string): string => `{
+  "version": 1,
+  "servers": [
+    { "namespace": "gh", "name": "GitHub", "command": "npx", "env": ${envLiteral} }
+  ]
+}
+`;
+
+  for (const [label, envLiteral, assignment] of [
+    ["null", "null", "env.A=1"],
+    ["an array", "[]", "env.A=1"],
+    ["a string, on a set", '"oops"', "env.A=1"],
+    // The clear branch was not safe either: its guard only checked the LIVE
+    // map's value, and the spread that builds that map turns a string env into
+    // index keys, so this threw the same parser internal. No --force here on
+    // purpose: a string env makes `env.0=` look like it drops a stored value,
+    // so an exit of 1 (this guard) rather than 2 (the clear confirmation)
+    // proves the guard runs first.
+    ["a string, on a clear", '"oops"', "env.0="],
+  ] as const) {
+    it(`names the file and the field when env is ${label}`, async () => {
+      const body = withEnv(envLiteral);
+      writeBundles(body);
+      const cap = capture();
+      const r = await runSet({ target: "gh", assignments: [assignment], home: synthHome, ...cap });
+      expect(r.exitCode, label).toBe(1);
+      expect(r.written, label).toEqual([]);
+      expect(cap.errText(), label).toContain(bundlesPath());
+      expect(cap.errText(), label).toContain('has an "env"');
+      // The parser internal never reaches the user.
+      expect(cap.errText(), label).not.toContain("Can not add index");
+      // A refusal writes nothing at all, including the other assignments.
+      expect(readFileSync(bundlesPath(), "utf8"), label).toBe(body);
+    });
+  }
+
+  it("still allows a scalar edit on an entry whose env is broken", async () => {
+    // The guard is scoped to runs that TARGET env. A scalar edit is
+    // well-defined on such an entry -- the loader ignores the bad env either
+    // way -- so refusing it would be a bigger change than the bug.
+    writeBundles(withEnv("null"));
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["isActive=false"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(read().servers[0].isActive).toBe(false);
+  });
+
+  it("refuses a clear of a key whose value is not a string instead of calling it unset", async () => {
+    // `env.A=` on `{"A": 5}` printed "already unset" and exited 0 while "A": 5
+    // was still in the file -- the CLI reporting success over a key it left
+    // behind. The map is well-formed here, so the guard above does not fire;
+    // the value is still the user's to fix, so say which key and exit non-zero.
+    const body = withEnv('{ "A": 5 }');
+    writeBundles(body);
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["env.A="], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain(bundlesPath());
+    expect(cap.errText()).toContain("env.A");
+    expect(cap.errText()).toContain("not a string");
+    expect(cap.text()).not.toContain("already unset");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(body);
+  });
+});
+
 describe("runSet -- target resolution", () => {
   it("resolves a stored slug as well as a namespace", async () => {
     writeBundles(`{

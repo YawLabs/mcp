@@ -119,6 +119,37 @@ describe("runSearch", () => {
     expect(cap.text()).toContain("Showing 1 of 2; re-run with --limit 2 for the rest.");
   });
 
+  it("never names a --limit that parseSearchArgs would reject", async () => {
+    // The footer is an instruction, so any number it prints has to survive the
+    // parser -- which caps --limit at 500. A catalog past the cap used to print
+    // `--limit 501`, a command guaranteed to exit 2, and the truncation branch
+    // offers no other escape (the "browse the catalog" line is zero-match only).
+    // The 2-match case above cannot catch this; it takes a catalog over the cap.
+    const catalogOf = (n: number): CatalogServer[] =>
+      Array.from({ length: n }, (_, i) => ({
+        slug: `srv-${i}`,
+        name: `Server ${i}`,
+        install: { command: "npx -y x", runtime: "node" },
+      })) as unknown as CatalogServer[];
+    for (const size of [500, 501]) {
+      const cap = capture();
+      await runSearch({ query: "", fetchCatalog: async () => catalogOf(size), env: {}, ...cap });
+      const text = cap.text();
+      expect(text, `size ${size}`).toContain(`Showing 20 of ${size};`);
+      const limits = [...text.matchAll(/--limit (\d+)/g)].map((m) => m[1]);
+      for (const n of limits) expect(parseSearchArgs(["--limit", n]).ok, `size ${size}: --limit ${n}`).toBe(true);
+      if (size <= 500) {
+        // At or under the cap the honest advice is still a runnable --limit.
+        expect(limits).toEqual([String(size)]);
+      } else {
+        // Above it there IS no --limit that shows the rest, so the footer has to
+        // hand back a different next step rather than dead-ending the user.
+        expect(limits).toEqual([]);
+        expect(text).toContain("https://yaw.sh/mcp/catalog/");
+      }
+    }
+  });
+
   it("exits 0 on no matches, and suggests a near miss", async () => {
     // Exit 0, not grep's 1: "nothing found" is an answer, and a non-zero code
     // would make a shell && chain treat a successful search as a failure.

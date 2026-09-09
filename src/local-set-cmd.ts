@@ -283,6 +283,18 @@ function render(value: unknown): string {
   return value === undefined ? "unset" : JSON.stringify(value);
 }
 
+/** English for the SHAPE of a value read out of the user's file, for an error
+ *  about a field whose type is wrong. `typeof` alone calls null and an array
+ *  "object", and those two are exactly the shapes a hand edit produces -- the
+ *  reader needs to know WHICH one to go fix. */
+function describeJsonShape(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  const t = typeof value;
+  if (t === "undefined") return "absent";
+  return t === "object" ? "an object" : `a ${t}`;
+}
+
 export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult> {
   const out = opts.out ?? ((s: string) => process.stdout.write(s));
   const err = opts.err ?? ((s: string) => process.stderr.write(s));
@@ -356,6 +368,33 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     const entry = servers[idx] as Record<string, unknown>;
     const namespace = String(entry.namespace);
 
+    // A hand-edited or foreign-written entry can carry an "env" that is not a
+    // map -- `null`, an array, a bare string. The LOADER tolerates it (a
+    // non-object env is ignored, so the entry still loads), which is exactly
+    // why one survives long enough to reach this command. Every env path below
+    // assumes an object: the set branch hands ["servers", i, "env", KEY] to
+    // jsonc-parser, whose setProperty throws `Can not add index to parent of
+    // type null`, and the clear branch is no safer -- its guard only checks the
+    // LIVE map's value, and the spread that builds that map turns a string env
+    // into index keys, so `env.0=` on "oops" throws the same way. Reject it
+    // ONCE here, naming the file and the field, the way the missing "servers"
+    // array above is rejected: `set` exists to service hand-edited
+    // bundles.json, so a bad shape in that file is the thing it should NAME
+    // rather than surface a parser internal over. Scoped to runs that actually
+    // target env -- a scalar edit on such an entry is well-defined, and
+    // refusing it would make this guard a bigger change than the bug.
+    const envAssignments = assignments.filter((a) => a.field === "env");
+    const envIsMap =
+      entry.env === undefined || (typeof entry.env === "object" && entry.env !== null && !Array.isArray(entry.env));
+    if (!envIsMap && envAssignments.length > 0) {
+      const targeted = envAssignments.map((a) => `env.${a.key}`).join(", ");
+      printErr(
+        `yaw-mcp set: "${namespace}" in ${path} has an "env" that is ${describeJsonShape(entry.env)}, not an object of "NAME": "value" pairs.`,
+      );
+      printErr(`  Fix that field by hand (or delete it), then re-run to set ${targeted}.`);
+      return { exitCode: 1, written: [] };
+    }
+
     // A clear that DROPS a stored value is the one irreversible edit here, so
     // it is confirmed. Setting or overwriting is not: the previous value is
     // shown in the transcript either way.
@@ -410,7 +449,21 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       if (a.field === "env") {
         const current = liveEnv[a.key as string];
         if (a.value === undefined) {
-          if (typeof current !== "string") {
+          // PRESENT but not a string is not "already unset": the key is in the
+          // file and this run leaves it there, so reporting success over it was
+          // the CLI claiming an edit it had not made. The guard above rules out
+          // a non-map env, not a non-string VALUE inside a real map, and the
+          // delete is refused rather than attempted because the file is the
+          // user's to fix. Nothing has been written at this point -- the single
+          // atomic write happens after this loop -- so bailing here leaves
+          // bundles.json exactly as it was found.
+          if (current !== undefined && typeof current !== "string") {
+            printErr(
+              `yaw-mcp set: env.${a.key} on "${namespace}" is ${describeJsonShape(current)} in ${path}, not a string -- remove it by hand.`,
+            );
+            return { exitCode: 1, written: [] };
+          }
+          if (current === undefined) {
             applied.push(`env.${a.key}: already unset`);
             jsonUnchanged.push({ field: "env", key: a.key });
             continue;

@@ -217,7 +217,15 @@ export async function runSearch(opts: SearchCommandOptions): Promise<SearchComma
     print();
   }
   if (shown.length < matches.length) {
-    print(`Showing ${shown.length} of ${matches.length}; re-run with --limit ${matches.length} for the rest.`);
+    // The footer is an instruction, so every number it names has to be one the
+    // parser accepts -- and `--limit` is capped at MAX_LIMIT. Past the cap no
+    // --limit shows the rest, so offer narrowing instead of a command that is
+    // guaranteed to exit 2.
+    const rest =
+      matches.length <= MAX_LIMIT
+        ? `re-run with --limit ${matches.length} for the rest.`
+        : `--limit tops out at ${MAX_LIMIT}, so add more words to narrow it (or browse https://yaw.sh/mcp/catalog/).`;
+    print(`Showing ${shown.length} of ${matches.length}; ${rest}`);
   }
   print("Add one with `yaw-mcp add <slug>`.");
   return { exitCode: 0 };

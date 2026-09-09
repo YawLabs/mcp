@@ -48,10 +48,17 @@
 //     ignored there, so the flag was a no-op that --help still described as
 //     a base URL. It was accepted-and-ignored for one release (v0.79.x) and
 //     is now rejected as an unknown flag like any other.
-//   - A project-scope target (VS Code's .vscode/mcp.json is the only one
-//     `try` can reach) is commit-to-share config, and the trial entry carries
-//     its secret INLINE. Writing a plaintext credential into a file that
-//     `git add -A` sweeps up is refused unless --yes is passed; see step 5b.
+//   - A project-scope target -- the per-project file a client reads out of
+//     the repo (.mcp.json, .cursor/mcp.json, .vscode/mcp.json,
+//     .gemini/settings.json) -- is commit-to-share config, and the trial
+//     entry carries its secret INLINE. Writing a plaintext credential into a
+//     file that `git add -A` sweeps up is refused unless --yes is passed; see
+//     step 5b. WHICH file is in play (if any) follows the RESOLVED SCOPE, not
+//     the client id: this note used to name .vscode/mcp.json as the only one
+//     `try` could reach, which stopped being true once the scope started
+//     coming from the target table. `try` takes a user scope wherever the
+//     client has one, so the refusal is reachable only by a client with no
+//     user scope -- see step 3.
 
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
@@ -75,6 +82,11 @@ import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 
+// The --client line is derived from the same table parseTryArgs validates
+// against (and that completion-cmd builds INSTALL_CLIENTS from), not a
+// hand-kept copy of it: the literal four-client list here outlived the
+// windsurf and gemini-cli additions, so both were ACCEPTED by the parser and
+// named nowhere a user could find them. Interpolating leaves one list to keep.
 export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   Wire a one-off trial of an MCP server into your AI client. No account
@@ -82,7 +94,7 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
   it on a timer -- once --ttl has elapsed it is removed by the next
   \`yaw-mcp doctor\` run. Run \`yaw-mcp try-cleanup <slug>\` to remove it now.
 
-  --client <name>      claude-code | claude-desktop | cursor | vscode
+  --client <name>      ${INSTALL_TARGETS.map((t) => t.clientId).join(" | ")}
                        (default: auto-detect, prefers the first installed
                        client in the order probed by \`yaw-mcp install --list\`)
   --ttl <duration>     How long the trial lives before doctor GCs it
@@ -92,10 +104,15 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
   --yes, -y            Confirm writing an inline secret into a PROJECT-scope
-                       config (vscode's .vscode/mcp.json -- a per-project
-                       file that is routinely committed). Without it, a trial
-                       whose entry carries a secret refuses that target and
-                       says why; user-scope clients never need it.
+                       config -- a per-project file the client reads out of
+                       the repo (.mcp.json, .cursor/mcp.json,
+                       .vscode/mcp.json, .gemini/settings.json), which is
+                       routinely committed. Without it, a trial whose entry
+                       carries a secret refuses that target and says why.
+                       A trial takes a user-scope file wherever the client
+                       has one, and every client shipped today has one, so
+                       this flag is currently never required -- it is here
+                       for a future project-only client.
 
   Point the catalog somewhere else with $YAW_MCP_CATALOG_URL.`;
 
@@ -743,14 +760,22 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
 
   // Step 5b: refuse to write a secret into a commit-to-share file without an
   // explicit --yes. A project-scope target is per-project config the client
-  // expects to be checked in (install-targets.ts labels VS Code's only scope
+  // expects to be checked in (install-targets.ts labels such a scope
   // "Workspace -- commit to share"), and unlike `add` the trial entry carries
   // its values INLINE (see the divergence note above), so `git add -A` in
-  // that repo publishes the credential. Auto-detect makes this easy to hit
-  // by accident: a repo that ships .vscode/mcp.json is picked whenever no
-  // personal client config exists. The warning prints on stderr either way;
-  // --yes lifts only the refusal. It runs BEFORE the --dry-run return so a
-  // preview never promises a write the real run declines.
+  // that repo publishes the credential. The warning prints on stderr either
+  // way; --yes lifts only the refusal. It runs BEFORE the --dry-run return
+  // so a preview never promises a write the real run declines.
+  //
+  // Unreachable today, and kept on purpose. Step 3 prefers a user scope
+  // whenever the client has one and all six shipped targets do, so `scope`
+  // is always "user" by the time control arrives here. It last fired while
+  // VS Code was project-only. Keeping it is what makes a project-only client
+  // added later refuse rather than silently commit the secret; there is no
+  // test that exercises the refusal firing, because no shipped target can
+  // reach it -- the sibling suite pins the AVOIDANCE instead (a trial lands
+  // in the private user file while a committed .vscode/mcp.json sits beside
+  // it, untouched and unwarned about).
   if (scope === "project" && entryHasSecrets) {
     const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
     const scopeSpec = target?.scopes.find((s) => s.scope === scope);

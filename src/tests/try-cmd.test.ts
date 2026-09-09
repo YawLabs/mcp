@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { atomicWriteFile } from "../atomic-write.js";
-import { buildLaunchEntry, ENTRY_NAME } from "../install-targets.js";
+import { buildLaunchEntry, ENTRY_NAME, INSTALL_TARGETS } from "../install-targets.js";
 import {
   type ExploreServerResponse,
   formatTtl,
@@ -192,6 +192,19 @@ describe("parseTryArgs", () => {
     const r = parseTryArgs(["-"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/Invalid argument "-"/);
+  });
+
+  it("names in TRY_USAGE every client --client accepts", () => {
+    // --help is the only place a user learns which clients `try` takes, and
+    // that line used to be a hand-kept literal listing four of them. It was
+    // never updated when windsurf and gemini-cli joined INSTALL_TARGETS, so
+    // both were accepted by the parser below and discoverable nowhere. The
+    // line is derived from the table now; this pins the two together so a
+    // seventh target cannot desync them again.
+    for (const target of INSTALL_TARGETS) {
+      expect(parseTryArgs(["demo", "--client", target.clientId]).ok).toBe(true);
+      expect(TRY_USAGE).toContain(target.clientId);
+    }
   });
 });
 

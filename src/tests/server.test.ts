@@ -430,6 +430,47 @@ describe("ConnectServer", () => {
         expect(second).toContain("Postgres");
         expect(second).not.toContain("GitHub");
       });
+
+      it("keeps the co-usage peer that the full listing shows", () => {
+        // Focus exists to EXPAND one card, so that card must never be less
+        // informative than the same one in the full listing. The co-usage map
+        // is filtered by the installed set, every detected pack spans >=2
+        // namespaces, and focus used to narrow that set to one -- which
+        // emptied every bucket and silently dropped this line.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ id: "2", namespace: "pg", name: "Postgres" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+        // Two bursts of (gh, pg) -- enough for a detected pack.
+        const t0 = 1_000_000;
+        priv.packDetector.recordCall("gh", "create_issue", t0);
+        priv.packDetector.recordCall("pg", "query", t0 + 1000);
+        priv.packDetector.recordCall("gh", "create_issue", t0 + 300_000);
+        priv.packDetector.recordCall("pg", "query", t0 + 301_000);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        expect(text).toContain('often loaded with "pg"');
+        // Only the card LOOP narrows: the peer is named, its card is not.
+        expect(text).not.toContain("Postgres");
+      });
+
+      it("names the tools of a connected server the client never activated", () => {
+        // The unadvertised connection prewarm's claim and a deferred first
+        // tools/call both produce: tools/list withholds its tools under the
+        // default gateway exposure, so if the focused card omits them too the
+        // names appear NOWHERE in the session -- while the meta-tool's own
+        // description promises this call returns that server's complete list.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+        // The state under test: connected, never asked for by the client.
+        expect(priv.sessionActivated.size).toBe(0);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        expect(text).toContain("known tools: create_issue, list_prs");
+      });
     });
 
     it("surfaces a token-cost estimate per server line", () => {
@@ -2036,6 +2077,18 @@ describe("ConnectServer", () => {
         const text = priv.handleHealth().content[0].text;
         expect(text).not.toContain("Profile:");
         expect(text).toContain("No servers loaded in this session");
+      });
+
+      it("shows the per-tool deny for a blockedTools-only profile", () => {
+        // toProfile returns non-null for a config carrying ONLY blockedTools,
+        // so health would print a bare Profile header with nothing under it --
+        // announcing a policy while displaying none of what it enforces.
+        const priv = getPrivate(server);
+        priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo", "pg_drop_*"] };
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("Profile: /h/.yaw-mcp/config.json");
+        expect(text).toContain("block tools: gh_delete_repo, pg_drop_*");
       });
     });
 
@@ -4997,6 +5050,20 @@ describe("blockedTools deny gate", () => {
     withDeny(priv, ["gh_delete_repo"]);
 
     expect(priv.handleDiscover().content[0].text).toContain("known tools: create_issue, delete_repo [blocked]");
+  });
+
+  it("counts only the visible tools when the server is already loaded", async () => {
+    // The fresh-connect path already filters, so the early return for an
+    // already-connected server was the one place left reporting a count
+    // tools/list does not carry -- inflated by exactly the tools the gate
+    // would refuse if the model went and called one.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "delete_repo"]));
+    withDeny(priv, ["gh_delete_repo"]);
+
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+    expect(text).toContain("already loaded with 1 tools");
   });
 
   it("refuses an exec pipeline before any step runs", () => {

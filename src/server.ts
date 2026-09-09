@@ -1110,6 +1110,7 @@ export class ConnectServer {
         userPath: this.profile.userPath,
         allow: this.profile.servers,
         block: this.profile.blocked,
+        blockedTools: this.profile.blockedTools,
       });
     }
     // Resolve the shadow-driven install-nudge gate once, from the env
@@ -2452,7 +2453,15 @@ export class ConnectServer {
     // another server's `often loaded with "<ns>"` line -- naming something
     // `activate` can no longer load. The Suggested-packs block below filters
     // exactly the same way.
-    const installedNamespaces = new Set(activeServers.map((s) => s.namespace));
+    //
+    // Built from allProfiled, not activeServers, for the reason the block
+    // comment above the focus narrowing states: every advisory reads the FULL
+    // profiled set. A focused call collapses activeServers to ONE element, and
+    // buildCoUsageMap keeps a pack bucket only when a PEER survives the filter
+    // -- so a one-element set empties every bucket and the focused card loses
+    // the `often loaded with` line the same card carries in the full listing.
+    // Unfocused output is unchanged: activeServers === allProfiled there.
+    const installedNamespaces = new Set(allProfiled.map((s) => s.namespace));
     // Precompute the co-usage map once per discover call. Derived from
     // the PackDetector's current history — same signal `suggest` surfaces,
     // but delivered inline so the LLM doesn't need a second meta-tool
@@ -2631,11 +2640,19 @@ export class ConnectServer {
       const usageHint = formatUsageHint(this.learning.get(server.namespace), coUsageMap.get(server.namespace) ?? []);
       if (usageHint) lines.push(`    ${usageHint}`);
 
-      // Show cached tool names for servers that aren't currently connected.
-      // Same merged list as the cost label above.
-      if (!connection) {
-        const cached = server.toolCache;
-        if (cached && cached.length > 0) {
+      // Tool names. A dormant server renders from the cache (same merged list
+      // as the cost label above); a CONNECTED one renders only under focus,
+      // where the meta-tool's own description promises that server's complete
+      // list. The load-bearing case there is a connection the client never
+      // activated -- under gateway exposure tools/list withholds its tools, so
+      // without this the names appear NOWHERE in the session.
+      //
+      // RAW connection.tools, not visibleTools(): as the label below says, this
+      // line describes what the SERVER offers, with policy annotated rather
+      // than omitted. Both shapes carry a bare `name`, which is all it reads.
+      if (!connection || focused) {
+        const names: Array<{ name: string }> | undefined = connection ? connection.tools : server.toolCache;
+        if (names && names.length > 0) {
           // In the RANKED shape, a server the query did not match at all
           // contributes nothing but noise here -- its card still names it, its
           // type and its tool count, which is what the model needs to know it
@@ -2651,14 +2668,14 @@ export class ConnectServer {
             // A focused call is bounded by one server and was explicitly asked
             // for, so it renders the full list -- that is the recovery path the
             // cap depends on existing.
-            const cap = focused ? cached.length : ConnectServer.DISCOVER_TOOL_NAME_CAP;
-            const shown = cached.slice(0, cap);
+            const cap = focused ? names.length : ConnectServer.DISCOVER_TOOL_NAME_CAP;
+            const shown = names.slice(0, cap);
             // Annotated, not omitted. This list describes what the SERVER
             // offers, and a tool quietly missing from it reads as a yaw-mcp
             // bug rather than as the policy the user themselves wrote.
             const label = (t: { name: string }): string =>
               this.isToolDenied(`${server.namespace}_${t.name}`) ? `${t.name} [blocked]` : t.name;
-            const hidden = cached.length - shown.length;
+            const hidden = names.length - shown.length;
             if (hidden > 0) omittedToolNames = true;
             const more = hidden > 0 ? ` (+${hidden} more)` : "";
             lines.push(`    known tools: ${shown.map(label).join(", ")}${more}`);
@@ -3045,10 +3062,14 @@ export class ConnectServer {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
       progress?.(`"${namespace}" already loaded`);
+      // The same predicate the fresh-connect path counts with, and the same one
+      // tools/list applies. The raw inventory reports a number that includes
+      // tools no client can see and the gate would refuse.
+      const visible = existing.tools.filter((t) => !this.isToolDenied(t.namespacedName)).length;
       return {
         ok: true,
         isChanged: false,
-        message: `"${namespace}" is already loaded with ${existing.tools.length} tools.`,
+        message: `"${namespace}" is already loaded with ${visible} tools.`,
         serverId: existing.config.id,
       };
     }
@@ -4503,6 +4524,11 @@ export class ConnectServer {
       }
       if (this.profile.servers?.length) lines.push(`  allow: ${this.profile.servers.join(", ")}`);
       if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
+      // The per-tool deny belongs here too. toProfile returns non-null for a
+      // blockedTools-ONLY config, so without this line health announces a
+      // profile and then displays none of the policy it is enforcing --
+      // exactly the surface the Profile.blockedTools doc comment points at.
+      if (this.profile.blockedTools?.length) lines.push(`  block tools: ${this.profile.blockedTools.join(", ")}`);
       lines.push("");
     }
 
