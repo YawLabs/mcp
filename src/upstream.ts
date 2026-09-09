@@ -502,6 +502,178 @@ export class ActivationError extends Error {
   }
 }
 
+/** True for a value that is itself an unresolved `${secret:NAME}` reference
+ *  rather than a resolved credential. Shared by the variant builder and the
+ *  replace loop so the two cannot drift: the loop SKIPS such a value (the
+ *  catch-all rewrite at the end of redactSecretsInOutput is what handles it,
+ *  and it hides the vault entry's NAME instead of naming the env key), and the
+ *  builder must not spend variants on it either -- a percent-encoded
+ *  `${secret:...}` is not a shape any credential takes. */
+function isUnresolvedSecretRef(value: string): boolean {
+  return value.startsWith("${secret:") && value.endsWith("}");
+}
+
+/** The length a value has to clear before it is matched against output at all.
+ *  It gates BOTH ends on purpose -- the replace loop skips anything shorter,
+ *  and secretMatchVariants refuses to DERIVE an encoded form from a shorter
+ *  base -- so it is one constant rather than two literals: a threshold that
+ *  moved in one place and not the other is exactly how a value the design skips
+ *  as too short creeps back in through a longer encoding of itself. */
+const SECRET_MATCH_MIN_LENGTH = 8;
+
+/** The value as an HTML-escaping serializer would print it. A LIST rather than
+ *  one string because the encoders agree on four characters and disagree on the
+ *  fifth: `&` -> `&amp;`, `<` -> `&lt;`, `>` -> `&gt;` and `"` -> `&quot;` are
+ *  universal, while the apostrophe comes out as `&#39;` (escape-html, lodash),
+ *  `&#x27;` (Handlebars, Python's html.escape) or `&apos;` (XML-shaped
+ *  serializers). Exact matching cannot pick a winner, so a value carrying an
+ *  apostrophe emits all three and a value without one collapses to a single
+ *  entry in the caller's dedupe. `&` is replaced FIRST so the ampersands the
+ *  later replacements introduce are not escaped a second time (`<` would
+ *  otherwise become `&lt;` and then `&amp;lt;`). */
+function htmlEscapeVariants(base: string): string[] {
+  const escaped = base.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  if (!escaped.includes("'")) return [escaped];
+  return ["&#39;", "&#x27;", "&apos;"].map((apostrophe) => escaped.replace(/'/g, apostrophe));
+}
+
+/** Every FORM one resolved value can plausibly take by the time an upstream
+ *  ECHOES it back, so exact-substring matching still finds it. The caller keys
+ *  every variant of a value to the SAME env or secret name, so a hit still
+ *  names the credential to rotate.
+ *
+ *  Two bases, then a transform per base:
+ *
+ *  - RAW and TRIMMED. undici strips leading and trailing HTTP whitespace from
+ *    every header value, so a vault entry keeping the newline `yaw-mcp secrets
+ *    set --stdin` preserves (that path is documented as raw) is SENT as
+ *    `Bearer tok` while the map holds `Bearer tok\n`. A child that reads an
+ *    injected var usually trims it before echoing it back too.
+ *
+ *  - JSON-ESCAPED, the one that matters most. MCP servers speak JSON-RPC and
+ *    the common Node loggers (pino, winston) default to JSON lines, so a value
+ *    an upstream echoes is escaped the moment it lands in a document: a newline
+ *    becomes a literal \n, a quote a \", a backslash a \\. A multi-line PEM, or
+ *    a token carrying a quote or backslash (`Headers` accepts both, so both
+ *    reach the wire), therefore comes back sharing no substring with the stored
+ *    value -- and one JSON.parse on the logged line recovers the credential
+ *    byte-for-byte. `JSON.stringify(v).slice(1, -1)` is exactly what the value
+ *    looks like embedded IN a JSON string, minus the quotes the document adds.
+ *
+ *  - PERCENT-ENCODED. `+`, `/` and `=` are exactly the characters
+ *    encodeURIComponent rewrites and exactly the ones a base64-shaped
+ *    credential is made of, so a gateway that bounces the failed request
+ *    through a login redirect, or quotes back the query string it received,
+ *    echoes %2B / %2F / %3D and matches nothing.
+ *
+ *  - HTML-ESCAPED. A remote answering with an HTML error page is ordinary -- an
+ *    auth proxy, a WAF, a load balancer in front of the endpoint -- and the
+ *    streamable-http transport puts `response.text()` straight into the error
+ *    it throws, so that page reaches the redactor whole. NOT covered by the
+ *    JSON variant: on the one character the two encoders share, JSON emits `\"`
+ *    and HTML emits `&quot;`, which are different byte strings, so a token
+ *    carrying a quote rides out of an HTML echo intact and with no ***NAME***
+ *    marker to say a credential was involved at all. The other four characters
+ *    (`&`, `<`, `>`, `'`) are rare in token alphabets but ordinary in a
+ *    password, which is a credential this map holds just as often. See
+ *    htmlEscapeVariants for why the apostrophe costs three entries.
+ *
+ *  - CASE-FOLDED, but ONLY for an all-hex value. An upstream that normalizes a
+ *    token before printing it (a case-insensitive compare path logging its
+ *    normalized form) echoes a case this map does not hold. Deliberately NOT
+ *    applied to every value: this function is handed the whole resolved env,
+ *    most of which is ordinary configuration, and a case-insensitive pass would
+ *    replace a Windows path or a URL merely MENTIONED in the output in another
+ *    case -- costing the reader the path the error was actually about while
+ *    hiding no credential. Hex is the carve-out because a >=8-char hex run
+ *    cannot collide with prose, and because folding it is lossless: the echo IS
+ *    the credential. For a mixed-alphabet token the folded echo is not the
+ *    credential anyway, so the trade lands the same way twice.
+ *
+ *  NOT EXHAUSTIVE. The gap is other ENCODERS of shapes already in the list, not
+ *  shapes nobody thought of, so the four above are "the common encoders" rather
+ *  than "every encoder". Each of these was reproduced; none is covered:
+ *
+ *  - Other runtimes' JSON differs from Node's. Python's `json.dumps` defaults
+ *    to `ensure_ascii=True` and escapes every non-ASCII character as `\uXXXX`;
+ *    Go's `encoding/json` escapes `&`, `<` and `>` as `\u0026`, `\u003c`
+ *    and `\u003e`. A non-ASCII password -- an ordinary shape for a credential --
+ *    echoed by a Python upstream therefore still leaks whole.
+ *  - `URLSearchParams` / form-urlencoded, which is the standard OAuth redirect
+ *    encoder, differs from encodeURIComponent: a space becomes `+` rather than
+ *    `%20`, and `~`, `!`, `'`, `(` and `)` are percent-encoded where
+ *    encodeURIComponent leaves them alone.
+ *  - Double percent-encoding across a redirect chain (`%2F` -> `%252F`), which
+ *    a second hop that re-encodes what it received produces.
+ *
+ *  Each is one more replace chain, so the reason to stop is not cost: every
+ *  entry widens the map matched against arbitrary output, and these are
+ *  progressively rarer than the four above.
+ *
+ *  REJECTED:
+ *
+ *  - BASE64 re-encoding of the value. Not a false-match risk -- a base64 blob
+ *    of a high-entropy value collides with nothing -- but it cannot be done
+ *    honestly. base64 of a SUBSTRING appears in the output only when that
+ *    substring starts on a 3-byte boundary, so the realistic shape,
+ *    `base64("user:" + token)`, does not contain `base64(token)`. It would
+ *    cover the whole-value re-encode alone while reading like coverage of
+ *    re-encoding. It is also the wrong CLASS: JSON escaping and percent
+ *    encoding are applied by the echo to whatever string it holds, whereas
+ *    base64 is applied to a credential before USE -- which would mean the map
+ *    should be holding the encoded form in the first place.
+ *
+ *  - Unicode normalization, shell quoting, regex escaping: no reproduced shape,
+ *    so they would be guesses paid for on every call.
+ *
+ *  The floor (SECRET_MATCH_MIN_LENGTH) is enforced HERE as well as in the
+ *  caller's replace loop, and the two are not redundant. Every transform above
+ *  LENGTHENS its base, so a floor checked only at match time is a floor on the
+ *  ENCODED string rather than on the credential: a 7-char config snippet the
+ *  design deliberately skips clears the bar as a 9-char JSON escape, and a
+ *  6-char path clears it percent-encoded -- and the redactor then mangles
+ *  exactly the ordinary output the floor exists to keep readable. So a base
+ *  under the floor emits no derived form at all: a value too short to match raw
+ *  cannot match encoded either. The base itself is still emitted, and still
+ *  floored by the loop, which is what keeps the TRIMMED base -- the one
+ *  transform that can SHORTEN a value -- honest.
+ *
+ *  For an ordinary non-hex token (letters, digits, `_`, `-`) every transform IS
+ *  the identity, so the caller's dedupe collapses the list back to the single
+ *  entry this function used to produce -- the list only grows for a value that
+ *  actually needs escaping, or for hex. */
+function secretMatchVariants(value: string): string[] {
+  const bases = [value];
+  const trimmed = value.trim();
+  if (trimmed !== value) bases.push(trimmed);
+  if (isUnresolvedSecretRef(trimmed)) return bases;
+
+  const variants: string[] = [];
+  for (const base of bases) {
+    variants.push(base);
+    // Gate the DERIVED forms on the BASE, not on what they produce. Everything
+    // below lengthens its input, so a base under the floor would otherwise
+    // re-enter matching as a longer encoding of itself -- see the floor
+    // paragraph above. The raw base pushed on the line above is still emitted
+    // and still floored by the caller.
+    if (base.length < SECRET_MATCH_MIN_LENGTH) continue;
+    variants.push(JSON.stringify(base).slice(1, -1));
+    try {
+      variants.push(encodeURIComponent(base));
+    } catch {
+      // encodeURIComponent throws URIError on a lone surrogate, which a value
+      // decoded from a truncated buffer can carry. Skip that one variant
+      // rather than letting a redactor that runs ONLY on the failure path
+      // throw and replace the ActivationError with a URIError.
+    }
+    variants.push(...htmlEscapeVariants(base));
+    if (/^[0-9a-f]+$/i.test(base)) {
+      variants.push(base.toLowerCase(), base.toUpperCase());
+    }
+  }
+  return variants;
+}
+
 /**
  * Redact secret values out of captured stderr before embedding it in error
  * messages. A server that crashes during init often echoes the bad value
@@ -520,9 +692,47 @@ export class ActivationError extends Error {
  * seeing it. We also drop ${secret:NAME} literals themselves to
  * `${secret:***}` in case any leaked unresolved.
  *
- * The redactor is conservative: short values (<8 chars) are skipped to
- * avoid mangling unrelated substrings; the goal is to catch the high-
- * entropy tokens that look like secrets, not redact the entire output.
+ * The redactor is conservative: short values (under SECRET_MATCH_MIN_LENGTH,
+ * 8 chars) are skipped to avoid mangling unrelated substrings; the goal is to
+ * catch the high-entropy tokens that look like secrets, not redact the entire
+ * output. That floor is on the STORED value, so a value below it does not
+ * re-enter matching through a longer encoding of itself either.
+ *
+ * Matching is against a VARIANT LIST per value (secretMatchVariants, defined
+ * directly above), not the single stored string, because the transform that
+ * defeats an exact match is applied by the ECHO -- a JSON logger, a redirect
+ * builder -- not by anything on this side. That list is not exhaustive either;
+ * its own doc block names the encoders it does not cover.
+ *
+ * STILL NOT COVERED, and not fixable by adding more variants. These are limits
+ * of substring matching itself, so the list below is not a coverage claim:
+ *
+ *   - A value BROKEN across lines. Reads exotic if you picture a fixed-width
+ *     logger, but the dominant trigger is Node's OWN default object formatting:
+ *     util.inspect, which is what a plain `console.error({ key })` in a child
+ *     goes through, renders a long MULTI-LINE string as one quoted chunk per
+ *     line joined with ` +`. So a PEM -- the exact credential shape the
+ *     JSON-escaped variant exists for -- comes back as
+ *     `'-----BEGIN PRIVATE KEY-----\n' +` / `'MIIB...'`, and NEITHER the raw
+ *     value nor its JSON escape is a contiguous run of that output (measured on
+ *     Node 22, which splits only once the rendering also exceeds the 80-column
+ *     breakLength; a short two-line value stays on one line and still matches).
+ *     A single-line token is not split by inspect at any length -- that one
+ *     does need a fixed-width formatter, and is the rarer case of the two.
+ *   - A token straddling the stderr-ring cut. The ring is the `stderrRing`
+ *     accumulator on the local-spawn path, whose `.slice(-STDERR_RING_CAP)`
+ *     keeps only the newest 8K of decoded stderr, so a token written across
+ *     that boundary survives into the tail as a SUFFIX, and a suffix matches
+ *     nothing.
+ *   - An upstream that echoes only a PREFIX ("key lin_api_9f... was
+ *     rejected"). Same shape, other end.
+ *
+ * Each of those leaks a PARTIAL credential -- worth less than the whole one,
+ * but worth something, and none of them emits a ***NAME*** marker, so nothing
+ * in the message even says a credential was involved. Closing them means
+ * leaving exact substrings for a fuzzy or entropy-based matcher, which trades
+ * away this function's most important property: it cannot mangle output that
+ * does not contain the secret. That trade has not been made here.
  *
  * SCOPE -- documented rather than widened. Every call site hands this the
  * RESOLVED SERVER ENV only (the values yaw-mcp itself injected from bundles.json
@@ -540,44 +750,86 @@ export class ActivationError extends Error {
  */
 function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
-  // A value can reach the wire TRIMMED while this map holds it untrimmed, and
-  // exact-substring matching then misses the echo entirely. undici strips
-  // leading and trailing HTTP whitespace from every header value, so a vault
-  // entry keeping the newline `yaw-mcp secrets set --stdin` preserves (that
-  // path is documented as raw) is SENT as `Bearer tok` while the map holds
-  // `Bearer tok\n` -- neither the composed entry nor the bare one matches what
-  // a gateway echoes back, and the token lands verbatim in the
-  // ActivationError. So emit the trimmed form as an EXTRA entry under the same
-  // key, which keeps the message naming the entry to rotate. Fixed here rather
-  // than at the header call site because this is the choke point every caller
-  // goes through and the local/stdio path meets the same shape: a child that
-  // reads an injected var usually trims it before echoing it back.
+  // Expand each value into its variant list (secretMatchVariants) and treat
+  // every variant as a plain extra entry under the SAME key, so a hit still
+  // names the credential to rotate rather than reporting an anonymous match.
+  // Fixed here rather than at the header call site because this is the choke
+  // point every caller goes through, and the local/stdio path meets the same
+  // encoded-echo shapes the remote one does.
   //
-  // trim(), not a trailing-only cut -- leading whitespace is stripped
-  // identically. A variant is a plain extra entry, so the >=8-char floor in
-  // the loop below governs it exactly as it governs the original: trimming can
-  // drop a value under the floor, and that floor is what keeps the regex off
-  // unrelated substrings. Deliberately NOT re-checked here -- a second copy of
-  // the same threshold is one more place to forget when it moves.
+  // Deduped by the variant STRING. Most transforms are the identity for an
+  // ordinary token, so without this the same regex would run three or four
+  // times per value; and when two DIFFERENT env keys hold the same value, one
+  // entry is what already happened in practice (the first replace consumed
+  // every occurrence and the second found nothing) -- the set just makes that
+  // explicit and keeps a key naming it.
+  //
+  // TWO passes, RAW values first, because the marker names the credential to
+  // ROTATE and pointing at the wrong entry is worse than an anonymous match.
+  // One value's derived variant can equal a DIFFERENT value's raw string (a
+  // path's JSON escape is a plausible token; a path's percent-encoding is a
+  // plausible value of the _URL twin sitting next to it in the same env). With
+  // a single pass the winner is whichever env key Object.entries happened to
+  // yield first, so a real credential in the output gets reported under the
+  // path's key. Claiming every raw string before any derived one makes the rule
+  // "the value that IS this string owns it" instead of "whoever got there
+  // first", and a raw string too short to matter still only blocks the identical
+  // string, which the floor below would have skipped anyway.
   const entries: Array<[string, string]> = [];
+  const seen = new Set<string>();
+  const claim = (k: string, variant: string): void => {
+    if (seen.has(variant)) return;
+    seen.add(variant);
+    entries.push([k, variant]);
+  };
   for (const [k, v] of Object.entries(env)) {
     if (typeof v !== "string") continue;
-    entries.push([k, v]);
-    const trimmed = v.trim();
-    if (trimmed !== v) entries.push([k, trimmed]);
+    claim(k, v);
+  }
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== "string") continue;
+    for (const variant of secretMatchVariants(v)) claim(k, variant);
   }
   // Replace longest values first. When one secret value is a substring of
   // another (e.g. a token and that same token with a suffix), a short-first
   // pass can redact the inner value and leave a real-secret suffix exposed.
   // Descending-by-length order guarantees the containing value is redacted
-  // whole before any of its substrings is considered. The trimmed variants
-  // sort in this same pass, so each is a strictly shorter entry that cannot
-  // jump ahead of a value containing it.
+  // whole before any of its substrings is considered.
+  //
+  // ONE flat sort over every (key, variant) pair, not a sort per secret --
+  // that is what makes CONTAINMENT hold ACROSS secrets, which is where the
+  // variants make it harder. A variant can now be LONGER than another secret's
+  // raw value (a token containing a quote is shorter than its own JSON-escaped
+  // form, which in turn can contain a second secret's raw value whole), so
+  // grouping by secret, or sorting the env entries before expanding them, would
+  // let a short raw value redact the inside of a longer escaped one and leave
+  // the tail of a real credential in the clear.
+  //
+  // What longest-first buys is exactly CONTAINMENT: whenever one entry contains
+  // another, the container is replaced first, so no later pass can strand a real
+  // tail. It does NOT make two DISTINCT secrets that OVERLAP in the echoed text
+  // both come out whole -- where A's escaped form ends INSIDE B's raw span,
+  // replacing the longer A first eats the shared bytes and B stops matching,
+  // leaving B's remainder in the clear (A=`aaaa"bbbb`, B=`bbbbCCCC`, echoed
+  // JSON-escaped, strands `CCCC`).
+  //
+  // Measured rather than assumed, 4000 pairs each way: two INDEPENDENT random
+  // values echoed back to back never strand a byte (0/4000 -- adjacency is not
+  // overlap, since B is still whole after A is replaced), while values built to
+  // share bytes at the boundary strand every time (4000/4000). So this is not a
+  // dice roll the ordering could win: it needs two secrets whose values actually
+  // overlap in the output, and no ordering of a substring replacer survives that
+  // -- whereas every ordering other than longest-first loses containment, which
+  // is the case that shows up in practice.
   entries.sort(([, a], [, b]) => b.length - a.length);
   for (const [k, v] of entries) {
-    if (v.length < 8) continue;
+    // The other end of the floor secretMatchVariants gates emission on. This
+    // one catches what still reaches the loop under it: a TRIMMED base (the one
+    // transform that shortens) and a raw value that was always too short. That
+    // floor is what keeps the regex off unrelated substrings.
+    if (v.length < SECRET_MATCH_MIN_LENGTH) continue;
     // Skip values that are themselves an unresolved ${secret:...} literal.
-    if (v.startsWith("${secret:") && v.endsWith("}")) continue;
+    if (isUnresolvedSecretRef(v)) continue;
     // Escape regex metacharacters in the secret value.
     const escaped = v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     out = out.replace(new RegExp(escaped, "g"), `***${k}***`);

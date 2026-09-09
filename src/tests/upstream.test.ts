@@ -1088,6 +1088,272 @@ describe("redactSecretsInOutput", () => {
     // ... and the literal took the rewrite, not the value-substitution path.
     expect(err!.stderrTail).not.toContain("***TOKEN***");
   });
+
+  // --- ENCODED ECHOES ------------------------------------------------------
+  // Everything above matches the value as the MAP holds it, or as the wire
+  // trimmed it. The cases below are the same credential after the ECHO
+  // re-encoded it: the transform is applied by whatever printed the error, not
+  // by anything on this side, so exact-substring matching against the stored
+  // form finds nothing at all -- no ***NAME*** marker is emitted and the
+  // cleartext rides out whole.
+
+  it("redacts a multi-line secret an upstream echoed inside a JSON document", async () => {
+    // The serious one. MCP servers speak JSON-RPC and the common Node loggers
+    // (pino, winston) default to JSON lines, so a value echoed back is escaped
+    // the moment it lands in a document: every newline becomes a literal \n,
+    // every quote a \". A PEM stored raw -- `secrets set --stdin` is documented
+    // as preserving exactly what was piped in -- therefore reaches stderr in a
+    // form the stored value cannot match, and one JSON.parse on the logged line
+    // hands the reader the private key back byte-for-byte.
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIBVwIBADANBgkqhkiG9w0\nQ8sTuF1x/2rmKp0=\n-----END PRIVATE KEY-----\n";
+    const escapedRaw = JSON.stringify(pem).slice(1, -1);
+    const escapedTrimmed = JSON.stringify(pem.trim()).slice(1, -1);
+    const config = makeLocalConfig({ env: { PRIVATE_KEY: pem } });
+
+    _sdkBehavior.clientConnect = () => {
+      // Both bases in one echo: a logger that dumps the value as it was read,
+      // and one that trims first. Each has to be matched in its ESCAPED form,
+      // so dropping either base from the variant list fails this case.
+      _sdkBehavior.stderrEmitter?.emit(
+        "data",
+        Buffer.from(JSON.stringify({ error: "bad key", value: pem, trimmed: pem.trim() })),
+      );
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(escapedRaw);
+    expect(err!.stderrTail).not.toContain(escapedTrimmed);
+    // No fragment of the key body survives either -- the absence assertions
+    // above would also pass if only the first line had been cut.
+    expect(err!.stderrTail).not.toContain("MIIBVwIBADANBgkqhkiG9w0");
+    // Named, not merely blanked: the reader still learns which credential to
+    // rotate, and this cannot pass on an empty tail.
+    expect(err!.stderrTail).toContain("***PRIVATE_KEY***");
+  });
+
+  it("redacts a hex token an upstream echoed back in the other case", async () => {
+    // An upstream that normalizes a token before printing it (a case-
+    // insensitive compare path logging its normalized form) echoes a shape the
+    // stored value does not match. For a hex value the fold is lossless -- the
+    // echo IS the credential, recoverable by lowercasing -- so it is worth
+    // matching. See the companion case below for why the fold stops at hex.
+    const key = "9f8e7d6c5b4a39281706fedcba098765";
+    const config = makeLocalConfig({ env: { SIGNING_KEY: key } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`bad signature for key ${key.toUpperCase()}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(key.toUpperCase());
+    expect(err!.stderrTail).toContain("***SIGNING_KEY***");
+  });
+
+  it("does NOT case-fold a value outside the hex alphabet -- an ordinary path stays readable", async () => {
+    // The over-redaction guard for the variant above, and the reason the fold
+    // is not applied to every value. This function is handed the whole resolved
+    // env, most of which is ordinary configuration; folding case globally would
+    // replace a Windows path merely MENTIONED in another case with a marker,
+    // costing the reader the path the error was actually about while hiding no
+    // credential. Hex is the carve-out precisely because a >=8-char hex run
+    // cannot collide with prose.
+    const config = makeLocalConfig({ env: { HOME_DIR: "C:\\Users\\Jeff\\AppData" } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from("ENOENT: c:\\users\\jeff\\appdata\\cache"));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain("c:\\users\\jeff\\appdata\\cache");
+    expect(err!.stderrTail).not.toContain("***HOME_DIR***");
+  });
+
+  it("keeps longest-first ordering across variants of DIFFERENT secrets", async () => {
+    // The invariant the sort exists for, now that one secret's VARIANT can be
+    // longer than another secret's raw value. INNER's raw is a substring of
+    // OUTER's JSON-escaped form, and OUTER's own raw does not match the echo at
+    // all (the echo carries \" where the value has "). So a pass that grouped
+    // by secret -- or sorted the env entries before expanding them -- would run
+    // INNER's raw first, redact the inside of OUTER, and leave OUTER's real
+    // suffix in the clear. One flat longest-first sort over every (key,variant)
+    // pair is what prevents that.
+    const inner = "lin_api_9fJ2sQx1TvB";
+    const outer = `${inner}"tail_ZZZ9`;
+    const config = makeLocalConfig({ env: { INNER_TOKEN: inner, OUTER_TOKEN: outer } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(JSON.stringify({ error: "bad", key: outer })));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    // OUTER's suffix is the part a short-first pass leaks.
+    expect(err!.stderrTail).not.toContain("tail_ZZZ9");
+    expect(err!.stderrTail).toContain("***OUTER_TOKEN***");
+    // ... and it was redacted as OUTER, whole, not as INNER plus a leftover.
+    expect(err!.stderrTail).not.toContain("***INNER_TOKEN***");
+  });
+
+  it("redacts a value an upstream echoed HTML-ESCAPED inside an error page", async () => {
+    // A child that renders its failure as HTML (a gateway proxy, an embedded
+    // admin page, anything piping the response body straight to stderr) escapes
+    // the value before printing it, and the escaped form shares no substring
+    // with the stored one. Three apostrophe encodings in one echo because the
+    // encoders disagree and exact matching cannot pick a winner: escape-html
+    // and lodash emit &#39;, Handlebars and Python's html.escape emit &#x27;,
+    // XML-shaped serializers emit &apos;. The ampersand, angle brackets and
+    // quote are the same everywhere.
+    const secret = "pa&ss'w<r>d_9fJ2sQx1TvB";
+    const numeric = "pa&amp;ss&#39;w&lt;r&gt;d_9fJ2sQx1TvB";
+    const hex = "pa&amp;ss&#x27;w&lt;r&gt;d_9fJ2sQx1TvB";
+    const named = "pa&amp;ss&apos;w&lt;r&gt;d_9fJ2sQx1TvB";
+    const config = makeLocalConfig({ env: { DB_PASSWORD: secret } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit(
+        "data",
+        Buffer.from(`<p>auth failed for ${numeric}</p>\n<p>${hex}</p>\n<p>${named}</p>`),
+      );
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(numeric);
+    expect(err!.stderrTail).not.toContain(hex);
+    expect(err!.stderrTail).not.toContain(named);
+    // The high-entropy tail is the part worth stealing; assert it is gone
+    // rather than trusting the whole-string absence checks alone.
+    expect(err!.stderrTail).not.toContain("9fJ2sQx1TvB");
+    expect(err!.stderrTail).toContain("***DB_PASSWORD***");
+  });
+
+  it("does not redact a 7-char value through its 9-char JSON variant", async () => {
+    // The floor is a floor on the STORED value, not on whatever string a
+    // transform happened to produce. A 7-char config snippet is below it and
+    // must stay readable -- but JSON-escaping it clears the floor by two
+    // characters, so a floor checked only at match time lets a value the design
+    // deliberately skipped re-enter matching and mangle ordinary output.
+    const mode = '{"a":1}';
+    const jsonVariant = JSON.stringify(mode).slice(1, -1);
+    expect(mode.length).toBe(7);
+    expect(jsonVariant.length).toBe(9);
+    const config = makeLocalConfig({ env: { MODE: mode } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`config error: ${jsonVariant} is not a valid mode`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain(jsonVariant);
+    expect(err!.stderrTail).not.toContain("***MODE***");
+  });
+
+  it("does not redact a 6-char path through its percent-encoded variant", async () => {
+    // Same floor, the other encoder. A short path is exactly what the floor
+    // exists to leave alone -- the reader needs it to fix the error -- and
+    // percent-encoding inflates it past the bar without making it any more of a
+    // credential.
+    const dataDir = "/tmp/x";
+    const encoded = encodeURIComponent(dataDir);
+    expect(dataDir.length).toBe(6);
+    expect(encoded.length).toBe(10);
+    const config = makeLocalConfig({ env: { DATA_DIR: dataDir } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`open failed: ${encoded} -- no such directory`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).toContain(encoded);
+    expect(err!.stderrTail).not.toContain("***DATA_DIR***");
+  });
+
+  it("names the key whose RAW value matched, not one whose derived variant collided", async () => {
+    // Attribution, which is the whole point of naming the key: the marker tells
+    // the operator which credential to rotate, so pointing at the wrong entry is
+    // worse than an anonymous match. The echoed string here IS API_TOKEN's
+    // stored value, and it is ALSO what JSON-escaping PROJECT_PATH produces. A
+    // dedupe keyed on the variant string with plain first-key-wins hands the
+    // string to whichever env entry was enumerated first -- PROJECT_PATH -- and
+    // the real credential in the output gets reported as a path.
+    const projectPath = "C:\\ws\\svc-a";
+    const apiToken = JSON.stringify(projectPath).slice(1, -1);
+    expect(apiToken).not.toBe(projectPath);
+    // PROJECT_PATH is enumerated first, which is what puts its derived variant
+    // ahead of API_TOKEN's raw value in insertion order.
+    const config = makeLocalConfig({ env: { PROJECT_PATH: projectPath, API_TOKEN: apiToken } });
+
+    _sdkBehavior.clientConnect = () => {
+      _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`rejected credential ${apiToken}`));
+      return Promise.reject(new Error("handshake failed"));
+    };
+
+    let err: ActivationError | undefined;
+    try {
+      await connectToUpstream(config);
+    } catch (e) {
+      err = e as ActivationError;
+    }
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(err!.stderrTail).not.toContain(apiToken);
+    expect(err!.stderrTail).toContain("***API_TOKEN***");
+    expect(err!.stderrTail).not.toContain("***PROJECT_PATH***");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3323,6 +3589,87 @@ describe("connectToUpstream remote headers", () => {
     );
 
     expect(String((err as Error).message)).not.toContain(secret);
+  });
+
+  it("redacts a header value the gateway echoed back JSON-ESCAPED", async () => {
+    // The remote half of the JSON-escaping leak. validateHeaders is the
+    // runtime's own `Headers` parser, which refuses only line breaks and
+    // control characters -- a quote and a backslash are both legal in a header
+    // value, so a token carrying either is reachable here. The gateway's error
+    // body is JSON, so what comes back is the ESCAPED form: `\"` where the
+    // value has `"` and `\\` where it has `\`. The stored value matches none of
+    // that, so before the variant list the whole token landed in an
+    // ActivationError that is logged, recorded in activationFailures AND
+    // rendered into the activate result the model reads -- recoverable exactly
+    // with one JSON.parse.
+    const token = 'sk_live_"quoted"\\slash\\_9fJ2sQx1TvB';
+    const escaped = JSON.stringify(token).slice(1, -1);
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(
+        new Error(`Error POSTing to endpoint: ${JSON.stringify({ error: "invalid_api_key", sent: token })}`),
+      );
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: token } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(String((err as Error).message)).not.toContain(escaped);
+    // The high-entropy tail of the token is what an attacker needs; assert it
+    // is gone rather than trusting the whole-string absence check alone.
+    expect(String((err as Error).message)).not.toContain("9fJ2sQx1TvB");
+    expect(String((err as Error).message)).toContain("***Authorization***");
+  });
+
+  it("redacts a base64-alphabet token the gateway PERCENT-ENCODED into a redirect", async () => {
+    // `+`, `/` and `=` are exactly the characters encodeURIComponent rewrites,
+    // and exactly the ones a base64-shaped credential is made of. A gateway
+    // that bounces the failed request through a login redirect, or quotes the
+    // query string it received, echoes the token as %2B / %2F / %3D -- a string
+    // that shares no substring with the stored value, so nothing matched and no
+    // marker was emitted.
+    const token = "AKIA+9fJ2sQ/x1TvB=";
+    const encoded = encodeURIComponent(token);
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(new Error(`Error POSTing to endpoint: 302 -> https://gw.example.test/login?token=${encoded}`));
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: token } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(String((err as Error).message)).not.toContain(encoded);
+    expect(String((err as Error).message)).not.toContain("9fJ2sQ");
+    expect(String((err as Error).message)).toContain("***Authorization***");
+  });
+
+  it("redacts a header value the gateway echoed back HTML-ESCAPED in an error page", async () => {
+    // A remote gateway answering with an HTML error page is ordinary -- an auth
+    // proxy, a WAF, a load balancer in front of the MCP endpoint -- and the
+    // streamable-http transport puts response.text() straight into the error
+    // it throws. HTML escaping is NOT covered by the JSON variant: the two
+    // produce different byte strings for the one character they share, so a
+    // token carrying a quote survives an HTML echo whole and with no marker
+    // saying a credential was involved.
+    const token = 'sk_live_"q"_9fJ2sQx1TvB';
+    const htmlEscaped = "sk_live_&quot;q&quot;_9fJ2sQx1TvB";
+    const jsonEscaped = JSON.stringify(token).slice(1, -1);
+    // The premise, pinned: the JSON form does not contain the HTML form, so
+    // matching one cannot match the other.
+    expect(htmlEscaped).not.toBe(jsonEscaped);
+    expect(htmlEscaped).not.toContain(jsonEscaped);
+
+    _sdkBehavior.clientConnect = () =>
+      Promise.reject(new Error(`Error POSTing to endpoint: <p>rejected key ${htmlEscaped}</p>`));
+
+    const err = await connectToUpstream(makeRemoteConfig({ headers: { Authorization: token } })).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(ActivationError);
+    expect(String((err as Error).message)).not.toContain(htmlEscaped);
+    expect(String((err as Error).message)).not.toContain("9fJ2sQx1TvB");
+    expect(String((err as Error).message)).toContain("***Authorization***");
   });
 
   it("still warns about env on a remote, and now points at headers", async () => {
