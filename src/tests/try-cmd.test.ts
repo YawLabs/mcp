@@ -201,9 +201,23 @@ describe("parseTryArgs", () => {
     // both were accepted by the parser below and discoverable nowhere. The
     // line is derived from the table now; this pins the two together so a
     // seventh target cannot desync them again.
+    //
+    // Asserted against the --client LINE, not the whole usage blob. "cursor"
+    // and "vscode" both occur elsewhere in the text -- the --yes paragraph
+    // names .cursor/mcp.json and .vscode/mcp.json -- so a toContain over the
+    // blob stayed green with either one dropped from the list, passing on
+    // exactly the desync it was written to catch. Order is asserted too: the
+    // line is a map over the table, so it should read in table order.
+    const marker = "--client <name>";
+    const clientLine = TRY_USAGE.split("\n").find((l) => l.includes(marker)) ?? "";
+    const listed = clientLine
+      .slice(clientLine.indexOf(marker) + marker.length)
+      .split("|")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    expect(listed).toEqual(INSTALL_TARGETS.map((t) => t.clientId));
     for (const target of INSTALL_TARGETS) {
       expect(parseTryArgs(["demo", "--client", target.clientId]).ok).toBe(true);
-      expect(TRY_USAGE).toContain(target.clientId);
     }
   });
 });

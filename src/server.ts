@@ -2507,15 +2507,6 @@ export class ConnectServer {
     const exposure = resolveToolExposure();
     const isAdvertised = (namespace: string): boolean => exposure === "full" || this.sessionActivated.has(namespace);
 
-    // One predicate behind every count that claims to describe tools/list.
-    // A tool hidden by a filter and a tool hidden by a deny both leave the
-    // advertised set, so both leave these numbers -- the difference between
-    // them is what happens on a CALL, not on a list.
-    const visibleTools = <T extends { name: string }>(namespace: string, tools: T[]): T[] => {
-      const f = this.toolFilters.get(namespace);
-      return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
-    };
-
     // The SESSION token total, computed over every live connection rather than
     // accumulated inside the card loop below. Two reasons, one new and one
     // pre-existing. New: the loop can now render a single focused server, and a
@@ -2535,7 +2526,7 @@ export class ConnectServer {
     for (const conn of this.connections.values()) {
       const ns = conn.config.namespace;
       if (conn.status !== "connected" || !isAdvertised(ns)) continue;
-      const visible = visibleTools(ns, conn.tools);
+      const visible = this.visibleTools(ns, conn.tools);
       if (visible.length > 0) totalContextTokens += estimateFromConnectedTools(visible).tokens;
     }
 
@@ -2546,7 +2537,7 @@ export class ConnectServer {
       // still shown as the denominator so the model sees what's hidden.
       const filter = this.toolFilters.get(server.namespace);
       const total = connection?.tools.length ?? 0;
-      const exposed = connection ? visibleTools(server.namespace, connection.tools).length : 0;
+      const exposed = connection ? this.visibleTools(server.namespace, connection.tools).length : 0;
       // The suffix still fires on a FILTER only: it reads `filtered: K of N`,
       // which describes the model's own narrowing. A deny is the user's
       // policy and is reported on the tool, not as a filter the model set.
@@ -2573,7 +2564,7 @@ export class ConnectServer {
       // total, which describes context actually spent.
       let costLabel = "";
       if (connection && connection.tools.length > 0) {
-        const visible = visibleTools(server.namespace, connection.tools);
+        const visible = this.visibleTools(server.namespace, connection.tools);
         if (visible.length > 0) {
           const sample = estimateFromConnectedTools(visible);
           costLabel = ` — ${formatCostLabel(sample)}`;
@@ -2647,7 +2638,7 @@ export class ConnectServer {
       // activated -- under gateway exposure tools/list withholds its tools, so
       // without this the names appear NOWHERE in the session.
       //
-      // RAW connection.tools, not visibleTools(): as the label below says, this
+      // RAW connection.tools, not this.visibleTools(): as the label below says,
       // line describes what the SERVER offers, with policy annotated rather
       // than omitted. Both shapes carry a bare `name`, which is all it reads.
       if (!connection || focused) {
@@ -2774,7 +2765,7 @@ export class ConnectServer {
     const totalTools = Array.from(this.connections.values()).reduce((sum, c) => {
       const ns = c.config.namespace;
       if (c.status !== "connected" || !isAdvertised(ns)) return sum;
-      return sum + visibleTools(ns, c.tools).length;
+      return sum + this.visibleTools(ns, c.tools).length;
     }, 0);
     const tokenSummary = totalContextTokens > 0 ? ` (~${totalContextTokens.toLocaleString()} tokens)` : "";
     lines.push(`\n${activeCount} loaded in this session, ${totalTools} tools in context${tokenSummary}.`);
@@ -3052,6 +3043,21 @@ export class ConnectServer {
   // byte-identical modal inside the same activate call -- spending the whole
   // budget (and three spawn attempts plus their retry sleeps) before the user
   // has any chance to go fix the value somewhere else.
+  /** One predicate behind every count that claims to describe tools/list.
+   *  A tool hidden by a FILTER and a tool hidden by a DENY both leave the
+   *  advertised set, so both leave these numbers -- the difference between
+   *  them is what happens on a CALL, not on a list.
+   *
+   *  On the class rather than inside handleDiscover because activate makes the
+   *  same claim and got it wrong: both of its messages name a tool count, and
+   *  counting with the deny alone over-reported the surface of the very call
+   *  that had just narrowed it -- activate({server, tools: [...]}) installs the
+   *  filter BEFORE the connect loop runs. One predicate, one place. */
+  private visibleTools<T extends { name: string }>(namespace: string, tools: T[]): T[] {
+    const f = this.toolFilters.get(namespace);
+    return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
+  }
+
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
@@ -3063,9 +3069,14 @@ export class ConnectServer {
     if (existing && existing.status === "connected") {
       progress?.(`"${namespace}" already loaded`);
       // The same predicate the fresh-connect path counts with, and the same one
-      // tools/list applies. The raw inventory reports a number that includes
-      // tools no client can see and the gate would refuse.
-      const visible = existing.tools.filter((t) => !this.isToolDenied(t.namespacedName)).length;
+      // tools/list applies -- filter AND deny, not deny alone. The raw inventory
+      // reports a number that includes tools no client can see and the gate
+      // would refuse; counting with the deny alone then over-reported the very
+      // call that had just narrowed the surface, because
+      // activate({server, tools: [...]}) installs the filter before this loop
+      // runs. A re-activation narrowing gh to one tool answered "already loaded
+      // with 2 tools" while the tools/list it triggered carried one.
+      const visible = this.visibleTools(namespace, existing.tools).length;
       return {
         ok: true,
         isChanged: false,
@@ -3207,8 +3218,11 @@ export class ConnectServer {
           // The same predicate tools/list uses. Announcing the raw inventory
           // told the model a denied tool had just been loaded, and the next
           // call to it was refused by the gate -- the one advertised-surface
-          // claim the deny did not already cover.
-          const visible = connection.tools.filter((t) => !this.isToolDenied(t.namespacedName));
+          // claim the deny did not already cover. The FILTER belongs here for
+          // the same reason: a first activate carrying tools: [...] installs it
+          // before this runs, and this message ENUMERATES the names, so counting
+          // deny-only handed the model back the very tools it asked to hide.
+          const visible = this.visibleTools(namespace, connection.tools);
           const toolNames = visible.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
           // server isn't permanently demoted for a transient past failure.

@@ -1004,6 +1004,21 @@ describe("ConnectServer", () => {
       expect(priv.idleCallCounts.get("gh")).toBe(0);
     });
 
+    it("names only the filtered tools in the very call that installs the filter", async () => {
+      // handleActivate installs the tools filter BEFORE the connect loop, so
+      // this message is rendered with it live. Counting and naming with the
+      // deny alone handed the model back the names it had just asked to hide --
+      // and tools/list, which applies both, then carried fewer tools than the
+      // activate that loaded them said it had.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "list_prs"]));
+
+      const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
+      expect(text).toContain("1 tools: gh_create_issue");
+      expect(text).not.toContain("gh_list_prs");
+    });
+
     it("retries on first failure", async () => {
       const priv = getPrivate(server);
       const config = makeServerConfig({ namespace: "gh" });
@@ -5063,6 +5078,21 @@ describe("blockedTools deny gate", () => {
     withDeny(priv, ["gh_delete_repo"]);
 
     const text = (await priv.handleActivate(["gh"])).content[0].text;
+    expect(text).toContain("already loaded with 1 tools");
+  });
+
+  it("counts the tools filter too, not just the deny", async () => {
+    // The sibling above covers the deny. A FILTER hides a tool from tools/list
+    // just as completely -- the difference is what happens on a CALL -- and it
+    // is installed by the same activate that lands on this early return, so
+    // counting deny-only over-reported the surface of the call that had just
+    // narrowed it. No deny here at all: the filter alone has to move the count.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+    priv.profile = null;
+
+    const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
     expect(text).toContain("already loaded with 1 tools");
   });
 

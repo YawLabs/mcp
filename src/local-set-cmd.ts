@@ -395,14 +395,68 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       return { exitCode: 1, written: [] };
     }
 
+    // The entry env, and every map derived from it below, is PROTOTYPE-LESS.
+    // parseAssignment puts no name rule on an env key, so a bare lookup on a
+    // map that inherits Object.prototype answers an ABSENT key named after one
+    // of its members -- constructor, toString, valueOf, hasOwnProperty -- with
+    // a FUNCTION rather than undefined. That made `set gh env.constructor=`
+    // report a broken field in the user file ("is a function ... remove it by
+    // hand") over a key that was never there: the same false-report class the
+    // refusal below exists to prevent, produced by the refusal itself.
+    // describeJsonShape answering "a function" is the tell -- no JSON parse
+    // can produce one.
+    //
+    // Object.assign(Object.create(null), ...) at EACH map rather than a spread
+    // of this one: `{ ...protoLess }` builds a fresh object, which gets
+    // Object.prototype back. So the guarantee is re-established per map, and
+    // the two that need it are the ones read by bare key -- projectedEnv and
+    // liveEnv. (This one is copied FROM, and its only read tests === "string",
+    // which no inherited member satisfies.)
+    const originalEnv: Record<string, unknown> = Object.assign(
+      Object.create(null),
+      (entry.env as Record<string, unknown> | undefined) ?? {},
+    );
+
+    // A clear whose stored value is NOT a string is refused rather than
+    // applied: the key is in the file and this run leaves it there, so
+    // reporting success over it would be the CLI claiming an edit it had not
+    // made. (The shape guard above rules out a non-map env; this is a
+    // non-string VALUE inside a real map.)
+    //
+    // Decided HERE, above the confirmation gate, rather than in the apply loop:
+    // down there a mixed run -- `env.A= env.B=`, A a string and B a number --
+    // prompted for A irreversible clear, took the yes, and only THEN bailed on
+    // B, leaving the user believing a drop they had just confirmed had
+    // happened. Nothing is written before the loop single atomic write either
+    // way, so only the order the user sees differs.
+    //
+    // Walked in assignment ORDER against a projected map rather than read off
+    // the original, so an earlier edit in the SAME run counts: `env.B=x env.B=`
+    // clears a value this run wrote, and is fine.
+    const projectedEnv: Record<string, unknown> = Object.assign(Object.create(null), originalEnv);
+    for (const a of assignments) {
+      if (a.field !== "env") continue;
+      const key = a.key as string;
+      if (a.value !== undefined) {
+        projectedEnv[key] = a.value;
+        continue;
+      }
+      const current = projectedEnv[key];
+      if (current !== undefined && typeof current !== "string") {
+        printErr(
+          `yaw-mcp set: env.${key} on "${namespace}" is ${describeJsonShape(current)} in ${path}, not a string -- remove it by hand.`,
+        );
+        printErr("  Nothing was written; re-run once that field is a string or gone.");
+        return { exitCode: 1, written: [] };
+      }
+      delete projectedEnv[key];
+    }
+
     // A clear that DROPS a stored value is the one irreversible edit here, so
     // it is confirmed. Setting or overwriting is not: the previous value is
     // shown in the transcript either way.
     const droppingEnv = assignments.filter(
-      (a) =>
-        a.field === "env" &&
-        a.value === undefined &&
-        typeof (entry.env as Record<string, unknown> | undefined)?.[a.key as string] === "string",
+      (a) => a.field === "env" && a.value === undefined && typeof originalEnv[a.key as string] === "string",
     );
     if (droppingEnv.length > 0 && !opts.force) {
       const names = droppingEnv.map((a) => a.key).join(", ");
@@ -438,7 +492,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     // the original for every assignment made a run that clears two keys see
     // the pre-run map both times, so the second clear still believed a sibling
     // survived and left an empty `"env": {}` husk behind.
-    const liveEnv: Record<string, unknown> = { ...((entry.env as Record<string, unknown> | undefined) ?? {}) };
+    const liveEnv: Record<string, unknown> = Object.assign(Object.create(null), originalEnv);
     // Same reason, for the scalars: the loop below used to compare against
     // the pre-run entry while the TEXT it edits accumulates, so `set gh
     // runtime=oam runtime=node` decided the second edit was redundant and
@@ -449,20 +503,10 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       if (a.field === "env") {
         const current = liveEnv[a.key as string];
         if (a.value === undefined) {
-          // PRESENT but not a string is not "already unset": the key is in the
-          // file and this run leaves it there, so reporting success over it was
-          // the CLI claiming an edit it had not made. The guard above rules out
-          // a non-map env, not a non-string VALUE inside a real map, and the
-          // delete is refused rather than attempted because the file is the
-          // user's to fix. Nothing has been written at this point -- the single
-          // atomic write happens after this loop -- so bailing here leaves
-          // bundles.json exactly as it was found.
-          if (current !== undefined && typeof current !== "string") {
-            printErr(
-              `yaw-mcp set: env.${a.key} on "${namespace}" is ${describeJsonShape(current)} in ${path}, not a string -- remove it by hand.`,
-            );
-            return { exitCode: 1, written: [] };
-          }
+          // Present-but-not-a-string was refused by the pre-flight walk above,
+          // which projects these same assignments in the same order -- so by
+          // here `current` is a string or absent, and the delete below cannot
+          // meet a shape jsonc-parser would throw on.
           if (current === undefined) {
             applied.push(`env.${a.key}: already unset`);
             jsonUnchanged.push({ field: "env", key: a.key });

@@ -373,6 +373,46 @@ describe("runSet -- an env this command cannot edit", () => {
     expect(cap.text()).not.toContain("already unset");
     expect(readFileSync(bundlesPath(), "utf8")).toBe(body);
   });
+
+  it("reports an ABSENT key named after an Object.prototype member as unset", async () => {
+    // The map this reads was a spread literal, so it inherited Object.prototype
+    // and a lookup for an absent "constructor" came back with a FUNCTION --
+    // non-undefined and not a string, which is exactly what the refusal above
+    // tests for. So the CLI reported a broken field in the user file over a key
+    // that was never in it, the same false-report class that refusal exists to
+    // prevent. Nothing else stops this: parseAssignment puts no name rule on an
+    // env key. "is a function" was the tell -- no JSON parse can produce one.
+    const body = withEnv('{ "TOKEN": "x" }');
+    writeBundles(body);
+    for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+      const cap = capture();
+      const r = await runSet({ target: "gh", assignments: [`env.${name}=`], home: synthHome, ...cap });
+      expect(r.exitCode, name).toBe(0);
+      expect(cap.text(), name).toContain("already unset");
+      expect(cap.errText(), name).not.toContain("not a string");
+      expect(readFileSync(bundlesPath(), "utf8"), name).toBe(body);
+    }
+  });
+
+  it("refuses the unclearable key BEFORE prompting about the clearable one", async () => {
+    // A mixed run: A is a string, so clearing it is the irreversible edit that
+    // prompts; B is a number, so it is refused. The refusal used to sit inside
+    // the apply loop, AFTER the confirmation gate -- so the user was asked to
+    // confirm dropping A, answered yes, and only then hit the bail on B with
+    // nothing written, left believing the drop they had just confirmed had
+    // happened. Exit 1 rather than 2 is what proves the ordering here: 2 is the
+    // non-TTY stand-in for the prompt, so seeing 1 means the gate never ran.
+    const body = withEnv('{ "A": "secret", "B": 5 }');
+    writeBundles(body);
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["env.A=", "env.B="], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain("env.B");
+    expect(cap.errText()).toContain("Nothing was written");
+    expect(cap.errText()).not.toContain("This clears a stored value");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(body);
+  });
 });
 
 describe("runSet -- target resolution", () => {
