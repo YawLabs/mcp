@@ -1245,8 +1245,17 @@ function resolveUpsertTarget(
   // to hand-add a remote server -- counts as a change too: joining only
   // command/args rendered it as "" and a "nothing stored" guard then
   // swallowed the note, while the merge carried the stale url along.
+  //
+  // The gate asks whether the incoming entry has a launch at all, not whether
+  // it is a stdio one. Keying on `incoming.command` meant the note fired for
+  // remote -> stdio but never for stdio -> remote: `add <name> --url ...` over
+  // an app-added stdio entry exited 0 with a bare "Updated" line, silently
+  // converting someone's one-click-installed server into a remote endpoint --
+  // the exact swap this note exists to make loud, in the direction that
+  // became reachable when `add --url` shipped.
   let launchChanged: LaunchChange | undefined;
-  if (typeof stored.slug !== "string" && typeof incoming.command === "string") {
+  const incomingHasLaunch = typeof incoming.command === "string" || typeof incoming.url === "string";
+  if (typeof stored.slug !== "string" && incomingHasLaunch) {
     const from = launchShapeOf(stored);
     const to = launchShapeOf(incoming);
     if (!sameLaunch(from, to)) launchChanged = { from, to };

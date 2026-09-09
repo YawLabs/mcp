@@ -1332,24 +1332,30 @@ async function collectVaultStatus(opts: {
   const refs: VaultStatus["refs"] = [];
   const malformed: VaultStatus["malformed"] = [];
   for (const s of opts.servers) {
-    // LOCAL servers only. A remote entry's env is never sent anywhere --
-    // upstream.ts logs "Ignoring env on a remote server" and connects
-    // unauthenticated -- so resolveServerEnv never runs for one and no
-    // passphrase changes its outcome. Listing it here would put it under the
-    // "these servers FAIL TO START while the vault is locked" note, which is
-    // simply untrue of a remote: it starts fine and gets a 401 from the far
-    // end. A diagnostic that invents a cause is worse than one that says
-    // nothing, so the vault section stays silent about remotes rather than
-    // sending the user to unlock a vault that was never in the path.
-    if (s.type === "remote") continue;
+    // Which map carries the refs depends on the server's shape, and getting
+    // this wrong in either direction invents a cause or hides a real one.
+    //
+    // A LOCAL server's credentials ride in `env`, substituted into the child
+    // at spawn. A REMOTE server spawns nothing, so its `env` is ignored
+    // outright (upstream.ts warns and connects without it) -- listing that
+    // here would send the user to unlock a vault that was never in the path.
+    // Its `headers` ARE sent, though, resolved through the same fail-closed
+    // path, so a locked vault or a missing name refuses the CONNECT. That is
+    // exactly what this section exists to explain.
+    //
+    // Reading `env` for a remote (or `headers` for a local, which upstream
+    // never sends) is what the old blanket `if (s.type === "remote") continue`
+    // was avoiding -- correctly, until `headers` existed. Now the fix is to
+    // pick the right map rather than to skip the server.
+    const refSource = s.type === "remote" ? s.headers : s.env;
     // secrets-vault's shared scanner, not a local matchAll over SECRET_REF_RE:
     // that object carries /g and is module-shared, so scanning against it
     // directly leaves a lastIndex other callers trip over. This loop used to be
     // a hand copy of collectSecretRefNames re-deriving that rule, as did
     // meta-tools.ts's and upstream.ts's.
-    const names = collectSecretRefNames(s.env);
+    const names = collectSecretRefNames(refSource);
     if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
-    const malformedRefs = collectMalformedSecretRefs(s.env);
+    const malformedRefs = collectMalformedSecretRefs(refSource);
     if (malformedRefs.length > 0) malformed.push({ namespace: s.namespace, refs: malformedRefs });
   }
 
@@ -1405,7 +1411,7 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
   }
   print(`  passphrase: ${status.passphraseSet ? "set in this environment" : "not set in this environment"}`);
   if (status.refs.length === 0) {
-    print("  refs:       no server env references ${secret:NAME}");
+    print("  refs:       no server env or headers reference ${secret:NAME}");
   } else {
     print("  refs:");
     for (const r of status.refs) {
@@ -1422,8 +1428,11 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
     }
   }
   if (status.refs.length > 0 && !status.passphraseSet) {
-    print("  note:       the servers above FAIL TO START while the vault is locked -- yaw-mcp");
-    print("              refuses the spawn rather than passing the literal placeholder through.");
+    // "start or connect", because the section now covers both shapes: a local
+    // server is refused at SPAWN and a remote one at CONNECT, and naming only
+    // the spawn would read as not applying to the remote entries listed above.
+    print("  note:       the servers above FAIL TO START OR CONNECT while the vault is locked -- yaw-mcp");
+    print("              refuses it rather than passing the literal placeholder through.");
     print("              Set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's OWN env (the `env` block of");
     print("              the yaw-mcp entry in your MCP client config), NOT in the upstream");
     print("              server's -- it is stripped from every child env. A client that");
@@ -1461,6 +1470,9 @@ interface OamRuntimeStatus {
     namespace: string;
     command: string | undefined;
     env: Record<string, string> | undefined;
+    /** Remote-only, and the reason the vault section reads it: a remote entry
+     *  spawns nothing, so its credentials ride here rather than in `env`. */
+    headers: Record<string, string> | undefined;
     type: "local" | "remote";
     info: ServerRuntimeInfo;
   }>;
@@ -1578,6 +1590,7 @@ async function collectOamRuntimeStatus(opts: {
     namespace: s.namespace,
     command: s.command,
     env: s.env,
+    headers: s.headers,
     type: s.type,
     info: describeServerRuntime(s, dflt.runtime, probe),
   }));

@@ -481,6 +481,99 @@ describe("runAdd", () => {
     expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
   });
 
+  it("warns when a header references a secret the vault does not hold", async () => {
+    // Otherwise the refusal surfaces in the user's MCP client at the next
+    // session, far from the command that caused it. A warning, not a refusal:
+    // storing the secret after wiring the server is a reasonable order.
+    const io2 = captureIO();
+    const r = await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:nope}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const err = io2.err.join("");
+    expect(err).toContain("nope");
+    expect(err).toContain("not stored in your vault");
+    expect(err).toContain("yaw-mcp secrets set nope");
+  });
+
+  it("stays quiet when the referenced secret IS stored", async () => {
+    // The other half: a warning that fires on a correctly-configured entry is
+    // noise that trains the user to ignore it.
+    // A minimal on-disk vault. The check reads NAMES only (listKeys), never a
+    // value, so an entry needs no real ciphertext -- and writing the file
+    // directly keeps this test off the passphrase/KDF path it is not about.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "secrets.json"),
+      JSON.stringify({ salt: Buffer.alloc(16).toString("base64"), entries: { realkey: {} } }),
+    );
+    const io2 = captureIO();
+    await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:realkey}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("is silent about a vault it cannot read, rather than guessing", async () => {
+    // No vault at all is the ordinary first-run state; failing or nagging
+    // there would fire on every add before the user has stored anything.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "plain",
+      command: "npx -y plain-mcp",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("says so out loud when a --url add converts a slug-less stdio entry", async () => {
+    // The note is what stops someone's one-click-installed server being turned
+    // into a remote endpoint silently. It used to be gated on the INCOMING
+    // entry having a command, so it fired for remote -> stdio and never for
+    // stdio -> remote -- the direction that only became reachable when
+    // `add --url` shipped.
+    const io2 = captureIO();
+    const common = {
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, slug: "appadded", command: "npx -y old-mcp" });
+    // Emulate an app-written entry: no slug, which is the weaker identity
+    // signal the note exists to protect.
+    const file = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { servers: Array<Record<string, unknown>> };
+    for (const srv of parsed.servers) delete srv.slug;
+    writeFileSync(file, JSON.stringify(parsed));
+
+    io2.err.length = 0;
+    await runAdd({ ...common, slug: "appadded", url: "https://c.test/mcp" });
+    const err = io2.err.join("");
+    expect(err).toContain("launch command changed");
+    expect(err).toContain("npx -y old-mcp");
+    expect(err).toContain("HTTP https://c.test/mcp");
+  });
+
   it("drops the stored headers when a remote entry is converted back to local", async () => {
     // Through two real runAdd calls against a real bundles.json, because the
     // bug is what ends up ON DISK. `headers` belongs to the remote shape

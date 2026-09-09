@@ -38,6 +38,7 @@ import {
 } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
+import { collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
 // control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
@@ -344,11 +345,53 @@ function ambientOnlyRequiredKeys(
  *  and it used to return before either note, so `add --dry-run` said nothing
  *  about the ambient var the server would depend on, nor about the project
  *  file that would shadow the write. stderr so both survive --json. */
+/** Names referenced by this entry that the vault does not hold.
+ *
+ *  Read WITHOUT the passphrase: listKeys reads entry names off the on-disk
+ *  file, and only a value needs unlocking -- so this works in the ordinary
+ *  case where `add` is run in a shell that has no YAW_MCP_VAULT_PASSPHRASE.
+ *
+ *  Returns [] on any read problem. A missing or unreadable vault is not
+ *  something to fail an `add` over, and a diagnostic that guesses is worse
+ *  than none: the vault section of `yaw-mcp doctor` is the surface that
+ *  reports vault trouble properly. */
+async function danglingSecretRefs(entry: Partial<UpstreamServerConfig>, home: string): Promise<string[]> {
+  const referenced = new Set<string>([...collectSecretRefNames(entry.env), ...collectSecretRefNames(entry.headers)]);
+  if (referenced.size === 0) return [];
+  try {
+    const vault = await loadVault(vaultPath(home));
+    const stored = new Set(vault ? listKeys(vault) : []);
+    return [...referenced].filter((n) => !stored.has(n)).sort();
+  } catch {
+    return [];
+  }
+}
+
 async function printPostWriteNotes(
   printErr: (s: string) => void,
-  opts: { ambientOnly: string[]; cwd: string; home: string; env: NodeJS.ProcessEnv; dryRun: boolean },
+  opts: {
+    ambientOnly: string[];
+    cwd: string;
+    home: string;
+    env: NodeJS.ProcessEnv;
+    dryRun: boolean;
+    dangling: string[];
+  },
 ): Promise<void> {
   const { ambientOnly, dryRun } = opts;
+  // A ${secret:NAME} the vault does not hold is a spawn/connect refusal
+  // waiting to happen, and the user finds out in their MCP client at the next
+  // session -- far from the command that caused it. Says so here instead, in
+  // the same breath as the write. A WARNING rather than a refusal: storing the
+  // secret after wiring the server is a perfectly reasonable order, and the
+  // catalog path's required-env gate already refuses the case where the value
+  // is genuinely mandatory up front.
+  if (opts.dangling.length > 0) {
+    const one = opts.dangling.length === 1;
+    printErr(
+      `Note: ${opts.dangling.join(", ")} ${one ? "is" : "are"} referenced by this entry but not stored in your vault; the server will be refused until ${one ? "it is" : "they are"} set. Store ${one ? "it" : "them"} with \`yaw-mcp secrets set ${opts.dangling[0]}\`.`,
+    );
+  }
   if (ambientOnly.length > 0) {
     const one = ambientOnly.length === 1;
     const verb = dryRun ? "would be" : one ? "was" : "were";
@@ -663,6 +706,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     }
     await printPostWriteNotes(printErr, {
       ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, previewEntry, env),
+      // Previewed from the entry the run WOULD write, so --dry-run reports the
+      // same dangling refs the real run would.
+      dangling: await danglingSecretRefs(previewEntry, home),
       cwd,
       home,
       env,
@@ -747,6 +793,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // entry, never the pre-merge input.
   await printPostWriteNotes(printErr, {
     ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, written, env),
+    // From the entry as WRITTEN, not from the flags: a re-add merges with what
+    // was already on disk, so the stored refs are what will actually resolve.
+    dangling: await danglingSecretRefs(written, home),
     cwd,
     home,
     env,
