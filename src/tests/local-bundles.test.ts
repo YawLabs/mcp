@@ -11,7 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BUNDLES_FILENAME,
@@ -527,6 +528,52 @@ describe("loadLocalBundles", () => {
     });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.warnings.filter((w) => w.includes("connectTimeoutMs"))).toEqual([]);
+  });
+
+  it("carries a per-server pinned flag from bundles.json", async () => {
+    // Same fixed-whitelist trap as runtime and connectTimeoutMs: the return of
+    // validateEntry is a closed list, so a field missing from it is DROPPED and
+    // never reaches the reaper. Without this the pin is a no-op that `list` and
+    // `set` both keep reporting as configured.
+    //
+    // Only `true` pins. `false` is the DEFAULT spelled out, so it must land as
+    // undefined rather than as a stored false -- every reader tests the flag as
+    // a boolean, and keeping an explicit false would make the two spellings of
+    // "unpinned" differ on disk for no behavioural difference.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "pin", name: "Pin", command: "npx", args: ["-y", "a"], pinned: true },
+        { namespace: "unpin", name: "Unpin", command: "npx", args: ["-y", "b"], pinned: false },
+        { namespace: "absent", name: "Absent", command: "npx", args: ["-y", "c"] },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers.map((s) => s.pinned)).toEqual([true, undefined, undefined]);
+    expect(r.warnings.filter((w) => w.includes("pinned"))).toEqual([]);
+  });
+
+  it("warns on and drops a non-boolean pinned", async () => {
+    // WARNS rather than dropping in silence, for connectTimeoutMs's reason
+    // rather than runtime's: a pin exists to stop a reap the user is already
+    // watching happen, so `"pinned": "true"` with the quotes leaves the same
+    // server being unloaded every few minutes with nothing anywhere saying the
+    // setting was thrown away. The warning names the namespace AND quotes the
+    // rejected value -- unquoted, `"true"` and `true` read identically.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "str", name: "Str", command: "npx", args: ["-y", "a"], pinned: "true" },
+        { namespace: "num", name: "Num", command: "npx", args: ["-y", "b"], pinned: 1 },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers.map((s) => s.pinned)).toEqual([undefined, undefined]);
+    const pinWarnings = r.warnings.filter((w) => w.includes("pinned"));
+    expect(pinWarnings).toHaveLength(2);
+    expect(pinWarnings[0]).toContain('"str"');
+    expect(pinWarnings[0]).toContain('"true"');
+    expect(pinWarnings[1]).toContain("1");
   });
 
   it("surfaces a top-level defaultRuntime", async () => {
@@ -1350,6 +1397,23 @@ describe("write path births ~/.yaw-mcp/ owner-only (0o700)", () => {
   // so it can only reach its own atomicWriteFile once the dir already exists.
   // Seed via upsert, then exercise the remove write path and confirm it asks
   // for the same owner-only parent rather than dropping the dirMode.
+  it("asks for file mode 0o600 as well, which is what the docs promise", async () => {
+    // The FILE mode, not the dir mode -- a bundles.json entry can carry a
+    // plaintext `--env` credential, and `yaw-mcp add --help` and the README
+    // both tell the user the file is written 0600. Asserted as a REQUEST for
+    // the same reason the dirMode assertions above are: the bits are
+    // meaningful only on POSIX, and this suite also runs on Windows.
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
+    await upsertUserBundle(
+      { namespace: "github", name: "GitHub", command: "npx", args: [], isActive: true, env: { TOKEN: "plain" } },
+      { home: synthHome },
+    );
+    const call = spy.mock.calls.find((c) => c[0] === userBundlesPath());
+    expect(call, "the user bundles file was never written").toBeDefined();
+    expect(call?.[3]).toBe(0o600);
+  });
+
   it("removeUserBundle's write path asks for dirMode 0o700 too", async () => {
     await upsertUserBundle(
       { namespace: "gone", name: "Gone", command: "npx", args: [], isActive: true },
@@ -1657,5 +1721,24 @@ describe("bundlesSignature", () => {
     utimesSync(p("x.json"), pinned, pinned);
     utimesSync(p("y.json"), pinned, pinned);
     expect(bundlesSignature([p("x.json"), p("y.json")])).not.toBe(bundlesSignature([p("y.json"), p("x.json")]));
+  });
+});
+
+// The 0600 promise is made in prose as well as in code, and prose is where it
+// went wrong: mode 0o600 is a POSIX fact. Measured on this Node (22.x) on
+// win32, a file born 0o600 stats back as 0o666 and a chmod to 0o600 leaves it
+// there -- Node maps the mode to the read-only attribute alone -- so an
+// unqualified "file mode 0600" told half the users something untrue about
+// where their plaintext credential ended up. The write path is POSIX-gated
+// (see doUpsertUserBundle); this pins the DOC to the same platform split.
+describe("the README's 0600 claim names the platform it is true on", () => {
+  it("qualifies the bundles.json mode claim rather than stating it flatly", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    const idx = readme.indexOf("stored in plain text in `bundles.json`");
+    expect(idx, "the --env storage sentence moved; re-point this guard").toBeGreaterThan(-1);
+    const sentence = readme.slice(idx, idx + 400);
+    expect(sentence).toContain("0600");
+    // The half that was missing: Windows does not get that mode.
+    expect(sentence).toMatch(/Windows/);
   });
 });

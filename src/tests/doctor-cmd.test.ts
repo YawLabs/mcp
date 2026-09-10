@@ -4085,3 +4085,103 @@ describe("runDoctor -- a TRANSIENT client-config read (EBUSY / EAGAIN)", () => {
     expect(client?.malformed).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The ZERO-SERVER state. `servers (local bundles.json):` is guarded on a
+// non-empty list, so a machine with nothing configured got no line about
+// servers ANYWHERE in the report -- and DIAGNOSIS still said "All good",
+// which reads as a working setup rather than as one that will load nothing.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor — nothing configured", () => {
+  function writeLocalBundles(obj: unknown): void {
+    writeYawMcpConfig(synthHome, "bundles.json", obj);
+  }
+
+  it("says there is no bundles.json at all, and names the command that makes one", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("servers (local bundles.json): none -- no bundles.json on this machine yet.");
+    expect(txt).toContain("yaw-mcp add <slug>");
+    // Informational, NOT a warning: a fresh install with no servers is a
+    // legitimate state, and the warning fold is what drives exit 2.
+    expect(r.exitCode).toBe(0);
+    expect(r.snapshot.config.warnings).toEqual([]);
+  });
+
+  it("distinguishes a bundles.json that exists but defines no servers", async () => {
+    writeLocalBundles({ version: 1, servers: [] });
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("defines no servers");
+    expect(txt).toContain(join(synthHome, ".yaw-mcp", "bundles.json"));
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("points at WARNINGS instead when the file was unusable", async () => {
+    // A file that produced no servers BECAUSE it is broken already has its
+    // reason in WARNINGS (foldBundleWarnings puts it there). Restating it in
+    // the servers line would be a second, differently-worded diagnostic for
+    // one fault -- and "defines no servers" would be an outright wrong
+    // description of a file that could not be parsed.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{ not json");
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+    });
+    const txt = cap.text();
+    expect(txt).toContain("none loaded from");
+    expect(txt).toContain("see WARNINGS below");
+    expect(txt).not.toContain("defines no servers");
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("qualifies the DIAGNOSIS instead of leaving an unqualified All good", async () => {
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    // The verdict stays -- the setup IS healthy -- but it no longer stops at
+    // a sentence that hides the thing a new user is about to ask about.
+    expect(txt).toContain("All good");
+    expect(txt).toContain("No MCP servers are configured yet");
+  });
+
+  it("says it in the --json diagnosis summary too, where Yaw Terminal reads it", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.diagnosis.summary).toContain("All good");
+    expect(parsed.diagnosis.summary).toContain("No MCP servers are configured yet");
+  });
+
+  it("leaves a CONFIGURED machine's report alone", async () => {
+    // The empty-state line must not appear the moment a server exists, and
+    // the DIAGNOSIS must go back to the plain verdict.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"] }],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("servers (local bundles.json):");
+    expect(txt).not.toContain("no bundles.json on this machine yet");
+    expect(txt).not.toContain("No MCP servers are configured yet");
+  });
+});

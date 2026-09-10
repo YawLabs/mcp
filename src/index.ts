@@ -1,17 +1,20 @@
 import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
+import { parseCallArgs, runCall } from "./call-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
 import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
+import { parseImportArgs, runImport } from "./import-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { parseSetArgs, parseToggleArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
-import { log } from "./logger.js";
+import { log, setLogSurface } from "./logger.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "./reset-learning-cmd.js";
 import { parseSearchArgs, runSearch } from "./search-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
+import { decideServeMode } from "./serve-gate.js";
 import { ConnectServer } from "./server.js";
 import { registerShutdownTriggers } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
@@ -94,6 +97,15 @@ function run<T>(
 // subcommand here is local-only.
 const subcommand = process.argv[2];
 
+// Any subcommand at all means a person at a terminal, not a client speaking
+// JSON-RPC -- the server launch is the one invocation with NO first argument
+// (see the else branch at the bottom). Told here rather than inferred inside
+// logger.ts, because only the dispatcher knows which of the two this process
+// is. Structured records stop being written as raw JSON envelopes over the
+// command's own report; warnings and errors survive as plain sentences, and
+// LOG_LEVEL still restores the exact structured stream for support.
+if (subcommand !== undefined) setLogSurface("cli");
+
 if (subcommand === "compliance") {
   dispatch("compliance", runComplianceCommand(process.argv.slice(3)));
 } else if (subcommand === "audit") {
@@ -175,6 +187,20 @@ if (subcommand === "compliance") {
   run("add", parseAddArgs(process.argv.slice(3)), runAdd);
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
+} else if (subcommand === "import") {
+  // CLAUDE_CONFIG_DIR is read HERE, not inside runImport, for the same
+  // hermeticity reason install and uninstall do it: the tests call the runner
+  // directly and must not inherit a wrapper's env. It matters as much on the
+  // READ side -- under a Yaw Mode overlay the servers to import live in the
+  // wrapper's dir, and an import that ignored the redirect would report the
+  // user has none.
+  const claudeConfigDir =
+    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
+      ? process.env.CLAUDE_CONFIG_DIR
+      : undefined;
+  run("import", parseImportArgs(process.argv.slice(3)), (options) => runImport({ ...options, claudeConfigDir }));
+} else if (subcommand === "call") {
+  run("call", parseCallArgs(process.argv.slice(3)), runCall);
 } else if (subcommand === "search") {
   run("search", parseSearchArgs(process.argv.slice(3)), runSearch);
 } else if (subcommand === "set") {
@@ -212,8 +238,13 @@ if (subcommand === "compliance") {
                              server (for that, see \`add\` below). <client> is
                              one of: claude-code, claude-desktop, cursor, vscode,
                              windsurf, gemini-cli.
-    install --list           List which MCP clients are installed on this
-                             machine (read-only; no writes).
+    install --list           Show every MCP client config location on this
+                             machine and whether yaw-mcp is wired into each.
+                             The STATUS column is about YAW-MCP, not about the
+                             client: \`installed\` means yaw-mcp is configured
+                             in that file, \`other-entries\` that the file
+                             exists with other servers in it, \`not installed\`
+                             that the file is absent (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
     uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
                              for Claude Code, its permissions.allow grant).
@@ -223,7 +254,14 @@ if (subcommand === "compliance") {
     add <slug>               Add an MCP server from the yaw.sh/mcp catalog to
                              your local ~/.yaw-mcp/bundles.json so yaw-mcp loads
                              it. Pass required env with --env KEY=value.
-    remove <slug>            Remove a server (by slug or namespace) from
+    import <client>          Adopt the MCP servers a client already has into
+                             your bundles.json, so yaw-mcp serves the servers
+                             you already had instead of starting empty. The
+                             client keeps launching them itself until you say
+                             otherwise, so this offers to remove the originals
+                             (never silently). --dry-run, --scope,
+                             --remove-originals, --keep-originals.
+    remove <slug>            Remove a server (by slug, namespace or name) from
                              bundles.json. Shows the server and the command it
                              launches, then confirms; --force skips the prompt
                              (and is required when there is no TTY to ask on).
@@ -231,13 +269,25 @@ if (subcommand === "compliance") {
                              or description, and show what each match needs
                              before you add it. --json, --limit <n>.
     set <target> k=v ...     Change per-server fields in bundles.json without
-                             hand-editing it: isActive, runtime,
+                             hand-editing it: isActive, pinned, runtime,
                              connectTimeoutMs, description, env.KEY.
-                             Comments in the file survive. --json for JSON.
+                             \`pinned=true\` exempts a server from the idle
+                             reaper -- worth it when the server is expensive
+                             to start and a re-spawn costs more than the
+                             memory it frees. Comments in the file survive.
+                             --json for JSON.
     enable <target>          Mark a server loadable ("isActive": true).
     disable <target>         Keep a server out of the loaded set without
                              removing it, and without dropping its stored env.
     list                     List the servers yaw-mcp loads locally.
+    call <ns> <tool> [json]  Call ONE tool on ONE configured server and print
+                             the result, so a shell script, a git hook or a
+                             non-MCP agent loop can reach your servers without
+                             speaking MCP. The server is spawned for the call
+                             and torn down again. Honours the same policy a
+                             proxied call gets: a disabled server, a profile
+                             block, the compliance floor and \`blockedTools\`
+                             all refuse it. --args, --args-stdin, --json.
     trust                    Approve this project's .yaw-mcp/bundles.json so
                              yaw-mcp loads it. A project file is usually
                              committed to the repo and every server in it is
@@ -308,6 +358,14 @@ if (subcommand === "compliance") {
   for per-subcommand flag details.
 
   Environment variables:
+    YAW_MCP_STDIO                 Set to \`1\` to run the stdio MCP server even
+                               when stdin is a terminal. A bare \`yaw-mcp\` on a
+                               TTY prints what the command is and stops,
+                               because no client is there to speak JSON-RPC;
+                               this forces it to serve anyway (piping requests
+                               in by hand, or a supervisor that spawns it under
+                               a PTY). A client launch uses a pipe and is
+                               unaffected either way.
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
     YAW_MCP_TOOL_TOKEN_CAP        Ceiling on the ESTIMATED tokens of the loaded
                                tool surface, checked alongside SERVER_CAP
@@ -531,41 +589,58 @@ if (subcommand === "compliance") {
     process.stderr.write(`yaw-mcp: unknown flag "${subcommand}".${hint}\n`);
     process.exitCode = 2;
   } else {
-    // Startup failure path. runServer() registers a last-resort
-    // unhandledRejection handler (see below) BEFORE its first await, so a
-    // fatal startup rejection would otherwise be swallowed by that
-    // handler: logged as a JSON line, no server started, and the process
-    // exiting 0 as if all was well. Attaching a real catch here
-    // restores the "print the error and exit 1" contract. It only covers
-    // the startup promise; a genuine POST-startup rejection (an orphaned
-    // upstream connect that rejects late) still lands on the handler
-    // inside runServer, which logs and keeps the server running.
-    //
-    // Be honest about how narrow that is. The two failure modes this
-    // comment used to name cannot reach here:
-    //   * an unreadable config dir -- loadYawMcpConfig is fail-open by
-    //     construction. readConfigAt turns EVERY read/parse error into a
-    //     warning and returns null, and both the legacy-path migration and
-    //     the project-dir walk-up carry their own .catch().
-    //   * a transport that fails to connect -- server.start() is
-    //     fire-and-forget below with its OWN .catch(), which logs "Fatal
-    //     startup error" and calls process.exit(1) directly. It never
-    //     rejects the promise this catch is attached to.
-    // What DOES land here is a throw in runServer's own body before that
-    // hand-off: process.cwd() raising ENOENT on a deleted working dir
-    // inside loadYawMcpConfig, or the ConnectServer constructor throwing.
-    // The branch is a cheap net for those, not the config/transport guard
-    // it was once described as. Startup-failure behavior is otherwise
-    // owned by the server.start() catch.
-    //
-    // Same buffered-write reasoning as dispatch(): set process.exitCode
-    // instead of calling process.exit(), so the stderr write is drained
-    // before Node exits on its own.
-    runServer().catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`yaw-mcp: ${msg}\n`);
-      process.exitCode = 1;
-    });
+    // A bare `yaw-mcp` is BOTH the MCP server launch and the first thing a
+    // new user types. Told apart by stdin, not by argv -- the launch path
+    // passes no flags either, so argv cannot separate them. On a terminal
+    // (and only there) say what this command is and stop; on a pipe -- which
+    // is every real client spawn -- serve exactly as before. See
+    // serve-gate.ts for why `isTTY === true` cannot fire on a client launch.
+    const decision = decideServeMode(process.stdin, process.env);
+    if (decision.kind === "explain") {
+      // stderr + exit 2, not stdout + 0: nothing was started, and a script
+      // that ran `yaw-mcp` expecting a server must see that as a failure
+      // rather than a silent no-op. The body is written the same
+      // exitCode-not-exit way the help branch above is, so a slow pipe
+      // (`yaw-mcp 2>&1 | less`) cannot truncate it.
+      process.stderr.write(decision.text);
+      process.exitCode = 2;
+    } else {
+      // Startup failure path. runServer() registers a last-resort
+      // unhandledRejection handler (see below) BEFORE its first await, so a
+      // fatal startup rejection would otherwise be swallowed by that
+      // handler: logged as a JSON line, no server started, and the process
+      // exiting 0 as if all was well. Attaching a real catch here
+      // restores the "print the error and exit 1" contract. It only covers
+      // the startup promise; a genuine POST-startup rejection (an orphaned
+      // upstream connect that rejects late) still lands on the handler
+      // inside runServer, which logs and keeps the server running.
+      //
+      // Be honest about how narrow that is. The two failure modes this
+      // comment used to name cannot reach here:
+      //   * an unreadable config dir -- loadYawMcpConfig is fail-open by
+      //     construction. readConfigAt turns EVERY read/parse error into a
+      //     warning and returns null, and both the legacy-path migration and
+      //     the project-dir walk-up carry their own .catch().
+      //   * a transport that fails to connect -- server.start() is
+      //     fire-and-forget below with its OWN .catch(), which logs "Fatal
+      //     startup error" and calls process.exit(1) directly. It never
+      //     rejects the promise this catch is attached to.
+      // What DOES land here is a throw in runServer's own body before that
+      // hand-off: process.cwd() raising ENOENT on a deleted working dir
+      // inside loadYawMcpConfig, or the ConnectServer constructor throwing.
+      // The branch is a cheap net for those, not the config/transport guard
+      // it was once described as. Startup-failure behavior is otherwise
+      // owned by the server.start() catch.
+      //
+      // Same buffered-write reasoning as dispatch(): set process.exitCode
+      // instead of calling process.exit(), so the stderr write is drained
+      // before Node exits on its own.
+      runServer().catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`yaw-mcp: ${msg}\n`);
+        process.exitCode = 1;
+      });
+    }
   }
 }
 

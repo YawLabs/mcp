@@ -1794,6 +1794,103 @@ describe("runRemove maps a recorded catalog slug back to its NAME-derived namesp
   });
 });
 
+// An entry with NO catalog slug -- what `yaw-mcp import` writes, and what the
+// Yaw Terminal app and every pre-0.76 `add` wrote -- cannot be reached by the
+// slug path at all: namespacesForStoredSlug matches nothing, so the only
+// handles left are the namespace and whatever deriveNamespace makes of the
+// target. That is enough while the display NAME is already namespace-shaped
+// ("github") and useless the moment it is not ("GitHub Copilot", "server.v2")
+// -- the user is holding the name their client showed them, and the CLI
+// answers "isn't a valid slug or namespace".
+describe("runRemove resolves a slug-less entry by its stored NAME", () => {
+  const writeRaw = (servers: unknown[]): void => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ version: 1, servers }, null, 2));
+  };
+  const rawServers = (): Array<Record<string, unknown>> =>
+    (
+      JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+        servers: Array<Record<string, unknown>>;
+      }
+    ).servers;
+
+  it("removes by a name whose SHAPE is not a slug or a namespace", async () => {
+    writeRaw([{ namespace: "githubcopilot", name: "GitHub Copilot", command: "npx", args: ["-y", "x"] }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GitHub Copilot",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Removed "githubcopilot"/);
+    expect(rawServers()).toHaveLength(0);
+  });
+
+  it("still refuses an odd-shaped target that names NOTHING on disk", async () => {
+    // The shape gate is not deleted, only demoted: it still rejects a target
+    // no stored entry answers to, so `remove GA` against a catalog entry named
+    // "Google Analytics" stays a usage error rather than the exit-0 "nothing
+    // to do" that reads as "already gone".
+    writeRaw([{ namespace: "githubcopilot", name: "GitHub Copilot", command: "npx", args: ["-y", "x"] }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GitHub Copilo",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.errText()).toMatch(/isn't a valid slug or namespace/);
+    expect(rawServers()).toHaveLength(1);
+  });
+
+  it("shows the confirmation preview for a name-matched removal", async () => {
+    // A name match is the WEAKEST identity signal of the three, so it needs
+    // the preview more than the others, not less -- the gate has to fire on
+    // whichever candidate resolved, not only on the literal one.
+    writeRaw([{ namespace: "githubcopilot", name: "GitHub Copilot", command: "npx", args: ["-y", "x"] }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GitHub Copilot",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.text()).toMatch(/namespace: githubcopilot/);
+    expect(rawServers()).toHaveLength(1);
+  });
+
+  it("prefers an exact NAMESPACE match over a name match on another entry", async () => {
+    // Two entries, and one's NAMESPACE is the other's NAME. The literal target
+    // is tried first, so the namespace wins -- otherwise typing the value
+    // `yaw-mcp list` prints in its NAMESPACE column would delete a different
+    // server than the row the user was looking at.
+    writeRaw([
+      { namespace: "alpha", name: "Alpha", command: "npx", args: ["-y", "a"] },
+      { namespace: "beta", name: "alpha", command: "npx", args: ["-y", "b"] },
+    ]);
+    const r = await runRemove({
+      target: "alpha",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawServers().map((s) => s.namespace)).toEqual(["beta"]);
+  });
+});
+
 // `remove` used to delete the entry with no confirmation, on a TTY or off it --
 // the only destructive verb in the CLI without a gate. These lock the gate's
 // two halves (confirm on a TTY, refuse off one) AND the no-op behaviour that
@@ -2539,8 +2636,12 @@ describe("runList", () => {
     const io = captureIO();
     const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
     expect(r.exitCode).toBe(0);
-    // The empty-state hint appears on stdout (same as no-file), but warnings go to stderr.
-    expect(io.text()).toMatch(/No local servers/);
+    // Warnings go to stderr, and stdout now says the file could not be READ
+    // rather than reusing the no-file line -- "No local servers configured.
+    // Add one with `yaw-mcp add <slug>`" was an all-clear plus advice that
+    // does not work over a file `add` refuses too.
+    expect(io.text()).toMatch(/Could not read/);
+    expect(io.text()).not.toMatch(/No local servers/);
     expect(io.errText()).toMatch(/invalid JSON/);
   });
 
@@ -3400,5 +3501,242 @@ describe("runRemove target case handling", () => {
     expect(r.exitCode).toBe(0);
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(loaded.config?.servers ?? []).toEqual([]);
+  });
+});
+
+// --- ship-readiness gaps ----------------------------------------------------
+
+/** A claude-code user-scope config carrying a yaw-mcp launch entry, which is
+ *  what "a client is wired to yaw-mcp" means on disk. ~/.claude.json is the
+ *  claude-code user path on every OS (see pathFor in install-targets.ts), so
+ *  this fixture is platform-independent. */
+function writeWiredClaudeCode(): void {
+  writeFileSync(
+    join(synthHome, ".claude.json"),
+    JSON.stringify({ mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } }, null, 2),
+  );
+}
+
+describe("runAdd -- no MCP client wired", () => {
+  it("says the server will not load anywhere until a client is installed", async () => {
+    // The mirror already exists in `install`: with no servers in bundles.json
+    // it prints "Servers: none configured yet ... Add one with `yaw-mcp add`".
+    // `add` said nothing about the other half, so a first-time user who ran
+    // `add` alone got "Added ... no client restart" and a server no client
+    // could ever reach.
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toContain("yaw-mcp install");
+  });
+
+  it("stays quiet when a client already launches yaw-mcp", async () => {
+    writeWiredClaudeCode();
+    const io = captureIO();
+    await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(io.errText()).not.toContain("yaw-mcp install");
+  });
+
+  it("says it on --dry-run too, in the conditional voice", async () => {
+    // A preview that omits a note the real run prints describes a quieter run
+    // than the one it previews -- the rule every other note here follows.
+    const io = captureIO();
+    await runAdd({
+      slug: "fetch",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(io.errText()).toContain("yaw-mcp install");
+  });
+});
+
+describe("runRemove -- the preview of a REMOTE entry", () => {
+  it("names the header keys it is about to delete, never their values", async () => {
+    // A remote entry keeps its credential in `headers` (env is ignored on one
+    // -- see upstream.ts). The preview listed env keys only, so removing a
+    // remote server showed nothing at all about the credential going with it.
+    writeUserBundles({
+      version: 1,
+      servers: [
+        {
+          namespace: "remotesrv",
+          name: "Remote Srv",
+          type: "remote",
+          transport: "streamable-http",
+          url: "https://example.com/mcp",
+          headers: { Authorization: "Bearer live-token-value" },
+        },
+      ],
+    });
+    const io = captureIO();
+    const r = await runRemove({
+      target: "remotesrv",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // Off a TTY the run refuses -- but it prints the preview first, which is
+    // the whole point of showing a scripted caller what it WOULD have removed.
+    expect(r.exitCode).toBe(2);
+    const all = io.text() + io.errText();
+    expect(all).toContain("Authorization");
+    expect(all).not.toContain("live-token-value");
+  });
+
+  it("says a header value goes with the entry, not just an env value", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [
+        {
+          namespace: "remotesrv",
+          name: "Remote Srv",
+          type: "remote",
+          url: "https://example.com/mcp",
+          headers: { Authorization: "Bearer live-token-value" },
+        },
+      ],
+    });
+    const io = captureIO();
+    await runRemove({
+      target: "remotesrv",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // The CLOSING paragraph, not the field list: the "header names:" line
+    // above it would satisfy a bare /header/ match, so this pins the sentence
+    // that tells the user what the removal destroys.
+    expect(io.text()).toContain("Any env value or header stored on the");
+  });
+
+  it("does not invent a header line for a local entry", async () => {
+    writeUserBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp"] }],
+    });
+    const io = captureIO();
+    await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      isTTY: false,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(io.text()).not.toMatch(/header names:/);
+  });
+});
+
+describe("runAdd / runRemove -- a broken bundles.json is named ONCE", () => {
+  it("does not repeat the absolute path per parse warning", async () => {
+    // The thrown message embeds the file's own warnings, and each warning is
+    // prefixed with the same absolute path the sentence already opens with --
+    // so a file with two warnings printed the path three times in one line.
+    // On a Windows profile path that is most of the terminal width.
+    writeUserBundlesRaw('{ "version": 99 }');
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    const bundles = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const message = io.errText();
+    // The path is still there -- the user has to know which file to fix.
+    expect(message).toContain(bundles);
+    expect(message.split(bundles).length - 1).toBe(1);
+    // ...and the detail it carried is not lost with the prefix.
+    expect(message).toContain("servers");
+  });
+
+  it("names it once from `remove` too -- same message, same writer", async () => {
+    writeUserBundlesRaw('{ "version": 99 }');
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    const bundles = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    expect(io.errText().split(bundles).length - 1).toBe(1);
+  });
+});
+
+describe("runList -- an unreadable bundles.json is not an empty one", () => {
+  it("says the file could not be read instead of `No local servers configured`", async () => {
+    // A directory at the path (the portable stand-in for any unreadable file)
+    // made `list` print the fresh-install line -- "No local servers
+    // configured. Add one with `yaw-mcp add <slug>`" -- under a warning most
+    // readers skim past. That reads as an all-clear over a config yaw-mcp
+    // cannot load, and the advice is wrong: adding a server does not fix it,
+    // and `add` refuses the same file anyway.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), { recursive: true });
+    const io = captureIO();
+    const r = await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).not.toContain("No local servers configured");
+    expect(io.text()).toContain(join(synthHome, CONFIG_DIRNAME, "bundles.json"));
+    // The diagnostic itself still goes to stderr, where it always did.
+    expect(io.errText()).toMatch(/warning:/);
+  });
+
+  it("still says `No local servers configured` when there really are none", async () => {
+    writeUserBundles({ version: 1, servers: [] });
+    const io = captureIO();
+    const r = await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toContain("No local servers configured");
   });
 });

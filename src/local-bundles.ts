@@ -383,6 +383,30 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // explicit `"isActive": false`.
   const isActive = e.isActive !== false;
 
+  // Idle-reaper exemption (types.ts). Carried for the same fixed-whitelist
+  // reason as `runtime`, `connectTimeoutMs` and `complianceGrade` above -- the
+  // return below is a closed list, so a field missing from it is DROPPED and
+  // the reaper never sees the pin.
+  //
+  // Only `true` pins. An explicit `false` normalizes to undefined: it is the
+  // default spelled out, every reader tests the flag as a boolean, and keeping
+  // the stored false would make the two spellings of "unpinned" differ on disk
+  // (and churn configVersion, which hashes the loaded list) for no behavioural
+  // difference.
+  //
+  // A non-boolean WARNS, following connectTimeoutMs rather than runtime: this
+  // is a field whose whole purpose is to stop a teardown the user is already
+  // watching happen, so `"pinned": "true"` with the quotes would leave the same
+  // server being unloaded with nothing anywhere saying the setting was thrown
+  // away. Only a PRESENT key warns -- absent is the normal case for nearly
+  // every entry and must stay silent.
+  const pinned = e.pinned === true ? true : undefined;
+  if (pinned === undefined && e.pinned !== undefined && e.pinned !== false) {
+    warnings.push(
+      `bundles.json: ignoring invalid pinned ${JSON.stringify(e.pinned)} on "${namespace}" (expected true or false)`,
+    );
+  }
+
   // Synthesize an id from the namespace when absent. The id is mainly
   // a stable handle; not strictly needed, but the
   // downstream code paths use it as a stable handle.
@@ -404,6 +428,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     description,
     runtime,
     complianceGrade,
+    pinned,
   };
 }
 
@@ -1094,6 +1119,44 @@ export async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Pr
 // secrets report uses.
 export { isRemoteEntry } from "./types.js";
 
+/**
+ * Namespaces of the RAW entries that answer to `target` by an identity the
+ * entry RECORDS -- its catalog `slug` first, then its display `name`.
+ *
+ * WHY BOTH, AND IN THAT ORDER. `add <slug>` persists the slug because the
+ * namespace derives from the catalog display name, not the slug ("ga" ->
+ * "Google Analytics" -> "googleanalytics"), so neither the literal target nor
+ * deriveNamespace(target) can reach it. That covers a CATALOG server. It
+ * reaches nothing at all for an entry with no slug -- what `yaw-mcp import`
+ * writes, what the Yaw Terminal app writes, what every pre-0.76 `add` wrote --
+ * where the only identity the user has been shown is the display NAME. When
+ * that name is namespace-shaped ("github") deriveNamespace closes the gap; the
+ * moment it is not ("GitHub Copilot", "server.v2") nothing does. The name pass
+ * is what makes the identity the user was shown a usable handle.
+ *
+ * Slug matches come FIRST because a slug is the stronger signal: it was
+ * recorded by a writer, while a name is free text a user can duplicate.
+ * Callers try these candidates in order and stop at the first hit.
+ *
+ * Both comparisons are EXACT and case-sensitive, matching every other lookup
+ * in this file. Shared by `remove` and `set` so the two verbs resolve one
+ * target the same way -- `set` documents itself as taking "the same target
+ * `yaw-mcp remove` takes", and that was true only for as long as both copies
+ * of the scan agreed.
+ */
+export function namespacesForStoredIdentity(target: string, servers: readonly unknown[] | null): string[] {
+  if (servers === null) return [];
+  const bySlug: string[] = [];
+  const byName: string[] = [];
+  for (const s of servers) {
+    const e = s as { slug?: unknown; name?: unknown; namespace?: unknown } | null;
+    if (typeof e?.namespace !== "string") continue;
+    if (e.slug === target) bySlug.push(e.namespace);
+    else if (e.name === target) byName.push(e.namespace);
+  }
+  return [...bySlug, ...byName];
+}
+
 export function deriveNamespace(name: string): string {
   let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (ns.length === 0) return "server";
@@ -1596,6 +1659,15 @@ async function doUpsertUserBundle(
     // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
     // (matching secrets-vault): bundles.json can carry per-server `--env`
     // secrets, so its parent dir must not be group/other-listable.
+    //
+    // "0600" is a POSIX-ONLY claim, and every doc that repeats it has to say
+    // so. Measured on the Node this ships on (22.x, win32): a file born with
+    // mode 0o600 stats back as 0o666, and a follow-up chmod to 0o600 leaves
+    // it at 0o666 -- Node maps the mode to the read-only ATTRIBUTE alone
+    // there, so what actually protects the file is the NTFS ACL it inherits
+    // from the user profile. That is also why the chmod below is POSIX-gated
+    // rather than best-effort everywhere: on Windows it is not a fallback
+    // that might work, it is a call that provably does nothing.
     await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
     if (process.platform !== "win32") {
       try {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseAuditArgs } from "../audit-cmd.js";
 import { parseBundlesArgs } from "../bundles-cmd.js";
+import { parseCallArgs } from "../call-cmd.js";
 import {
   COMPLETION_USAGE,
   parseCompletionArgs,
@@ -10,6 +11,7 @@ import {
 } from "../completion-cmd.js";
 import { parseDoctorArgs } from "../doctor-cmd.js";
 import { parseFoundryArgs } from "../foundry-cmd.js";
+import { parseImportArgs } from "../import-cmd.js";
 import { parseInstallArgs, parseUninstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
 import { parseSetArgs } from "../local-set-cmd.js";
@@ -279,11 +281,13 @@ describe("renderScript — fish", () => {
       );
       expect(line).not.toContain("__fish_seen_subcommand_from");
     }
-    // `--scope` belongs to install and its subtract side alone -- no OTHER
-    // subcommand's guard offers it. Pinned as the exact set rather than a
-    // containment check, so a third subcommand growing a --scope has to come
-    // update this line.
+    // `--scope` belongs to the three client-config verbs alone -- install, its
+    // subtract side, and `import`, which resolves the SAME {client, scope, OS}
+    // path through resolveInstallSite. No other subcommand's guard offers it.
+    // Pinned as the exact set rather than a containment check, so a fourth
+    // subcommand growing a --scope has to come update this line.
     expect(flagLines.filter((l) => l.endsWith(" -l scope")).sort()).toEqual([
+      'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand import" -l scope',
       'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand install" -l scope',
       'complete -c yaw-mcp -n "__yaw_mcp_using_subcommand uninstall" -l scope',
     ]);
@@ -442,7 +446,9 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   install: parseInstallArgs,
   uninstall: parseUninstallArgs,
   add: parseAddArgs,
+  import: parseImportArgs,
   remove: parseRemoveArgs,
+  call: parseCallArgs,
   search: parseSearchArgs,
   set: parseSetArgs,
   // enable/disable share set's parser: they ARE `set <target> isActive=<bool>`.

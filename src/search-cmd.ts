@@ -69,9 +69,28 @@ export function parseSearchArgs(
     }
     if (a === "--limit") {
       const v = argv[i + 1];
-      const n = v === undefined ? Number.NaN : Number(v);
-      if (!Number.isInteger(n) || n < 1 || n > MAX_LIMIT) {
-        return { ok: false, error: `--limit requires a positive integer (1-${MAX_LIMIT})\n${SEARCH_USAGE}` };
+      // Every rejection ECHOES what was rejected. One message for three
+      // different mistakes ("--limit requires a positive integer (1-500)")
+      // left the user comparing it against an argument they could no longer
+      // see -- a typo'd `--limit 2O` and a forgotten value read identically,
+      // and neither said which of the two had happened.
+      if (v === undefined || v.startsWith("--")) {
+        return {
+          ok: false,
+          error: `--limit needs a value: a whole number from 1 to ${MAX_LIMIT}${
+            v === undefined ? ", and none followed it" : `, but the next argument is the flag "${v}"`
+          }.\n${SEARCH_USAGE}`,
+        };
+      }
+      const n = Number(v);
+      if (!Number.isInteger(n)) {
+        return {
+          ok: false,
+          error: `--limit requires a whole number from 1 to ${MAX_LIMIT}; got "${v}".\n${SEARCH_USAGE}`,
+        };
+      }
+      if (n < 1 || n > MAX_LIMIT) {
+        return { ok: false, error: `--limit requires a value from 1 to ${MAX_LIMIT}; got ${n}.\n${SEARCH_USAGE}` };
       }
       opts.limit = n;
       i++;
@@ -173,6 +192,25 @@ export async function runSearch(opts: SearchCommandOptions): Promise<SearchComma
     servers = await fetchCatalog(catalogUrl);
   } catch (e) {
     printErr(`yaw-mcp search: ${(e as Error).message}`);
+    return { exitCode: 1 };
+  }
+
+  // A catalog that fetched fine and holds NOTHING is a source problem, not a
+  // query problem, and the two used to share one message: with zero servers
+  // every query misses, so `yaw-mcp search postgres` answered `No catalog
+  // server matches "postgres"` -- and a bare `yaw-mcp search` answered `No
+  // catalog server matches ""`, which reads like a bug in the tool. Reported
+  // the way a fetch failure is (stderr, exit 1) because it is the same class
+  // of thing: the source could not answer, so there is no result to pipe.
+  // That also keeps --json honest -- it prints no body for an unusable
+  // source, exactly as it already does when the fetch itself fails.
+  if (servers.length === 0) {
+    printErr(
+      `yaw-mcp search: the Yaw MCP catalog at ${catalogUrl} loaded, but lists no servers at all -- there is nothing to search.`,
+    );
+    printErr(
+      "Check the --catalog value or $YAW_MCP_CATALOG_URL if you set one; otherwise the published catalog is empty right now, so try again later.",
+    );
     return { exitCode: 1 };
   }
 

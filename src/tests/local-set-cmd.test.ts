@@ -201,6 +201,38 @@ describe("runSet -- scalar fields", () => {
     }
   });
 
+  it("pins and unpins a server against the idle reaper", async () => {
+    // `pinned` is the write half of the reaper exemption (types.ts). Without a
+    // verb for it the only way to keep an expensive-to-start server loaded was
+    // a hand edit of bundles.json -- a file `add`/`remove` then rewrite
+    // wholesale, dropping the comments around it.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runSet({ target: "gh", assignments: ["pinned=true"], home: synthHome, ...cap });
+    expect(read().servers[0].pinned).toBe(true);
+    expect(cap.text()).toContain("pinned: false -> true");
+
+    const cap2 = capture();
+    await runSet({ target: "gh", assignments: ["pinned=false"], home: synthHome, ...cap2 });
+    expect(read().servers[0].pinned).toBe(false);
+    expect(cap2.text()).toContain("pinned: true -> false");
+  });
+
+  it("treats an absent pinned as false rather than as unset", async () => {
+    // The mirror of the isActive no-op below, in the other direction. Absent
+    // reads as NOT pinned everywhere (validateEntry honours only `true`), so
+    // `pinned=false` on an entry that never carried the key must report no
+    // change instead of dirtying the file to say what it already said.
+    writeBundles(SAMPLE);
+    const before = readFileSync(bundlesPath(), "utf8");
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["pinned=false"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.text()).toContain("pinned: already false");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(before);
+  });
+
   it("reports an edit that was already satisfied without writing", async () => {
     writeBundles(SAMPLE);
     const before = readFileSync(bundlesPath(), "utf8");
@@ -218,7 +250,9 @@ describe("runSet -- env", () => {
   it("sets one variable and leaves the rest of the map alone", async () => {
     writeBundles(SAMPLE);
     const cap = capture();
-    await runSet({ target: "gh", assignments: ["env.GITHUB_TOKEN=new"], home: synthHome, ...cap });
+    // --force because this OVERWRITES a stored value, which is confirmed now;
+    // the subject here is the splice (one key changes, its siblings do not).
+    await runSet({ target: "gh", assignments: ["env.GITHUB_TOKEN=new"], home: synthHome, force: true, ...cap });
     expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "new", OTHER: "o" });
     // The value is never echoed: this output gets pasted into bug reports.
     expect(cap.text()).toContain("env.GITHUB_TOKEN: set (value not shown)");
@@ -233,7 +267,15 @@ describe("runSet -- env", () => {
     // trim is invisible until it stops happening.
     writeBundles(SAMPLE);
     const cap = capture();
-    const r = await runSet({ target: "gh", assignments: ["env.GITHUB_TOKEN=  padded  "], home: synthHome, ...cap });
+    // --force: overwriting a stored value is gated, and the subject here is
+    // the trim, not the gate.
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=  padded  "],
+      home: synthHome,
+      force: true,
+      ...cap,
+    });
     expect(r.exitCode).toBe(0);
     expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "padded", OTHER: "o" });
   });
@@ -363,18 +405,32 @@ describe("runSet -- env", () => {
     }
   });
 
-  it("does not confirm a SET, only a clear", async () => {
-    // Overwriting is recoverable in the sense that matters: the transcript
-    // shows what changed, and the old value was already on disk.
+  it("confirms a SET that lands on a stored value, and only that one", async () => {
+    // This used to read "does not confirm a SET, only a clear", on the theory
+    // that an overwrite is recoverable because "the transcript shows what
+    // changed". It does not: every env surface here redacts the value, so the
+    // replaced credential was unreadable the moment it was replaced. A set
+    // over a STORED value is now gated exactly like a clear; a set of a key
+    // that is not there still writes straight through, because nothing is lost.
     writeBundles(SAMPLE);
-    const r = await runSet({
+    const overwrite = await runSet({
       target: "gh",
       assignments: ["env.GITHUB_TOKEN=other"],
       home: synthHome,
       isTTY: false,
       ...capture(),
     });
-    expect(r.exitCode).toBe(0);
+    expect(overwrite.exitCode).toBe(2);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "t", OTHER: "o" });
+
+    const fresh = await runSet({
+      target: "gh",
+      assignments: ["env.NEW_KEY=other"],
+      home: synthHome,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(fresh.exitCode).toBe(0);
   });
 });
 
@@ -637,6 +693,9 @@ describe("runSet -- output", () => {
       target: "gh",
       assignments: ["isActive=false", "env.GITHUB_TOKEN=shhh"],
       json: true,
+      // --force: the env assignment overwrites a stored value, which is
+      // confirmed now. The subject here is the success envelope's redaction.
+      force: true,
       home: synthHome,
       ...cap,
     });
@@ -684,5 +743,251 @@ describe("runEnableDisable", () => {
     });
     expect(read().servers[0].isActive).toBe(false);
     expect(read().servers[0].runtime).toBeUndefined();
+  });
+});
+
+// --- ship-readiness gaps ----------------------------------------------------
+
+const REMOTE_SAMPLE = `{
+  "version": 1,
+  "servers": [
+    { "namespace": "remote1", "name": "Remote One", "type": "remote", "transport": "streamable-http", "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer live-token" } }
+  ]
+}
+`;
+
+describe("runSet -- env on a REMOTE entry", () => {
+  it("refuses, naming headers as the field that carries the credential", async () => {
+    // A remote server spawns no process, so upstream.ts ignores `env` on it
+    // outright: the old accept-and-write path reported "env.FOO: set" for an
+    // edit that could never reach the server, and `env.FOO=` could never
+    // clear a credential because the credential lives in `headers`.
+    writeBundles(REMOTE_SAMPLE);
+    const cap = capture();
+    const r = await runSet({ target: "remote1", assignments: ["env.FOO=bar"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toContain("headers");
+    // And nothing was written -- the file is byte-identical.
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(REMOTE_SAMPLE);
+  });
+
+  it("refuses a CLEAR too, since the env path cannot reach a header", async () => {
+    writeBundles(REMOTE_SAMPLE);
+    const cap = capture();
+    const r = await runSet({ target: "remote1", assignments: ["env.Authorization="], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain("headers");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(REMOTE_SAMPLE);
+  });
+
+  it("still allows a scalar edit on a remote entry", async () => {
+    // The refusal is scoped to env. isActive/description/connectTimeoutMs all
+    // mean the same thing on a remote entry as on a local one.
+    writeBundles(REMOTE_SAMPLE);
+    const r = await runSet({ target: "remote1", assignments: ["isActive=false"], home: synthHome, ...capture() });
+    expect(r.exitCode).toBe(0);
+    expect(read().servers[0].isActive).toBe(false);
+  });
+});
+
+describe("runSet -- overwriting a stored env value", () => {
+  it("refuses off a TTY without --force: the stored value is destroyed too", async () => {
+    // Overwriting is as irreversible as clearing -- the previous value is gone
+    // from the file either way, and a scripted `set` that silently replaced a
+    // credential was the one destructive edit with no gate.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=new"],
+      home: synthHome,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "t", OTHER: "o" });
+    expect(cap.errText()).toMatch(/refusing to overwrite/);
+  });
+
+  it("--force overwrites without asking", async () => {
+    writeBundles(SAMPLE);
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=new"],
+      home: synthHome,
+      force: true,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "new", OTHER: "o" });
+  });
+
+  it("a yes at the prompt overwrites; a bare Enter does not", async () => {
+    writeBundles(SAMPLE);
+    const declined = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=new"],
+      home: synthHome,
+      promptAnswer: "",
+      ...capture(),
+    });
+    expect(declined.exitCode).toBe(1);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "t", OTHER: "o" });
+
+    const accepted = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=new"],
+      home: synthHome,
+      promptAnswer: "y",
+      ...capture(),
+    });
+    expect(accepted.exitCode).toBe(0);
+    expect(read().servers[0].env).toEqual({ GITHUB_TOKEN: "new", OTHER: "o" });
+  });
+
+  it("does not ask when the key is NEW -- nothing is destroyed", async () => {
+    writeBundles(SAMPLE);
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.BRAND_NEW=x"],
+      home: synthHome,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(read().servers[0].env).toMatchObject({ BRAND_NEW: "x" });
+  });
+
+  it("does not ask when the value is unchanged -- that write never happens", async () => {
+    writeBundles(SAMPLE);
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=t"],
+      home: synthHome,
+      isTTY: false,
+      ...capture(),
+    });
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("never prints the old or the new value while asking", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN=brandnewsecret"],
+      home: synthHome,
+      isTTY: false,
+      ...cap,
+    });
+    const all = cap.text() + cap.errText();
+    expect(all).not.toContain("brandnewsecret");
+  });
+});
+
+describe("runSet --json on a destructive refusal", () => {
+  it("emits a parseable {ok:false} envelope instead of only an exit code", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN="],
+      home: synthHome,
+      json: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    const lines = cap.errText().trim().split("\n");
+    const envelope = JSON.parse(lines[lines.length - 1]) as { ok: boolean; error: string };
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain("GITHUB_TOKEN");
+  });
+
+  it("emits one for a DECLINED prompt too", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    const r = await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN="],
+      home: synthHome,
+      json: true,
+      promptAnswer: "n",
+      ...cap,
+    });
+    expect(r.exitCode).toBe(1);
+    const lines = cap.errText().trim().split("\n");
+    const envelope = JSON.parse(lines[lines.length - 1]) as { ok: boolean; aborted?: boolean };
+    expect(envelope.ok).toBe(false);
+    expect(envelope.aborted).toBe(true);
+  });
+
+  it("keeps stdout free of the refusal so a --json consumer never half-parses one", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runSet({
+      target: "gh",
+      assignments: ["env.GITHUB_TOKEN="],
+      home: synthHome,
+      json: true,
+      isTTY: false,
+      ...cap,
+    });
+    expect(cap.text()).toBe("");
+  });
+});
+
+describe("runSet -- message quality", () => {
+  it("says what to do about a file with no servers array", async () => {
+    // The sibling message (no file at all) ends in "Add one with `yaw-mcp add
+    // <slug>`". This one used to stop at the diagnosis. `add` REFUSES such a
+    // file too, so the fix has to be the one that actually works: repair the
+    // array, or start over from a file that is not there.
+    writeBundles('{ "version": 1 }');
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["isActive=false"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain('has no "servers" array');
+    expect(cap.errText()).toContain('"servers": []');
+  });
+
+  it("names a DIRECTORY at bundles.json as a directory, like `add` does", async () => {
+    // `add` says "is a directory, not a file -- move or remove it"; `set` used
+    // to surface the raw errno ("could not be read (EISDIR: illegal operation
+    // on a directory, read)"), which reads as a permissions problem.
+    mkdirSync(bundlesPath(), { recursive: true });
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["isActive=false"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain("is a directory, not a file");
+    expect(cap.errText()).not.toContain("EISDIR");
+  });
+});
+
+describe("runEnableDisable -- error prefix", () => {
+  it("names the verb the user typed, not `set`", async () => {
+    // `yaw-mcp enable nosuch` reported "yaw-mcp set: no server named ..." --
+    // a verb the user never ran, which reads as an internal detail leaking.
+    writeBundles(SAMPLE);
+    const enableCap = capture();
+    const enabled = await runEnableDisable({ target: "nosuch", enabled: true, home: synthHome, ...enableCap });
+    expect(enabled.exitCode).toBe(1);
+    expect(enableCap.errText()).toContain("yaw-mcp enable:");
+    expect(enableCap.errText()).not.toContain("yaw-mcp set:");
+
+    const disableCap = capture();
+    await runEnableDisable({ target: "nosuch", enabled: false, home: synthHome, ...disableCap });
+    expect(disableCap.errText()).toContain("yaw-mcp disable:");
+    expect(disableCap.errText()).not.toContain("yaw-mcp set:");
+  });
+
+  it("still says `yaw-mcp set:` when set is what ran", async () => {
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runSet({ target: "nosuch", assignments: ["isActive=true"], home: synthHome, ...cap });
+    expect(cap.errText()).toContain("yaw-mcp set:");
   });
 });

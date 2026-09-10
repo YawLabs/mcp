@@ -75,6 +75,7 @@ describe("runResetLearning -- unlink fails with a non-ENOENT errno", () => {
     const r = await runResetLearning({
       home,
       env: {},
+      force: true,
       out: (s) => {
         out.push(s);
       },
@@ -104,12 +105,13 @@ describe("runResetLearning -- unlink fails with a non-ENOENT errno", () => {
   it("recovers on the next run once the failure clears", async () => {
     const io: string[] = [];
     failNextUnlink.code = "EACCES";
-    const failed = await runResetLearning({ home, env: {}, out: () => {}, err: () => {} });
+    const failed = await runResetLearning({ home, env: {}, force: true, out: () => {}, err: () => {} });
     expect(failed.exitCode).toBe(1);
 
     const ok = await runResetLearning({
       home,
       env: {},
+      force: true,
       out: (s) => {
         io.push(s);
       },

@@ -47,7 +47,7 @@ Your MCP client (Claude Code, Cursor, ...)
 - **Learning** -- servers that succeeded before get a small nudge (+10% max), persisted across restarts.
 - **Sampling tiebreak** -- when the top two are within 10% and your client supports [MCP sampling](https://modelcontextprotocol.io/specification/server/sampling), yaw-mcp asks your own model to pick (no extra provider key or cost).
 
-Servers auto-unload after ~10 tool calls to other servers, so context stays clean even if you forget. The threshold is adaptive per namespace (`[5, 50]`): bursty servers get more patience, long-idle ones unload at the baseline.
+Servers auto-unload after ~10 tool calls to other servers, so context stays clean even if you forget. The threshold is adaptive per namespace (`[5, 50]`): bursty servers get more patience, long-idle ones unload at the baseline. A server that is expensive to *start* can opt out entirely with `yaw-mcp set <server> pinned=true` -- it then stays loaded however idle it gets, and `mcp_connect_health` still reports how idle that is.
 
 ## Install
 
@@ -171,14 +171,23 @@ yaw-mcp doctor [--json]        # diagnose config, clients, learning, reliability
 yaw-mcp add <slug> [--env KEY=value] [--dry-run]   # add a catalog server to bundles.json
 yaw-mcp add <name> --command "npx -y my-mcp"       # ...or define a local server yourself
 yaw-mcp add <name> --url https://host/mcp          # ...or a remote one
-yaw-mcp remove <slug-or-namespace>                 # drop a server
+yaw-mcp import <client> [--dry-run]                # adopt the servers a client already has
+yaw-mcp remove <slug-or-namespace-or-name>         # drop a server
 yaw-mcp list [--json]                              # list configured servers with their cached compliance grade
 yaw-mcp try <slug> [--client <name>] [--ttl 1h]    # wire a one-off trial straight into your client (expires)
 yaw-mcp try-cleanup <slug>                          # remove a trial early (doctor GCs expired ones)
 yaw-mcp trust [--yes|--list|--revoke [<path>]]     # approve the project-local .yaw-mcp/bundles.json found from cwd so yaw-mcp loads it (pinned to its exact contents)
 ```
 
-`add` is not `install`: `install <client>` connects an AI client to yaw-mcp; `add <slug>` adds an MCP server to yaw-mcp itself. `try` points the client directly at the upstream server, bypassing yaw-mcp, so you can evaluate it in isolation. A `--env` value lands in your shell history and process argv like any argument. With `add` it is stored in plain text (file mode `0600`) in `bundles.json` -- keep real credentials in the [local secret vault](#local-secret-vault) and pass `--env KEY='${secret:NAME}'` instead (the single quotes are for bash, zsh and PowerShell; in cmd.exe pass it unquoted, since `$` is not special there and cmd.exe would keep the quotes as part of the value). A `missing` row in `yaw-mcp secrets audit` whose name starts with `<malformed ref>` is a reference that did not parse -- fix the typo in `bundles.json`. With `try` the value is written inline, in plain text, into the client's own config for the trial's lifetime, and is not vault-resolved (the client spawns the server, not yaw-mcp).
+`add` is not `install`: `install <client>` connects an AI client to yaw-mcp; `add <slug>` adds an MCP server to yaw-mcp itself. `try` points the client directly at the upstream server, bypassing yaw-mcp, so you can evaluate it in isolation. A `--env` value lands in your shell history and process argv like any argument. With `add` it is stored in plain text in `bundles.json` (written owner-only, mode `0600`, on macOS and Linux; on Windows that mode is not applied -- Node maps it to the read-only attribute only -- so the file is protected by the NTFS permissions it inherits from your user profile) -- keep real credentials in the [local secret vault](#local-secret-vault) and pass `--env KEY='${secret:NAME}'` instead (the single quotes are for bash, zsh and PowerShell; in cmd.exe pass it unquoted, since `$` is not special there and cmd.exe would keep the quotes as part of the value). A `missing` row in `yaw-mcp secrets audit` whose name starts with `<malformed ref>` is a reference that did not parse -- fix the typo in `bundles.json`. With `try` the value is written inline, in plain text, into the client's own config for the trial's lifetime, and is not vault-resolved (the client spawns the server, not yaw-mcp).
+
+**Servers you already have.** If a client is already configured with MCP servers, `yaw-mcp import <client>` reads that client's own config and adds every server in it to your `bundles.json` -- command, args, url, headers and env as they stand, so the imported server starts exactly as it did before. yaw-mcp's own entry is never imported. `--dry-run` shows what would come across without writing anything.
+
+After an import the client is *still* launching those servers itself, so each one would run twice -- once directly, once through yaw-mcp. `import` says so and offers to remove the originals from the client config: on a terminal it asks (a bare Enter is no), and off one it leaves them alone and names the `--remove-originals` flag. It refuses to remove them at all if the client has no yaw-mcp entry, since that entry is the only way it would still reach them -- run `yaw-mcp install <client>` first.
+
+An imported entry carries no catalog slug, so its handles are its namespace and its **name** (the key the client used). `remove`, `set`, `enable` and `disable` all accept either: `yaw-mcp remove "GitHub Copilot"` works as well as `yaw-mcp remove githubcopilot`.
+
+A credential that was sitting in the client config comes across as a plain value in `bundles.json` (file mode `0600`); the import prints the key names -- never the values -- and points at `yaw-mcp secrets set` for moving them into the [vault](#local-secret-vault).
 
 **Servers the catalog does not list.** The catalog is a curated front door, not the only one. Pass `--command` for a local (stdio) server or `--url` for a remote (HTTP) one, and `add` defines the server from your flags instead of looking up a slug -- no catalog fetch, so this also works offline:
 
@@ -191,6 +200,18 @@ yaw-mcp add linear --url https://mcp.linear.app/mcp \
 `--header` is repeatable and remote-only: a remote server spawns no process, so `--env` cannot reach it (see [`headers`](#remote-servers-headers)). `--transport sse` selects SSE over the streamable-HTTP default. `--description` is worth setting either way, since dispatch ranks servers on it.
 
 A project-local `.yaw-mcp/bundles.json` (committed with a repo) is ignored until `yaw-mcp trust` approves it, since every server in it is a command yaw-mcp spawns as you. Approval is pinned to the file's exact contents, so an edited file needs approving again; `--list` shows approvals (stale ones flagged) and `--revoke` withdraws one. Your own `~/.yaw-mcp/bundles.json` is never gated.
+
+**Calling a server from a shell** -- for a git hook, a Makefile, a cron job or an agent loop that does not speak MCP:
+
+```bash
+yaw-mcp call <namespace> <tool> '{"key":"value"}'   # call one tool, print the result
+yaw-mcp call github search --args-stdin < args.json # ...or pipe the argument object in
+yaw-mcp call github search --json                   # the raw MCP envelope, not just its text
+```
+
+One call, one spawn: the server is started for the call and torn down again, so nothing stays loaded and two calls are two spawns (for a batch, the `mcp_connect_exec` pipeline is the right tool). The tool's text goes to stdout verbatim so it can be piped; diagnostics go to stderr. Exit `0` when the tool answered, `1` when it could not be called or answered with an error, `2` when your own config refused the call.
+
+It gets the same policy a proxied call gets, and gets it *before* the server is spawned: a disabled server, one your project profile blocks, one below `YAW_MCP_MIN_COMPLIANCE`, and any tool on the [`blockedTools`](#blocking-individual-tools) deny list are all refused. A `${secret:NAME}` in the server's env resolves from the vault exactly as it does for the broker.
 
 **Inspection & maintenance**
 
@@ -256,6 +277,7 @@ Each match prints its runtime, tool count and the credentials it needs by name, 
 
 ```bash
 yaw-mcp set github isActive=false           # or: yaw-mcp disable github
+yaw-mcp set github pinned=true              # never idle-unload this one
 yaw-mcp set github runtime=oam              # host it on the oam runtime
 yaw-mcp set github connectTimeoutMs=60000   # slower handshake, this server only
 yaw-mcp set github env.GITHUB_TOKEN='${secret:gh}'   # point at the vault
@@ -264,7 +286,7 @@ yaw-mcp set github env.OLD_VAR=             # remove one variable
 
 Only the entry you name is rewritten, so comments and formatting elsewhere in `bundles.json` survive -- unlike `add` and `remove`, which rewrite the whole file. `enable` and `disable` are the same edit as `set <server> isActive=true|false`.
 
-Settable: `isActive`, `runtime`, `connectTimeoutMs`, `description`, and one `env.KEY` at a time. Everything else is refused, including `command`, `args` and `url` -- those decide which program yaw-mcp launches as you, and belong to `add`/`remove` or a deliberate edit. A trailing `=` clears a field; clearing a stored env value asks first, since it does not come back.
+Settable: `isActive`, `pinned`, `runtime`, `connectTimeoutMs`, `description`, and one `env.KEY` at a time. Everything else is refused, including `command`, `args` and `url` -- those decide which program yaw-mcp launches as you, and belong to `add`/`remove` or a deliberate edit. A trailing `=` clears a field; clearing a stored env value asks first, since it does not come back.
 
 ### Blocking individual tools
 

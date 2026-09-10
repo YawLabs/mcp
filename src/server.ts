@@ -13,7 +13,7 @@ import {
 import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
-import { type ComplianceGrade, classifyGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
+import { classifyGrade, passesMinCompliance } from "./compliance.js";
 import { loadYawMcpConfig, type Profile, profileAllows, type ResolvedConfig, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
@@ -98,6 +98,14 @@ import {
   resolveToolTokenCap,
 } from "./server-cap.js";
 import { maybeRefreshSidecars } from "./sidecar-refresh.js";
+import {
+  blockedToolsSource,
+  complianceRefusalReason,
+  isToolDenied,
+  resolveMinCompliance,
+  spawnGateVerdict,
+} from "./spawn-gate.js";
+import { TransientConnectError, withTransientUpstream } from "./transient-upstream.js";
 import { type ConnectConfig, launchIdentity, type UpstreamConnection, type UpstreamServerConfig } from "./types.js";
 import {
   ActivationError,
@@ -121,28 +129,12 @@ declare const __VERSION__: string;
 // the shared one reads process.env by default, which is exactly what the call
 // site below wants.
 
-// Current minimum compliance filter, parsed from YAW_MCP_MIN_COMPLIANCE.
-// Re-read on every call so tests can stub the env between cases. Null
-// means "filter disabled" — every server passes regardless of grade.
-// Invalid values log a one-shot warning (see parseMinCompliance) and
-// fall back to disabled so a typo never hides the user's whole catalog.
-export function resolveMinCompliance(): ComplianceGrade | null {
-  return parseMinCompliance(process.env.YAW_MCP_MIN_COMPLIANCE);
-}
-
-// Human-readable reason a server is refused under a compliance floor.
-// passesMinCompliance returns a single boolean for both "unrecognized
-// grade" and "recognized grade below the minimum", so a naive message
-// would call an unrecognized "Pass" grade "below B". classifyGrade
-// splits the two so the refusal names the real problem. Ungraded servers
-// never reach here (they pass the floor).
-function complianceRefusalReason(grade: string | undefined | null, min: ComplianceGrade): string {
-  const c = classifyGrade(grade);
-  if (c.kind === "unrecognized") {
-    return `unrecognized compliance grade "${c.raw}" (not A-F); failing closed under YAW_MCP_MIN_COMPLIANCE=${min}`;
-  }
-  return `compliance grade ${grade ?? "unknown"} is below YAW_MCP_MIN_COMPLIANCE=${min}`;
-}
+// resolveMinCompliance and complianceRefusalReason moved to spawn-gate.ts,
+// beside the verdict that consumes them, and are re-exported below: the CLI's
+// `call` has to apply the same floor and cannot import this module for it (see
+// the header of spawn-gate.ts). Re-exported rather than re-declared so
+// server.test.ts and every in-file caller keep their existing import.
+export { resolveMinCompliance };
 
 // Opt-in auto-load. Set YAW_MCP_AUTO_LOAD=1 (or "true") to pre-activate the
 // top recurring pack from persisted history on startup — no LLM round
@@ -348,6 +340,20 @@ export const ROUTING_FAULT_MARKERS: readonly string[] = [
 export function isRoutingFaultText(text: string): boolean {
   return ROUTING_FAULT_MARKERS.some((marker) => text.includes(marker));
 }
+
+// Launchers that FETCH before they run, keyed by the command basename, with
+// what each one fetches. Only these three: `npx` resolves a package into its
+// cache on a miss, `uvx` resolves and installs into uv's tool cache, and
+// `docker run` pulls a missing image -- each of them minutes of work on a cold
+// machine, before the server process exists. `node`, `python` and an absolute
+// path to a built entry run what is already on disk and are deliberately
+// absent: a hint on those would be noise on every fast spawn.
+const COLD_START_LAUNCHERS: Record<string, string> = {
+  npx: "npx may download the package before the server starts",
+  uvx: "uvx may download the package before the server starts",
+  bunx: "bunx may download the package before the server starts",
+  docker: "docker may pull the image before the server starts",
+};
 
 // The empty-catalog message, shared by discover and dispatch. One constant
 // because the two used to drift: discover was rewritten for the local-only
@@ -1331,6 +1337,25 @@ export class ConnectServer {
   private effectiveEntry(entry: UpstreamServerConfig): UpstreamServerConfig {
     const elicited = this.elicitedEnv.get(entry.namespace);
     return elicited ? { ...entry, env: { ...entry.env, ...elicited } } : entry;
+  }
+
+  /** Is this namespace exempt from the idle reaper (types.ts `pinned`)?
+   *
+   *  Read from the LIVE config, not from the connection's own launch-time
+   *  config. bundles.json is re-read at meta-tool boundaries, so `yaw-mcp set
+   *  <ns> pinned=false` takes effect on the next call with no client restart --
+   *  the same contract every other bundles.json field has. Reading
+   *  connection.config instead would pin a server for as long as it stayed
+   *  connected, which for a pinned server is forever: the pin would be
+   *  self-perpetuating and there would be no way to clear it short of a
+   *  restart.
+   *
+   *  A namespace no longer IN the config is not pinned. That is the entry
+   *  having been deleted from bundles.json while its child is still up, and
+   *  reconcileConfig tears those down on its own -- claiming a pin for one
+   *  would keep an orphan alive against the file that no longer describes it. */
+  private isPinned(namespace: string): boolean {
+    return this.config?.servers.find((s) => s.namespace === namespace)?.pinned === true;
   }
 
   /** Why a live child launched from `launchedFrom` no longer belongs to the
@@ -2607,44 +2632,18 @@ export class ConnectServer {
 
   /** Is this flattened wire tool name denied by the resolved `blockedTools`?
    *
-   *  Matched literally and case-sensitively against `<namespace>_<tool>` -- the
-   *  exact string tools/list advertises, buildToolRoutes keys on, the client
-   *  sends, and an exec step names. A single trailing `*` is a prefix match.
-   *
-   *  Namespace flattening means (ns `gh`, tool `actions_list`) and
-   *  (ns `gh_actions`, tool `list`) both render `gh_actions_list`, so a deny on
-   *  that string covers whichever upstream won the route collision. That is the
-   *  safe direction and is deliberately not disambiguated: a deny matching more
-   *  than the user pictured fails closed, one matching less fails open. */
+   *  Thin bind of the shared predicate (spawn-gate.ts) to this session's
+   *  profile. The predicate moved out so `yaw-mcp call` applies the identical
+   *  deny -- a shell entry point that skipped it would be a hole straight
+   *  through the policy -- without importing the broker. */
   private isToolDenied(wireName: string): boolean {
-    const denies = this.profile?.blockedTools;
-    if (!denies || denies.length === 0) return false;
-    for (const entry of denies) {
-      if (entry.endsWith("*")) {
-        const prefix = entry.slice(0, -1);
-        // A bare `*` is inert here as well as refused at load. Defence in
-        // depth on a claim three surfaces make -- the README, the JSON schema
-        // and the loader warning all promise a bare wildcard cannot match --
-        // and an empty prefix would otherwise deny EVERY tool, which is the
-        // one wrong answer that fails closed hard enough to look broken.
-        if (prefix !== "" && wireName.startsWith(prefix)) return true;
-      } else if (wireName === entry) {
-        return true;
-      }
-    }
-    return false;
+    return isToolDenied(wireName, this.profile?.blockedTools);
   }
 
-  /** Which file the user has to edit. `blockedTools` merges across scopes, so
-   *  when both a project and a user-global config contributed we cannot say
-   *  which one carries THIS entry without re-reading them -- name both rather
-   *  than guess, since sending someone to the wrong file is worse than sending
-   *  them to two. */
+  /** Which file the user has to edit. Shared with the CLI's deny refusal for
+   *  the same reason the predicate is: one answer to "where is this declared".  */
   private blockedToolsSource(): string {
-    if (!this.profile) return "your yaw-mcp config";
-    return this.profile.userPath
-      ? `whichever of ${this.profile.path} / ${this.profile.userPath} declares it (blockedTools merges across scopes)`
-      : this.profile.path;
+    return blockedToolsSource(this.profile);
   }
 
   /** read_tool's answer for a denied tool.
@@ -2844,6 +2843,86 @@ export class ConnectServer {
     return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}`;
   }
 
+  /** The "there is nothing to route to" text, for discover / dispatch /
+   *  find_tool.
+   *
+   *  NO_SERVERS_INSTALLED_TEXT alone was a falsehood whenever the config could
+   *  not be read: a hand-broken bundles.json leaves this.config null, and the
+   *  three empty-state branches then told the model "No servers installed.
+   *  Browse the catalog ... and add one" about a machine whose servers are all
+   *  still there, in a file that failed to parse. The model has no other way
+   *  to see that -- the warnings existed only as JSON log lines on stderr, and
+   *  the banner discover renders for them sits BELOW these early returns.
+   *
+   *  Warnings decide the wording, not `config === null`: a file that parsed
+   *  but had every entry rejected (an invalid namespace, a non-object entry)
+   *  leaves a non-null config with an EMPTY server list and the reasons in
+   *  warnings, and "add one" is just as wrong there. With no warnings at all
+   *  this is a genuinely fresh install, which is what the constant describes. */
+  private emptyStateText(): string {
+    if (this.configWarnings.length === 0) return NO_SERVERS_INSTALLED_TEXT;
+    return [
+      ...this.configWarnings.map((w) => `! ${w}`),
+      "No servers are loaded, and the diagnostics above say why -- so this is NOT necessarily an empty install; servers already in bundles.json can be missing because the file could not be read. Fix it (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.",
+    ].join("\n");
+  }
+
+  /** Everything installed is either `"isActive": false` or kept out by the
+   *  project profile -- there is no third way past getProfiledActiveServers,
+   *  so at least one of the two lists below is non-empty.
+   *
+   *  ONE copy, read by dispatch (which refuses) and by discover (which leads
+   *  its listing with it). Discover used to print its ordinary
+   *  "Installed MCP servers:" header over an empty list in this state, which
+   *  reads as "nothing is installed" -- the opposite of the truth, and the
+   *  opposite of what dispatch says about the same config.
+   *
+   *  Both fixes are local edits, but they are DIFFERENT edits in different
+   *  files, so only the ones that apply are named. A profile-blocked server is
+   *  already active: telling the model to set "isActive": true for it, or to
+   *  look for it in discover's disabled list (which renders profile-blocked
+   *  entries nowhere), sends it to the wrong file. */
+  private noServersEnabledText(): string {
+    const profile = this.profile;
+    const servers = this.config?.servers ?? [];
+    const disabled = servers.filter((s) => !s.isActive);
+    const blocked = profile ? servers.filter((s) => s.isActive && !profileAllows(profile, s.namespace)) : [];
+    const parts = ["No servers enabled."];
+    if (profile && blocked.length > 0) {
+      const quote = (list: UpstreamServerConfig[]) => list.map((s) => `"${s.namespace}"`).join(", ");
+      // isAllowed: an explicit "blocked" entry wins over the allow list, so
+      // a namespace on it needs removing from there; every other blocked
+      // namespace is missing from a non-empty "servers" allow list.
+      const denied = blocked.filter((s) => profile.blocked?.includes(s.namespace));
+      const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
+      const edits: string[] = [];
+      if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
+      // "blocked" is the UNION across every config scope (config-loader's
+      // unionBlocked), while profile.path is only the primary file -- so the
+      // list to edit may live in the user-global file instead. Name both
+      // when both contributed; the allow-list edit above is correctly
+      // pointed at the primary file, which is where "servers" is picked from.
+      if (denied.length > 0) {
+        const where = profile.userPath
+          ? `from the "blocked" list in whichever of ${profile.path} / ${profile.userPath} declares it (blocked lists merge across scopes)`
+          : `from its "blocked" list`;
+        edits.push(`remove ${quote(denied)} ${where}`);
+      }
+      parts.push(
+        `The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}. Restart this MCP client after editing the profile -- unlike bundles.json, profile config is read once per session.`,
+      );
+    }
+    if (disabled.length > 0) {
+      // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
+      // .yaw-mcp/bundles.json defines servers too, and a disabled one may
+      // live only there.
+      parts.push(
+        `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
+      );
+    }
+    return parts.join(" ");
+  }
+
   private buildDiscoverOutput(
     context: string | undefined,
     warmedNamespace: string | null,
@@ -2866,7 +2945,7 @@ export class ConnectServer {
     focusNamespace?: string,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
-      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
+      return { content: [{ type: "text", text: this.emptyStateText() }] };
     }
 
     const allProfiled = this.getProfiledActiveServers();
@@ -2956,7 +3035,18 @@ export class ConnectServer {
         "Fix bundles.json (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.\n",
       );
     }
-    lines.push(context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n");
+    // A header over an EMPTY list reads as "nothing is installed", which is
+    // the opposite of the truth when every installed server is disabled or
+    // profile-blocked. Lead with the same sentence dispatch refuses with --
+    // the Disabled servers block further down then reads as the detail for
+    // it rather than as a contradiction of the header above it.
+    lines.push(
+      allProfiled.length === 0
+        ? `${this.noServersEnabledText()}\n`
+        : context
+          ? "Servers ranked by relevance:\n"
+          : "Installed MCP servers:\n",
+    );
     if (warmedNamespace) {
       lines.push(`Auto-loaded "${warmedNamespace}" — top match for your query.\n`);
     }
@@ -3601,29 +3691,34 @@ export class ConnectServer {
     return estimateFromToolCache(cache).tokens;
   }
 
-  // The policy gates every SPAWN path shares, in one place and one order:
-  // disabled, then project profile, then the YAW_MCP_MIN_COMPLIANCE floor.
-  // Returns the refusal text, or null when the server clears all three.
+  // The BROKER's rendering of the shared spawn gate. The decision itself lives
+  // in spawn-gate.ts (spawnGateVerdict) so `yaw-mcp call` -- which spawns a
+  // configured server from a shell, with no broker in the process -- enforces
+  // the identical policy without importing this module.
   //
-  // Both callers -- runActivateOne (persistent activation) and handleReadTool
-  // (transient inspect) -- actually execute the server's configured command
-  // with its resolved env, so "we disconnect afterwards" buys read_tool no
-  // exemption. They used to carry line-for-line copies of this block, which
-  // meant a policy change had to land twice to stay consistent. `purpose`
-  // supplies the only words that legitimately differ: what the caller was
-  // about to do with the server once it started.
+  // Both callers HERE -- runActivateOne (persistent activation) and
+  // handleReadTool (transient inspect) -- actually execute the server's
+  // configured command with its resolved env, so "we disconnect afterwards"
+  // buys read_tool no exemption. They used to carry line-for-line copies of
+  // the checks, which meant a policy change had to land twice to stay
+  // consistent. `purpose` supplies the only words that legitimately differ:
+  // what the caller was about to do with the server once it started.
+  //
+  // The WORDS stay here rather than in the shared module because the
+  // remediation is world-specific: inside the broker the fix for a disabled
+  // server is an edit picked up on the next mcp_connect_* call, and a shell
+  // caller has no such call to wait for. Same verdict, different sentence.
   private spawnGateRefusal(server: UpstreamServerConfig, purpose: "activate" | "inspect its tools"): string | null {
-    if (!server.isActive) {
-      return `"${server.namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+    const refusal = spawnGateVerdict(server, this.profile, resolveMinCompliance());
+    if (!refusal) return null;
+    switch (refusal.kind) {
+      case "disabled":
+        return `"${refusal.namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
+      case "profile":
+        return `"${refusal.namespace}" is not allowed by the project profile at ${refusal.profilePath}.`;
+      case "compliance":
+        return `Refused to load "${refusal.namespace}": ${complianceRefusalReason(refusal.grade, refusal.min)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
     }
-    if (!profileAllows(this.profile, server.namespace)) {
-      return `"${server.namespace}" is not allowed by the project profile at ${this.profile?.path}.`;
-    }
-    const minCompliance = resolveMinCompliance();
-    if (minCompliance !== null && !passesMinCompliance(server.complianceGrade, minCompliance)) {
-      return `Refused to load "${server.namespace}": ${complianceRefusalReason(server.complianceGrade, minCompliance)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`;
-    }
-    return null;
   }
 
   // `skipCap` is for the post-elicitation retry only: that caller is already
@@ -3654,6 +3749,37 @@ export class ConnectServer {
   private visibleTools<T extends { name: string }>(namespace: string, tools: T[]): T[] {
     const f = this.toolFilters.get(namespace);
     return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
+  }
+
+  /** Why THIS activation may take tens of seconds, or "" when it should not.
+   *
+   *  A first activation of an `npx` / `uvx` / `docker` server pays for a
+   *  download before the server process even starts, and the progress line
+   *  said only `Spawning "gh" upstream...` -- so a 30s wait looked identical to
+   *  a hang, and the model had nothing to tell the user except that it was
+   *  waiting. Naming the cost up front is the difference between "this is
+   *  stuck" and "this is fetching a package".
+   *
+   *  "First" is decided by the tool cache: a namespace yaw-mcp has ever
+   *  successfully listed tools for has its names persisted (state.json, via
+   *  toolCache), so a cache HIT means this machine has run this server before
+   *  and the launcher's own cache is warm. A miss is a first load in every
+   *  sense that matters here. The hint is hedged ("may"), because a package
+   *  can also already be in the npx/uv cache from outside yaw-mcp -- and the
+   *  oam rewrite only ever applies to a package that IS already on disk.
+   *
+   *  Local servers only: a remote entry spawns nothing and downloads nothing.
+   */
+  private coldStartHint(server: UpstreamServerConfig): string {
+    if (server.type !== "local" || server.command === undefined) return "";
+    const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
+    if (cached && cached.length > 0) return "";
+    // The launcher basename, with the Windows extensions stripped the same way
+    // nodeLaunchKind does it -- `npx.cmd`, `C:/.../uvx.exe` and a bare `npx`
+    // are one launcher.
+    const base = (server.command.split(/[\\/]/).pop() ?? server.command).replace(/\.(exe|cmd|bat|ps1)$/i, "");
+    const fetches = COLD_START_LAUNCHERS[base.toLowerCase()];
+    return fetches === undefined ? "" : ` first load on this machine: ${fetches}`;
   }
 
   private async runActivateOne(
@@ -3784,13 +3910,21 @@ export class ConnectServer {
         if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
         try {
           progress?.(
-            attempt === 0 ? `Spawning "${namespace}" upstream…` : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
+            attempt === 0
+              ? `Spawning "${namespace}" upstream…${this.coldStartHint(effectiveConfig)}`
+              : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
           );
+          // `progress` is threaded INTO the connect, not just wrapped around
+          // it: everything slow about an activation happens inside that call
+          // (spawn, handshake, inventory), and from out here the only two
+          // observable moments are the ones already reported above and below.
+          // See withHeartbeat in upstream.ts.
           const connection = await connectToUpstream(
             effectiveConfig,
             this.onUpstreamDisconnect,
             this.onUpstreamListChanged,
             this.clientBridge,
+            progress,
           );
           // shutdown() latched while this handshake was in flight. Its drain
           // is bounded (SHUTDOWN_DRAIN_MS), so by now the teardown may already
@@ -4589,62 +4723,15 @@ export class ConnectServer {
     }
     if (!this.config || this.config.servers.length === 0) {
       return {
-        content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }],
+        content: [{ type: "text", text: this.emptyStateText() }],
         isError: true,
       };
     }
 
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) {
-      // Every installed server is either "isActive": false or kept out by
-      // the project profile -- there is no third way past the filter above,
-      // so at least one of the two lists below is non-empty. Both fixes are
-      // local edits, but they are DIFFERENT edits in different files, so
-      // name only the ones that apply. A profile-blocked server is already
-      // active: telling the model to set "isActive": true for it, or to look
-      // for it in discover's disabled list (discover renders profile-blocked
-      // entries nowhere), sent it to the wrong file. Name the namespaces and
-      // the exact list in the profile that keeps each one out instead.
-      const profile = this.profile;
-      const disabled = this.config.servers.filter((s) => !s.isActive);
-      const blocked = profile
-        ? this.config.servers.filter((s) => s.isActive && !profileAllows(profile, s.namespace))
-        : [];
-      const parts = ["No servers enabled."];
-      if (profile && blocked.length > 0) {
-        const quote = (servers: UpstreamServerConfig[]) => servers.map((s) => `"${s.namespace}"`).join(", ");
-        // isAllowed: an explicit "blocked" entry wins over the allow list, so
-        // a namespace on it needs removing from there; every other blocked
-        // namespace is missing from a non-empty "servers" allow list.
-        const denied = blocked.filter((s) => profile.blocked?.includes(s.namespace));
-        const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
-        const edits: string[] = [];
-        if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
-        // "blocked" is the UNION across every config scope (config-loader's
-        // unionBlocked), while profile.path is only the primary file -- so the
-        // list to edit may live in the user-global file instead. Name both
-        // when both contributed; the allow-list edit above is correctly
-        // pointed at the primary file, which is where "servers" is picked from.
-        if (denied.length > 0) {
-          const where = profile.userPath
-            ? `from the "blocked" list in whichever of ${profile.path} / ${profile.userPath} declares it (blocked lists merge across scopes)`
-            : `from its "blocked" list`;
-          edits.push(`remove ${quote(denied)} ${where}`);
-        }
-        parts.push(
-          `The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}. Restart this MCP client after editing the profile -- unlike bundles.json, profile config is read once per session.`,
-        );
-      }
-      if (disabled.length > 0) {
-        // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
-        // .yaw-mcp/bundles.json defines servers too, and a disabled one may
-        // live only there.
-        parts.push(
-          `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
-        );
-      }
       return {
-        content: [{ type: "text", text: parts.join(" ") }],
+        content: [{ type: "text", text: this.noServersEnabledText() }],
         isError: true,
       };
     }
@@ -4964,6 +5051,26 @@ export class ConnectServer {
     const toDeactivate: string[] = [];
     for (const [ns, idleCount] of this.idleCallCounts) {
       if (!this.connections.has(ns)) continue;
+      // A pinned server is never reaped. Checked BEFORE the threshold rather
+      // than folded into it as an infinite one: adaptiveThreshold is pure and
+      // clamps to ADAPTIVE_MAX, so there is no value it can return that means
+      // "never" -- and the adaptive-patience log below would then fire on
+      // every tick for a server whose survival has nothing to do with
+      // burstiness.
+      //
+      // The idle COUNT is deliberately still incremented above, so
+      // mcp_connect_health keeps reporting how idle a pinned server really is
+      // instead of freezing it at zero and hiding a server nobody uses.
+      if (this.isPinned(ns)) {
+        if (idleCount >= baseline && !this.adaptiveSkipLogged.has(ns)) {
+          // Same once-per-namespace latch the adaptive-patience line uses, and
+          // the same reason: a user watching the log wants to see WHY a server
+          // that should have been reaped is still here, once, not per call.
+          log("info", "Pinned upstream exempt from the idle reaper", { namespace: ns, idleCalls: idleCount });
+          this.adaptiveSkipLogged.add(ns);
+        }
+        continue;
+      }
       const threshold = adaptiveThreshold(ns, this.recentToolCalls, baseline);
       if (idleCount >= threshold) {
         // Never reap a namespace with a tool call still in flight: the
@@ -5138,64 +5245,66 @@ export class ConnectServer {
     // dedup map, which would change its semantics (persistent activation
     // vs transient inspection). Accepted as-is.
     progress?.(`Inspecting "${serverArg}" (transient — not loading into session)…`);
-    let transient: UpstreamConnection | undefined;
+    // Include any session-elicited credentials for this namespace so the
+    // transient connect uses the same env as a persistent activation
+    // would — otherwise schema inspection re-trips the missing-credential
+    // error the user already supplied a value for this session.
+    const elicitedForTransient = this.elicitedEnv.get(serverArg);
+    const transientConfig = elicitedForTransient
+      ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForTransient } }
+      : serverConfig;
     try {
-      // Include any session-elicited credentials for this namespace so the
-      // transient connect uses the same env as a persistent activation
-      // would — otherwise schema inspection re-trips the missing-credential
-      // error the user already supplied a value for this session.
-      const elicitedForTransient = this.elicitedEnv.get(serverArg);
-      const transientConfig = elicitedForTransient
-        ? { ...serverConfig, env: { ...serverConfig.env, ...elicitedForTransient } }
-        : serverConfig;
-      transient = await connectToUpstream(transientConfig, undefined, undefined, this.clientBridge);
+      // The connect / use / TEARDOWN shape lives in transient-upstream.ts:
+      // `yaw-mcp call` needs the identical dance from a shell, where there is
+      // no ConnectServer at all, and the teardown is the half that must not be
+      // re-derived per call site (an unclosed stdio upstream is a child that
+      // outlives whatever spawned it).
+      return await withTransientUpstream(
+        transientConfig,
+        async (transient) => {
+          // Normalize with the transient tool list so exact-match takes
+          // priority over prefix-stripping.
+          const toolName = normalizeToolName(serverArg, toolArg, transient.tools);
+          const tool = findTool(transient.tools, toolName);
+          if (!tool) {
+            return {
+              content: [{ type: "text", text: formatToolNotFound(serverConfig, toolName, transient.tools) }],
+              isError: true,
+            };
+          }
+          if (this.isToolDenied(tool.namespacedName)) return this.deniedToolRead(tool.namespacedName);
+          return {
+            content: [
+              {
+                type: "text",
+                text: formatReadToolOutput({ tool, server: serverConfig, loaded: false }),
+              },
+            ],
+          };
+        },
+        { bridge: this.clientBridge },
+      );
     } catch (err) {
-      // One branch, not two: ActivationError extends Error and carries its
-      // stderr tail + category hint inside `message`, so the separate
-      // instanceof arm returned the identical string.
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not connect to "${serverArg}" to read tool schema: ${message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    try {
-      // Normalize with the transient tool list so exact-match takes
-      // priority over prefix-stripping.
-      const toolName = normalizeToolName(serverArg, toolArg, transient.tools);
-      const tool = findTool(transient.tools, toolName);
-      if (!tool) {
+      // Only a CONNECT failure is reported this way, which is why the helper
+      // wraps that error and nothing else: the body above returns its own
+      // error results rather than throwing, so an exception reaching here that
+      // is NOT a TransientConnectError is a bug in this method, and calling it
+      // "could not connect" would send the user to check a server that started
+      // perfectly well. One branch for the connect case, not two: ActivationError
+      // extends Error and carries its stderr tail + category hint inside
+      // `message`, so a separate instanceof arm returned the identical string.
+      if (err instanceof TransientConnectError) {
         return {
-          content: [{ type: "text", text: formatToolNotFound(serverConfig, toolName, transient.tools) }],
+          content: [
+            {
+              type: "text",
+              text: `Could not connect to "${serverArg}" to read tool schema: ${err.message}`,
+            },
+          ],
           isError: true,
         };
       }
-      if (this.isToolDenied(tool.namespacedName)) return this.deniedToolRead(tool.namespacedName);
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatReadToolOutput({ tool, server: serverConfig, loaded: false }),
-          },
-        ],
-      };
-    } finally {
-      // Tear the transient connection down no matter what happened
-      // above. Leaving it open would silently promote "read tool"
-      // into "activate", which is exactly what this meta-tool exists
-      // to avoid.
-      await disconnectFromUpstream(transient).catch((e) =>
-        log("warn", "transient disconnect after read_tool failed", {
-          namespace: serverArg,
-          error: e instanceof Error ? e.message : String(e),
-        }),
-      );
+      throw err;
     }
   }
 
@@ -5344,7 +5453,16 @@ export class ConnectServer {
         lines.push(
           `    result bytes: ${h.resultBytesUpstream} upstream, ${h.resultBytesDownstream} to client (${trimmedPct}% trimmed)`,
         );
-        lines.push(`    idle: ${idleCount}/${idleLimit} until auto-unload`);
+        // The count is reported for a pinned server too, and deliberately: the
+        // pin suppresses the unload, not the bookkeeping, so this is the one
+        // surface that can tell the user a server they pinned has gone unused.
+        // Saying "until auto-unload" there would be a plain lie -- no unload is
+        // coming -- so the tail is replaced rather than appended to.
+        lines.push(
+          this.isPinned(namespace)
+            ? `    idle: ${idleCount} (pinned -- exempt from auto-unload)`
+            : `    idle: ${idleCount}/${idleLimit} until auto-unload`,
+        );
         if (h.lastErrorMessage) {
           // SCRUBBED, like the discover-side warning. lastErrorMessage is the
           // upstream tool-call error text stored verbatim above, so it can carry
@@ -5419,7 +5537,16 @@ export class ConnectServer {
   private handleFindTool(query: string, limit?: number): { content: Array<{ type: string; text: string }> } {
     const servers = this.getProfiledActiveServers();
     if (servers.length === 0) {
-      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
+      // Two different empty states reach this one branch, and they need
+      // different answers: nothing CONFIGURED (or nothing readable) is the
+      // emptyStateText case, while a full bundles.json whose every entry is
+      // disabled or profile-blocked is the noServersEnabledText case -- being
+      // told to "add one" when six are already installed is the same
+      // falsehood discover used to print.
+      const configured = this.config?.servers.length ?? 0;
+      return {
+        content: [{ type: "text", text: configured === 0 ? this.emptyStateText() : this.noServersEnabledText() }],
+      };
     }
     if (query.trim() === "") {
       return {

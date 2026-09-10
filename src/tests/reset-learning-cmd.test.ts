@@ -41,7 +41,7 @@ describe("runResetLearning", () => {
 
   it("reports nothing to reset when state.json does not exist", async () => {
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(false);
     expect(existsSync(stateFile)).toBe(false);
@@ -67,7 +67,7 @@ describe("runResetLearning", () => {
     writeFileSync(stateFile, JSON.stringify(payload), "utf8");
 
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
 
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(true);
@@ -103,7 +103,7 @@ describe("runResetLearning", () => {
       "utf8",
     );
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(true);
     const combined = io.out.join("");
@@ -130,7 +130,7 @@ describe("runResetLearning", () => {
     };
     writeFileSync(stateFile, JSON.stringify(payload), "utf8");
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(true);
     const combined = io.out.join("");
@@ -142,7 +142,7 @@ describe("runResetLearning", () => {
   it("reports a concrete 0 for a clean file with no tool cache at all (a v1 file)", async () => {
     writeFileSync(stateFile, JSON.stringify({ version: 1, savedAt: 1, learning: {}, packHistory: [] }), "utf8");
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.removed).toBe(true);
     const combined = io.out.join("");
     expect(combined).not.toContain("contents unreadable");
@@ -170,7 +170,7 @@ describe("runResetLearning", () => {
     };
     writeFileSync(stateFile, JSON.stringify(payload), "utf8");
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.removed).toBe(true);
     const combined = io.out.join("");
     expect(combined).toContain("learning entries removed:     2");
@@ -186,7 +186,7 @@ describe("runResetLearning", () => {
     // got real counts, so we say the contents were unreadable instead.
     writeFileSync(stateFile, "{{not json", "utf8");
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(true);
     expect(existsSync(stateFile)).toBe(false);
@@ -209,7 +209,7 @@ describe("runResetLearning", () => {
     };
     writeFileSync(stateFile, JSON.stringify(payload), "utf8");
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(true);
     expect(existsSync(stateFile)).toBe(false);
@@ -228,7 +228,7 @@ describe("runResetLearning", () => {
       "utf8",
     );
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(true);
     const combined = io.out.join("");
@@ -302,6 +302,7 @@ describe("runResetLearning", () => {
     const r = await runResetLearning({
       home,
       env: { YAW_MCP_DISABLE_PERSISTENCE: "" },
+      force: true,
       out: io.push,
       err: io.pushErr,
     });
@@ -312,7 +313,7 @@ describe("runResetLearning", () => {
 
   it("persists the path in the result regardless of outcome", async () => {
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.path).toBe(stateFile);
   });
 
@@ -321,7 +322,7 @@ describe("runResetLearning", () => {
     // brand-new install where the user is just poking at CLI commands.
     rmSync(yawMcpDir, { recursive: true, force: true });
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(r.removed).toBe(false);
     expect(io.out.join("")).toContain("no persisted state to reset");
@@ -349,7 +350,7 @@ describe("runResetLearning", () => {
     it("warns that a running serve process will re-save its in-memory state", async () => {
       writeState();
       const io = captureIO();
-      await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+      await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
       const combined = io.out.join("\n");
       expect(combined).toContain("running yaw-mcp serve");
       expect(combined).toContain("Restart your MCP client");
@@ -360,7 +361,7 @@ describe("runResetLearning", () => {
     it("warns on the unreadable-contents path too", async () => {
       writeFileSync(stateFile, "{{not json", "utf8");
       const io = captureIO();
-      await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+      await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
       const combined = io.out.join("\n");
       expect(combined).toContain("contents unreadable");
       expect(combined).toContain("Restart your MCP client");
@@ -368,7 +369,7 @@ describe("runResetLearning", () => {
 
     it("stays silent when there was nothing to remove", async () => {
       const io = captureIO();
-      await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+      await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
       expect(io.out.join("\n")).not.toContain("Restart your MCP client");
     });
 
@@ -408,7 +409,7 @@ describe("runResetLearning", () => {
     expect(readFileSync(stateFile, "utf8").length).toBeGreaterThan(0);
 
     const io = captureIO();
-    const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
+    const r = await runResetLearning({ home, env: {}, force: true, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(io.out.join("")).toContain("learning entries removed:     3");
   });
@@ -450,5 +451,161 @@ describe("parseResetLearningArgs", () => {
       expect(r.error).toContain('"--bogus"');
       expect(r.error).not.toContain('"--help"');
     }
+  });
+});
+
+// --- ship-readiness gap: the delete is irreversible and was ungated ---------
+
+describe("runResetLearning -- confirmation", () => {
+  let home: string;
+  let yawMcpDir: string;
+  let stateFile: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-mcp-reset-gate-"));
+    yawMcpDir = join(home, CONFIG_DIRNAME);
+    stateFile = join(yawMcpDir, STATE_FILENAME);
+    mkdirSync(yawMcpDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function cap(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
+    const out: string[] = [];
+    const err: string[] = [];
+    return {
+      out,
+      err,
+      push: (s: string) => {
+        out.push(s);
+      },
+      pushErr: (s: string) => {
+        err.push(s);
+      },
+    };
+  }
+
+  function writeState(
+    learning: Record<string, unknown> = { gh: { dispatched: 3, succeeded: 2, lastUsedAt: 1 } },
+  ): void {
+    writeFileSync(
+      stateFile,
+      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning, packHistory: [], toolCache: {} }),
+    );
+  }
+
+  it("refuses off a TTY, and the file survives", async () => {
+    // The delete is irreversible -- a rebuilt learning store costs the user
+    // every success they have accumulated -- and it used to happen on the bare
+    // verb, with no preview and nothing to confirm.
+    writeState();
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, isTTY: false, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(2);
+    expect(r.removed).toBe(false);
+    expect(existsSync(stateFile)).toBe(true);
+    expect(io.err.join("")).toContain("--force");
+  });
+
+  it("shows what it is about to delete before asking", async () => {
+    // Asserted on the REFUSED run, where the file is still on disk: the
+    // success report names the same counts, so a preview-less command would
+    // pass a bare "the counts appear somewhere" check.
+    writeState();
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, isTTY: false, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(2);
+    expect(existsSync(stateFile)).toBe(true);
+    const all = io.out.join("") + io.err.join("");
+    expect(all).toContain(stateFile);
+    expect(all).toContain("learning entries");
+  });
+
+  it("--force deletes without asking", async () => {
+    writeState();
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, force: true, isTTY: false, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    expect(existsSync(stateFile)).toBe(false);
+  });
+
+  it("a bare Enter declines and leaves the file alone", async () => {
+    writeState();
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, promptAnswer: "", out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(1);
+    expect(r.removed).toBe(false);
+    expect(existsSync(stateFile)).toBe(true);
+  });
+
+  it("a yes deletes", async () => {
+    writeState();
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, promptAnswer: "y", out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(r.removed).toBe(true);
+    expect(existsSync(stateFile)).toBe(false);
+  });
+
+  it("does not ask when there is nothing to delete", async () => {
+    // The no-op stays a no-op: refusing to no-op off a TTY would break the
+    // cleanup scripts that run this unconditionally, for no safety gain --
+    // the same rule `remove` follows.
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, isTTY: false, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(0);
+    expect(io.out.join("")).toContain("no persisted state to reset");
+  });
+
+  it("does not ask when persistence is disabled", async () => {
+    writeState();
+    const io = cap();
+    const r = await runResetLearning({
+      home,
+      env: { YAW_MCP_DISABLE_PERSISTENCE: "1" },
+      isTTY: false,
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(stateFile)).toBe(true);
+    expect(io.out.join("")).toContain("nothing to clear");
+  });
+
+  it("previews an unreadable file honestly rather than claiming 0 entries", async () => {
+    writeFileSync(stateFile, "{ not json");
+    const io = cap();
+    const r = await runResetLearning({ home, env: {}, isTTY: false, out: io.push, err: io.pushErr });
+    expect(r.exitCode).toBe(2);
+    const all = io.out.join("") + io.err.join("");
+    expect(all).toContain("unreadable");
+    expect(all).not.toContain("learning entries:     0");
+  });
+});
+
+describe("parseResetLearningArgs -- the confirmation bypass", () => {
+  it("accepts --force, -y and --yes", () => {
+    for (const flag of ["--force", "-y", "--yes"]) {
+      const r = parseResetLearningArgs([flag]);
+      expect(r.kind).toBe("ok");
+      if (r.kind === "ok") expect(r.options.force).toBe(true);
+    }
+  });
+
+  it("still rejects an unknown argument", () => {
+    const r = parseResetLearningArgs(["--nope"]);
+    expect(r.kind).toBe("error");
+  });
+
+  it("still answers --help without deleting anything", () => {
+    expect(parseResetLearningArgs(["--help"]).kind).toBe("help");
+    expect(parseResetLearningArgs(["-h"]).kind).toBe("help");
+  });
+
+  it("documents the flag in the usage text", () => {
+    expect(RESET_LEARNING_USAGE).toContain("--force");
   });
 });

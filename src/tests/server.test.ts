@@ -2086,6 +2086,49 @@ describe("ConnectServer", () => {
       await priv.trackUsageAndAutoDeactivate("gh");
       expect(priv.connections.has("slack")).toBe(false);
     });
+
+    it("never reaps a pinned namespace, however idle it gets", async () => {
+      // The reason the field exists: some servers cost seconds to start (a
+      // browser, a language server, a container) and re-spawning one is worth
+      // far more than the RAM the reaper is reclaiming. The idle COUNT keeps
+      // climbing -- the pin suppresses the unload, not the bookkeeping, so
+      // `mcp_connect_health` still reports how idle the server actually is.
+      //
+      // 60 is past the adaptive CEILING (ADAPTIVE_MAX = 50), so no amount of
+      // adaptive patience explains a survivor here; only the pin can.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh" }),
+        makeServerConfig({ namespace: "slack", pinned: true }),
+      ]);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("slack", makeConnection("slack"));
+      priv.idleCallCounts.set("slack", 60);
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(priv.connections.has("slack")).toBe(true);
+      expect(priv.idleCallCounts.get("slack")).toBe(61);
+      expect(disconnectFromUpstream).not.toHaveBeenCalled();
+    });
+
+    it("reaps the same namespace once the pin is cleared", async () => {
+      // The pin is read from the LIVE config, which is re-read at meta-tool
+      // boundaries -- so `yaw-mcp set <ns> pinned=false` takes effect without a
+      // client restart, exactly like every other bundles.json edit. Reading the
+      // pin off the connection's own launch-time config instead would keep a
+      // server pinned for as long as it stayed connected, which is forever.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh" }),
+        makeServerConfig({ namespace: "slack", pinned: false }),
+      ]);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("slack", makeConnection("slack"));
+      priv.idleCallCounts.set("slack", 60);
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(priv.connections.has("slack")).toBe(false);
+    });
   });
 
   describe("handleHealth", () => {
@@ -8105,5 +8148,222 @@ describe("exec preflights the spawn gate on deferred steps", () => {
     expect(body.ok).toBe(false);
     expect(body.failedStep).toBe("post");
     expect(body.partial.issue).toEqual({ number: 7 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The two empty states the meta-tools used to describe WRONGLY.
+//
+// 1. A bundles.json that cannot be read leaves this.config null, and the
+//    empty-state branches told the model "No servers installed. Browse the
+//    catalog ... and add one" about a machine whose servers are all still
+//    there. The warnings existed only as JSON log lines on stderr, and the
+//    banner discover renders for them sits below those early returns.
+// 2. Every installed server disabled printed "Installed MCP servers:" over an
+//    empty list, which reads as "you have nothing" -- while dispatch, on the
+//    same config, correctly said "No servers enabled".
+// ---------------------------------------------------------------------------
+
+describe("empty states name the REAL reason", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  const BROKEN = "~/.yaw-mcp/bundles.json: invalid JSON (Unexpected token }) -- file ignored";
+
+  it("discover says the config could not be read instead of claiming nothing is installed", () => {
+    const priv = getPrivate(server);
+    priv.config = null;
+    priv.configWarnings = [BROKEN];
+    const text = priv.handleDiscover().content[0].text;
+    // The reason the model could not otherwise see.
+    expect(text).toContain(BROKEN);
+    expect(text).toContain("NOT necessarily an empty install");
+    // And the falsehood is gone: nothing here tells the model to go add a
+    // server it may already have.
+    expect(text).not.toContain("No servers installed");
+    expect(text).not.toContain("add one with `yaw-mcp add <slug>`");
+  });
+
+  it("dispatch says the same thing about the same config", () => {
+    const priv = getPrivate(server);
+    priv.config = null;
+    priv.configWarnings = [BROKEN];
+    const result = priv.handleDispatch("file a github issue", 5);
+    return result.then((r: { isError?: boolean; content: Array<{ text: string }> }) => {
+      expect(r.isError).toBe(true);
+      expect(r.content[0].text).toContain(BROKEN);
+      expect(r.content[0].text).toEqual(priv.handleDiscover().content[0].text);
+    });
+  });
+
+  it("still says 'No servers installed' for a genuinely fresh install", () => {
+    // No warnings means nothing went wrong -- there is simply no bundles.json
+    // yet, which is exactly what the original text describes. The fix must
+    // not swallow the fresh-install path.
+    const priv = getPrivate(server);
+    priv.config = null;
+    priv.configWarnings = [];
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("No servers installed");
+    expect(text).toContain("https://yaw.sh/mcp/catalog/");
+  });
+
+  it("covers a config that PARSED but had every entry rejected", () => {
+    // Non-null config, empty server list, warnings explaining why: "add one"
+    // is just as wrong here as it is for an unreadable file, so the branch
+    // keys on the warnings rather than on config === null.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([]);
+    priv.configWarnings = ['bundles.json: skipping server with invalid namespace "Gh Prod"'];
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("skipping server with invalid namespace");
+    expect(text).not.toContain("No servers installed");
+  });
+
+  it("discover leads with 'No servers enabled' when every installed server is disabled", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false }),
+      makeServerConfig({ id: "2", namespace: "pg", name: "Postgres", isActive: false }),
+    ]);
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("No servers enabled");
+    expect(text).toContain('"isActive": true');
+    // The header that used to sit over an empty list is gone...
+    expect(text).not.toContain("Installed MCP servers:");
+    // ...and the detail that was already there still is.
+    expect(text).toContain('gh — GitHub ("isActive": false in bundles.json)');
+  });
+
+  it("says the same thing discover and dispatch say, from one source", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
+    return priv.handleDispatch("file a github issue", 5).then((r: { content: Array<{ text: string }> }) => {
+      // Not byte-equal -- discover continues into its listing -- but the
+      // dispatch refusal must be the LEAD of the discover body, or the two
+      // surfaces are describing the same config differently again.
+      expect(priv.handleDiscover().content[0].text.startsWith(r.content[0].text)).toBe(true);
+    });
+  });
+
+  it("keeps the ordinary header when something IS enabled", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ id: "2", namespace: "pg", name: "Postgres", isActive: false }),
+    ]);
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("Installed MCP servers:");
+    expect(text).not.toContain("No servers enabled");
+  });
+
+  it("find_tool tells a disabled setup to enable, not to install", () => {
+    // Its empty branch reads getProfiledActiveServers, so a fully-disabled
+    // config reached the same "No servers installed ... add one" text.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
+    const text = priv.handleFindTool("create an issue").content[0].text;
+    expect(text).toContain("No servers enabled");
+    expect(text).not.toContain("No servers installed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cold-start progress. A first activation of an npx / uvx / docker server pays
+// for a download before the server process exists, and the only line the
+// client got was `Spawning "gh" upstream...` -- so a 30s first load and a hang
+// looked the same. The wait is the same either way; what changed is that the
+// reader is told what is being waited on.
+// ---------------------------------------------------------------------------
+
+describe("activation progress names the cold start", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+    vi.mocked(connectToUpstream).mockImplementation(async (config: any) => makeConnection(config.namespace, ["t"]));
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  /** Every progress message one activation emitted. */
+  async function activateWithProgress(priv: any, namespace: string): Promise<string[]> {
+    const messages: string[] = [];
+    await priv.activateOne(namespace, (m: string) => messages.push(m));
+    return messages;
+  }
+
+  it("says npx may download the package on a first load", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", command: "npx", args: ["-y", "gh-mcp"] })]);
+    const messages = await activateWithProgress(priv, "gh");
+    expect(messages[0]).toContain('Spawning "gh" upstream');
+    expect(messages[0]).toContain("first load on this machine");
+    expect(messages[0]).toContain("npx may download the package");
+  });
+
+  it("names the IMAGE for a docker server, not a package", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", command: "docker", args: ["run", "-i", "img"] })]);
+    const messages = await activateWithProgress(priv, "gh");
+    expect(messages[0]).toContain("docker may pull the image");
+  });
+
+  it("recognizes the launcher through a Windows extension and an absolute path", async () => {
+    // `npx.cmd` and `C:/Program Files/nodejs/npx.cmd` are the same launcher --
+    // matching on the raw command string would drop the hint for most of the
+    // installs that need it most.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "a", command: "npx.cmd", args: [] }),
+      makeServerConfig({ id: "2", namespace: "b", command: "C:/Program Files/nodejs/npx.cmd", args: [] }),
+      makeServerConfig({ id: "3", namespace: "c", command: "C:\\Program Files\\nodejs\\npx.cmd", args: [] }),
+    ]);
+    expect((await activateWithProgress(priv, "a"))[0]).toContain("npx may download");
+    expect((await activateWithProgress(priv, "b"))[0]).toContain("npx may download");
+    // The backslash spelling is what a Windows bundles.json actually carries.
+    expect((await activateWithProgress(priv, "c"))[0]).toContain("npx may download");
+  });
+
+  it("says nothing extra once the server has been loaded before", async () => {
+    // The whole point of hedging on "first": a namespace with a learned tool
+    // cache has run on this machine, so the launcher's own cache is warm and
+    // the download line would be a guess about work that is not going to
+    // happen.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", command: "npx", args: ["-y", "gh-mcp"] })]);
+    priv.toolCache.set("gh", [{ name: "create_issue" }]);
+    const messages = await activateWithProgress(priv, "gh");
+    expect(messages[0]).toBe('Spawning "gh" upstream…');
+  });
+
+  it("says nothing extra for a launcher that runs what is already on disk", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", command: "node", args: ["/srv/index.js"] })]);
+    const messages = await activateWithProgress(priv, "gh");
+    expect(messages[0]).toBe('Spawning "gh" upstream…');
+  });
+
+  it("hands the reporter to connectToUpstream, where the slow part actually happens", async () => {
+    // Without this the heartbeat in upstream.ts is unreachable: every silent
+    // window an activation has is INSIDE that call, and this suite mocks it,
+    // so nothing else would notice the argument being dropped.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", command: "npx", args: [] })]);
+    const reporter = vi.fn();
+    await priv.activateOne("gh", reporter);
+    const call = vi.mocked(connectToUpstream).mock.calls[0];
+    expect(call[4]).toBe(reporter);
   });
 });
