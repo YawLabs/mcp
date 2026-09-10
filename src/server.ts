@@ -32,7 +32,7 @@ import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js
 import { closestNames } from "./fuzzy.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
-import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
+import { type ActivationFailure, formatHealthWarning, healthFactor, scrubForWarning } from "./health-score.js";
 import {
   ADAPTIVE_MAX,
   ADAPTIVE_MIN,
@@ -4565,7 +4565,17 @@ export class ConnectServer {
         lines.push(`    avg latency: ${avgLatency}ms`);
         lines.push(`    idle: ${idleCount}/${idleLimit} until auto-unload`);
         if (h.lastErrorMessage) {
-          lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
+          // SCRUBBED, like the discover-side warning. lastErrorMessage is the
+          // upstream tool-call error text stored verbatim above, so it can carry
+          // whatever credential the upstream chose to echo -- and this line is
+          // read by the LLM. formatHealthWarning already runs the same scrubber
+          // through truncateForWarning, so discover was safe while THIS renderer
+          // of the same field was not: one field, two readers, one of them
+          // unprotected. Not redactSecretsInOutput -- that one is private to
+          // upstream.ts and keyed to a resolved server env this call does not
+          // have; scrubForWarning is pattern-based and is exported for exactly
+          // this reuse.
+          lines.push(`    last error: ${scrubForWarning(h.lastErrorMessage)} at ${h.lastErrorAt}`);
         }
       }
     }

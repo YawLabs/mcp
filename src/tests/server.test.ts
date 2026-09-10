@@ -2081,6 +2081,32 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toContain("last error: timeout at 2026-01-01T00:00:00Z");
     });
 
+    it("scrubs a credential out of the stored upstream error", async () => {
+      // lastErrorMessage is the upstream tool-call error text stored VERBATIM
+      // (see the health booking in handleToolCall), so it carries whatever the
+      // upstream chose to echo -- and this line goes to the LLM. discover was
+      // already safe because formatHealthWarning scrubs; this renderer of the
+      // SAME field was not, so the field had two readers and one of them was
+      // unprotected. The benign "timeout" fixture above cannot catch that.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.health = {
+        totalCalls: 5,
+        errorCount: 1,
+        totalLatencyMs: 100,
+        lastErrorMessage: "401 rejected Authorization: Bearer eyJhbGciOiJIUzI1NiJ9dEADbEEF",
+        lastErrorAt: "2026-01-01T00:00:00Z",
+      };
+      priv.connections.set("gh", conn);
+
+      const text = priv.handleHealth().content[0].text;
+      expect(text).not.toContain("eyJhbGciOiJIUzI1NiJ9dEADbEEF");
+      // Scrubbed, not swallowed -- the reader still learns what went wrong.
+      expect(text).toContain("401 rejected");
+      expect(text).toContain("<redacted>");
+    });
+
     describe("profile header block", () => {
       it("names both sources when a project profile is layered over a user one", () => {
         const priv = getPrivate(server);
