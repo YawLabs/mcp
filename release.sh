@@ -397,6 +397,48 @@ mcp_registry_gh_token() {
   printf %s "$t"
 }
 
+# Is $1 listed on the MCP registry for this server? Returns 0 when it is, 1
+# otherwise. ONE spelling, shared by step 5's idempotence probe and the final
+# verification, so the read that decides whether to publish and the read that
+# reports what was published cannot drift.
+#
+# CACHE-BUSTED, and that is load-bearing rather than defensive. The registry
+# answers with an X-Registry-Cache header (measured: MISS, then STALE on the
+# same URL seconds later), so an un-busted read can serve a body from BEFORE
+# this run's publish, and both call sites are harmed by that in different
+# ways. Step 5: a resume reads a pre-publish body, believes the version is
+# absent, and falls through to `mcp-publisher publish`, which the registry
+# rejects as a duplicate (name, version) -- aborting the release at its final
+# step under `set -Eeuo pipefail`, which is precisely the failure the probe
+# exists to prevent. Final verification: the same stale body reports a channel
+# nobody can actually see yet. A unique `_` parameter is what moves the cache
+# key; the no-cache headers ride along because not every edge honours them on
+# their own, and the API ignores an unknown query parameter (verified: 200
+# with the correct body). $RANDOM rather than a nanosecond clock because BSD
+# `date` has no %N and would emit a literal "N" on a macOS release host.
+#
+# Probe-only by design: any failure -- offline, API change, unparseable body,
+# a busted read the edge refuses -- returns 1, which is exactly the behavior
+# both call sites had before the probe existed.
+registry_has_version() {
+  local want="$1"
+  local body
+  body=$(curl -fsSL --max-time 20 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YawLabs/mcp&version=${want}&_=$(date +%s)${RANDOM}" 2>/dev/null || echo "")
+  [ -n "$body" ] || return 1
+  printf %s "$body" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => {
+      try {
+        const j = JSON.parse(s);
+        const hit = (j.servers || []).some((e) => e && e.server && e.server.version === process.argv[1]);
+        process.exit(hit ? 0 : 1);
+      } catch { process.exit(1); }
+    });
+  ' "$want"
+}
+
 # Rewrite server.json's version + packages[0].version to $1. Used by both the
 # fresh-bump path and the resume self-heal, so the two can never drift.
 # mcp-publisher's `publish` validates that server.json's version matches what
@@ -894,6 +936,11 @@ step 4 "Publish to npm"
 # explicit on this: `npm login --auth-type=web` overwrites the automation
 # token and the next publish EOTPs on WebAuthn).
 PUBLISHED_VERSION=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+# Which branch ran decides how the final tarball-content check READS a
+# mismatch: bytes on npm that differ from what THIS run packed are an anomaly,
+# while bytes that differ from a tree whose version was already live are the
+# documented post-tag-commit recovery. Same fact, opposite conclusions.
+NPM_PUBLISHED_THIS_RUN=false
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "@yawlabs/mcp@${VERSION} already on npm -- skipping"
 else
@@ -944,6 +991,7 @@ else
     ATTEMPT=$((ATTEMPT + 1))
     sleep 30
   done
+  NPM_PUBLISHED_THIS_RUN=true
   info "Published @yawlabs/mcp@${VERSION} to npm"
 fi
 
@@ -952,22 +1000,10 @@ step 5 "Publish server.json to MCP registry"
 # registry rejects a duplicate (name, version), so a re-run after a COMPLETED
 # step 5 died here. Ask the registry whether this exact version is already
 # listed and skip the whole step (download, auth, publish) when it is.
-# Probe-only by design: any failure -- offline, API change, unparseable body
-# -- leaves REGISTRY_HAS_VERSION false and falls through to the publish path,
-# which is exactly the pre-probe behavior.
-REGISTRY_JSON=$(curl -fsSL --max-time 20 "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YawLabs/mcp&version=${VERSION}" 2>/dev/null || echo "")
+# registry_has_version carries the cache-buster and the fail-open contract;
+# see its header for why an un-busted read breaks exactly this guarantee.
 REGISTRY_HAS_VERSION=false
-if [ -n "$REGISTRY_JSON" ] && printf %s "$REGISTRY_JSON" | node -e '
-  let s = "";
-  process.stdin.on("data", (d) => { s += d; });
-  process.stdin.on("end", () => {
-    try {
-      const j = JSON.parse(s);
-      const hit = (j.servers || []).some((e) => e && e.server && e.server.version === process.argv[1]);
-      process.exit(hit ? 0 : 1);
-    } catch { process.exit(1); }
-  });
-' "$VERSION"; then
+if registry_has_version "$VERSION"; then
   REGISTRY_HAS_VERSION=true
 fi
 
@@ -1095,8 +1131,17 @@ else
   info "Published server.json to MCP registry"
 fi
 
-# Final verification across the channels this script owns: npm, the
-# MCP registry, and the local git tag.
+# Final verification across the channels this script owns: npm (its version
+# AND the CONTENT of the tarball it is serving), the MCP registry, the local
+# package.json, and the local git tag.
+#
+# Two things this block used to claim rather than check. (1) It compared
+# version STRINGS only, and a version string proves a push happened, not that
+# what is being served is what this run built. (2) The comment named the MCP
+# registry as one of the channels and the banner below says "released to npm +
+# MCP registry", while nothing ever read the registry back -- its success was
+# inferred from mcp-publisher's exit code alone, even though a parsed registry
+# read already existed in step 5.
 echo ""
 echo -e "${CYAN}Verifying...${NC}"
 NPM_FINAL=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
@@ -1104,6 +1149,62 @@ if [ "$NPM_FINAL" = "$VERSION" ]; then
   info "npm: @yawlabs/mcp@${NPM_FINAL}"
 else
   warn "npm shows ${NPM_FINAL:-nothing} (expected $VERSION)"
+fi
+
+# CONTENT, not the version string. An npm tarball is content-addressed: `npm
+# pack` normalizes the metadata a tar carries per host (mtime, uid/gid, mode),
+# so re-packing the same tree reproduces the exact sha512 integrity the
+# registry reports for the published tarball. Measured on this package rather
+# than assumed -- two `tsup` builds through `clean: true` plus two
+# `npm pack --dry-run --json` runs gave byte-identical integrity across fresh
+# mtimes. That makes this the one check that can answer "are the bytes on npm
+# the bytes this run built?".
+#
+# --dry-run writes no tarball and runs no prepublishOnly rebuild, so it is
+# cheap and side-effect free. The JSON on stdout is authoritative rather than
+# npm's exit code -- the ARM64 exit-cleanup segfault lands AFTER the report,
+# the same rule every other npm call in this script follows. Fail-OPEN
+# throughout: an unreadable integrity on either side warns that the comparison
+# could not run. Nothing here can fail the release, which has already gone out
+# and cannot be taken back.
+PUBLISHED_INTEGRITY=$(npm view "@yawlabs/mcp@${VERSION}" dist.integrity 2>/dev/null | tr -d '[:space:]' || echo "")
+LOCAL_INTEGRITY=$(npm pack --dry-run --json 2>/dev/null | node -e '
+  let s = "";
+  process.stdin.on("data", (d) => { s += d; });
+  process.stdin.on("end", () => {
+    try {
+      const j = JSON.parse(s);
+      const first = Array.isArray(j) ? j[0] : j;
+      process.stdout.write((first && first.integrity) || "");
+    } catch { process.stdout.write(""); }
+  });
+' | tr -d '[:space:]' || echo "")
+if [ -z "$PUBLISHED_INTEGRITY" ] || [ -z "$LOCAL_INTEGRITY" ]; then
+  warn "Could not compare the published tarball to this build (npm reported '${PUBLISHED_INTEGRITY:-nothing}', local pack reported '${LOCAL_INTEGRITY:-nothing}') -- the version string above is the only npm evidence this run has."
+elif [ "$PUBLISHED_INTEGRITY" = "$LOCAL_INTEGRITY" ]; then
+  info "npm tarball: content matches this build"
+elif [ "$NPM_PUBLISHED_THIS_RUN" = true ]; then
+  warn "npm is serving a DIFFERENT tarball than this run packed for ${VERSION} (published ${PUBLISHED_INTEGRITY}, local ${LOCAL_INTEGRITY}). npm forbids re-publishing a version, so the recovery is a new version cut from the tree you intended to ship."
+else
+  warn "${VERSION} was already on npm and its tarball differs from the current tree (published ${PUBLISHED_INTEGRITY}, local ${LOCAL_INTEGRITY}) -- expected when commits landed after the tag that published it. The tag describes what shipped, not HEAD."
+fi
+
+# The MCP registry, read back rather than inferred from an exit code. Polled:
+# mcp-publisher's write path returns before the read path lists the version,
+# which is the same lag step 5 polls npm for, so a single miss here would warn
+# on a healthy release.
+REGISTRY_FINAL=false
+for REGISTRY_TRY in 1 2 3; do
+  if registry_has_version "$VERSION"; then
+    REGISTRY_FINAL=true
+    break
+  fi
+  if [ "$REGISTRY_TRY" -lt 3 ]; then sleep 5; fi
+done
+if [ "$REGISTRY_FINAL" = true ]; then
+  info "MCP registry: io.github.YawLabs/mcp@${VERSION}"
+else
+  warn "The MCP registry does not list io.github.YawLabs/mcp@${VERSION} after 3 reads. Re-run ./release.sh ${VERSION} -- steps 1-4 no-op once published, and step 5 will re-publish if the version really is absent."
 fi
 
 PKG_FINAL=$(current_pkg_version)
@@ -1120,7 +1221,14 @@ else
 fi
 
 echo ""
-echo -e "${GREEN}  v${VERSION} released to npm + MCP registry.${NC}"
+# The banner reports what was VERIFIED, not what was attempted. Asserting
+# "released to npm + MCP registry" three lines under a warning saying the
+# registry does not list it is how a half-finished release gets closed out.
+if [ "$REGISTRY_FINAL" = true ]; then
+  echo -e "${GREEN}  v${VERSION} released to npm + MCP registry.${NC}"
+else
+  echo -e "${YELLOW}  v${VERSION} released to npm; the MCP registry did not confirm the listing (see above).${NC}"
+fi
 echo ""
 echo -e "  npm:        https://www.npmjs.com/package/@yawlabs/mcp"
 echo -e "  registry:   https://registry.modelcontextprotocol.io"

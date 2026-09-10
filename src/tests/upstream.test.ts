@@ -1354,6 +1354,136 @@ describe("redactSecretsInOutput", () => {
     expect(err!.stderrTail).toContain("***API_TOKEN***");
     expect(err!.stderrTail).not.toContain("***PROJECT_PATH***");
   });
+
+  // -------------------------------------------------------------------
+  // The PARENT env half of the redaction map. The child receives
+  // `{ ...stripInternalSecretsFromEnv(process.env), ...serverEnv }`, so a
+  // credential the user exported in their own shell is just as available
+  // for a crashing child to echo as one yaw-mcp injected -- and the tail
+  // reaches the log and the model either way.
+  // -------------------------------------------------------------------
+
+  it("redacts a credential-shaped PARENT env value the child echoed, not just the resolved server env", async () => {
+    const parentToken = "ghp_ParentShellExportedThisOne1234567";
+    process.env.PROPAGATION_TEST_GITHUB_TOKEN = parentToken;
+    try {
+      // Server env is EMPTY: everything redacted here came from process.env.
+      const config = makeLocalConfig({ env: {} });
+
+      _sdkBehavior.clientConnect = () => {
+        _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`auth rejected: ${parentToken}`));
+        return Promise.reject(new Error("handshake failed"));
+      };
+
+      let err: ActivationError | undefined;
+      try {
+        await connectToUpstream(config);
+      } catch (e) {
+        err = e as ActivationError;
+      }
+
+      expect(err).toBeInstanceOf(ActivationError);
+      expect(err!.message).not.toContain(parentToken);
+      expect(err!.stderrTail).not.toContain(parentToken);
+      expect(err!.stderrTail).toContain("***PROPAGATION_TEST_GITHUB_TOKEN***");
+    } finally {
+      delete process.env.PROPAGATION_TEST_GITHUB_TOKEN;
+    }
+  });
+
+  it("leaves a parent env value whose KEY does not read as a credential alone", async () => {
+    // The selector is credentials.ts's classifier, and this is the half that
+    // keeps ordinary diagnostic output readable: BYPASS and COMPASS contain
+    // "PASS" and a naive /(TOKEN|SECRET|PASS|API_?KEY|CREDENTIAL)/i would
+    // mangle both. So would MONKEY_CAGE on a bare "KEY" substring test.
+    const cases: Record<string, string> = {
+      PROPAGATION_TEST_BYPASS_CACHE: "cache-bypass-mode-enabled",
+      PROPAGATION_TEST_COMPASS_HOME: "/opt/compass/home",
+      PROPAGATION_TEST_MONKEY_CAGE: "cage-number-eleven",
+      PROPAGATION_TEST_PROJECT_DIR: "/srv/projects/alpha",
+    };
+    for (const [k, v] of Object.entries(cases)) process.env[k] = v;
+    try {
+      const config = makeLocalConfig({ env: {} });
+      const line = Object.values(cases).join(" ");
+
+      _sdkBehavior.clientConnect = () => {
+        _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`startup context: ${line}`));
+        return Promise.reject(new Error("handshake failed"));
+      };
+
+      let err: ActivationError | undefined;
+      try {
+        await connectToUpstream(config);
+      } catch (e) {
+        err = e as ActivationError;
+      }
+
+      expect(err).toBeInstanceOf(ActivationError);
+      expect(err!.stderrTail).toContain(line);
+      expect(err!.stderrTail).not.toContain("***");
+    } finally {
+      for (const k of Object.keys(cases)) delete process.env[k];
+    }
+  });
+
+  it("names the SERVER env key when the same value sits under both a server and a parent key", async () => {
+    // The common shape: the user exports a token and the bundle passes it
+    // through. Both keys hold the identical string, and the marker has to
+    // name the one the operator can edit in bundles.json.
+    const shared = "shared_value_under_two_keys_0001";
+    process.env.PROPAGATION_TEST_SHARED_TOKEN = shared;
+    try {
+      const config = makeLocalConfig({ env: { BUNDLE_TOKEN: shared } });
+
+      _sdkBehavior.clientConnect = () => {
+        _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`rejected ${shared}`));
+        return Promise.reject(new Error("handshake failed"));
+      };
+
+      let err: ActivationError | undefined;
+      try {
+        await connectToUpstream(config);
+      } catch (e) {
+        err = e as ActivationError;
+      }
+
+      expect(err).toBeInstanceOf(ActivationError);
+      expect(err!.stderrTail).not.toContain(shared);
+      expect(err!.stderrTail).toContain("***BUNDLE_TOKEN***");
+      expect(err!.stderrTail).not.toContain("***PROPAGATION_TEST_SHARED_TOKEN***");
+    } finally {
+      delete process.env.PROPAGATION_TEST_SHARED_TOKEN;
+    }
+  });
+
+  it("keeps the >=8-char floor on parent env values too", async () => {
+    // PATH / HOME are never mangled because they are not credential-shaped;
+    // this is the second gate, for a short value under a name that IS.
+    const shortSecret = "abc1234"; // 7 chars
+    process.env.PROPAGATION_TEST_TINY_TOKEN = shortSecret;
+    try {
+      const config = makeLocalConfig({ env: {} });
+
+      _sdkBehavior.clientConnect = () => {
+        _sdkBehavior.stderrEmitter?.emit("data", Buffer.from(`error: ${shortSecret} is invalid`));
+        return Promise.reject(new Error("handshake failed"));
+      };
+
+      let err: ActivationError | undefined;
+      try {
+        await connectToUpstream(config);
+      } catch (e) {
+        err = e as ActivationError;
+      }
+
+      expect(err).toBeInstanceOf(ActivationError);
+      expect(err!.stderrTail).toContain(shortSecret);
+      expect(err!.stderrTail).not.toContain("***PROPAGATION_TEST_TINY_TOKEN***");
+    } finally {
+      delete process.env.PROPAGATION_TEST_TINY_TOKEN;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

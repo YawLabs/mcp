@@ -1,5 +1,47 @@
 import { describe, expect, it } from "vitest";
-import { detectMissingCredentials } from "../credentials.js";
+import { detectMissingCredentials, isCredentialEnvName } from "../credentials.js";
+
+// The classifier the elicitation path and upstream.ts's stderr redactor now
+// share. Pinned directly (not just through detectMissingCredentials) because
+// the redactor REPLACES the values it selects, so a false positive there
+// mangles ordinary diagnostic output rather than merely popping a prompt.
+describe("isCredentialEnvName", () => {
+  it("accepts the credential names a shell actually exports", () => {
+    for (const name of [
+      "GITHUB_TOKEN",
+      "NPM_TOKEN",
+      "AWS_SECRET_ACCESS_KEY",
+      "OPENAI_API_KEY",
+      "SLACK_BOTTOKEN",
+      "YAW_MCP_VAULT_PASSPHRASE",
+    ]) {
+      expect(isCredentialEnvName(name), name).toBe(true);
+    }
+  });
+
+  it("refuses the names a naive TOKEN|SECRET|PASS|KEY regex would mangle", () => {
+    for (const name of [
+      "BYPASS_CACHE",
+      "COMPASS_HOME",
+      "MONKEY_CAGE",
+      "TOKENIZER_PATH",
+      "SECRETARY_EMAIL",
+      "API_URL",
+      "PATH",
+      "HOME",
+      "SSH_AUTH_SOCK",
+    ]) {
+      expect(isCredentialEnvName(name), name).toBe(false);
+    }
+  });
+
+  it("folds case, because an env var is not ALL_CAPS on Windows", () => {
+    expect(isCredentialEnvName("github_token")).toBe(true);
+    expect(isCredentialEnvName("Path")).toBe(false);
+    // Folding must not turn a refused name into an accepted one.
+    expect(isCredentialEnvName("Compass")).toBe(false);
+  });
+});
 
 describe("detectMissingCredentials", () => {
   it("returns empty for undefined or empty input", () => {
