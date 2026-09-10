@@ -110,6 +110,7 @@ import {
   VaultPassphraseRequiredError,
   verifyVaultPassphrase,
 } from "./upstream.js";
+import { fenceUpstreamInstructions } from "./upstream-instructions.js";
 import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint, selectFlakyNamespaces } from "./usage-hints.js";
 import { ensureUv, uvLaunchKind } from "./uv-bootstrap.js";
 
@@ -327,6 +328,11 @@ export const ROUTING_FAULT_UNKNOWN_TOOL = "Unknown tool:";
 // without this marker, an exec step landing on a deferred route whose
 // load fails (including a server-cap or compliance refusal) was booked as
 // a 0.0 tool-call outcome against a server that never got to run.
+// Still reached from both callers, though by different routes now that
+// handleExec preflights the spawn gate: an EXEC step gets here on a cap
+// refusal or a genuine spawn failure (its policy refusals are decided before
+// step 0), while a direct tools/call on a deferred route still gets here on
+// any of them.
 export const ROUTING_FAULT_LOAD_FAILED = "could not be loaded on first call";
 export const ROUTING_FAULT_MARKERS: readonly string[] = [
   ROUTING_FAULT_TOOL_GONE,
@@ -388,6 +394,41 @@ export function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean>
     };
     p.then(done, done);
   });
+}
+
+/** Serialized size, in UTF-8 bytes, of the part of a tool result that costs
+ *  the reader context: the `content` blocks plus `structuredContent` when the
+ *  upstream sent one.
+ *
+ *  Both halves are counted because both reach the client. structuredContent is
+ *  passed through verbatim by the proxy and is deliberately exempt from BOTH
+ *  the pruner and the cap (see their comments below), so measuring `content`
+ *  alone would report a structured-output tool as near-free while the model
+ *  reads the whole payload. The envelope's own `isError` flag is left out --
+ *  it is a handful of bytes and is not part of the body either pass operates
+ *  on.
+ *
+ *  Returns null, NOT 0, when the body cannot be serialized -- a cyclic object,
+ *  a BigInt, a stringify that throws for any other reason. Callers book both
+ *  ends of a measurement or neither, so an unmeasurable body records nothing;
+ *  a 0 here would read as "the server returned nothing", which is the opposite
+ *  of what an unserializable payload means. result-cap.ts makes the same
+ *  distinction for the same reason, and resolves it the other way (Infinity)
+ *  because its job is to REFUSE what it cannot measure, not to count it.
+ *
+ *  Exported for its own unit test: a body that arrives over the wire has been
+ *  through JSON.parse and is acyclic by construction, so the null branch is
+ *  unreachable through handleToolCall and would otherwise ship untested. */
+export function measureResultBytes(result: { content?: unknown; structuredContent?: unknown }): number | null {
+  try {
+    let bytes = Buffer.byteLength(JSON.stringify(result.content ?? []), "utf8");
+    if (result.structuredContent !== undefined) {
+      bytes += Buffer.byteLength(JSON.stringify(result.structuredContent), "utf8");
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
 }
 
 // Words that are never content terms but clear relevance.ts's 3-char prose
@@ -521,6 +562,10 @@ export class ConnectServer {
   // Session-scoped on purpose -- it is not persisted, so a new session starts
   // at the meta-tools again and the client re-asks for what it needs.
   private sessionActivated = new Set<string>();
+  /** Namespaces whose upstream `instructions` have already been rendered to
+   *  the client this session. See the collection site in handleActivate for
+   *  why the block is shown once rather than on every activate. */
+  private readonly instructionsShown = new Set<string>();
   private profile: Profile | null = null;
   // Shadow-driven install-nudge gate. Resolved once at start() from the
   // env override (YAW_MCP_INSTALL_NUDGE=1) OR config (installNudge: true);
@@ -1959,6 +2004,23 @@ export class ConnectServer {
         }
       }
 
+      // Result-byte accounting, measurement half. The counter is booked
+      // further down, AFTER pruneContent and capContent have run, because the
+      // two numbers only mean anything as a pair -- the claim being measured
+      // is the DELTA between what the upstream sent and what left this broker,
+      // and splitting the booking across two sites is how a pair drifts apart.
+      // So the reading is taken here, where it has to be (the pruner rewrites
+      // result.content a few lines down), and both halves are written at the
+      // one site below.
+      //
+      // Deliberately UNCONDITIONAL, so that the whole rule about what may be
+      // booked lives in one guard below rather than half here and half there.
+      // The only calls this measures and then discards are the ones that guard
+      // excludes -- a routing fault, a cancel, a vanished connection -- and all
+      // three carry a sentence of error text, so the serialize it costs is a
+      // few hundred bytes on a path that is already an error.
+      const upstreamBytes = measureResultBytes(result);
+
       // Prune the response before it hits the LLM. Rules are
       // conservative (drop null / undefined / empty collections,
       // collapse runs of blank lines) so we trim obvious dead weight
@@ -2024,6 +2086,31 @@ export class ConnectServer {
         // Same posture as the pruner above: a ceiling that throws must not
         // fail the user's call.
         log("warn", "capContent failed", { error: err?.message });
+      }
+
+      // Result-byte accounting, booking half -- see the measurement above for
+      // why it sits here rather than in the health block. This is the last
+      // point at which result.content is what handleToolCall will hand back,
+      // so `downstream` is the post-prune, post-cap body and the difference
+      // from `upstream` is exactly what the two passes above removed.
+      //
+      // The guard is the health counters' guard, verbatim, and for the same
+      // reason. A routing fault never reached the upstream at all; a cancelled
+      // call reached it but was withdrawn before the answer came back. Either
+      // way what is in hand is an error sentence yaw-mcp or the SDK wrote, not
+      // a body the server returned -- booking it would make a dead server look
+      // chatty and put a trim percentage on bytes no upstream ever sent.
+      //
+      // Book BOTH or NEITHER. An unserializable body measures as null on
+      // either side, and booking the half that succeeded would invent a
+      // saving (or a cost) out of a failed measurement -- the same "a
+      // non-observation is not a zero" rule the health counters follow.
+      if (connForHealth && !nonObservation && upstreamBytes !== null) {
+        const downstreamBytes = measureResultBytes(result);
+        if (downstreamBytes !== null) {
+          connForHealth.health.resultBytesUpstream += upstreamBytes;
+          connForHealth.health.resultBytesDownstream += downstreamBytes;
+        }
       }
       // Cross-session learning signal — GRADED, not binary. recordOutcome
       // records both the dispatch (denominator) and a quality-weighted
@@ -3896,6 +3983,9 @@ export class ConnectServer {
     }
 
     const results: string[] = [];
+    // Fenced upstream `instructions` blocks, appended after every broker line.
+    // See the collection site in the loop below.
+    const upstreamInstructions: string[] = [];
     let anyChanged = false;
     let anyError = false;
     let anyCapped = false;
@@ -3934,6 +4024,23 @@ export class ConnectServer {
       if (r.ok) {
         if (!this.sessionActivated.has(namespace)) advertisedGrew = true;
         this.sessionActivated.add(namespace);
+        // The server's own initialize-time `instructions`, if it sent any.
+        // Collected here and rendered after the loop, so the broker's own
+        // per-namespace lines come first and the third-party text is a
+        // separate, later block rather than interleaved with them.
+        //
+        // ONCE per namespace per session. The text is a static property of
+        // the server, so reprinting up to MAX_UPSTREAM_INSTRUCTIONS_BYTES of
+        // it on every re-activate -- a `tools` filter change, a reload after
+        // an idle unload -- would spend, on repeats of one paragraph, exactly
+        // the context this broker exists to save. The set is not cleared by
+        // deactivate for the same reason: what the server said has not
+        // changed, and the model has already read it this session.
+        const captured = this.connections.get(namespace)?.instructions;
+        if (captured && !this.instructionsShown.has(namespace)) {
+          this.instructionsShown.add(namespace);
+          upstreamInstructions.push(fenceUpstreamInstructions(namespace, captured));
+        }
       }
       // Cap refusals are tracked separately: alongside successes they are
       // informational (the per-namespace message says what to unload), but
@@ -4004,6 +4111,20 @@ export class ConnectServer {
         results.push(lead + fix);
       }
     }
+
+    // Third-party text goes LAST within this text block, after every line
+    // yaw-mcp wrote itself. Not an aesthetic choice: each block carries its own
+    // attribution header and closing delimiter, and broker prose sitting AFTER
+    // an upstream's text inside one blob is what would let a reader carry the
+    // wrong attribution forward. So inside this string, what follows a fenced
+    // block is another fenced block or the end of it.
+    //
+    // The REPLY can still grow one more part: attachGuideNudge appends its tip
+    // as a separate content block. That is fine and is why it matters that it
+    // is separate -- a distinct block, opening with the `[yaw-mcp]` prefix that
+    // sanitizeUpstreamInstructions neutralizes inside any payload, so no fenced
+    // text can pass itself off as that tip or be mistaken for part of it.
+    results.push(...upstreamInstructions);
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
@@ -4823,6 +4944,21 @@ export class ConnectServer {
         lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
         lines.push(`    calls: ${h.totalCalls}, errors: ${h.errorCount} (${errorRate}%)`);
         lines.push(`    avg latency: ${avgLatency}ms`);
+        // The context-economy claim, as a number. Rendered as the PAIR plus
+        // the trim it implies, because "9876 bytes to the client" alone says
+        // what the session cost and nothing about what it saved. Bytes, not
+        // tokens: nothing in this process tokenizes, and a token figure here
+        // would be a guess dressed as a measurement. Booked in handleToolCall
+        // -- see ConnectionHealth for what each half counts and for the two
+        // cases (exec steps, unserializable bodies) where the pair is a bound
+        // rather than an exact figure.
+        const trimmedPct =
+          h.resultBytesUpstream > 0
+            ? Math.round(((h.resultBytesUpstream - h.resultBytesDownstream) / h.resultBytesUpstream) * 100)
+            : 0;
+        lines.push(
+          `    result bytes: ${h.resultBytesUpstream} upstream, ${h.resultBytesDownstream} to client (${trimmedPct}% trimmed)`,
+        );
         lines.push(`    idle: ${idleCount}/${idleLimit} until auto-unload`);
         if (h.lastErrorMessage) {
           // SCRUBBED, like the discover-side warning. lastErrorMessage is the
@@ -5199,6 +5335,81 @@ export class ConnectServer {
       // bindings map -- the message already names the offending step index.
       return {
         content: [{ type: "text", text: `exec: ${refCheck.message}` }],
+        isError: true,
+      };
+    }
+
+    // Fourth whole-pipeline refusal: a step on a DEFERRED route whose server
+    // the spawn gate is going to refuse. Same reason as the three above -- the
+    // answer is known before step 0, and finding it out at step 4 costs the
+    // side effects of steps 1 through 3. Measured on a two-step pipeline whose
+    // step 0 files an issue and whose step 1 named a below-floor server: the
+    // refusal needed ZERO spawns to decide, and still cost a filed issue.
+    //
+    // WHY IT IS SAFE TO HOIST, which is the whole question. spawnGateRefusal's
+    // three conditions -- disabled, project profile, YAW_MCP_MIN_COMPLIANCE --
+    // are pure over `this.config`, `this.profile` and process.env, and all
+    // three are fixed for the life of the process: the config and profile are
+    // read once in start(), and an upstream tool cannot reach this process's
+    // env. Nothing a STEP can do moves them either -- meta-tools are refused
+    // from exec above, so no step can activate, block, or re-grade anything. A
+    // refusal decided now is therefore the same refusal step N would have hit,
+    // which is what makes hoisting it unable to false-refuse a pipeline that
+    // would have worked.
+    //
+    // That is the assumption to re-check first if config ever becomes
+    // reloadable mid-session: a reload landing between this pass and step N
+    // would break the equivalence, and the fix would be to re-evaluate the
+    // gate at the step as well, not to drop the preflight.
+    //
+    // Two neighbouring refusals are deliberately NOT hoisted:
+    //
+    //   * A step naming NO route at all stays lazy. The deferred set is built
+    //     from a toolCache SNAPSHOT (getDeferredServers), so a step that
+    //     activates a deferred server rebuilds routes and can add tools the
+    //     snapshot never carried -- a later step may legitimately name one of
+    //     them. That is the same staleness the re-snapshot in the dispatch
+    //     loop below already handles in the shrink direction. Refusing it up
+    //     front would turn a valid pipeline into a false refusal, which is a
+    //     worse failure than the one being fixed.
+    //   * The server CAP stays lazy too. Unlike the three gates above it is
+    //     genuinely dynamic across a pipeline: an earlier step's activation
+    //     fills a slot and an idle unload frees one, so a decision taken now
+    //     describes a cap state step N will not be in.
+    //
+    // In today's build only the COMPLIANCE arm can actually fire here, because
+    // a deferred route only exists for a server that already passed the other
+    // two: getDeferredServers draws from getProfiledActiveServers, which
+    // filters isActive and profileAllows. A disabled or blocked namespace has
+    // no route to defer, so its step degrades to the lazy unknown-tool path
+    // above. The shared gate is still what gets called -- one refusal string
+    // per case, the same one runActivateOne emits -- so this stays correct if
+    // that filtering ever moves.
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const route = this.toolRoutes.get(step.tool);
+      if (!route?.deferred) continue;
+      // A deferred route is built FROM a config entry, so a miss means the
+      // route table is stale relative to `this.config` -- the two are separate
+      // pieces of state and nothing forces a rebuild when the config is
+      // replaced. There is nothing to apply a policy to in that case, so fall
+      // through to the lazy path, which is where the step would have gone
+      // anyway and which re-resolves everything at dispatch time.
+      const serverConfig = this.config?.servers.find((sc) => sc.namespace === route.namespace);
+      if (!serverConfig) continue;
+      const gateRefusal = this.spawnGateRefusal(serverConfig, "activate");
+      if (!gateRefusal) continue;
+      const key = stepBindingKey(step, i);
+      // Plain text, like all three siblings: the SHAPE is the phase marker.
+      // The gate's own sentence is appended verbatim rather than reworded,
+      // because it is the one that names the fix.
+      return {
+        content: [
+          {
+            type: "text",
+            text: `exec: step "${key}": tool "${step.tool}" cannot be loaded; no step ran. ${gateRefusal}`,
+          },
+        ],
         isError: true,
       };
     }

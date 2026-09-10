@@ -29,6 +29,11 @@ import { ConnectServer } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "../upstream.js";
 
+// The result-byte counters every ConnectionHealth carries (types.ts). Spelled
+// once, and spread into the fixtures below, so the health literals in this file
+// stay about the thing each test is actually asserting.
+const ZERO_BYTES = { resultBytesUpstream: 0, resultBytesDownstream: 0 };
+
 function makeServerConfig(overrides: Partial<UpstreamServerConfig> = {}): UpstreamServerConfig {
   return {
     id: "srv-id",
@@ -58,7 +63,7 @@ function makeConnection(
     })),
     resources: [],
     prompts: [],
-    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
+    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0, ...ZERO_BYTES },
     status,
   } as UpstreamConnection;
 }

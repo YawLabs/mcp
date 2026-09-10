@@ -71,8 +71,13 @@ export interface CapResult {
  *  mid-sequence and decode to a replacement char -- and if the tail happens
  *  to be the lead byte of a surrogate pair, the model reads a corrupted final
  *  token. Decoding the cut and stripping a trailing replacement char is the
- *  cheap way to land on a character boundary without hand-decoding UTF-8. */
-function cutToBytes(text: string, maxBytes: number): string {
+ *  cheap way to land on a character boundary without hand-decoding UTF-8.
+ *
+ *  Exported for upstream-instructions.ts, which applies its own (much
+ *  smaller) ceiling to a third-party string and needs exactly this cut. A
+ *  second implementation of the surrogate-boundary rule above is the kind of
+ *  duplicate that stays right in one copy and rots in the other. */
+export function cutToBytes(text: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
   const buf = Buffer.from(text, "utf8");
   if (buf.byteLength <= maxBytes) return text;

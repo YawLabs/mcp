@@ -48,6 +48,7 @@ import {
   isAutoLoadEnabled,
   isRoutingFaultText,
   MAX_VAULT_PASSPHRASE_PROMPTS,
+  measureResultBytes,
   ROUTING_FAULT_DISCONNECTED,
   ROUTING_FAULT_UNKNOWN_TOOL,
   resolveIdleThreshold,
@@ -64,6 +65,11 @@ import {
   vaultPassphrase,
   verifyVaultPassphrase,
 } from "../upstream.js";
+
+// The result-byte counters every ConnectionHealth carries (types.ts). Spelled
+// once, and spread into the fixtures below, so the health literals in this file
+// stay about the thing each test is actually asserting.
+const ZERO_BYTES = { resultBytesUpstream: 0, resultBytesDownstream: 0 };
 
 function makeConfig(servers: UpstreamServerConfig[]) {
   return { servers, configVersion: "v1" };
@@ -97,7 +103,7 @@ function makeConnection(
     })),
     resources: [],
     prompts: [],
-    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
+    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0, ...ZERO_BYTES },
     status,
   } as UpstreamConnection;
 }
@@ -582,7 +588,13 @@ describe("ConnectServer", () => {
       const conn = makeConnection("gh", ["create_issue"]);
       // 4/10 failed = 40% → above WARN_RATE_FLOOR, the 10% warning gate in
       // health-score.ts (and past the 3-call observation floor).
-      conn.health = { totalCalls: 10, errorCount: 4, totalLatencyMs: 0, lastErrorMessage: "502 bad gateway" };
+      conn.health = {
+        totalCalls: 10,
+        errorCount: 4,
+        totalLatencyMs: 0,
+        ...ZERO_BYTES,
+        lastErrorMessage: "502 bad gateway",
+      };
       priv.connections.set("gh", conn);
 
       const result = priv.handleDiscover();
@@ -2086,7 +2098,7 @@ describe("ConnectServer", () => {
     it("shows health stats for active connections", () => {
       const priv = getPrivate(server);
       const conn = makeConnection("gh", ["create_issue"]);
-      conn.health = { totalCalls: 10, errorCount: 2, totalLatencyMs: 500 };
+      conn.health = { totalCalls: 10, errorCount: 2, totalLatencyMs: 500, ...ZERO_BYTES };
       priv.connections.set("gh", conn);
       priv.idleCallCounts.set("gh", 3);
 
@@ -2105,6 +2117,7 @@ describe("ConnectServer", () => {
         totalCalls: 5,
         errorCount: 1,
         totalLatencyMs: 100,
+        ...ZERO_BYTES,
         lastErrorMessage: "timeout",
         lastErrorAt: "2026-01-01T00:00:00Z",
       };
@@ -2128,6 +2141,7 @@ describe("ConnectServer", () => {
         totalCalls: 5,
         errorCount: 1,
         totalLatencyMs: 100,
+        ...ZERO_BYTES,
         lastErrorMessage: "401 rejected Authorization: Bearer eyJhbGciOiJIUzI1NiJ9dEADbEEF",
         lastErrorAt: "2026-01-01T00:00:00Z",
       };
@@ -2211,7 +2225,7 @@ describe("ConnectServer", () => {
       it("skips namespaces currently loaded (in-session block covers them)", () => {
         const priv = getPrivate(server);
         const conn = makeConnection("gh");
-        conn.health = { totalCalls: 10, errorCount: 5, totalLatencyMs: 100 };
+        conn.health = { totalCalls: 10, errorCount: 5, totalLatencyMs: 100, ...ZERO_BYTES };
         priv.connections.set("gh", conn);
         priv.learning.loadSnapshot({
           gh: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
@@ -7661,5 +7675,435 @@ describe("activate reports a tool filter name that matches nothing", () => {
     const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
     expect(r.content[0].text).not.toContain("does not exist");
     expect(priv.toolFilters.has("gh")).toBe(false);
+  });
+});
+
+describe("result-byte accounting", () => {
+  let server: ConnectServer;
+
+  // Trailing whitespace on every line plus a run of blank lines: pruneContent
+  // strips both, and the win clears its MIN_SAVINGS_RATIO, so the pruned body
+  // is genuinely smaller than the raw one. Measured against the real pruner
+  // (681 bytes in, 553 out), not assumed -- the tests below assert the two
+  // counters DIFFER, which is vacuous against a body the pruner declines to
+  // touch.
+  const PRUNABLE = `${"hello world   \n".repeat(40)}\n\n\n\n\ntail`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // isPruneEnabled() re-reads the env per call, so an operator with
+    // YAW_MCP_PRUNE_RESPONSES=0 in their shell would otherwise measure an
+    // unpruned body here. Blank is the documented default (pruning on).
+    vi.stubEnv("YAW_MCP_PRUNE_RESPONSES", "");
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await server.shutdown();
+  });
+
+  function withGh(priv: any, callResult: unknown) {
+    const conn = makeConnection("gh", ["report"]);
+    conn.client.callTool = vi.fn().mockResolvedValue(callResult);
+    priv.connections.set("gh", conn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.rebuildRoutes();
+    return conn;
+  }
+
+  it("books what the upstream sent AND what left the broker, and they differ", async () => {
+    // The whole claim in one assertion: the counter is a PAIR, and the gap
+    // between its halves is the only measurable part of "this broker spends
+    // less of your context". A single number could not show it.
+    const priv = getPrivate(server);
+    const conn = withGh(priv, { content: [{ type: "text", text: PRUNABLE }] });
+
+    const result = await priv.handleToolCall("gh_report", {});
+
+    // Upstream is the body the server sent, before the pruner rewrote it.
+    expect(conn.health.resultBytesUpstream).toBe(
+      Buffer.byteLength(JSON.stringify([{ type: "text", text: PRUNABLE }]), "utf8"),
+    );
+    // Downstream is the body the caller actually got back -- derived from the
+    // RETURNED result, not from a second guess at what pruning does.
+    expect(conn.health.resultBytesDownstream).toBe(Buffer.byteLength(JSON.stringify(result.content), "utf8"));
+    expect(conn.health.resultBytesDownstream).toBeLessThan(conn.health.resultBytesUpstream);
+  });
+
+  it("accumulates across calls rather than reporting only the last one", async () => {
+    const priv = getPrivate(server);
+    const conn = withGh(priv, { content: [{ type: "text", text: "ok" }] });
+
+    await priv.handleToolCall("gh_report", {});
+    const afterOne = conn.health.resultBytesUpstream;
+    await priv.handleToolCall("gh_report", {});
+
+    expect(afterOne).toBeGreaterThan(0);
+    expect(conn.health.resultBytesUpstream).toBe(afterOne * 2);
+  });
+
+  it("counts structuredContent, which neither the pruner nor the cap touches", async () => {
+    // A structured-output tool's payload passes through verbatim (proxy.ts)
+    // and is exempt from both trimming passes, so counting `content` alone
+    // would report the chattiest shape in MCP as nearly free while the model
+    // reads all of it.
+    const priv = getPrivate(server);
+    const structured = { rows: Array.from({ length: 20 }, (_, i) => ({ id: i, name: "x".repeat(20) })) };
+    const conn = withGh(priv, { content: [{ type: "text", text: "ok" }], structuredContent: structured });
+
+    await priv.handleToolCall("gh_report", {});
+
+    const contentOnly = Buffer.byteLength(JSON.stringify([{ type: "text", text: "ok" }]), "utf8");
+    expect(conn.health.resultBytesUpstream).toBe(contentOnly + Buffer.byteLength(JSON.stringify(structured), "utf8"));
+    // Exempt from both passes, so nothing was trimmed off it.
+    expect(conn.health.resultBytesDownstream).toBe(conn.health.resultBytesUpstream);
+  });
+
+  it("books no bytes for a routing fault that never reached the upstream", async () => {
+    // Same non-observation rule the call/error/latency counters follow: the
+    // fault is yaw-mcp's own, so booking its apology text as "what this server
+    // returned" would make a dead server look chatty and put a trim percentage
+    // on bytes no upstream ever sent.
+    const priv = getPrivate(server);
+    const conn = makeConnection("gh", ["report"], "error");
+    priv.connections.set("gh", conn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.rebuildRoutes();
+    priv.config = makeConfig([]);
+
+    const result = await priv.handleToolCall("gh_report", {});
+
+    expect(isRoutingFaultResult(result)).toBe(true);
+    expect(conn.health.resultBytesUpstream).toBe(0);
+    expect(conn.health.resultBytesDownstream).toBe(0);
+  });
+
+  it("renders the pair, and the trim it implies, in mcp_connect_health", async () => {
+    const priv = getPrivate(server);
+    const conn = withGh(priv, { content: [{ type: "text", text: PRUNABLE }] });
+    await priv.handleToolCall("gh_report", {});
+
+    const text = priv.handleHealth().content[0].text;
+
+    expect(text).toContain(
+      `result bytes: ${conn.health.resultBytesUpstream} upstream, ${conn.health.resultBytesDownstream} to client`,
+    );
+    // The percentage is DERIVED from the two counters, so it cannot claim a
+    // saving the numbers do not carry.
+    const pct = Math.round(
+      ((conn.health.resultBytesUpstream - conn.health.resultBytesDownstream) / conn.health.resultBytesUpstream) * 100,
+    );
+    expect(text).toContain(`(${pct}% trimmed)`);
+  });
+
+  it("reports 0% rather than NaN for a connection that has returned nothing", () => {
+    // handleHealth renders every loaded connection, including one that has
+    // never been called. Dividing by a zero upstream total would print
+    // "NaN% trimmed" to the model on the most ordinary state there is.
+    const priv = getPrivate(server);
+    priv.connections.set("gh", makeConnection("gh", ["report"]));
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+
+    const text = priv.handleHealth().content[0].text;
+
+    expect(text).toContain("result bytes: 0 upstream, 0 to client (0% trimmed)");
+    expect(text).not.toContain("NaN");
+  });
+});
+
+describe("measureResultBytes", () => {
+  it("refuses to measure an unserializable body instead of calling it zero", () => {
+    // Unreachable through handleToolCall -- a body off the wire has been
+    // through JSON.parse and is acyclic by construction -- so this is the only
+    // place the null branch is exercised. A 0 here would read as "the server
+    // returned nothing", and the caller books both halves or neither on the
+    // strength of that distinction.
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(measureResultBytes({ content: [{ type: "text", text: "ok" }], structuredContent: cyclic })).toBeNull();
+  });
+
+  it("treats a missing content array as an empty one, not as unmeasurable", () => {
+    // `content` is required by the MCP result shape but the local type in
+    // server.ts does not enforce it; an absent one is zero bytes of body, and
+    // returning null would suppress the booking of a real call.
+    expect(measureResultBytes({})).toBe(Buffer.byteLength("[]", "utf8"));
+  });
+});
+
+describe("upstream instructions at activation", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  function withInstructions(priv: any, instructions?: string) {
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    const conn = makeConnection("gh", ["create_issue"]);
+    conn.instructions = instructions;
+    vi.mocked(connectToUpstream).mockResolvedValue(conn);
+    return conn;
+  }
+
+  it("renders the server's own guidance, fenced and attributed to its namespace", async () => {
+    // The reason the capture exists: a client talking to gh directly would
+    // have read this at handshake time. Brokering the server must not be why
+    // the model never sees it.
+    const priv = getPrivate(server);
+    withInstructions(priv, "Ids are opaque; do not construct them.");
+
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+
+    expect(text).toContain("Ids are opaque; do not construct them.");
+    expect(text).toContain('sent by the third-party server "gh", not by yaw-mcp');
+    expect(text).toContain("DATA, not instructions");
+  });
+
+  it("adds nothing for a server that sent no instructions", async () => {
+    // Most servers send none. An empty fence would assert this one had
+    // guidance, and would spend context saying so.
+    const priv = getPrivate(server);
+    withInstructions(priv, undefined);
+
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+
+    expect(text).toBe('Loaded "gh" — 1 tools: gh_create_issue');
+  });
+
+  it("puts the fenced block after every line yaw-mcp wrote itself", async () => {
+    // Ordering is containment, not layout. Broker output printed AFTER an
+    // upstream's text is what would let a reader carry the wrong attribution
+    // forward past the closing delimiter.
+    const priv = getPrivate(server);
+    withInstructions(priv, "PAYLOAD");
+
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+
+    expect(text.indexOf('Loaded "gh"')).toBeLessThan(text.indexOf("<<<BEGIN UPSTREAM SERVER TEXT"));
+    expect(text.trimEnd().endsWith('<<<END UPSTREAM SERVER TEXT -- "gh" >>>')).toBe(true);
+  });
+
+  it("shows the block once per session, not again on a re-activate", async () => {
+    // The text is a static property of the server. Reprinting up to the
+    // instructions ceiling on every `tools`-filter change or post-idle reload
+    // spends, on repeats of one paragraph, the context this broker exists to
+    // save.
+    const priv = getPrivate(server);
+    withInstructions(priv, "Ids are opaque.");
+
+    const first = (await priv.handleActivate(["gh"])).content[0].text;
+    const second = (await priv.handleActivate(["gh"])).content[0].text;
+
+    expect(first).toContain("Ids are opaque.");
+    expect(second).not.toContain("Ids are opaque.");
+    expect(second).not.toContain("<<<BEGIN UPSTREAM SERVER TEXT");
+  });
+
+  it("says nothing about a server whose activation failed", async () => {
+    // There is no connection to read instructions off, and attributing text
+    // to a server that never came up would be yaw-mcp inventing a source.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn failed"));
+
+    const result = await withoutRetryBackoff(() => priv.handleActivate(["gh"]));
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).not.toContain("<<<BEGIN UPSTREAM SERVER TEXT");
+  });
+});
+
+describe("exec preflights the spawn gate on deferred steps", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await server.shutdown();
+  });
+
+  // step 0 lands on a live gh; step 1 names a tool on a DEFERRED slack route.
+  // A deferred route exists for any active, profile-allowed server with a
+  // cached tool list -- the compliance grade is NOT part of that filter
+  // (getDeferredServers -> getProfiledActiveServers), which is why a
+  // below-floor server can be reached from a pipeline at all.
+  function twoStep(priv: any, slack: Partial<UpstreamServerConfig>) {
+    const gh = makeConnection("gh", ["create_issue"]);
+    gh.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: '{"number":7}' }] });
+    priv.connections.set("gh", gh);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh" }),
+      makeServerConfig({ namespace: "slack", toolCache: [{ name: "post" }], ...slack }),
+    ]);
+    priv.rebuildRoutes();
+    return gh;
+  }
+
+  const pipeline = {
+    steps: [
+      { id: "issue", tool: "gh_create_issue", args: {} },
+      { id: "post", tool: "slack_post", args: {} },
+    ],
+  };
+
+  it("refuses a below-floor deferred server before step 0 files an issue", async () => {
+    // The case the preflight exists for. Deciding this needs ZERO spawns --
+    // the grade and the floor are both known before anything runs -- and yet
+    // it used to be decided at step 1, by which time step 0 had already filed
+    // an issue. The model's natural response, re-running the exec, files a
+    // second one.
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    const gh = twoStep(priv, { complianceGrade: "D" });
+
+    const result = await priv.handleToolCall("mcp_connect_exec", pipeline);
+
+    expect(result.isError).toBe(true);
+    // Zero dispatches. Not "one dispatch and a good error".
+    expect(gh.client.callTool).not.toHaveBeenCalled();
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("reports it in the preflight shape, not the envelope", async () => {
+    // The SHAPE is the phase marker, exactly as it is for the three sibling
+    // preflights: `exec: ...` means nothing ran, while {ok, failedStep,
+    // partial} means execution started and `partial` holds what completed.
+    // That distinction is what tells a reader whether a retry is free or can
+    // double a side effect -- so a refusal that moved from the dispatch loop
+    // to a pre-pass has to change shape with it.
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    twoStep(priv, { complianceGrade: "D" });
+
+    const text = (await priv.handleToolCall("mcp_connect_exec", pipeline)).content[0].text;
+
+    expect(text.startsWith("exec: ")).toBe(true);
+    expect(text).toContain('step "post"');
+    expect(text).toContain("no step ran.");
+    expect(text).not.toContain("partial");
+    expect(() => JSON.parse(text)).toThrow();
+  });
+
+  it("hands back the gate's own refusal text, not a paraphrase of it", async () => {
+    // One refusal string per case, shared with runActivateOne through
+    // spawnGateRefusal. A second wording here would drift from the one the
+    // model is told everywhere else, and the fix (unset or lower the env var)
+    // lives in that string.
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    twoStep(priv, { complianceGrade: "D" });
+
+    const text = (await priv.handleToolCall("mcp_connect_exec", pipeline)).content[0].text;
+
+    expect(text).toContain('Refused to load "slack"');
+    expect(text).toContain("grade D");
+    expect(text).toContain("YAW_MCP_MIN_COMPLIANCE");
+  });
+
+  it("lets an in-grade deferred step through to run", async () => {
+    // The other half of the contract. A preflight that refused deferred steps
+    // in general would break the feature it is guarding: a deferred server is
+    // the ORDINARY case for a pipeline that spans servers.
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    const gh = twoStep(priv, { complianceGrade: "A" });
+    const slack = makeConnection("slack", ["post"]);
+    slack.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "posted" }] });
+    vi.mocked(connectToUpstream).mockResolvedValue(slack);
+
+    const result = await priv.handleToolCall("mcp_connect_exec", { ...pipeline, return: "post" });
+
+    expect(result.isError).toBeUndefined();
+    expect(gh.client.callTool).toHaveBeenCalled();
+    expect(slack.client.callTool).toHaveBeenCalled();
+  });
+
+  it("consults the shared spawn gate, not a hand-rolled compliance check", async () => {
+    // profileAllows is the second arm of that gate, and reaching it takes a
+    // CONSTRUCTED state: the profile is installed after the routes were built,
+    // which production never does -- start() loads the profile before anything
+    // rebuilds routes, and getProfiledActiveServers then filters a blocked
+    // namespace out of the deferred set entirely (asserted below). So this is
+    // not a claim that the profile arm fires in normal operation. It pins the
+    // thing that matters: the preflight calls spawnGateRefusal, so all three
+    // arms and their exact refusal strings come from the one copy shared with
+    // runActivateOne. A compliance-only reimplementation would pass every
+    // other test in this block and fail this one.
+    const priv = getPrivate(server);
+    const gh = twoStep(priv, {});
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", blocked: ["slack"] };
+
+    const result = await priv.handleToolCall("mcp_connect_exec", pipeline);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not allowed by the project profile");
+    expect(gh.client.callTool).not.toHaveBeenCalled();
+
+    // The production premise the comment above rests on: with the profile in
+    // place when routes are built, the blocked namespace has no deferred route
+    // for a preflight to inspect in the first place.
+    priv.rebuildRoutes();
+    expect(priv.toolRoutes.has("slack_post")).toBe(false);
+  });
+
+  it("does not apply the gate to a step on an already-connected server", async () => {
+    // The gate is about SPAWNING, and a live connection is already spawned.
+    // A direct tools/call to a below-floor server that is connected succeeds
+    // -- the floor is enforced in runActivateOne, not on the call path -- so
+    // an exec step naming the same tool has to succeed too. Widening the
+    // preflight from deferred routes to every route would make exec stricter
+    // than calling the tool directly, which is a difference no caller could
+    // predict from the tool's own description.
+    vi.stubEnv("YAW_MCP_MIN_COMPLIANCE", "B");
+    const priv = getPrivate(server);
+    const gh = makeConnection("gh", ["create_issue"]);
+    gh.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: '{"number":7}' }] });
+    priv.connections.set("gh", gh);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", complianceGrade: "D" })]);
+    priv.rebuildRoutes();
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [{ id: "issue", tool: "gh_create_issue", args: {} }],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(gh.client.callTool).toHaveBeenCalled();
+  });
+
+  it("leaves a step naming no route at all to the lazy path", async () => {
+    // Deliberately NOT preflighted. The deferred set is built from a toolCache
+    // snapshot, so an earlier step that activates a deferred server can add
+    // routes the snapshot never carried -- a later step may legitimately name
+    // a tool that had no route when the pipeline started. Refusing up front
+    // would turn that into a false refusal of a valid pipeline, so an unknown
+    // tool stays a step-time failure and keeps the envelope that says step 0
+    // already ran.
+    const priv = getPrivate(server);
+    const gh = twoStep(priv, { complianceGrade: "A" });
+
+    const result = await priv.handleToolCall("mcp_connect_exec", {
+      steps: [
+        { id: "issue", tool: "gh_create_issue", args: {} },
+        { id: "post", tool: "nowhere_at_all", args: {} },
+      ],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(gh.client.callTool).toHaveBeenCalled();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.ok).toBe(false);
+    expect(body.failedStep).toBe("post");
+    expect(body.partial.issue).toEqual({ number: 7 });
   });
 });
