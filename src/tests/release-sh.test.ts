@@ -863,3 +863,111 @@ describe("release.sh MCP-registry read-back", () => {
     expect(r.status).toBe(0);
   });
 });
+
+// The behaviour-change gate: a default that changes without an opt-in is the
+// one release hazard nothing in the diff can reveal, so the only check is a
+// human answering out loud. Both defects below were found by an adversarial
+// review AFTER the gate shipped, and both made it answer itself.
+describe("release.sh behaviour-change gate (fixture run)", () => {
+  const block = extractBlock(
+    '  read -p "Behaviour change with no opt-in? (y/N) " -r BEHAVIOUR_REPLY || BEHAVIOUR_REPLY=""',
+    "  fi",
+  );
+  const dir = newTmp("release-behaviour-");
+
+  // A CHANGELOG shaped like the real one: an Unreleased section naming this
+  // release's switch, and an older section naming a different one.
+  const CHANGELOG = [
+    "# Changelog",
+    "",
+    "## Unreleased -- something",
+    "",
+    "Set `YAW_MCP_NEW_THING=0` to disable it.",
+    "",
+    "## 0.79.0 -- older",
+    "",
+    "Set `YAW_MCP_OLD_THING=0` to disable it.",
+    "",
+  ].join("\n");
+
+  function run(answers: string[]): RunResult {
+    writeFileSync(join(dir, "CHANGELOG.md"), CHANGELOG);
+    const body = [STUB_HELPERS, 'VERSION="0.81.0"', "CYAN=''", "NC=''", block, 'echo "CONTINUED"'].join("\n");
+    const file = join(dir, "behaviour-harness.sh");
+    writeFileSync(file, body);
+    const r = spawnSync("bash", [file], {
+      cwd: dir,
+      encoding: "utf8",
+      input: `${answers.join("\n")}\n`,
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  }
+
+  it("passes straight through when nothing changes for an existing user", () => {
+    expect(run(["n"]).out).toContain("CONTINUED");
+  });
+
+  it("accepts a documented switch and continues", () => {
+    const r = run(["y", "YAW_MCP_NEW_THING"]);
+    expect(r.out).toContain("found in the Unreleased section");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("does not answer itself when the operator types 'yes' rather than 'y'", () => {
+    // The original read used -n 1, so "yes" left "es" in the buffer for the
+    // NEXT read to swallow as the off-switch name -- and "es" matches almost
+    // any CHANGELOG as a substring, so the gate passed itself. A normal answer
+    // defeated the check.
+    const r = run(["yes", "YAW_MCP_NEW_THING"]);
+    expect(r.out).toContain("found in the Unreleased section");
+    expect(r.out).not.toContain("'es'");
+    expect(r.out).toContain("CONTINUED");
+  });
+
+  it("treats a FLAG-shaped switch as a pattern, not as a grep option", () => {
+    // Without -e, `grep -qF "--no-cap"` exits 2 with "unknown option" and the
+    // 2>/dev/null hid it, so the operator was told the name was absent from a
+    // file that contained it. Here it is genuinely absent, so the abort is
+    // correct -- what matters is that grep did not error.
+    const r = run(["y", "--no-such-flag"]);
+    expect(r.out).toContain("does not appear");
+    expect(r.out).not.toContain("unknown option");
+    expect(r.out).not.toContain("Usage: grep");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("accepts a flag-shaped switch that IS documented", () => {
+    writeFileSync(join(dir, "CHANGELOG.md"), CHANGELOG.replace("YAW_MCP_NEW_THING=0", "--no-new-thing"));
+    const body = [STUB_HELPERS, 'VERSION="0.81.0"', "CYAN=''", "NC=''", block, 'echo "CONTINUED"'].join("\n");
+    const file = join(dir, "behaviour-harness-flag.sh");
+    writeFileSync(file, body);
+    const r = spawnSync("bash", [file], {
+      cwd: dir,
+      encoding: "utf8",
+      input: "y\n--no-new-thing\n",
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain("CONTINUED");
+  });
+
+  it("refuses a switch documented only in an OLDER release", () => {
+    // The gate exists to assert THIS release documents the way back. An
+    // unscoped grep was satisfied by a name mentioned three releases ago.
+    const r = run(["y", "YAW_MCP_OLD_THING"]);
+    expect(r.out).toContain("does not appear");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("refuses a blank switch", () => {
+    const r = run(["y", "   "]);
+    expect(r.out).toContain("documented way back");
+    expect(r.out).not.toContain("CONTINUED");
+  });
+
+  it("trims surrounding whitespace off the switch", () => {
+    const r = run(["y", "  YAW_MCP_NEW_THING  "]);
+    expect(r.out).toContain("found in the Unreleased section");
+    expect(r.out).toContain("CONTINUED");
+  });
+});

@@ -695,6 +695,16 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "  Install method is ${CYAN}npm install -g @yawlabs/mcp${NC} (or ${CYAN}npx -y @yawlabs/mcp${NC})."
   echo ""
+  # The TTY check comes FIRST, ahead of both prompts. Without a terminal every
+  # `read` below returns EOF instantly, so the behaviour-change gate would
+  # "pass" on an empty answer and only then hit this abort -- a gate answering
+  # itself, even though the release stopped anyway. Checking here means neither
+  # prompt is ever reached without someone able to answer it.
+  if [ ! -t 0 ]; then
+    echo "Aborted: stdin is not a terminal, so the confirm prompt cannot be answered."
+    echo "Re-run with -y (or SKIP_CONFIRM=1 ./release.sh ${VERSION}) to release non-interactively."
+    exit 0
+  fi
   # Behaviour-change prompt, deliberately BEFORE the release confirm rather
   # than folded into it. This package has real installs, and the failure it
   # guards is not a bug -- it is a default that changes without an opt-in, so
@@ -710,33 +720,46 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   # so -y / SKIP_CONFIRM=1 skips it exactly like the confirm below.
   echo -e "${YELLOW}Does v${VERSION} change behaviour for an EXISTING user who opts into nothing?${NC}"
   echo "  A new default, a new ceiling, a changed threshold, a newly-enforced rule."
-  read -p "Behaviour change with no opt-in? (y/N) " -n 1 -r BEHAVIOUR_REPLY || BEHAVIOUR_REPLY=""
-  echo
-  if [[ $BEHAVIOUR_REPLY =~ ^[Yy]$ ]]; then
+  # A WHOLE LINE, not `read -n 1`. The sibling confirm below reads one
+  # character safely because nothing reads after it; this one is followed by a
+  # second prompt, and `-n 1` on an answer of "yes" leaves "es" in the buffer
+  # for that second read to swallow as the off-switch name. "es" then matches
+  # CHANGELOG.md as a substring of any word containing it, so the gate passed
+  # itself -- the operator typing a NORMAL answer defeated the check.
+  read -p "Behaviour change with no opt-in? (y/N) " -r BEHAVIOUR_REPLY || BEHAVIOUR_REPLY=""
+  if [[ $BEHAVIOUR_REPLY =~ ^[Yy]([Ee][Ss])?$ ]]; then
     echo "  Then it needs an off switch, and CHANGELOG.md must name it."
     read -p "  Off switch (env var / flag), or blank to abort: " -r OFF_SWITCH || OFF_SWITCH=""
-    if [ -z "${OFF_SWITCH// /}" ]; then
+    OFF_SWITCH="${OFF_SWITCH#"${OFF_SWITCH%%[![:space:]]*}"}"
+    OFF_SWITCH="${OFF_SWITCH%"${OFF_SWITCH##*[![:space:]]}"}"
+    if [ -z "$OFF_SWITCH" ]; then
       echo "Aborted: a default-on behaviour change ships with a documented way back, or it does not ship."
       exit 0
     fi
-    if ! grep -qF "$OFF_SWITCH" CHANGELOG.md 2>/dev/null; then
-      echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md -- document it there first."
+    # Scoped to the UNRELEASED section, not the whole file. The point of the
+    # gate is that THIS release documents the switch; an unscoped grep is
+    # satisfied by a name mentioned three releases ago, which is exactly the
+    # case where the operator most needs to be stopped.
+    UNRELEASED_BODY=$(awk '/^## [Uu]nreleased/ { inside = 1; next } inside && /^## / { exit } inside { print }' CHANGELOG.md 2>/dev/null || true)
+    # `-e` so a flag-shaped switch is a PATTERN, not an option. Without it
+    # `grep -qF "--no-cap"` exits 2 with "unknown option", and the message
+    # below then told the operator the name was absent from a file that
+    # contains it -- an abort on the answer the prompt above asks for.
+    if ! printf '%s\n' "$UNRELEASED_BODY" | grep -qF -e "$OFF_SWITCH"; then
+      echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md's Unreleased section -- document it there first."
       exit 0
     fi
-    echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in CHANGELOG.md."
+    echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in the Unreleased section."
   fi
   echo ""
   # Non-interactive stdin (piped, nohup, an agent harness) gets EOF from
   # `read`, which returns non-zero -- under `set -e` that used to kill the run
   # with the generic "Release failed at line NNN" banner, as if a gate had
   # failed. Nothing has been mutated at this point, so say what happened and
-  # exit the same clean way a declined prompt does. `|| REPLY=""` covers the
-  # EOF-on-a-tty case (Ctrl-D) the same way.
-  if [ ! -t 0 ]; then
-    echo "Aborted: stdin is not a terminal, so the confirm prompt cannot be answered."
-    echo "Re-run with -y (or SKIP_CONFIRM=1 ./release.sh ${VERSION}) to release non-interactively."
-    exit 0
-  fi
+  # exit the same clean way a declined prompt does. The `-t 0` guard that used
+  # to sit here now runs at the top of this block, ahead of BOTH prompts --
+  # see the comment there. `|| REPLY=""` still covers the EOF-on-a-tty case
+  # (Ctrl-D), which no `-t 0` check can see.
   read -p "Continue? (y/N) " -n 1 -r || REPLY=""
   echo
   if [[ ! $REPLY =~ ^[Yy]$ ]]; then
