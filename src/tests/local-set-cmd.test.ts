@@ -708,6 +708,41 @@ describe("runSet -- output", () => {
 });
 
 describe("runEnableDisable", () => {
+  it("names the verb the user typed in every refusal, not `set`", async () => {
+    // This runner backs three commands, and the refusals in it interpolate
+    // ${verb} so the message names the one that was actually typed. One of the
+    // three copies was missed when the other two were fixed, so `enable` and
+    // `disable` still said "yaw-mcp set:" on a shape refusal -- pointing the
+    // reader at a --help for a command they did not run.
+    //
+    // Asserted over ALL THREE refusal paths at once, because three copies of
+    // one message is exactly why it drifted: an odd-shaped target that matches
+    // nothing (the shape gate), a well-formed target that is not configured,
+    // and the same two through `set` itself.
+    writeBundles(SAMPLE);
+    for (const [enabled, verb] of [
+      [true, "enable"],
+      [false, "disable"],
+    ] as const) {
+      const bad = capture();
+      const r1 = await runEnableDisable({ target: "Not A Server!", enabled, home: synthHome, ...bad });
+      expect(r1.exitCode, verb).toBe(2);
+      expect(bad.errText(), verb).toContain(`yaw-mcp ${verb}:`);
+      expect(bad.errText(), verb).not.toContain("yaw-mcp set:");
+
+      const missing = capture();
+      await runEnableDisable({ target: "nosuchns", enabled, home: synthHome, ...missing });
+      expect(missing.errText(), verb).toContain(`yaw-mcp ${verb}:`);
+      expect(missing.errText(), verb).not.toContain("yaw-mcp set:");
+    }
+
+    // The control: `set` itself must still say `set`, so the fix cannot be a
+    // blanket rename that breaks the command the message was right about.
+    const asSet = capture();
+    await runSet({ target: "Not A Server!", assignments: ["isActive=false"], home: synthHome, ...asSet });
+    expect(asSet.errText()).toContain("yaw-mcp set:");
+  });
+
   it("is exactly set isActive=<bool>", async () => {
     writeBundles(SAMPLE);
     await runEnableDisable({ target: "gh", enabled: false, home: synthHome, ...capture() });
