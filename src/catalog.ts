@@ -194,6 +194,40 @@ export function normalizeCatalogUrl(url: string | undefined): string {
  *  cannot false-positive that way: only throws written here carry it. */
 class CatalogError extends Error {}
 
+/** Why a catalog URL cannot be fetched at all, or null when it can be tried.
+ *
+ *  A MALFORMED url and an UNREACHABLE one are different problems with
+ *  different fixes, and undici reports them in a way that hid the difference:
+ *  a scheme-less `cat.example/c.json` rejects with `TypeError: Failed to parse
+ *  URL from ...` and an unsupported scheme (`ftp://`, `file://`) with a bare
+ *  `TypeError: fetch failed` whose cause reads "unknown scheme" -- both of
+ *  which fell into the transport branch below and came back as "could not
+ *  reach the Yaw MCP catalog ... Check your network, then retry." The user
+ *  then debugged a network that was never involved, on a request that was
+ *  never made.
+ *
+ *  Deciding it HERE, with the URL parser rather than with the error text, is
+ *  what makes the verdict stable: the branch below reads undici's wording,
+ *  and undici rephrases across versions. Both shapes above are verified
+ *  against the Node this ships on (22.x): `new URL` throws ERR_INVALID_URL for
+ *  the first, and yields a non-http protocol for the second.
+ *
+ *  http/https only, because that is what fetch itself supports -- a `file://`
+ *  catalog is a reasonable thing to want and simply does not work here, so it
+ *  earns a message that says so instead of a network complaint. */
+function catalogUrlProblem(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "it is not a URL";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `its scheme is "${parsed.protocol.replace(":", "")}", and only http and https can be fetched`;
+  }
+  return null;
+}
+
 /** Fetch + shape-validate the catalog. Bounded by FETCH_TIMEOUT_MS. Throws a
  *  friendly Error on network / parse / shape failure. Injectable for tests. */
 export async function defaultFetchCatalog(
@@ -203,6 +237,15 @@ export async function defaultFetchCatalog(
   // Every message below names `url`, so normalize before the first use -- an
   // empty string would otherwise produce "the catalog at  returned HTTP 404".
   const url = normalizeCatalogUrl(catalogUrl);
+  // Before the request, not after the failure: a URL fetch cannot even parse
+  // is a configuration typo, and reporting it as "could not reach ... check
+  // your network" sends the user to debug a connection nothing attempted.
+  const urlProblem = catalogUrlProblem(url);
+  if (urlProblem !== null) {
+    throw new CatalogError(
+      `the Yaw MCP catalog URL "${url}" cannot be fetched -- ${urlProblem}. Fix the --catalog value or $YAW_MCP_CATALOG_URL, or unset it to use ${DEFAULT_CATALOG_URL}.`,
+    );
+  }
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
   let body: unknown;

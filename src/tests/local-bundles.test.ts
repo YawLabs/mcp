@@ -11,7 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BUNDLES_FILENAME,
@@ -1350,6 +1351,23 @@ describe("write path births ~/.yaw-mcp/ owner-only (0o700)", () => {
   // so it can only reach its own atomicWriteFile once the dir already exists.
   // Seed via upsert, then exercise the remove write path and confirm it asks
   // for the same owner-only parent rather than dropping the dirMode.
+  it("asks for file mode 0o600 as well, which is what the docs promise", async () => {
+    // The FILE mode, not the dir mode -- a bundles.json entry can carry a
+    // plaintext `--env` credential, and `yaw-mcp add --help` and the README
+    // both tell the user the file is written 0600. Asserted as a REQUEST for
+    // the same reason the dirMode assertions above are: the bits are
+    // meaningful only on POSIX, and this suite also runs on Windows.
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
+    await upsertUserBundle(
+      { namespace: "github", name: "GitHub", command: "npx", args: [], isActive: true, env: { TOKEN: "plain" } },
+      { home: synthHome },
+    );
+    const call = spy.mock.calls.find((c) => c[0] === userBundlesPath());
+    expect(call, "the user bundles file was never written").toBeDefined();
+    expect(call?.[3]).toBe(0o600);
+  });
+
   it("removeUserBundle's write path asks for dirMode 0o700 too", async () => {
     await upsertUserBundle(
       { namespace: "gone", name: "Gone", command: "npx", args: [], isActive: true },
@@ -1657,5 +1675,24 @@ describe("bundlesSignature", () => {
     utimesSync(p("x.json"), pinned, pinned);
     utimesSync(p("y.json"), pinned, pinned);
     expect(bundlesSignature([p("x.json"), p("y.json")])).not.toBe(bundlesSignature([p("y.json"), p("x.json")]));
+  });
+});
+
+// The 0600 promise is made in prose as well as in code, and prose is where it
+// went wrong: mode 0o600 is a POSIX fact. Measured on this Node (22.x) on
+// win32, a file born 0o600 stats back as 0o666 and a chmod to 0o600 leaves it
+// there -- Node maps the mode to the read-only attribute alone -- so an
+// unqualified "file mode 0600" told half the users something untrue about
+// where their plaintext credential ended up. The write path is POSIX-gated
+// (see doUpsertUserBundle); this pins the DOC to the same platform split.
+describe("the README's 0600 claim names the platform it is true on", () => {
+  it("qualifies the bundles.json mode claim rather than stating it flatly", () => {
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+    const idx = readme.indexOf("stored in plain text in `bundles.json`");
+    expect(idx, "the --env storage sentence moved; re-point this guard").toBeGreaterThan(-1);
+    const sentence = readme.slice(idx, idx + 400);
+    expect(sentence).toContain("0600");
+    // The half that was missing: Windows does not get that mode.
+    expect(sentence).toMatch(/Windows/);
   });
 });

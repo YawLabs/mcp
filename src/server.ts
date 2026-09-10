@@ -349,6 +349,20 @@ export function isRoutingFaultText(text: string): boolean {
   return ROUTING_FAULT_MARKERS.some((marker) => text.includes(marker));
 }
 
+// Launchers that FETCH before they run, keyed by the command basename, with
+// what each one fetches. Only these three: `npx` resolves a package into its
+// cache on a miss, `uvx` resolves and installs into uv's tool cache, and
+// `docker run` pulls a missing image -- each of them minutes of work on a cold
+// machine, before the server process exists. `node`, `python` and an absolute
+// path to a built entry run what is already on disk and are deliberately
+// absent: a hint on those would be noise on every fast spawn.
+const COLD_START_LAUNCHERS: Record<string, string> = {
+  npx: "npx may download the package before the server starts",
+  uvx: "uvx may download the package before the server starts",
+  bunx: "bunx may download the package before the server starts",
+  docker: "docker may pull the image before the server starts",
+};
+
 // The empty-catalog message, shared by discover and dispatch. One constant
 // because the two used to drift: discover was rewritten for the local-only
 // product (`yaw-mcp add <slug>` into ~/.yaw-mcp/bundles.json) while dispatch
@@ -2844,6 +2858,86 @@ export class ConnectServer {
     return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}`;
   }
 
+  /** The "there is nothing to route to" text, for discover / dispatch /
+   *  find_tool.
+   *
+   *  NO_SERVERS_INSTALLED_TEXT alone was a falsehood whenever the config could
+   *  not be read: a hand-broken bundles.json leaves this.config null, and the
+   *  three empty-state branches then told the model "No servers installed.
+   *  Browse the catalog ... and add one" about a machine whose servers are all
+   *  still there, in a file that failed to parse. The model has no other way
+   *  to see that -- the warnings existed only as JSON log lines on stderr, and
+   *  the banner discover renders for them sits BELOW these early returns.
+   *
+   *  Warnings decide the wording, not `config === null`: a file that parsed
+   *  but had every entry rejected (an invalid namespace, a non-object entry)
+   *  leaves a non-null config with an EMPTY server list and the reasons in
+   *  warnings, and "add one" is just as wrong there. With no warnings at all
+   *  this is a genuinely fresh install, which is what the constant describes. */
+  private emptyStateText(): string {
+    if (this.configWarnings.length === 0) return NO_SERVERS_INSTALLED_TEXT;
+    return [
+      ...this.configWarnings.map((w) => `! ${w}`),
+      "No servers are loaded, and the diagnostics above say why -- so this is NOT necessarily an empty install; servers already in bundles.json can be missing because the file could not be read. Fix it (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.",
+    ].join("\n");
+  }
+
+  /** Everything installed is either `"isActive": false` or kept out by the
+   *  project profile -- there is no third way past getProfiledActiveServers,
+   *  so at least one of the two lists below is non-empty.
+   *
+   *  ONE copy, read by dispatch (which refuses) and by discover (which leads
+   *  its listing with it). Discover used to print its ordinary
+   *  "Installed MCP servers:" header over an empty list in this state, which
+   *  reads as "nothing is installed" -- the opposite of the truth, and the
+   *  opposite of what dispatch says about the same config.
+   *
+   *  Both fixes are local edits, but they are DIFFERENT edits in different
+   *  files, so only the ones that apply are named. A profile-blocked server is
+   *  already active: telling the model to set "isActive": true for it, or to
+   *  look for it in discover's disabled list (which renders profile-blocked
+   *  entries nowhere), sends it to the wrong file. */
+  private noServersEnabledText(): string {
+    const profile = this.profile;
+    const servers = this.config?.servers ?? [];
+    const disabled = servers.filter((s) => !s.isActive);
+    const blocked = profile ? servers.filter((s) => s.isActive && !profileAllows(profile, s.namespace)) : [];
+    const parts = ["No servers enabled."];
+    if (profile && blocked.length > 0) {
+      const quote = (list: UpstreamServerConfig[]) => list.map((s) => `"${s.namespace}"`).join(", ");
+      // isAllowed: an explicit "blocked" entry wins over the allow list, so
+      // a namespace on it needs removing from there; every other blocked
+      // namespace is missing from a non-empty "servers" allow list.
+      const denied = blocked.filter((s) => profile.blocked?.includes(s.namespace));
+      const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
+      const edits: string[] = [];
+      if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
+      // "blocked" is the UNION across every config scope (config-loader's
+      // unionBlocked), while profile.path is only the primary file -- so the
+      // list to edit may live in the user-global file instead. Name both
+      // when both contributed; the allow-list edit above is correctly
+      // pointed at the primary file, which is where "servers" is picked from.
+      if (denied.length > 0) {
+        const where = profile.userPath
+          ? `from the "blocked" list in whichever of ${profile.path} / ${profile.userPath} declares it (blocked lists merge across scopes)`
+          : `from its "blocked" list`;
+        edits.push(`remove ${quote(denied)} ${where}`);
+      }
+      parts.push(
+        `The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}. Restart this MCP client after editing the profile -- unlike bundles.json, profile config is read once per session.`,
+      );
+    }
+    if (disabled.length > 0) {
+      // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
+      // .yaw-mcp/bundles.json defines servers too, and a disabled one may
+      // live only there.
+      parts.push(
+        `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
+      );
+    }
+    return parts.join(" ");
+  }
+
   private buildDiscoverOutput(
     context: string | undefined,
     warmedNamespace: string | null,
@@ -2866,7 +2960,7 @@ export class ConnectServer {
     focusNamespace?: string,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
-      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
+      return { content: [{ type: "text", text: this.emptyStateText() }] };
     }
 
     const allProfiled = this.getProfiledActiveServers();
@@ -2956,7 +3050,18 @@ export class ConnectServer {
         "Fix bundles.json (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.\n",
       );
     }
-    lines.push(context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n");
+    // A header over an EMPTY list reads as "nothing is installed", which is
+    // the opposite of the truth when every installed server is disabled or
+    // profile-blocked. Lead with the same sentence dispatch refuses with --
+    // the Disabled servers block further down then reads as the detail for
+    // it rather than as a contradiction of the header above it.
+    lines.push(
+      allProfiled.length === 0
+        ? `${this.noServersEnabledText()}\n`
+        : context
+          ? "Servers ranked by relevance:\n"
+          : "Installed MCP servers:\n",
+    );
     if (warmedNamespace) {
       lines.push(`Auto-loaded "${warmedNamespace}" — top match for your query.\n`);
     }
@@ -3656,6 +3761,37 @@ export class ConnectServer {
     return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
   }
 
+  /** Why THIS activation may take tens of seconds, or "" when it should not.
+   *
+   *  A first activation of an `npx` / `uvx` / `docker` server pays for a
+   *  download before the server process even starts, and the progress line
+   *  said only `Spawning "gh" upstream...` -- so a 30s wait looked identical to
+   *  a hang, and the model had nothing to tell the user except that it was
+   *  waiting. Naming the cost up front is the difference between "this is
+   *  stuck" and "this is fetching a package".
+   *
+   *  "First" is decided by the tool cache: a namespace yaw-mcp has ever
+   *  successfully listed tools for has its names persisted (state.json, via
+   *  toolCache), so a cache HIT means this machine has run this server before
+   *  and the launcher's own cache is warm. A miss is a first load in every
+   *  sense that matters here. The hint is hedged ("may"), because a package
+   *  can also already be in the npx/uv cache from outside yaw-mcp -- and the
+   *  oam rewrite only ever applies to a package that IS already on disk.
+   *
+   *  Local servers only: a remote entry spawns nothing and downloads nothing.
+   */
+  private coldStartHint(server: UpstreamServerConfig): string {
+    if (server.type !== "local" || server.command === undefined) return "";
+    const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
+    if (cached && cached.length > 0) return "";
+    // The launcher basename, with the Windows extensions stripped the same way
+    // nodeLaunchKind does it -- `npx.cmd`, `C:/.../uvx.exe` and a bare `npx`
+    // are one launcher.
+    const base = (server.command.split(/[\\/]/).pop() ?? server.command).replace(/\.(exe|cmd|bat|ps1)$/i, "");
+    const fetches = COLD_START_LAUNCHERS[base.toLowerCase()];
+    return fetches === undefined ? "" : ` first load on this machine: ${fetches}`;
+  }
+
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
@@ -3784,13 +3920,21 @@ export class ConnectServer {
         if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
         try {
           progress?.(
-            attempt === 0 ? `Spawning "${namespace}" upstream…` : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
+            attempt === 0
+              ? `Spawning "${namespace}" upstream…${this.coldStartHint(effectiveConfig)}`
+              : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
           );
+          // `progress` is threaded INTO the connect, not just wrapped around
+          // it: everything slow about an activation happens inside that call
+          // (spawn, handshake, inventory), and from out here the only two
+          // observable moments are the ones already reported above and below.
+          // See withHeartbeat in upstream.ts.
           const connection = await connectToUpstream(
             effectiveConfig,
             this.onUpstreamDisconnect,
             this.onUpstreamListChanged,
             this.clientBridge,
+            progress,
           );
           // shutdown() latched while this handshake was in flight. Its drain
           // is bounded (SHUTDOWN_DRAIN_MS), so by now the teardown may already
@@ -4589,62 +4733,15 @@ export class ConnectServer {
     }
     if (!this.config || this.config.servers.length === 0) {
       return {
-        content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }],
+        content: [{ type: "text", text: this.emptyStateText() }],
         isError: true,
       };
     }
 
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) {
-      // Every installed server is either "isActive": false or kept out by
-      // the project profile -- there is no third way past the filter above,
-      // so at least one of the two lists below is non-empty. Both fixes are
-      // local edits, but they are DIFFERENT edits in different files, so
-      // name only the ones that apply. A profile-blocked server is already
-      // active: telling the model to set "isActive": true for it, or to look
-      // for it in discover's disabled list (discover renders profile-blocked
-      // entries nowhere), sent it to the wrong file. Name the namespaces and
-      // the exact list in the profile that keeps each one out instead.
-      const profile = this.profile;
-      const disabled = this.config.servers.filter((s) => !s.isActive);
-      const blocked = profile
-        ? this.config.servers.filter((s) => s.isActive && !profileAllows(profile, s.namespace))
-        : [];
-      const parts = ["No servers enabled."];
-      if (profile && blocked.length > 0) {
-        const quote = (servers: UpstreamServerConfig[]) => servers.map((s) => `"${s.namespace}"`).join(", ");
-        // isAllowed: an explicit "blocked" entry wins over the allow list, so
-        // a namespace on it needs removing from there; every other blocked
-        // namespace is missing from a non-empty "servers" allow list.
-        const denied = blocked.filter((s) => profile.blocked?.includes(s.namespace));
-        const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
-        const edits: string[] = [];
-        if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
-        // "blocked" is the UNION across every config scope (config-loader's
-        // unionBlocked), while profile.path is only the primary file -- so the
-        // list to edit may live in the user-global file instead. Name both
-        // when both contributed; the allow-list edit above is correctly
-        // pointed at the primary file, which is where "servers" is picked from.
-        if (denied.length > 0) {
-          const where = profile.userPath
-            ? `from the "blocked" list in whichever of ${profile.path} / ${profile.userPath} declares it (blocked lists merge across scopes)`
-            : `from its "blocked" list`;
-          edits.push(`remove ${quote(denied)} ${where}`);
-        }
-        parts.push(
-          `The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}. Restart this MCP client after editing the profile -- unlike bundles.json, profile config is read once per session.`,
-        );
-      }
-      if (disabled.length > 0) {
-        // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
-        // .yaw-mcp/bundles.json defines servers too, and a disabled one may
-        // live only there.
-        parts.push(
-          `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
-        );
-      }
       return {
-        content: [{ type: "text", text: parts.join(" ") }],
+        content: [{ type: "text", text: this.noServersEnabledText() }],
         isError: true,
       };
     }
@@ -5419,7 +5516,16 @@ export class ConnectServer {
   private handleFindTool(query: string, limit?: number): { content: Array<{ type: string; text: string }> } {
     const servers = this.getProfiledActiveServers();
     if (servers.length === 0) {
-      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
+      // Two different empty states reach this one branch, and they need
+      // different answers: nothing CONFIGURED (or nothing readable) is the
+      // emptyStateText case, while a full bundles.json whose every entry is
+      // disabled or profile-blocked is the noServersEnabledText case -- being
+      // told to "add one" when six are already installed is the same
+      // falsehood discover used to print.
+      const configured = this.config?.servers.length ?? 0;
+      return {
+        content: [{ type: "text", text: configured === 0 ? this.emptyStateText() : this.noServersEnabledText() }],
+      };
     }
     if (query.trim() === "") {
       return {

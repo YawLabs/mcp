@@ -434,20 +434,65 @@ describe("defaultFetchCatalog", () => {
     );
   });
 
-  it("wraps fetch's OWN url-parse failure, even though its message names the url", async () => {
-    // A malformed YAW_MCP_CATALOG_URL (scheme-less, a typo'd protocol) never
-    // reaches the network: fetch rejects with `TypeError: Failed to parse URL
-    // from <url>`. That message CONTAINS the url, so the old message-based
-    // rethrow gate (`err.message.includes(url)`) read it as an error this
-    // module had already worded and handed it straight back -- no "could not
-    // reach the Yaw MCP catalog" prefix and no cause detail, for a failure the
-    // user's own config caused. A marker class cannot mistake it that way.
+  it("still wraps a transport error whose message happens to name the url", async () => {
+    // The marker-class guard, kept from the case that motivated it. The old
+    // rethrow gate asked whether the message CONTAINED the url and handed such
+    // an error straight back -- no "could not reach the Yaw MCP catalog"
+    // prefix, no cause detail. Only errors this module worded itself may skip
+    // the wrapper, and a class is what tells them apart. Driven through a
+    // VALID url now, because a malformed one no longer reaches fetch at all
+    // (see the pre-flight tests below).
     stubFetch(async () => {
-      throw new TypeError("Failed to parse URL from cat.example/c.json");
+      throw new TypeError("Failed to parse URL from https://cat.example/c.json");
     });
-    await expect(defaultFetchCatalog("cat.example/c.json")).rejects.toThrow(
-      "could not reach the Yaw MCP catalog at cat.example/c.json (Failed to parse URL from cat.example/c.json).",
+    await expect(defaultFetchCatalog("https://cat.example/c.json")).rejects.toThrow(
+      "could not reach the Yaw MCP catalog at https://cat.example/c.json (Failed to parse URL from https://cat.example/c.json).",
     );
+  });
+
+  describe("a malformed catalog URL is a typo, not a network failure", () => {
+    it("rejects an unparsable url before making any request", async () => {
+      // `YAW_MCP_CATALOG_URL=cat.example/c.json` (no scheme) used to come back
+      // as "could not reach the Yaw MCP catalog at cat.example/c.json ...
+      // Check your network, then retry" -- sending the user to debug a
+      // connection that was never attempted.
+      const f = stubFetch(async () => ({ ok: true, status: 200, json: async () => ({ servers: [] }) }));
+      await expect(defaultFetchCatalog("cat.example/c.json")).rejects.toThrow(
+        'the Yaw MCP catalog URL "cat.example/c.json" cannot be fetched -- it is not a URL.',
+      );
+      // The point of doing it up front: no request goes out, so nothing about
+      // the network can be blamed.
+      expect(f).not.toHaveBeenCalled();
+      // And it names the two places the value can come from.
+      await expect(defaultFetchCatalog("cat.example/c.json")).rejects.toThrow("$YAW_MCP_CATALOG_URL");
+    });
+
+    it("names the scheme when the url parses but fetch cannot use it", async () => {
+      // `ftp://` and `file://` PARSE, so the pre-flight has to look at the
+      // protocol as well. undici reports these as a bare `TypeError: fetch
+      // failed` with a "unknown scheme" cause -- indistinguishable from being
+      // offline in the message the user saw.
+      const f = stubFetch(async () => ({ ok: true, status: 200, json: async () => ({ servers: [] }) }));
+      await expect(defaultFetchCatalog("ftp://cat.example/c.json")).rejects.toThrow(
+        'the Yaw MCP catalog URL "ftp://cat.example/c.json" cannot be fetched -- its scheme is "ftp", and only http and https can be fetched.',
+      );
+      await expect(defaultFetchCatalog("file:///tmp/c.json")).rejects.toThrow('its scheme is "file"');
+      expect(f).not.toHaveBeenCalled();
+    });
+
+    it("lets a well-formed http(s) url through to the request", async () => {
+      // The pre-flight must gate on the URL SHAPE only -- a reachable-looking
+      // host that is down is still a network failure, and still worded as one.
+      const f = stubFetch(async () => {
+        const err = new TypeError("fetch failed");
+        (err as { cause?: unknown }).cause = new Error("getaddrinfo ENOTFOUND cat.example");
+        throw err;
+      });
+      await expect(defaultFetchCatalog("http://cat.example/c.json")).rejects.toThrow(
+        "could not reach the Yaw MCP catalog at http://cat.example/c.json (getaddrinfo ENOTFOUND cat.example). Check your network, then retry.",
+      );
+      expect(f).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("wraps a non-Error rejection in an Error", async () => {

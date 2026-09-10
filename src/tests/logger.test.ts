@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { log } from "../logger.js";
+import { log, setLogSurface } from "../logger.js";
 
 // -----------------------------------------------------------------------
 // logger.ts: spread-order pin (logger.ts:9)
@@ -184,5 +184,104 @@ describe("log() reads LOG_LEVEL per call, not once at import", () => {
     log("info", "still-shown");
     expect(stderrWrites.length).toBe(1);
     expect(JSON.parse(stderrWrites[0].trim()).msg).toBe("still-shown");
+  });
+});
+
+// -----------------------------------------------------------------------
+// logger.ts CLI surface: the structured envelope is for the stdio server,
+// whose only channel is stderr. A person running `yaw-mcp list` against a
+// hand-broken bundles.json was shown the raw record --
+// {"level":"warn","msg":"bundles.json is not valid JSON; ignoring",...} --
+// stacked on top of the sentence the command itself prints. These pin the
+// split, including the half that must NOT be silenced.
+// -----------------------------------------------------------------------
+
+describe("log() on the CLI surface", () => {
+  let stderrWrites: string[] = [];
+
+  beforeEach(() => {
+    stderrWrites = [];
+    // Deliberately UNSET, not "debug": the whole gate is "did the operator
+    // ask for the structured stream", and stubbing a level would answer yes
+    // for every case below.
+    vi.stubEnv("LOG_LEVEL", undefined);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") stderrWrites.push(chunk);
+      return true;
+    });
+    setLogSurface("cli");
+  });
+
+  afterEach(() => {
+    // Back to the module default. A leaked "cli" would quietly change what
+    // every later test in this process sees on stderr.
+    setLogSurface("server");
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it("drops an info record entirely -- it is server telemetry with no reader here", () => {
+    log("info", "Loaded bundles", { path: "/x/bundles.json", serverCount: 3 });
+    expect(stderrWrites).toEqual([]);
+  });
+
+  it("renders a warning as a plain sentence rather than a JSON envelope", () => {
+    log("warn", "bundles.json is not valid JSON; ignoring", { path: "/x/bundles.json", code: "EJSON" });
+    expect(stderrWrites).toHaveLength(1);
+    const line = stderrWrites[0];
+    expect(line).toBe(
+      "yaw-mcp: warning: bundles.json is not valid JSON; ignoring (path=/x/bundles.json; code=EJSON)\n",
+    );
+    // The shape the CLI user must never see again.
+    expect(line).not.toContain('"level"');
+    expect(line).not.toContain('"msg"');
+  });
+
+  it("keeps errors too, labelled as errors", () => {
+    // Not silenced: several warn/error records (an invalid
+    // YAW_MCP_DEFAULT_RUNTIME, an unreadable trust store) have no other
+    // surface, so dropping them would trade noise for a missing warning.
+    log("error", "Failed to save yaw-mcp state");
+    expect(stderrWrites).toEqual(["yaw-mcp: error: Failed to save yaw-mcp state\n"]);
+  });
+
+  it("restores the structured stream when LOG_LEVEL asks for it", () => {
+    // The documented support path: LOG_LEVEL=debug is what --help tells a
+    // user to set when asking why a server did not load.
+    vi.stubEnv("LOG_LEVEL", "debug");
+    log("info", "yaw-mcp startup");
+    expect(stderrWrites).toHaveLength(1);
+    expect(JSON.parse(stderrWrites[0].trim()).msg).toBe("yaw-mcp startup");
+  });
+
+  it("does not treat an unrecognized LOG_LEVEL as an opt-in", () => {
+    // minLevel() already falls back to info for a typo, so honoring it as
+    // "the operator asked for JSON" would turn `LOG_LEVEL=chatty` into a
+    // wall of envelopes.
+    vi.stubEnv("LOG_LEVEL", "chatty");
+    log("info", "still-dropped");
+    log("warn", "still-plain");
+    expect(stderrWrites).toEqual(["yaw-mcp: warning: still-plain\n"]);
+  });
+
+  it("still emits the line when data cannot be serialized", () => {
+    // Same containment contract as the structured path: a diagnostic must
+    // never take down the operation it is diagnosing.
+    expect(() => log("warn", "bigint-payload", { size: BigInt(7) })).not.toThrow();
+    expect(stderrWrites).toHaveLength(1);
+    expect(stderrWrites[0]).toContain("yaw-mcp: warning: bigint-payload");
+  });
+});
+
+describe("index.ts wiring for the CLI surface", () => {
+  it("switches the surface for any subcommand, and only for a subcommand", async () => {
+    // index.ts dispatches at import time and cannot be imported, so the
+    // source is the only place this wiring is visible. Without the call the
+    // module above is correct and never reached; with it applied
+    // unconditionally the stdio server would lose its structured stream.
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const src = await readFile(fileURLToPath(new URL("../index.ts", import.meta.url)), "utf8");
+    expect(src).toContain('if (subcommand !== undefined) setLogSurface("cli");');
   });
 });
