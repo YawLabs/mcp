@@ -13,9 +13,11 @@ import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  type BundlesSummary,
   DRY_RUN_ENV_PLACEHOLDER,
   deepEqualJson,
   describeEntryDiff,
+  directClientEntries,
   INSTALL_USAGE,
   mergeClientConfig,
   mergePermissionsAllow,
@@ -26,6 +28,7 @@ import {
   removePermissionsAllow,
   runInstall,
   runUninstall,
+  summarizeBundles,
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
 import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME } from "../install-targets.js";
@@ -513,6 +516,378 @@ const OAM_ENTRY = "/opt/nm/@yawlabs/mcp/dist/index.js";
 const OAM_PROBE_FORBIDDEN = (): never => {
   throw new Error("refusal path must not probe oam");
 };
+
+const BUNDLES_EMPTY = (): BundlesSummary => ({
+  state: "empty",
+  count: 0,
+  path: "/h/.yaw-mcp/bundles.json",
+  warnings: [],
+});
+const bundlesWith =
+  (count: number): (() => BundlesSummary) =>
+  () => ({ state: "servers", count, path: "/h/.yaw-mcp/bundles.json", warnings: [] });
+const BUNDLES_UNREADABLE = (): BundlesSummary => ({
+  state: "unreadable",
+  count: 0,
+  path: "/h/.yaw-mcp/bundles.json",
+  warnings: ["/h/.yaw-mcp/bundles.json: invalid JSON (x) -- file ignored"],
+});
+/** A summary that must never be computed. The refusal paths return BEFORE the
+ *  read, so they are hermetic by ORDERING alone -- hoist the read above the
+ *  refusals and those runs would walk the host filesystem. Mirrors
+ *  OAM_PROBE_FORBIDDEN. */
+const BUNDLES_FORBIDDEN = (): never => {
+  throw new Error("refusal path must not read bundles.json");
+};
+
+describe("runInstall -- bundles.json summary", () => {
+  it("tells a user with no servers what to add, and says it before the restart line", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toContain("Servers: none configured yet");
+    expect(out).toContain("`yaw-mcp add <slug>`");
+    expect(out).toContain("/h/.yaw-mcp/bundles.json");
+    // The index comparison is the assertion that matters: the advice ends with
+    // "add before you restart", and Done is the restart instruction. Printed
+    // after Done it would tell the user to act before a step already taken.
+    expect(out.indexOf("Servers: none")).toBeLessThan(out.indexOf("Done:"));
+  });
+
+  it("counts the servers it will serve, and agrees with itself about plurals", async () => {
+    const many = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: many.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: bundlesWith(4),
+    });
+    expect(many.stdout()).toContain("Servers: 4 configured in /h/.yaw-mcp/bundles.json -- yaw-mcp serves them");
+
+    const one = captureIo();
+    await runInstall({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: one.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: bundlesWith(1),
+    });
+    expect(one.stdout()).toContain("Servers: 1 configured in /h/.yaw-mcp/bundles.json -- yaw-mcp serves it");
+  });
+
+  it("reports an unusable bundles.json instead of telling the user to add one", async () => {
+    // A file that IS there and did not load is a defect, not an empty file --
+    // and `yaw-mcp add` is advice that would not fix it.
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_UNREADABLE,
+    });
+    expect(cap.stdout()).toContain("Servers: could not read /h/.yaw-mcp/bundles.json");
+    expect(cap.stdout()).not.toContain("yaw-mcp add");
+    expect(cap.stderr()).toContain("warning: /h/.yaw-mcp/bundles.json: invalid JSON");
+  });
+
+  it("does not read bundles.json on a refusal", async () => {
+    // The throwing fixture IS the assertion: it fails loudly if the read is
+    // ever hoisted above the refusals.
+    //
+    // NOT OAM_PROBE_FORBIDDEN, unlike the refusals that return before the
+    // probe: a COLLISION refusal is decided by comparing the stored entry
+    // against the candidate one, and building that candidate is what probes
+    // oam -- so the probe legitimately runs here, ahead of the refusal. What
+    // must not escape is the runtime CLAIM, which the buffered `runtimeLines`
+    // hold back and "refuses a collision WITHOUT first claiming a runtime"
+    // pins. The bundles read has no such reason to move: it stays below every
+    // refusal, and this test is what says so.
+    mkdirSync(join(synthHome, ".claude"), { recursive: true });
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "x" } } }));
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stdout()).not.toContain("Servers:");
+  });
+
+  it("does not read bundles.json under --skip", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "x" } } }));
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      skip: true,
+      oamProbe: OAM_PROBE_FORBIDDEN,
+      bundlesSummary: BUNDLES_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).not.toContain("Servers:");
+  });
+
+  it("--dry-run reports the summary without writing", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      dryRun: true,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: bundlesWith(2),
+    });
+    expect(cap.stdout()).toContain("Servers: 2 configured");
+    expect(r.written).toEqual([]);
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+  });
+
+  it("wires the default seam to the real loader", async () => {
+    // Without this one case the seam could be connected to nothing and every
+    // other test here would still pass. It MUST pass cwd: findProjectConfigDir
+    // only bounds at $HOME when the walk STARTS under it, so a run with `home`
+    // pointed at a tmpdir and cwd left at the real process.cwd() can walk to
+    // the filesystem root and pick up the developer's own ~/.yaw-mcp.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          { namespace: "github", command: "npx" },
+          { namespace: "linear", command: "npx" },
+        ],
+      }),
+    );
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(cap.stdout()).toContain(`Servers: 2 configured in ${join(synthHome, ".yaw-mcp", "bundles.json")}`);
+  });
+});
+
+describe("runInstall -- other client entries stay direct", () => {
+  it("counts them without naming them", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { github: { command: "a" }, linear: { command: "b" }, slack: { command: "c" } } }),
+    );
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    const out = cap.stdout();
+    expect(out).toContain("Note: 3 other MCP servers are already configured in");
+    expect(out).toContain("Claude Code keeps launching them directly, not through yaw-mcp");
+    // Count only. The dry-run preview exists to be pasted into a bug report,
+    // and the same emitter feeds it.
+    expect(out).not.toContain('"github"');
+  });
+
+  it("uses singular wording for one", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { github: { command: "a" } } }));
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(cap.stdout()).toContain("Note: 1 other MCP server is already configured in");
+    expect(cap.stdout()).toContain("launching it directly");
+    expect(cap.stdout()).toContain("leaves it as it is.");
+  });
+
+  it("does not count our own entry or a legacy one", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "x" }, "mcp.hosting": { command: "y" }, github: { command: "a" } },
+      }),
+    );
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      force: true,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(cap.stdout()).toContain("Note: 1 other MCP server is already configured in");
+    // The legacy note is a separate fact and must still print, so the two stay
+    // independent rather than one masking the other.
+    expect(cap.stdout()).toContain('legacy "mcp.hosting"');
+  });
+
+  it("counts only object-shaped entries", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { github: {}, junk: "nope", empty: null, arr: [] } }),
+    );
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(cap.stdout()).toContain("Note: 1 other MCP server is already configured in");
+  });
+
+  it("names the projects[] block at local scope, and ignores the top-level container", async () => {
+    // The file alone under-describes claude-code local scope: the container is
+    // projects[<dir>].mcpServers inside a ~/.claude.json that also carries a
+    // top-level mcpServers this count must NOT include.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { a: {}, b: {} },
+        projects: { [projectsKey(synthCwd)]: { mcpServers: { c: {} } } },
+      }),
+    );
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    const out = cap.stdout();
+    expect(out).toContain("Note: 1 other MCP server is already configured in");
+    expect(out).toContain("under projects[");
+    expect(out).toContain("].mcpServers");
+    expect(out).not.toContain("3 other MCP servers");
+  });
+
+  it("says nothing when there are no other entries", async () => {
+    const cap = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(cap.stdout()).not.toMatch(/other MCP server/);
+  });
+});
+
+describe("directClientEntries", () => {
+  it("skips our own entry and every pre-rename spelling of it", () => {
+    expect(directClientEntries({})).toEqual([]);
+    expect(directClientEntries({ [ENTRY_NAME]: {} })).toEqual([]);
+    expect(directClientEntries({ "mcp.hosting": {} })).toEqual([]);
+    expect(directClientEntries({ mcph: {} })).toEqual([]);
+    expect(directClientEntries({ "yaw-mcp": {} })).toEqual([]);
+  });
+
+  it("counts a trial entry, which is a server wired straight into the client", () => {
+    expect(directClientEntries({ github: {}, "yaw-mcp-try-linear": {} })).toEqual(["github", "yaw-mcp-try-linear"]);
+  });
+
+  it("skips values no client could launch", () => {
+    expect(directClientEntries({ a: "s", b: null, c: [] })).toEqual([]);
+  });
+
+  it("returns nothing for a container that is not an object", () => {
+    expect(directClientEntries(null)).toEqual([]);
+    expect(directClientEntries([])).toEqual([]);
+    expect(directClientEntries("x")).toEqual([]);
+    expect(directClientEntries(undefined)).toEqual([]);
+  });
+});
+
+describe("summarizeBundles", () => {
+  it("reports the file `add` would create when neither exists", async () => {
+    const s = await summarizeBundles({ home: synthHome, cwd: synthCwd });
+    expect(s.state).toBe("empty");
+    expect(s.count).toBe(0);
+    expect(s.path).toBe(join(synthHome, ".yaw-mcp", "bundles.json"));
+  });
+
+  it("counts validated servers from the global file", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "bundles.json"),
+      JSON.stringify({
+        version: 1,
+        servers: [
+          { namespace: "a", command: "x" },
+          { namespace: "b", command: "y" },
+        ],
+      }),
+    );
+    const s = await summarizeBundles({ home: synthHome, cwd: synthCwd });
+    expect(s.state).toBe("servers");
+    expect(s.count).toBe(2);
+    expect(s.path).toBe(join(synthHome, ".yaw-mcp", "bundles.json"));
+  });
+
+  it("separates a file that is there and unusable from an empty one", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), "{oops");
+    const s = await summarizeBundles({ home: synthHome, cwd: synthCwd });
+    expect(s.state).toBe("unreadable");
+    expect(s.count).toBe(0);
+    expect(s.warnings.length).toBeGreaterThan(0);
+  });
+});
 
 describe("runInstall — settings.json merge edge cases (claude-code)", () => {
   it("preserves existing settings.json content when patching", async () => {
@@ -2040,6 +2415,34 @@ describe("runInstall — --project-dir at a scope that resolves none", () => {
     expect(stderr).toMatch(/has no project-directory scope/);
     expect(stderr).not.toMatch(/--scope\s*$/m);
   });
+
+  it("vscode (one project-reading scope) HONORS the flag instead of refusing", async () => {
+    // The other side of the rule, and the reason it exists. VS Code gained a
+    // user scope, which flipped its default and made this exact command --
+    // previously the only way to write a workspace file -- refuse. With
+    // exactly one scope that reads a project directory, `--project-dir` names
+    // it unambiguously, so it is honoured rather than rejected.
+    //
+    // claude-code above keeps refusing precisely because it has TWO such
+    // scopes (project and local): there, choosing would be a guess.
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "vscode",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(r.exitCode).toBe(0);
+    const workspaceFile = join(synthCwd, ".vscode", "mcp.json");
+    expect(existsSync(workspaceFile)).toBe(true);
+    expect(r.written).toContain(workspaceFile);
+    // And the user-scope file it would have defaulted to is NOT written.
+    expect(existsSync(join(synthHome, ".config", "Code", "User", "mcp.json"))).toBe(false);
+  });
 });
 
 describe("runInstall — Windows %APPDATA% redirection", () => {
@@ -2293,40 +2696,32 @@ describe("runInstall --all", () => {
     // Cursor user → ~/.cursor/mcp.json exists.
     expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
     // Claude Desktop is unavailable on linux, so skipped — no claude_desktop_config.
-    // VS Code requires project-dir (user-scope unsupported); it's reported as skipped.
+    // VS Code is no longer skipped: it has a user scope now, which is the
+    // whole point -- it was the one supported client --all visibly refused.
     const out = cap.stdout();
-    expect(out).toContain("skip vscode");
+    expect(out).not.toContain("skip vscode");
+    expect(existsSync(join(synthHome, ".config", "Code", "User", "mcp.json"))).toBe(true);
+    // And the two new clients ride the same table-driven planner.
+    expect(existsSync(join(synthHome, ".codeium", "windsurf", "mcp_config.json"))).toBe(true);
+    expect(existsSync(join(synthHome, ".gemini", "settings.json"))).toBe(true);
     expect(out).toMatch(/Done: \d+\/\d+ clients installed successfully\./);
     // ~/.yaw-mcp/config.json is not part of an install any more.
     expect(existsSync(join(synthHome, ".yaw-mcp", "config.json"))).toBe(false);
   });
 
-  it("--project-dir pulls the project-only client (vscode) into the plan", async () => {
-    // The other side of the "skip vscode" line above, and the untested half of
-    // runInstallAll's planner: a client with NO non-project scope is planned at
-    // its first scope only when --project-dir is passed.
-    const cap = captureIo();
-    const r = await runInstall({
-      os: "linux",
-      home: synthHome,
-      cwd: synthCwd,
-      projectDir: synthCwd,
-      all: true,
-      io: cap.io,
-      oamProbe: OAM_ABSENT,
-    });
-    expect(r.exitCode).toBe(0);
-    const out = cap.stdout();
-    expect(out).not.toContain("skip vscode");
-    // Planned at its workspace scope, and the file lands under the project dir.
-    const vscodeConfig = join(synthCwd, ".vscode", "mcp.json");
-    expect(existsSync(vscodeConfig)).toBe(true);
-    expect(r.written).toContain(vscodeConfig);
-    const config = JSON.parse(readFileSync(vscodeConfig, "utf8"));
-    expect(config.servers[ENTRY_NAME]).toBeDefined();
-    // The user-scope clients are still installed alongside it.
-    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
-    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
+  it("--project-dir is refused rather than silently dropped", async () => {
+    // Every client carries a user scope now, so --all plans them all there and
+    // hands `projectDir: undefined` to each sub-install: the flag would parse,
+    // print nothing and change nothing. This file refuses that class twice
+    // already -- a flag that is accepted and dropped reads as honored.
+    const r = parseInstallArgs(["--all", "--project-dir", "/tmp/x"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("--all installs every client at its user scope");
+      // The error names the command that DOES write a workspace file, so the
+      // refusal is a redirect rather than a dead end.
+      expect(r.error).toContain("--scope project --project-dir");
+    }
   });
 
   it("--dry-run aggregates every client's would-writes and writes nothing", async () => {
@@ -3315,13 +3710,23 @@ describe("runInstall — --project-dir resolution", () => {
 });
 
 describe("runInstall --all — an all-refused run", () => {
-  // Both user-scope clients (claude-code, cursor) already carry an entry, and
-  // stdin is not a TTY with no --force/--skip: every sub-install refuses.
+  // EVERY client --all plans on linux already carries an entry, and stdin is
+  // not a TTY with no --force/--skip: every sub-install refuses. Seeding only
+  // some of them makes this an all-refused run in name only -- the run would
+  // succeed for the rest and the assertions below would be measuring a
+  // partially-successful run.
   const seedBothColliding = (): void => {
     const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
+    const vscodeSeeded = { servers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
     mkdirSync(join(synthHome, ".cursor"), { recursive: true });
     writeFileSync(join(synthHome, ".cursor", "mcp.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".config", "Code", "User"), { recursive: true });
+    writeFileSync(join(synthHome, ".config", "Code", "User", "mcp.json"), JSON.stringify(vscodeSeeded), "utf8");
+    mkdirSync(join(synthHome, ".codeium", "windsurf"), { recursive: true });
+    writeFileSync(join(synthHome, ".codeium", "windsurf", "mcp_config.json"), JSON.stringify(seeded), "utf8");
+    mkdirSync(join(synthHome, ".gemini"), { recursive: true });
+    writeFileSync(join(synthHome, ".gemini", "settings.json"), JSON.stringify(seeded), "utf8");
   };
 
   it("returns a trail with only the CONSOLIDATED refusal, not the swallowed per-client ones", async () => {

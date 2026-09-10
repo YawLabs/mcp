@@ -35,7 +35,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 export type InstallOS = "macos" | "linux" | "windows";
-export type InstallClientId = "claude-code" | "claude-desktop" | "cursor" | "vscode";
+export type InstallClientId = "claude-code" | "claude-desktop" | "cursor" | "vscode" | "windsurf" | "gemini-cli";
 export type InstallScope = "user" | "project" | "local";
 export type JsonShape = "mcpServers" | "servers";
 
@@ -147,12 +147,63 @@ export const INSTALL_TARGETS: InstallTarget[] = [
     label: "VS Code",
     jsonShape: "servers",
     availableOn: ["macos", "linux", "windows"],
-    notes: "VS Code uses `servers` (not `mcpServers`) as the top-level key in .vscode/mcp.json.",
+    notes:
+      "VS Code uses `servers` (not `mcpServers`) as the top-level key in mcp.json -- the user-profile file and .vscode/mcp.json share that shape. The user file covers the DEFAULT profile only; a custom profile keeps its own copy under Code/User/profiles/<id>/mcp.json. Needs VS Code 1.102 or newer, before which user-level MCP lived under the `mcp` key in settings.json.",
     scopes: [
+      // User FIRST: enumerateProbeSlots walks this array in order, so it
+      // decides --list and doctor row order, and every other multi-scope
+      // client lists user before project.
+      {
+        scope: "user",
+        label: "User (global)",
+        description: "Private to this machine; applies to every VS Code workspace.",
+        requiresProjectDir: false,
+      },
       {
         scope: "project",
         label: "Workspace",
         description: "Per-project config; commit to share.",
+        requiresProjectDir: true,
+      },
+    ],
+  },
+  // APPENDED, never inserted: autoDetectClient returns the first usable probe
+  // slot in array order and documents Claude-Code-first as an invariant, so an
+  // insert would silently change which client `try` picks for existing users.
+  {
+    clientId: "windsurf",
+    label: "Windsurf",
+    jsonShape: "mcpServers",
+    availableOn: ["macos", "linux", "windows"],
+    notes:
+      "Windsurf reads ~/.codeium/windsurf/mcp_config.json and does not create it on first launch. If the server does not appear, open Cascade -> MCP servers -> Manage plugins -> View raw config and check it is the file above.",
+    scopes: [
+      {
+        scope: "user",
+        label: "User (global)",
+        description: "The only config file Windsurf reads; it has no workspace scope.",
+        requiresProjectDir: false,
+      },
+    ],
+  },
+  {
+    clientId: "gemini-cli",
+    label: "Gemini CLI",
+    jsonShape: "mcpServers",
+    availableOn: ["macos", "linux", "windows"],
+    notes:
+      "Gemini CLI merges ~/.gemini/settings.json with <project>/.gemini/settings.json, project winning. `mcpServers` is a top-level key, distinct from the sibling `mcp` object that holds discovery knobs.",
+    scopes: [
+      {
+        scope: "user",
+        label: "User (global)",
+        description: "Private to this machine; applies to every project.",
+        requiresProjectDir: false,
+      },
+      {
+        scope: "project",
+        label: "Project",
+        description: "Commit to share with your team; wins over the user file.",
         requiresProjectDir: true,
       },
     ],
@@ -370,11 +421,65 @@ function pathFor(
   }
 
   if (client === "vscode") {
-    // VS Code only supports workspace/project scope today.
+    if (scope === "user") {
+      // The user-profile mcp.json that `MCP: Open User Configuration`
+      // opens. Same `servers` root key as the workspace file. Windows uses
+      // %APPDATA%, resolved by the CALLER (resolveAppDataDir) for exactly the
+      // reason this function stays pure -- see the header note.
+      if (os === "windows") {
+        return {
+          absolute: join(appData, "Code", "User", "mcp.json"),
+          display: "%APPDATA%\\Code\\User\\mcp.json",
+          containerPath: ["servers"],
+        };
+      }
+      if (os === "macos") {
+        return {
+          absolute: join(home, "Library", "Application Support", "Code", "User", "mcp.json"),
+          display: "~/Library/Application Support/Code/User/mcp.json",
+          containerPath: ["servers"],
+        };
+      }
+      // Linux. Hardcoded ~/.config rather than honouring $XDG_CONFIG_HOME:
+      // that would need the same caller-resolved threading %APPDATA% gets,
+      // and this function reads no environment. On a box that sets it, this
+      // path is wrong -- copy resolveAppDataDir's shape if that ever bites.
+      return {
+        absolute: join(home, ".config", "Code", "User", "mcp.json"),
+        display: "~/.config/Code/User/mcp.json",
+        containerPath: ["servers"],
+      };
+    }
+    // project / workspace
     return {
       absolute: join(projectDir, ".vscode", "mcp.json"),
       display: joinPath("<project folder>", ".vscode", "mcp.json"),
       containerPath: ["servers"],
+    };
+  }
+
+  if (client === "windsurf") {
+    // One cross-platform path: the `~` expansion is %USERPROFILE% on Windows,
+    // so a single join covers all three. Windsurf has no workspace config.
+    const display =
+      os === "windows" ? "%USERPROFILE%\\.codeium\\windsurf\\mcp_config.json" : "~/.codeium/windsurf/mcp_config.json";
+    return {
+      absolute: join(home, ".codeium", "windsurf", "mcp_config.json"),
+      display,
+      containerPath: ["mcpServers"],
+    };
+  }
+
+  if (client === "gemini-cli") {
+    if (scope === "user") {
+      const display = os === "windows" ? "%USERPROFILE%\\.gemini\\settings.json" : "~/.gemini/settings.json";
+      return { absolute: join(home, ".gemini", "settings.json"), display, containerPath: ["mcpServers"] };
+    }
+    // project
+    return {
+      absolute: join(projectDir, ".gemini", "settings.json"),
+      display: joinPath("<project folder>", ".gemini", "settings.json"),
+      containerPath: ["mcpServers"],
     };
   }
 

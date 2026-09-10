@@ -135,7 +135,7 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
     // own branch rather than the shared tail -- a second shape to keep right.
     const r = runCli(["install", "--help"]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode>");
+    expect(r.stdout).toContain("Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli>");
     expect(r.stderr).toBe("");
   });
 

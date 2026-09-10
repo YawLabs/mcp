@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { atomicWriteFile } from "../atomic-write.js";
-import { buildLaunchEntry, ENTRY_NAME } from "../install-targets.js";
+import { buildLaunchEntry, ENTRY_NAME, INSTALL_TARGETS } from "../install-targets.js";
 import {
   type ExploreServerResponse,
   formatTtl,
@@ -192,6 +192,49 @@ describe("parseTryArgs", () => {
     const r = parseTryArgs(["-"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/Invalid argument "-"/);
+  });
+
+  it("names in TRY_USAGE every client --client accepts", () => {
+    // --help is the only place a user learns which clients `try` takes, and
+    // that line used to be a hand-kept literal listing four of them. It was
+    // never updated when windsurf and gemini-cli joined INSTALL_TARGETS, so
+    // both were accepted by the parser below and discoverable nowhere. The
+    // line is derived from the table now; this pins the two together so a
+    // seventh target cannot desync them again.
+    //
+    // Asserted against the --client LINE, not the whole usage blob. "cursor"
+    // and "vscode" both occur elsewhere in the text -- the --yes paragraph
+    // names .cursor/mcp.json and .vscode/mcp.json -- so a toContain over the
+    // blob stayed green with either one dropped from the list, passing on
+    // exactly the desync it was written to catch. Order is asserted too: the
+    // line is a map over the table, so it should read in table order.
+    const marker = "--client <name>";
+    const lines = TRY_USAGE.split("\n");
+    const start = lines.findIndex((l) => l.includes(marker));
+    // The list WRAPS to the flag column once it outgrows 80 columns, and a
+    // continued line ends in "|" -- so collect until one does not.
+    const chunk = [lines[start].slice(lines[start].indexOf(marker) + marker.length)];
+    while (chunk[chunk.length - 1].trimEnd().endsWith("|")) chunk.push(lines[start + chunk.length]);
+    const listed = chunk
+      .join(" ")
+      .split("|")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    expect(listed).toEqual(INSTALL_TARGETS.map((t) => t.clientId));
+    for (const target of INSTALL_TARGETS) {
+      expect(parseTryArgs(["demo", "--client", target.clientId]).ok).toBe(true);
+    }
+  });
+
+  it("keeps every --help line inside 80 columns", () => {
+    // The derived client list is what outgrew the block: six ids on one line
+    // render at 93 columns while every other line here fits 80, so an
+    // 80-column terminal soft-wrapped it back to column 0 and broke the
+    // two-column layout. wrapToUsageColumn is what holds the width; this is
+    // what notices when a seventh target pushes some line over again.
+    for (const line of TRY_USAGE.split("\n")) {
+      expect(line.length, line).toBeLessThanOrEqual(80);
+    }
   });
 });
 
@@ -1392,6 +1435,172 @@ describe("scanTrials + gcExpiredTrials", () => {
   });
 });
 
+describe("gcExpiredTrials -- the container itself was deleted by hand", () => {
+  const baseNow = 1_700_000_000_000;
+
+  /** An expired marker pointing at `containerPath` inside `clientPath`. Same
+   *  shape the sweep above uses; only the two fields under test vary. */
+  function writeExpiredMarker(clientPath: string, containerPath: string[]): string {
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "old",
+      name: "Old MCP",
+      expiresAt: baseNow - 1,
+      clientPath,
+      clientName: "claude-code",
+      containerPath,
+      entryName: "yaw-mcp-try-old",
+      createdAt: baseNow - 3_600_000,
+    };
+    const markerPath = trialMarkerPath("old", synthHome);
+    writeFileSync(markerPath, JSON.stringify(marker));
+    return markerPath;
+  }
+
+  it("clears the marker with no warning when the mcpServers block is gone", async () => {
+    // The user pulled the trial entry AND the now-empty mcpServers block out
+    // by hand. jsonc-parser cannot delete under a missing intermediate -- it
+    // throws "Can not delete in empty document" -- which the sweep used to
+    // report as a peel failure saying the trial was STILL WIRED IN, over a
+    // file that provably holds no trial entry at all. The marker then survived
+    // every sweep and doctor exited 2 on that warning forever.
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ numStartups: 3 });
+    writeFileSync(clientPath, before);
+    const markerPath = writeExpiredMarker(clientPath, ["mcpServers"]);
+
+    const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.failures).toEqual([]);
+    // Self-healed: the marker is gone, so the next doctor run is quiet.
+    expect(existsSync(markerPath)).toBe(false);
+    // Nothing to peel means nothing written -- the file is left as found.
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+    // jsonc-parser's internal wording must never reach a user-facing surface.
+    expect(JSON.stringify(result)).not.toContain("Can not delete in empty document");
+  });
+
+  it("clears the marker when a claude-code local-scope projects[dir] block is gone", async () => {
+    // Same defect one level deeper: at claude-code local scope containerPath
+    // is ["projects", <cwd>, "mcpServers"], and deleting the whole
+    // projects[<cwd>] block leaves the walk breaking on the MIDDLE segment.
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ projects: {} });
+    writeFileSync(clientPath, before);
+    const markerPath = writeExpiredMarker(clientPath, ["projects", synthCwd, "mcpServers"]);
+
+    const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+  });
+
+  // DECISION: a container key that EXISTS but is not an object is treated the
+  // same as a missing one -- "absent", swept clean. A number, a string, an
+  // array or a null cannot hold a key, so the trial entry provably is not in
+  // the file, and that is the only outcome that keeps doctor's claim TRUE.
+  // Reporting "not-object" here would warn "still wired in" about an entry
+  // that is not there and would keep the marker forever, since nothing can
+  // ever make that peel succeed.
+  for (const [label, container] of [
+    ["a number", "5"],
+    ["a string", '"nope"'],
+    ["an array", "[]"],
+    ["null", "null"],
+  ] as const) {
+    it(`clears the marker when the container key holds ${label}`, async () => {
+      const clientPath = join(synthHome, ".claude.json");
+      const before = `{"mcpServers":${container}}`;
+      writeFileSync(clientPath, before);
+      const markerPath = writeExpiredMarker(clientPath, ["mcpServers"]);
+
+      const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+      expect(result.cleared).toBe(1);
+      expect(result.failed).toBe(0);
+      expect(result.failures).toEqual([]);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(readFileSync(clientPath, "utf8")).toBe(before);
+      expect(JSON.stringify(result)).not.toContain("Can not add index to parent");
+    });
+  }
+
+  it("still peels a container that DOES hold the entry, comments and siblings intact", async () => {
+    // The guard above must not swallow the real peel. A nested containerPath
+    // exercises every walk step, and the comment proves the removal still
+    // routes through the comment-preserving jsonc edit rather than a
+    // parse + stringify round trip.
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(
+      clientPath,
+      [
+        "{",
+        '  "projects": {',
+        `    ${JSON.stringify(synthCwd)}: {`,
+        '      "mcpServers": {',
+        "        // hand-written note the user wants kept",
+        '        "keep": { "command": "y" },',
+        '        "yaw-mcp-try-old": { "command": "npx", "args": ["-y", "@old/mcp"] }',
+        "      }",
+        "    }",
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const markerPath = writeExpiredMarker(clientPath, ["projects", synthCwd, "mcpServers"]);
+
+    const result = await gcExpiredTrials({ home: synthHome, now: () => baseNow });
+
+    expect(result.cleared).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(existsSync(markerPath)).toBe(false);
+    const text = readFileSync(clientPath, "utf8");
+    expect(text).not.toContain("yaw-mcp-try-old");
+    expect(text).toContain("hand-written note the user wants kept");
+    expect(text).toContain('"keep"');
+  });
+
+  it("try-cleanup reports a clean removal instead of leaking the parser error", async () => {
+    // The user-initiated path shares the same peel. Before the fix it printed
+    // "warning -- couldn't strip ... (Can not delete in empty document)",
+    // handing jsonc-parser's internal wording straight to the user about a
+    // file that holds no trial entry.
+    const clientPath = join(synthHome, ".claude.json");
+    const before = JSON.stringify({ numStartups: 3 });
+    writeFileSync(clientPath, before);
+    mkdirSync(trialsDir(synthHome), { recursive: true });
+    const marker: TrialMarker = {
+      schemaVersion: 1,
+      slug: "demo",
+      name: "Demo MCP",
+      expiresAt: baseNow + 3_600_000,
+      clientPath,
+      clientName: "claude-code",
+      containerPath: ["mcpServers"],
+      entryName: "yaw-mcp-try-demo",
+      createdAt: baseNow,
+    };
+    writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(marker));
+
+    const cap = captureIO();
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, out: cap.pushOut, err: cap.pushErr });
+
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toBe("");
+    expect(cap.errText()).not.toContain("Can not delete");
+    expect(cap.text()).toMatch(/cleaned up/);
+    expect(readFileSync(clientPath, "utf8")).toBe(before);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+});
+
 describe("runTryCleanup — marker field validation", () => {
   const baseMarker = (): Record<string, unknown> => ({
     schemaVersion: 1,
@@ -1773,8 +1982,8 @@ describe("runTry — auto-detected client (no --client)", () => {
   });
 });
 
-describe("runTry — vscode has no user scope", () => {
-  it("writes the trial into .vscode/mcp.json under the cwd, keyed on `servers`", async () => {
+describe("runTry -- an explicitly named client with nothing configured", () => {
+  it("writes the trial into VS Code's USER file, keyed on `servers`", async () => {
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
@@ -1788,125 +1997,82 @@ describe("runTry — vscode has no user scope", () => {
       fetchExplore: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
-    // vscode flips the scope to "project", so the trial lands in a WORKSPACE
-    // file that is routinely committed. With no inline secret there is
-    // nothing to publish, so no --yes is needed and nothing is said about it.
+    // Trials are user-scoped by design, and VS Code now has a user scope, so
+    // an explicitly named client with nothing configured lands in the private
+    // profile file rather than in a workspace file that gets committed. With
+    // no inline secret there is nothing to publish either way.
     expect(cap.errText()).toBe("");
-    const workspacePath = join(synthCwd, ".vscode", "mcp.json");
-    expect(existsSync(workspacePath)).toBe(true);
-    const config = JSON.parse(readFileSync(workspacePath, "utf8"));
+    const userPath = join(synthHome, ".config", "Code", "User", "mcp.json");
+    expect(existsSync(userPath)).toBe(true);
+    expect(existsSync(join(synthCwd, ".vscode", "mcp.json"))).toBe(false);
+    const config = JSON.parse(readFileSync(userPath, "utf8"));
     // VS Code's top-level key is `servers`, not `mcpServers`.
     expect(config.servers["yaw-mcp-try-demo"].command).toBe("npx");
     expect(config.mcpServers).toBeUndefined();
     const marker = JSON.parse(readFileSync(trialMarkerPath("demo", synthHome), "utf8")) as TrialMarker;
     expect(marker.clientName).toBe("vscode");
-    expect(marker.clientPath).toBe(workspacePath);
+    expect(marker.clientPath).toBe(userPath);
     expect(marker.containerPath).toEqual(["servers"]);
   });
 });
 
-describe("runTry -- inline secret bound for a project-scope (commit-to-share) file", () => {
-  // The auto-detect scenario: a repo ships .vscode/mcp.json, the developer
-  // has the token exported and no personal client config, and `yaw-mcp try`
-  // picks vscode -- whose only scope is the workspace file -- and copies the
-  // token inline into a file `git add -A` sweeps up. Nothing used to say so:
-  // the only secret-location note was the ambient-only one, and the 0600
-  // chmod protects local perms, not version control.
+describe("runTry -- a trial never lands in a commit-to-share file when a private one exists", () => {
+  // The auto-detect scenario this group was written for: a repo ships
+  // .vscode/mcp.json, the developer has the token exported and no personal
+  // client config, and `try` picks vscode. It used to write the trial -- and
+  // an inline token with it -- into the committed workspace file, which is why
+  // the --yes refusal below exists.
+  //
+  // VS Code now has a USER scope, and `try` prefers one whenever the client
+  // has it: the trial still works (VS Code reads both files) and nothing lands
+  // in git. So the hazard is avoided rather than warned about, which is the
+  // better outcome -- and the refusal machinery stays for a project-only
+  // client, which the shipped table no longer has.
   const workspacePath = (): string => join(synthCwd, ".vscode", "mcp.json");
+  const userPath = (): string => join(synthHome, ".config", "Code", "User", "mcp.json");
 
   function seedWorkspaceConfig(): void {
     mkdirSync(join(synthCwd, ".vscode"), { recursive: true });
     writeFileSync(workspacePath(), JSON.stringify({ servers: { existing: { command: "x" } } }));
   }
 
-  it("refuses without --yes, names the file, the key and the hazard, and writes nothing", async () => {
+  it("writes an inline secret to the private user file, not the committed workspace one", async () => {
     seedWorkspaceConfig();
     const before = readFileSync(workspacePath(), "utf8");
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
-      // No --client: auto-detect lands on vscode because its workspace file
-      // is the only client config that exists.
+      // No --client: auto-detect finds the workspace file, but the scope
+      // resolution prefers VS Code's user scope over the slot it was found on.
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
-      env: { FOO_TOKEN: "ambient-secret" },
+      env: {},
+      envOverrides: { FOO_TOKEN: "secret" },
       out: cap.pushOut,
       err: cap.pushErr,
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
-    expect(r.exitCode).toBe(1);
-    expect(r.written).toEqual([]);
-    // The workspace file is byte-identical and no marker was dropped.
+
+    // No --yes needed, because nothing commit-to-share is being written.
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(userPath());
+    // The committed file is untouched, byte for byte.
     expect(readFileSync(workspacePath(), "utf8")).toBe(before);
-    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
-    const err = cap.errText();
-    expect(err).toContain(workspacePath());
-    expect(err).toMatch(/commit/i);
-    expect(err).toContain("FOO_TOKEN");
-    expect(err).not.toContain("ambient-secret");
-    expect(err).toContain("--yes");
-    // The way out that keeps the secret off the shared file.
-    expect(err).toMatch(/--client claude-code/);
-    expect(cap.text()).not.toMatch(/Trial wired/);
-  });
-
-  it("refuses under --dry-run too, so the preview never promises a write the real run declines", async () => {
-    seedWorkspaceConfig();
-    const cap = captureIO();
-    const r = await runTry({
-      slug: "demo",
-      clientId: "vscode",
-      dryRun: true,
-      home: synthHome,
-      cwd: synthCwd,
-      os: "linux",
-      env: {},
-      envOverrides: { FOO_TOKEN: "secret" },
-      out: cap.pushOut,
-      err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-    });
-    expect(r.exitCode).toBe(1);
-    expect(cap.text()).not.toMatch(/would write/);
-    expect(cap.errText()).toContain("--yes");
-  });
-
-  it("writes it with --yes, still warning on stderr", async () => {
-    seedWorkspaceConfig();
-    const cap = captureIO();
-    const r = await runTry({
-      slug: "demo",
-      clientId: "vscode",
-      yes: true,
-      home: synthHome,
-      cwd: synthCwd,
-      os: "linux",
-      env: {},
-      envOverrides: { FOO_TOKEN: "secret" },
-      out: cap.pushOut,
-      err: cap.pushErr,
-      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.written).toContain(workspacePath());
-    const config = JSON.parse(readFileSync(workspacePath(), "utf8"));
+    const config = JSON.parse(readFileSync(userPath(), "utf8"));
     expect(config.servers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
-    expect(config.servers.existing).toBeDefined();
-    // --yes lifts the refusal, not the warning: the user is still told where
-    // the plaintext value now lives.
-    const err = cap.errText();
-    expect(err).toContain(workspacePath());
-    expect(err).toContain("FOO_TOKEN");
-    expect(err).not.toContain("refusing");
-    expect(cap.text()).toMatch(/Trial wired/);
   });
 
-  it("never asks a user-scope target for --yes", async () => {
+  it("does not warn about a commit-to-share file it did not write to", async () => {
+    // The hazard warning is gated on the SCOPE, not on the secret: with the
+    // write going to the private user file there is nothing to publish and
+    // nothing to warn about. Asserting the silence is what pins the two halves
+    // together -- a warning here would mean the scope preference regressed and
+    // the trial had gone back into the committed file.
+    seedWorkspaceConfig();
     const cap = captureIO();
     const r = await runTry({
       slug: "demo",
-      clientId: "claude-code",
       home: synthHome,
       cwd: synthCwd,
       os: "linux",
@@ -1917,11 +2083,10 @@ describe("runTry -- inline secret bound for a project-scope (commit-to-share) fi
       fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
     });
     expect(r.exitCode).toBe(0);
-    expect(cap.errText()).not.toContain("--yes");
-    expect(cap.errText()).not.toMatch(/commit/i);
+    expect(cap.errText()).not.toContain("Committing that file publishes the value");
+    expect(cap.errText()).not.toContain("refusing to write it without --yes");
   });
 });
-
 describe("runTry — previous marker the real peel refuses", () => {
   it("warns on stderr, leaves the other file untouched, and still wires the new trial", async () => {
     // The dry-run twin of this is covered above; this is the REAL run, whose

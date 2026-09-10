@@ -73,6 +73,7 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
+import { loadLocalBundles, localBundlesPath } from "./local-bundles.js";
 import {
   MIN_OAM_VERSION,
   type OamProbe,
@@ -83,6 +84,7 @@ import {
   probeOam,
   resolveStableNpmEntry,
 } from "./oam-spawn.js";
+import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
 
 export interface InstallCommandOptions {
@@ -177,6 +179,21 @@ export interface InstallCommandOptions {
    *  `token` / `skipYawMcpConfig` stripping at the --all call site -- a
    *  machine-level fact restated per client is noise, not diagnosis. */
   suppressOamAbsentNote?: boolean;
+  /** Test seam for the bundles.json read, mirroring `oamProbe`. Without it a
+   *  test that overrides `home` but not `cwd` still walks up from the REAL
+   *  process.cwd(): findProjectConfigDir only bounds at $HOME when the walk
+   *  STARTS under it, so from a repo checkout inside the developer's home --
+   *  with `home` pointed at a tmpdir -- the walk runs to the filesystem root
+   *  and can accept the developer's own ~/.yaw-mcp as this run's PROJECT
+   *  config. Same class as the oamProbe seam's own rationale above. */
+  bundlesSummary?: () => BundlesSummary | Promise<BundlesSummary>;
+  /** Internal, set by `--all`: suppress the bundles.json summary so it prints
+   *  once for the run instead of once per client, exactly like
+   *  suppressOamAbsentNote above -- one machine-level file restated per client
+   *  is noise. Deliberately does NOT cover the direct-entries Note, which
+   *  describes the CLIENT FILE this plan just wrote and differs per client.
+   *  Also suppresses the READ, so an --all run loads bundles.json once. */
+  suppressBundlesNote?: boolean;
 }
 
 /** The oam-absent Runtime line. Shared so `--all`'s single copy and the
@@ -203,6 +220,117 @@ function oamAbsentNote(os: InstallOS, publishesBinary: () => boolean = oamPublis
  *  conditions. */
 function oamIsAbsent(probe: OamProbe): boolean {
   return probe.bin === null && probe.binPath === null && !probe.belowMin && probe.failure === null;
+}
+
+/** What install reports about bundles.json. Three states, split exactly the
+ *  way `sidecars install` splits them: a null config with a non-null path is a
+ *  file that IS there and could not be used, and telling that user to
+ *  `yaw-mcp add` would describe a defect as an empty file. */
+export type BundlesState = "servers" | "empty" | "unreadable";
+export interface BundlesSummary {
+  state: BundlesState;
+  /** Validated servers the loader would serve. Counts disabled entries too,
+   *  matching `yaw-mcp list` so the two surfaces cannot disagree about how
+   *  many servers a machine has. */
+  count: number;
+  /** The file the count came from, or -- when neither file exists -- the file
+   *  `yaw-mcp add` would create. The empty-state line has to name where the
+   *  server lands. */
+  path: string;
+  /** The loader's own diagnostics. Printed ONLY in the unreadable state. */
+  warnings: string[];
+}
+
+export async function summarizeBundles(opts: { home?: string; cwd?: string }): Promise<BundlesSummary> {
+  const home = opts.home ?? homedir();
+  const loaded = await loadLocalBundles({ home, cwd: opts.cwd ?? process.cwd() });
+  // ENABLED entries only. The loader keeps a disabled one in the array, but
+  // the broker filters on isActive before it serves anything -- so counting
+  // the raw length told a user with every server disabled that yaw-mcp "serves
+  // it through this entry", which it does not.
+  const count = (loaded.config?.servers ?? []).filter((srv) => srv.isActive !== false).length;
+  const state: BundlesState =
+    loaded.config === null && loaded.path !== null ? "unreadable" : count > 0 ? "servers" : "empty";
+  return { state, count, path: loaded.path ?? localBundlesPath(userConfigDir(home)), warnings: loaded.warnings };
+}
+
+/** Entry keys in the container this install writes into that are somebody
+ *  else's server: everything except our own entry and the pre-rename keys for
+ *  it (both are the BROKER, not an upstream). Non-object values are skipped --
+ *  a key holding a string or null is not a server any client can launch, and
+ *  counting it inflates the number the user is asked to trust.
+ *
+ *  Returns the NAMES, not just a count: install prints only `.length` (the
+ *  dry-run preview is asserted not to echo a sibling's name), while a later
+ *  import prompt needs the names themselves. Exported for tests. */
+export function directClientEntries(container: unknown): string[] {
+  if (typeof container !== "object" || container === null || Array.isArray(container)) return [];
+  const skip = new Set<string>([ENTRY_NAME, ...LEGACY_ENTRY_NAMES]);
+  return Object.entries(container as Record<string, unknown>)
+    .filter(([k, v]) => !skip.has(k) && typeof v === "object" && v !== null && !Array.isArray(v))
+    .map(([k]) => k);
+}
+
+/** Where the counted entries live. The file alone under-describes claude-code
+ *  LOCAL scope, whose container is projects[<dir>].mcpServers inside a
+ *  ~/.claude.json that also carries a top-level mcpServers this count does not
+ *  include. */
+function describeContainer(file: string, containerPath: string[]): string {
+  if (containerPath.length <= 1) return file;
+  const tail = containerPath
+    .slice(2)
+    .map((k) => `.${k}`)
+    .join("");
+  return `${file} under ${containerPath[0]}[${JSON.stringify(containerPath[1])}]${tail}`;
+}
+
+/** The tail both the live path and the --dry-run preview end with. One
+ *  function, two call sites: the dry-run branch returns before the live tail,
+ *  and a second copy of these strings is how one of them goes stale.
+ *
+ *  Tense-neutral on purpose, unlike the collision and container-repair lines
+ *  elsewhere in this file. Those describe a MUTATION and so need `would`;
+ *  these describe state install does not change -- the sibling entries keep
+ *  loading directly either way, and bundles.json is not touched by install. */
+function logInstallTail(
+  log: (s: string) => void,
+  err: (s: string) => void,
+  direct: { names: string[]; where: string; clientLabel: string },
+  bundles: BundlesSummary | null,
+): void {
+  const n = direct.names.length;
+  if (n > 0) {
+    // COUNT ONLY, never the keys: the dry-run preview exists to be pasted into
+    // a bug report and is asserted not to echo a sibling's name. The names stay
+    // in `direct` for the import prompt, which will ask before printing any.
+    log(
+      n === 1
+        ? `Note: 1 other MCP server is already configured in ${direct.where} -- ${direct.clientLabel} keeps launching it directly, not through yaw-mcp. Installing yaw-mcp leaves it as it is.`
+        : `Note: ${n} other MCP servers are already configured in ${direct.where} -- ${direct.clientLabel} keeps launching them directly, not through yaw-mcp. Installing yaw-mcp leaves them as they are.`,
+    );
+  }
+  if (!bundles) return;
+  // Every state, not just `unreadable`: an untrusted project bundles.json is
+  // dropped by the trust gate and yields `empty` PLUS the warning that names
+  // `yaw-mcp trust`, which is the only line explaining why the servers the
+  // user can see are not being served.
+  for (const w of bundles.warnings) err(`warning: ${w}`);
+  if (bundles.state === "servers") {
+    log(
+      `Servers: ${bundles.count} configured in ${bundles.path} -- yaw-mcp serves ${bundles.count === 1 ? "it" : "them"} through this entry.`,
+    );
+    return;
+  }
+  if (bundles.state === "unreadable") {
+    log(`Servers: could not read ${bundles.path} -- yaw-mcp will start with nothing to serve.`);
+    log("  The `warning:` line above says what is wrong; `yaw-mcp list` prints the same detail.");
+    return;
+  }
+  log("Servers: none configured yet -- yaw-mcp will start with nothing to serve.");
+  log(
+    "  Add one with `yaw-mcp add <slug>` (browse the catalog at https://yaw.sh/mcp/catalog/); it lands in " +
+      `${bundles.path}, and yaw-mcp reads that file once at startup -- so add before you restart.`,
+  );
 }
 
 /** %APPDATA% for this run, resolved in ONE place and threaded to
@@ -237,7 +365,7 @@ export interface InstallResult {
 }
 
 const USAGE =
-  "Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode> [--scope user|project|local]\n" +
+  "Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli> [--scope user|project|local]\n" +
   "                       [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                       [--force | --repair | --skip] [--keep-legacy] [--dry-run]\n" +
   "       yaw-mcp install --list  (detect clients; no writes)\n" +
@@ -327,10 +455,30 @@ function resolveInstallSite(
     return null;
   }
 
-  // Pick a default scope sensibly: prefer user-global where supported,
-  // else fall back to the first scope the client supports (vscode → project).
-  const scope: InstallScope =
-    opts.scope ?? (target.scopes.find((s) => s.scope === "user") ? "user" : target.scopes[0].scope);
+  // Pick a default scope sensibly: prefer user-global where supported, else
+  // fall back to the first scope the client supports.
+  //
+  // An explicit --project-dir with no --scope picks the client's project scope
+  // instead, but ONLY when exactly one scope reads a project directory.
+  //
+  // Why the flag is read at all: giving VS Code a user scope flipped its
+  // default from project to user, and the guard below then refused the flag
+  // that had been the only way to write a workspace file -- a working command
+  // broken by a change meant to add one. Where a client has a single
+  // project-reading scope, `--project-dir` names it unambiguously.
+  //
+  // Why only when unambiguous: claude-code has TWO (project and local), and
+  // choosing between them would be a guess about which file the user meant.
+  // That client keeps the refusal below, which lists both and asks -- the
+  // behaviour its own test records as a deliberate answer to this question.
+  const projectDirScopes = target.scopes.filter((s) => s.requiresProjectDir);
+  const defaultScope: InstallScope =
+    opts.projectDir !== undefined && projectDirScopes.length === 1
+      ? projectDirScopes[0].scope
+      : target.scopes.find((s) => s.scope === "user")
+        ? "user"
+        : target.scopes[0].scope;
+  const scope: InstallScope = opts.scope ?? defaultScope;
   const scopeSpec = target.scopes.find((s) => s.scope === scope);
   if (!scopeSpec) {
     err(
@@ -477,6 +625,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
    *  Compared against the entry this run builds -- see the entryState ladder. */
   let storedEntry: unknown;
   let legacyEntry: string | null = null;
+  // Computed HERE, from the container already read -- not with a second read
+  // later, and not from the post-merge bytes, which by then include our own
+  // entry. A file that is absent, empty, unparsed, or whose container holds a
+  // non-object leaves this empty, which is correct in every one of those
+  // shapes: there is nothing there to bypass.
+  let directEntryNames: string[] = [];
   // Fingerprinted BEFORE the read (never after: a write landing between a
   // read and a later stat would be carried forward under a fresh fingerprint)
   // and compared again right before atomicWriteFile -- see there for why. A
@@ -522,6 +676,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // then decline to fix the very thing a re-run is for.
       storedEntry = c[ENTRY_NAME];
       legacyEntry = findLegacyEntry(c);
+      directEntryNames = directClientEntries(c);
     }
   }
 
@@ -907,6 +1062,19 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     );
   }
 
+  // Read AFTER every refusal above, for the same reason the oam probe is: a
+  // malformed client config, a non-TTY collision and `--skip` all return before
+  // this point, and a "Servers: none configured yet -- add one before you
+  // restart" line above `Refusing to overwrite` is advice about a broker this
+  // run did not wire. Suppressed wholesale under --all, which reads once after
+  // its loop. Best-effort: the launch entry is the product of this command, and
+  // no bundles.json diagnostic may fail it.
+  const bundles = opts.suppressBundlesNote
+    ? null
+    : await Promise.resolve((opts.bundlesSummary ?? summarizeBundles)({ home: opts.home, cwd: opts.cwd })).catch(
+        () => null,
+      );
+
   if (opts.dryRun) {
     // ONLY what this run adds, never the merged file. `clientJson` is the
     // whole post-merge config, and for ~/.claude.json that is every sibling
@@ -960,6 +1128,20 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           : `Note: legacy "${legacyEntry}" entry at ${resolved.absolute} would remain (--keep-legacy) -- remove it to avoid running yaw-mcp twice.`,
       );
     }
+    logInstallTail(
+      log,
+      err,
+      {
+        names: directEntryNames,
+        where: describeContainer(resolved.absolute, containerPath),
+        clientLabel: target.label,
+      },
+      bundles,
+    );
+    // Conditional, unlike the live path's unconditional push: an identical
+    // entry with only a legacy trim or a permissions patch pending leaves
+    // `clientJson` null, and naming the client file as "would write" there
+    // promises an edit the real run does not make.
     const wouldWrite: string[] = clientJson !== null ? [resolved.absolute] : [];
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
@@ -1062,6 +1244,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       `Note: legacy "${legacyEntry}" entry remains at ${resolved.absolute} (--keep-legacy). Remove it to avoid running yaw-mcp twice.`,
     );
   }
+  logInstallTail(
+    log,
+    err,
+    { names: directEntryNames, where: describeContainer(resolved.absolute, containerPath), clientLabel: target.label },
+    bundles,
+  );
   // Claude Code gates project-scope (.mcp.json) servers behind a one-time
   // per-project approval prompt (tracked as enabledMcpjsonServers /
   // disabledMcpjsonServers under projects[<dir>] in ~/.claude.json), so
@@ -1782,6 +1970,18 @@ export function parseInstallArgs(argv: string[]):
         error: `yaw-mcp install: --all chooses each client's scope itself and cannot honor --scope. Install the client you want at a specific scope individually.\n${USAGE}`,
       };
     }
+    // The same class once more, and newly reachable: every client in
+    // INSTALL_TARGETS now carries a user scope, so --all plans every one of
+    // them at user scope and hands `projectDir: undefined` to each
+    // sub-install. The flag would parse, print nothing and change nothing.
+    // (Before VS Code gained a user scope it was the one client --all could
+    // only reach WITH this flag, which is why it used to be honored.)
+    if (opts.all && opts.projectDir) {
+      return {
+        ok: false,
+        error: `yaw-mcp install: --all installs every client at its user scope, so --project-dir would be dropped. Write a workspace file directly: \`yaw-mcp install vscode --scope project --project-dir <path>\`.\n${USAGE}`,
+      };
+    }
     return { ok: true, options: opts as InstallCommandOptions };
   }
 
@@ -2030,6 +2230,7 @@ async function runInstallAll(
       skipYawMcpConfig: undefined,
       // Same consolidation, one line down: printed once after the loop.
       suppressOamAbsentNote: true,
+      suppressBundlesNote: true,
       clientId: plan.clientId,
       scope: plan.scope,
       // Only the plans whose scope actually resolves a path from --project-dir
@@ -2072,8 +2273,21 @@ async function runInstallAll(
   // lists empty -- and gating on those alone made the tip vanish from exactly
   // the run where every entry it describes is present and about to be used.
   const runLeftAnEntry = aggregateWritten.length > 0 || aggregateWouldWrite.length > 0 || succeeded > 0;
-  if (runLeftAnEntry && oamIsAbsent(await (opts.oamProbe ?? probeOam)())) {
-    log(oamAbsentNote(os, opts.oamPublishesBinary));
+  if (runLeftAnEntry) {
+    if (oamIsAbsent(await (opts.oamProbe ?? probeOam)())) log(oamAbsentNote(os, opts.oamPublishesBinary));
+    // The single copy the per-client suppression defers to. Same gate as the
+    // runtime tip above and for the same reason: on an all-refused run there are
+    // no entries for it to describe. An all-SKIP run is a success that writes
+    // nothing (`succeeded > 0` carries it), and that is exactly the run where
+    // every entry the line describes is present and about to be used.
+    //
+    // The empty `names` is what makes the emitter print only the bundles half:
+    // the direct-entries half already printed inside each client's section,
+    // where it belongs, because each plan writes a different file.
+    const bundles = await Promise.resolve(
+      (opts.bundlesSummary ?? summarizeBundles)({ home: opts.home, cwd: opts.cwd }),
+    ).catch(() => null);
+    logInstallTail(log, err, { names: [], where: "", clientLabel: "" }, bundles);
   }
 
   if (collisionClients.length > 0) {
@@ -2130,7 +2344,11 @@ export const INSTALL_USAGE = USAGE;
 // ---------------------------------------------------------------------------
 
 const UNINSTALL_USAGE =
-  "Usage: yaw-mcp uninstall <claude-code|claude-desktop|cursor|vscode> [--scope user|project|local]\n" +
+  // Every client INSTALL_TARGETS carries, because that array is what the
+  // parser validates against -- uninstall has accepted windsurf and gemini-cli
+  // since they were added to it, and a usage line naming only the first four
+  // reads as a refusal that never happens.
+  `Usage: yaw-mcp uninstall <${INSTALL_TARGETS.map((t) => t.clientId).join("|")}> [--scope user|project|local]\n` +
   "                         [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                         [--force | -y] [--keep-legacy] [--dry-run]\n" +
   "\n" +

@@ -2,6 +2,71 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## Unreleased -- an authenticated remote server can actually authenticate, and the two doors that blew a context budget are shut
+
+The largest release since 0.80.0, and the first to merge two lines of work that had been running in parallel. Where both produced a fix for the same thing, there is one implementation here, not two -- the reconciliation is described at the end.
+
+**Added -- `headers` on a remote entry, resolved through the vault**
+
+Every authenticated remote (HTTP or SSE) MCP server was unreachable, and nothing said so usefully. Both transports were constructed with a URL and no options at all, so no credential could be attached under any configuration; a token parked in the entry's `env` went nowhere, because `resolveServerEnv` ran only on the local spawn path. The connect went out bare, the far end answered 401, and the failure read as "server down".
+
+A remote entry now takes `headers`, an object of request headers sent on every request the transport makes -- the initial GET event stream, every POST, and the DELETE, on both transports. Values may carry `${secret:NAME}` refs and resolve through the same vault `env` does, with the same fail-closed refusal: a locked vault, a missing name or a malformed ref refuses the connect *before any transport is constructed*, so the literal placeholder can never travel as a credential.
+
+```jsonc
+{ "namespace": "linear", "type": "remote", "url": "https://mcp.linear.app/mcp",
+  "headers": { "Authorization": "Bearer ${secret:linear}" } }
+```
+
+Only `requestInit` is passed. Not `eventSourceInit`: supplying it hands the SDK a `fetch` that wins over its own header-injecting one, and the SDK's own docs note it also suppresses the Authorization attach. Not `authProvider` either -- that is the interactive OAuth flow, which on a missing token tries to open a browser, and there is no browser inside a stdio MCP server. A static credential is a header.
+
+Header names are validated at load, against the HTTP token grammar and a reserved-name list, and a value carrying a CR, LF or NUL is refused before the transport is built rather than throwing a raw `TypeError` out of the SDK constructor. Validation runs *ahead* of the resolve audit, so a header that gets rejected is never recorded as injected -- `yaw-mcp secrets audit` could otherwise claim a secret reached a server that never received it.
+
+**Added -- two ceilings, because the broker budgeted everything except the doors that actually blow a context**
+
+`YAW_MCP_MAX_RESULT_BYTES` (default 100000, `0` disables) caps a single proxied tool result. Response pruning is a savings pass that gives up when the win is marginal, so it bounded nothing: a tool returning a whole log file walked through it untouched and landed whole in the model's context, undoing every other budget in the process. The cut is loud by construction -- a marker names the byte total, what was dropped, and the two ways to get the rest -- because a silently truncated log reads to the model as a complete one. `structuredContent` is passed through verbatim and is **not** capped, so a structured-output tool can still return an unbounded payload.
+
+`YAW_MCP_TOOL_TOKEN_CAP` (default off) gates activation on the estimated token cost of the loaded tool surface. The server-count cap's own header says the point is to keep tool-list tokens bounded, but a slot is a slot: six 3-tool servers and six 60-tool servers both sit exactly at a cap of 6, and only one of those fits in a context a model can still reason about. The estimator had computed the real number all along and nothing outside a discover label read it. Even with the ceiling off, the count-cap refusal now names each loaded server's token cost so the model can pick a victim instead of guessing.
+
+**Added -- `mcp_connect_find_tool`, and three more ways to find what you need without loading it**
+
+`find_tool` searches tools across every configured server by what they do, for the caller who knows the capability but not its home. `read_tool` demands the namespace up front and `discover`'s match block is prose capped at five servers by five tools with no schemas, so that caller previously had to activate servers to look -- the exact context cost this broker exists to avoid. Nothing is contacted and nothing is activated. A hit on a loaded server carries its input schema; a cold one *says* the schema is unavailable rather than omitting the line, since a silently absent schema reads as "this tool takes no arguments".
+
+`yaw-mcp search` searches the public catalog, and a mistyped slug now gets a did-you-mean instead of a bare miss. `discover`'s tool lists are bounded, with `server:` focus as the way back to the full list. And `yaw-mcp add` can define a server directly from `--command` or `--url` rather than only by catalog slug.
+
+**Added -- `set`, `enable` and `disable`, plus two more install targets**
+
+`yaw-mcp set <ns> key=value`, `enable <ns>` and `disable <ns>` edit per-server fields without hand-editing `bundles.json`. `install` gained Windsurf and Gemini CLI, and a VS Code user scope, and now says what to do next and how many servers it will actually serve.
+
+**Added -- `blockedTools`, a per-tool deny enforced at the call gate**
+
+A per-server deny list, enforced where the call is routed rather than only where the list is rendered, so `read_tool` refuses in the gate's own words instead of handing the model a schema for a tool the gate will refuse.
+
+**Changed -- `install` is idempotent, and there is an `uninstall`**
+
+Re-running `install` against an already-correct entry is now a no-op: no write, no prompt, exit 0. A drifted entry shows a field diff, and `--repair` takes it unprompted, so a post-upgrade fixup can run unconditionally. The pre-rename entry is removed in the same atomic write, behind `--keep-legacy`. `yaw-mcp uninstall <client>` removes the entry and its permission grant, with the same confirm-then-refuse posture as `yaw-mcp remove`.
+
+**Fixed -- the credential diagnostics follow the credential channel**
+
+`doctor`'s vault section and `mcp_connect_secrets` both scanned a server's `env` and skipped remote entries outright, justified by "a remote entry's env is never sent anywhere" -- true, and written before `headers` existed as a channel. A remote server with a missing secret was therefore omitted from the reports that exist to pre-empt exactly that, reading as "needs no secrets" right before the connect is refused over the name. Both now pick the map by the server's shape. `yaw-mcp add` gained the matching warning at write time, for a `${secret:NAME}` the vault does not hold and for a span that does not parse.
+
+The same shape rule fixed the write side: converting an entry to remote with `add --url` left the stale stdio `command`, `args`, `transport` and a plaintext `env` credential on disk, and printed no launch-change note -- so `list` showed an npx launch line for a server that connects over HTTPS. Both directions are now symmetric and both are loud.
+
+**Fixed -- a departing client stops stranding the broker, and a cancelled call stops counting against the upstream**
+
+Closing stdin now shuts the broker down, so a client that exits without a signal no longer leaves the process and every server it spawned running. A tool call the client cancels is no longer booked as an upstream error, and progress notifications are forwarded across the upstream hop instead of being dropped at the proxy.
+
+**Fixed -- smaller things**
+
+`activate` now says so when a `tools` filter names a tool that does not exist, instead of quietly advertising a smaller list and leaving the model to wonder why its tool "is not working". Observation meta-tools advance the idle clock, so a session that speaks only to the broker no longer holds every upstream child process for the life of the connection. `list` neuters control bytes in the compliance grade, which comes from a file a repo can ship. A bare `*` in `blockedTools` no longer denies every tool. `enable` and `disable` no longer die with the `set` parser's usage text. And the uv PATH probe treats a timeout as inconclusive rather than as absent.
+
+**Changed (BREAKING) -- `exec` stops echoing skipped step outputs when `return` names one**
+
+An `exec` pipeline that names a `return` step no longer echoes every other step's full output alongside it. The step keys are still returned, and the full bodies still come back when no `return` is named or when the skipped bodies fit a small budget.
+
+**Note on the merge**
+
+Two branches independently implemented remote `headers`, and two pull requests independently fixed the credential-diagnostic bug above. This release carries one implementation of each. Where the two differed the better half won on its merits rather than by which landed first: the broader remote-entry predicate, which also recognises a hand-written `url`+`headers` entry that omits `"type"`; validation ahead of the resolve audit; the wording that keeps "spawn" accurate for a local server while adding "connect" for a remote one; and, from the other side, the `mcp_connect_secrets` fix and the stale-credential cleanup that the first did not have.
+
 ## 0.80.0 -- yaw-mcp's own secrets stop riding into the processes it spawns, and a typo'd secret reference stops reaching the server as a literal
 
 Recorded after the fact: 0.79.2 and 0.80.0 both shipped to npm without release notes, and these two entries were reconstructed from the diffs. 0.80.0 is 119 files and roughly 11,600 insertions -- the full-pass sweep that followed 0.79.2, plus the nineteen findings from the PR #110 review and a round of test work. The security items come first because several of them share one root cause.

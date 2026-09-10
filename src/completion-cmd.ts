@@ -16,6 +16,8 @@
 // at once. Static strings would drift on a codebase that's been
 // shipping a subcommand a day.
 
+import { INSTALL_TARGETS } from "./install-targets.js";
+
 export type CompletionShell = "bash" | "zsh" | "fish" | "powershell";
 
 export interface CompletionCommandOptions {
@@ -70,7 +72,9 @@ interface SubcommandSpec {
   flags: string[];
 }
 
-const INSTALL_CLIENTS = ["claude-code", "claude-desktop", "cursor", "vscode"] as const;
+// Derived from the target table, not a hand-kept copy: a fourth list of the
+// same ids is a fourth place to forget when a client is added.
+const INSTALL_CLIENTS = INSTALL_TARGETS.map((t) => t.clientId);
 
 // Single source of truth for shell completion across bash/zsh/fish/powershell.
 // MUST cover every dispatched subcommand in KNOWN_SUBCOMMANDS (src/subcommands.ts)
@@ -132,6 +136,33 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     description: "Remove a local server",
     positional: [["<slug-or-namespace>"]],
     flags: ["--force", "--yes", "--help"],
+  },
+  // Keep these three in sync with KNOWN_SUBCOMMANDS: a verb that dispatches
+  // but does not complete is invisible to anyone who found the CLI by
+  // pressing Tab.
+  {
+    name: "search",
+    description: "Search the public MCP catalog",
+    positional: [["<text>"]],
+    flags: ["--json", "--limit", "--catalog", "--help"],
+  },
+  {
+    name: "set",
+    description: "Change a per-server field in bundles.json",
+    positional: [["<slug-or-namespace>"], ["<key=value>"]],
+    flags: ["--json", "--force", "--yes", "--help"],
+  },
+  {
+    name: "enable",
+    description: "Mark a server loadable -- isActive true",
+    positional: [["<slug-or-namespace>"]],
+    flags: ["--json", "--help"],
+  },
+  {
+    name: "disable",
+    description: "Keep a server out of the loaded set -- isActive false",
+    positional: [["<slug-or-namespace>"]],
+    flags: ["--json", "--help"],
   },
   { name: "list", description: "List the servers yaw-mcp loads locally", flags: ["--json", "--help"] },
   // Positional is the literal subcommand, not a placeholder -- `install` is

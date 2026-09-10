@@ -14,21 +14,17 @@ export interface UpstreamServerConfig {
   env?: Record<string, string>;
   url?: string;
   /**
-   * HTTP headers sent on every request to a REMOTE server. Values may carry
-   * `${secret:NAME}` references, resolved from the local vault at connect
-   * time by the same fail-closed path that resolves a local server's `env` --
-   * so a missing or malformed reference refuses the connection rather than
-   * putting the literal on the wire.
+   * REMOTE ONLY -- HTTP request headers sent on every request the transport
+   * makes (the GET event stream, every POST, and the DELETE), for both the
+   * streamable-http and SSE transports. Values may carry `${secret:NAME}`
+   * refs, resolved through the same vault path `env` uses and fail-CLOSED in
+   * exactly the same way: a locked vault, a missing name or a malformed ref
+   * refuses the connect rather than sending the literal.
    *
-   * This is how a remote upstream gets a credential. `env` cannot do it: a
-   * remote entry spawns no process, so there is no environment to put one in,
-   * and upstream.ts warns and ignores `env` on a remote entry for exactly
-   * that reason. Before this field existed the only remote servers reachable
-   * were the ones that take their credential in the URL, which is why the
-   * public catalog wraps fifteen HTTPS endpoints in the `mcp-remote` npx shim
-   * instead of configuring them as remote entries.
-   *
-   * Ignored on a local server, where `env` is the right channel.
+   * Ignored (with a warn) on a local entry, where `env` is the equivalent.
+   * Unlike `env` there is no ambient fallback for a header -- nothing
+   * inherits one from the shell -- so a blank value would claim a credential
+   * is configured while sending nothing, and is dropped at load.
    */
   headers?: Record<string, string>;
   isActive: boolean;
@@ -47,18 +43,13 @@ export interface UpstreamServerConfig {
   // every candidate.
   toolCache?: Array<{ name: string; description?: string }>;
   /**
-   * A–F grade for this server. Two suppliers, and the order between them
-   * matters: `yaw-mcp add` records the catalog's published grade into
-   * bundles.json (validateEntry carries it through), and the LOCAL grades
-   * cache that `yaw-mcp audit <namespace>` writes to ~/.yaw-mcp/grades.json
-   * is then overlaid ON TOP by hydrateComplianceGrades (server.ts) and
-   * runList (local-add-cmd.ts). A locally-measured letter therefore beats a
-   * published claim, which is the right way round: the cached one was
-   * produced by running the suite against the bytes on this machine.
-   *
-   * Absent means "ungraded", which passes filters by default (we don't
-   * punish unknown) -- so when NEITHER supplier has one,
-   * YAW_MCP_MIN_COMPLIANCE cannot refuse that server. See compliance.ts.
+   * A–F grade for this server, overlaid from the LOCAL grades cache that
+   * `yaw-mcp audit <namespace>` writes to ~/.yaw-mcp/grades.json --
+   * hydrateComplianceGrades (server.ts) and runList (local-add-cmd.ts)
+   * apply it. It never rides along in bundles.json: validateEntry drops
+   * unknown fields, so the cache is the only supplier. Absent on any
+   * server that has not been audited; absent means "ungraded" and passes
+   * filters by default (we don't punish unknown). See compliance.ts.
    */
   complianceGrade?: "A" | "B" | "C" | "D" | "F";
   /**
@@ -94,7 +85,13 @@ export interface UpstreamServerConfig {
  *  nothing at runtime, so every surface that has to agree on the answer can
  *  reach it: local-bundles re-exports it for the CLI, and meta-tools reads it
  *  for the secrets report without taking on the bundles loader's whole
- *  dependency chain. */
+ *  dependency chain.
+ *
+ *  KNOWN DISAGREEMENT with the connector, worth closing separately: a
+ *  command-less url entry that omits `type` is called remote here, while
+ *  upstream.ts refuses it with "command is required for local servers" and
+ *  never sends its headers. The entry fails either way, but the diagnostic
+ *  currently names the vault rather than the missing `type`. */
 export function isRemoteEntry(entry: { type?: string; command?: string; url?: string }): boolean {
   return entry.type === "remote" || (!entry.command && entry.url !== undefined);
 }

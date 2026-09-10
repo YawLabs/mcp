@@ -280,6 +280,92 @@ describe("buildToolList — tool filters", () => {
   });
 });
 
+describe("buildToolList -- the blockedTools deny predicate", () => {
+  // The 6th argument is the ONLY thing that keeps a `blockedTools`-denied
+  // tool off the advertised tools/list: server.ts hands it isToolDenied and
+  // nothing downstream of buildToolList filters the surface again. Both
+  // branches need their own case -- the live one and the tool-cache one are
+  // separate `continue`s, so a regression can drop either alone.
+  const deny = (wireName: string) => wireName === "gh_delete_repo" || wireName === "tailscale_down";
+
+  it("hides a denied tool from a LIVE connection and keeps its siblings", () => {
+    const connections = new Map([["gh", makeConnection("gh", ["create_issue", "delete_repo"])]]);
+    const names = buildToolList(connections, [], undefined, "full", undefined, deny).map((t) => t.name);
+    expect(names).not.toContain("gh_delete_repo");
+    // The deny is per TOOL, not per namespace: the rest of gh must survive,
+    // or a single blocked tool would quietly cost the user its whole server.
+    expect(names).toContain("gh_create_issue");
+  });
+
+  it("hides a denied tool rendered from a DORMANT server's tool cache", () => {
+    // The placeholder path is the one that bites in practice: a blocked tool
+    // on an idle server would otherwise be advertised (name, description and
+    // all) right up until the server is activated, so the model sees a tool
+    // the call gate will always refuse.
+    const inactive = [makeInactiveServer("tailscale", [{ name: "status" }, { name: "down" }])];
+    const names = buildToolList(new Map(), inactive, undefined, "full", undefined, deny).map((t) => t.name);
+    expect(names).not.toContain("tailscale_down");
+    expect(names).toContain("tailscale_status");
+  });
+
+  it("hides a denied tool from the list but leaves its ROUTE intact", () => {
+    // Hiding and routing are deliberately different answers, and buildToolRoutes
+    // takes no deny predicate at all. Dropping the route instead would make a
+    // call by name return `Unknown tool`, which reads as a typo and sends the
+    // model hunting for a name that is right there; the block has to announce
+    // itself at the call gate. Covers both branches -- live and deferred.
+    const connections = new Map([["gh", makeConnection("gh", ["create_issue", "delete_repo"])]]);
+    const inactive = [makeInactiveServer("tailscale", [{ name: "status" }, { name: "down" }])];
+    const names = buildToolList(connections, inactive, undefined, "full", undefined, deny).map((t) => t.name);
+    expect(names).not.toContain("gh_delete_repo");
+    expect(names).not.toContain("tailscale_down");
+
+    const routes = buildToolRoutes(connections, inactive);
+    expect(routes.get("gh_delete_repo")).toEqual({ namespace: "gh", originalName: "delete_repo" });
+    expect(routes.get("tailscale_down")).toEqual({
+      namespace: "tailscale",
+      originalName: "down",
+      deferred: true,
+    });
+  });
+
+  it("still applies the deny in gateway mode, on an ACTIVATED namespace", () => {
+    // Gateway is the policy default, so a deny that only worked under `full`
+    // would be dead code in every real session. Activation is the one thing
+    // that puts a namespace's live tools back on the wire -- the deny has to
+    // outlive it.
+    const connections = new Map([["gh", makeConnection("gh", ["create_issue", "delete_repo"])]]);
+    const names = buildToolList(connections, [], undefined, "gateway", new Set(["gh"]), deny).map((t) => t.name);
+    expect(names).toContain("gh_create_issue");
+    expect(names).not.toContain("gh_delete_repo");
+  });
+
+  it("outranks a per-namespace tool filter that allows the denied tool", () => {
+    // Filters are the model's own per-session narrowing; a deny is the user's
+    // policy and is refused at the call gate too. So the filter can only ever
+    // subtract -- an allow-list naming a denied tool must not resurrect it.
+    const connections = new Map([["gh", makeConnection("gh", ["create_issue", "delete_repo"])]]);
+    const filters = new Map([["gh", new Set(["delete_repo"])]]);
+    // Control: that same filter WITHOUT the deny is what surfaces the tool,
+    // so the assertion below cannot pass just because the filter emptied the
+    // namespace.
+    expect(buildToolList(connections, [], filters).map((t) => t.name)).toContain("gh_delete_repo");
+    const names = buildToolList(connections, [], filters, "full", undefined, deny).map((t) => t.name);
+    expect(names).not.toContain("gh_delete_repo");
+  });
+
+  it("never hides a meta-tool, even when the predicate denies its name", () => {
+    // The call gate runs after every meta-tool branch on purpose (see the
+    // server-side "never blocks a meta-tool" case): blocking one would
+    // disable the surface the user manages the block with. The LIST has to
+    // agree, or the tool the refusal text points at is invisible.
+    const metaName = Object.values(META_TOOLS)[0].name;
+    const tools = buildToolList(new Map(), [], undefined, "full", undefined, (n) => n === metaName);
+    expect(tools.map((t) => t.name)).toContain(metaName);
+    expect(tools).toHaveLength(Object.keys(META_TOOLS).length);
+  });
+});
+
 describe("buildToolList — cross-namespace name collisions", () => {
   it("emits ONE entry when two active namespaces flatten to the same name", () => {
     // (ns=`gh`, tool=`actions_list`) and (ns=`gh_actions`, tool=`list`) both

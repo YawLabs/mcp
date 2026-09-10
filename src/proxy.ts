@@ -105,6 +105,12 @@ export function buildToolList(
   // Namespaces the client explicitly activated this session. Only consulted
   // in gateway mode; `full` advertises everything regardless.
   exposedNamespaces?: ReadonlySet<string>,
+  // Per-TOOL deny predicate, taking the flattened wire name. Distinct from
+  // toolFilters above in both key and intent: filters are the model's own
+  // per-session narrowing and keep hidden tools reachable by dispatch, while
+  // a deny is the user's policy and is refused at the call gate too. Absent
+  // by default, so a caller that does not pass it sees no behaviour change.
+  isDenied?: (wireName: string) => boolean,
 ): Array<{
   name: string;
   title?: string;
@@ -153,6 +159,7 @@ export function buildToolList(
     const filter = toolFilters?.get(conn.config.namespace);
     for (const tool of conn.tools) {
       if (filter && !filter.has(tool.name)) continue;
+      if (isDenied?.(tool.namespacedName)) continue;
       if (seen.has(tool.namespacedName)) continue;
       // title / outputSchema / _meta ride along so the structured-output
       // contract and display name survive the proxy (deferred placeholders
@@ -190,6 +197,7 @@ export function buildToolList(
     for (const cached of server.toolCache) {
       if (filter && !filter.has(cached.name)) continue;
       const namespacedName = `${server.namespace}_${cached.name}`;
+      if (isDenied?.(namespacedName)) continue;
       if (seen.has(namespacedName)) continue;
       tools.push({
         name: namespacedName,

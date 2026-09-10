@@ -8,7 +8,7 @@
 // The central rule of this file: the user must SEE THE ARGV before they
 // approve it. A consent prompt that only shows a path teaches the user to
 // hit `y`, which is worse than no prompt at all -- so the grant path always
-// renders every command + args (and env KEY NAMES, never values) that the
+// renders every command + args (and env / header KEY NAMES, never values) that the
 // file would spawn, derived through the SAME parse + validation the loader
 // uses, and only then asks.
 //
@@ -299,6 +299,14 @@ async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandRes
       // Names only, never values -- bundles.json env can hold secrets, and
       // this output is meant to be pasted into a support thread.
       if (envKeys.length > 0) print(`       env: ${envKeys.map(displayArg).join(", ")}`);
+      // Same rule for a remote entry's headers, and the same reason: approving
+      // this file authorizes yaw-mcp to send a vault secret to whatever URL it
+      // names, while renderLaunch shows a remote as a bare `HTTP <url>`. The
+      // approval has to be informed. Not a refusal, because a project file
+      // could already reach a secret through a local command's argv -- this is
+      // not a new exfiltration class, just one the preview was silent about.
+      const headerKeys = Object.keys(s.headers ?? {});
+      if (headerKeys.length > 0) print(`       headers: ${headerKeys.map(displayArg).join(", ")}`);
       for (const gap of pinGaps(s)) print(`       ! ${gap}`);
     }
   }

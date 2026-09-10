@@ -48,10 +48,17 @@
 //     ignored there, so the flag was a no-op that --help still described as
 //     a base URL. It was accepted-and-ignored for one release (v0.79.x) and
 //     is now rejected as an unknown flag like any other.
-//   - A project-scope target (VS Code's .vscode/mcp.json is the only one
-//     `try` can reach) is commit-to-share config, and the trial entry carries
-//     its secret INLINE. Writing a plaintext credential into a file that
-//     `git add -A` sweeps up is refused unless --yes is passed; see step 5b.
+//   - A project-scope target -- the per-project file a client reads out of
+//     the repo (.mcp.json, .cursor/mcp.json, .vscode/mcp.json,
+//     .gemini/settings.json) -- is commit-to-share config, and the trial
+//     entry carries its secret INLINE. Writing a plaintext credential into a
+//     file that `git add -A` sweeps up is refused unless --yes is passed; see
+//     step 5b. WHICH file is in play (if any) follows the RESOLVED SCOPE, not
+//     the client id: this note used to name .vscode/mcp.json as the only one
+//     `try` could reach, which stopped being true once the scope started
+//     coming from the target table. `try` takes a user scope wherever the
+//     client has one, so the refusal is reachable only by a client with no
+//     user scope -- see step 3.
 
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
@@ -75,6 +82,39 @@ import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 
+// The --client line is derived from the same table parseTryArgs validates
+// against (and that completion-cmd builds INSTALL_CLIENTS from), not a
+// hand-kept copy of it: the literal four-client list here outlived the
+// windsurf and gemini-cli additions, so both were ACCEPTED by the parser and
+// named nowhere a user could find them. Interpolating leaves one list to keep.
+
+/** The flag column every continuation line in TRY_USAGE hangs from. */
+const USAGE_INDENT = " ".repeat(23);
+
+/** Wrap the derived client list to the flag column. Six clientIds on one line
+ *  render at 93 columns while every other line in TRY_USAGE fits 80, so an
+ *  80-column terminal soft-wrapped the list back to column 0 and broke the
+ *  two-column layout the whole block is written in. Wrapping HERE rather than
+ *  hand-splitting the literal keeps the list derived: a seventh target still
+ *  cannot desync it, it just wraps. A continued line ends in "|" so the reader
+ *  (and the test that parses this back) can tell the list is not finished. */
+function wrapToUsageColumn(parts: string[], width = 80): string {
+  const lines: string[] = [];
+  let current = "";
+  parts.forEach((part, i) => {
+    const candidate = current === "" ? part : `${current} | ${part}`;
+    // Reserve the trailing " |" unless this is the last item on the last line.
+    const rendered = USAGE_INDENT.length + candidate.length + (i === parts.length - 1 ? 0 : 2);
+    if (rendered > width && current !== "") {
+      lines.push(`${current} |`);
+      current = part;
+    } else {
+      current = candidate;
+    }
+  });
+  lines.push(current);
+  return lines.join(`\n${USAGE_INDENT}`);
+}
 export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   Wire a one-off trial of an MCP server into your AI client. No account
@@ -82,7 +122,7 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
   it on a timer -- once --ttl has elapsed it is removed by the next
   \`yaw-mcp doctor\` run. Run \`yaw-mcp try-cleanup <slug>\` to remove it now.
 
-  --client <name>      claude-code | claude-desktop | cursor | vscode
+  --client <name>      ${wrapToUsageColumn(INSTALL_TARGETS.map((t) => t.clientId))}
                        (default: auto-detect, prefers the first installed
                        client in the order probed by \`yaw-mcp install --list\`)
   --ttl <duration>     How long the trial lives before doctor GCs it
@@ -92,10 +132,15 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
   --yes, -y            Confirm writing an inline secret into a PROJECT-scope
-                       config (vscode's .vscode/mcp.json -- a per-project
-                       file that is routinely committed). Without it, a trial
-                       whose entry carries a secret refuses that target and
-                       says why; user-scope clients never need it.
+                       config -- a per-project file the client reads out of
+                       the repo (.mcp.json, .cursor/mcp.json,
+                       .vscode/mcp.json, .gemini/settings.json), which is
+                       routinely committed. Without it, a trial whose entry
+                       carries a secret refuses that target and says why.
+                       A trial takes a user-scope file wherever the client
+                       has one, and every client shipped today has one, so
+                       this flag is currently never required -- it is here
+                       for a future project-only client.
 
   Point the catalog somewhere else with $YAW_MCP_CATALOG_URL.`;
 
@@ -408,10 +453,11 @@ async function readTrialMarker(markerPath: string): Promise<{ marker: TrialMarke
  *  differs between them:
  *   - "removed":    the entry was present and the file was rewritten (or, with
  *                   `dryRun`, would have been).
- *   - "absent":     nothing to do (no file, empty file, entry already gone).
- *   - "not-object": valid JSON that is NOT an object, so there is no container
- *                   to name the entry in and no peel is possible. The GC
- *                   refuses to unlink the marker on this; try-cleanup warns
+ *   - "absent":     nothing to do (no file, empty file, entry already gone, or
+ *                   a container on the way down that cannot hold it).
+ *   - "not-object": the whole FILE is valid JSON that is NOT an object, so it
+ *                   is not a client config at all and no peel is possible. The
+ *                   GC refuses to unlink the marker on this; try-cleanup warns
  *                   and carries on.
  *  Read/parse/write errors propagate to the caller's own catch. */
 async function peelEntryFromConfig(
@@ -425,6 +471,38 @@ async function peelEntryFromConfig(
   if (raw.trim().length === 0) return "absent";
   const parsed = parseJsonc(raw);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "not-object";
+  // Walk containerPath ourselves BEFORE handing it to removeJsoncEntry.
+  // jsonc-parser cannot delete under a missing intermediate -- the walk breaks
+  // with no parent and it throws "Can not delete in empty document" (the same
+  // trap editJsoncPath documents in jsonc.ts) -- so removeJsoncEntry's "no-op
+  // when the path does not exist" contract only holds once every container on
+  // the way down is really there. The check belongs HERE, on the caller side,
+  // because only the caller knows what a missing container MEANS: the user
+  // pulled the trial entry and the now-empty mcpServers block (or, at
+  // claude-code local scope, the whole projects[<dir>] block) out by hand, so
+  // there is provably no entry left to peel. Letting the throw out reported
+  // that as a peel FAILURE -- doctor told the user the trial was still wired
+  // into a file that held no trial entry, kept the marker, and re-failed on
+  // every later sweep, so its exit 2 never cleared.
+  //
+  // A container that EXISTS but is not an object (mcpServers set to 5, to a
+  // string, to an array) is "absent" for the same reason: a non-object cannot
+  // hold a key, so the entry is not in the file either and no future peel
+  // could ever succeed. Reporting it as a failure would warn "still wired in"
+  // about an entry that is not there, forever. Only the whole FILE not being
+  // an object stays "not-object" above -- there the marker is naming something
+  // that is not a client config at all, which is worth keeping the marker over
+  // rather than claiming a clean sweep.
+  //
+  // Own properties only, so this walk sees exactly what jsonc-parser's walk
+  // over the parse tree will see: an inherited member is not a container in
+  // the text.
+  let container = parsed as Record<string, unknown>;
+  for (const segment of containerPath) {
+    const child = Object.hasOwn(container, segment) ? container[segment] : undefined;
+    if (typeof child !== "object" || child === null || Array.isArray(child)) return "absent";
+    container = child as Record<string, unknown>;
+  }
   const next = removeJsoncEntry(raw, containerPath, entryName);
   if (next === raw) return "absent";
   if (dryRun) return "removed";
@@ -502,13 +580,18 @@ async function defaultFetchExplore(slug: string, catalogUrl?: string): Promise<E
  *  whether the config directory can be written. A client whose directory is
  *  read-only is still selected here and fails later, at the write, with a
  *  path in the message. */
+/** The (client, scope) slot `try` should write into. Returning the SCOPE as
+ *  well as the id is what keeps the write in the file the probe actually
+ *  found: a user with only a committed `.vscode/mcp.json` is detected on the
+ *  workspace slot, and answering with the id alone left the caller to guess
+ *  the scope from a hardcoded client list. */
 async function autoDetectClient(opts: {
   home: string;
   os: InstallOS;
   cwd: string;
   claudeConfigDir: string | undefined;
   appData?: string;
-}): Promise<InstallClientId> {
+}): Promise<{ clientId: InstallClientId; scope: InstallScope | null }> {
   const probes = await probeClientsAsync({
     home: opts.home,
     os: opts.os,
@@ -520,15 +603,17 @@ async function autoDetectClient(opts: {
   // doctor could read (the user is actively using it, and `try` will be able
   // to splice into it).
   for (const p of probes) {
-    if (probeUsable(p)) return p.clientId;
+    if (probeUsable(p)) return { clientId: p.clientId, scope: p.scope };
   }
   // Second: any client that's available on this OS (config file not
   // yet created -- we'll create it). claude-code is availableOn every
   // InstallOS (see INSTALL_TARGETS), so it is always present and never
   // `unavailable` -- this loop always returns it (first in probe order)
   // when nothing else matches, which IS the claude-code fallback.
+  // Nothing is configured yet, so there is no slot to inherit a scope from:
+  // null means 'the caller picks', which is the user-scope preference below.
   for (const p of probes) {
-    if (!p.unavailable) return p.clientId;
+    if (!p.unavailable) return { clientId: p.clientId, scope: null };
   }
   // Unreachable: the loop above always returns (claude-code is available on
   // every OS). Throw rather than return a redundant literal so a future
@@ -594,24 +679,42 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
 
   // Step 2: pick a client (explicit > auto-detect).
-  const clientId =
-    opts.clientId ??
-    (await autoDetectClient({
-      home,
-      os,
-      cwd,
-      claudeConfigDir,
-      appData,
-    }));
+  const detected = opts.clientId ? null : await autoDetectClient({ home, os, cwd, claudeConfigDir, appData });
+  const clientId = opts.clientId ?? (detected as { clientId: InstallClientId }).clientId;
 
   // Step 3: resolve the config file path (user scope; project scope
   // requires extra flags we don't expose in `try` -- trials are
   // user-scoped by design).
-  // VS Code has no user scope -- only workspace. Fall back to project
-  // scope when targeting vscode; the user must be inside the workspace, and
-  // a secret-bearing entry then needs --yes (step 5b), because that file is
+  // Prefer a user scope, falling back to the client's first scope when it has
+  // none -- trials are user-scoped by design, and a project-scoped fallback
+  // then needs --yes for a secret-bearing entry (step 5b) because that file is
   // commit-to-share config.
-  const scope: InstallScope = clientId === "vscode" ? "project" : "user";
+  //
+  // Derived from the target table rather than from a hardcoded client id: this
+  // used to read `clientId === "vscode" ? "project" : "user"`, which was true
+  // only while VS Code had no user scope. autoDetectClient returns the id of
+  // the first usable probe SLOT, so the moment VS Code gained one, that line
+  // would have detected the user slot and then written the workspace file --
+  // a different file, possibly in a directory that is not a workspace at all.
+  // The slot auto-detect actually found wins. That is what keeps a trial in
+  // the file the user is already using -- a repo shipping .vscode/mcp.json
+  // and no personal config is detected on the WORKSPACE slot, and writing a
+  // trial (possibly carrying an inline token) into a committed file is a
+  // hazard step 5b exists to warn about. Deriving the scope from the client
+  // id instead would silently move that write to the user file and lose the
+  // warning with it.
+  //
+  // ...but only when the client has NO user scope of its own. Inheriting a
+  // project slot unconditionally went too far: claude-code and cursor both
+  // have a user scope, so a checkout carrying a committed .mcp.json would
+  // put the trial into a commit-to-share file for them too, which is exactly
+  // what "trials are user-scoped by design" rules out. A user scope wins
+  // whenever one exists; the detected slot decides only for a client that
+  // cannot honour that (today: none, after VS Code gained one -- so this is
+  // the branch that keeps the rule true if a project-only client is added).
+  const tryTarget = INSTALL_TARGETS.find((t) => t.clientId === clientId);
+  const hasUserScope = tryTarget?.scopes.some((sc) => sc.scope === "user") ?? false;
+  const scope: InstallScope = hasUserScope ? "user" : (detected?.scope ?? tryTarget?.scopes[0].scope ?? "user");
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
   try {
@@ -718,14 +821,22 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
 
   // Step 5b: refuse to write a secret into a commit-to-share file without an
   // explicit --yes. A project-scope target is per-project config the client
-  // expects to be checked in (install-targets.ts labels VS Code's only scope
+  // expects to be checked in (install-targets.ts labels such a scope
   // "Workspace -- commit to share"), and unlike `add` the trial entry carries
   // its values INLINE (see the divergence note above), so `git add -A` in
-  // that repo publishes the credential. Auto-detect makes this easy to hit
-  // by accident: a repo that ships .vscode/mcp.json is picked whenever no
-  // personal client config exists. The warning prints on stderr either way;
-  // --yes lifts only the refusal. It runs BEFORE the --dry-run return so a
-  // preview never promises a write the real run declines.
+  // that repo publishes the credential. The warning prints on stderr either
+  // way; --yes lifts only the refusal. It runs BEFORE the --dry-run return
+  // so a preview never promises a write the real run declines.
+  //
+  // Unreachable today, and kept on purpose. Step 3 prefers a user scope
+  // whenever the client has one and all six shipped targets do, so `scope`
+  // is always "user" by the time control arrives here. It last fired while
+  // VS Code was project-only. Keeping it is what makes a project-only client
+  // added later refuse rather than silently commit the secret; there is no
+  // test that exercises the refusal firing, because no shipped target can
+  // reach it -- the sibling suite pins the AVOIDANCE instead (a trial lands
+  // in the private user file while a committed .vscode/mcp.json sits beside
+  // it, untouched and unwarned about).
   if (scope === "project" && entryHasSecrets) {
     const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
     const scopeSpec = target?.scopes.find((s) => s.scope === scope);

@@ -92,6 +92,19 @@ export class VaultPassphraseRequiredError extends Error {
   }
 }
 
+/** A resolved value the caller's own shape check rejected -- today, a header
+ *  value that cannot be a legal HTTP header value.
+ *
+ *  Carries only the KEY. The message deliberately does not quote the value:
+ *  it is a decrypted secret, and the runtime's own `Headers` TypeError quotes
+ *  it, which is why that error is caught and discarded rather than wrapped. */
+export class InvalidResolvedValueError extends Error {
+  constructor(public readonly key: string) {
+    super(`invalid resolved value for "${key}"`);
+    this.name = "InvalidResolvedValueError";
+  }
+}
+
 /** Vault passphrase captured from an in-session MCP elicitation.
  *
  *  Held in a module variable and NOT written back to `process.env`, which is
@@ -171,46 +184,67 @@ export function vaultPassphrase(): string | undefined {
 }
 
 /**
- * Resolve `${secret:NAME}` references in a string map an upstream server
- * needs -- a local server's env, or a remote server's HTTP headers --
+ * Resolve `${secret:NAME}` references in an upstream server's env
  * against the local secret vault. Fail-closed:
- *   - No refs present: pass through unchanged (free path, no vault load).
+ *   - No refs in env: pass through unchanged (free path, no vault load).
  *   - Refs present but no vault file / locked / unlock fails / missing
- *     values: THROW. Passing a literal `${secret:NAME}` on would leak the
- *     placeholder into logs or be interpreted as a real token by some
- *     servers, which is worse than refusing to connect.
+ *     values: THROW. Passing literal `${secret:NAME}` to the child would
+ *     leak the placeholder into logs or be interpreted as a real token
+ *     by some servers, which is worse than refusing to spawn.
  *
- * A local spawn happens in a non-interactive MCP-server context, so there is
+ * The spawn happens in a non-interactive MCP-server context, so there is
  * no stdin to prompt on -- writing one would corrupt the parent's JSON-RPC
  * transport. The passphrase therefore comes from the env, or from an
  * in-session MCP elicitation the server layer answers on our behalf when
  * the client supports one (see VaultPassphraseRequiredError and
  * setSessionVaultPassphrase below).
- *
- * `what` only names the map in the operator-facing wording. Headers deliberately
- * share this ONE implementation rather than getting a parallel one: every
- * fail-closed decision here (no vault, wrong passphrase, missing name,
- * malformed ref, and the audit written before the refusal) has to hold
- * identically for a credential on the wire and a credential in a child env,
- * and a second copy is a second thing to drift.
  */
 export async function resolveServerEnv(
   env: Record<string, string>,
   namespace: string,
-  what: "env" | "headers" = "env",
+  // What this map IS, in the operator's words -- the only thing that differs
+  // between a local server's env and a remote server's headers, both of which
+  // resolve through this exact function. It is ONE parameter rather than two
+  // (a noun and a capitalized noun) so the two spellings cannot drift apart.
+  // The default reproduces the previous message bytes EXACTLY: callers, logs
+  // and tests match on that text (see the VaultPassphraseRequiredError doc
+  // above, and src/tests/server.test.ts's verbatim assertion).
+  subject: string = "server env",
+  /** Shape check on the RESOLVED values, run before anything is audited.
+   *  Returns the offending KEY name, or undefined when every value is usable.
+   *  Exists so a caller that will reject a value can do so before the audit
+   *  claims the secret was injected. */
+  validate?: (resolved: Record<string, string>) => string | undefined,
+  /** Receives every DECRYPTED value keyed by secret name, so the caller can
+   *  redact the bare token as well as the string it was composed into. Not
+   *  called when the map carries no refs -- there is nothing to decrypt. */
+  onSecretValues?: (values: Record<string, string>) => void,
 ): Promise<Record<string, string>> {
-  if (!hasSecretRefs(env)) return env;
+  // A ref-free map skips the vault entirely, so there is nothing to audit and
+  // nothing decrypted -- but the caller's shape check still has to run, or an
+  // unusable LITERAL value would sail past it.
+  if (!hasSecretRefs(env)) {
+    const bad = validate?.(env);
+    if (bad) throw new InvalidResolvedValueError(bad);
+    return env;
+  }
   const refKeys = Object.entries(env)
     .filter(([, v]) => typeof v === "string" && v.includes("${secret:"))
     .map(([k]) => k);
+  const lead = subject.charAt(0).toUpperCase() + subject.slice(1);
   const passphrase = vaultPassphrase();
   if (typeof passphrase !== "string" || passphrase.length === 0) {
-    log("warn", `Server ${what} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, {
+    // `namespace` rides along with the keys. Without it this line says a
+    // server is waiting on the vault without saying WHICH, and on a config
+    // with several credentialed servers that is the only fact the reader
+    // needs -- the thrown error carries it, but the log is what a user
+    // grepping their client's stderr actually sees.
+    log("warn", `${lead} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, {
       namespace,
       keys: refKeys,
     });
     throw new VaultPassphraseRequiredError(
-      `vault locked: server ${what} references \${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set`,
+      `vault locked: ${subject} references \${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set`,
       namespace,
       refKeys,
       "missing",
@@ -230,7 +264,7 @@ export async function resolveServerEnv(
     throw new Error(`vault unreadable: ${msg}`);
   }
   if (!vault) {
-    throw new Error(`vault locked: server ${what} references \${secret:...} but no vault exists yet`);
+    throw new Error(`vault locked: ${subject} references \${secret:...} but no vault exists yet`);
   }
   // A passphrase that does not open the vault is a question for the user, not
   // a dead end -- so it throws the SAME typed error as no passphrase at all,
@@ -258,7 +292,24 @@ export async function resolveServerEnv(
       "invalid",
     );
   }
-  const { resolved, missing, malformed } = resolveSecretRefs(env, vault, key);
+  const { resolved, missing, malformed, values } = resolveSecretRefs(env, vault, key);
+  // Hand the caller every decrypted value, keyed by secret NAME, so it can arm
+  // the redactor with those as well as the composed strings. `resolved` holds
+  // `Bearer <token>` for the documented `"Bearer ${secret:linear}"` shape, so
+  // an upstream echoing only the bare token matched nothing -- the redactor
+  // replaces exact substrings. A callback rather than a return field or a
+  // module variable: the return type is consumed in several places, and a
+  // module variable would be shared across concurrent connects.
+  onSecretValues?.(values);
+
+  // Caller-supplied shape check on the RESOLVED values, run before the audit
+  // below. The remote branch uses it to reject a value that cannot be an HTTP
+  // header: without it, that refusal happened after resolveServerEnv returned,
+  // so the audit had already written "injected" for a secret that reached no
+  // request and no transport. Nothing is recorded on this path -- the value was
+  // decrypted and then discarded, which is neither "injected" nor "missing".
+  const invalid = missing.length === 0 && malformed.length === 0 ? validate?.(resolved) : undefined;
+
   // Audit which secrets were consumed for this spawn -- NAME + namespace
   // only, never a value. Wrapped in try/catch (and each append is itself
   // fail-open) so a broken audit log can never block the spawn.
@@ -269,14 +320,20 @@ export async function resolveServerEnv(
   // first, then refuse. recordResolveAudit itself suppresses "injected" on
   // the refusal path -- nothing reaches a child env when the spawn is
   // refused, so "injected" would be a lie (see its doc comment).
-  try {
-    await recordResolveAudit(namespace, env, missing, malformed);
-  } catch (auditErr) {
-    log("warn", "Failed to record secret-resolve audit (non-fatal)", {
-      namespace,
-      error: auditErr instanceof Error ? auditErr.message : String(auditErr),
-    });
+  if (!invalid) {
+    try {
+      await recordResolveAudit(namespace, env, missing, malformed);
+    } catch (auditErr) {
+      log("warn", "Failed to record secret-resolve audit (non-fatal)", {
+        namespace,
+        error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+      });
+    }
   }
+  // Thrown after the audit decision above so the two orderings stay in one
+  // place; the caller turns the key name into its own error, where the config
+  // pointer lives.
+  if (invalid) throw new InvalidResolvedValueError(invalid);
   // A malformed ref refuses exactly like an absent name -- the literal must
   // never reach a child -- but it is reported in its own clause and in its
   // bounded `display` form: `missing` holds NAMES, while a malformed span is a
@@ -453,6 +510,191 @@ export class ActivationError extends Error {
   }
 }
 
+/** True for a value that is itself an unresolved `${secret:NAME}` reference
+ *  rather than a resolved credential. Shared by the variant builder and the
+ *  replace loop so the two cannot drift: the loop SKIPS such a value (the
+ *  catch-all rewrite at the end of redactSecretsInOutput is what handles it,
+ *  and it hides the vault entry's NAME instead of naming the env key), and the
+ *  builder must not spend variants on it either -- a percent-encoded
+ *  `${secret:...}` is not a shape any credential takes. */
+function isUnresolvedSecretRef(value: string): boolean {
+  return value.startsWith("${secret:") && value.endsWith("}");
+}
+
+/** The length a value has to clear before it is matched against output at all.
+ *  It gates BOTH ends on purpose -- the replace loop skips anything shorter,
+ *  and secretMatchVariants refuses to DERIVE an encoded form from a shorter
+ *  base -- so it is one constant rather than two literals: a threshold that
+ *  moved in one place and not the other is exactly how a value the design skips
+ *  as too short creeps back in through a longer encoding of itself. */
+const SECRET_MATCH_MIN_LENGTH = 8;
+
+/** The value as an HTML-escaping serializer would print it. A LIST rather than
+ *  one string because the encoders agree on four characters and disagree on the
+ *  fifth: `&` -> `&amp;`, `<` -> `&lt;`, `>` -> `&gt;` and `"` -> `&quot;` are
+ *  universal, while the apostrophe comes out as `&#39;` (escape-html, lodash),
+ *  `&#x27;` (Handlebars, Python's html.escape) or `&apos;` (XML-shaped
+ *  serializers). Exact matching cannot pick a winner, so a value carrying an
+ *  apostrophe emits all three and a value without one collapses to a single
+ *  entry in the caller's dedupe. `&` is replaced FIRST so the ampersands the
+ *  later replacements introduce are not escaped a second time (`<` would
+ *  otherwise become `&lt;` and then `&amp;lt;`). */
+function htmlEscapeVariants(base: string): string[] {
+  const escaped = base.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  if (!escaped.includes("'")) return [escaped];
+  return ["&#39;", "&#x27;", "&apos;"].map((apostrophe) => escaped.replace(/'/g, apostrophe));
+}
+
+/** Every FORM one resolved value can plausibly take by the time an upstream
+ *  ECHOES it back, so exact-substring matching still finds it. The caller keys
+ *  every variant of a value to the SAME env or secret name, so a hit still
+ *  names the credential to rotate.
+ *
+ *  Two bases, then a transform per base:
+ *
+ *  - RAW and TRIMMED. undici strips leading and trailing HTTP whitespace from
+ *    every header value, so a vault entry carrying edge whitespace is SENT as
+ *    `Bearer tok` while the map holds `Bearer tok ` -- and the exact-substring
+ *    match then finds nothing in the echo. Reachable shapes, checked rather
+ *    than assumed: a LEADING space (nothing strips it), a trailing SPACE, and
+ *    a doubled trailing newline. Note what is NOT one -- `secrets set --stdin`
+ *    strips a single trailing newline itself (secrets-cmd.ts, the piped-stdin
+ *    branch: `.replace(/\r?\n$/, "")`), so the tidiest-looking example is the
+ *    one that path cannot produce; it strips ONE, so a doubled newline still
+ *    arrives here. A child that reads an injected var usually trims it before
+ *    echoing it back too.
+ *
+ *  - JSON-ESCAPED, the one that matters most. MCP servers speak JSON-RPC and
+ *    the common Node loggers (pino, winston) default to JSON lines, so a value
+ *    an upstream echoes is escaped the moment it lands in a document: a newline
+ *    becomes a literal \n, a quote a \", a backslash a \\. A multi-line PEM, or
+ *    a token carrying a quote or backslash (`Headers` accepts both, so both
+ *    reach the wire), therefore comes back sharing no substring with the stored
+ *    value -- and one JSON.parse on the logged line recovers the credential
+ *    byte-for-byte. `JSON.stringify(v).slice(1, -1)` is exactly what the value
+ *    looks like embedded IN a JSON string, minus the quotes the document adds.
+ *
+ *  - PERCENT-ENCODED. encodeURIComponent rewrites 24 printable-ASCII
+ *    characters; the three that fall INSIDE the base64 alphabet are `+`, `/`
+ *    and `=`, which is what makes a base64-shaped credential the shape worth
+ *    covering here. So a gateway that bounces the failed request
+ *    through a login redirect, or quotes back the query string it received,
+ *    echoes %2B / %2F / %3D and matches nothing.
+ *
+ *  - HTML-ESCAPED. A remote answering with an HTML error page is ordinary -- an
+ *    auth proxy, a WAF, a load balancer in front of the endpoint -- and the
+ *    streamable-http transport puts `response.text()` straight into the error
+ *    it throws, so that page reaches the redactor whole. NOT covered by the
+ *    JSON variant: on the one character the two encoders share, JSON emits `\"`
+ *    and HTML emits `&quot;`, which are different byte strings, so a token
+ *    carrying a quote rides out of an HTML echo intact and with no ***NAME***
+ *    marker to say a credential was involved at all. The other four characters
+ *    (`&`, `<`, `>`, `'`) are rare in token alphabets but ordinary in a
+ *    password, which is a credential this map holds just as often. See
+ *    htmlEscapeVariants for why the apostrophe costs three entries.
+ *
+ *  - CASE-FOLDED, but ONLY for an all-hex value. An upstream that normalizes a
+ *    token before printing it (a case-insensitive compare path logging its
+ *    normalized form) echoes a case this map does not hold. Deliberately NOT
+ *    applied to every value: this function is handed the whole resolved env,
+ *    most of which is ordinary configuration, and a case-insensitive pass would
+ *    replace a Windows path or a URL merely MENTIONED in the output in another
+ *    case -- costing the reader the path the error was actually about while
+ *    hiding no credential. Hex is the carve-out because folding it is LOSSLESS,
+ *    so the folded echo IS still the credential; for a mixed-alphabet token it
+ *    is not, and there is nothing to recover. The gate is /^[0-9a-f]+$/i, which
+ *    also admits digit-only runs -- a date, a timestamp -- and those DO collide
+ *    with prose. Harmless rather than fixed: for a digit-only value both folds
+ *    are the identity, so they add no variant the raw match did not already
+ *    carry. It is the losslessness that earns the carve-out, not any claim that
+ *    hex cannot appear in ordinary text.
+ *
+ *  NOT EXHAUSTIVE. The gap is other ENCODERS of shapes already in the list, not
+ *  shapes nobody thought of, so the four above are "the common encoders" rather
+ *  than "every encoder". Each of these was reproduced; none is covered:
+ *
+ *  - Other runtimes' JSON differs from Node's. Python's `json.dumps` defaults
+ *    to `ensure_ascii=True` and escapes every non-ASCII character as `\uXXXX`;
+ *    Go's `encoding/json` escapes `&`, `<` and `>` as `\u0026`, `\u003c`
+ *    and `\u003e`. A non-ASCII password -- an ordinary shape for a credential --
+ *    echoed by a Python upstream therefore still leaks whole.
+ *  - `URLSearchParams` / form-urlencoded, which is the standard OAuth redirect
+ *    encoder, differs from encodeURIComponent: a space becomes `+` rather than
+ *    `%20`, and `~`, `!`, `'`, `(` and `)` are percent-encoded where
+ *    encodeURIComponent leaves them alone.
+ *  - Double percent-encoding across a redirect chain (`%2F` -> `%252F`), which
+ *    a second hop that re-encodes what it received produces.
+ *
+ *  Each is one more replace chain, so the reason to stop is not cost: every
+ *  entry widens the map matched against arbitrary output, and these are
+ *  progressively rarer than the four above.
+ *
+ *  REJECTED:
+ *
+ *  - BASE64 re-encoding of the value. Not a false-match risk -- a base64 blob
+ *    of a high-entropy value collides with nothing -- but it cannot be done
+ *    honestly. base64 of a SUBSTRING appears in the output only when that
+ *    substring starts on a 3-byte boundary, so the realistic shape,
+ *    `base64("user:" + token)`, does not contain `base64(token)`. It would
+ *    cover the whole-value re-encode alone while reading like coverage of
+ *    re-encoding. It is also the wrong CLASS: JSON escaping and percent
+ *    encoding are applied by the echo to whatever string it holds, whereas
+ *    base64 is applied to a credential before USE -- which would mean the map
+ *    should be holding the encoded form in the first place.
+ *
+ *  - Unicode normalization, shell quoting, regex escaping: no reproduced shape,
+ *    so they would be guesses paid for on every call.
+ *
+ *  The floor (SECRET_MATCH_MIN_LENGTH) is enforced HERE as well as in the
+ *  caller's replace loop, and the two are not redundant. No transform above
+ *  SHORTENS its base (several are the identity on a value with nothing to
+ *  escape, and the hex fold is equal-length by construction), so a floor
+ *  checked only at match time is a floor on the
+ *  ENCODED string rather than on the credential: a 7-char config snippet the
+ *  design deliberately skips clears the bar as a 9-char JSON escape, and a
+ *  6-char path clears it percent-encoded -- and the redactor then mangles
+ *  exactly the ordinary output the floor exists to keep readable. So a base
+ *  under the floor emits no derived form at all: a value too short to match raw
+ *  cannot match encoded either. The base itself is still emitted, and still
+ *  floored by the loop, which is what keeps the TRIMMED base -- the one
+ *  transform that can SHORTEN a value -- honest.
+ *
+ *  For an ordinary non-hex token (letters, digits, `_`, `-`) every transform IS
+ *  the identity, so the caller's dedupe collapses the list back to the single
+ *  entry this function used to produce -- the list only grows for a value that
+ *  actually needs escaping, or for hex. */
+function secretMatchVariants(value: string): string[] {
+  const bases = [value];
+  const trimmed = value.trim();
+  if (trimmed !== value) bases.push(trimmed);
+  if (isUnresolvedSecretRef(trimmed)) return bases;
+
+  const variants: string[] = [];
+  for (const base of bases) {
+    variants.push(base);
+    // Gate the DERIVED forms on the BASE, not on what they produce. Everything
+    // below lengthens its input, so a base under the floor would otherwise
+    // re-enter matching as a longer encoding of itself -- see the floor
+    // paragraph above. The raw base pushed on the line above is still emitted
+    // and still floored by the caller.
+    if (base.length < SECRET_MATCH_MIN_LENGTH) continue;
+    variants.push(JSON.stringify(base).slice(1, -1));
+    try {
+      variants.push(encodeURIComponent(base));
+    } catch {
+      // encodeURIComponent throws URIError on a lone surrogate, which a value
+      // decoded from a truncated buffer can carry. Skip that one variant
+      // rather than letting a redactor that runs ONLY on the failure path
+      // throw and replace the ActivationError with a URIError.
+    }
+    variants.push(...htmlEscapeVariants(base));
+    if (/^[0-9a-f]+$/i.test(base)) {
+      variants.push(base.toLowerCase(), base.toUpperCase());
+    }
+  }
+  return variants;
+}
+
 /**
  * Redact secret values out of captured stderr before embedding it in error
  * messages. A server that crashes during init often echoes the bad value
@@ -471,9 +713,47 @@ export class ActivationError extends Error {
  * seeing it. We also drop ${secret:NAME} literals themselves to
  * `${secret:***}` in case any leaked unresolved.
  *
- * The redactor is conservative: short values (<8 chars) are skipped to
- * avoid mangling unrelated substrings; the goal is to catch the high-
- * entropy tokens that look like secrets, not redact the entire output.
+ * The redactor is conservative: short values (under SECRET_MATCH_MIN_LENGTH,
+ * 8 chars) are skipped to avoid mangling unrelated substrings; the goal is to
+ * catch the high-entropy tokens that look like secrets, not redact the entire
+ * output. That floor is on the STORED value, so a value below it does not
+ * re-enter matching through a longer encoding of itself either.
+ *
+ * Matching is against a VARIANT LIST per value (secretMatchVariants, defined
+ * directly above), not the single stored string, because the transform that
+ * defeats an exact match is applied by the ECHO -- a JSON logger, a redirect
+ * builder -- not by anything on this side. That list is not exhaustive either;
+ * its own doc block names the encoders it does not cover.
+ *
+ * STILL NOT COVERED, and not fixable by adding more variants. These are limits
+ * of substring matching itself, so the list below is not a coverage claim:
+ *
+ *   - A value BROKEN across lines. Reads exotic if you picture a fixed-width
+ *     logger, but the dominant trigger is Node's OWN default object formatting:
+ *     util.inspect, which is what a plain `console.error({ key })` in a child
+ *     goes through, renders a long MULTI-LINE string as one quoted chunk per
+ *     line joined with ` +`. So a PEM -- the exact credential shape the
+ *     JSON-escaped variant exists for -- comes back as
+ *     `'-----BEGIN PRIVATE KEY-----\n' +` / `'MIIB...'`, and NEITHER the raw
+ *     value nor its JSON escape is a contiguous run of that output (measured on
+ *     Node 22, which splits only once the rendering also exceeds the 80-column
+ *     breakLength; a short two-line value stays on one line and still matches).
+ *     A single-line token is not split by inspect at any length -- that one
+ *     does need a fixed-width formatter, and is the rarer case of the two.
+ *   - A token straddling the stderr-ring cut. The ring is the `stderrRing`
+ *     accumulator on the local-spawn path, whose `.slice(-STDERR_RING_CAP)`
+ *     keeps only the newest 8K of decoded stderr, so a token written across
+ *     that boundary survives into the tail as a SUFFIX, and a suffix matches
+ *     nothing.
+ *   - An upstream that echoes only a PREFIX ("key lin_api_9f... was
+ *     rejected"). Same shape, other end.
+ *
+ * Each of those leaks a PARTIAL credential -- worth less than the whole one,
+ * but worth something, and none of them emits a ***NAME*** marker, so nothing
+ * in the message even says a credential was involved. Closing them means
+ * leaving exact substrings for a fuzzy or entropy-based matcher, which trades
+ * away this function's most important property: it cannot mangle output that
+ * does not contain the secret. That trade has not been made here.
  *
  * SCOPE -- documented rather than widened. Every call site hands this the
  * RESOLVED SERVER ENV only (the values yaw-mcp itself injected from bundles.json
@@ -491,18 +771,86 @@ export class ActivationError extends Error {
  */
 function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
+  // Expand each value into its variant list (secretMatchVariants) and treat
+  // every variant as a plain extra entry under the SAME key, so a hit still
+  // names the credential to rotate rather than reporting an anonymous match.
+  // Fixed here rather than at the header call site because this is the choke
+  // point every caller goes through, and the local/stdio path meets the same
+  // encoded-echo shapes the remote one does.
+  //
+  // Deduped by the variant STRING. Most transforms are the identity for an
+  // ordinary token, so without this the same regex would run three or four
+  // times per value; and when two DIFFERENT env keys hold the same value, one
+  // entry is what already happened in practice (the first replace consumed
+  // every occurrence and the second found nothing) -- the set just makes that
+  // explicit and keeps a key naming it.
+  //
+  // TWO passes, RAW values first, because the marker names the credential to
+  // ROTATE and pointing at the wrong entry is worse than an anonymous match.
+  // One value's derived variant can equal a DIFFERENT value's raw string (a
+  // path's JSON escape is a plausible token; a path's percent-encoding is a
+  // plausible value of the _URL twin sitting next to it in the same env). With
+  // a single pass the winner is whichever env key Object.entries happened to
+  // yield first, so a real credential in the output gets reported under the
+  // path's key. Claiming every raw string before any derived one makes the rule
+  // "the value that IS this string owns it" instead of "whoever got there
+  // first", and a raw string too short to matter still only blocks the identical
+  // string, which the floor below would have skipped anyway.
+  const entries: Array<[string, string]> = [];
+  const seen = new Set<string>();
+  const claim = (k: string, variant: string): void => {
+    if (seen.has(variant)) return;
+    seen.add(variant);
+    entries.push([k, variant]);
+  };
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== "string") continue;
+    claim(k, v);
+  }
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== "string") continue;
+    for (const variant of secretMatchVariants(v)) claim(k, variant);
+  }
   // Replace longest values first. When one secret value is a substring of
   // another (e.g. a token and that same token with a suffix), a short-first
   // pass can redact the inner value and leave a real-secret suffix exposed.
   // Descending-by-length order guarantees the containing value is redacted
   // whole before any of its substrings is considered.
-  const entries = Object.entries(env).sort(
-    ([, a], [, b]) => (typeof b === "string" ? b.length : 0) - (typeof a === "string" ? a.length : 0),
-  );
+  //
+  // ONE flat sort over every (key, variant) pair, not a sort per secret --
+  // that is what makes CONTAINMENT hold ACROSS secrets, which is where the
+  // variants make it harder. A variant can now be LONGER than another secret's
+  // raw value (a token containing a quote is shorter than its own JSON-escaped
+  // form, which in turn can contain a second secret's raw value whole), so
+  // grouping by secret, or sorting the env entries before expanding them, would
+  // let a short raw value redact the inside of a longer escaped one and leave
+  // the tail of a real credential in the clear.
+  //
+  // What longest-first buys is exactly CONTAINMENT: whenever one entry contains
+  // another, the container is replaced first, so no later pass can strand a real
+  // tail. It does NOT make two DISTINCT secrets that OVERLAP in the echoed text
+  // both come out whole -- where A's escaped form ends INSIDE B's raw span,
+  // replacing the longer A first eats the shared bytes and B stops matching,
+  // leaving B's remainder in the clear (A=`aaaa"bbbb`, B=`bbbbCCCC`, echoed
+  // JSON-escaped, strands `CCCC`).
+  //
+  // Measured rather than assumed, 4000 pairs each way: two INDEPENDENT random
+  // values echoed back to back never strand a byte (0/4000 -- adjacency is not
+  // overlap, since B is still whole after A is replaced), while values built to
+  // share bytes at the boundary strand every time (4000/4000). So this is not a
+  // dice roll the ordering could win: it needs two secrets whose values actually
+  // overlap in the output, and no ordering of a substring replacer survives that
+  // -- whereas every ordering other than longest-first loses containment, which
+  // is the case that shows up in practice.
+  entries.sort(([, a], [, b]) => b.length - a.length);
   for (const [k, v] of entries) {
-    if (typeof v !== "string" || v.length < 8) continue;
+    // The other end of the floor secretMatchVariants gates emission on. This
+    // one catches what still reaches the loop under it: a TRIMMED base (the one
+    // transform that shortens) and a raw value that was always too short. That
+    // floor is what keeps the regex off unrelated substrings.
+    if (v.length < SECRET_MATCH_MIN_LENGTH) continue;
     // Skip values that are themselves an unresolved ${secret:...} literal.
-    if (v.startsWith("${secret:") && v.endsWith("}")) continue;
+    if (isUnresolvedSecretRef(v)) continue;
     // Escape regex metacharacters in the secret value.
     const escaped = v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     out = out.replace(new RegExp(escaped, "g"), `***${k}***`);
@@ -555,14 +903,27 @@ function categorizeSpawnError(err: unknown): ActivationFailureCategory {
  *  error code (-32000 and friends) is not a status and must not be printed as
  *  one. Truncated because a streamable-http failure can carry a whole HTML
  *  error page from `response.text()`. */
-function remoteFailureDetail(err: unknown): string {
+function remoteFailureDetail(err: unknown, resolved: Record<string, string>): string {
   const parts: string[] = [];
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code === "number" && code >= 100 && code <= 599) parts.push(`HTTP ${code}`);
   const cause = err instanceof Error ? err.cause : undefined;
   const message = cause instanceof Error ? cause.message : err instanceof Error ? err.message : String(err);
   if (message) parts.push(message);
-  return parts.join(": ").replace(/\s+/g, " ").trim().slice(0, 200);
+  // Redact BEFORE the whitespace collapse and BEFORE the 200-char cut, and
+  // both orderings are load-bearing. redactSecretsInOutput matches exact
+  // substrings, so a resolved value containing a newline stops matching once
+  // /\s+/g has flattened it; and a secret sitting past the cut has to be
+  // REMOVED rather than merely hidden -- the same scrub-then-truncate
+  // reasoning health-score.ts already spells out for its own truncation.
+  //
+  // This is the remote leak path, and it is the whole reason the resolved
+  // headers are assigned into resolvedServerEnv: the stderr ring is empty for
+  // a remote, so nothing else on this branch ever reaches the redactor. A
+  // gateway that echoes the request headers in its 401 body would otherwise
+  // put the bearer token into an ActivationError that is logged, recorded in
+  // activationFailures, AND rendered into discover() output for the model.
+  return redactSecretsInOutput(parts.join(": "), resolved).replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
 /** Attach the child's stderr tail to an ActivationError raised AFTER the
@@ -580,6 +941,31 @@ function remoteFailureDetail(err: unknown): string {
  *  server.ts's instanceof branches behave exactly as before -- the tail and the
  *  appended reason are additive. Remote connections never populate the ring,
  *  so this is a no-op for them. */
+/** Redact resolved secret values out of an ActivationError's own MESSAGE.
+ *
+ *  withStderrTail below redacts only the tail it APPENDS, and returns the
+ *  error untouched when there is no tail -- which is always, for a remote,
+ *  since nothing writes the stderr ring on that branch. That left the whole
+ *  post-handshake path unredacted: a `tools/list` failure carries the SDK's
+ *  `Error POSTing to endpoint: <response body>` verbatim, so a gateway that
+ *  echoes the request headers in a 401 body put the bearer token into an
+ *  error that is logged to stderr AND returned to the model in the activate
+ *  result. The pre-handshake branch was already covered; this is the same
+ *  leak one phase later.
+ *
+ *  Applied unconditionally rather than only for remotes: on a local server
+ *  the same map holds the child's resolved env, so an upstream that echoes an
+ *  injected value in a JSON-RPC error leaks it identically.
+ *
+ *  Category, tail and cause are carried over verbatim so the oam boot-probe
+ *  downgrade gate and server.ts's instanceof branches are unaffected. */
+function redactActivationMessage(err: unknown, env: Record<string, string>): unknown {
+  if (!(err instanceof ActivationError)) return err;
+  const safe = redactSecretsInOutput(err.message, env);
+  if (safe === err.message) return err;
+  return new ActivationError(safe, err.category, err.stderrTail, err.cause);
+}
+
 function withStderrTail(err: unknown, stderrRing: string, env: Record<string, string>): unknown {
   if (!(err instanceof ActivationError) || err.stderrTail) return err;
   const trimmed = stderrRing.trim();
@@ -804,6 +1190,12 @@ async function connectToUpstreamOnce(
   // before they're embedded in ActivationError / logs. The original
   // config.env still carries `${secret:NAME}` literals; the child sees
   // the cleartext and may echo it on failure.
+  //
+  // On a REMOTE entry this same map holds the resolved request HEADERS,
+  // keyed by header name (so a leaked bearer token redacts to
+  // `***Authorization***`). A remote has no child and therefore no stderr
+  // ring: its leak path is the HTTP response body that remoteFailureDetail
+  // lifts out of the SDK error, which is why that function takes this map.
   let resolvedServerEnv: Record<string, string> = {};
   // The command that is ACTUALLY handed to the transport, post uv/oam rewrite.
   // config.command is what the operator typed (`npx`, `uvx`); the process that
@@ -896,8 +1288,26 @@ async function connectToUpstreamOnce(
     // child. A ref-free env skips the vault entirely and passes through
     // unchanged. The throw is a plain Error, so the oam boot-probe
     // downgrade below deliberately does not retry it.
-    const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace);
-    resolvedServerEnv = serverEnv;
+    // Mirror image of the remote branch's env warning below. A local server
+    // has no HTTP request to put a header on, so `headers` here is the same
+    // silent drop this field exists to fix, pointing the other way. Keys
+    // only in the structured field -- never values.
+    if (config.headers && Object.keys(config.headers).length > 0) {
+      log("warn", "Ignoring headers on a local server: headers apply only to remote (HTTP/SSE) upstreams", {
+        namespace: config.namespace,
+        keys: Object.keys(config.headers),
+      });
+    }
+
+    // The bare decrypted values ride alongside the composed ones in the
+    // redaction map. A child that echoes only the token -- not the whole
+    // `Bearer <token>` string it was spliced into -- would otherwise match
+    // nothing, the redactor being exact-substring.
+    let secretValues: Record<string, string> = {};
+    const serverEnv = await resolveServerEnv(config.env ?? {}, config.namespace, undefined, undefined, (v) => {
+      secretValues = v;
+    });
+    resolvedServerEnv = { ...serverEnv, ...secretValues };
     const stdioTransport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
@@ -916,17 +1326,21 @@ async function connectToUpstreamOnce(
       throw new Error("url is required for remote servers");
     }
 
-    // Remote entries never spawn a child, so there is no process env to fill:
-    // resolveServerEnv's env call runs only in the local branch above, and
-    // nothing turns `env` into request headers. A `${secret:TOKEN}` sitting in
-    // a remote entry's env gets NEITHER auth NOR a failure -- the connect goes
-    // out unauthenticated and the server answers 401. Say so once, at connect,
-    // rather than leaving the operator to infer it. `headers` is the channel
-    // that does work, so the warning names it.
+    // Remote entries never spawn a child, so there is no process env to fill
+    // and `env` still goes nowhere -- but the credential now has a home:
+    // `headers`, resolved through the same vault a few lines below. An entry
+    // that still carries its token in `env` would connect unauthenticated and
+    // get a 401, so the warning stays and now names the fix.
+    //
+    // The PREFIX of this message is load-bearing: callers and tests filter on
+    // "Ignoring env on a remote server". Append to it, never reword it.
+    // It stays a WARN rather than becoming an error deliberately -- an
+    // existing entry with a stale `env` block still connects to whatever
+    // works today, and an upgrade must not turn that into a hard failure.
     if (config.env && Object.keys(config.env).length > 0) {
       log(
         "warn",
-        'Ignoring env on a remote server: env (and ${secret:...} refs in it) is never sent to remote upstreams -- use "headers" instead',
+        'Ignoring env on a remote server: env (and ${secret:...} refs in it) is never sent to remote upstreams -- put the credential in "headers" instead',
         { namespace: config.namespace, keys: Object.keys(config.env) },
       );
     }
@@ -961,54 +1375,93 @@ async function connectToUpstreamOnce(
         err,
       );
     }
-    // The credential channel for a remote upstream. Resolved through the same
-    // fail-closed path a local server's env takes, so a missing or malformed
-    // `${secret:NAME}` refuses the CONNECT rather than putting the literal on
-    // the wire -- where it would reach a third party, not just a child process.
+    // Resolve the headers AFTER the url parse, not before. A malformed url is
+    // a permanent config error; resolving first would fire a vault-passphrase
+    // elicitation round-trip (up to a 60s modal in the client) before
+    // reporting a failure no passphrase could ever fix.
     //
-    // Resolved here, immediately before the transport is built, so the
-    // plaintext lives for as few statements as possible and is never stored on
-    // the connection: `requestInit` holds it, and nothing reads it back out.
-    let resolvedHeaders: Record<string, string> | undefined;
-    if (config.headers && Object.keys(config.headers).length > 0) {
-      resolvedHeaders = await resolveServerEnv(config.headers, config.namespace, "headers");
-    }
-    // Both transports funnel `requestInit.headers` through their own
-    // _commonHeaders(), so this covers the POSTs and the SSE GET stream alike
-    // -- including SSE, which applies them inside the custom fetch it hands
-    // EventSource. Passing `undefined` is inert in both.
-    // Reject a value the wire cannot carry BEFORE the transport is built.
-    // Node's Headers throws a raw TypeError on a CR, LF or NUL, and it throws
-    // from inside the SDK constructor below -- outside the try that classifies
-    // a malformed url. Measured before this guard: a stray newline in a header
-    // was reported to the user as `Remote server at <url> refused the
-    // connection`, which is a lie (nothing was ever sent) that sends them to
-    // check the remote server's auth and uptime instead of their own config.
-    // Same reasoning, and the same fix, as the invalid-url guard a few lines
-    // up; measured against that sibling, both now answer in well under a
-    // second and both still spend runActivateOne's one retry, so this guard
-    // is consistent with it rather than better.
-    //
-    // The NAME is reported and the VALUE never is: this runs AFTER vault
-    // resolution, so the offending value can be a decrypted secret, and the
-    // whole point of the vault is that it does not turn up in an error string.
-    if (resolvedHeaders) {
-      const badHeader = Object.entries(resolvedHeaders).find(([, v]) => /[\r\n\0]/.test(v));
-      if (badHeader) {
-        throw new ActivationError(
-          withConfigPointer(
-            `Server "${config.namespace}" header "${badHeader[0]}" has a value containing a newline or NUL, which cannot be sent as an HTTP header`,
-            config,
-          ),
-          "unknown",
+    // Fail-CLOSED exactly like the local env path: a locked vault, a missing
+    // name or a malformed ref THROWS here and no transport is ever
+    // constructed, so the literal `${secret:NAME}` can never reach a request.
+    const rawHeaders = config.headers ?? {};
+    let requestHeaders: Record<string, string> | undefined;
+    if (Object.keys(rawHeaders).length > 0) {
+      // Validate with the runtime's own parser rather than a hand-rolled
+      // regex, one key at a time so the refusal can name WHICH header. The
+      // TypeError that `Headers` throws QUOTES the offending value, which here
+      // is the secret, so it is caught and discarded rather than wrapped. A
+      // merely trailing newline is fine (Headers strips leading and trailing
+      // HTTP whitespace), which matters because `yaw-mcp secrets set --stdin`
+      // is documented as raw and multi-line.
+      //
+      // Passed INTO resolveServerEnv rather than run after it: the resolve
+      // audits what it decrypted, so a check that ran afterwards left the log
+      // claiming the secret was injected into a server that never received it
+      // and for which no transport was ever built.
+      const validateHeaders = (resolved: Record<string, string>): string | undefined => {
+        const probe = new Headers();
+        for (const [name, value] of Object.entries(resolved)) {
+          try {
+            probe.append(name, value);
+          } catch {
+            return name;
+          }
+        }
+        return undefined;
+      };
+
+      let resolvedHeaders: Record<string, string>;
+      let headerSecretValues: Record<string, string> = {};
+      try {
+        resolvedHeaders = await resolveServerEnv(
+          rawHeaders,
+          config.namespace,
+          "remote server headers",
+          validateHeaders,
+          (v) => {
+            headerSecretValues = v;
+          },
         );
+      } catch (err) {
+        if (err instanceof InvalidResolvedValueError) {
+          throw new ActivationError(
+            withConfigPointer(
+              `Server "${config.namespace}" has an invalid value for header "${err.key}" -- an HTTP header value cannot contain a line break or a control character (the value is not shown).`,
+              config,
+            ),
+            "unknown",
+            undefined,
+            undefined,
+          );
+        }
+        throw err;
       }
+      // Assigning into the redaction map is what arms redactSecretsInOutput
+      // for this branch -- see remoteFailureDetail. The bare decrypted values
+      // go in beside the composed headers: the documented shape is
+      // `"Authorization": "Bearer ${secret:linear}"`, and a gateway that
+      // answers with `{"error":"invalid_api_key","key":"<token>"}` echoes only
+      // the token, which the composed string does not match.
+      resolvedServerEnv = { ...resolvedHeaders, ...headerSecretValues };
+      requestHeaders = resolvedHeaders;
     }
-    const requestInit = resolvedHeaders ? { headers: resolvedHeaders } : undefined;
+
+    // Pass the PLAIN OBJECT the operator wrote, not the probe Headers
+    // instance, and pass `undefined` when there is nothing to send so the
+    // zero-header path stays byte-identical to before this field existed.
+    //
+    // requestInit is correct for BOTH transports and is all that is needed:
+    // the SSE transport's _commonHeaders merges requestInit.headers into the
+    // initial GET stream as well as every POST, despite a stale doc comment
+    // saying it only customizes POSTs. Deliberately NOT eventSourceInit --
+    // supplying that hands the SDK a fetch that wins over the header-injecting
+    // one -- and deliberately not authProvider, which is the interactive
+    // OAuth flow and would try to open a browser from inside a stdio server.
+    const transportOpts = requestHeaders ? { requestInit: { headers: requestHeaders } } : undefined;
     if (config.transport === "sse") {
-      transport = new SSEClientTransport(url, { requestInit });
+      transport = new SSEClientTransport(url, transportOpts);
     } else {
-      transport = new StreamableHTTPClientTransport(url, { requestInit });
+      transport = new StreamableHTTPClientTransport(url, transportOpts);
     }
   }
 
@@ -1063,7 +1516,7 @@ async function connectToUpstreamOnce(
       // APPENDED: on its own it reads as "server down" for failures that are
       // nothing of the kind (401, 404, ENOTFOUND, a self-signed certificate),
       // and the SDK error carrying the truth was discarded entirely.
-      const detail = timedOut ? "" : remoteFailureDetail(err);
+      const detail = timedOut ? "" : remoteFailureDetail(err, resolvedServerEnv);
       message = timedOut
         ? `Remote server at ${config.url} did not respond within ${connectTimeoutMs / 1000}s. Verify the URL is reachable.`
         : `Remote server at ${config.url} refused the connection.${detail ? ` ${detail}` : ""}`;
@@ -1303,7 +1756,13 @@ async function connectToUpstreamOnce(
     // withStderrTail attaches (and redacts) that tail, so the credential
     // elicitation and the oam heap-cap hint get the same input they would have
     // had if the child had died a moment earlier, before the handshake.
-    throw withStderrTail(err, stderrRing, resolvedServerEnv);
+    //
+    // The message itself is redacted FIRST, and separately: withStderrTail
+    // scrubs only the tail it appends and returns the error untouched when
+    // there is no tail -- which is always, on a remote. Without this the
+    // response body of a post-handshake failure reached the log and the model
+    // verbatim, carrying whatever header the far end echoed back.
+    throw withStderrTail(redactActivationMessage(err, resolvedServerEnv), stderrRing, resolvedServerEnv);
   }
 }
 

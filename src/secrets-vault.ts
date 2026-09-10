@@ -703,7 +703,20 @@ export function resolveSecretRefs(
   env: Record<string, string>,
   vault: VaultFile,
   key: Buffer,
-): { resolved: Record<string, string>; missing: string[]; malformed: MalformedSecretRef[] } {
+): {
+  resolved: Record<string, string>;
+  missing: string[];
+  malformed: MalformedSecretRef[];
+  /** The decrypted values themselves, keyed by SECRET NAME.
+   *
+   *  Returned so a caller can redact the bare token as well as the string it
+   *  was composed into. `resolved` holds `Bearer <token>` for the documented
+   *  `"Authorization": "Bearer ${secret:linear}"` shape, so an upstream that
+   *  echoes only the token back -- an `{"error":"invalid_api_key","key":"..."}`
+   *  body -- matched nothing, the redactor being exact-substring. Same values,
+   *  indexed the other way. */
+  values: Record<string, string>;
+} {
   const missing: string[] = [];
   const malformed: MalformedSecretRef[] = [];
   const decrypted = new Map<string, string>();
@@ -740,7 +753,7 @@ export function resolveSecretRefs(
       if (!malformed.some((m) => m.display === ref.display)) malformed.push(ref);
     }
   }
-  return { resolved, missing, malformed };
+  return { resolved, missing, malformed, values: Object.fromEntries(decrypted) };
 }
 
 /** The substring hasSecretRefs gates on, and every malformed reference

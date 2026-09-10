@@ -7,8 +7,10 @@ import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
+import { parseSetArgs, parseToggleArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
 import { log } from "./logger.js";
 import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "./reset-learning-cmd.js";
+import { parseSearchArgs, runSearch } from "./search-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
@@ -175,6 +177,17 @@ if (subcommand === "compliance") {
   run("add", parseAddArgs(process.argv.slice(3)), runAdd);
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
+} else if (subcommand === "search") {
+  run("search", parseSearchArgs(process.argv.slice(3)), runSearch);
+} else if (subcommand === "set") {
+  run("set", parseSetArgs(process.argv.slice(3)), runSet);
+} else if (subcommand === "enable" || subcommand === "disable") {
+  // enable/disable share the WRITER with `set` -- they ARE `isActive=<bool>`,
+  // and one target resolution is one thing to keep in step with `remove` --
+  // but NOT the parser. parseSetArgs requires at least one `key=value`, so
+  // routing these through it rejected every legitimate invocation of both
+  // verbs with the wrong usage text.
+  run(subcommand, parseToggleArgs(process.argv.slice(3), subcommand === "enable"), runEnableDisable);
 } else if (subcommand === "list") {
   run("list", parseListArgs(process.argv.slice(3)), runList);
 } else if (subcommand === "secrets") {
@@ -194,7 +207,8 @@ if (subcommand === "compliance") {
     install <client>         Connect one MCP client to yaw-mcp. This wires the
                              aggregator into the client; it does NOT add a
                              server (for that, see \`add\` below). <client> is
-                             one of: claude-code, claude-desktop, cursor, vscode.
+                             one of: claude-code, claude-desktop, cursor, vscode,
+                             windsurf, gemini-cli.
     install --list           List which MCP clients are installed on this
                              machine (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
@@ -210,6 +224,16 @@ if (subcommand === "compliance") {
                              bundles.json. Shows the server and the command it
                              launches, then confirms; --force skips the prompt
                              (and is required when there is no TTY to ask on).
+    search [<text>]          Search the public catalog by name, tag, category
+                             or description, and show what each match needs
+                             before you add it. --json, --limit <n>.
+    set <target> k=v ...     Change per-server fields in bundles.json without
+                             hand-editing it: isActive, runtime,
+                             connectTimeoutMs, description, env.KEY.
+                             Comments in the file survive. --json for JSON.
+    enable <target>          Mark a server loadable ("isActive": true).
+    disable <target>         Keep a server out of the loaded set without
+                             removing it, and without dropping its stored env.
     list                     List the servers yaw-mcp loads locally.
     trust                    Approve this project's .yaw-mcp/bundles.json so
                              yaw-mcp loads it. A project file is usually

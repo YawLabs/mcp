@@ -116,6 +116,25 @@ describe("computeSecretsReport (names only, never values)", () => {
     expect(rows).toEqual([{ server: "notion", injectedSecrets: [], missing: ["NOTION_TOKEN"], malformed: [] }]);
   });
 
+  it("sees a url+headers entry that omits `type`, which validateEntry calls local", () => {
+    // isRemoteEntry does not read `type` alone, and this is the case that
+    // forced the fallback: validateEntry defaults a missing `"type"` to
+    // "local", so a hand-written url+headers entry looks local and its only
+    // credential looks like a channel nothing uses. The report reaches the
+    // predicate through the caller's projection, so this also pins that
+    // `command` and `url` are actually threaded through -- passing neither
+    // leaves the fallback permanently false and the row silently absent.
+    const servers = [
+      {
+        namespace: "notype",
+        url: "https://mcp.example.test/mcp",
+        headers: { Authorization: "Bearer ${secret:LINEAR_TOKEN}" },
+      },
+    ];
+    const rows = computeSecretsReport(servers, new Set());
+    expect(rows).toEqual([{ server: "notype", injectedSecrets: [], missing: ["LINEAR_TOKEN"], malformed: [] }]);
+  });
+
   it("ignores a remote server's env, which is never sent anywhere", () => {
     // Not merely unused -- reporting it would promise a credential the
     // transport will never carry.
