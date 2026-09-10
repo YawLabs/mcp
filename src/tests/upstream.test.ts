@@ -4062,3 +4062,142 @@ describe("upstream instructions capture", () => {
     expect(conn.instructions).toContain("[redacted-marker]");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Progress during a connect.
+//
+// Measured before this existed: an activation whose child never completes the
+// handshake produced ONE line ("Spawning ... upstream") and then ~34.5s of
+// silence -- the 15s connect timeout, a 1s backoff, and a second 15s timeout
+// -- before the failure. To a model waiting on the call, silence and a hang
+// are the same observation, so a slow-but-working server and a wedged one were
+// indistinguishable for half a minute.
+//
+// The rule these pin: a SLOW phase reports that it is still running; a FAST
+// one says nothing extra.
+// ---------------------------------------------------------------------------
+
+describe("connectToUpstream progress reporting", () => {
+  beforeEach(() => {
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+    _sdkBehavior.clientConnect = () => Promise.resolve();
+    _sdkBehavior.clientClose = () => Promise.resolve();
+    _sdkBehavior.clientListTools = () => Promise.resolve({ tools: [] });
+    _sdkBehavior.clientListResources = () => Promise.resolve({ resources: [] });
+    _sdkBehavior.clientListPrompts = () => Promise.resolve({ prompts: [] });
+    vi.mocked(resolveOamSpawn).mockReset();
+    resetOamDowngrades();
+    vi.mocked(defaultRuntime).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it("reports that a hanging spawn is STILL RUNNING, every few seconds", async () => {
+    vi.useFakeTimers();
+    const messages: string[] = [];
+    // A child that starts and never answers initialize -- the shape that
+    // produced the measured silent window.
+    _sdkBehavior.clientConnect = () => new Promise<void>(() => {});
+
+    const connecting = connectToUpstream(
+      makeLocalConfig({ namespace: "gh" }),
+      undefined,
+      undefined,
+      undefined,
+      (m: string) => messages.push(m),
+    );
+    // Attached before any timer is advanced: the connect ends in a rejection,
+    // and an un-awaited one would surface as an unhandled rejection instead of
+    // as this test's assertion.
+    const settled = expect(connecting).rejects.toThrow(/didn't complete the MCP handshake/);
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(messages, "a heartbeat fired before the phase had earned one").toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(messages).toHaveLength(1);
+    // Names the server, the elapsed time, AND the deadline -- the deadline is
+    // what tells the reader whether waiting longer can still work.
+    expect(messages[0]).toContain('"gh" is still starting');
+    expect(messages[0]).toContain("5s so far");
+    expect(messages[0]).toContain("15s");
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toContain("10s so far");
+
+    // ...and it stops when the phase does, rather than ticking forever.
+    await vi.advanceTimersByTimeAsync(20_000);
+    await settled;
+    const afterFailure = messages.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(messages).toHaveLength(afterFailure);
+  });
+
+  it("says nothing extra when the spawn is fast", async () => {
+    // The other half of the rule. A healthy local server answers in
+    // milliseconds; narrating that would spend the client's context on every
+    // activation to describe work that already finished.
+    const messages: string[] = [];
+    await connectToUpstream(makeLocalConfig({ namespace: "gh" }), undefined, undefined, undefined, (m: string) =>
+      messages.push(m),
+    );
+    expect(messages.filter((m) => m.includes("still"))).toEqual([]);
+  });
+
+  it("marks the handshake/inventory boundary, so a slow tool list is not read as a slow spawn", async () => {
+    const messages: string[] = [];
+    await connectToUpstream(makeLocalConfig({ namespace: "gh" }), undefined, undefined, undefined, (m: string) =>
+      messages.push(m),
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('"gh" is up');
+    expect(messages[0]).toContain("reading its tools");
+  });
+
+  it("reports a slow INVENTORY separately from a slow spawn", async () => {
+    vi.useFakeTimers();
+    const messages: string[] = [];
+    // Handshake fine, tools/list never answers: three list calls with their
+    // own timeout each sit behind this, and the caller used to see nothing
+    // between "up" and the eventual failure.
+    _sdkBehavior.clientListTools = () => new Promise(() => {});
+
+    const connecting = connectToUpstream(
+      makeLocalConfig({ namespace: "gh" }),
+      undefined,
+      undefined,
+      undefined,
+      (m: string) => messages.push(m),
+    );
+    connecting.catch(() => {});
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(messages[0]).toContain('"gh" is up');
+    expect(messages[1]).toContain("still listing its capabilities");
+    expect(messages[1]).toContain("5s so far");
+  });
+
+  it("says which runtime the oam downgrade is retrying on", async () => {
+    // The boot-probe fallback is a SECOND full boot. It was invisible from
+    // outside: one "Spawning" line, then up to two timeouts of silence.
+    vi.mocked(resolveOamSpawn).mockResolvedValue({ command: "/usr/bin/oam", args: ["run", "/x/index.js"] });
+    let attempts = 0;
+    _sdkBehavior.clientConnect = () => {
+      attempts += 1;
+      return attempts === 1 ? Promise.reject(new Error("oam boot failed")) : Promise.resolve();
+    };
+    const messages: string[] = [];
+    await connectToUpstream(
+      makeLocalConfig({ namespace: "gh", runtime: "oam", command: "npx", args: ["-y", "pkg"] }),
+      undefined,
+      undefined,
+      undefined,
+      (m: string) => messages.push(m),
+    );
+    expect(messages.some((m) => m.includes("did not boot on oam") && m.includes("retrying on node"))).toBe(true);
+  });
+});

@@ -67,8 +67,39 @@ describe("parseSearchArgs", () => {
     for (const bad of [["--limit", "0"], ["--limit", "abc"], ["--limit", "501"], ["--limit"]]) {
       const r = parseSearchArgs(bad);
       expect(r.ok, bad.join(" ")).toBe(false);
-      if (!r.ok) expect(r.error).toContain("--limit requires");
     }
+  });
+
+  it("echoes the value it rejected, and says which mistake it was", () => {
+    // One message for three mistakes ("--limit requires a positive integer
+    // (1-500)") made the user compare it against an argument they could no
+    // longer see: a typo'd value, an out-of-range one and a forgotten one all
+    // read identically.
+    const notANumber = parseSearchArgs(["--limit", "2O"]);
+    expect(notANumber.ok).toBe(false);
+    if (!notANumber.ok) {
+      expect(notANumber.error).toContain('got "2O"');
+      expect(notANumber.error).toContain("1 to 500");
+    }
+
+    const outOfRange = parseSearchArgs(["--limit", "501"]);
+    expect(outOfRange.ok).toBe(false);
+    // The number is echoed, and the range says what would have been accepted.
+    if (!outOfRange.ok) expect(outOfRange.error).toContain("got 501");
+
+    const zero = parseSearchArgs(["--limit", "0"]);
+    expect(zero.ok).toBe(false);
+    if (!zero.ok) expect(zero.error).toContain("got 0");
+
+    const missing = parseSearchArgs(["--limit"]);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.error).toContain("none followed it");
+
+    // `--limit --json` is a forgotten value, not a bad number -- naming the
+    // flag that turned up instead is what makes that legible.
+    const swallowedFlag = parseSearchArgs(["--limit", "--json"]);
+    expect(swallowedFlag.ok).toBe(false);
+    if (!swallowedFlag.ok) expect(swallowedFlag.error).toContain('the flag "--json"');
   });
 
   it("refuses a --catalog that would swallow the next flag as its value", () => {
@@ -221,5 +252,54 @@ describe("runSearch", () => {
       ...capture(),
     });
     expect(seen).toBe("https://yaw.sh/data/mcp-catalog.json");
+  });
+});
+
+describe("runSearch against an EMPTY catalog", () => {
+  // Fetches fine, contains nothing. Every query misses, so the no-match branch
+  // used to answer `No catalog server matches "postgres"` -- blaming the
+  // query for a source that has no servers in it at all.
+  const emptyCatalog = async (): Promise<CatalogServer[]> => [];
+
+  it("says the catalog is empty rather than that the query missed", async () => {
+    const cap = capture();
+    const r = await runSearch({ query: "postgres", fetchCatalog: emptyCatalog, env: {}, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain("lists no servers at all");
+    expect(cap.errText()).toContain("nothing to search");
+    // The query is not blamed, and stdout stays clean for a pipeline.
+    expect(cap.errText()).not.toContain("No catalog server matches");
+    expect(cap.text()).toBe("");
+  });
+
+  it("names the override as the first thing to check", async () => {
+    const cap = capture();
+    await runSearch({
+      query: "",
+      catalogUrl: "https://mine.test/c.json",
+      fetchCatalog: emptyCatalog,
+      env: {},
+      ...cap,
+    });
+    expect(cap.errText()).toContain("https://mine.test/c.json");
+    expect(cap.errText()).toContain("$YAW_MCP_CATALOG_URL");
+  });
+
+  it("prints no JSON body either -- an unusable source has no results to emit", async () => {
+    // Same contract --json already has when the FETCH fails: stderr and a
+    // non-zero exit, not an empty result set that reads like a real answer.
+    const cap = capture();
+    const r = await runSearch({ query: "sql", json: true, fetchCatalog: emptyCatalog, env: {}, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.text()).toBe("");
+  });
+
+  it("still reports a real no-match against a NON-empty catalog as exit 0", async () => {
+    // The distinction is the whole point: a query that misses a healthy
+    // catalog is an answer, and must not start failing.
+    const cap = capture();
+    const r = await runSearch({ query: "zzzzzz", fetchCatalog, env: {}, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toContain("No catalog server matches");
   });
 });

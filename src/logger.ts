@@ -37,9 +37,76 @@ function guardStderrErrors(): void {
   }
 }
 
+/** Where this process's log records are going.
+ *
+ *  "server" is the stdio MCP server: stderr is the ONLY channel it has (stdout
+ *  carries JSON-RPC), the reader is a client's log pane or a support
+ *  transcript, and one machine-parseable record per line is exactly right.
+ *
+ *  "cli" is a person at a terminal running a subcommand. The same records
+ *  reach them as raw envelopes interleaved with the command's own report --
+ *  `yaw-mcp list` against a hand-broken bundles.json printed
+ *  {"level":"warn","msg":"bundles.json is not valid JSON; ignoring",...} above
+ *  the sentence saying the same thing in English. Every subcommand prints its
+ *  own diagnostics, so the envelope adds nothing there but noise.
+ *
+ *  Deliberately NOT auto-detected from stdout.isTTY: `yaw-mcp doctor > report`
+ *  is still a person running a subcommand, and the server's stderr is never a
+ *  TTY under a client either -- the caller knows which it is, so it says. */
+export type LogSurface = "server" | "cli";
+
+let surface: LogSurface = "server";
+
+/** Called once by the CLI dispatcher for any subcommand. Not called on the
+ *  bare-`yaw-mcp` server launch, which keeps the structured stream. */
+export function setLogSurface(next: LogSurface): void {
+  surface = next;
+}
+
+/** Whether the operator explicitly asked for the structured stream. An
+ *  unrecognized value is NOT "explicit": minLevel already falls back to info
+ *  for it, so treating `LOG_LEVEL=chatty` as an opt-in would turn a typo into
+ *  a wall of JSON. */
+function logLevelRequested(): boolean {
+  const raw = process.env.LOG_LEVEL?.trim().toLowerCase();
+  return raw !== undefined && raw in LOG_LEVELS;
+}
+
+/** One `key=value` tail for the plain-text CLI rendering. Never throws: `data`
+ *  is caller-supplied and can carry a BigInt or a cycle, exactly like the
+ *  JSON.stringify below, and a diagnostic must not take down the operation it
+ *  is describing. */
+function renderData(data: Record<string, unknown> | undefined): string {
+  if (data === undefined) return "";
+  try {
+    const parts = Object.entries(data).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
+    return parts.length > 0 ? ` (${parts.join("; ")})` : "";
+  } catch {
+    return " (details omitted)";
+  }
+}
+
 export function log(level: LogLevel, msg: string, data?: Record<string, unknown>): void {
   if (LOG_LEVELS[level] < minLevel()) return;
   guardStderrErrors();
+
+  // CLI surface, and the operator did not ask for the structured stream.
+  // debug/info are the server's own operational telemetry ("Loaded bundles",
+  // "yaw-mcp startup") and have no reader here, so they are dropped. warn and
+  // error are NOT dropped -- some of them (an invalid YAW_MCP_DEFAULT_RUNTIME,
+  // an unreadable trust store) have no other surface at all, and silencing
+  // those would trade a formatting complaint for a missing warning. They are
+  // re-rendered as the one plain sentence a person can read, prefixed like
+  // every other line the CLI writes to stderr.
+  if (surface === "cli" && !logLevelRequested()) {
+    if (LOG_LEVELS[level] < LOG_LEVELS.warn) return;
+    try {
+      process.stderr.write(`yaw-mcp: ${level === "warn" ? "warning" : "error"}: ${msg}${renderData(data)}\n`);
+    } catch {
+      // Same closed-stderr case the structured write below swallows.
+    }
+    return;
+  }
 
   const ts = new Date().toISOString();
   let entry: string;

@@ -921,6 +921,14 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     print(
       staleHint ? "  Healthy, but an upgrade is available (see above)." : "  All good. yaw-mcp should start cleanly.",
     );
+    // "All good" is true and incomplete on a machine with nothing configured:
+    // yaw-mcp starts, serves its meta-tools, and has no servers to load.
+    // Appended rather than replacing the verdict -- the setup really is
+    // healthy, and this is the next step, not a fault.
+    if (oamStatus.servers.length === 0) {
+      print("  No MCP servers are configured yet, so it will start with none loaded.");
+      print("  Add one with `yaw-mcp add <slug>`; `yaw-mcp search <text>` finds slugs.");
+    }
   }
 
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
@@ -1172,6 +1180,14 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     summary = "Warnings need attention.";
   } else {
     summary = stale ? "Healthy, but an upgrade is available." : "All good. yaw-mcp should start cleanly.";
+    // Same sentence the text path appends, for the same reason: a consumer
+    // reading `.diagnosis.summary` alone (Yaw Terminal does) would otherwise
+    // render an unqualified "All good" for a setup that loads no servers.
+    // The oamRuntime.servers array beside it has always carried the count;
+    // the summary is what gets shown.
+    if (oamStatus.servers.length === 0) {
+      summary += " No MCP servers are configured yet -- add one with `yaw-mcp add <slug>`.";
+    }
   }
 
   const snapshotJson: DoctorJsonSnapshot = {
@@ -1254,6 +1270,12 @@ export const DOCTOR_ENV_VARS: ReadonlyArray<{ name: string; defaultHint: string 
   { name: "YAW_MCP_REWARD_GRADER", defaultHint: "off" },
   { name: "YAW_MCP_FOUNDRY", defaultHint: "harvest off" },
   { name: "YAW_MCP_INSTALL_NUDGE", defaultHint: "nudge off" },
+  // Listed even though it changes nothing for a client-spawned server: it is
+  // read at runtime by the dispatcher, and a stale `YAW_MCP_STDIO=1` in a
+  // shell profile is exactly the invisible state this section exists to make
+  // visible -- it turns a bare `yaw-mcp` in a terminal back into a process
+  // that sits there waiting for JSON-RPC instead of explaining itself.
+  { name: "YAW_MCP_STDIO", defaultHint: "explain instead of serving on a TTY" },
 ];
 function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) => void }): void {
   const { env, print } = opts;
@@ -1520,6 +1542,12 @@ interface OamRuntimeStatus {
    *  invalid defaultRuntime, skipped entries). The caller folds these into
    *  config.warnings -- see foldBundleWarnings. */
   bundleWarnings: string[];
+  /** The bundles.json the loader settled on, or null when there is none
+   *  anywhere. Carried ONLY so the zero-server line can tell the two apart: a
+   *  machine with no file yet is a fresh install with a next step, while a
+   *  file that exists and defines nothing is either an empty edit or a broken
+   *  one -- different sentences, and the section printed neither. */
+  bundlesPath: string | null;
 }
 
 // Latest-version probe for a managed sidecar package. Same contract and
@@ -1687,7 +1715,16 @@ async function collectOamRuntimeStatus(opts: {
     platformMismatch:
       installedFor !== null && (installedFor.platform !== process.platform || installedFor.arch !== process.arch),
   };
-  return { probe, dflt, servers, managed, refreshSkips, refreshDisabled, bundleWarnings: bundles?.warnings ?? [] };
+  return {
+    probe,
+    dflt,
+    servers,
+    managed,
+    refreshSkips,
+    refreshDisabled,
+    bundleWarnings: bundles?.warnings ?? [],
+    bundlesPath: bundles?.path ?? null,
+  };
 }
 
 function renderOamRuntimeSection(opts: {
@@ -1755,6 +1792,30 @@ function renderOamRuntimeSection(opts: {
       ? `${dflt.runtime} (${dflt.source === "env" ? "env YAW_MCP_DEFAULT_RUNTIME" : `bundles.json defaultRuntime @ ${dflt.path}`})`
       : `(not set -- oam when installed, currently ${probe.bin !== null ? "oam" : "node"})`;
   print(`  default runtime: ${dfltLabel}`);
+  if (servers.length === 0) {
+    // The zero-server state was rendered as NOTHING AT ALL: the block below is
+    // guarded on a non-empty list, so the one question a fresh install has --
+    // "is yaw-mcp going to load anything?" -- had no answer anywhere in the
+    // report, and a doctor that says "All good" while loading no servers reads
+    // as a working setup.
+    //
+    // Not a warning, and deliberately so: a fresh install with no servers is
+    // legitimate, and the WARNINGS fold drives exit 2 (see the exit-code note
+    // at the top of this file). This is the informational line the section was
+    // missing, in the same place the server table would have been.
+    if (status.bundlesPath === null) {
+      print("  servers (local bundles.json): none -- no bundles.json on this machine yet.");
+      print("           add one: `yaw-mcp add <slug>` (find a slug with `yaw-mcp search <text>`)");
+    } else if (status.bundleWarnings.length > 0) {
+      // The file was read and produced nothing usable. WARNINGS below carries
+      // the reason (foldBundleWarnings puts it there), so point at it rather
+      // than restating a diagnostic this line does not own.
+      print(`  servers (local bundles.json): none loaded from ${status.bundlesPath} -- see WARNINGS below.`);
+    } else {
+      print(`  servers (local bundles.json): none -- ${status.bundlesPath} defines no servers.`);
+      print("           add one: `yaw-mcp add <slug>` (find a slug with `yaw-mcp search <text>`)");
+    }
+  }
   if (servers.length > 0) {
     print("  servers (local bundles.json):");
     const widest = servers.reduce((m, s) => Math.max(m, s.namespace.length), 0);

@@ -1659,6 +1659,15 @@ async function doUpsertUserBundle(
     // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
     // (matching secrets-vault): bundles.json can carry per-server `--env`
     // secrets, so its parent dir must not be group/other-listable.
+    //
+    // "0600" is a POSIX-ONLY claim, and every doc that repeats it has to say
+    // so. Measured on the Node this ships on (22.x, win32): a file born with
+    // mode 0o600 stats back as 0o666, and a follow-up chmod to 0o600 leaves
+    // it at 0o666 -- Node maps the mode to the read-only ATTRIBUTE alone
+    // there, so what actually protects the file is the NTFS ACL it inherits
+    // from the user profile. That is also why the chmod below is POSIX-gated
+    // rather than best-effort everywhere: on Windows it is not a fallback
+    // that might work, it is a call that provably does nothing.
     await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
     if (process.platform !== "win32") {
       try {

@@ -1105,15 +1105,68 @@ export interface DownstreamClientBridge {
   listRoots(params?: ListRootsRequest["params"], options?: { signal?: AbortSignal }): Promise<ListRootsResult>;
 }
 
+/** Where a connect reports what it is DOING, as opposed to what it returned.
+ *
+ *  Deliberately message-only rather than the full ProgressReporter: nothing in
+ *  here knows how far along a spawn is (there are no milestones inside a
+ *  handshake), and a percentage nobody can compute is worse than a sentence
+ *  that says what is being waited on. server.ts passes its reporter straight
+ *  in -- a message-only call is exactly what createProgressReporter renders as
+ *  an indeterminate step. */
+export type ConnectProgress = (message: string) => void;
+
+/** How long a phase may stay silent before it says it is still running, and
+ *  how often it repeats after that.
+ *
+ *  5s is chosen against the two deadlines it sits under: the 15s connect
+ *  timeout and the 15s-per-call inventory timeout. A healthy local spawn
+ *  finishes well inside it, so the common case emits NOTHING extra -- the
+ *  point is to make a SLOW spawn legible, not to narrate a fast one. */
+export const PROGRESS_HEARTBEAT_MS = 5_000;
+
+/** Run `work`, and while it is still running emit `tick` every
+ *  PROGRESS_HEARTBEAT_MS.
+ *
+ *  This is the whole of what a client saw during a hanging activation before:
+ *  nothing. `Spawning "gh" upstream...` went out, then the connect sat for its
+ *  full 15s timeout, then the single retry sat for another (measured end to
+ *  end at ~34.5s of silence, one line at each end) -- and to a model waiting
+ *  on the call, silence and a hang are the same observation.
+ *
+ *  The timer is unref'd: a heartbeat exists to describe work that is already
+ *  holding the process open, and must never be the reason a process stays
+ *  alive. It is cleared in a finally, so a fast phase leaves nothing behind. */
+async function withHeartbeat<T>(
+  progress: ConnectProgress | undefined,
+  tick: (elapsedSeconds: number) => string,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (!progress) return work();
+  const started = Date.now();
+  const timer = setInterval(() => {
+    progress(tick(Math.round((Date.now() - started) / 1000)));
+  }, PROGRESS_HEARTBEAT_MS);
+  // Node's Timeout has unref; a host substituting a browser-shaped setInterval
+  // returns a number, which does not. Guarded rather than cast, because the
+  // cast would be a claim about someone else's runtime.
+  (timer as { unref?: () => void }).unref?.();
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 export async function connectToUpstream(
   config: UpstreamServerConfig,
   onDisconnect?: (namespace: string) => void,
   onListChanged?: (namespace: string) => void,
   bridge?: DownstreamClientBridge,
+  progress?: ConnectProgress,
 ): Promise<UpstreamConnection> {
   const attempt: SpawnAttempt = { oamRewriteApplied: false, oamVersion: null };
   try {
-    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, false);
+    return await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, false, progress);
   } catch (err) {
     // Boot-probe fallback: when the spawn was oam-rewritten and the boot
     // failed (spawn error, connect/initialize handshake failure, or the
@@ -1158,7 +1211,21 @@ export async function connectToUpstream(
     // suppressing the second event would make the audit under-report exactly
     // the spawn that ended up serving traffic.
     try {
-      const connection = await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, true);
+      // The downgrade respawn is a SECOND full boot -- another spawn, another
+      // handshake, another inventory -- and it was invisible from outside: the
+      // caller saw one "Spawning" line and then up to two timeouts' worth of
+      // silence. Say which runtime is being tried now, or the retry looks like
+      // the first attempt hanging.
+      progress?.(`"${config.namespace}" did not boot on oam -- retrying on node`);
+      const connection = await connectToUpstreamOnce(
+        config,
+        onDisconnect,
+        onListChanged,
+        bridge,
+        attempt,
+        true,
+        progress,
+      );
       // node booted where oam did not: oam IS implicated, so make it stick.
       oamDowngradedNamespaces.add(config.namespace);
       return connection;
@@ -1197,6 +1264,7 @@ async function connectToUpstreamOnce(
   bridge: DownstreamClientBridge | undefined,
   attempt: SpawnAttempt,
   disableOamRewrite: boolean,
+  progress?: ConnectProgress,
 ): Promise<UpstreamConnection> {
   // Mirror the DOWNSTREAM client's declared capabilities onto this upstream
   // client, and register a forwarding handler below for each one mirrored.
@@ -1557,7 +1625,16 @@ async function connectToUpstreamOnce(
     // rejection and can kill the process.
     const connectP = client.connect(transport);
     connectP.catch(() => {});
-    await Promise.race([connectP, timeoutPromise]);
+    // The longest silent window in an activation: a cold `npx` fetching a
+    // package, a container image being pulled, or a child that started and
+    // will never answer initialize. The tick names the deadline as well as the
+    // elapsed time, so the reader knows whether waiting longer can still work.
+    await withHeartbeat(
+      progress,
+      (elapsed) =>
+        `"${config.namespace}" is still starting -- ${elapsed}s so far, ${Math.round(connectTimeoutMs / 1000)}s before it is given up on`,
+      () => Promise.race([connectP, timeoutPromise]),
+    );
     clearTimeout(timer);
   } catch (err) {
     clearTimeout(timer);
@@ -1777,13 +1854,31 @@ async function connectToUpstreamOnce(
       );
     }
 
-    // allowMissingToolsCapability on the INITIAL fetch only: a resources-only
-    // or prompts-only upstream answers tools/list with -32601, which is a
-    // zero-tool server rather than a boot failure. The refresh path keeps the
-    // throw -- see fetchToolsFromUpstream.
-    const tools = await fetchToolsFromUpstream(client, config.namespace, { allowMissingToolsCapability: true });
-    const resources = await fetchResourcesFromUpstream(client, config.namespace);
-    const prompts = await fetchPromptsFromUpstream(client, config.namespace);
+    // A REAL phase boundary, not a tick: the handshake is done and the child
+    // is answering, and what follows is three list calls with their own
+    // LIST_TIMEOUT each (plus pagination). A server that handshakes fast and
+    // then takes ten seconds to enumerate a large tool set was previously
+    // indistinguishable from one still trying to start.
+    progress?.(`"${config.namespace}" is up -- reading its tools, resources and prompts`);
+    const [tools, resources, prompts] = await withHeartbeat(
+      progress,
+      (elapsed) => `"${config.namespace}" is still listing its capabilities -- ${elapsed}s so far`,
+      async () => {
+        // allowMissingToolsCapability on the INITIAL fetch only: a
+        // resources-only or prompts-only upstream answers tools/list with
+        // -32601, which is a zero-tool server rather than a boot failure. The
+        // refresh path keeps the throw -- see fetchToolsFromUpstream.
+        //
+        // Still SEQUENTIAL, deliberately: these run against one child over one
+        // stdio pipe, and the order is what the pre-existing tests (and the
+        // closedBeforeReady path) observe. The wrapper adds a heartbeat, not
+        // concurrency.
+        const t = await fetchToolsFromUpstream(client, config.namespace, { allowMissingToolsCapability: true });
+        const r = await fetchResourcesFromUpstream(client, config.namespace);
+        const pr = await fetchPromptsFromUpstream(client, config.namespace);
+        return [t, r, pr] as const;
+      },
+    );
 
     // Client closed while we were still fetching capabilities -- treat it as
     // a boot failure rather than returning a dead "connected" connection.
