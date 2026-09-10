@@ -15,7 +15,7 @@
 // field of one entry, so the same trade would mean losing a user's annotations
 // to flip a boolean. It splices instead, through editJsoncPath.
 //
-// WHAT IS SETTABLE, AND WHY THE LIST IS SHORT. isActive, runtime,
+// WHAT IS SETTABLE, AND WHY THE LIST IS SHORT. isActive, pinned, runtime,
 // connectTimeoutMs, description and individual env keys. Not namespace,
 // command, args, url, transport or type: those decide WHICH PROGRAM yaw-mcp
 // spawns as the user, and they belong to `add`/`remove` or to a deliberate
@@ -27,7 +27,13 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { editJsoncPath, parseJsonc } from "./jsonc.js";
-import { deriveNamespace, findShadowingProjectBundles, localBundlesPath, withBundlesLock } from "./local-bundles.js";
+import {
+  deriveNamespace,
+  findShadowingProjectBundles,
+  localBundlesPath,
+  namespacesForStoredIdentity,
+  withBundlesLock,
+} from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 import { MAX_TIMEOUT_MS } from "./upstream.js";
@@ -39,12 +45,22 @@ export const SET_USAGE = `Usage: yaw-mcp set <slug-or-namespace> <key=value> [<k
   formatting and every other entry keep their bytes.
 
   <slug-or-namespace> is the catalog slug the server was added with (e.g.
-  "brave-search") or its namespace as shown by \`yaw-mcp list\` (e.g.
-  "bravesearch") -- the same target \`yaw-mcp remove\` takes.
+  "brave-search"), its namespace as shown by \`yaw-mcp list\` (e.g.
+  "bravesearch"), or its NAME from that same listing (e.g. "Brave Search") --
+  the same target \`yaw-mcp remove\` takes. The name is the handle an imported
+  server has, since it carries no catalog slug.
 
 Settable keys:
   isActive=true|false   Load this server, or keep it out of the set.
                         \`yaw-mcp enable\` / \`disable\` is the same edit.
+  pinned=true|false     Exempt this server from the idle reaper, which
+                        otherwise unloads an upstream that has sat through
+                        ~10 tool calls aimed elsewhere. Worth setting on a
+                        server that is expensive to START (a browser, a
+                        language server, anything that indexes on boot),
+                        where the re-spawn costs more than the memory.
+                        Pinning keeps a LOADED server loaded; it does not
+                        pre-load one. Default false.
   runtime=oam|node      Host this server on the oam runtime, or keep it on
                         node/npx. \`runtime=\` clears it, restoring the machine
                         default (see YAW_MCP_DEFAULT_RUNTIME).
@@ -89,15 +105,18 @@ export const DISABLE_USAGE = `Usage: yaw-mcp disable <slug-or-namespace> [--json
   isActive=false\`. Re-enable with \`yaw-mcp enable\`. Comments survive.
 `;
 
-/** Same shape and the same case-SENSITIVITY as `remove`'s target: the slug
- *  lookup compares literally, so folding case here would make `set GitHub`
- *  resolve where `remove GitHub` does not. */
+/** Same shape and the same case-SENSITIVITY as `remove`'s target, and applied
+ *  at the same point in the flow: only AFTER the identity lookup has failed,
+ *  so an entry whose stored display NAME is the target still resolves (see
+ *  runSet). Every lookup downstream compares literally, so folding case into
+ *  the PATTERN would make `set GitHub` match a server named "github" where
+ *  `remove GitHub` does not. */
 const SET_TARGET_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 /** Scalar fields a `set` may touch. Deliberately not a superset of
  *  validateEntry's whitelist -- see the module header on why the launch
  *  fields are excluded. */
-const SETTABLE_SCALARS = new Set(["isActive", "runtime", "connectTimeoutMs", "description"]);
+const SETTABLE_SCALARS = new Set(["isActive", "pinned", "runtime", "connectTimeoutMs", "description"]);
 
 export interface SetCommandOptions {
   target?: string;
@@ -130,7 +149,7 @@ export interface SetCommandResult {
 
 /** One requested edit, parsed but not yet applied. */
 interface Assignment {
-  /** "isActive" | "runtime" | "connectTimeoutMs" | "description" | "env" */
+  /** "isActive" | "pinned" | "runtime" | "connectTimeoutMs" | "description" | "env" */
   field: string;
   /** Present only for env: the variable name. */
   key?: string;
@@ -219,15 +238,19 @@ function parseAssignment(raw: string): { ok: true; value: Assignment } | { ok: f
   if (!SETTABLE_SCALARS.has(key)) {
     return {
       ok: false,
-      error: `yaw-mcp set: "${key}" is not settable. Settable: isActive, runtime, connectTimeoutMs, description, env.KEY.`,
+      error: `yaw-mcp set: "${key}" is not settable. Settable: isActive, pinned, runtime, connectTimeoutMs, description, env.KEY.`,
     };
   }
 
-  if (key === "isActive") {
+  // isActive and pinned are the two booleans, and they take the same argument
+  // shape for the same reason: absent already MEANS one of the two values
+  // (isActive absent = true, pinned absent = false), so there is no third state
+  // for a `key=` clear to express. The default each one falls back to is the
+  // caller's business -- see the `current` computation in runSet.
+  if (key === "isActive" || key === "pinned") {
     if (text === "true") return { ok: true, value: { field: key, value: true, raw } };
     if (text === "false") return { ok: true, value: { field: key, value: false, raw } };
-    // No clear: absent reads as true, so there is no third state to express.
-    return { ok: false, error: `yaw-mcp set: isActive must be exactly "true" or "false" (got "${text}").` };
+    return { ok: false, error: `yaw-mcp set: ${key} must be exactly "true" or "false" (got "${text}").` };
   }
 
   if (key === "runtime") {
@@ -302,7 +325,12 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
   const printErr = (s: string): void => err(`${s}\n`);
 
   const target = opts.target ?? "";
-  if (!SET_TARGET_RE.test(target)) {
+  // Shape-gated below, AFTER the file has been read, for the reason `remove`
+  // gives at the same spot: a display name can carry spaces, capitals and dots
+  // and is the only identity an imported server has, so refusing on shape
+  // first would make every one of them unsettable. An empty target is refused
+  // here, before any read -- nothing on disk answers to "".
+  if (target === "") {
     printErr(`yaw-mcp set: "${target}" is not a valid server name.`);
     return { exitCode: 2, written: [] };
   }
@@ -347,18 +375,24 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       return { exitCode: 1, written: [] };
     }
 
-    // Same resolution order as `remove`: the literal target, then any entry
-    // whose stored slug matches, then the namespace `add` would have derived.
-    const bySlug: string[] = [];
-    for (const s of servers) {
-      const e = s as { slug?: unknown; namespace?: unknown } | null;
-      if (e?.slug === target && typeof e?.namespace === "string") bySlug.push(e.namespace);
-    }
-    const candidates = [...new Set([target, ...bySlug, deriveNamespace(target)])];
+    // Same resolution order as `remove`, through the SAME helper: the literal
+    // target, then any entry whose stored slug or display name matches, then
+    // the namespace `add` would have derived. Two hand-written copies of that
+    // scan is how the two verbs stopped taking the same target.
+    const byIdentity = namespacesForStoredIdentity(target, servers);
+    const candidates = [...new Set([target, ...byIdentity, deriveNamespace(target)])];
     let idx = -1;
     for (const cand of candidates) {
       idx = servers.findIndex((s) => (s as { namespace?: unknown } | null)?.namespace === cand);
       if (idx >= 0) break;
+    }
+    // Shape gate, demoted below the lookup exactly as `remove`'s is: an
+    // odd-shaped target that no stored entry answers to is a usage error (exit
+    // 2), while one that IS a stored display name resolves. Ordering it before
+    // the read refused every imported server by its own name.
+    if (idx < 0 && !SET_TARGET_RE.test(target)) {
+      printErr(`yaw-mcp set: "${target}" is not a valid server name.`);
+      return { exitCode: 2, written: [] };
     }
     if (idx < 0) {
       printErr(`yaw-mcp set: no server named "${target}" in ${path}. Run \`yaw-mcp list\` to see what is configured.`);
@@ -542,7 +576,17 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       // defaults it), so `set gh isActive=true` on an entry that never carried
       // the key is a semantic no-op. Writing it anyway would report a change
       // and dirty the file to say what it already said.
-      const current = a.field === "isActive" && liveScalars.isActive === undefined ? true : liveScalars[a.field];
+      //
+      // `pinned` is the same rule with the opposite default: validateEntry
+      // honours only an explicit `true`, so absent reads as NOT pinned and
+      // `pinned=false` on an entry without the key is the same no-op. Absent
+      // these two lines the file gets dirtied -- and the run reports a change
+      // -- to write the value the loader was already using.
+      const scalarDefaults: Record<string, unknown> = { isActive: true, pinned: false };
+      const current =
+        liveScalars[a.field] === undefined && a.field in scalarDefaults
+          ? scalarDefaults[a.field]
+          : liveScalars[a.field];
       if (current === a.value) {
         applied.push(`${a.field}: already ${render(a.value)}`);
         jsonUnchanged.push({ field: a.field });

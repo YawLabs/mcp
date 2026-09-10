@@ -1794,6 +1794,103 @@ describe("runRemove maps a recorded catalog slug back to its NAME-derived namesp
   });
 });
 
+// An entry with NO catalog slug -- what `yaw-mcp import` writes, and what the
+// Yaw Terminal app and every pre-0.76 `add` wrote -- cannot be reached by the
+// slug path at all: namespacesForStoredSlug matches nothing, so the only
+// handles left are the namespace and whatever deriveNamespace makes of the
+// target. That is enough while the display NAME is already namespace-shaped
+// ("github") and useless the moment it is not ("GitHub Copilot", "server.v2")
+// -- the user is holding the name their client showed them, and the CLI
+// answers "isn't a valid slug or namespace".
+describe("runRemove resolves a slug-less entry by its stored NAME", () => {
+  const writeRaw = (servers: unknown[]): void => {
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ version: 1, servers }, null, 2));
+  };
+  const rawServers = (): Array<Record<string, unknown>> =>
+    (
+      JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+        servers: Array<Record<string, unknown>>;
+      }
+    ).servers;
+
+  it("removes by a name whose SHAPE is not a slug or a namespace", async () => {
+    writeRaw([{ namespace: "githubcopilot", name: "GitHub Copilot", command: "npx", args: ["-y", "x"] }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GitHub Copilot",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Removed "githubcopilot"/);
+    expect(rawServers()).toHaveLength(0);
+  });
+
+  it("still refuses an odd-shaped target that names NOTHING on disk", async () => {
+    // The shape gate is not deleted, only demoted: it still rejects a target
+    // no stored entry answers to, so `remove GA` against a catalog entry named
+    // "Google Analytics" stays a usage error rather than the exit-0 "nothing
+    // to do" that reads as "already gone".
+    writeRaw([{ namespace: "githubcopilot", name: "GitHub Copilot", command: "npx", args: ["-y", "x"] }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GitHub Copilo",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(io.errText()).toMatch(/isn't a valid slug or namespace/);
+    expect(rawServers()).toHaveLength(1);
+  });
+
+  it("shows the confirmation preview for a name-matched removal", async () => {
+    // A name match is the WEAKEST identity signal of the three, so it needs
+    // the preview more than the others, not less -- the gate has to fire on
+    // whichever candidate resolved, not only on the literal one.
+    writeRaw([{ namespace: "githubcopilot", name: "GitHub Copilot", command: "npx", args: ["-y", "x"] }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "GitHub Copilot",
+      home: synthHome,
+      cwd: synthCwd,
+      promptAnswer: "n",
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.text()).toMatch(/namespace: githubcopilot/);
+    expect(rawServers()).toHaveLength(1);
+  });
+
+  it("prefers an exact NAMESPACE match over a name match on another entry", async () => {
+    // Two entries, and one's NAMESPACE is the other's NAME. The literal target
+    // is tried first, so the namespace wins -- otherwise typing the value
+    // `yaw-mcp list` prints in its NAMESPACE column would delete a different
+    // server than the row the user was looking at.
+    writeRaw([
+      { namespace: "alpha", name: "Alpha", command: "npx", args: ["-y", "a"] },
+      { namespace: "beta", name: "alpha", command: "npx", args: ["-y", "b"] },
+    ]);
+    const r = await runRemove({
+      target: "alpha",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      out: () => {},
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(rawServers().map((s) => s.namespace)).toEqual(["beta"]);
+  });
+});
+
 // `remove` used to delete the entry with no confirmation, on a TTY or off it --
 // the only destructive verb in the CLI without a gate. These lock the gate's
 // two halves (confirm on a TTY, refuse off one) AND the no-op behaviour that

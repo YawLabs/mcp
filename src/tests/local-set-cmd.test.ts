@@ -201,6 +201,38 @@ describe("runSet -- scalar fields", () => {
     }
   });
 
+  it("pins and unpins a server against the idle reaper", async () => {
+    // `pinned` is the write half of the reaper exemption (types.ts). Without a
+    // verb for it the only way to keep an expensive-to-start server loaded was
+    // a hand edit of bundles.json -- a file `add`/`remove` then rewrite
+    // wholesale, dropping the comments around it.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runSet({ target: "gh", assignments: ["pinned=true"], home: synthHome, ...cap });
+    expect(read().servers[0].pinned).toBe(true);
+    expect(cap.text()).toContain("pinned: false -> true");
+
+    const cap2 = capture();
+    await runSet({ target: "gh", assignments: ["pinned=false"], home: synthHome, ...cap2 });
+    expect(read().servers[0].pinned).toBe(false);
+    expect(cap2.text()).toContain("pinned: true -> false");
+  });
+
+  it("treats an absent pinned as false rather than as unset", async () => {
+    // The mirror of the isActive no-op below, in the other direction. Absent
+    // reads as NOT pinned everywhere (validateEntry honours only `true`), so
+    // `pinned=false` on an entry that never carried the key must report no
+    // change instead of dirtying the file to say what it already said.
+    writeBundles(SAMPLE);
+    const before = readFileSync(bundlesPath(), "utf8");
+    const cap = capture();
+    const r = await runSet({ target: "gh", assignments: ["pinned=false"], home: synthHome, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.text()).toContain("pinned: already false");
+    expect(readFileSync(bundlesPath(), "utf8")).toBe(before);
+  });
+
   it("reports an edit that was already satisfied without writing", async () => {
     writeBundles(SAMPLE);
     const before = readFileSync(bundlesPath(), "utf8");

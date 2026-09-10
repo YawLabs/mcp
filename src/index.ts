@@ -1,10 +1,12 @@
 import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
+import { parseCallArgs, runCall } from "./call-cmd.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
 import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
+import { parseImportArgs, runImport } from "./import-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { parseSetArgs, parseToggleArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
@@ -175,6 +177,20 @@ if (subcommand === "compliance") {
   run("add", parseAddArgs(process.argv.slice(3)), runAdd);
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
+} else if (subcommand === "import") {
+  // CLAUDE_CONFIG_DIR is read HERE, not inside runImport, for the same
+  // hermeticity reason install and uninstall do it: the tests call the runner
+  // directly and must not inherit a wrapper's env. It matters as much on the
+  // READ side -- under a Yaw Mode overlay the servers to import live in the
+  // wrapper's dir, and an import that ignored the redirect would report the
+  // user has none.
+  const claudeConfigDir =
+    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
+      ? process.env.CLAUDE_CONFIG_DIR
+      : undefined;
+  run("import", parseImportArgs(process.argv.slice(3)), (options) => runImport({ ...options, claudeConfigDir }));
+} else if (subcommand === "call") {
+  run("call", parseCallArgs(process.argv.slice(3)), runCall);
 } else if (subcommand === "search") {
   run("search", parseSearchArgs(process.argv.slice(3)), runSearch);
 } else if (subcommand === "set") {
@@ -223,7 +239,14 @@ if (subcommand === "compliance") {
     add <slug>               Add an MCP server from the yaw.sh/mcp catalog to
                              your local ~/.yaw-mcp/bundles.json so yaw-mcp loads
                              it. Pass required env with --env KEY=value.
-    remove <slug>            Remove a server (by slug or namespace) from
+    import <client>          Adopt the MCP servers a client already has into
+                             your bundles.json, so yaw-mcp serves the servers
+                             you already had instead of starting empty. The
+                             client keeps launching them itself until you say
+                             otherwise, so this offers to remove the originals
+                             (never silently). --dry-run, --scope,
+                             --remove-originals, --keep-originals.
+    remove <slug>            Remove a server (by slug, namespace or name) from
                              bundles.json. Shows the server and the command it
                              launches, then confirms; --force skips the prompt
                              (and is required when there is no TTY to ask on).
@@ -231,13 +254,25 @@ if (subcommand === "compliance") {
                              or description, and show what each match needs
                              before you add it. --json, --limit <n>.
     set <target> k=v ...     Change per-server fields in bundles.json without
-                             hand-editing it: isActive, runtime,
+                             hand-editing it: isActive, pinned, runtime,
                              connectTimeoutMs, description, env.KEY.
-                             Comments in the file survive. --json for JSON.
+                             \`pinned=true\` exempts a server from the idle
+                             reaper -- worth it when the server is expensive
+                             to start and a re-spawn costs more than the
+                             memory it frees. Comments in the file survive.
+                             --json for JSON.
     enable <target>          Mark a server loadable ("isActive": true).
     disable <target>         Keep a server out of the loaded set without
                              removing it, and without dropping its stored env.
     list                     List the servers yaw-mcp loads locally.
+    call <ns> <tool> [json]  Call ONE tool on ONE configured server and print
+                             the result, so a shell script, a git hook or a
+                             non-MCP agent loop can reach your servers without
+                             speaking MCP. The server is spawned for the call
+                             and torn down again. Honours the same policy a
+                             proxied call gets: a disabled server, a profile
+                             block, the compliance floor and \`blockedTools\`
+                             all refuse it. --args, --args-stdin, --json.
     trust                    Approve this project's .yaw-mcp/bundles.json so
                              yaw-mcp loads it. A project file is usually
                              committed to the repo and every server in it is

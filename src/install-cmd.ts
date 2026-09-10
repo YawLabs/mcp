@@ -415,9 +415,16 @@ export const DRY_RUN_ENV_PLACEHOLDER = "<kept from existing entry>";
  *  class of bug the shared `resolveAppDataDir` was introduced to end.
  *
  *  Returns null after printing the refusal; every refusal here is exit 2 (a
- *  usage error), which is what both callers return on null. */
-function resolveInstallSite(
-  cmd: "install" | "uninstall",
+ *  usage error), which is what every caller returns on null.
+ *
+ *  EXPORTED for `yaw-mcp import`, which resolves the very same {client, scope,
+ *  OS} -> config-file path and must not hand-roll a second table of config
+ *  locations to do it. Every refusal here is one that path needs word for word
+ *  -- unknown client, unsupported scope, a client that does not ship on this
+ *  OS, --project-dir on a scope that reads none -- which is why `cmd` is a
+ *  parameter rather than a literal. */
+export function resolveInstallSite(
+  cmd: "install" | "uninstall" | "import",
   opts: {
     clientId?: InstallClientId;
     scope?: InstallScope;

@@ -33,6 +33,7 @@ import {
   type LaunchChange,
   loadLocalBundles,
   localBundlesPath,
+  namespacesForStoredIdentity,
   previewUpsertUserBundle,
   removeUserBundle,
   upsertUserBundle,
@@ -837,9 +838,11 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
 
 export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
 
-  Remove a server from your local ~/.yaw-mcp/bundles.json. Accepts either the
-  catalog slug it was added with (e.g. "brave-search") or its namespace as
-  shown by \`yaw-mcp list\` (e.g. "bravesearch"). No-op if it isn't present.
+  Remove a server from your local ~/.yaw-mcp/bundles.json. Accepts the catalog
+  slug it was added with (e.g. "brave-search"), its namespace as shown by
+  \`yaw-mcp list\` (e.g. "bravesearch"), or its NAME from that same listing
+  (e.g. "Brave Search") -- the name is the handle an IMPORTED server has, since
+  it carries no catalog slug. No-op if it isn't present.
 
   Dropping an entry also drops any env value stored on it, so when there IS
   something to remove you are shown the server -- namespace, name, and the
@@ -1006,27 +1009,11 @@ function findRemovalTarget(candidates: string[], servers: unknown[] | null): Rem
   return null;
 }
 
-/**
- * Namespaces recorded for a catalog slug at add time. `add` persists the
- * resolved slug on the entry (see runAdd) precisely because the namespace
- * derives from the catalog display NAME, not the slug -- "ga" ("Google
- * Analytics") lands as namespace "googleanalytics", so neither the literal
- * target nor deriveNamespace(target) can reach it. Reads the same raw servers
- * array the removal preview does (readRawServers); an absent, unreadable, or
- * malformed file yields [] and leaves the existing miss / parse-error paths to
- * report themselves. Entries written before the slug was recorded simply never
- * match here (their namespace, as shown by `yaw-mcp list`, still works as the
- * removal target).
- */
-function namespacesForStoredSlug(target: string, servers: unknown[] | null): string[] {
-  if (servers === null) return [];
-  const out: string[] = [];
-  for (const s of servers) {
-    const e = s as { slug?: unknown; namespace?: unknown } | null;
-    if (e?.slug === target && typeof e?.namespace === "string") out.push(e.namespace);
-  }
-  return out;
-}
+// The slug/name lookup this used to spell inline is namespacesForStoredIdentity
+// (local-bundles.ts), shared with `set` so the two verbs resolve one target the
+// same way. It reads the same raw servers array the removal preview does
+// (readRawServers); an absent, unreadable or malformed file yields [] and
+// leaves the existing miss / parse-error paths to report themselves.
 
 /** How the entry would be launched, as one reviewable line. Mirrors
  *  trust-cmd's renderLaunch, but reads an UNVALIDATED raw entry (see
@@ -1102,26 +1089,22 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     printErr(REMOVE_USAGE);
     return { exitCode: 2, written: [] };
   }
-  if (!REMOVE_TARGET_RE.test(opts.target)) {
-    printErr(
-      `yaw-mcp remove: "${opts.target}" isn't a valid slug or namespace (lowercase letters, digits, dashes and underscores only).`,
-    );
-    return { exitCode: 2, written: [] };
-  }
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
   const env = opts.env ?? process.env;
 
   // Try the literal target first -- covers a namespace copied from `list`
   // (including legacy underscore namespaces from older `add` versions). Then
-  // any namespace whose entry RECORDS this slug (add persists it; "ga" ->
-  // "googleanalytics" is unreachable any other way). Then the derived form so
-  // passing the catalog SLUG also works for the common case where slug and
-  // name agree ("brave-search" -> "bravesearch"). deriveNamespace strips
-  // non-alphanumerics, so it would mangle an underscore namespace; that's why
-  // the literal goes first.
+  // any namespace whose entry RECORDS this target as its slug or its display
+  // name (namespacesForStoredIdentity; `add` persists the slug, so "ga" ->
+  // "googleanalytics" is unreachable any other way, and an IMPORTED entry has
+  // no slug at all so its name is the only identity the user has been shown).
+  // Then the derived form so passing the catalog SLUG also works for the common
+  // case where slug and name agree ("brave-search" -> "bravesearch").
+  // deriveNamespace strips non-alphanumerics, so it would mangle an underscore
+  // namespace; that's why the literal goes first.
   //
-  // ONE read for both raw lookups (the slug map and the removal preview).
+  // ONE read for both raw lookups (the identity map and the removal preview).
   // They used to read and parse the same file independently, before
   // removeUserBundle read it a third time -- and two reads of one file are two
   // chances to disagree about its contents. A concurrent edit can still land
@@ -1130,8 +1113,26 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
   // to try.
   const path = localBundlesPath(userConfigDir(home));
   const rawServers = await readRawServers(path);
-  const bySlug = namespacesForStoredSlug(opts.target, rawServers);
-  const candidates = [...new Set([opts.target, ...bySlug, deriveNamespace(opts.target)])];
+  const byIdentity = namespacesForStoredIdentity(opts.target, rawServers);
+  const candidates = [...new Set([opts.target, ...byIdentity, deriveNamespace(opts.target)])];
+
+  // The shape gate runs AFTER the identity lookup, not before it, and that
+  // ordering is the whole of the name feature: a display name can hold spaces,
+  // capitals and dots, none of which REMOVE_TARGET_RE admits, so checking
+  // first refused every imported server by the only name its owner has been
+  // shown. It is demoted, not deleted -- a target that no stored entry answers
+  // to is still a usage error (exit 2), which is what keeps `remove GA` from
+  // becoming the exit-0 "nothing to do" that reads as "already gone".
+  //
+  // The read above cannot report a target as valid on a file it could not
+  // parse (byIdentity is [] then), so a malformed bundles.json still reaches
+  // the write path below and surfaces its own parse error.
+  if (byIdentity.length === 0 && !REMOVE_TARGET_RE.test(opts.target)) {
+    printErr(
+      `yaw-mcp remove: "${displaySafe(opts.target)}" isn't a valid slug or namespace (lowercase letters, digits, dashes and underscores only), and no configured server carries that name.`,
+    );
+    return { exitCode: 2, written: [] };
+  }
 
   // ----- destructive-action confirmation --------------------------------
   // Gated on there being something to delete (see findRemovalTarget): a miss
@@ -1397,7 +1398,13 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   const cols: Array<[string, (s: UpstreamServerConfig) => string]> = [
     ["NAMESPACE", (s) => s.namespace],
     ["NAME", (s) => displaySafe(s.name)],
-    ["STATUS", (s) => (s.isActive ? "active" : "disabled")],
+    // The pin rides in the STATUS cell rather than taking a column of its own:
+    // it modifies "will this server be loaded and STAY loaded", which is the
+    // question this column already answers, and a dedicated column would be
+    // blank for nearly every row. "disabled, pinned" is a real combination (a
+    // pin on a server the user later disabled) and showing both is what makes
+    // it findable -- the pin does nothing at all until the server is enabled.
+    ["STATUS", (s) => (s.isActive ? "active" : "disabled") + (s.pinned ? ", pinned" : "")],
     // "-" for never-audited, matching the GRADE column this ported from.
     // LAUNCH stays last: it's the only variable-width cell, so anything after
     // it would be ragged.

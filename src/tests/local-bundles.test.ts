@@ -529,6 +529,52 @@ describe("loadLocalBundles", () => {
     expect(r.warnings.filter((w) => w.includes("connectTimeoutMs"))).toEqual([]);
   });
 
+  it("carries a per-server pinned flag from bundles.json", async () => {
+    // Same fixed-whitelist trap as runtime and connectTimeoutMs: the return of
+    // validateEntry is a closed list, so a field missing from it is DROPPED and
+    // never reaches the reaper. Without this the pin is a no-op that `list` and
+    // `set` both keep reporting as configured.
+    //
+    // Only `true` pins. `false` is the DEFAULT spelled out, so it must land as
+    // undefined rather than as a stored false -- every reader tests the flag as
+    // a boolean, and keeping an explicit false would make the two spellings of
+    // "unpinned" differ on disk for no behavioural difference.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "pin", name: "Pin", command: "npx", args: ["-y", "a"], pinned: true },
+        { namespace: "unpin", name: "Unpin", command: "npx", args: ["-y", "b"], pinned: false },
+        { namespace: "absent", name: "Absent", command: "npx", args: ["-y", "c"] },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers.map((s) => s.pinned)).toEqual([true, undefined, undefined]);
+    expect(r.warnings.filter((w) => w.includes("pinned"))).toEqual([]);
+  });
+
+  it("warns on and drops a non-boolean pinned", async () => {
+    // WARNS rather than dropping in silence, for connectTimeoutMs's reason
+    // rather than runtime's: a pin exists to stop a reap the user is already
+    // watching happen, so `"pinned": "true"` with the quotes leaves the same
+    // server being unloaded every few minutes with nothing anywhere saying the
+    // setting was thrown away. The warning names the namespace AND quotes the
+    // rejected value -- unquoted, `"true"` and `true` read identically.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "str", name: "Str", command: "npx", args: ["-y", "a"], pinned: "true" },
+        { namespace: "num", name: "Num", command: "npx", args: ["-y", "b"], pinned: 1 },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers.map((s) => s.pinned)).toEqual([undefined, undefined]);
+    const pinWarnings = r.warnings.filter((w) => w.includes("pinned"));
+    expect(pinWarnings).toHaveLength(2);
+    expect(pinWarnings[0]).toContain('"str"');
+    expect(pinWarnings[0]).toContain('"true"');
+    expect(pinWarnings[1]).toContain("1");
+  });
+
   it("surfaces a top-level defaultRuntime", async () => {
     writeBundles(synthHome, {
       version: 1,

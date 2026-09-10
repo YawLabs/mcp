@@ -127,6 +127,17 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     positional: [["<slug>"]],
     flags: ["--env", "--dry-run", "--json", "--catalog", "--help"],
   },
+  // Same client list as install/uninstall -- one INSTALL_CLIENTS constant
+  // feeds all three, so a new client cannot appear in one and not the others.
+  // --remove-originals / --keep-originals are the two ways to answer the
+  // duplicate-run question without a prompt, which is the only way to script
+  // an import at all. Mirrors parseImportArgs in src/import-cmd.ts.
+  {
+    name: "import",
+    description: "Adopt a client's existing MCP servers into bundles.json",
+    positional: [[...INSTALL_CLIENTS]],
+    flags: ["--scope", "--project-dir", "--dry-run", "--remove-originals", "--keep-originals", "--help"],
+  },
   // --force / --yes gate the destructive removal (confirm on a TTY, refuse off
   // one), so they MUST be completable -- a user who cannot tab --force will not
   // discover the only way to script a remove. Mirrors parseRemoveArgs in
@@ -136,6 +147,17 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     description: "Remove a local server",
     positional: [["<slug-or-namespace>"]],
     flags: ["--force", "--yes", "--help"],
+  },
+  // The shell door onto a configured server. Its flags are the only way to
+  // pass a JSON argument object without fighting shell quoting, so hiding them
+  // from Tab hides the feature -- --args-stdin in particular is what a script
+  // author reaches for once and never finds if it does not complete. Mirrors
+  // parseCallArgs in src/call-cmd.ts -- keep them in sync.
+  {
+    name: "call",
+    description: "Call one tool on one configured server",
+    positional: [["<slug-or-namespace>"], ["<tool>"], ["<json>"]],
+    flags: ["--args", "--args-stdin", "--json", "--help"],
   },
   // Keep these three in sync with KNOWN_SUBCOMMANDS: a verb that dispatches
   // but does not complete is invisible to anyone who found the CLI by

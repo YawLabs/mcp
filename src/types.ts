@@ -65,6 +65,24 @@ export interface UpstreamServerConfig {
    * Per-server -- set in bundles.json. See oam-spawn.ts.
    */
   runtime?: "oam" | "node";
+  /**
+   * Exempt this server from the idle reaper. The reaper unloads an upstream
+   * once it has sat through `adaptiveThreshold` tool calls aimed at OTHER
+   * namespaces (idle-ttl.ts), on the bet that a re-spawn is cheaper than the
+   * RAM. That bet is wrong for a server whose START is expensive -- a browser,
+   * a language server, a container, anything that indexes on boot -- where the
+   * re-spawn costs seconds of the user's next call.
+   *
+   * `true` suppresses the UNLOAD only, never the bookkeeping: the idle count
+   * keeps climbing and `mcp_connect_health` keeps reporting it, so a pinned
+   * server that is genuinely unused is still visible as such.
+   *
+   * Absent (or false) = reapable, the default for every server. Per-server --
+   * set in bundles.json, or with `yaw-mcp set <target> pinned=true`. It does
+   * NOT survive a client restart on its own: a pin keeps a LOADED server
+   * loaded, it does not pre-load one (that is prewarm's job).
+   */
+  pinned?: boolean;
 }
 
 /** Does this entry connect over HTTP rather than spawning a process?

@@ -41,6 +41,8 @@ export const KNOWN_SUBCOMMANDS = [
   "uninstall",
   "add",
   "remove",
+  "import",
+  "call",
   "search",
   "set",
   "enable",

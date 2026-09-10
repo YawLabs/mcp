@@ -2086,6 +2086,49 @@ describe("ConnectServer", () => {
       await priv.trackUsageAndAutoDeactivate("gh");
       expect(priv.connections.has("slack")).toBe(false);
     });
+
+    it("never reaps a pinned namespace, however idle it gets", async () => {
+      // The reason the field exists: some servers cost seconds to start (a
+      // browser, a language server, a container) and re-spawning one is worth
+      // far more than the RAM the reaper is reclaiming. The idle COUNT keeps
+      // climbing -- the pin suppresses the unload, not the bookkeeping, so
+      // `mcp_connect_health` still reports how idle the server actually is.
+      //
+      // 60 is past the adaptive CEILING (ADAPTIVE_MAX = 50), so no amount of
+      // adaptive patience explains a survivor here; only the pin can.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh" }),
+        makeServerConfig({ namespace: "slack", pinned: true }),
+      ]);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("slack", makeConnection("slack"));
+      priv.idleCallCounts.set("slack", 60);
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(priv.connections.has("slack")).toBe(true);
+      expect(priv.idleCallCounts.get("slack")).toBe(61);
+      expect(disconnectFromUpstream).not.toHaveBeenCalled();
+    });
+
+    it("reaps the same namespace once the pin is cleared", async () => {
+      // The pin is read from the LIVE config, which is re-read at meta-tool
+      // boundaries -- so `yaw-mcp set <ns> pinned=false` takes effect without a
+      // client restart, exactly like every other bundles.json edit. Reading the
+      // pin off the connection's own launch-time config instead would keep a
+      // server pinned for as long as it stayed connected, which is forever.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh" }),
+        makeServerConfig({ namespace: "slack", pinned: false }),
+      ]);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("slack", makeConnection("slack"));
+      priv.idleCallCounts.set("slack", 60);
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(priv.connections.has("slack")).toBe(false);
+    });
   });
 
   describe("handleHealth", () => {
