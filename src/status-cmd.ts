@@ -5,7 +5,7 @@
 // several separate spawns of this CLI (a server list, a grade source, a
 // state/learning source) plus `yaw-mcp servers --json`, whose non-zero exit it
 // read as "signed out" -- a check against a hosted backend that no longer
-// exists (see servers-cmd.ts). Every panel open therefore paid several process
+// exists. Every panel open therefore paid several process
 // starts and still showed zero calls and no grades.
 //
 // The contract this command makes, in the order it matters to a poller:
@@ -206,8 +206,8 @@ export interface StatusCommandOptions {
 
 export interface StatusCommandResult {
   // No `lines` transcript: the exit code plus what reached the injected
-  // out/err sinks IS the contract, and servers-cmd.ts already documents the
-  // dead-weight a `lines` field became there when nothing read it.
+  // out/err sinks IS the contract. The deleted servers-cmd carried a `lines`
+  // field that nothing ever read; do not reintroduce the shape here.
   exitCode: number;
 }
 

@@ -13,11 +13,10 @@ import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "
 import { parseSearchArgs, runSearch } from "./search-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
-import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { registerShutdownTriggers } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
 import { parseStatusArgs, runStatus } from "./status-cmd.js";
-import { suggestFlag, suggestSubcommand } from "./subcommands.js";
+import { retiredSubcommandReplacement, suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseTrustArgs, runTrust } from "./trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
@@ -160,8 +159,6 @@ if (subcommand === "compliance") {
   } else {
     dispatch("reset-learning", runResetLearning());
   }
-} else if (subcommand === "servers") {
-  run("servers", parseServersArgs(process.argv.slice(3)), runServersCommand);
 } else if (subcommand === "sidecars") {
   run("sidecars", parseSidecarsArgs(process.argv.slice(3)), runSidecarsInstall);
 } else if (subcommand === "bundles") {
@@ -503,9 +500,15 @@ if (subcommand === "compliance") {
   // and belongs here. Under the old truthy guard it fell through to the
   // else branch and was reported as `unknown flag ""` -- naming the wrong
   // category for an argument that has no dash in it at all.
+  // A RETIRED verb answers first. It is a better answer than a fuzzy match --
+  // the user did not make a typo, they typed a real command that no longer
+  // exists -- and better than the generic --help pointer, which sends them
+  // hunting for a replacement that has a name.
+  const retired = retiredSubcommandReplacement(subcommand);
   const suggestions = suggestSubcommand(subcommand);
-  const hint =
-    suggestions.length > 0
+  const hint = retired
+    ? ` That command was removed -- use \`yaw-mcp ${retired}\` instead.`
+    : suggestions.length > 0
       ? ` Did you mean: ${suggestions.join(", ")}?`
       : " Run `yaw-mcp --help` for the list of subcommands.";
   process.stderr.write(`yaw-mcp: unknown subcommand "${subcommand}".${hint}\n`);
