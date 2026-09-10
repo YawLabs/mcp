@@ -35,6 +35,7 @@ import {
   namespacesForStoredIdentity,
   withBundlesLock,
 } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -335,8 +336,8 @@ function describeJsonShape(value: unknown): string {
 }
 
 export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 

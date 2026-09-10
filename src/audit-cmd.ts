@@ -28,7 +28,7 @@ import { locateComplianceSuite } from "./compliance-cmd.js";
 import { gradesCachePath, writeGrade } from "./grades-cache.js";
 import { scrubForWarning } from "./health-score.js";
 import { loadLocalBundles } from "./local-bundles.js";
-import { log } from "./logger.js";
+import { createStreamWriter, log } from "./logger.js";
 import { hasSecretRefs } from "./secrets-vault.js";
 import type { UpstreamServerConfig } from "./types.js";
 import { resolveServerEnv, scrubInternalSecretsFromProcessEnv } from "./upstream.js";
@@ -299,8 +299,8 @@ async function defaultRunner(target: {
 }
 
 export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCommandResult> {
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
+  const writeErr = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => write(`${s}\n`);
   const printErr = (s: string): void => writeErr(`${s}\n`);
 

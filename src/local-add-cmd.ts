@@ -40,6 +40,7 @@ import {
   removeUserBundle,
   upsertUserBundle,
 } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 import { collectMalformedSecretRefs, collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
@@ -539,8 +540,8 @@ function renderLaunchChange(change: LaunchChange): string {
 }
 
 export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
@@ -1194,8 +1195,8 @@ async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<s
 }
 
 export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
@@ -1425,8 +1426,8 @@ export function parseListArgs(
 }
 
 export async function runList(opts: ListCommandOptions): Promise<AddCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 

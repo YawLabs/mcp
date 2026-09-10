@@ -164,6 +164,62 @@ describe("a real client, a real broker and a real upstream complete a tool call"
     if (workDir) await rm(workDir, { recursive: true, force: true });
   });
 
+  it("survives a reader that stops reading, and keeps the exit code it computed", async () => {
+    // `yaw-mcp doctor | head` died with a raw Node stack -- an unhandled
+    // 'error' event on stdout -- and exited 1 on a config it had just judged
+    // healthy. Piping into a reader that takes a few lines and leaves is an
+    // ordinary thing to do to a CLI, so this is the behavioural half of the
+    // guard scanned for in cli-pipe-safety.test.ts: that one proves the shape
+    // is gone from the source, this one proves the mechanism works against a
+    // real process whose consumer walks away mid-write.
+    //
+    // Reuses the bundle built in beforeAll, so it costs a spawn and nothing else.
+    const home = await mkdtemp(join(tmpdir(), "yaw-mcp-pipe-"));
+    await mkdir(join(home, ".yaw-mcp"), { recursive: true });
+    // A config doctor judges HEALTHY, so the exit code being asserted is a real
+    // verdict rather than an error that would coincidentally match the crash.
+    await writeFile(join(home, ".yaw-mcp", "bundles.json"), JSON.stringify({ version: 1, servers: [] }), "utf8");
+
+    const childEnv: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(childEnv)) {
+      if (k.startsWith("YAW_MCP_")) delete childEnv[k];
+    }
+
+    const run = (destroyStdout: boolean): Promise<{ code: number | null; stderr: string }> =>
+      new Promise((resolve) => {
+        const proc = spawn(process.execPath, [bundlePath, "doctor"], {
+          cwd: home,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...childEnv, HOME: home, USERPROFILE: home, YAW_MCP_AUTO_UPGRADE: "0", YAW_MCP_SIDECAR_REFRESH: "0" },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (c: Buffer) => {
+          stderr += c.toString();
+        });
+        if (destroyStdout) {
+          // What `| head -2` does: take the first chunk, then close the pipe.
+          proc.stdout.once("data", () => proc.stdout.destroy());
+        } else {
+          proc.stdout.resume();
+        }
+        proc.on("close", (code) => resolve({ code, stderr }));
+      });
+
+    const [piped, unpiped] = await Promise.all([run(true), run(false)]);
+
+    // The crash shape, named exactly so a different failure cannot pass as this one.
+    expect(piped.stderr).not.toContain("Unhandled 'error' event");
+    expect(piped.stderr).not.toContain("EPIPE: broken pipe");
+
+    // And the code the command computed stands. A consumer leaving early says
+    // nothing about whether the tool answered, so the two runs must agree --
+    // asserted against the unpiped run rather than a hardcoded 0, so this stays
+    // true if doctor's verdict on an empty config ever changes.
+    expect(piped.code).toBe(unpiped.code);
+
+    await rm(home, { recursive: true, force: true }).catch(() => {});
+  }, 120_000);
+
   it("routes a namespaced call to the upstream it spawned and returns its answer", async () => {
     const home = await mkdtemp(join(tmpdir(), "yaw-mcp-e2e-home-"));
     const pidFile = join(home, "upstream.pid");

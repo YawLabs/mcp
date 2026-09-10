@@ -196,6 +196,14 @@ None of them blocked shipping. Together they are most of the difference between 
 
 The upstream's tool-call error text is stored verbatim as the connection's last error, so it carries whatever credential the upstream chose to echo back -- `{"error":"invalid_api_key","key":"<token>"}` is the shape this branch series has been closing all along. `discover` was already safe, running that field through the warning scrubber. `mcp_connect_health` rendered the same field raw, and that surface is read by the model. It now uses the same scrubber, which was already exported for exactly this and simply never adopted here. Its only test had pinned a benign `timeout` fixture with no absence assertion, so neither the leak nor a fix for it was visible to the suite.
 
+**Fixed -- `yaw-mcp <anything> | head` no longer kills the command**
+
+Piping a subcommand into something that reads a few lines and leaves -- `| head`, `| grep -q`, a `$(...)` whose consumer exits -- killed it with a raw Node stack trace: `Unhandled 'error' event ... Error: EPIPE: broken pipe, write`. That is an ordinary thing to do to a CLI, and it hit every command that printed anything, `doctor` and `secrets list` included.
+
+The exit code was wrong too, which is the half a script would have noticed: the crash produced `1` on a config `doctor` had just judged healthy, so a caller branching on the code got the opposite answer piped than unpiped. Both runs now report the code the command actually computed -- a consumer walking away says nothing about whether the tool answered.
+
+The guard itself shipped earlier in this release for `yaw-mcp call`, and the fix is that every other command now uses it: one no-op listener per stream, the stream latched broken so later writes are dropped rather than re-raising, and the caller's exit code left alone. Two regression guards, because this returns by way of a NEW command being added with its own raw writer rather than by the old ones changing back: a scan that fails on any subcommand writing straight to a process stream, and a spawn of the real binary against a reader that closes the pipe mid-write.
+
 **Fixed -- smaller things**
 
 `activate` now says so when a `tools` filter names a tool that does not exist, instead of quietly advertising a smaller list and leaving the model to wonder why its tool "is not working". Observation meta-tools advance the idle clock, so a session that speaks only to the broker no longer holds every upstream child process for the life of the connection. `list` neuters control bytes in the compliance grade, which comes from a file a repo can ship. A bare `*` in `blockedTools` no longer denies every tool. `enable` and `disable` no longer die with the `set` parser's usage text. And the uv PATH probe treats a timeout as inconclusive rather than as absent.

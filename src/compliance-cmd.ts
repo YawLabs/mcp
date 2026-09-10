@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, posix as posixPath, win32 as winPath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
+import { createStreamWriter } from "./logger.js";
 
 interface ComplianceReport {
   grade: string;
@@ -37,16 +38,8 @@ export interface ComplianceIo {
 }
 
 export async function runComplianceCommand(argv: string[], io: ComplianceIo = {}): Promise<number> {
-  const out =
-    io.out ??
-    ((s: string) => {
-      process.stdout.write(s);
-    });
-  const err =
-    io.err ??
-    ((s: string) => {
-      process.stderr.write(s);
-    });
+  const out = io.out ?? createStreamWriter(process.stdout);
+  const err = io.err ?? createStreamWriter(process.stderr);
 
   // Handle --help BEFORE spawning -- otherwise "--help" falls through to the
   // mcp-compliance subprocess (a suite launch, plus the sub-tool's help),

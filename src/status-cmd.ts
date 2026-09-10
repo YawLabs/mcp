@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import type { NamespaceUsage } from "./learning.js";
 import { isRemoteEntry, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
 import { collectSecretRefNames, vaultPath } from "./secrets-vault.js";
@@ -371,8 +372,8 @@ export async function collectStatus(opts: StatusCommandOptions = {}): Promise<St
 }
 
 export async function runStatus(opts: StatusCommandOptions = {}): Promise<StatusCommandResult> {
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
+  const writeErr = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => write(`${s}\n`);
 
   const payload = await collectStatus(opts);

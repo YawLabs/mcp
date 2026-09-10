@@ -43,6 +43,7 @@ import { existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
+import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { isFileNotFound, isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
 import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
@@ -178,8 +179,8 @@ async function askYesNo(opts: ResetLearningOptions, question: string): Promise<s
 export async function runResetLearning(opts: ResetLearningOptions = {}): Promise<ResetLearningResult> {
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
+  const writeErr = opts.err ?? createStreamWriter(process.stderr);
   const lines: string[] = [];
   const print = (s = ""): void => {
     lines.push(s);

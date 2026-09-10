@@ -81,7 +81,7 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
-import { log } from "./logger.js";
+import { createStreamWriter, log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 
@@ -749,8 +749,8 @@ async function autoDetectClient(opts: {
 }
 
 export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
@@ -1370,8 +1370,8 @@ async function askYesNo(opts: TryCleanupOptions, question: string): Promise<stri
 }
 
 export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 

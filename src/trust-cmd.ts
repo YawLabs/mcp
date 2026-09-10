@@ -23,6 +23,7 @@ import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { localBundlesPath, previewBundlesContent, probeProjectTrust } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { isRegistrySpec, specConstraint } from "./oam-spawn.js";
 import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "./paths.js";
 // One prompt reader for the whole product -- see askYesNo at the bottom of
@@ -181,8 +182,8 @@ export async function runTrust(opts: TrustCommandOptions = {}): Promise<TrustCom
 // --- grant ------------------------------------------------------------------
 
 async function runTrustGrant(opts: TrustCommandOptions): Promise<TrustCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
@@ -675,8 +676,8 @@ function pinGaps(s: UpstreamServerConfig): string[] {
 type ListStatus = "ok" | "stale (content changed)" | "missing (file not found)" | "unreadable";
 
 async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
@@ -821,8 +822,8 @@ async function resolveRevokeTarget(target: string): Promise<string> {
 }
 
 async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
