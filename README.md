@@ -65,7 +65,7 @@ Useful flags:
 - `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
 - `--force` / `--skip` -- overwrite or leave an existing `mcp` entry (otherwise prompts on a TTY, refuses off-TTY).
 
-After it writes, install reports two things it did **not** change. First, how many servers `~/.yaw-mcp/bundles.json` gives yaw-mcp to serve -- and when that is none, the `yaw-mcp add <slug>` step to take *before* restarting the client, since yaw-mcp reads that file once at startup. Second, how many other MCP servers were already configured in the client file it just edited; those keep launching directly from the client, and installing yaw-mcp does not move them behind the broker. The count is a number, never the server names. Under `--all` the bundles.json line prints once for the run, while the per-client count prints under each client.
+After it writes, install reports two things it did **not** change. First, how many servers `~/.yaw-mcp/bundles.json` gives yaw-mcp to serve -- and when that is none, the `yaw-mcp add <slug>` step still to take -- though no longer *before* a restart, since yaw-mcp re-reads that file while the session runs and picks up a server added afterwards on the next `mcp_connect_*` call. Second, how many other MCP servers were already configured in the client file it just edited; those keep launching directly from the client, and installing yaw-mcp does not move them behind the broker. The count is a number, never the server names. Under `--all` the bundles.json line prints once for the run, while the per-client count prints under each client.
 
 Or do every detected client at once:
 
@@ -257,7 +257,7 @@ The project `.yaw-mcp/` is found by walking up from the cwd -- stopping just bef
 
 That shape ships as a JSON Schema -- [`schemas/yaw-mcp.config.v1.json`](schemas/yaw-mcp.config.v1.json), served from the raw URL in the `$schema` line above -- so any editor that honors `$schema` completes the keys and flags a typo as you type. A namespace is `[a-z][a-z0-9_]{0,29}` (so `prod_db`, not `prod-db`); the schema rejects anything else, while the loader only warns and keeps loading.
 
-Malformed files log a warning and fall through (fail-open). yaw-mcp reads config at startup, so restart the client after editing; `mcp_connect_health` shows which files are applied.
+Malformed files log a warning and fall through (fail-open). yaw-mcp reads *this* file once at startup, so restart the client after editing it -- unlike `bundles.json`, which is re-read while the session runs. `mcp_connect_health` shows which files are applied.
 
 ### Project guide -- `YAW-MCP.md`
 
