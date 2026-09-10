@@ -456,6 +456,13 @@ export class ConnectServer {
   private clientBridge: DownstreamClientBridge;
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
+  /** bundles.json warnings from the last load, kept so DISCOVER can show them.
+   *  They were logged to stderr and dropped, which is invisible to the only
+   *  reader that matters here: stderr is the server's log, not the tool result,
+   *  so an LLM asking what is installed saw a config-broken server rendered
+   *  exactly like a healthy one. The CLI already surfaces these (list prints
+   *  them, doctor exits 2 on them) -- this is the third surface. */
+  private configWarnings: string[] = [];
   private configVersion: string | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
@@ -1151,6 +1158,8 @@ export class ConnectServer {
       return { config: null, path: null, warnings: [] };
     });
     for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
+    // Kept, not just logged -- see the field. handleDiscover renders these.
+    this.configWarnings = result.warnings;
     this.config = result.config ?? { servers: [], configVersion: "" };
     // Deduplicate by namespace -- keep first occurrence. The routing
     // state assumes one server per namespace, so a duplicate in
@@ -2410,7 +2419,17 @@ export class ConnectServer {
       sorted = activeServers;
     }
 
-    const lines: string[] = [context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n"];
+    const lines: string[] = [];
+    // FIRST, above the listing: a server whose config was partly thrown away is
+    // rendered below with the same [ready] marker as a healthy one, so without
+    // this the model reads a confident inventory of a broken install and
+    // activates something that cannot authenticate. Named on the tool result
+    // rather than left on stderr, which no model reads.
+    if (this.configWarnings.length > 0) {
+      for (const w of this.configWarnings) lines.push(`! ${w}`);
+      lines.push("Fix bundles.json (or run `yaw-mcp doctor` for the full report), then restart this server.\n");
+    }
+    lines.push(context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n");
     if (warmedNamespace) {
       lines.push(`Auto-loaded "${warmedNamespace}" — top match for your query.\n`);
     }

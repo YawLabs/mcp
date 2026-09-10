@@ -574,6 +574,58 @@ describe("loadLocalBundles", () => {
     });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config?.servers[0].env).toEqual({ KEPT: "value" });
+    // And SILENTLY. This is the one env drop that must never warn: `add`
+    // seeds a "" for every required key of every server it writes, so warning
+    // here would fire on a normal user's config on every single load. The
+    // shape-warnings above are the deliberate contrast.
+    expect(r.warnings).toEqual([]);
+  });
+
+  it("warns on and still loads an entry whose 'env' is not a map at all", async () => {
+    // A hand-edit writes `"env": "GITHUB_TOKEN=abc"` (or a null, or an array)
+    // far more readily than a well-formed map, and the old filter answered
+    // undefined for every one of them -- so EVERY variable vanished while
+    // `list` showed the server active, `doctor` said All good, and discover
+    // reported it ready. The server then started with no credentials and died
+    // on an auth error pointing nowhere. An env var authenticates for the same
+    // reason a header does, so it warns for the same reason (see the headers
+    // block in local-bundles.ts).
+    for (const bad of ["GITHUB_TOKEN=abc", null, ["GITHUB_TOKEN=abc"], 42] as unknown[]) {
+      writeBundles(synthHome, {
+        version: 1,
+        servers: [{ namespace: "github", name: "GitHub", command: "npx", env: bad }],
+      });
+      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+      // Still LOADS. Refusing the entry would be a bigger behavioural change
+      // than warning about it -- a remote entry can authenticate via headers,
+      // and a stdio one can rely on the ambient shell.
+      expect(r.config?.servers).toHaveLength(1);
+      expect(r.config?.servers[0].env).toBeUndefined();
+      expect(r.warnings.some((w) => w.includes(`ignoring 'env' on "github"`))).toBe(true);
+    }
+  });
+
+  it("warns on a non-string value inside a real env map", async () => {
+    // A stored credential is being dropped, and `yaw-mcp set` REFUSES this
+    // exact shape ("... is a number in <path>, not a string -- remove it by
+    // hand") rather than treating it as absent. A loader that ignores it
+    // silently contradicts its own sibling command.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "github",
+          name: "GitHub",
+          command: "npx",
+          env: { GITHUB_TOKEN: 123, NULLED: null, NESTED: { a: 1 }, OK: "yes" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].env).toEqual({ OK: "yes" });
+    expect(r.warnings.some((w) => w.includes(`ignoring env "GITHUB_TOKEN" on "github"`))).toBe(true);
+    expect(r.warnings.some((w) => w.includes(`ignoring env "NULLED" on "github"`))).toBe(true);
+    expect(r.warnings.some((w) => w.includes(`ignoring env "NESTED" on "github"`))).toBe(true);
   });
 
   it("warns on schema version newer than supported", async () => {

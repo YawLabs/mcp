@@ -460,6 +460,39 @@ describe("ConnectServer", () => {
         expect(text).not.toContain("Redis");
       });
 
+      it("names a bundles.json warning above the listing", () => {
+        // A server whose config was partly thrown away renders with the same
+        // [ready] marker as a healthy one, so the model reads a confident
+        // inventory of a broken install and activates something that cannot
+        // authenticate. The warning existed but went only to stderr -- the
+        // server log, not the tool result -- so the one reader that acts on
+        // this text never saw it. list and doctor already surface it.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.configWarnings = [`bundles.json: ignoring 'env' on "gh" (expected an object of string values)`];
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("ignoring 'env' on \"gh\"");
+        // Above the listing, not buried under it.
+        expect(text.indexOf("ignoring")).toBeLessThan(text.indexOf("Installed MCP servers"));
+        // Still lists the server -- it does load; the point is that the model
+        // is told the config is broken, not that the entry vanishes.
+        expect(text).toContain("gh");
+      });
+
+      it("stays quiet when the config loaded cleanly", () => {
+        // The silence pin. Every normal config has zero warnings, so a header
+        // that rendered unconditionally would put noise at the top of every
+        // discover call the model ever makes.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.configWarnings = [];
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text.startsWith("Installed MCP servers")).toBe(true);
+        expect(text).not.toContain("Fix bundles.json");
+      });
+
       it("keeps the co-usage peer that the full listing shows", () => {
         // Focus exists to EXPAND one card, so that card must never be less
         // informative than the same one in the full listing. The co-usage map
