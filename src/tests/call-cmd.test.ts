@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,50 @@ function makeHome(servers: unknown[], config?: Record<string, unknown>): string 
   writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), JSON.stringify({ version: 1, servers }, null, 2));
   if (config) writeFileSync(join(home, CONFIG_DIRNAME, "config.json"), JSON.stringify(config, null, 2));
   return home;
+}
+
+/** Write ~/.yaw-mcp/grades.json -- the cache `yaw-mcp audit` fills in and the
+ *  ONLY supplier of a LOCALLY MEASURED compliance grade. Deliberately not
+ *  folded into makeHome: a grade in the bundles entry and a grade in this
+ *  cache are two different suppliers with a precedence rule between them, and
+ *  a test that cannot set them independently cannot pin that rule. */
+function writeGrades(home: string, grades: Record<string, unknown>): void {
+  writeFileSync(join(home, CONFIG_DIRNAME, "grades.json"), JSON.stringify(grades, null, 2));
+}
+
+/** One cache entry, carrying every field grades-cache.ts requires to validate
+ *  it. A missing `score` or `gradedAt` drops the whole entry, which would make
+ *  a gate test pass for the wrong reason. */
+function cachedGrade(grade: string): Record<string, unknown> {
+  return { grade, score: 50, gradedAt: "2026-06-11T00:00:00.000Z" };
+}
+
+const ESC = String.fromCharCode(0x1b);
+const CR = String.fromCharCode(0x0d);
+
+/** An ANSI + CR payload, built from code points so this file never carries the
+ *  raw bytes itself. Erase-line then carriage return rewrites whatever the
+ *  terminal has already drawn on that line, so a third-party server can
+ *  overwrite yaw-mcp's own diagnostic with text of its choosing. */
+const INJECTION = `safe${ESC}[31m${ESC}[2K${CR}INJECTED`;
+
+/** Every code point DISPLAY_CONTROL_SOURCE (trust-cmd.ts) neuters, minus tab
+ *  and newline, which a stderr line legitimately carries. A code point scan
+ *  rather than a character class so a failure names what got through. */
+function rawControls(text: string): string[] {
+  return [...text].filter((c) => {
+    if (c === "\n" || c === "\t") return false;
+    const n = c.codePointAt(0) ?? 0;
+    return (
+      n <= 0x1f ||
+      (n >= 0x7f && n <= 0x9f) ||
+      (n >= 0x200b && n <= 0x200f) ||
+      n === 0x2028 ||
+      n === 0x2029 ||
+      (n >= 0x202a && n <= 0x202e) ||
+      (n >= 0x2066 && n <= 0x2069)
+    );
+  });
 }
 
 function capture() {
@@ -441,6 +486,242 @@ describe("runCall -- the default connect really is the transient helper", () => 
       expect(r.exitCode).toBe(1);
     } finally {
       spy.mockRestore();
+    }
+  });
+});
+
+// The compliance floor reads ONE field -- server.complianceGrade -- and
+// bundles.json is not the only thing that fills it. `yaw-mcp audit` writes the
+// letter it MEASURED to ~/.yaw-mcp/grades.json, and every other reader of a
+// server list overlays that cache before showing or acting on a grade
+// (local-add-cmd runList, server.ts hydrateComplianceGrades, status-cmd). A
+// gate handed the un-overlaid list never sees an audited letter at all, so
+// `list` printed GRADE F for a server `call` then spawned -- the exact hole
+// this command's header says it closes. Reproduced against a built binary
+// before the fix: exit 1 on a handshake timeout instead of exit 2.
+describe("runCall -- the compliance floor reads the AUDIT cache", () => {
+  it("refuses a server whose AUDITED grade is below the floor, with no grade in bundles.json", async () => {
+    const home = makeHome([GH]);
+    writeGrades(home, { gh: cachedGrade("F") });
+    const fake = fakeConnect({});
+    const cap = capture();
+    const r = await runCall({
+      namespace: "gh",
+      tool: "search",
+      home,
+      env: { YAW_MCP_MIN_COMPLIANCE: "B" },
+      connect: fake.connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.errText()).toContain("YAW_MCP_MIN_COMPLIANCE");
+    expect(cap.errText()).toContain("grade F");
+    expect(fake.connected).toEqual([]);
+  });
+
+  it("lets the AUDITED grade supersede the catalog claim in bundles.json", async () => {
+    // The documented precedence, stated in local-add-cmd.ts runList and
+    // server.ts hydrateComplianceGrades alike: the cached letter was measured
+    // against the bytes on THIS machine, the bundles one is what the catalog
+    // claimed at add time. Inverted here, a server could publish an "A" and
+    // buy itself a spawn the audit had already refused.
+    const home = makeHome([{ ...GH, complianceGrade: "A" }]);
+    writeGrades(home, { gh: cachedGrade("F") });
+    const fake = fakeConnect({});
+    const cap = capture();
+    const r = await runCall({
+      namespace: "gh",
+      tool: "search",
+      home,
+      env: { YAW_MCP_MIN_COMPLIANCE: "B" },
+      connect: fake.connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(fake.connected).toEqual([]);
+  });
+
+  it("lets a passing AUDITED grade lift a failing catalog claim", async () => {
+    // The same precedence in the other direction, which is what makes it a
+    // REPLACE rather than a worst-of-both: a server the catalog called F and
+    // the local audit scored A runs.
+    const home = makeHome([{ ...GH, complianceGrade: "F" }]);
+    writeGrades(home, { gh: cachedGrade("A") });
+    const fake = fakeConnect({});
+    const cap = capture();
+    const r = await runCall({
+      namespace: "gh",
+      tool: "search",
+      home,
+      env: { YAW_MCP_MIN_COMPLIANCE: "B" },
+      connect: fake.connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(fake.connected).toHaveLength(1);
+  });
+
+  it("degrades to the bundles.json grade when the cache is garbage", async () => {
+    // readGradesCache answers {} for a file it cannot parse, so a hand-broken
+    // cache must leave the config letter standing rather than blanking it --
+    // blanking would make an ungraded server, and ungraded passes every floor.
+    const home = makeHome([{ ...GH, complianceGrade: "F" }]);
+    writeFileSync(join(home, CONFIG_DIRNAME, "grades.json"), "{ not json");
+    const fake = fakeConnect({});
+    const cap = capture();
+    const r = await runCall({
+      namespace: "gh",
+      tool: "search",
+      home,
+      env: { YAW_MCP_MIN_COMPLIANCE: "B" },
+      connect: fake.connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(fake.connected).toEqual([]);
+  });
+
+  it("does not read an Object.prototype key as a cache hit", async () => {
+    // NAMESPACE_RE is lowercase `[a-z][a-z0-9_]{0,29}`, which admits
+    // `constructor` (and `tostring`, and `valueof`). A bare `grades[ns]`
+    // answers Object.prototype's member for those -- truthy, so the overlay
+    // fires and writes `complianceGrade: undefined` OVER the config's F.
+    // Ungraded passes every floor, so the un-own-checked read turns a refusal
+    // into a spawn.
+    const home = makeHome([{ ...GH, namespace: "constructor", complianceGrade: "F" }]);
+    writeGrades(home, { gh: cachedGrade("A") });
+    const fake = fakeConnect({});
+    const cap = capture();
+    const r = await runCall({
+      namespace: "constructor",
+      tool: "search",
+      home,
+      env: { YAW_MCP_MIN_COMPLIANCE: "B" },
+      connect: fake.connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.errText()).toContain("grade F");
+    expect(fake.connected).toEqual([]);
+  });
+});
+
+// The file header's contract: stdout is the tool's bytes verbatim, and
+// everything yaw-mcp writes ITSELF goes to stderr with its control bytes
+// neutered. Tool names, tool-call failures and a spawn's stderr tail are all
+// third-party text, so an upstream that names a tool with an erase-line
+// escape could rewrite the line yaw-mcp had just drawn. Reproduced against a
+// built binary before the fix, on both the not-found diagnostic and the
+// tool-call failure.
+describe("runCall -- upstream text cannot inject control bytes into stderr", () => {
+  it("escapes an upstream tool name in the not-found diagnostic", async () => {
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ tools: ["boom", INJECTION] });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "nosuch", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    // Still legible -- the payload's printable text survives, only the bytes
+    // the terminal would ACT on are quoted.
+    expect(cap.errText()).toContain("INJECTED");
+    expect(rawControls(cap.errText())).toEqual([]);
+  });
+
+  it("escapes the upstream's failure message on a tool call", async () => {
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ throwOnCall: new Error(`MCP error -32000: ${INJECTION}`) });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain("INJECTED");
+    expect(rawControls(cap.errText())).toEqual([]);
+  });
+
+  it("escapes the spawn failure message, which carries the child's stderr tail", async () => {
+    // The widest of the three: connectToUpstream puts the child's own stderr
+    // into the ActivationError message, so ANY server that fails to boot gets
+    // to write bytes onto this line.
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ connectError: new Error(`failed to start. stderr: ${INJECTION}`) });
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain("INJECTED");
+    expect(rawControls(cap.errText())).toEqual([]);
+  });
+
+  it("escapes the resolved tool name in the post-connect deny", async () => {
+    // Reached only when the pre-spawn wire name differs from the resolved one
+    // -- a server whose OWN tool name embeds the namespace, the same shape the
+    // `gh_status` test above uses. The deny is a WILDCARD because
+    // TOOL_ENTRY_RE (config-loader.ts) drops a blockedTools entry carrying
+    // control bytes, so a literal one could never match; a prefix deny still
+    // matches, and the name it prints is whatever the wire said.
+    const home = makeHome([GH], { blockedTools: ["gh_gh_*"] });
+    const fake = fakeConnect({ tools: [`gh_${INJECTION}`] });
+    const cap = capture();
+    const r = await runCall({
+      namespace: "gh",
+      tool: `gh_${INJECTION}`,
+      home,
+      cwd: home,
+      connect: fake.connect,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.errText()).toContain("blocked");
+    expect(rawControls(cap.errText())).toEqual([]);
+  });
+
+  it("escapes the tool argument in the pre-spawn deny", async () => {
+    // Not upstream text, but not the user's own typing either: the header
+    // sells this command to "an agent loop that is not MCP-shaped", so the
+    // tool argument can be model- or attacker-derived.
+    const home = makeHome([GH], { blockedTools: ["gh_*"] });
+    const fake = fakeConnect({});
+    const cap = capture();
+    const r = await runCall({ namespace: "gh", tool: INJECTION, home, cwd: home, connect: fake.connect, ...cap });
+    expect(r.exitCode).toBe(2);
+    expect(fake.connected).toEqual([]);
+    expect(rawControls(cap.errText())).toEqual([]);
+  });
+});
+
+// `yaw-mcp call ... | head -1` is the NORMAL case for a command built for
+// scripts and hooks, and an unguarded process.stdout turns it into an
+// unhandled EPIPE 'error' event: raw Node stack, exit 1 (the code documented
+// for "the tool answered with an error"), and the process dying mid-await so
+// transient-upstream's `finally` never runs and the child is orphaned.
+// Reproduced against a built binary: piped, "Disconnected from upstream" was
+// logged zero times; unpiped, once.
+describe("runCall -- an early-exiting stdout consumer", () => {
+  it("guards the real process.stdout it writes to, and still tears the upstream down", async () => {
+    const home = makeHome([GH]);
+    const fake = fakeConnect({ result: { content: [{ type: "text", text: "one" }] } });
+    const written: string[] = [];
+    const stub = new EventEmitter() as unknown as NodeJS.WriteStream;
+    (stub as unknown as { write: (s: string) => boolean }).write = (s: string): boolean => {
+      written.push(s);
+      // The real pipe shape: the write returns, the error lands a tick later.
+      if (written.length === 1) {
+        setImmediate(() =>
+          stub.emit("error", Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" })),
+        );
+      }
+      return true;
+    };
+    const realStdout = Object.getOwnPropertyDescriptor(process, "stdout") as PropertyDescriptor;
+    Object.defineProperty(process, "stdout", { value: stub, configurable: true });
+    try {
+      // No `out` seam: the point is the writer runCall builds for ITSELF.
+      const r = await runCall({ namespace: "gh", tool: "search", home, connect: fake.connect, err: () => {} });
+      // Armed before the first write, or the deferred emit below is an
+      // unhandled 'error' -- which is the process going down.
+      expect(stub.listenerCount("error")).toBe(1);
+      expect(r.exitCode).toBe(0);
+      expect(fake.tornDown).toBe(1);
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      Object.defineProperty(process, "stdout", realStdout);
     }
   });
 });

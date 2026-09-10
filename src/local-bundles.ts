@@ -1612,6 +1612,17 @@ export async function previewUpsertUserBundle(
   namespace: string | undefined;
   entry: Partial<UpstreamServerConfig>;
   launchChanged?: LaunchChange;
+  /** The launch shape of the STORED entry this write would fold onto, when
+   *  there is one. Reported alongside `launchChanged` rather than folded into
+   *  it because the two answer different questions: `launchChanged` fires only
+   *  for a SLUG-LESS stored entry (a slug-carrying one either refuses on a
+   *  different slug, or is a deliberate same-slug re-add), while a merge onto a
+   *  slug-carrying entry still replaces command/args wholesale. A caller that
+   *  has to show the user what a write would overwrite -- `import`, whose
+   *  entries never carry a slug and so can never trip the refusal -- needs the
+   *  BEFORE on both paths. Empty ({}) when the stored entry has neither a
+   *  command nor a url; absent when nothing is being replaced. */
+  replacing?: LaunchShape;
   /** Same read diagnostics the real run would surface (see readRawUserBundles). */
   warnings: string[];
 }> {
@@ -1625,6 +1636,7 @@ export async function previewUpsertUserBundle(
     namespace: target.namespace ?? entry.namespace,
     entry: mergedUpsertEntry(file.servers, entry, target),
     launchChanged: target.launchChanged,
+    replacing: target.idx >= 0 ? launchShapeOf((file.servers[target.idx] ?? {}) as Record<string, unknown>) : undefined,
     warnings,
   };
 }

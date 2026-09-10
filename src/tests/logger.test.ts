@@ -1,5 +1,6 @@
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { log, setLogSurface } from "../logger.js";
+import { createStreamWriter, log, setLogSurface } from "../logger.js";
 
 // -----------------------------------------------------------------------
 // logger.ts: spread-order pin (logger.ts:9)
@@ -283,5 +284,98 @@ describe("index.ts wiring for the CLI surface", () => {
     const { fileURLToPath } = await import("node:url");
     const src = await readFile(fileURLToPath(new URL("../index.ts", import.meta.url)), "utf8");
     expect(src).toContain('if (subcommand !== undefined) setLogSurface("cli");');
+  });
+});
+
+// -----------------------------------------------------------------------
+// createStreamWriter: an early-exiting consumer must not kill the process
+//
+// `yaw-mcp call ... | head -1` closes the read end of stdout after the
+// first line. The next write emits 'error' (EPIPE) on the stream, and with
+// no listener Node treats that as an unhandled 'error' event and takes the
+// process down mid-await -- which SKIPS the `finally` in
+// transient-upstream.ts, so the spawned upstream is never disconnected and
+// the child is orphaned. Reproduced against a built binary:
+// `call fake med {} | head -1` logged "Disconnected from upstream" zero
+// times, the unpiped run logged it once.
+// -----------------------------------------------------------------------
+describe("createStreamWriter", () => {
+  /** Minimal writable: an EventEmitter with a `write` that records, plus an
+   *  optional failure mode. Not a PassThrough, because the two failure shapes
+   *  under test are exactly the ones a real pipe produces and a PassThrough
+   *  produces neither on demand. */
+  function fakeStream(mode: "ok" | "emit" | "throw"): NodeJS.WritableStream & { written: string[] } {
+    const emitter = new EventEmitter() as unknown as NodeJS.WritableStream & { written: string[] };
+    emitter.written = [];
+    (emitter as { write: (s: string) => boolean }).write = (s: string): boolean => {
+      emitter.written.push(s);
+      if (emitter.written.length === 1) {
+        // "emit" is the real pipe shape: the write RETURNS, and the error
+        // lands a tick later. Emitting it synchronously here would be caught
+        // by the writer's own try/catch, which stops the listener from being
+        // tested at all -- a mutation run with the listener removed still
+        // went green until this was deferred.
+        if (mode === "emit") {
+          setImmediate(() =>
+            emitter.emit("error", Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" })),
+          );
+        }
+        if (mode === "throw") throw Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" });
+      }
+      return true;
+    };
+    return emitter;
+  }
+
+  it("survives an EPIPE that arrives as an 'error' EVENT, not a throw", async () => {
+    // The shape an unguarded stream dies on, and the one a try/catch cannot
+    // reach: the write returns normally and Node emits 'error' a tick later.
+    // An EventEmitter with no 'error' listener RETHROWS what is emitted, out
+    // of a timer callback and into nobody's hands -- which IS the process
+    // going down. The listener count is asserted directly because it is the
+    // whole mechanism, and without it a regression here surfaces as an
+    // unhandled error rather than as a readable failure.
+    const stream = fakeStream("emit");
+    const write = createStreamWriter(stream);
+    expect(stream.listenerCount("error")).toBe(1);
+    write("first\n");
+    await new Promise((resolve) => setImmediate(resolve));
+    // And nothing more is written: the consumer is gone, so every later line
+    // would just re-emit the same error.
+    write("second\n");
+    write("third\n");
+    expect(stream.written).toEqual(["first\n"]);
+  });
+
+  it("survives an EPIPE that arrives as a synchronous THROW", () => {
+    const stream = fakeStream("throw");
+    const write = createStreamWriter(stream);
+    expect(() => write("first\n")).not.toThrow();
+    write("second\n");
+    expect(stream.written).toEqual(["first\n"]);
+  });
+
+  it("writes everything while the consumer is still there", () => {
+    const stream = fakeStream("ok");
+    const write = createStreamWriter(stream);
+    write("a");
+    write("b");
+    expect(stream.written).toEqual(["a", "b"]);
+  });
+
+  it("shares one verdict across two writers over the SAME stream", async () => {
+    // `call` builds one writer for stdout and one for stderr, and `2>&1`
+    // hands both the same fd -- the second must not keep writing after the
+    // first learned the consumer had gone. One listener for the two of them,
+    // not two: ten stacked on process.stdout would trip Node's
+    // MaxListenersExceededWarning.
+    const stream = fakeStream("emit");
+    const a = createStreamWriter(stream);
+    const b = createStreamWriter(stream);
+    expect(stream.listenerCount("error")).toBe(1);
+    a("first\n");
+    await new Promise((resolve) => setImmediate(resolve));
+    b("second\n");
+    expect(stream.written).toEqual(["first\n"]);
   });
 });
