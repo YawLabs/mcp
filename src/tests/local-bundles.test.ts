@@ -304,6 +304,28 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].type).toBe("local");
   });
 
+  it("treats a BLANK command as no command, matching isRemoteEntry", async () => {
+    // `typeof "" === "string"`, so a typeof-only guard let this fall back to
+    // "local" here while isRemoteEntry called it remote via `!entry.command`
+    // -- reopening the same reader disagreement the inference exists to close,
+    // on the shape a hand-edit most plausibly produces: clearing the field
+    // rather than deleting the key.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "blank",
+          name: "Blank",
+          command: "   ",
+          url: "https://x.test/mcp",
+          headers: { Authorization: "Bearer ${secret:tok}" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].type).toBe("remote");
+  });
+
   it("an explicit type wins over the inference", async () => {
     writeBundles(synthHome, {
       version: 1,
