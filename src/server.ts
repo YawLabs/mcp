@@ -44,7 +44,7 @@ import {
 import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudges, shouldNudge } from "./install-nudge.js";
 import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
-import { loadLocalBundles } from "./local-bundles.js";
+import { bundlesSignature, loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
@@ -98,7 +98,7 @@ import {
   resolveToolTokenCap,
 } from "./server-cap.js";
 import { maybeRefreshSidecars } from "./sidecar-refresh.js";
-import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
+import { type ConnectConfig, launchIdentity, type UpstreamConnection, type UpstreamServerConfig } from "./types.js";
 import {
   ActivationError,
   clearSessionVaultPassphrase,
@@ -350,7 +350,7 @@ export function isRoutingFaultText(text: string): boolean {
 // user to the retired hosted add/enable UI at yaw.sh/mcp, a page that can no
 // longer do what the text said.
 const NO_SERVERS_INSTALLED_TEXT =
-  "No servers installed. Browse the catalog at https://yaw.sh/mcp/catalog/ and add one with `yaw-mcp add <slug>` — it lands in ~/.yaw-mcp/bundles.json. Restart this MCP client afterwards; yaw-mcp reads bundles.json once at startup.";
+  "No servers installed. Browse the catalog at https://yaw.sh/mcp/catalog/ and add one with `yaw-mcp add <slug>` — it lands in ~/.yaw-mcp/bundles.json and is picked up on your next mcp_connect_* call, with no client restart.";
 
 /** Namespaces from an activate/deactivate meta-tool args bag. `servers`
  *  (array) wins over the single `server` form; empty when neither is
@@ -483,6 +483,32 @@ export class ConnectServer {
    *  them, doctor exits 2 on them) -- this is the third surface. */
   private configWarnings: string[] = [];
   private configVersion: string | null = null;
+  /** Every path the LAST completed load consulted, and the mtime+size
+   *  fingerprint it had at that moment. Together they are the gate on the
+   *  lazy re-read at meta-tool boundaries (maybeReloadBundles): when the
+   *  fingerprint still matches, nothing changed and the boundary costs one
+   *  stat per path instead of a read, a trust probe and a parse.
+   *
+   *  Empty until start() has run a load, and empty forever if that load's
+   *  own loader threw -- both mean "no confirmed watch set", and reload
+   *  stays off rather than watching paths nothing verified. That also keeps
+   *  the unit tests that construct a ConnectServer without start() on
+   *  exactly the behaviour they had before reload existed.
+   *
+   *  KNOWN WINDOW: the fingerprint is taken AFTER the read, so an edit that
+   *  lands between the read and the stat is recorded as already-seen and is
+   *  picked up on the following edit instead. Taking it before is not an
+   *  option -- consultedPaths is only known once the load has finished --
+   *  and the cost is bounded: the miss is milliseconds wide, and the next
+   *  write to the same file clears it. */
+  private bundlesConsultedPaths: string[] = [];
+  private bundlesFingerprint: string | null = null;
+  /** A reconcile deferred because a namespace it wanted to tear down had a
+   *  tool call in flight. Without it the deferral would be permanent: the
+   *  fingerprint is adopted when the re-read happens, so the NEXT boundary
+   *  would see an unchanged file and skip the reconcile that never finished,
+   *  leaving a connection running on config the user has already replaced. */
+  private bundlesReconcilePending = false;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
@@ -1069,6 +1095,292 @@ export class ConnectServer {
     if (applied > 0) log("info", "Applied cached compliance grades", { graded: applied });
   }
 
+  /** Install a freshly-loaded server list as the running config. Shared by
+   *  start() and the reload path so the namespace dedupe below cannot come to
+   *  exist on only one of them: the routing state assumes ONE server per
+   *  namespace, and a duplicate reaching it through the reload path would be
+   *  the same corruption start() has always filtered -- just harder to find. */
+  private adoptConfig(config: ConnectConfig | null): void {
+    this.config = config ?? { servers: [], configVersion: "" };
+    // Deduplicate by namespace -- keep first occurrence. The routing
+    // state assumes one server per namespace, so a duplicate in
+    // bundles.json has to be filtered before it is ever read.
+    const seenNs = new Set<string>();
+    this.config.servers = this.config.servers.filter((s) => {
+      if (seenNs.has(s.namespace)) {
+        log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
+        return false;
+      }
+      seenNs.add(s.namespace);
+      return true;
+    });
+    this.configVersion = this.config.configVersion;
+  }
+
+  /** Record what the lazy re-read should watch, and how it looks right now. */
+  private rememberBundlesInputs(consultedPaths: string[]): void {
+    this.bundlesConsultedPaths = consultedPaths;
+    this.bundlesFingerprint = consultedPaths.length > 0 ? bundlesSignature(consultedPaths) : null;
+  }
+
+  /** Pick up an edited bundles.json without a client restart.
+   *
+   *  WHERE THIS RUNS: at the TOP of handleToolCall, for META-TOOLS ONLY, before
+   *  any branch has read this.config. That placement is the whole safety
+   *  argument, and it has three parts:
+   *
+   *    1. Never mid-handler. A handler that reloaded partway through would
+   *       answer half from the old server list and half from the new one.
+   *    2. Never on a PROXIED tool call. Those are the calls a reload would
+   *       invalidate -- the client is calling a tool on an upstream the reload
+   *       might take down -- so the boundary deliberately excludes them. A
+   *       proxied call runs entirely on the config that was live when it
+   *       started.
+   *    3. Never under a live call it would kill. Reconcile honours
+   *       inflightCalls, the same pin explicit deactivate and the idle reaper
+   *       honour, so a CONCURRENT meta-tool call cannot tear down a server a
+   *       proxied call (or an exec pipeline, which holds a pin for its whole
+   *       lifetime, between steps included) is using.
+   *
+   *  TRUST: the re-read goes through loadLocalBundles, so it re-runs the
+   *  consent gate from scratch. An unapproved project bundles.json is dropped
+   *  on reload exactly as at startup, and a PREVIOUSLY-approved one whose bytes
+   *  have changed fails its content pin and is dropped too -- editing an
+   *  approved project file revokes its own approval rather than smuggling new
+   *  argv into a running session.
+   *
+   *  What this does NOT do is watch the trust store. Both directions of an
+   *  EXPLICIT trust decision write ~/.yaw-mcp/trusted.json, which is not a
+   *  consulted path, so neither moves the fingerprint and neither reaches a
+   *  running session until bundles.json is next written (or the client
+   *  restarts, which is what the trust CLI tells the user to do, in both
+   *  directions, for exactly this reason):
+   *
+   *    - `yaw-mcp trust <path>` mid-session does not start loading the
+   *      newly-approved file. Deliberate: consent WIDENS the surface, so it
+   *      waits for an explicit config write.
+   *    - `yaw-mcp trust --revoke <path>` mid-session does not stop the session
+   *      serving what that file already contributed. NOT a security-motivated
+   *      choice, just the same mechanism read the other way -- and it is the
+   *      claim this paragraph used to get wrong, so it is pinned by a test
+   *      rather than left to the prose.
+   *
+   *  Watching trusted.json would make the revoke live, but by stat alone a
+   *  grant and a revoke are the same event -- so it would make grants live
+   *  too, reversing the deliberate stance above as a side effect. Told apart
+   *  they could be (re-read, then discard a result that newly honours a
+   *  project file), at the cost of a second trigger, a second signature and an
+   *  asymmetric adopt-or-discard rule. The gain does not carry that: the
+   *  children a revoke would tear down were spawned from argv the user HAD
+   *  approved, and the gate that stops UNAPPROVED argv already re-runs on
+   *  every re-read, so a live revoke retracts nothing that has already run.
+   *
+   *  FAILURE: a re-read that fails NEVER blanks the session. A loader that
+   *  throws, and a bundles.json that exists but will not parse, both leave the
+   *  running config exactly as it was -- someone saving a broken JSON must not
+   *  cost them the servers they already have loaded. */
+  private async maybeReloadBundles(): Promise<void> {
+    // A reload during teardown would spawn nothing but could still notify a
+    // closing transport, and shuttingDown is the latch every other
+    // connection-touching path already reads.
+    if (this.shuttingDown) return;
+    if (this.bundlesConsultedPaths.length === 0) return;
+    const fingerprint = bundlesSignature(this.bundlesConsultedPaths);
+    const moved = fingerprint !== this.bundlesFingerprint;
+    // The common case, and the reason this is a stat and not a watcher: the
+    // file has not changed, so the boundary is over before it reads anything.
+    if (!moved && !this.bundlesReconcilePending) return;
+
+    let configChanged = false;
+    if (moved) {
+      // Adopt the new fingerprint BEFORE the read, for exactly ONE case: a
+      // loader that THROWS. That path returns before it can report which
+      // paths it consulted, so nothing downstream re-fingerprints, and
+      // without this line a throwing loader would be re-invoked on every
+      // meta-tool call for the rest of the session. Every path where the
+      // loader RETURNS -- including a bundles.json that will not parse --
+      // re-fingerprints inside applyReloadedBundles instead, over the watch
+      // set that load actually reported. The user's next save moves the
+      // fingerprint again and re-triggers either way.
+      //
+      // It also collapses CONCURRENT boundaries, which is why there is no
+      // in-flight promise here: the assignment is synchronous with the stat
+      // above (nothing awaits between them), so a second meta-tool call
+      // arriving while this read is still in flight sees the fingerprint it
+      // is about to compare against and returns without starting a second
+      // load. That call then runs its handler on the pre-reload config --
+      // the same answer it would have got by arriving a moment earlier.
+      this.bundlesFingerprint = fingerprint;
+      configChanged = await this.applyReloadedBundles();
+    }
+    if (!configChanged && !this.bundlesReconcilePending) return;
+    await this.reconcileConfig(configChanged);
+  }
+
+  /** Re-read bundles.json and install it if it is usable. Returns whether the
+   *  running server list actually MOVED -- a touched-but-identical file (what
+   *  `yaw-mcp add` leaves when it rewrites an entry to the same values, and
+   *  what a backup tool bumping mtime leaves) reloads to the same
+   *  configVersion and must not cost a teardown or a tools-changed
+   *  notification. */
+  private async applyReloadedBundles(): Promise<boolean> {
+    const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
+      log("warn", "bundles.json re-read failed; keeping the running config", { error: err?.message });
+      return null;
+    });
+    // Nothing to install and nothing new to watch: keep the previous watch set
+    // so the next boundary still stats the files we do know about.
+    if (result === null) return false;
+    // The loader's report is authoritative about what to watch NEXT, and the
+    // set can move between loads -- a project `.yaw-mcp/` created mid-session
+    // adds a candidate. Re-fingerprint over the new set rather than keeping
+    // the one taken over the old paths in maybeReloadBundles.
+    this.rememberBundlesInputs(result.consultedPaths);
+
+    // Degraded: a file EXISTS at the winning location but produced no config
+    // (invalid JSON, or unreadable). Distinguished from "no bundles.json
+    // anywhere" by `path`, the same predicate default-runtime.ts uses to tell
+    // a degraded load from a genuinely empty one. Keep the running config: a
+    // half-saved edit in the user's editor must not unload every server they
+    // have.
+    if (result.config === null && result.path !== null) {
+      // Swap the warnings in so discover TELLS the model the file on disk is
+      // broken while the session keeps serving what it loaded. Silence here
+      // would leave the model reading a confident inventory of a config that
+      // no longer exists on disk.
+      this.configWarnings = result.warnings;
+      log("warn", "bundles.json changed but could not be read; keeping the running config", {
+        path: result.path,
+        warnings: result.warnings.length,
+      });
+      return false;
+    }
+
+    const previousVersion = this.configVersion;
+    this.configWarnings = result.warnings;
+    this.adoptConfig(result.config);
+    // Re-overlay grades for the same reason start() overlays them before
+    // anything reads the config: freshly-parsed entries carry no
+    // complianceGrade (validateEntry drops it), so without this a reload would
+    // blank the [A]-[F] badge on every server it re-read and
+    // YAW_MCP_MIN_COMPLIANCE would stop filtering.
+    await this.hydrateComplianceGrades();
+    const changed = this.configVersion !== previousVersion;
+    log("info", changed ? "Reloaded bundles" : "bundles.json touched but unchanged", {
+      path: result.path,
+      serverCount: this.config?.servers.length ?? 0,
+    });
+    return changed;
+  }
+
+  /** The entry as a fresh activation would actually launch it: the config
+   *  file's entry with any session-elicited credentials merged over its env.
+   *
+   *  ONE copy, reached from both the activation path (which builds the child
+   *  from it) and the staleness check below (which compares a live child
+   *  against it). Two copies drifted the moment elicitation existed: a
+   *  connection is launched from the MERGED shape and remembers it as
+   *  connection.config, so comparing a freshly-parsed entry against it
+   *  directly reads every elicited server as "launch config changed" and
+   *  reaps a healthy child on the next unrelated edit. */
+  private effectiveEntry(entry: UpstreamServerConfig): UpstreamServerConfig {
+    const elicited = this.elicitedEnv.get(entry.namespace);
+    return elicited ? { ...entry, env: { ...entry.env, ...elicited } } : entry;
+  }
+
+  /** Why a live child launched from `launchedFrom` no longer belongs to the
+   *  config that is live RIGHT NOW -- or null when it still does.
+   *
+   *  Shared by the two places a connection can be found stale, which is the
+   *  point: reconcileConfig sweeps the ones already in this.connections, and
+   *  runActivateOne asks the same question of the one it is about to put
+   *  there. Two copies of this predicate would disagree exactly at the seam
+   *  between them. */
+  private launchIsStale(
+    namespace: string,
+    launchedFrom: UpstreamServerConfig,
+  ): "removed" | "disabled" | "launch-config-changed" | null {
+    const entry = (this.config?.servers ?? []).find((s) => s.namespace === namespace);
+    if (entry === undefined) return "removed";
+    if (!entry.isActive) return "disabled";
+    if (launchIdentity(this.effectiveEntry(entry)) !== launchIdentity(launchedFrom)) return "launch-config-changed";
+    return null;
+  }
+
+  /** Bring the CONNECTED set back in line with a config that has just changed.
+   *
+   *  A namespace comes down when the new config no longer defines it, when it
+   *  has been switched to `isActive: false`, or when its launch identity moved
+   *  (see launchIdentity in types.ts) -- in the last case because the live
+   *  child process is running the OLD argv/env, and leaving it up would serve
+   *  the user's edit back to them as if it had not happened. It is a teardown,
+   *  not a restart: the next activate/dispatch spawns it fresh from the new
+   *  entry, which is also what keeps this off the credential path (env is
+   *  re-resolved through the vault at connect time, by the normal activation).
+   *
+   *  IN-FLIGHT CALLS ARE NEVER CUT. A namespace with a live call keeps its
+   *  connection and its OLD config until the call drains; the same rule
+   *  explicit deactivate and the idle reaper already follow, and for the same
+   *  reason -- closing under a live call rejects the caller's own pending
+   *  tools/call, which the proxy turns into an isError result and
+   *  handleToolCall then books as a 0.0 reliability outcome against a server
+   *  that was answering normally, and that WE killed. The deferral is
+   *  remembered (bundlesReconcilePending) and retried at the next meta-tool
+   *  boundary, so "stale until the call finishes" never becomes "stale for the
+   *  rest of the session".
+   *
+   *  IN-FLIGHT ACTIVATIONS ARE NOT THIS METHOD'S PROBLEM, and that is on
+   *  purpose. This loop iterates this.connections, and an activation mid
+   *  handshake is not in it yet -- there is no connection here to close, only
+   *  one that will appear afterwards. A deferral could not fix that either:
+   *  it would just move the reap to the next meta-tool boundary, which may
+   *  never come. runActivateOne re-asks launchIsStale after its handshake
+   *  resolves and before it inserts, which is the one place the check and the
+   *  insert are in the same synchronous block. */
+  private async reconcileConfig(configChanged: boolean): Promise<void> {
+    let deactivated = 0;
+    let deferred = false;
+    // Snapshot the keys: the loop awaits, and forgetNamespace deletes from
+    // this.connections while we would otherwise still be iterating it.
+    for (const namespace of [...this.connections.keys()]) {
+      const connection = this.connections.get(namespace);
+      if (!connection) continue;
+      // connection.config is what this child was LAUNCHED from, elicited env
+      // included -- which is why the comparison runs through launchIsStale
+      // rather than against the raw entry. See effectiveEntry.
+      const stale = this.launchIsStale(namespace, connection.config);
+      if (stale === null) continue;
+      // Checked immediately before the close and INSIDE the awaiting loop, not
+      // against a list built up front: each disconnectFromUpstream burns real
+      // event-loop time (the SDK's stdio close races a 2s timer twice), so a
+      // tools/call for a LATER entry can be routed and started in that window,
+      // and a snapshot taken before the loop would already be stale.
+      if ((this.inflightCalls.get(namespace) ?? 0) > 0) {
+        log("info", "Deferring config reconcile -- tool call in flight", {
+          namespace,
+          inflight: this.inflightCalls.get(namespace),
+        });
+        deferred = true;
+        continue;
+      }
+      log("info", "Config changed; unloading server", { namespace, reason: stale });
+      await disconnectFromUpstream(connection);
+      // Same teardown as an explicit deactivate -- one copy, so the three
+      // teardown sites can never drift over what survives an unload.
+      this.forgetNamespace(namespace);
+      deactivated++;
+    }
+    this.bundlesReconcilePending = deferred;
+    // A config change moves tools/list even when NOTHING was torn down: the
+    // deferred routes rebuildRoutes derives from getDeferredServers() come
+    // straight off this.config, so an ADDED server is new advertised surface
+    // with no connection involved. The discover memo needs no explicit
+    // invalidation -- configVersion is the first component of its cache key.
+    if (configChanged || deactivated > 0) {
+      await this.refreshRoutesAndNotify();
+    }
+  }
+
   private async notifyAllListsChanged(): Promise<void> {
     // Each send is independent — one failure shouldn't cancel the
     // others. Log so the failure is visible without throwing, since
@@ -1187,41 +1499,37 @@ export class ConnectServer {
     // errors allow startup with an empty config.
     const result = await loadLocalBundles({ cwd: process.cwd() }).catch((err: Error) => {
       log("warn", "loadLocalBundles failed; starting with empty config", { error: err?.message });
-      return { config: null, path: null, warnings: [] };
+      // consultedPaths:[] is load-bearing, not shape-padding. It is the watch
+      // set the lazy re-read stats, and an empty one disables reload for the
+      // session -- which is the honest answer when the loader threw before it
+      // could tell us which files it was going to read. Guessing the two
+      // canonical paths here would be a watch set no load ever confirmed.
+      return { config: null, path: null, warnings: [], consultedPaths: [] as string[] };
     });
     for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
     // Kept, not just logged -- see the field. handleDiscover renders these.
     this.configWarnings = result.warnings;
-    this.config = result.config ?? { servers: [], configVersion: "" };
-    // Deduplicate by namespace -- keep first occurrence. The routing
-    // state assumes one server per namespace, so a duplicate in
-    // bundles.json has to be filtered before it is ever read.
-    const seenNs = new Set<string>();
-    this.config.servers = this.config.servers.filter((s) => {
-      if (seenNs.has(s.namespace)) {
-        log("warn", "Duplicate namespace in bundles.json, skipping", { namespace: s.namespace });
-        return false;
-      }
-      seenNs.add(s.namespace);
-      return true;
-    });
-    this.configVersion = this.config.configVersion;
+    this.adoptConfig(result.config);
+    // Baseline for the lazy re-read at meta-tool boundaries. Taken from the
+    // loader's OWN report of what it consulted rather than from `path`, for
+    // the reasons LoadLocalBundlesResult.consultedPaths spells out.
+    this.rememberBundlesInputs(result.consultedPaths);
     log("info", "Loaded bundles", {
       path: result.path,
-      serverCount: this.config.servers.length,
+      serverCount: this.config?.servers.length ?? 0,
     });
     // Overlay cached compliance grades BEFORE anything reads the config,
     // so the routing state and every downstream grade reader see the same
     // graded server list.
     //
-    // NOTE: there is deliberately NO config "reconcile" step here. A
+    // There is still deliberately NO config "reconcile" step HERE. A
     // reconcileConfig method (deactivate servers removed/changed in a new
-    // config) lived at this call site for a long time, but bundles.json is
-    // read exactly ONCE per process (discover's own user-facing text says
-    // so) and start() runs before any connection can exist, so its entire
-    // diff/deactivate body was dead code with live-looking tests. If a
-    // hot-reload path ever lands, reintroduce it AS the reload handler --
-    // do not resurrect it here.
+    // config) lived at this call site for a long time and was dead code:
+    // start() runs before any connection can exist, so it had nothing to
+    // diff against. The instruction left behind was to reintroduce it AS the
+    // reload handler rather than resurrect it here, and that is where it now
+    // lives -- reconcileConfig is reached only from maybeReloadBundles, on
+    // the meta-tool boundary, where a connected set genuinely does exist.
     await this.hydrateComplianceGrades();
 
     // Prewarm the uv bootstrap if any configured server needs it. Fire
@@ -1565,6 +1873,15 @@ export class ConnectServer {
     // are assignable to this wider shape.
   ): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
     const progress = createProgressReporter(extra);
+    // THE meta-tool boundary. Everything about why it is here and not
+    // anywhere else is on maybeReloadBundles; the two load-bearing facts at
+    // this call site are that it runs BEFORE any branch below reads
+    // this.config, and that the guard excludes proxied tool calls -- which
+    // are exactly the calls a reload could invalidate.
+    // Cast for the same reason handleExec's preflight casts it: META_TOOL_NAMES
+    // is a Set over the literal meta-tool names and `name` is a client-supplied
+    // string. Widening `.has()` keeps the runtime check intact.
+    if ((META_TOOL_NAMES as Set<string>).has(name)) await this.maybeReloadBundles();
     if (name === META_TOOLS.discover.name) {
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
@@ -2427,7 +2744,17 @@ export class ConnectServer {
     // `discover(server: "gh")` followed inside the 3s TTL by
     // `discover(server: "pg")` replays gh's card labelled as pg's -- and the
     // back-to-back double call is exactly the pattern this memo exists for.
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}`;
+    // The config WARNINGS, which are not derivable from configVersion. The
+    // degraded-load path is the whole reason: a bundles.json that breaks
+    // mid-session swaps new warnings in and deliberately leaves the running
+    // config (and so configVersion) exactly where it was, so without this
+    // component discover replays the pre-break body for the rest of the TTL
+    // -- no warning, and a confident inventory of a file that no longer
+    // parses on disk. Keying beats invalidating at the one call site that
+    // moves them today: any future writer of configWarnings gets the
+    // invalidation for free instead of having to remember it.
+    const warningSignature = JSON.stringify(this.configWarnings);
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}|${warningSignature}`;
   }
 
   private buildDiscoverOutput(
@@ -2538,7 +2865,9 @@ export class ConnectServer {
     // rather than left on stderr, which no model reads.
     if (this.configWarnings.length > 0) {
       for (const w of this.configWarnings) lines.push(`! ${w}`);
-      lines.push("Fix bundles.json (or run `yaw-mcp doctor` for the full report), then restart this server.\n");
+      lines.push(
+        "Fix bundles.json (or run `yaw-mcp doctor` for the full report); the fix is picked up on the next mcp_connect_* call, with no client restart.\n",
+      );
     }
     lines.push(context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n");
     if (warmedNamespace) {
@@ -2913,7 +3242,7 @@ export class ConnectServer {
     // meta-tool.
     if (!focused && this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
       lines.push(
-        "Browse the catalog at https://yaw.sh/mcp/catalog/ and add servers with `yaw-mcp add <slug>` — they land in ~/.yaw-mcp/bundles.json and load on the next client restart.",
+        "Browse the catalog at https://yaw.sh/mcp/catalog/ and add servers with `yaw-mcp add <slug>` — they land in ~/.yaw-mcp/bundles.json and show up on your next mcp_connect_* call, with no client restart.",
       );
     }
 
@@ -3084,6 +3413,27 @@ export class ConnectServer {
     return { ok: false, isChanged: false, message: `"${namespace}" was not loaded — yaw-mcp is shutting down.` };
   }
 
+  /** The refusal for a connection that came up against config the user had
+   *  already changed. Says what moved and that a retry is the whole remedy --
+   *  the next activation reads the entry as it now stands, with no restart. */
+  private staleLaunchRefusal(
+    namespace: string,
+    reason: "removed" | "disabled" | "launch-config-changed",
+  ): { ok: false; message: string; isChanged: false } {
+    const what =
+      reason === "removed"
+        ? "was removed from bundles.json while it was loading"
+        : reason === "disabled"
+          ? 'was set to "isActive": false in bundles.json while it was loading'
+          : "changed while it was loading";
+    const next = reason === "launch-config-changed" ? ` Activate "${namespace}" again to load the current entry.` : "";
+    return {
+      ok: false,
+      isChanged: false,
+      message: `"${namespace}" ${what}, so the connection that just came up was already stale and has been closed.${next}`,
+    };
+  }
+
   // Evaluate the concurrent-server cap for one candidate namespace against
   // the CURRENT slot occupancy. Shared by runActivateOne and the prewarm
   // claim path in activateOne so the two can never disagree on what counts.
@@ -3177,7 +3527,7 @@ export class ConnectServer {
   // about to do with the server once it started.
   private spawnGateRefusal(server: UpstreamServerConfig, purpose: "activate" | "inspect its tools"): string | null {
     if (!server.isActive) {
-      return `"${server.namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and restart this MCP client to ${purpose}.`;
+      return `"${server.namespace}" is installed but disabled. Set "isActive": true for it in ~/.yaw-mcp/bundles.json and try again to ${purpose} -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
     }
     if (!profileAllows(this.profile, server.namespace)) {
       return `"${server.namespace}" is not allowed by the project profile at ${this.profile?.path}.`;
@@ -3326,8 +3676,9 @@ export class ConnectServer {
     try {
       // Merge any session-elicited env over the server's configured env.
       // Elicited values only apply inside this yaw-mcp process lifetime.
-      const elicited = this.elicitedEnv.get(namespace);
-      const effectiveConfig = elicited ? { ...serverConfig, env: { ...serverConfig.env, ...elicited } } : serverConfig;
+      // Through effectiveEntry so the staleness check below compares this
+      // child against the same shape it was launched from.
+      const effectiveConfig = this.effectiveEntry(serverConfig);
 
       let lastError: unknown = null;
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -3364,6 +3715,36 @@ export class ConnectServer {
           if (this.shuttingDown) {
             await disconnectFromUpstream(connection).catch(() => {});
             return this.shuttingDownRefusal(namespace);
+          }
+          // The config can also MOVE while a handshake is in flight, and
+          // reconcileConfig cannot see us here: it sweeps this.connections,
+          // which we are one line from entering. A namespace removed,
+          // disabled or relaunched during the handshake would land in the
+          // connected set AFTER the reconcile that would have reaped it, and
+          // nothing sweeps it again -- the session keeps serving a server the
+          // user has already replaced, for the rest of its life.
+          //
+          // This is the gate rather than making reconcileConfig aware of
+          // in-flight activations, and the difference is that this one cannot
+          // itself race. The check and the insert below are ONE synchronous
+          // block -- nothing awaits between them -- and every config swap
+          // lands behind an await inside maybeReloadBundles, so no reload can
+          // interleave. Teaching reconcile about pendingActivations instead
+          // would only let it DEFER (there is no connection to close yet),
+          // and the deferral is retried at the next meta-tool boundary, which
+          // may never come: the leak would shrink from permanent to unbounded
+          // rather than close.
+          // Compared against effectiveConfig, the shape THIS call launched
+          // from, rather than against connection.config: they are the same
+          // object in production (connectToUpstream stores what it was
+          // given), but the local is the one this scope actually owns, and
+          // reading it here does not make the gate depend on the connection
+          // faithfully echoing its own config back.
+          const stale = this.launchIsStale(namespace, effectiveConfig);
+          if (stale) {
+            log("info", "Config changed during activation; discarding the connection", { namespace, reason: stale });
+            await disconnectFromUpstream(connection).catch(() => {});
+            return this.staleLaunchRefusal(namespace, stale);
           }
           progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
           this.connections.set(namespace, connection);
@@ -3430,9 +3811,12 @@ export class ConnectServer {
         error: lastError instanceof Error ? lastError.message : String(lastError),
       });
 
-      // Record the failure so dispatch down-ranks this namespace for a
-      // few minutes. The TTL is short enough that a fixed server (user
-      // edited bundles.json env, for example) recovers on the next client restart.
+      // Record the failure so dispatch down-ranks this namespace for a few
+      // minutes. Recovery no longer waits on a client restart: a user who
+      // edits this server's env in bundles.json has that edit picked up at
+      // the next meta-tool boundary, and the successful activation that
+      // follows clears this record outright (see the delete on the success
+      // path). The TTL is the backstop for the case where they never retry.
       this.activationFailures.set(namespace, {
         at: Date.now(),
         message: lastError instanceof Error ? lastError.message : String(lastError),
@@ -3527,7 +3911,7 @@ export class ConnectServer {
       const promptsSoFar = this.credentialPrompts.get(namespace) ?? 0;
       const retryHint =
         promptsSoFar >= MAX_CREDENTIAL_PROMPTS
-          ? ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and restart this MCP client.`
+          ? ` No further prompts for "${namespace}" this session: set ${missing.join(", ")} in its "env" in ~/.yaw-mcp/bundles.json and activate again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`
           : ` Activate "${namespace}" again to try new ones.`;
       return {
         ok: false,
@@ -4126,17 +4510,18 @@ export class ConnectServer {
             : `from its "blocked" list`;
           edits.push(`remove ${quote(denied)} ${where}`);
         }
-        parts.push(`The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}.`);
+        parts.push(
+          `The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}. Restart this MCP client after editing the profile -- unlike bundles.json, profile config is read once per session.`,
+        );
       }
       if (disabled.length > 0) {
         // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
         // .yaw-mcp/bundles.json defines servers too, and a disabled one may
         // live only there.
         parts.push(
-          `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled.`,
+          `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled. The edit is picked up on the next mcp_connect_* call, with no client restart.`,
         );
       }
-      parts.push("Restart this MCP client after editing.");
       return {
         content: [{ type: "text", text: parts.join(" ") }],
         isError: true,
@@ -5032,7 +5417,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No curated bundles match your currently installed servers. Browse the catalog at https://yaw.sh/mcp/catalog/ and add what a bundle needs with `yaw-mcp add <slug>`, then restart this MCP client and re-run mcp_connect_bundles.",
+            text: "No curated bundles match your currently installed servers. Browse the catalog at https://yaw.sh/mcp/catalog/ and add what a bundle needs with `yaw-mcp add <slug>`, then re-run mcp_connect_bundles -- the new servers are picked up without a client restart.",
           },
         ],
       };

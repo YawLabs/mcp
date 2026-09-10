@@ -17,6 +17,7 @@ import { parseResetLearningArgs } from "../reset-learning-cmd.js";
 import { parseSearchArgs } from "../search-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
 import { parseSidecarsArgs } from "../sidecars-cmd.js";
+import { parseStatusArgs } from "../status-cmd.js";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
 import { parseTrustArgs } from "../trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs } from "../try-cmd.js";
@@ -448,6 +449,7 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   enable: parseSetArgs,
   disable: parseSetArgs,
   list: parseListArgs,
+  status: parseStatusArgs,
   sidecars: parseSidecarsArgs,
   trust: parseTrustArgs,
   try: parseTryArgs,

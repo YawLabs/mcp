@@ -3272,6 +3272,23 @@ describe("connectToUpstream activation failure categories", () => {
     expect(err.message).toContain("OAM-RT-OOM");
   });
 
+  it("points at the file to edit without ordering a restart", async () => {
+    // This suffix rides EVERY activation and connect failure into the text the
+    // LLM reads and relays, which makes it the most-read sentence yaw-mcp
+    // prints. "then restart this MCP client" was true while bundles.json was
+    // read once per process; it stopped being true when the file became a live
+    // re-read at meta-tool boundaries. Fix the entry on disk, send activate
+    // again, and it loads -- so the old wording was false at the exact moment
+    // a user is most likely to act on it.
+    _sdkBehavior.clientConnect = () => Promise.reject(new Error("spawn nope ENOENT"));
+
+    const err = await failedConnect(makeLocalConfig({ command: "nope" }));
+
+    expect(err.message).toContain('Fix in ~/.yaw-mcp/bundles.json under "test"');
+    expect(err.message).not.toMatch(/restart this MCP client/i);
+    expect(err.message).toContain("activate it again");
+  });
+
   it("wraps a resolver failure as an ActivationError carrying the config pointer", async () => {
     // The connect try/catch wraps client.connect() ONLY, so a throw out of
     // resolveUvSpawn (ensureUv: unsupported platform, download or checksum

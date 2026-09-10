@@ -611,7 +611,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
           `Note: ${shadow} overrides your user-global bundles.json, so this change won't take effect until you make it there or remove that file.`,
         );
       }
-      print("Restart your MCP client (or yaw-mcp) to apply.");
+      print("A running yaw-mcp applies it on its next mcp_connect_* call -- no client restart.");
     }
     return { exitCode: 0, written: changed ? [path] : [] };
   });

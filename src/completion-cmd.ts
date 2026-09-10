@@ -189,6 +189,12 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
   },
   { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--help"] },
   // Inspection.
+  // Flags mirror parseStatusArgs in src/status-cmd.ts -- keep them in sync.
+  {
+    name: "status",
+    description: "Print a read-only snapshot of servers, vault and learning",
+    flags: ["--json", "--help"],
+  },
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
   // `servers` is deliberately NOT here. It is still dispatched -- Yaw Terminal
   // shells out to `yaw-mcp servers --json` and reads signedIn:false from its

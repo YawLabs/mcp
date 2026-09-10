@@ -29,7 +29,7 @@
 // Path keys are built with join(), never POSIX literals: the SUT routes
 // through path.join, which yields backslashes on the Windows runner.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -112,9 +112,9 @@ import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME } from "../persistence.js";
 import { ConnectServer } from "../server.js";
-import { grantTrust } from "../trust.js";
+import { grantTrust, revokeTrust } from "../trust.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
-import { connectToUpstream } from "../upstream.js";
+import { connectToUpstream, disconnectFromUpstream } from "../upstream.js";
 import { ensureUv } from "../uv-bootstrap.js";
 
 const ENV_KEYS = [
@@ -206,6 +206,29 @@ function writeBundles(dir: string, servers: Array<Record<string, unknown>>): str
   const path = bundlesPathIn(dir);
   writeFileSync(path, JSON.stringify({ version: 1, servers }));
   return path;
+}
+
+/** Rewrite bundles.json and push its mtime forward.
+ *
+ *  The forward stamp is not cosmetic. The reload gate is mtime+size, and a
+ *  test rewrites a file within microseconds of the load it is supposed to
+ *  invalidate -- well inside NTFS's ~15ms timestamp granularity -- so a
+ *  same-size edit can land on the identical mtime and read as unchanged.
+ *  A real user's edit is seconds away from the load; this makes the fixture
+ *  match that rather than testing a race the feature never sees. */
+function rewriteBundles(dir: string, servers: Array<Record<string, unknown>>): string {
+  const path = writeBundles(dir, servers);
+  const ahead = new Date(Date.now() + 10_000);
+  utimesSync(path, ahead, ahead);
+  return path;
+}
+
+/** Corrupt bundles.json the way a half-finished save in an editor does. */
+function breakBundles(dir: string): void {
+  const path = bundlesPathIn(dir);
+  writeFileSync(path, '{"version": 1, "servers": [ {{{ ');
+  const ahead = new Date(Date.now() + 10_000);
+  utimesSync(path, ahead, ahead);
 }
 
 function serverEntry(namespace: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -879,5 +902,648 @@ describe("ConnectServer.start() — profile", () => {
     // Full exposure so the assertion is about the PROFILE, not about gateway
     // mode withholding the deferred placeholders of both namespaces alike.
     expect(await atFullExposure(() => listedUpstreamTools(priv))).toEqual(["allowed_allowed_live"]);
+  });
+});
+
+describe("ConnectServer -- live bundles.json reload", () => {
+  // Every test here drives the reload through the REAL meta-tool entry point
+  // (handleToolCall), against the REAL loader and the REAL trust gate on a
+  // real filesystem. That matters more here than anywhere else in this file:
+  // the whole feature is "what happens when the bytes on disk change", so a
+  // stubbed loader would test the mock's idea of a config change.
+
+  it("picks up a server added to bundles.json at the next meta-tool call", async () => {
+    // The headline behaviour: adding a server used to require killing the
+    // client session, and discover's own text said so.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+
+    // Not a direct call to the reload method -- through the meta-tool the
+    // model actually calls, so the boundary itself is what is under test.
+    await priv.handleToolCall("mcp_connect_discover", {});
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
+  });
+
+  it("tells the client its tool list moved when the config changed", async () => {
+    // An added server is new ADVERTISED surface even though nothing connected:
+    // the deferred routes come straight off this.config. Without the
+    // notification the client keeps serving a stale tools/list until something
+    // else happens to move it.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    const refresh = vi.spyOn(priv, "refreshRoutesAndNotify");
+
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("costs a stat and nothing more when bundles.json has not changed", async () => {
+    // The reason this is a lazy stat rather than a filesystem watcher: the
+    // common case is that nothing moved, and it must not turn every meta-tool
+    // call into a read + trust probe + parse.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    const applied = vi.spyOn(priv, "applyReloadedBundles");
+
+    await priv.handleToolCall("mcp_connect_discover", {});
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(applied).not.toHaveBeenCalled();
+  });
+
+  it("does not reload on a PROXIED tool call", async () => {
+    // The one call shape a reload could invalidate mid-flight. A proxied call
+    // runs entirely on the config that was live when it started; the boundary
+    // is meta-tools only, and this is the assertion that keeps it that way.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    // The shared fakeConnection stubs callTool with a bare vi.fn(), which
+    // resolves undefined; the proxy books the RESULT, so this one test needs a
+    // real reply to get through the path it is asserting about.
+    priv.connections.get("gh").client.callTool = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "ok" }],
+    });
+    const applied = vi.spyOn(priv, "applyReloadedBundles");
+
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    // A real proxied name, routed like any upstream tool call.
+    await priv.handleToolCall("gh_gh_live", {});
+
+    expect(applied).not.toHaveBeenCalled();
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+  });
+
+  it("unloads a connected server that the new config no longer defines", async () => {
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(priv.connections.has("gh")).toBe(true);
+
+    rewriteBundles(synthHome, [serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    // Both halves matter: the child process is gone AND the tools it was
+    // advertising have left the surface. Dropping the entry without the
+    // teardown would leave a live child nothing can route to.
+    expect(priv.connections.has("gh")).toBe(false);
+    expect(await atFullExposure(() => listedUpstreamTools(priv))).not.toContain("gh_gh_live");
+  });
+
+  it("unloads a connected server whose launch config changed", async () => {
+    // The live child is running the OLD argv. Leaving it up would serve the
+    // user's edit back to them as if it had not happened.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+    rewriteBundles(synthHome, [serverEntry("gh", { args: ["gh", "--new-flag"] })]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("keeps a connected server up when only its description changed", async () => {
+    // Presentation metadata is not a launch change. Killing a healthy child
+    // over a reworded description would make editing the file hostile.
+    writeBundles(synthHome, [serverEntry("gh", { description: "before" })]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+    rewriteBundles(synthHome, [serverEntry("gh", { description: "after" })]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(priv.config.servers[0].description).toBe("after");
+  });
+
+  it("unloads a connected server switched to isActive:false", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+    rewriteBundles(synthHome, [serverEntry("gh", { isActive: false })]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("never cuts an in-flight call, and retries the teardown at the next boundary", async () => {
+    // The judgement call this feature turns on. A concurrent meta-tool call
+    // must not close a connection a proxied call (or an exec pipeline) is
+    // using: the close rejects the caller's own pending tools/call, which is
+    // then booked as a 0.0 reliability outcome against a server that was
+    // answering normally and that WE killed.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    priv.inflightCalls.set("gh", 1);
+
+    rewriteBundles(synthHome, [serverEntry("gh", { args: ["gh", "--new-flag"] })]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.connections.has("gh")).toBe(true);
+
+    // And the deferral is not permanent. The fingerprint was already adopted
+    // by the re-read above, so without the pending flag this second boundary
+    // would see an unchanged file and skip the teardown forever -- leaving a
+    // connection running on config the user replaced.
+    priv.inflightCalls.delete("gh");
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("keeps the running config when bundles.json becomes unparseable", async () => {
+    // Saving a broken JSON must never blank the session.
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+    breakBundles(synthHome);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
+    expect(priv.connections.has("gh")).toBe(true);
+    // The break is not silent, though: discover renders configWarnings, so the
+    // model is told the file on disk is broken while the session keeps serving
+    // what it loaded.
+    expect(priv.configWarnings.join(" ")).toContain("invalid JSON");
+  });
+
+  it("does not re-parse an unchanged broken file on every meta-tool call", async () => {
+    // The fingerprint is adopted before the read is judged, so a file that
+    // stays broken costs one stat per boundary, not a parse per boundary.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    breakBundles(synthHome);
+    const applied = vi.spyOn(priv, "applyReloadedBundles");
+    await priv.handleToolCall("mcp_connect_health", {});
+    await priv.handleToolCall("mcp_connect_health", {});
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(applied).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers when the broken file is fixed", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    breakBundles(synthHome);
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
+  });
+
+  it("will not load an untrusted project bundles.json on reload", async () => {
+    // Reload must not become a way around the consent gate. A hostile repo
+    // that writes .yaw-mcp/bundles.json mid-session gets exactly what it gets
+    // at startup: ignored, and the user-global file left standing.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    rewriteBundles(synthCwd, [serverEntry("evil")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+  });
+
+  it("drops an APPROVED project file once its bytes change", async () => {
+    // The trust pin is over CONTENT, so editing an approved project file
+    // revokes its own approval. Reload has to honour that rather than carrying
+    // the old grant forward -- otherwise approving a project file once would
+    // approve every later edit to it, which is the smuggling path.
+    const projectPath = writeBundles(synthCwd, [serverEntry("proj")]);
+    await grantTrust(projectPath, readFileSync(projectPath), { home: synthHome });
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    // Baseline: the approved project file wins outright over user-global.
+    expect(namespacesOf(priv).sort()).toEqual(["proj"]);
+
+    rewriteBundles(synthCwd, [serverEntry("proj"), serverEntry("smuggled")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    // Not "proj + smuggled", and not "proj": the edited file is no longer
+    // approved at all, so the user-global file loads as if it were not there.
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+  });
+
+  it("dedupes a namespace duplicated by the RELOAD, not just by startup", async () => {
+    // The dedupe used to live inline in start(), where a duplicate could only
+    // ever arrive at startup. Reload is a second way in, and the routing state
+    // assumes one server per namespace either way -- so both paths share one
+    // copy of the filter. Without that sharing this is silent corruption
+    // reached through the newer door.
+    writeBundles(synthHome, [serverEntry("gh", { args: ["first"] })]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    rewriteBundles(synthHome, [serverEntry("gh", { args: ["first"] }), serverEntry("gh", { args: ["second"] })]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.config.servers.filter((x: UpstreamServerConfig) => x.namespace === "gh")).toHaveLength(1);
+    // First occurrence wins, matching what startup has always done.
+    expect(priv.config.servers[0].args).toEqual(["first"]);
+  });
+
+  it("keeps compliance grades on the servers a reload re-read", async () => {
+    // Grades come from ~/.yaw-mcp/grades.json and are OVERLAID onto the parsed
+    // entries -- validateEntry drops complianceGrade, so a freshly-parsed entry
+    // always arrives ungraded. Without re-overlaying them the reload would
+    // blank the [A]-[F] badge on every server it re-read and, worse, silently
+    // stop YAW_MCP_MIN_COMPLIANCE filtering (ungraded passes by default).
+    writeGrades({ gh: { grade: "A", score: 95 } });
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    expect(priv.config.servers.find((x: UpstreamServerConfig) => x.namespace === "gh").complianceGrade).toBe("A");
+
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.config.servers.find((x: UpstreamServerConfig) => x.namespace === "gh").complianceGrade).toBe("A");
+  });
+
+  it("stops re-invoking a loader that throws, and keeps the running config", async () => {
+    // The loader swallows its own I/O errors, so this path needs the seam.
+    // It is the ONE case the pre-read fingerprint adoption exists for: a throw
+    // returns before the loader can report which paths it consulted, so
+    // nothing downstream re-fingerprints, and the re-read would otherwise
+    // repeat on every meta-tool call for the rest of the session.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    // Set only AFTER start(), so the session has a real watch set to begin
+    // with and it is the RELOAD that meets the throw.
+    hoisted.bundlesError = new Error("injected loader failure");
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const applied = vi.spyOn(priv, "applyReloadedBundles");
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    await priv.handleToolCall("mcp_connect_health", {});
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(applied).toHaveBeenCalledTimes(1);
+    // And the throw cost the session nothing it already had.
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+  });
+
+  it("does not reload for a session whose startup load never reported a watch set", async () => {
+    // A ConnectServer that never ran start() (embedded hosts, most unit tests)
+    // has no confirmed watch set, and reload stays off rather than guessing at
+    // the canonical paths. This is what keeps the pre-reload behaviour of
+    // every such caller byte-identical.
+    const server = new ConnectServer();
+    servers.push(server);
+    const priv = server as any;
+    const applied = vi.spyOn(priv, "applyReloadedBundles");
+
+    writeBundles(synthHome, [serverEntry("gh")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(applied).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConnectServer -- reload vs. an activation already in flight", () => {
+  // reconcileConfig iterates this.connections, and connectToUpstream only
+  // inserts there once its handshake RESOLVES. A namespace whose entry is
+  // removed, disabled or relaunched during that handshake is therefore in
+  // nothing the reconcile can see, and the connection lands afterwards --
+  // permanently unreaped, still serving a server the user has already
+  // replaced. These tests hold the handshake open so the window is a fixture
+  // rather than a race.
+
+  /** Swap connectToUpstream for one that parks until the returned release is
+   *  called, so a test can put a whole config reload inside one handshake. */
+  function gateConnect(): () => void {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      await gate;
+      return fakeConnection(config, [`${config.namespace}_live`]);
+    }) as unknown as typeof connectToUpstream);
+    return release;
+  }
+
+  it("closes an in-flight activation whose server the reload removed", async () => {
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    // Pre-warm learns tool lists by connecting and disconnecting, so the
+    // disconnect assertions below have to start from a clean count.
+    vi.mocked(disconnectFromUpstream).mockClear();
+
+    const release = gateConnect();
+    const activating = priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await new Promise((r) => setImmediate(r));
+    expect(priv.connections.has("gh")).toBe(false);
+
+    // The user deletes the entry while the child is still handshaking. The
+    // reconcile this triggers has nothing to iterate for "gh".
+    rewriteBundles(synthHome, [serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_discover", {});
+    expect(namespacesOf(priv).sort()).toEqual(["linear"]);
+
+    release();
+    const res = await activating;
+
+    // Both halves: the connection never joins the session, and the child that
+    // did come up is actually closed rather than dropped on the floor.
+    expect(priv.connections.has("gh")).toBe(false);
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("gh");
+  });
+
+  it("closes an in-flight activation whose launch config the reload changed", async () => {
+    // Same window, the commoner edit: the entry survives but the child now
+    // running is on the OLD argv, which is exactly what reconcileConfig tears
+    // down for a connection that made it into the map in time.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    const release = gateConnect();
+    const activating = priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await new Promise((r) => setImmediate(r));
+
+    rewriteBundles(synthHome, [serverEntry("gh", { args: ["gh", "--new-flag"] })]);
+    await priv.handleToolCall("mcp_connect_discover", {});
+
+    release();
+    await activating;
+
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("closes an in-flight activation whose server the reload disabled", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    const release = gateConnect();
+    const activating = priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await new Promise((r) => setImmediate(r));
+
+    rewriteBundles(synthHome, [serverEntry("gh", { isActive: false })]);
+    await priv.handleToolCall("mcp_connect_discover", {});
+
+    release();
+    await activating;
+
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("keeps an in-flight activation the reload did not touch", async () => {
+    // The other direction, and the reason the gate is a launch-identity
+    // comparison rather than "did the config move at all": a reload triggered
+    // by an UNRELATED entry must not cost the user the server they are in the
+    // middle of loading.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    vi.mocked(disconnectFromUpstream).mockClear();
+
+    const release = gateConnect();
+    const activating = priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await new Promise((r) => setImmediate(r));
+
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_discover", {});
+
+    release();
+    await activating;
+
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("does not tear down a connection whose env was elicited this session", async () => {
+    // connection.config is the config the child was LAUNCHED from, which is
+    // the entry merged with any session-elicited credentials. Comparing a
+    // freshly-parsed entry against it directly reads every elicited server as
+    // "launch config changed" and reaps it on the next unrelated edit.
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    priv.elicitedEnv.set("gh", { GITHUB_TOKEN: "elicited-value" });
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(priv.connections.get("gh").config.env.GITHUB_TOKEN).toBe("elicited-value");
+
+    // An edit to a DIFFERENT server. "gh" itself is untouched on disk.
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear", { args: ["linear", "--x"] })]);
+    await priv.handleToolCall("mcp_connect_health", {});
+
+    expect(priv.connections.has("gh")).toBe(true);
+  });
+});
+
+describe("ConnectServer -- the discover memo vs. a config that broke under it", () => {
+  // buildDiscoverOutput memoizes its body for 3 seconds, keyed on
+  // configVersion + the focus/warm/filter signature. configWarnings is in
+  // NEITHER: the degraded-load path swaps new warnings in without moving
+  // configVersion, so for the whole TTL discover replays the pre-break body --
+  // telling the model everything is fine while bundles.json on disk is broken.
+  // The warnings are precisely the thing that must not be memoized away.
+
+  it("renders a warning raised since the memoized body was built", async () => {
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    // Fills the memo. Nothing is wrong yet, so the body carries no warning.
+    const before = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(before.content[0].text).not.toContain("invalid JSON");
+
+    breakBundles(synthHome);
+    const after = await priv.handleToolCall("mcp_connect_discover", {});
+
+    // The running config is deliberately KEPT (a half-saved edit must not
+    // blank the session), so the server list staying put is correct. What is
+    // not correct is saying nothing about the file on disk.
+    expect(priv.configWarnings.join(" ")).toContain("invalid JSON");
+    expect(after.content[0].text).toContain("invalid JSON");
+  });
+
+  it("drops the warning again once the file is fixed", async () => {
+    // The other direction: a stale WARNING outliving the break would be the
+    // same lie pointed the other way.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    breakBundles(synthHome);
+    expect((await priv.handleToolCall("mcp_connect_discover", {})).content[0].text).toContain("invalid JSON");
+
+    const fixed = writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const ahead = new Date(Date.now() + 20_000);
+    utimesSync(fixed, ahead, ahead);
+    expect((await priv.handleToolCall("mcp_connect_discover", {})).content[0].text).not.toContain("invalid JSON");
+  });
+
+  it("still memoizes a repeated discover when nothing moved", async () => {
+    // The fix must key the memo on the warnings, not defeat the memo. Two
+    // back-to-back discovers inside the TTL are the pattern it exists for.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    const build = vi.spyOn(priv, "buildDiscoverOutputImpl");
+
+    await priv.handleToolCall("mcp_connect_discover", {});
+    await priv.handleToolCall("mcp_connect_discover", {});
+
+    expect(build).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ConnectServer -- recovery from a bad entry needs no restart", () => {
+  // The behavioural half of the string audit. Every activation and connect
+  // failure carries "Fix in ~/.yaw-mcp/bundles.json under <ns>, then restart
+  // this MCP client" (upstream.ts, withConfigPointer) into the text the LLM
+  // reads and relays to the user. This is the test that says the second half
+  // of that sentence is false: fix the entry on disk, send activate again,
+  // and it loads.
+
+  it("loads a server after its bundles.json entry is fixed, without a restart", async () => {
+    writeBundles(synthHome, [serverEntry("brokensrv", { command: "definitely-not-a-binary" })]);
+    vi.mocked(connectToUpstream).mockImplementation((async (config: UpstreamServerConfig) => {
+      if (config.command === "definitely-not-a-binary") throw new Error("spawn definitely-not-a-binary ENOENT");
+      return fakeConnection(config, [`${config.namespace}_live`]);
+    }) as unknown as typeof connectToUpstream);
+
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    // The one fixed step before runActivateOne's single retry, zeroed so the
+    // failing activation below does not burn a real second.
+    priv.activationRetryDelayMs = 0;
+
+    const failed = await priv.handleToolCall("mcp_connect_activate", { server: "brokensrv" });
+    expect(failed.isError).toBe(true);
+    expect(priv.connections.has("brokensrv")).toBe(false);
+
+    // Exactly what the pointer tells the user to do, minus the restart.
+    rewriteBundles(synthHome, [serverEntry("brokensrv", { command: "echo" })]);
+    await priv.handleToolCall("mcp_connect_activate", { server: "brokensrv" });
+
+    expect(priv.connections.has("brokensrv")).toBe(true);
+  });
+});
+
+describe("ConnectServer -- the reload gate's documented blind spot", () => {
+  // bundlesSignature is mtime+size, so a rewrite that keeps the byte length
+  // and lands on the same filesystem tick reads as "nothing moved". The part
+  // worth pinning is not that the write is missed -- that is the documented
+  // heuristic -- but WHEN it stops being missed: the recorded pair never moves
+  // on its own, so no later boundary recovers it. Only another write does.
+
+  it("misses a same-size same-tick rewrite at every later boundary, not just the first", async () => {
+    const path = writeBundles(synthHome, [serverEntry("gh")]);
+    // Pin the mtime BEFORE the load so the recorded fingerprint is a value the
+    // test can reproduce exactly, rather than a stat it has to race.
+    const pinned = new Date(1_700_000_000_000);
+    utimesSync(path, pinned, pinned);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    expect(namespacesOf(priv)).toEqual(["gh"]);
+
+    // Same byte length, different content, restored to the same tick.
+    writeFileSync(path, readFileSync(path, "utf8").replaceAll("gh", "hg"));
+    utimesSync(path, pinned, pinned);
+
+    // Three boundaries, not one: the miss is PERMANENT, not deferred. A gate
+    // that merely postponed the read would recover here.
+    await priv.handleToolCall("mcp_connect_health", {});
+    await priv.handleToolCall("mcp_connect_discover", {});
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(namespacesOf(priv)).toEqual(["gh"]);
+
+    // And the escape is a WRITE, not a check -- the next one that moves the
+    // pair loads the file as it now stands, missed edit included.
+    rewriteBundles(synthHome, [serverEntry("hg"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(namespacesOf(priv).sort()).toEqual(["hg", "linear"]);
+  });
+});
+
+describe("ConnectServer -- what an explicit trust revoke does to a live session", () => {
+  // The two revocations are not the same event, and the comment on
+  // maybeReloadBundles used to claim they were.
+  //
+  //   IMPLICIT: edit an approved project bundles.json. The edit moves the
+  //   fingerprint AND breaks the content pin, so the reload drops the file --
+  //   live, at the next boundary. (Pinned by "drops an APPROVED project file
+  //   once its bytes change" above.)
+  //
+  //   EXPLICIT: `yaw-mcp trust --revoke`. It writes trusted.json, which is NOT
+  //   a consulted path, so nothing moves and the session keeps serving the
+  //   project file's servers until bundles.json is next written or the client
+  //   restarts -- which is exactly what the CLI tells the user to do.
+  //
+  // Pinned rather than left to the comment, because the comment being wrong
+  // about it is the whole finding.
+
+  it("keeps serving a revoked project config until the file itself moves", async () => {
+    const projectPath = writeBundles(synthCwd, [serverEntry("proj")]);
+    await grantTrust(projectPath, readFileSync(projectPath), { home: synthHome });
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    expect(namespacesOf(priv)).toEqual(["proj"]);
+
+    const revoked = await revokeTrust(projectPath, { home: synthHome });
+    expect(revoked.removed).toBe(true);
+
+    // No boundary picks it up: the trust store is not part of the watch set,
+    // so from the reload gate's point of view nothing happened.
+    await priv.handleToolCall("mcp_connect_health", {});
+    await priv.handleToolCall("mcp_connect_discover", {});
+    expect(namespacesOf(priv)).toEqual(["proj"]);
+
+    // A write to a CONSULTED path is what re-runs the consent gate, and the
+    // now-unapproved project file loses to user-global there.
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
+  });
+
+  it("says so in the comment that used to claim revocation was live", async () => {
+    // A behaviour this surprising is only safe while the paragraph next to it
+    // is honest; "revocation does not [wait]" was true of the implicit form and
+    // false of the explicit one, which is the half a reader acts on.
+    const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    const start = src.indexOf("   *  TRUST: the re-read goes through loadLocalBundles");
+    const end = src.indexOf("   *  FAILURE: a re-read that fails NEVER blanks");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const paragraph = src.slice(start, end);
+
+    expect(paragraph).not.toContain("revocation does not");
+    expect(paragraph).toContain("--revoke");
   });
 });

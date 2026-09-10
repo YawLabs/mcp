@@ -46,6 +46,7 @@ export const KNOWN_SUBCOMMANDS = [
   "enable",
   "disable",
   "list",
+  "status",
   "doctor",
   "reset-learning",
   "servers",

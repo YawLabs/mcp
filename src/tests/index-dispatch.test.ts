@@ -409,6 +409,27 @@ const UNDOCUMENTED_INTERNAL_ENV = new Set([
   "XDG_CACHE_HOME",
 ]);
 
+describe("--help config-resolution block", () => {
+  it("scopes the restart instruction to config.json and exempts bundles.json", async () => {
+    // The block heads a list of config.json paths and then says "yaw-mcp reads
+    // config at startup. Restart the MCP client ... after editing any config."
+    // That is TRUE of config.json -- the profile really is read once per
+    // session -- and FALSE of bundles.json, which is now re-read at every
+    // meta-tool boundary. "any config" is the word that makes one sentence
+    // cover both, so the block has to name which file it means.
+    const src = await readFile(INDEX_SRC, "utf8");
+    const start = src.indexOf("Config resolution");
+    expect(start).toBeGreaterThan(-1);
+    const block = src.slice(start, start + 900);
+
+    expect(block).toContain("config.json");
+    expect(block).not.toContain("after editing any config");
+    // And it says the other half out loud rather than leaving the reader to
+    // infer it from a section heading.
+    expect(block).toContain("bundles.json");
+  });
+});
+
 describe("--help environment variable coverage", () => {
   it("documents every live env knob", async () => {
     // The old shape checked four hardcoded names (YAW_MCP_REWARD_GRADER,

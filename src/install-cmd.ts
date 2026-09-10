@@ -329,7 +329,7 @@ function logInstallTail(
   log("Servers: none configured yet -- yaw-mcp will start with nothing to serve.");
   log(
     "  Add one with `yaw-mcp add <slug>` (browse the catalog at https://yaw.sh/mcp/catalog/); it lands in " +
-      `${bundles.path}, and yaw-mcp reads that file once at startup -- so add before you restart.`,
+      `${bundles.path}, and a running yaw-mcp picks it up on its next mcp_connect_* call -- no client restart.`,
   );
 }
 

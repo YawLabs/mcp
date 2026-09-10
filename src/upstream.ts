@@ -922,13 +922,20 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
  * (#server-<id>); that dashboard is gone and the URL 404s, so naming the local
  * file and namespace is both accurate and more actionable -- the LLM can tell
  * the user exactly what to open.
+ *
+ * It does NOT order a restart. This suffix rides every activation and connect
+ * failure into the text the LLM reads and relays, so it is the most-read
+ * sentence yaw-mcp prints -- and "then restart this MCP client" stopped being
+ * true when bundles.json became a live re-read at meta-tool boundaries. The
+ * fixed entry is loaded by the next activate, which is both cheaper and the
+ * thing the reader was about to do anyway.
  */
 function withConfigPointer(message: string, config: UpstreamServerConfig): string {
   if (!config.namespace) return message;
   // ASCII arrow on purpose: this suffix rides every activation error into the
   // stderr log, and a `->` survives a Windows console codepage where the
   // Unicode arrow renders as mojibake and then gets pasted into bug reports.
-  return `${message} -> Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
+  return `${message} -> Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
 }
 
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {

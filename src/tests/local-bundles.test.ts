@@ -17,6 +17,7 @@ import {
   BUNDLES_FILENAME,
   BUNDLES_LOCK_NAME,
   BUNDLES_LOCK_WAIT_MS,
+  bundlesSignature,
   loadLocalBundles,
   localBundlesPath,
   NAMESPACE_RE,
@@ -1556,5 +1557,83 @@ describe("cross-process bundles.json lock", () => {
     const res = await removeUserBundle("nothing", { home: synthHome });
     expect(res.removed).toBe(false);
     expect(existsSync(configDir())).toBe(false);
+  });
+});
+
+describe("bundlesSignature", () => {
+  function p(name: string): string {
+    return join(synthHome, name);
+  }
+
+  it("changes when a consulted file's content changes, and is stable when nothing moves", () => {
+    writeFileSync(p("a.json"), "one");
+    const before = bundlesSignature([p("a.json")]);
+    expect(bundlesSignature([p("a.json")])).toBe(before);
+    // utimes, not a bare write: the whole point of the size term is to catch a
+    // rewrite the mtime alone would miss, and a same-tick same-size rewrite is
+    // exactly the case a test that only edits content cannot distinguish. Two
+    // different lengths AND a moved mtime is what a real edit looks like.
+    writeFileSync(p("a.json"), "one-longer");
+    utimesSync(p("a.json"), new Date(), new Date(Date.now() + 5_000));
+    expect(bundlesSignature([p("a.json")])).not.toBe(before);
+  });
+
+  it("distinguishes a file that does not exist yet from one that does", () => {
+    // Creating a project bundles.json where there was none MUST move the
+    // signature: absence is part of the load's verdict, so a caller gating a
+    // re-read on this would otherwise never notice the new file.
+    const absent = bundlesSignature([p("later.json")]);
+    writeFileSync(p("later.json"), "{}");
+    expect(bundlesSignature([p("later.json")])).not.toBe(absent);
+  });
+
+  it("collides on a same-size rewrite inside one mtime tick -- and says so", () => {
+    // The documented blind spot, pinned rather than left implicit. mtime+size
+    // is a heuristic: a rewrite that keeps the byte length and lands on the
+    // same filesystem tick is indistinguishable from no write at all. Measured
+    // at 213 of 300 back-to-back same-size writes colliding on (mtimeMs, size)
+    // on this filesystem, and constructible outright by restoring the tick.
+    writeFileSync(p("same.json"), "aaaa");
+    const pinned = new Date(1_700_000_000_000);
+    utimesSync(p("same.json"), pinned, pinned);
+    const before = bundlesSignature([p("same.json")]);
+
+    writeFileSync(p("same.json"), "bbbb");
+    utimesSync(p("same.json"), pinned, pinned);
+
+    expect(readFileSync(p("same.json"), "utf8")).toBe("bbbb");
+    expect(bundlesSignature([p("same.json")])).toBe(before);
+  });
+
+  it("documents that a missed change is missed until the next WRITE, not the next check", () => {
+    // "Missed until the next boundary" and "missed until the file is written
+    // again" are different promises, and only the second one is true: the
+    // recorded pair never moves on its own, so no later check recovers a
+    // collision -- see the server-level pin in server-start.test.ts. The
+    // heuristic is defensible; an inaccurate comment about it is not, which is
+    // why the doc claim is asserted here rather than trusted.
+    const src = readFileSync(new URL("../local-bundles.ts", import.meta.url), "utf8");
+    const start = src.indexOf("/** Cheap change-detector");
+    const end = src.indexOf("export function bundlesSignature");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const doc = src.slice(start, end);
+    expect(doc).toContain("no later");
+    expect(doc).toContain("written again");
+  });
+
+  it("keeps two identically-shaped files apart by path", () => {
+    // Same size AND the same forced mtime, so the mtime+size term alone is
+    // byte-identical for both -- the path in each term is the ONLY thing
+    // telling them apart. Without it the project and global candidates
+    // collide whenever they happen to match in shape, and swapping which one
+    // the loader consulted (consultedPaths documents its order as part of its
+    // contract: project first, global last) reads as "nothing moved".
+    writeFileSync(p("x.json"), "xx");
+    writeFileSync(p("y.json"), "xx");
+    const pinned = new Date(1_700_000_000_000);
+    utimesSync(p("x.json"), pinned, pinned);
+    utimesSync(p("y.json"), pinned, pinned);
+    expect(bundlesSignature([p("x.json"), p("y.json")])).not.toBe(bundlesSignature([p("y.json"), p("x.json")]));
   });
 });

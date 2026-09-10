@@ -1419,6 +1419,10 @@ describe("runAdd re-add preserves user state", () => {
     expect(r.exitCode).toBe(0);
     expect(io.text()).toMatch(/stays disabled and will NOT load/);
     expect(io.text()).not.toMatch(/Restart your MCP client/);
+    // And no live-pickup claim either: a disabled entry never loads, so
+    // "picked up on the next call" would be exactly as wrong as the restart
+    // line it replaced.
+    expect(io.text()).not.toContain("no client restart");
   });
 
   // The dry run has to say the SAME thing about a hand-disabled entry. It
@@ -1489,7 +1493,7 @@ describe("runAdd re-add preserves user state", () => {
     expect(dry.entry.args).toEqual(["-y", "@yawlabs/fetch-mcp"]);
   });
 
-  it("still tells the user to restart when the entry is enabled", async () => {
+  it("tells the user a running broker will pick it up when the entry is enabled", async () => {
     // Counterweight: the note above must not swallow the normal line, or
     // every ordinary add loses its only next-step instruction.
     const io = captureIO();
@@ -1503,7 +1507,11 @@ describe("runAdd re-add preserves user state", () => {
       err: (s) => io.err.push(s),
     });
     expect(r.exitCode).toBe(0);
-    expect(io.text()).toMatch(/Restart your MCP client/);
+    // Not "Restart your MCP client (or yaw-mcp) to pick it up." A running
+    // broker re-reads bundles.json at its next meta-tool boundary, so the
+    // restart the line ordered is work nobody has to do any more.
+    expect(io.text()).not.toMatch(/Restart your MCP client/);
+    expect(io.text()).toContain("no client restart");
     expect(io.text()).not.toMatch(/stays disabled/);
   });
 
@@ -1639,6 +1647,11 @@ describe("runRemove", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(io.text()).toMatch(/Removed "legacy_gh"/);
+    // A running broker reconciles the removal itself -- it unloads the server
+    // at its next meta-tool boundary -- so "Restart your MCP client to apply"
+    // was ordering a step that had stopped being necessary.
+    expect(io.text()).not.toMatch(/Restart your MCP client/);
+    expect(io.text()).toContain("no client restart");
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(loaded.config?.servers ?? []).toHaveLength(0);
   });

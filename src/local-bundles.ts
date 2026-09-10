@@ -39,7 +39,7 @@
 // (YAW_MCP_DEFAULT_RUNTIME env > this file's defaultRuntime > unset).
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -776,6 +776,66 @@ export interface LoadLocalBundlesResult {
    *  and a project candidate, when the walk found one, is first. A caller can
    *  therefore tell the two apart without re-deriving either path. */
   consultedPaths: string[];
+}
+
+/** Cheap change-detector over a `consultedPaths` set: mtime + size of each
+ *  path, in the order given, joined. A path that cannot be stat'ed (never
+ *  existed, deleted, or its directory became unreadable) contributes a fixed
+ *  absent marker rather than being skipped, so CREATING a file that was
+ *  absent at load changes the signature -- the absence of a project
+ *  bundles.json is part of the verdict (see consultedPaths), and skipping it
+ *  would make "the user just added a project file" indistinguishable from
+ *  "nothing moved".
+ *
+ *  Size rides along with mtime because filesystem timestamp granularity is
+ *  coarse (~15ms on NTFS): two writes inside one tick can share an mtime, and
+ *  the pair is far less likely to collide than mtime alone. It is still a
+ *  heuristic, not a hash -- a same-size rewrite inside one mtime tick reads as
+ *  unchanged. Callers that need certainty about the CONTENT compare the
+ *  configVersion of a completed load instead; this exists only to keep the
+ *  common case (nothing changed) at one stat per path rather than a parse.
+ *
+ *  HOW LONG A MISSED WRITE STAYS MISSED, precisely, because "missed" alone
+ *  reads as "missed for a moment": the caller stores the pair this returned
+ *  and compares every later check against that SAME stored pair, so a
+ *  collision is not deferred to the next check -- no later check recovers it.
+ *  It is missed until the file is written again in a way that DOES move the
+ *  pair, and if the colliding write was the user's last edit, that is for the
+ *  rest of the process. Two pins hold this: the collision itself in
+ *  local-bundles.test.ts, and the across-boundaries permanence in
+ *  server-start.test.ts.
+ *
+ *  A content hash is NOT the fix, and the reason is worth stating so it is not
+ *  re-proposed: hashing costs the read this stat exists to avoid, and it
+ *  cannot be made conditional, because the collision case (same mtime, same
+ *  size, different bytes) is byte-for-byte indistinguishable BY STAT from the
+ *  steady state (nothing changed at all) -- which is every boundary. A
+ *  condition like "hash when the recorded mtime is within the granularity
+ *  window" narrows that to writes made very recently, but still does not cover
+ *  the constructible case (utimes, `rsync -t`, a restore-from-backup restoring
+ *  an old timestamp onto new bytes at any later time), so the limitation above
+ *  would have to be documented anyway. Paying a read on the hot path for a
+ *  mitigation that does not remove the caveat is the worse trade.
+ *
+ *  Sync on purpose: the whole point is that it is cheaper than the read it
+ *  gates, and the callers are on a request path where an extra microtask per
+ *  path buys nothing.
+ *
+ *  A near-identical private helper lives in default-runtime.ts. It is NOT
+ *  imported here and this is not an oversight: default-runtime.ts imports
+ *  loadLocalBundles from this module, so the reverse import would close a
+ *  cycle. */
+export function bundlesSignature(paths: string[]): string {
+  return paths
+    .map((path) => {
+      try {
+        const s = statSync(path);
+        return `${path}=${s.mtimeMs}:${s.size}`;
+      } catch {
+        return `${path}=absent`;
+      }
+    })
+    .join("|");
 }
 
 /** Load bundles.json from the canonical locations. An APPROVED project-local

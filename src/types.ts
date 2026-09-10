@@ -97,6 +97,52 @@ export function isRemoteEntry(entry: { type?: string; command?: string; url?: st
   return entry.type === "remote" || (!entry.command && entry.url !== undefined);
 }
 
+/** Everything about an entry that decides WHAT a fresh activation would
+ *  start: the process (command/args/env/runtime) or the endpoint (url/headers/
+ *  transport), plus the connect timeout the attempt would run under. Two
+ *  entries with the same launch identity produce the same upstream, so a live
+ *  connection to one is a live connection to the other.
+ *
+ *  Deliberately EXCLUDES `name`, `description`, `toolCache`, `complianceGrade`
+ *  and `isActive`. The first four are presentation and ranking metadata -- a
+ *  reworded description must never cost the user a running server -- and
+ *  `isActive` is a separate question the caller asks on its own (a server
+ *  switched to false has to come down even though its launch identity is
+ *  untouched), so folding it in here would blur "the config for this server
+ *  moved" into "the user turned it off".
+ *
+ *  `env` and `headers` are serialized with their keys SORTED. JSON.stringify
+ *  preserves insertion order, so a bundles.json rewrite that emits the same
+ *  pairs in a different order would otherwise read as a changed launch and
+ *  tear down a healthy connection for nothing. Values are compared, not
+ *  hashed: a `${secret:NAME}` ref is compared as the ref it is, so rotating
+ *  the VALUE behind an unchanged ref does not read as a config change (the
+ *  ref resolves at connect time, so a rotation is picked up by the next
+ *  activation either way).
+ *
+ *  It lives here, beside isRemoteEntry, for the same reason that one does:
+ *  this module owns UpstreamServerConfig and imports nothing at runtime, so
+ *  every surface that has to agree on the answer can reach it. */
+export function launchIdentity(entry: UpstreamServerConfig): string {
+  const stableMap = (m: Record<string, string> | undefined): Array<[string, string]> =>
+    m === undefined
+      ? []
+      : Object.keys(m)
+          .sort()
+          .map((k) => [k, m[k]] as [string, string]);
+  return JSON.stringify([
+    entry.type,
+    entry.transport ?? null,
+    entry.command ?? null,
+    entry.args ?? null,
+    stableMap(entry.env),
+    entry.url ?? null,
+    stableMap(entry.headers),
+    entry.connectTimeoutMs ?? null,
+    entry.runtime ?? null,
+  ]);
+}
+
 export interface ConnectConfig {
   servers: UpstreamServerConfig[];
   configVersion: string;
