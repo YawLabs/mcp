@@ -38,7 +38,7 @@ const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
 // thing teaches it -- the rule that already hides `--token`. The dedicated
 // test below pins that it stays dispatched AND stays uncompleted.
 const DISPATCHED_SUBCOMMANDS = KNOWN_SUBCOMMANDS.filter(
-  (s) => !(FLAG_ALIASES as readonly string[]).includes(s) && s !== "help" && s !== "servers",
+  (s) => !(FLAG_ALIASES as readonly string[]).includes(s) && s !== "help",
 );
 
 function capture(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
@@ -491,12 +491,15 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     expect(stale).toEqual([]);
   });
 
-  it("does not complete the deprecated `servers` stub, which stays dispatched for Yaw Terminal", () => {
-    // Completing a deprecated thing teaches it (the rule that hides --token).
-    // The subcommand itself must NOT go: Yaw Terminal shells out to
-    // `yaw-mcp servers --json` and derives signedIn:false from its exit code.
+  it("does not dispatch or complete `servers`, which was deleted", () => {
+    // This used to assert the opposite half -- uncompleted but STILL
+    // DISPATCHED -- because Yaw Terminal shelled out to `yaw-mcp servers
+    // --json` and read signedIn:false from its exit code. That app-side spawn
+    // is gone and the stub went with it, so the verb must now be absent from
+    // BOTH lists. A retired-verb signpost in index.ts still points anyone who
+    // types it at `yaw-mcp list`; see cli-dispatch.test.ts.
     expect(SUBCOMMAND_NAMES).not.toContain("servers");
-    expect([...KNOWN_SUBCOMMANDS]).toContain("servers");
+    expect([...KNOWN_SUBCOMMANDS]).not.toContain("servers");
   });
 
   it("specs foundry (previously dispatched but absent from the completion spec)", () => {

@@ -49,7 +49,6 @@ export const KNOWN_SUBCOMMANDS = [
   "status",
   "doctor",
   "reset-learning",
-  "servers",
   "sidecars",
   "bundles",
   "completion",
@@ -68,6 +67,31 @@ export const KNOWN_SUBCOMMANDS = [
  * flag aliases are stripped (those are handled by `suggestFlag`).
  * Returns up to `limit` names, best first; [] when nothing is close.
  */
+/**
+ * Verbs that USED to exist, mapped to what replaced them.
+ *
+ * Deleting a command is not the same as it never having existed. `servers`
+ * shipped for months, was documented, and was a deprecation stub for months
+ * more precisely so a user who typed it landed somewhere useful rather than on
+ * "unknown subcommand" -- its own header called itself a signpost. Removing the
+ * stub removed the signpost with it, and edit distance does not recover it:
+ * `servers` is 4 edits from `secrets` and 5 from `status`, so closestNames
+ * offers NOTHING and the user is told to go read --help.
+ *
+ * This keeps the signpost without keeping the command. The entry costs one line
+ * and no dispatch surface, and it is the honest answer to "where did it go".
+ */
+const RETIRED_SUBCOMMANDS: ReadonlyMap<string, string> = new Map([
+  // Listed the servers on a Yaw MCP ACCOUNT. Account mode is gone -- the hosted
+  // backend is decommissioned -- so the local equivalent is the answer.
+  ["servers", "list"],
+]);
+
+/** What replaced a retired verb, or null if the input never named one. */
+export function retiredSubcommandReplacement(input: string): string | null {
+  return RETIRED_SUBCOMMANDS.get(input.toLowerCase()) ?? null;
+}
+
 export function suggestSubcommand(input: string, limit = 3): string[] {
   const visible = KNOWN_SUBCOMMANDS.filter((s) => !s.startsWith("-"));
   return closestNames(input, visible, limit);

@@ -205,6 +205,21 @@ describe("CLI dispatch -- argv errors go to stderr and exit 2", () => {
     expect(r.stderr).toContain("doctor");
   });
 
+  it("points a RETIRED subcommand at what replaced it", () => {
+    // `servers` shipped for months and was then a deprecation stub for months
+    // more, precisely so someone who typed it landed somewhere useful -- its own
+    // header called itself a signpost. Deleting the stub removed the signpost
+    // with it, and edit distance cannot recover this one: `servers` is 4 edits
+    // from `secrets` and 5 from `status`, so the typo path offers nothing and
+    // the user is told to go read --help. This is the replacement signpost.
+    const r = runCli(["servers"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('unknown subcommand "servers"');
+    expect(r.stderr).toContain("yaw-mcp list");
+    // Named as removed, not as a typo -- the user typed a real former command.
+    expect(r.stderr).not.toContain("Did you mean");
+  });
+
   it("suggests the closest flag for a long-flag typo", () => {
     // Without this branch the argv would fall through to runServer() and hang
     // as a stdio MCP server with no diagnostic -- so exiting at all is the
