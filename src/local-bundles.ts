@@ -144,7 +144,15 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // A url+command entry is NOT inferred -- that is genuinely ambiguous, and an
   // explicit `"type"` is the only honest way to resolve it, so it keeps the
   // "local" default and the connector's own error stands.
-  const inferredRemote = e.type === undefined && typeof e.url === "string" && typeof e.command !== "string";
+  // A BLANK command counts as no command. `typeof "" === "string"`, so a
+  // `typeof` test alone let `{ url, command: "" }` fall back to "local" here
+  // while isRemoteEntry (types.ts) called it remote via `!entry.command` --
+  // reopening the exact reader disagreement this inference exists to close,
+  // on the shape a hand-edit most plausibly produces (clearing the command
+  // field rather than deleting the key). Both sides now agree that an empty
+  // command is no command.
+  const hasCommand = typeof e.command === "string" && e.command.trim() !== "";
+  const inferredRemote = e.type === undefined && typeof e.url === "string" && !hasCommand;
   const type: "local" | "remote" = e.type === "remote" || inferredRemote ? "remote" : "local";
   const transport =
     e.transport === "streamable-http" || e.transport === "sse" || e.transport === "stdio"
