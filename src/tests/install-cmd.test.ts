@@ -639,7 +639,7 @@ describe("runInstall -- bundles.json summary", () => {
       oamProbe: OAM_ABSENT,
       bundlesSummary: BUNDLES_FORBIDDEN,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(cap.stdout()).not.toContain("Servers:");
   });
 
@@ -1400,7 +1400,11 @@ describe("runInstall — preserves existing entries", () => {
 });
 
 describe("runInstall — collision handling", () => {
-  it("non-TTY without --force/--skip refuses with exit 1 when entry exists", async () => {
+  // Exit 2, not 1, since the ship-readiness pass: a confirmation that cannot
+  // be asked for off a TTY is a usage refusal, and `remove`, `set`,
+  // `uninstall` and `secrets remove` all return 2 for exactly that. install
+  // was the outlier. 1 still means the run tried and failed.
+  it("non-TTY without --force/--skip refuses with exit 2 when entry exists", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
@@ -1414,7 +1418,7 @@ describe("runInstall — collision handling", () => {
       io: { ...cap.io, isTTY: false },
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/already has/);
     // Original entry untouched.
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
@@ -3598,7 +3602,7 @@ describe("runInstall — Runtime line ordering", () => {
       io: cap.io,
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/stdin is not a TTY/);
     expect(r.messages.join("\n")).not.toMatch(/Runtime:/);
     expect(cap.stdout()).not.toMatch(/Runtime:/);
@@ -3956,7 +3960,7 @@ describe("runInstall — idempotence (re-run over an entry that already matches)
       io: { ...cap.io, isTTY: false },
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toContain("type: would be removed");
   });
 
@@ -4079,7 +4083,7 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
       io: { ...cap.io, isTTY: false },
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toContain(`already has a "${ENTRY_NAME}" entry and stdin is not a TTY`);
     expect(cap.stderr()).toContain('command: "old-broker" -> "npx"');
     expect(cap.stderr()).toContain("args:");
@@ -4099,7 +4103,7 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
       io: { ...cap.io, isTTY: false },
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     // The env is CARRIED OVER, so it is not part of the diff at all here --
     // and either way the secret must not appear.
     expect(cap.stderr()).not.toContain("hunter2");
@@ -4763,5 +4767,106 @@ describe("removePermissionsAllow", () => {
       CLAUDE_CODE_ALLOW_PATTERN,
     ]);
     expect(out).toEqual({ permissions: { allow: [] } });
+  });
+});
+
+// --- ship-readiness gaps ----------------------------------------------------
+
+describe("INSTALL_USAGE -- the flags in the synopsis are explained", () => {
+  it("says what --force, --skip and --dry-run do", () => {
+    // They appear in the synopsis line, so a reader knows they exist and has
+    // no way to learn what they do -- and two of the three decide what happens
+    // to an entry that is already in the user's config.
+    for (const phrase of ["--force", "--skip", "--dry-run"]) {
+      expect(INSTALL_USAGE).toContain(phrase);
+    }
+    // Not just NAMED: each carries a description on its own line.
+    const explained = INSTALL_USAGE.split("\n").filter((l) => /^\s+--(force|skip|dry-run)\b/.test(l));
+    expect(explained.length).toBeGreaterThanOrEqual(3);
+    for (const line of explained) {
+      // "  --force   <something>" -- the flag plus prose, not a bare mention.
+      expect(line.replace(/^\s+--[a-z-]+\s*/, "").length).toBeGreaterThan(10);
+    }
+  });
+});
+
+describe("runInstall -- off-TTY collision exit code", () => {
+  it("refuses with 2, the code every other off-TTY confirmation refusal uses", async () => {
+    // `remove`, `set`, `uninstall` and `secrets remove` all exit 2 when a
+    // confirmation is required and there is no TTY to ask on; install alone
+    // exited 1, so a script could not tell "needs a flag" from "the write
+    // failed" without parsing prose.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.stderr()).toMatch(/stdin is not a TTY/);
+    // Still a refusal, not a write.
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
+  it("keeps a genuine write FAILURE distinguishable at exit 1", async () => {
+    // The point of moving the collision to 2: 1 stays "the run tried and
+    // failed". A malformed client config is that case.
+    writeFileSync(join(synthHome, ".claude.json"), "{ not json");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+  });
+});
+
+describe("a DIRECTORY at the client config path", () => {
+  it("is named as a directory by install, not as a raw errno", async () => {
+    // `add` already says "is a directory, not a file -- move or remove it".
+    // install surfaced "cannot read <path>: EISDIR: illegal operation on a
+    // directory, read", which reads as a permissions fault and sends the user
+    // to chmod something that is not a file.
+    mkdirSync(join(synthHome, ".claude.json"), { recursive: true });
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain("is a directory, not a file");
+    expect(cap.stderr()).not.toContain("EISDIR");
+  });
+
+  it("is named the same way by uninstall", async () => {
+    mkdirSync(join(synthHome, ".claude.json"), { recursive: true });
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: { ...cap.io, isTTY: false },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain("is a directory, not a file");
+    expect(cap.stderr()).not.toContain("EISDIR");
   });
 });

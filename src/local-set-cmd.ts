@@ -27,9 +27,16 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { editJsoncPath, parseJsonc } from "./jsonc.js";
-import { deriveNamespace, findShadowingProjectBundles, localBundlesPath, withBundlesLock } from "./local-bundles.js";
+import {
+  deriveNamespace,
+  findShadowingProjectBundles,
+  isRemoteEntry,
+  localBundlesPath,
+  withBundlesLock,
+} from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
+import type { UpstreamServerConfig } from "./types.js";
 import { MAX_TIMEOUT_MS } from "./upstream.js";
 
 export const SET_USAGE = `Usage: yaw-mcp set <slug-or-namespace> <key=value> [<key=value> ...] [flags]
@@ -55,12 +62,16 @@ Settable keys:
                         verbatim, so \`description=true\` stores the word.
                         \`description=\` clears it.
   env.KEY=<value>       Set ONE environment variable, leaving the rest of this
-                        server's env alone. \`env.KEY=\` REMOVES that variable --
-                        a stored value does not come back, so that clear is
-                        confirmed on a TTY. For a real credential, store it
-                        with \`yaw-mcp secrets set NAME\` and set
+                        server's env alone. \`env.KEY=\` REMOVES that variable.
+                        A stored value does not come back either way, so
+                        REPLACING one is confirmed on a TTY just as clearing it
+                        is. For a real credential, store it with
+                        \`yaw-mcp secrets set NAME\` and set
                         env.KEY='\${secret:NAME}' instead: the vault resolves it
                         at launch and only the reference is written.
+                        Local (stdio) servers only -- a remote server spawns no
+                        process, so its credentials live in "headers" and this
+                        key is refused on one.
 
   Every other key is refused, including namespace, command, args, url,
   transport and type: those decide which program yaw-mcp spawns as you, and
@@ -69,9 +80,13 @@ Settable keys:
   and process argv like any argument.
 
 Flags:
-  --force, -y, --yes  Skip the confirmation for a clear that drops a stored
-                      env value. Required when stdin or stdout is not a TTY.
+  --force, -y, --yes  Skip the confirmation for an edit that destroys a stored
+                      env value -- a clear, or an overwrite. Required when
+                      stdin or stdout is not a TTY.
   --json              Emit the result as JSON. env values are never printed.
+                      A refused or declined confirmation emits an
+                      {"ok":false,...} envelope on stderr, so a script never
+                      has to read prose to tell why nothing was written.
 `;
 
 export const ENABLE_USAGE = `Usage: yaw-mcp enable <slug-or-namespace> [--json]
@@ -121,6 +136,12 @@ export interface SetCommandOptions {
   isTTY?: boolean;
   promptAnswer?: string;
   io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
+  /** The verb the USER typed, for the message prefix. `enable` and `disable`
+   *  are sugar that delegates to runSet, and every diagnostic here used to say
+   *  `yaw-mcp set:` -- so `yaw-mcp enable nosuch` reported a failure of a
+   *  command the user never ran. Defaults to "set", which is what a direct
+   *  `yaw-mcp set` invocation (and any caller that omits it) gets. */
+  verb?: "set" | "enable" | "disable";
 }
 
 export interface SetCommandResult {
@@ -301,9 +322,11 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
+  const verb = opts.verb ?? "set";
+
   const target = opts.target ?? "";
   if (!SET_TARGET_RE.test(target)) {
-    printErr(`yaw-mcp set: "${target}" is not a valid server name.`);
+    printErr(`yaw-mcp ${verb}: "${target}" is not a valid server name.`);
     return { exitCode: 2, written: [] };
   }
 
@@ -320,7 +343,9 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
   if (!existsSync(path)) {
-    printErr(`yaw-mcp set: no servers configured yet (${path} does not exist). Add one with \`yaw-mcp add <slug>\`.`);
+    printErr(
+      `yaw-mcp ${verb}: no servers configured yet (${path} does not exist). Add one with \`yaw-mcp add <slug>\`.`,
+    );
     return { exitCode: 1, written: [] };
   }
 
@@ -329,7 +354,18 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     try {
       rawText = await readFile(path, "utf8");
     } catch (e) {
-      printErr(`yaw-mcp set: ${path} could not be read (${(e as Error).message}).`);
+      // A DIRECTORY at the bundles.json path is not a permissions problem, and
+      // the raw errno ("EISDIR: illegal operation on a directory, read") reads
+      // as one. `add` and `remove` already name the shape -- readRawUserBundles
+      // in local-bundles.ts turns the same EISDIR into "is a directory, not a
+      // file" -- so `set` says that sentence too rather than being a third
+      // spelling of one fault. Every other read failure keeps the errno, which
+      // is what a permissions problem actually needs.
+      if ((e as NodeJS.ErrnoException).code === "EISDIR") {
+        printErr(`yaw-mcp ${verb}: ${path} is a directory, not a file -- move or remove it, then re-run.`);
+        return { exitCode: 1, written: [] };
+      }
+      printErr(`yaw-mcp ${verb}: ${path} could not be read (${(e as Error).message}).`);
       return { exitCode: 1, written: [] };
     }
     let parsed: unknown;
@@ -337,13 +373,22 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       parsed = parseJsonc(rawText);
     } catch (e) {
       printErr(
-        `yaw-mcp set: ${path} could not be parsed -- fix the JSON before setting fields (${(e as Error).message}).`,
+        `yaw-mcp ${verb}: ${path} could not be parsed -- fix the JSON before setting fields (${(e as Error).message}).`,
       );
       return { exitCode: 1, written: [] };
     }
     const servers = (parsed as { servers?: unknown } | null)?.servers;
     if (!Array.isArray(servers)) {
-      printErr(`yaw-mcp set: ${path} has no "servers" array.`);
+      printErr(`yaw-mcp ${verb}: ${path} has no "servers" array.`);
+      // Its sibling above (no file at all) ends on what to do; this one stopped
+      // at the diagnosis. The fix is NOT "run `yaw-mcp add`": add refuses this
+      // same file ("'servers' must be an array -- file ignored"), so pointing
+      // there would hand the user a second failure. Repairing the array by hand
+      // is what works, and deleting the file makes `add` recreate it from
+      // scratch.
+      printErr(
+        `  Add a top-level "servers": [] to that file (or delete the file, and \`yaw-mcp add <slug>\` will recreate it).`,
+      );
       return { exitCode: 1, written: [] };
     }
 
@@ -361,7 +406,9 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       if (idx >= 0) break;
     }
     if (idx < 0) {
-      printErr(`yaw-mcp set: no server named "${target}" in ${path}. Run \`yaw-mcp list\` to see what is configured.`);
+      printErr(
+        `yaw-mcp ${verb}: no server named "${target}" in ${path}. Run \`yaw-mcp list\` to see what is configured.`,
+      );
       return { exitCode: 1, written: [] };
     }
 
@@ -384,12 +431,38 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     // target env -- a scalar edit on such an entry is well-defined, and
     // refusing it would make this guard a bigger change than the bug.
     const envAssignments = assignments.filter((a) => a.field === "env");
+
+    // A REMOTE entry has no env to set. It spawns no process, so upstream.ts
+    // ignores `env` on it outright -- and since the credential for such a
+    // server travels in `headers`, `set <remote> env.KEY=` could never reach
+    // the thing a user clearing a credential is aiming at. The old behaviour
+    // wrote the key anyway and reported "env.KEY: set", which is the CLI
+    // claiming an edit that changes nothing the server will ever see.
+    //
+    // REFUSED rather than redirected onto headers: a header is the remote
+    // server's credential channel, and `add --header` (which validates the
+    // field name, refuses a blank value, and rejects a CR/LF/NUL that Node's
+    // Headers would throw on) is the vetted way in. A `set` that silently
+    // rewrote `env.X` as a header would bypass all three checks.
+    //
+    // isRemoteEntry, not a local `url !== undefined` test: that predicate is
+    // types.ts's, the one upstream.ts and doctor route on, so this refusal
+    // cannot disagree with the reader about which entries have no env.
+    if (envAssignments.length > 0 && isRemoteEntry(entry as Partial<UpstreamServerConfig>)) {
+      const targeted = envAssignments.map((a) => `env.${a.key}`).join(", ");
+      printErr(`yaw-mcp ${verb}: "${namespace}" is a remote server, so ${targeted} would never be read.`);
+      printErr(
+        `  A remote server spawns no process: its credentials travel in "headers". Re-add it with \`yaw-mcp add ${namespace} --url <url> --header 'Name: value'\`, or edit "headers" in ${path} by hand.`,
+      );
+      return { exitCode: 1, written: [] };
+    }
+
     const envIsMap =
       entry.env === undefined || (typeof entry.env === "object" && entry.env !== null && !Array.isArray(entry.env));
     if (!envIsMap && envAssignments.length > 0) {
       const targeted = envAssignments.map((a) => `env.${a.key}`).join(", ");
       printErr(
-        `yaw-mcp set: "${namespace}" in ${path} has an "env" that is ${describeJsonShape(entry.env)}, not an object of "NAME": "value" pairs.`,
+        `yaw-mcp ${verb}: "${namespace}" in ${path} has an "env" that is ${describeJsonShape(entry.env)}, not an object of "NAME": "value" pairs.`,
       );
       printErr(`  Fix that field by hand (or delete it), then re-run to set ${targeted}.`);
       return { exitCode: 1, written: [] };
@@ -444,7 +517,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       const current = projectedEnv[key];
       if (current !== undefined && typeof current !== "string") {
         printErr(
-          `yaw-mcp set: env.${key} on "${namespace}" is ${describeJsonShape(current)} in ${path}, not a string -- remove it by hand.`,
+          `yaw-mcp ${verb}: env.${key} on "${namespace}" is ${describeJsonShape(current)} in ${path}, not a string -- remove it by hand.`,
         );
         printErr("  Nothing was written; re-run once that field is a string or gone.");
         return { exitCode: 1, written: [] };
@@ -452,30 +525,81 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       delete projectedEnv[key];
     }
 
-    // A clear that DROPS a stored value is the one irreversible edit here, so
-    // it is confirmed. Setting or overwriting is not: the previous value is
-    // shown in the transcript either way.
-    const droppingEnv = assignments.filter(
-      (a) => a.field === "env" && a.value === undefined && typeof originalEnv[a.key as string] === "string",
-    );
-    if (droppingEnv.length > 0 && !opts.force) {
-      const names = droppingEnv.map((a) => a.key).join(", ");
-      // stderr, not stdout: this is a diagnostic about a prompt, and stdout
-      // has to stay a single parseable line under --json.
-      printErr(`This clears a stored value on "${namespace}": ${names}`);
-      printErr("  Re-adding the server will not bring it back.");
+    // Any edit that DESTROYS a stored env value is confirmed -- a clear and an
+    // overwrite alike. The gate used to cover only the clear, reasoning that
+    // "the previous value is shown in the transcript either way" for a set.
+    // It is not: nothing prints a stored value (this command redacts its own
+    // env output, and so does `add --json` and the removal preview), so
+    // `set gh env.TOKEN=<new>` replaced a credential nobody could read back,
+    // with no prompt, no --force, and exit 0. Same irreversible act on the
+    // same bytes as a clear, so it takes the same gate.
+    //
+    // Classified against projectedEnv -- the map the pre-flight walk above
+    // built by applying THIS RUN's assignments in order -- rather than one
+    // question per assignment. That is what makes a repeated key ask once, and
+    // what makes `env.A=x env.A=t` (ending on the value already stored) ask
+    // nothing at all: the file is unchanged, so nothing is lost.
+    const destroyed = new Map<string, "cleared" | "overwritten">();
+    for (const a of assignments) {
+      if (a.field !== "env") continue;
+      const key = a.key as string;
+      const stored = originalEnv[key];
+      // Only a stored STRING can be destroyed: an absent key has nothing to
+      // lose, and a non-string one was refused by the walk above.
+      if (typeof stored !== "string") continue;
+      const final = projectedEnv[key];
+      if (final === stored) continue;
+      destroyed.set(key, final === undefined ? "cleared" : "overwritten");
+    }
+    if (destroyed.size > 0 && !opts.force) {
+      const clearing = [...destroyed].filter(([, kind]) => kind === "cleared").map(([name]) => name);
+      const overwriting = [...destroyed].filter(([, kind]) => kind === "overwritten").map(([name]) => name);
+      // "clear A, B" / "overwrite C" / "clear A and overwrite C" -- ONE phrase
+      // shared by the refusal and the prompt, so the two can never describe
+      // different edits.
+      const actions: string[] = [];
+      if (clearing.length > 0) actions.push(`clear ${clearing.join(", ")}`);
+      if (overwriting.length > 0) actions.push(`overwrite ${overwriting.join(", ")}`);
+      const phrase = actions.join(" and ");
+      // Under --json the envelope below is the WHOLE output, on stderr -- the
+      // shape every `yaw-mcp secrets` failure already takes. A script that
+      // asked for machine output used to get an exit code and prose it had to
+      // scrape. stdout stays empty on this path either way: it carries exactly
+      // one line, the success envelope, and never half of a refusal.
+      if (!opts.json) {
+        if (clearing.length > 0) printErr(`This clears a stored value on "${namespace}": ${clearing.join(", ")}`);
+        if (overwriting.length > 0) {
+          printErr(`This overwrites a stored value on "${namespace}": ${overwriting.join(", ")}`);
+        }
+        printErr("  The old value is gone -- re-adding the server will not bring it back.");
+      }
       if (!isInteractive(opts)) {
-        printErr(`yaw-mcp set: refusing to clear ${names} without a confirmation -- stdin/stdout is not a TTY.`);
-        printErr("  Re-run with --force (or -y).");
+        if (opts.json) {
+          printErr(
+            JSON.stringify({
+              ok: false,
+              error: `refusing to ${phrase} on "${namespace}" without a confirmation -- stdin/stdout is not a TTY. Re-run with --force (or -y).`,
+              path,
+              namespace,
+              // Key NAMES only, like every other env surface here.
+              destructive: [...destroyed.keys()],
+            }),
+          );
+        } else {
+          printErr(`yaw-mcp ${verb}: refusing to ${phrase} without a confirmation -- stdin/stdout is not a TTY.`);
+          printErr("  Re-run with --force (or -y).");
+        }
         return { exitCode: 2, written: [] };
       }
-      const answer = await askYesNo(opts, `Clear ${names} on "${namespace}"? [y/N] `);
+      const answer = await askYesNo(opts, `${phrase[0].toUpperCase()}${phrase.slice(1)} on "${namespace}"? [y/N] `);
       if (answer === QUESTION_CANCELLED) {
-        printErr("Aborted.");
+        if (opts.json) printErr(JSON.stringify({ ok: false, error: "Cancelled.", cancelled: true, path, namespace }));
+        else printErr("Aborted.");
         return { exitCode: 130, written: [] };
       }
       if (answer !== "y" && answer !== "yes") {
-        print("Aborted.");
+        if (opts.json) printErr(JSON.stringify({ ok: false, error: "Aborted.", aborted: true, path, namespace }));
+        else print("Aborted.");
         return { exitCode: 1, written: [] };
       }
     }
@@ -620,5 +744,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
 /** `enable` / `disable` are exactly `set <target> isActive=<bool>`. Written as
  *  a delegation rather than a copy so the two can never drift. */
 export async function runEnableDisable(opts: SetCommandOptions & { enabled: boolean }): Promise<SetCommandResult> {
-  return runSet({ ...opts, assignments: [`isActive=${opts.enabled}`] });
+  // `verb` is what keeps the delegation invisible in the output: without it
+  // every diagnostic named `set`, the one verb the user did not type.
+  return runSet({ ...opts, verb: opts.enabled ? "enable" : "disable", assignments: [`isActive=${opts.enabled}`] });
 }

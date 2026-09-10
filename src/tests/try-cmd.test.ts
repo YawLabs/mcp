@@ -15,6 +15,7 @@ import {
   runTry,
   runTryCleanup,
   scanTrials,
+  TRY_CLEANUP_USAGE,
   TRY_USAGE,
   type TrialMarker,
   trialGcFailureWarning,
@@ -700,6 +701,7 @@ describe("runTry — client config perms", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -860,12 +862,18 @@ describe("runTry — preserves existing client config siblings", () => {
 });
 
 describe("runTry — unreadable vs invalid client config", () => {
-  it("reports a read failure as a read failure, not as invalid JSON", async () => {
+  it("reports a DIRECTORY as a directory -- not as invalid JSON, and not as an errno", async () => {
     // A directory where the config should be is the portable way to make
     // readFile fail (EISDIR); the real-world shape is a root-owned or
     // other-user-0600 ~/.claude.json (EACCES). Folding read and parse into one
     // catch told the user their JSON was invalid and sent them to inspect a
     // file they cannot even open.
+    //
+    // The wording moved with the ship-readiness pass: EISDIR now gets the
+    // same sentence `add`, `install` and `uninstall` use for it, because the
+    // old "check its permissions and ownership" was advice you cannot act on
+    // for a directory. Every OTHER read failure keeps the errno line, which is
+    // what a real permissions problem needs.
     mkdirSync(join(synthHome, ".claude.json"), { recursive: true });
     const cap = captureIO();
     const r = await runTry({
@@ -880,8 +888,8 @@ describe("runTry — unreadable vs invalid client config", () => {
       fetchExplore: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(1);
-    expect(cap.errText()).toMatch(/could not be read/);
-    expect(cap.errText()).toMatch(/permissions/);
+    expect(cap.errText()).toContain("is a directory, not a file");
+    expect(cap.errText()).not.toContain("EISDIR");
     expect(cap.errText()).not.toMatch(/not valid JSON/);
   });
 
@@ -1006,6 +1014,7 @@ describe("marker trust guards", () => {
     const r = await runTryCleanup({
       slug: "evil",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1048,6 +1057,7 @@ describe("marker trust guards", () => {
     const r = await runTryCleanup({
       slug: "future",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1107,6 +1117,7 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1136,6 +1147,7 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1170,6 +1182,7 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1183,6 +1196,7 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1215,6 +1229,7 @@ describe("runTryCleanup", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1589,7 +1604,7 @@ describe("gcExpiredTrials -- the container itself was deleted by hand", () => {
     writeFileSync(trialMarkerPath("demo", synthHome), JSON.stringify(marker));
 
     const cap = captureIO();
-    const r = await runTryCleanup({ slug: "demo", home: synthHome, out: cap.pushOut, err: cap.pushErr });
+    const r = await runTryCleanup({ slug: "demo", home: synthHome, force: true, out: cap.pushOut, err: cap.pushErr });
 
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
@@ -1634,6 +1649,7 @@ describe("runTryCleanup — marker field validation", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1651,6 +1667,7 @@ describe("runTryCleanup — marker field validation", () => {
     const r = await runTryCleanup({
       slug: "demo",
       home: synthHome,
+      force: true,
       out: cap.pushOut,
       err: cap.pushErr,
     });
@@ -1679,8 +1696,13 @@ describe("runTry — previous marker naming the SAME client file", () => {
     // the SAME file (a renamed / hand-edited marker). Step 6b peels it out of
     // the file, but the splice was built from the bytes read BEFORE the peel,
     // so writing that render put the peeled entry straight back.
+    //
+    // The renamed entry keeps SAMPLE's launch on purpose: a rename moves our
+    // entry, it does not replace it, and the peel's provenance check (see
+    // trialLaunchFingerprint) would rightly leave a differently-launching
+    // entry alone -- which is a different scenario, covered on its own below.
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
-    client.mcpServers["yaw-mcp-try-demo-old"] = { command: "npx", args: ["-y", "@old/mcp"] };
+    client.mcpServers["yaw-mcp-try-demo-old"] = { command: "npx", args: ["-y", "@demo/mcp"] };
     writeFileSync(clientPath, JSON.stringify(client, null, 2));
     const markerPath = trialMarkerPath("demo", synthHome);
     const marker = JSON.parse(readFileSync(markerPath, "utf8")) as TrialMarker;
@@ -2450,5 +2472,363 @@ describe("runTry — client-config write failure on a re-run", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+});
+
+// --- ship-readiness gaps ----------------------------------------------------
+
+describe("runTry -- refusals that were resolver internals", () => {
+  it("refuses a client this OS does not have, the way install does", async () => {
+    // `try --client claude-desktop` on Linux went straight to
+    // resolveInstallPath, whose bare throw ("Claude Desktop is not available
+    // on linux") reached the user as `yaw-mcp try: <that>` with nothing to do
+    // about it. install has said what to do instead since it grew the check.
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-desktop",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.errText()).toContain("not available on linux");
+    expect(cap.errText()).toMatch(/Claude Code|Cursor/);
+    // No --os in `try`, so it must not advertise one.
+    expect(cap.errText()).not.toContain("--os");
+  });
+
+  it("carries the `yaw-mcp try:` prefix on a catalog failure, like every other message here", async () => {
+    // The catalog error was the one message in this file printed bare, so a
+    // user piping stderr could not tell which command produced it.
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => {
+        throw new Error("no server named demo in the catalog");
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.errText()).toContain("yaw-mcp try: no server named demo in the catalog");
+  });
+});
+
+describe("runTry -- re-running for a slug that is already wired", () => {
+  const wire = async (): Promise<void> => {
+    const cap = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+  };
+
+  it("says it is replacing the entry that is there", async () => {
+    // The second run overwrote the first entry in silence: same file, same
+    // key, so the splice simply replaced it and the nudge said "Trial wired"
+    // as if nothing had been there. A user re-running with a different --ttl
+    // or --env had no signal that the previous wiring (and its inline secret)
+    // was gone.
+    await wire();
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      ttl: "2h",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/[Rr]eplac/);
+  });
+
+  it("says nothing about replacing on a FIRST run", async () => {
+    const cap = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(cap.text()).not.toMatch(/[Rr]eplac/);
+  });
+
+  it("--dry-run says it WOULD replace, and writes nothing", async () => {
+    await wire();
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/would replace/i);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+});
+
+describe("runTryCleanup -- confirmation", () => {
+  const wire = async (): Promise<void> => {
+    const cap = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+  };
+
+  it("refuses off a TTY, having shown what it would remove", async () => {
+    // try-cleanup rewrites a file the user's AI client launches from, and it
+    // did so with no preview and no confirmation -- the only destructive verb
+    // left in the CLI without one.
+    await wire();
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      isTTY: false,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
+    const all = cap.text() + cap.errText();
+    expect(all).toContain("yaw-mcp-try-demo");
+    expect(all).toContain(join(synthHome, ".claude.json"));
+    expect(cap.errText()).toContain("--force");
+  });
+
+  it("--force removes without asking", async () => {
+    await wire();
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      isTTY: false,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+
+  it("a bare Enter declines and changes nothing", async () => {
+    await wire();
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      promptAnswer: "",
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(true);
+  });
+
+  it("a yes removes", async () => {
+    await wire();
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      promptAnswer: "y",
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+  });
+
+  it("does not ask when there is no marker at all", async () => {
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      isTTY: false,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toContain("nothing to do");
+  });
+
+  it("takes --force, -y and --yes at the parser", () => {
+    for (const flag of ["--force", "-y", "--yes"]) {
+      const r = parseTryCleanupArgs(["demo", flag]);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.options.force).toBe(true);
+    }
+    expect(TRY_CLEANUP_USAGE).toContain("--force");
+  });
+});
+
+describe("trial provenance -- the entry at the name may not be OURS any more", () => {
+  const wire = async (): Promise<void> => {
+    const cap = captureIO();
+    await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+  };
+
+  /** Replace the trial entry's launch with the user's own server, keeping the
+   *  key. This is the "I kept the name and pointed it at my build" case. */
+  const replaceEntry = (): void => {
+    const path = join(synthHome, ".claude.json");
+    const client = JSON.parse(readFileSync(path, "utf8"));
+    client.mcpServers["yaw-mcp-try-demo"] = { command: "node", args: ["/home/me/my-own-server.js"] };
+    writeFileSync(path, JSON.stringify(client, null, 2));
+  };
+
+  it("try-cleanup leaves a replaced entry alone and says so", async () => {
+    await wire();
+    replaceEntry();
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    // The user's work survives...
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toEqual({
+      command: "node",
+      args: ["/home/me/my-own-server.js"],
+    });
+    // ...they are told why nothing was stripped, and the marker is gone so it
+    // is not re-reported forever.
+    expect(cap.text() + cap.errText()).toMatch(/replaced/i);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("doctor's GC leaves a replaced entry alone and reports it once", async () => {
+    await wire();
+    replaceEntry();
+    // Expire the marker so the sweep picks it up.
+    const markerPath = trialMarkerPath("demo", synthHome);
+    const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+    marker.expiresAt = Date.now() - 1000;
+    writeFileSync(markerPath, JSON.stringify(marker));
+
+    const gc = await gcExpiredTrials({ home: synthHome });
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toEqual({
+      command: "node",
+      args: ["/home/me/my-own-server.js"],
+    });
+    expect(gc.failures).toHaveLength(1);
+    expect(trialGcFailureWarning(gc.failures[0])).toMatch(/replaced/i);
+    // Reported once: the marker is gone, so the next sweep is silent rather
+    // than re-failing forever.
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  it("still removes an UNCHANGED entry", async () => {
+    await wire();
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
+  });
+
+  it("still removes when the marker predates fingerprints", async () => {
+    // A marker written by an older yaw-mcp carries no fingerprint. Refusing
+    // those would strand every trial wired before this change -- inline secret
+    // and all -- with nothing left able to reclaim it.
+    await wire();
+    const markerPath = trialMarkerPath("demo", synthHome);
+    const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+    delete marker.entryFingerprint;
+    writeFileSync(markerPath, JSON.stringify(marker));
+    replaceEntry();
+
+    const cap = captureIO();
+    const r = await runTryCleanup({
+      slug: "demo",
+      home: synthHome,
+      force: true,
+      out: cap.pushOut,
+      err: cap.pushErr,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp-try-demo"]).toBeUndefined();
+  });
+
+  it("keeps the marker readable by an older yaw-mcp -- the schema version does not move", async () => {
+    // entryFingerprint is ADDITIVE. Bumping TRIAL_SCHEMA_VERSION for it would
+    // make an older yaw-mcp refuse every marker this version writes
+    // (rejectUntrustedMarker rejects a version above its own), stranding live
+    // trials on a downgrade -- a worse failure than the one provenance fixes.
+    await wire();
+    const marker = JSON.parse(readFileSync(trialMarkerPath("demo", synthHome), "utf8"));
+    expect(marker.schemaVersion).toBe(1);
+    expect(typeof marker.entryFingerprint).toBe("string");
   });
 });

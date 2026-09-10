@@ -378,12 +378,80 @@ const USAGE =
   "       yaw-mcp install --all   (install into every client available on this OS)\n" +
   "\n" +
   "  Re-running install over an entry that already matches is a no-op (exit 0, no prompt).\n" +
-  "  --repair replaces an entry that has drifted, without prompting.\n" +
   "  Undo it with `yaw-mcp uninstall <client>`.\n" +
+  "\n" +
+  // What to do about an entry that is ALREADY there is the decision install
+  // asks the user to make, and the three flags that answer it were named in
+  // the synopsis and explained nowhere. Off a TTY there is no prompt to fall
+  // back on: the run refuses (exit 2) naming these, so a reader who cannot
+  // find out what they mean is stuck.
+  "  When a different `" +
+  ENTRY_NAME +
+  "` entry is already in the config, install asks on a TTY\n" +
+  "  and refuses without one. Answer up front with:\n" +
+  "  --force     Overwrite whatever is there.\n" +
+  "  --repair    Replace an entry that has DRIFTED from what install writes; a\n" +
+  "              no-op when it already matches, so a fixup script can run it\n" +
+  "              unconditionally.\n" +
+  "  --skip      Leave the existing entry untouched and exit 0.\n" +
+  "  --dry-run   Print the entry (and any permissions patch) that WOULD be\n" +
+  "              written, and exit 0 without touching a file.\n" +
   "\n" +
   "  Deprecated (accepted, ignored, warns): --token <mcp_pat_...>, --no-yaw-mcp-config.\n" +
   "  yaw-mcp is local-only -- it stores no token and never writes ~/.yaw-mcp/config.json.\n" +
   "  Configure servers in ~/.yaw-mcp/bundles.json (see `yaw-mcp add <slug>`).";
+
+/** How every command in this file reports a config file it could not READ.
+ *
+ *  A DIRECTORY at the path is the one read failure that is not a permissions
+ *  problem, and the raw errno for it ("EISDIR: illegal operation on a
+ *  directory, read") reads exactly like one -- it sent users to chmod
+ *  something that is not a file. `add` and `remove` already name the shape
+ *  (readRawUserBundles in local-bundles.ts turns the same EISDIR into "is a
+ *  directory, not a file"), so install, uninstall and `try` say the same
+ *  sentence rather than being three more spellings of one fault.
+ *
+ *  Every other errno keeps its message, which is what a real permissions
+ *  problem needs. Exported so `try` uses this one instead of a fourth copy. */
+export function describeUnreadableConfig(cmd: string, path: string, err: unknown): string {
+  if ((err as NodeJS.ErrnoException).code === "EISDIR") {
+    return `yaw-mcp ${cmd}: ${path} is a directory, not a file -- move or remove it, then re-run.`;
+  }
+  return `yaw-mcp ${cmd}: cannot read ${path}: ${(err as Error).message}`;
+}
+
+/** The refusal for a client this OS does not have, as one two-line message.
+ *
+ *  Shared so every verb that resolves a client path says the same thing.
+ *  `install` and `uninstall` route their availability check through here;
+ *  `try` did NOT have one at all -- it went straight to resolveInstallPath,
+ *  whose bare `throw new Error("Claude Desktop is not available on linux")`
+ *  surfaced as a resolver internal with no way forward. Same fault, three
+ *  verbs, one sentence.
+ *
+ *  The claude-desktop-on-linux case gets its own line because it is the only
+ *  one a user cannot fix by changing a flag: Anthropic does not ship that app
+ *  for Linux, so the remedy is a different client, not different arguments.
+ *  Every other verb passes its own `genericFix` -- the flags differ (`try` has
+ *  no --os, so it must not advertise one).
+ *
+ *  A CLAIM about a third party, checked when written: Anthropic's own download
+ *  page lists macOS and Windows builds and no Linux one, which is what
+ *  INSTALL_TARGETS encodes as `availableOn: ["macos", "windows"]` for
+ *  claude-desktop -- the two agree, and this message reads the table, not a
+ *  memory of it. */
+export function clientUnavailableMessage(
+  cmd: string,
+  target: (typeof INSTALL_TARGETS)[number],
+  os: InstallOS,
+  genericFix: string,
+): string {
+  const fix =
+    target.clientId === "claude-desktop" && os === "linux"
+      ? "Anthropic ships Claude Desktop on macOS and Windows only. Install Claude Code or Cursor instead."
+      : genericFix;
+  return `yaw-mcp ${cmd}: ${target.label} is not available on ${os}.\n  ${fix}`;
+}
 
 /** Warning printed when the retired `--token` flag is passed. Exported so
  *  tests pin the exact wording -- this is the user's only signal that a
@@ -444,14 +512,17 @@ function resolveInstallSite(
 
   const os = opts.os ?? CURRENT_OS;
   if (!target.availableOn.includes(os)) {
-    const fix =
-      target.clientId === "claude-desktop" && os === "linux"
-        ? "Anthropic ships Claude Desktop on macOS and Windows only. Install Claude Code or Cursor instead."
-        : // NOT "pass --os to override": install resolves paths against THIS
-          // machine, so a cross-OS --os write is refused at the flag boundary
-          // (see parseInstallArgs) — only the --dry-run preview is offered.
-          "Pick a different client, or preview another OS's config with --os <os> --dry-run.";
-    err(`yaw-mcp ${cmd}: ${target.label} is not available on ${os}.\n  ${fix}`);
+    err(
+      clientUnavailableMessage(
+        cmd,
+        target,
+        os,
+        // NOT "pass --os to override": install resolves paths against THIS
+        // machine, so a cross-OS --os write is refused at the flag boundary
+        // (see parseInstallArgs) — only the --dry-run preview is offered.
+        "Pick a different client, or preview another OS's config with --os <os> --dry-run.",
+      ),
+    );
     return null;
   }
 
@@ -643,7 +714,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     try {
       raw = await readFile(resolved.absolute, "utf8");
     } catch (e) {
-      err(`yaw-mcp install: cannot read ${resolved.absolute}: ${(e as Error).message}`);
+      err(describeUnreadableConfig("install", resolved.absolute, e));
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
     if (raw.trim().length > 0) {
@@ -893,7 +964,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           `  It differs from the entry install would write:\n${diffBlock}\n` +
           "  Re-run with --repair to bring it up to date, --force to overwrite, --skip to leave it, or --dry-run to preview.",
       );
-      return { written: [], wouldWrite: [], messages, exitCode: 1 };
+      // Exit 2, not 1: this is a confirmation that could not be asked for off
+      // a TTY, which is what `remove`, `set`, `uninstall` and `secrets remove`
+      // all return 2 for. install was the outlier, so a script could not tell
+      // "needs a flag" from "the write failed" without parsing the prose --
+      // and 1 stays available for the failures that really are failures (an
+      // unreadable config, a malformed one, a refused write).
+      return { written: [], wouldWrite: [], messages, exitCode: 2 };
     }
     if (decision === "abort") {
       err("Aborted.");
@@ -2556,7 +2633,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     try {
       raw = await readFile(resolved.absolute, "utf8");
     } catch (e) {
-      err(`yaw-mcp uninstall: cannot read ${resolved.absolute}: ${(e as Error).message}`);
+      err(describeUnreadableConfig("uninstall", resolved.absolute, e));
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
     if (raw.trim().length > 0) {

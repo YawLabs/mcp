@@ -22,14 +22,30 @@
 // If finer granularity is ever needed we can add `--namespace <ns>`
 // as an additive flag without breaking the current contract.
 //
+// The delete is IRREVERSIBLE -- a rebuilt learning store costs the user every
+// success they have accumulated -- so it is confirmed, on the pattern `set`
+// and `remove` already use: preview what is about to go, prompt on a TTY,
+// refuse off one, and take --force / -y / --yes as the bypass. The gate fires
+// only when there is really something to delete; a missing file, or a run
+// under YAW_MCP_DISABLE_PERSISTENCE, stays the exit-0 no-op it has always been
+// so the cleanup scripts that run this unconditionally keep working.
+//
 // Exit codes:
-//   0  normal: file removed, nothing to remove, or persistence disabled
-//   1  I/O error: file existed but couldn't be removed (permissions, etc.)
+//   0    normal: file removed, nothing to remove, or persistence disabled
+//   1    I/O error (file existed but couldn't be removed), or the
+//        confirmation was declined
+//   2    a confirmation was required and stdin/stdout is not a TTY -- the code
+//        every other destructive verb here uses for that refusal (`remove`,
+//        `set`, `uninstall`, `secrets remove`)
+//   130  Ctrl+C at the prompt
 
+import { existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline/promises";
 import { userConfigDir } from "./paths.js";
 import { isFileNotFound, isPersistenceDisabled, loadStateClassified, statePath } from "./persistence.js";
+import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
 
 export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
 
@@ -42,7 +58,12 @@ export const RESET_LEARNING_USAGE = `Usage: yaw-mcp reset-learning
   the learning it has in memory and re-saves it over the deleted file
   on its next tool call.
 
-  -h, --help  Show this help.`;
+  The delete cannot be undone, so when there IS something to remove you
+  are shown what the file holds and asked to confirm. A bare Enter is NO.
+
+  --force, -y, --yes  Skip the confirmation. Required when stdin or
+                      stdout is not a TTY (there is nothing to ask on).
+  -h, --help          Show this help.`;
 
 // Printed on every path that actually removed the file. The delete is a
 // pure filesystem operation with no channel to a live serve process, and
@@ -60,36 +81,57 @@ const RUNNING_SERVE_NOTE = [
 export type ParsedResetLearning =
   | { kind: "help" }
   | { kind: "error"; error: string }
-  | { kind: "ok"; options: Record<string, never> };
+  | { kind: "ok"; options: { force?: boolean } };
 
 // Argv parser. Crucially, this exists so `yaw-mcp reset-learning --help`
 // doesn't fall through to runResetLearning() and silently delete state.
 //
-// The command takes ZERO arguments (the only switch is -h/--help). So
-// rather than loop over argv pretending to validate each element, we
-// state that contract directly: no args is the only success, the first
-// arg being a help flag prints help, and anything else is an error on
-// that first arg. (A loop here would imply per-arg validation it never
-// actually performs — it returns on its first iteration regardless, so
-// argv[1..] are never inspected. Making the contract explicit avoids
-// that misleading shape; behavior is unchanged.)
+// The switches are -h/--help and the confirmation bypass -- --force / -y /
+// --yes, both spellings its destructive siblings accept (`remove` takes both,
+// so a user never has to remember which verb took which). Anything else is an
+// error naming the offending argument.
+//
+// EVERY argument is inspected, not just the first. The old shape returned on
+// argv[0] alone, which was harmless while the only switch was --help; with a
+// bypass flag in the set, `reset-learning --force --nope` would have run the
+// delete and ignored the typo.
 export function parseResetLearningArgs(argv: string[]): ParsedResetLearning {
-  if (argv.length === 0) return { kind: "ok", options: {} };
-  const first = argv[0];
-  if (first === "-h" || first === "--help") return { kind: "help" };
-  return {
-    kind: "error",
-    error: `yaw-mcp reset-learning: unknown argument "${first}"\n\n${RESET_LEARNING_USAGE}`,
-  };
+  let force = false;
+  for (const a of argv) {
+    if (a === "-h" || a === "--help") return { kind: "help" };
+    if (a === "--force" || a === "-y" || a === "--yes") {
+      force = true;
+      continue;
+    }
+    return {
+      kind: "error",
+      error: `yaw-mcp reset-learning: unknown argument "${a}"\n\n${RESET_LEARNING_USAGE}`,
+    };
+  }
+  return { kind: "ok", options: force ? { force: true } : {} };
 }
 
 export interface ResetLearningOptions {
   home?: string;
   env?: NodeJS.ProcessEnv;
+  /** Skip the confirmation. Required off a TTY.
+   *
+   *  REQUIRES A DISPATCHER CHANGE TO BE REACHABLE FROM THE CLI. Every other
+   *  subcommand goes through index.ts's generic `run(...)`, which threads the
+   *  parsed options into the runner; `reset-learning` is hand-rolled and calls
+   *  `runResetLearning()` with NO arguments (index.ts, the reset-learning
+   *  branch), so a `--force` the parser accepts is dropped before it gets
+   *  here. Passing `parsed.options` there is the one-line fix. */
+  force?: boolean;
   /** Override for tests; defaults to process.stdout.write. */
   out?: (s: string) => void;
   /** Override for tests; defaults to process.stderr.write. */
   err?: (s: string) => void;
+  /** Test hooks, spelled exactly as `remove` and `set` spell them so all three
+   *  confirmations are driven the same way. */
+  isTTY?: boolean;
+  promptAnswer?: string;
+  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
 }
 
 export interface ResetLearningResult {
@@ -100,6 +142,33 @@ export interface ResetLearningResult {
   removed: boolean;
   /** Absolute path we targeted — useful for the "nothing to reset" message. */
   path: string;
+}
+
+/** Both ends must be a TTY: stdin to read the answer, stdout to show the
+ *  question. Same predicate (and the same test seams) as `remove` and `set`. */
+function isInteractive(opts: ResetLearningOptions): boolean {
+  if (opts.isTTY !== undefined) return opts.isTTY;
+  if (opts.promptAnswer !== undefined) return true;
+  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+}
+
+/** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds, so
+ *  a bare Enter, a stray keystroke, or EOF (^D, a piped stdin running dry)
+ *  leaves state.json where it is. EOF is questionOrEmpty's job: a bare
+ *  rl.question() never settles once its input closes, which would leave this
+ *  hanging with no answer and no exit. */
+async function askYesNo(opts: ResetLearningOptions, question: string): Promise<string | typeof QUESTION_CANCELLED> {
+  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
+  const input = opts.io?.stdin ?? process.stdin;
+  const output = opts.io?.stdout ?? process.stdout;
+  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
+  try {
+    const raw = await questionOrEmpty(rl, question);
+    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
+    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
 }
 
 export async function runResetLearning(opts: ResetLearningOptions = {}): Promise<ResetLearningResult> {
@@ -175,6 +244,48 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // upstream handshake on the next session, which is exactly the kind of
   // consequence someone running a reset wants to see up front.
   const toolCacheCount = rawCounts.toolCache;
+
+  // ----- destructive-action confirmation --------------------------------
+  // Gated on the file actually being there. A missing one falls through to the
+  // unlink below, whose ENOENT branch keeps the exit-0 "nothing to reset"
+  // no-op: refusing to no-op off a TTY would break every cleanup script that
+  // runs this unconditionally, for no safety gain (the same rule `remove`
+  // follows). The existsSync/unlink race is the same advisory TOCTOU the
+  // counts above already document -- either way the delete is correct.
+  if (existsSync(filePath) && !opts.force) {
+    print("yaw-mcp reset-learning: this deletes your cross-session learning.");
+    print(`  path: ${filePath}`);
+    // The SAME numbers the success report prints, from the same peek, so the
+    // preview cannot promise a different delete than the one that happens.
+    // An unparseable file gets the honest line instead of "0, 0, 0": those
+    // counts were never read, and printing them would talk a user into
+    // deleting a file they were told was empty.
+    if (parsedCleanly) {
+      print(`  learning entries:     ${learningCount}`);
+      print(`  pack history entries: ${packCount}`);
+      print(`  tool caches:          ${toolCacheCount}`);
+    } else {
+      print("  contents unreadable -- it will be deleted as it is.");
+    }
+    print("  This cannot be undone.");
+    if (!isInteractive(opts)) {
+      printErr(
+        `yaw-mcp reset-learning: refusing to delete ${filePath} without a confirmation -- stdin/stdout is not a TTY.`,
+      );
+      printErr("  Re-run with --force (or -y).");
+      return { exitCode: 2, lines, removed: false, path: filePath };
+    }
+    const answer = await askYesNo(opts, "Delete it? [y/N] ");
+    if (answer === QUESTION_CANCELLED) {
+      // Ctrl+C at the prompt: exit 130, like every other prompt in the product.
+      printErr("yaw-mcp reset-learning: Cancelled. Nothing was deleted.");
+      return { exitCode: 130, lines, removed: false, path: filePath };
+    }
+    if (answer !== "y" && answer !== "yes") {
+      printErr("yaw-mcp reset-learning: Aborted. Nothing was deleted.");
+      return { exitCode: 1, lines, removed: false, path: filePath };
+    }
+  }
 
   try {
     await unlink(filePath);

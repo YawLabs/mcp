@@ -19,7 +19,9 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
+import { probeClientsAsync } from "./doctor-cmd.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
+import { CURRENT_OS, resolveAppDataDir } from "./install-targets.js";
 // The removal gate must see the same files the WRITE path can modify, so it
 // parses with the loader's JSONC parser (comments + trailing commas) rather
 // than a stricter JSON.parse. See findRemovalTarget.
@@ -388,6 +390,9 @@ async function printPostWriteNotes(
     ambientOnly: string[];
     cwd: string;
     home: string;
+    /** %APPDATA% for the client probe, resolved by the caller from the RAW
+     *  `--home` override (see resolveAppDataDir). */
+    appData: string;
     env: NodeJS.ProcessEnv;
     dryRun: boolean;
     dangling: { missing: string[]; malformed: string[] };
@@ -446,6 +451,82 @@ async function printPostWriteNotes(
       } load until you add it there or remove that file.`,
     );
   }
+  // The other half of the setup, and the one `add` alone never mentions: a
+  // server in bundles.json is reachable only through a client that launches
+  // yaw-mcp. `install` already prints the mirror of this ("Servers: none
+  // configured yet ... Add one with `yaw-mcp add <slug>`"), so a user who
+  // started from install is told what is missing; a user who started from
+  // `add` was told "no client restart" -- advice about restarting a client
+  // that is not wired to anything -- and nothing else.
+  //
+  // Best-effort and quiet on failure: this is a note, and an unreadable client
+  // config must never fail an add that already succeeded.
+  if (!(await anyClientWiredToYawMcp(opts.home, opts.cwd, opts.env, opts.appData))) {
+    printErr(
+      `Note: no AI client is wired to yaw-mcp yet, so nothing ${
+        dryRun ? "would load" : "loads"
+      } this server. Run \`yaw-mcp install <client>\` (\`yaw-mcp install --list\` shows the clients it can detect).`,
+    );
+  }
+}
+
+/** True when at least one client config on this machine already launches
+ *  yaw-mcp. `hasMcpEntry` is doctor's own verdict, read through the shared
+ *  probe rather than re-derived here: which files a client reads (and which
+ *  key inside them counts as the broker) is exactly the knowledge that drifts
+ *  when a second copy of it exists.
+ *
+ *  Any probe failure reads as "wired" -- the caller only uses this to decide
+ *  whether to print a nudge, and a nudge printed at someone who IS installed
+ *  is worse than a nudge withheld from someone who is not. */
+async function anyClientWiredToYawMcp(
+  home: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  appData: string,
+): Promise<boolean> {
+  try {
+    const probes = await probeClientsAsync({
+      home,
+      os: CURRENT_OS,
+      cwd,
+      // CLAUDE_CONFIG_DIR relocates claude-code's file; `appData` is resolved
+      // by the caller (see runAdd) because choosing between the ambient
+      // %APPDATA% and a home-derived one is a caller's job -- resolving it
+      // from the ALREADY-defaulted home here would pin every real run to
+      // <home>\AppData\Roaming and miss a redirected profile, which is the
+      // exact split resolveAppDataDir exists to prevent.
+      claudeConfigDir: env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined,
+      appData,
+    });
+    return probes.some((p) => p.hasMcpEntry);
+  } catch {
+    return true;
+  }
+}
+
+/** The write path's failure message with the bundles.json path named ONCE.
+ *
+ *  readRawUserBundles (local-bundles.ts) builds its message as
+ *  `<path> could not be parsed -- fix the JSON (<warnings>) ...`, and every
+ *  warning readBundlesAt collects is itself prefixed `<path>: ` -- so a file
+ *  with two warnings (say a future schema version AND a missing `servers`
+ *  array) printed a full Windows profile path three times in one sentence,
+ *  most of the terminal width, for one file.
+ *
+ *  The prefix is the redundant part and is exactly what this drops: the
+ *  sentence already opened with the path, and the DETAIL each warning carries
+ *  is kept. Matching on `<path>: ` -- path plus colon plus space -- is why the
+ *  leading `<path> could not be parsed` survives: it is followed by a space,
+ *  not a colon. This is a string the caller already knows (we built it from
+ *  the same localBundlesPath), never a pattern guess.
+ *
+ *  A path embedded in an ERRNO message ("EACCES: permission denied, open
+ *  '<path>'") is Node's own text and is left alone -- rewriting inside it
+ *  would edit a message we do not own for a gain the parse case does not need.
+ */
+function nameBundlesFileOnce(message: string, path: string): string {
+  return message.split(`${path}: `).join("");
 }
 
 /** Both halves of a launch swap, rendered like the removal preview: through
@@ -479,6 +560,11 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   const env = opts.env ?? process.env;
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
+  // Resolved from the RAW override, not from `home` above: with no --home the
+  // ambient %APPDATA% is the one Claude Desktop actually reads (it can be
+  // redirected away from <home>\AppData\Roaming), while a synthetic home
+  // must keep the probe inside itself. Same call `install` and `try` make.
+  const appData = resolveAppDataDir({ home: opts.home, env });
 
   // Resolve the launch shape -- from the flags when the user supplied one, and
   // from the catalog otherwise.
@@ -652,8 +738,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     try {
       preview = await previewUpsertUserBundle(entry, { home });
     } catch (e) {
-      // Same unreadable-file failure the real run surfaces.
-      printErr(`yaw-mcp add: ${(e as Error).message}`);
+      // Same unreadable-file failure the real run surfaces -- including its
+      // de-duplicated path (see nameBundlesFileOnce).
+      printErr(`yaw-mcp add: ${nameBundlesFileOnce((e as Error).message, localBundlesPath(userConfigDir(home)))}`);
       return { exitCode: 1, written: [] };
     }
     // The same read diagnostics the real run prints (see readRawUserBundles):
@@ -741,6 +828,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       dangling: await danglingSecretRefs(previewEntry, home),
       cwd,
       home,
+      appData,
       env,
       dryRun: true,
     });
@@ -760,7 +848,9 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     // need to know about before they do.
     if (e instanceof BundleCollisionError) for (const w of e.warnings) printErr(`warning: ${w}`);
     const msg =
-      e instanceof BundleCollisionError ? formatBundleCollision(e.collision, displaySafe) : (e as Error).message;
+      e instanceof BundleCollisionError
+        ? formatBundleCollision(e.collision, displaySafe)
+        : nameBundlesFileOnce((e as Error).message, localBundlesPath(userConfigDir(home)));
     printErr(`yaw-mcp add: ${msg}`);
     return { exitCode: 1, written: [] };
   }
@@ -827,6 +917,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     dangling: await danglingSecretRefs(written, home),
     cwd,
     home,
+    appData,
     env,
     dryRun: false,
   });
@@ -934,6 +1025,12 @@ interface RemovalTarget {
   launch: string;
   /** env KEY names only -- never values; bundles.json env can hold secrets. */
   envKeys: string[];
+  /** header NAMES only, same posture as envKeys and for a sharper reason: on a
+   *  REMOTE entry `headers` is the credential channel (env is ignored on one --
+   *  see upstream.ts), so an Authorization value here is a live bearer token.
+   *  The preview listed env alone, which meant removing a remote server showed
+   *  nothing at all about the credential going with it. */
+  headerNames: string[];
 }
 
 /**
@@ -1001,7 +1098,20 @@ function findRemovalTarget(candidates: string[], servers: unknown[] | null): Rem
     if (!hit) continue;
     const name = typeof hit.name === "string" && hit.name.length > 0 ? hit.name : "(unnamed)";
     const env = typeof hit.env === "object" && hit.env !== null ? (hit.env as Record<string, unknown>) : {};
-    return { namespace: ns, name, launch: renderLaunch(hit), envKeys: Object.keys(env) };
+    // Same shape test for both maps: this entry is RAW (never validated -- see
+    // the doc above), so an array or a string in either field must read as "no
+    // keys" rather than reaching Object.keys and rendering indices.
+    const headers =
+      typeof hit.headers === "object" && hit.headers !== null && !Array.isArray(hit.headers)
+        ? (hit.headers as Record<string, unknown>)
+        : {};
+    return {
+      namespace: ns,
+      name,
+      launch: renderLaunch(hit),
+      envKeys: Object.keys(env),
+      headerNames: Object.keys(headers),
+    };
   }
   return null;
 }
@@ -1055,9 +1165,13 @@ function printRemovalPreview(print: (s?: string) => void, path: string, t: Remov
   print(`    name:      ${displaySafe(t.name)}`);
   print(`    launch:    ${t.launch}`);
   if (t.envKeys.length > 0) print(`    env keys:  ${t.envKeys.map(displayArg).join(", ")}`);
+  // NAMES only, like env -- and the line only appears when there are headers,
+  // so a local entry's preview is unchanged.
+  if (t.headerNames.length > 0) print(`    header names: ${t.headerNames.map(displayArg).join(", ")}`);
   print("");
-  print("  yaw-mcp will stop loading it. Any env value stored on the entry goes");
-  print("  with it -- re-adding the server will not bring those values back.");
+  print("  yaw-mcp will stop loading it. Any env value or header stored on the");
+  print("  entry goes with it -- and for a remote server the header IS the");
+  print("  credential. Re-adding it will not bring those values back.");
   print("");
 }
 
@@ -1186,7 +1300,9 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
       }
     }
   } catch (e) {
-    printErr(`yaw-mcp remove: ${(e as Error).message}`);
+    // Same writer, same message, same de-duplication -- `remove` reaches
+    // readRawUserBundles through removeUserBundle.
+    printErr(`yaw-mcp remove: ${nameBundlesFileOnce((e as Error).message, path)}`);
     return { exitCode: 1, written: [] };
   }
   for (const w of warnings) printErr(`warning: ${w}`);
@@ -1374,6 +1490,21 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   }
 
   if (servers.length === 0) {
+    // "Nothing configured" and "we could not read what you configured" are
+    // different facts, and this printed the first for both. A directory (or a
+    // malformed file) at bundles.json produced the fresh-install line -- "Add
+    // one with `yaw-mcp add <slug>`" -- under a `warning:` most readers skim,
+    // which reads as an all-clear over a config yaw-mcp cannot load AND hands
+    // out advice that does not work (`add` refuses that same file).
+    //
+    // The predicate is `install`'s (summarizeBundles in install-cmd.ts): a null
+    // config WITH a path means the file was found and could not be used, while
+    // a null path means there was nothing to find.
+    if (loaded.config === null && loaded.path !== null) {
+      print(`Could not read ${displaySafe(loaded.path)} -- yaw-mcp has nothing to load from it.`);
+      print("The `warning:` line above says what is wrong; `yaw-mcp doctor` prints the same detail.");
+      return { exitCode: 0, written: [] };
+    }
     print("No local servers configured. Add one with `yaw-mcp add <slug>`");
     print("(browse the catalog at https://yaw.sh/mcp/catalog/).");
     return { exitCode: 0, written: [] };

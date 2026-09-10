@@ -60,14 +60,16 @@
 //     client has one, so the refusal is reachable only by a client with no
 //     user scope -- see step 3.
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
 import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
-import { mergeClientConfig } from "./install-cmd.js";
+import { clientUnavailableMessage, describeUnreadableConfig, mergeClientConfig } from "./install-cmd.js";
 import {
   buildLaunchEntry,
   CURRENT_OS,
@@ -81,6 +83,7 @@ import {
 import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { log } from "./logger.js";
 import { CONFIG_DIRNAME } from "./paths.js";
+import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 
 // The --client line is derived from the same table parseTryArgs validates
 // against (and that completion-cmd builds INSTALL_CLIENTS from), not a
@@ -144,11 +147,21 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
 
   Point the catalog somewhere else with $YAW_MCP_CATALOG_URL.`;
 
-export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
+export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug> [--force]
 
   Remove a previously-wired trial: peels the yaw-mcp-try-<slug> entry out of
   the AI client config and deletes the marker under ~/.yaw-mcp/trials/. Safe
-  to run after the trial expires (no-op if nothing is wired).`;
+  to run after the trial expires (no-op if nothing is wired).
+
+  This rewrites a config file your AI client launches from, so when there IS
+  a trial to remove you are shown the file and the entry and asked to
+  confirm. A bare Enter is NO.
+
+  An entry that is no longer the one the trial wrote -- you kept the name and
+  pointed it at your own server -- is left alone; only the marker goes.
+
+  --force, -y, --yes  Skip the confirmation. Required when stdin or stdout
+                      is not a TTY (there is nothing to ask on).`;
 
 export const TRIAL_SCHEMA_VERSION = 1;
 export const TRIALS_DIRNAME = "trials";
@@ -194,6 +207,18 @@ export interface TrialMarker {
   entryName: string;
   /** Epoch ms when the trial was created. Diagnostic. */
   createdAt: number;
+  /** Fingerprint of the LAUNCH this trial wrote (command + args), so the
+   *  cleanup and GC paths can tell the entry they wrote from one the user has
+   *  since replaced under the same key. See trialLaunchFingerprint.
+   *
+   *  OPTIONAL, and TRIAL_SCHEMA_VERSION deliberately does NOT move for it. The
+   *  field is additive -- an older yaw-mcp ignores it -- while a version bump
+   *  would make that older yaw-mcp REFUSE every marker this version writes
+   *  (rejectUntrustedMarker rejects a version above its own), stranding live
+   *  trials, inline secrets and all, on a downgrade. A marker without one is
+   *  swept exactly as before: unprovable provenance is what every marker had
+   *  until now, and refusing those would strand them too. */
+  entryFingerprint?: string;
 }
 
 export interface TryCommandOptions {
@@ -234,8 +259,15 @@ export interface TryCleanupOptions {
   slug?: string;
   home?: string;
   os?: InstallOS;
+  /** Skip the confirmation. Required off a TTY. */
+  force?: boolean;
   out?: (s: string) => void;
   err?: (s: string) => void;
+  /** Test hooks, spelled as `remove` and `set` spell them so every
+   *  confirmation in the CLI is driven the same way. */
+  isTTY?: boolean;
+  promptAnswer?: string;
+  io?: { stdin?: NodeJS.ReadableStream; stdout?: NodeJS.WritableStream; terminal?: boolean };
 }
 
 export interface TryCommandResult {
@@ -337,6 +369,13 @@ export function parseTryCleanupArgs(
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { ok: false, error: TRY_CLEANUP_USAGE, help: true };
+    // Both spellings, for the same reason `remove` takes both: --force is what
+    // `secrets remove` documents and -y/--yes is what `trust` and `try`
+    // document, and a user should not have to remember which verb took which.
+    if (a === "--force" || a === "-y" || a === "--yes") {
+      opts.force = true;
+      continue;
+    }
     if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_CLEANUP_USAGE}` };
     // Reject a bare "-" with a clear arg-parse error rather than deferring
     // to the slug regex's generic "invalid slug" message.
@@ -406,6 +445,38 @@ function rejectUntrustedMarker(marker: { entryName: string; schemaVersion?: numb
   return null;
 }
 
+/** Fingerprint of the LAUNCH an entry performs: its command and args, in the
+ *  exact shape they were written to (or read back from) the client config.
+ *
+ *  WHAT IT IS FOR. `try-cleanup` and doctor's GC delete the entry AT A NAME
+ *  (`yaw-mcp-try-<slug>`), read verbatim out of a marker file. That name is
+ *  the user's to edit: someone who liked the trial can point the same key at
+ *  their own build, or at a pinned version, and keep working. The sweep then
+ *  deleted THAT -- their work, under our name, with nothing to say what
+ *  happened. The marker could not tell the two apart because it recorded only
+ *  where the entry lived, never what it was.
+ *
+ *  WHY COMMAND + ARGS AND NOT THE WHOLE ENTRY. env is deliberately excluded:
+ *  the trial's own inline credential is the thing most likely to be edited in
+ *  place (a rotated token), and that edit leaves the entry OURS -- refusing to
+ *  reclaim it would strand exactly the entries whose secret we most want gone
+ *  at expiry. A different command or args is a different program, which is the
+ *  case worth protecting.
+ *
+ *  Hashed rather than stored plainly so the marker never grows a second copy
+ *  of an argv that can carry a token in a --url or a flag value. Truncated to
+ *  16 hex chars: this distinguishes an edit from a non-edit, it is not a
+ *  security boundary -- an attacker who can write the client config can write
+ *  the marker beside it. */
+function trialLaunchFingerprint(entry: { command?: unknown; args?: unknown }): string {
+  const command = typeof entry.command === "string" ? entry.command : "";
+  const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+  return createHash("sha256")
+    .update(JSON.stringify([command, args]))
+    .digest("hex")
+    .slice(0, 16);
+}
+
 /** The marker fields every consumer reads VERBATIM off disk and hands to the
  *  peel. Throws rather than returning a boolean so the one caller that reports
  *  the reason -- runTryCleanup's "marker at <path> is unreadable (...)" -- has
@@ -459,13 +530,22 @@ async function readTrialMarker(markerPath: string): Promise<{ marker: TrialMarke
  *                   is not a client config at all and no peel is possible. The
  *                   GC refuses to unlink the marker on this; try-cleanup warns
  *                   and carries on.
- *  Read/parse/write errors propagate to the caller's own catch. */
+ *   - "replaced":   an entry IS at that name, but it is not the one the trial
+ *                   wrote (see trialLaunchFingerprint). Nothing is touched --
+ *                   it is the user's now.
+ *  Read/parse/write errors propagate to the caller's own catch.
+ *
+ *  `expectFingerprint` is undefined for a marker written before fingerprints
+ *  existed, and then the provenance check is skipped entirely: every marker
+ *  had unprovable provenance until now, and refusing those would strand the
+ *  trials they name. */
 async function peelEntryFromConfig(
   clientPath: string,
   containerPath: string[],
   entryName: string,
   dryRun = false,
-): Promise<"removed" | "absent" | "not-object"> {
+  expectFingerprint?: string,
+): Promise<"removed" | "absent" | "not-object" | "replaced"> {
   if (!existsSync(clientPath)) return "absent";
   const raw = await readFile(clientPath, "utf8");
   if (raw.trim().length === 0) return "absent";
@@ -503,6 +583,20 @@ async function peelEntryFromConfig(
     if (typeof child !== "object" || child === null || Array.isArray(child)) return "absent";
     container = child as Record<string, unknown>;
   }
+  // Provenance, checked against the CONTAINER we just walked -- the same
+  // object removeJsoncEntry is about to delete from, so the entry judged here
+  // is the entry that would go.
+  if (expectFingerprint !== undefined) {
+    const current = Object.hasOwn(container, entryName) ? container[entryName] : undefined;
+    if (
+      current !== undefined &&
+      typeof current === "object" &&
+      current !== null &&
+      trialLaunchFingerprint(current as { command?: unknown; args?: unknown }) !== expectFingerprint
+    ) {
+      return "replaced";
+    }
+  }
   const next = removeJsoncEntry(raw, containerPath, entryName);
   if (next === raw) return "absent";
   if (dryRun) return "removed";
@@ -511,6 +605,30 @@ async function peelEntryFromConfig(
   // holds another trial's inline secret.
   await atomicWriteFile(clientPath, next.endsWith("\n") ? next : `${next}\n`);
   return "removed";
+}
+
+/** True when `raw` already holds an entry at `entryName` under `containerPath`.
+ *  Parsed with the same JSONC parser the splice uses, and walked with the same
+ *  own-property rule, so this answers for the bytes that are about to be
+ *  rewritten rather than for a JSON.parse view of them. Any unparseable or
+ *  unexpected shape answers false: the run is about to fail on that anyway,
+ *  and claiming a replacement it cannot see would be worse than staying quiet. */
+function configHasEntry(raw: string | null, containerPath: string[], entryName: string): boolean {
+  if (raw === null || raw.trim().length === 0) return false;
+  let parsed: unknown;
+  try {
+    parsed = parseJsonc(raw);
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  let container = parsed as Record<string, unknown>;
+  for (const segment of containerPath) {
+    const child = Object.hasOwn(container, segment) ? container[segment] : undefined;
+    if (typeof child !== "object" || child === null || Array.isArray(child)) return false;
+    container = child as Record<string, unknown>;
+  }
+  return Object.hasOwn(container, entryName);
 }
 
 /** Peel `marker.entryName` out of the client config the marker names,
@@ -522,10 +640,19 @@ async function peelEntryFromConfig(
  *
  *  With `dryRun`, every check runs but the write does not -- so --dry-run can
  *  promise a removal only when the real run would actually perform one. */
-async function peelTrialEntry(marker: TrialMarker, dryRun = false): Promise<"removed" | "absent" | "failed"> {
+async function peelTrialEntry(
+  marker: TrialMarker,
+  dryRun = false,
+): Promise<"removed" | "absent" | "failed" | "replaced"> {
   if (rejectUntrustedMarker(marker) !== null) return "failed";
   try {
-    const outcome = await peelEntryFromConfig(marker.clientPath, marker.containerPath, marker.entryName, dryRun);
+    const outcome = await peelEntryFromConfig(
+      marker.clientPath,
+      marker.containerPath,
+      marker.entryName,
+      dryRun,
+      marker.entryFingerprint,
+    );
     return outcome === "not-object" ? "failed" : outcome;
   } catch {
     return "failed";
@@ -674,7 +801,10 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   try {
     server = await fetchExplore(slug, catalogUrl);
   } catch (e) {
-    printErr((e as Error).message);
+    // Prefixed like every other message this command prints. It was the one
+    // bare line here, so a user reading a piped stderr (or a bug report) could
+    // not tell which command produced "no server named x in the catalog".
+    printErr(`yaw-mcp try: ${(e as Error).message}`);
     return { exitCode: 1, written: [] };
   }
 
@@ -713,6 +843,21 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // cannot honour that (today: none, after VS Code gained one -- so this is
   // the branch that keeps the rule true if a project-only client is added).
   const tryTarget = INSTALL_TARGETS.find((t) => t.clientId === clientId);
+  // A client this OS does not have is refused HERE, in the same sentence
+  // `install` uses, rather than at resolveInstallPath -- whose bare throw
+  // ("Claude Desktop is not available on linux") reached the user as a
+  // resolver internal with nothing to do about it. Exit 2: the argv named a
+  // client that cannot work on this machine, which is a usage error, and the
+  // same code install's identical refusal returns.
+  //
+  // The generic fix line is `try`'s own: install offers `--os <os> --dry-run`,
+  // a flag pair `try` does not have, so advertising it here would hand the
+  // user a command that fails on an unknown flag.
+  if (tryTarget && !tryTarget.availableOn.includes(os)) {
+    const alternatives = INSTALL_TARGETS.filter((t) => t.availableOn.includes(os)).map((t) => t.clientId);
+    printErr(clientUnavailableMessage("try", tryTarget, os, `Pick another client: --client ${alternatives.join("|")}`));
+    return { exitCode: 2, written: [] };
+  }
   const hasUserScope = tryTarget?.scopes.some((sc) => sc.scope === "user") ?? false;
   const scope: InstallScope = hasUserScope ? "user" : (detected?.scope ?? tryTarget?.scopes[0].scope ?? "user");
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
@@ -869,6 +1014,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     containerPath: resolved.containerPath,
     entryName,
     createdAt: now,
+    // What this run is about to write, so a later sweep can tell this entry
+    // from one the user has since put at the same name (see
+    // trialLaunchFingerprint). Taken from `entry` -- the object actually
+    // written -- not from `server`, so the Windows `cmd /c` wrap that
+    // buildLaunchEntry adds is inside the fingerprint, exactly as it will be
+    // read back out of the config.
+    entryFingerprint: trialLaunchFingerprint(entry),
   };
 
   // Step 6: read existing client config (if any).
@@ -898,9 +1050,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     try {
       raw = await readFile(resolved.absolute, "utf8");
     } catch (e) {
+      // A DIRECTORY at the path is not a permissions problem, and the
+      // permissions-and-ownership advice sends the user nowhere on one. The
+      // shared helper says what `add`, `install` and `uninstall` all say for
+      // that shape, and keeps the errno wording for every other read failure,
+      // which is what a real permissions problem needs.
       const code = (e as NodeJS.ErrnoException).code;
       printErr(
-        `yaw-mcp try: ${resolved.absolute} could not be read (${code ?? (e as Error).message}) -- check its permissions and ownership. Refusing to overwrite.`,
+        code === "EISDIR"
+          ? `${describeUnreadableConfig("try", resolved.absolute, e)} Refusing to overwrite.`
+          : `yaw-mcp try: ${resolved.absolute} could not be read (${code ?? (e as Error).message}) -- check its permissions and ownership. Refusing to overwrite.`,
       );
       return { ok: false };
     }
@@ -919,6 +1078,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
 
   const firstRead = await readClientRaw();
   if (!firstRead.ok) return { exitCode: 1, written: [] };
+
+  // Is there already an entry at this exact name in this exact file? A re-run
+  // for a wired slug simply spliced over it: same file, same key, and the
+  // nudge said "Trial wired" as though nothing had been there -- so a user
+  // re-running with a different --ttl or --env had no signal that the previous
+  // wiring, and the inline secret in it, was gone. Read from the config rather
+  // than inferred from the marker: the marker can name an entry a user has
+  // already deleted by hand, and the file is what the splice will actually
+  // overwrite.
+  const replacesEntryInPlace = configHasEntry(firstRead.raw, resolved.containerPath, entryName);
 
   // If a previous trial of the same slug is wired, overwrite it (the
   // user is re-running `try`, presumably with a different --ttl or env).
@@ -984,21 +1153,33 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     if (entry.env) print(`  env keys:   ${Object.keys(entry.env).join(", ")}`);
     print(`  expires:    ${new Date(expiresAt).toISOString()}`);
     print(`  marker:     ${trialMarkerPath(slug, home)}`);
+    if (replacesEntryInPlace) {
+      print(`  would replace: the existing ${entryName} entry in ${resolved.absolute}`);
+    }
     if (previousMarker && peelsPrevious) {
       if (previousRefusal !== null) {
         print(
           `  would NOT remove: the previous ${slug} marker ${previousRefusal} -- remove that entry from ${previousMarker.clientPath} by hand`,
         );
-      } else if ((await peelTrialEntry(previousMarker, true)) === "removed") {
-        // Every check the real peel runs, minus the write. Naming the removal
-        // on the STRENGTH of the clientPath/entryName comparison alone
-        // over-promised: when that file (or that entry inside it) is already
-        // gone, the real run's peel returns "absent" and prints nothing at
-        // all. An "absent"/"failed" preview therefore stays quiet too, which
-        // is the direction --dry-run is allowed to be wrong in.
-        print(
-          `  would remove: the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`,
-        );
+      } else {
+        // Every check the real peel runs, minus the write -- and run ONCE, so
+        // the two branches below cannot describe two different reads of the
+        // same file. Naming the removal on the STRENGTH of the
+        // clientPath/entryName comparison alone over-promised: when that file
+        // (or that entry inside it) is already gone, the real run's peel
+        // returns "absent" and prints nothing at all. An "absent"/"failed"
+        // preview therefore stays quiet too, which is the direction --dry-run
+        // is allowed to be wrong in.
+        const previewOutcome = await peelTrialEntry(previousMarker, true);
+        if (previewOutcome === "removed") {
+          print(
+            `  would remove: the previous ${slug} trial (${previousMarker.entryName}) from ${previousMarker.clientPath}`,
+          );
+        } else if (previewOutcome === "replaced") {
+          print(
+            `  would NOT remove: the previous ${slug} trial's entry (${previousMarker.entryName}) in ${previousMarker.clientPath} is no longer the one the trial wrote`,
+          );
+        }
       }
     }
     return { exitCode: 0, written: [], marker };
@@ -1028,6 +1209,16 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
         if (!respliced.ok) return { exitCode: 1, written: [] };
         clientJson = respliced.json;
       }
+    } else if (outcome === "replaced") {
+      // The previous trial's key now holds something else -- the user kept the
+      // name and pointed it at their own server. Leaving it is the whole point
+      // of the fingerprint; saying so is what stops it reading as a silent
+      // no-op. The marker is not restored on a later rollback either (see
+      // previousPeelFailedWhileTrusted): nothing of OURS is wired there any
+      // more, so there is nothing for a marker to name.
+      printErr(
+        `yaw-mcp try: the previous ${slug} trial's entry (${previousMarker.entryName}) in ${previousMarker.clientPath} is no longer the one the trial wrote, so it was left alone.`,
+      );
     } else if (outcome === "failed") {
       previousPeelFailedWhileTrusted = previousRefusal === null;
       printErr(
@@ -1122,6 +1313,12 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // `entryName`, not a rebuilt literal: the name printed here has to be the
   // name actually written, or a change to TRIAL_ENTRY_PREFIX makes this line
   // lie about what is in the file.
+  // Above the nudge, because it is about the state the nudge describes: the
+  // entry that was there is gone, and if it carried its own inline value that
+  // value went with it.
+  if (replacesEntryInPlace) {
+    print(`Replaced the existing ${entryName} entry in ${resolved.absolute}`);
+  }
   print(`Trial wired: ${server.name} via ${entryName} -> ${resolved.absolute}`);
   // "Expires in Nh" alone read as a timer. Nothing sweeps on a schedule: the
   // TTL is only consumed by gcExpiredTrials, which runs from `yaw-mcp doctor`
@@ -1144,6 +1341,32 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     );
   }
   return { exitCode: 0, written, marker };
+}
+
+/** Both ends must be a TTY: stdin to read the answer, stdout to show the
+ *  question. Same predicate, and the same test seams, as `remove` and `set`. */
+function isInteractive(opts: TryCleanupOptions): boolean {
+  if (opts.isTTY !== undefined) return opts.isTTY;
+  if (opts.promptAnswer !== undefined) return true;
+  return Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+}
+
+/** Ask the confirmation. Defaults to NO -- a bare Enter, a stray keystroke, or
+ *  EOF (^D, a piped stdin running dry) leaves the client config alone.
+ *  questionOrEmpty is what makes EOF an answer at all: a bare rl.question()
+ *  never settles once its input closes. */
+async function askYesNo(opts: TryCleanupOptions, question: string): Promise<string | QuestionCancelled> {
+  if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
+  const input = opts.io?.stdin ?? process.stdin;
+  const output = opts.io?.stdout ?? process.stdout;
+  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
+  try {
+    const raw = await questionOrEmpty(rl, question);
+    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
+    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
 }
 
 export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommandResult> {
@@ -1197,13 +1420,70 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 1, written: [] };
   }
 
+  // ----- destructive-action confirmation --------------------------------
+  // This rewrites a file the user's AI client launches from, which is the
+  // same class of write `install` prompts over and `remove` shows a preview
+  // for -- try-cleanup was the last one doing it on the bare verb. Gated on
+  // there BEING a trial to remove: the no-marker case above already returned
+  // exit 0, so a cleanup script that runs this unconditionally still no-ops
+  // rather than starting to refuse.
+  if (!opts.force) {
+    print("");
+    print(`  Remove the "${slug}" trial:`);
+    print("");
+    print(`    entry:  ${marker.entryName}`);
+    print(`    from:   ${marker.clientPath}`);
+    print(`    marker: ${markerPath}`);
+    print("");
+    print("  The entry stops launching, and any value stored inline on it goes");
+    print("  with it. Your other entries in that file are untouched.");
+    print("");
+    if (!isInteractive(opts)) {
+      // Exit 2, the code every off-TTY confirmation refusal in this CLI uses
+      // (`remove`, `set`, `uninstall`, `secrets remove`).
+      printErr(
+        `yaw-mcp try-cleanup: refusing to edit ${marker.clientPath} without a confirmation -- stdin/stdout is not a TTY.`,
+      );
+      printErr("  Re-run with --force (or -y) to remove it.");
+      return { exitCode: 2, written: [] };
+    }
+    const answer = await askYesNo(opts, `  Remove "${marker.entryName}"? [y/N] `);
+    if (answer === QUESTION_CANCELLED) {
+      printErr("yaw-mcp try-cleanup: Cancelled. Nothing was removed.");
+      return { exitCode: 130, written: [] };
+    }
+    if (answer !== "y" && answer !== "yes") {
+      printErr("yaw-mcp try-cleanup: Aborted. Nothing was removed.");
+      return { exitCode: 1, written: [] };
+    }
+  }
+
   // Peel the entry out of the client config (no-op if already gone). Routed
   // through `removeJsoncEntry` so user comments in the client config survive
   // -- a JSON.parse + JSON.stringify pass would silently strip them.
   const written: string[] = [];
+  /** Set when the entry at the marker's name turned out to be someone else's
+   *  work, so the closing line does not claim a cleanup that did not happen. */
+  let leftReplacedEntry = false;
   try {
-    const outcome = await peelEntryFromConfig(marker.clientPath, marker.containerPath, marker.entryName);
-    if (outcome === "removed") {
+    const outcome = await peelEntryFromConfig(
+      marker.clientPath,
+      marker.containerPath,
+      marker.entryName,
+      false,
+      marker.entryFingerprint,
+    );
+    if (outcome === "replaced") {
+      leftReplacedEntry = true;
+      // The key is the user's now -- they kept the trial's name and pointed it
+      // at something else. Leave it, and still drop the marker: what the
+      // marker described is gone, and keeping it would make doctor report an
+      // expired trial forever over an entry nothing here will ever remove.
+      printErr(
+        `yaw-mcp try-cleanup: ${marker.entryName} in ${marker.clientPath} is no longer the entry this trial wrote -- it was replaced, so it has been left alone.`,
+      );
+      printErr("  Remove it by hand if you no longer want it.");
+    } else if (outcome === "removed") {
       written.push(marker.clientPath);
       print(`Removed ${marker.entryName} from ${marker.clientPath}`);
     } else if (outcome === "not-object") {
@@ -1232,7 +1512,14 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 1, written: [] };
   }
 
-  print(`Trial for "${slug}" cleaned up.`);
+  // "cleaned up" would over-claim on the replaced path: the marker is gone,
+  // but the entry at that name is still wired -- deliberately, because it is
+  // the user's. Say which of the two happened.
+  print(
+    leftReplacedEntry
+      ? `Trial marker for "${slug}" removed; the entry at ${marker.entryName} was left in place.`
+      : `Trial for "${slug}" cleaned up.`,
+  );
   return { exitCode: 0, written };
 }
 
@@ -1353,7 +1640,50 @@ export async function gcExpiredTrials(opts: {
       // Routed through removeJsoncEntry (inside the shared peel) so user
       // comments in the client config survive doctor's GC pass -- the previous
       // JSON.parse + JSON.stringify shape silently stripped them.
-      const outcome = await peelEntryFromConfig(marker.clientPath, marker.containerPath, marker.entryName);
+      const outcome = await peelEntryFromConfig(
+        marker.clientPath,
+        marker.containerPath,
+        marker.entryName,
+        false,
+        marker.entryFingerprint,
+      );
+      if (outcome === "replaced") {
+        // The entry at that name is not the one this trial wrote: the user
+        // kept the key and pointed it at their own server. The sweep used to
+        // delete it -- their work, silently, on a timer.
+        //
+        // Reported as a failure so doctor SAYS so once (it renders every
+        // failure through trialGcFailureWarning), and the marker is unlinked
+        // anyway: what it described is gone, and keeping it would re-report
+        // the same non-event on every sweep forever -- the exact never-clears
+        // loop the not-object branch below was written to avoid.
+        stage = "replaced";
+        // Unlinked in its OWN catch, not the loop's: a failure here leaves the
+        // marker on disk, and the surrounding catch would then report the
+        // errno under stage "replaced" -- whose wording promises the marker
+        // WAS removed. Falling back to stage "unlink" is no better (that line
+        // says the entry was removed, and it deliberately was not), so this
+        // one keeps its own message.
+        let markerRemoved = true;
+        try {
+          await unlink(path);
+        } catch {
+          markerRemoved = false;
+        }
+        failures.push({
+          slug: marker.slug,
+          clientPath: marker.clientPath,
+          markerPath: path,
+          stage,
+          // The WHOLE sentence, because the two cases differ in what actually
+          // happened -- see trialGcFailureWarning, which prints this verbatim
+          // for stage "replaced" rather than adding a tail that could contradict it.
+          error: markerRemoved
+            ? `${marker.entryName} in ${marker.clientPath} was replaced since the trial wrote it, so it was left in place; the expired trial marker was deleted -- remove that entry by hand if you do not want it`
+            : `${marker.entryName} in ${marker.clientPath} was replaced since the trial wrote it, so it was left in place; its marker ${path} could not be deleted either, so this will be reported again -- delete that marker by hand`,
+        });
+        continue;
+      }
       if (outcome === "not-object") {
         // Valid JSON, but not an object (an array, a string, a number):
         // removeJsoncEntry has no container to name the entry in, so the
@@ -1385,8 +1715,11 @@ export interface TrialGcFailure {
   clientPath: string;
   markerPath: string;
   /** "peel": the entry is STILL in the client config. "unlink": the config
-   *  is clean; only the marker file could not be deleted. */
-  stage: "peel" | "unlink";
+   *  is clean; only the marker file could not be deleted. "replaced": the
+   *  entry at that name is not the one the trial wrote, so it was deliberately
+   *  left alone (the marker WAS removed) -- not a failure of the sweep so much
+   *  as a thing the user needs told once. */
+  stage: "peel" | "unlink" | "replaced";
   error: string;
 }
 
@@ -1394,6 +1727,9 @@ export interface TrialGcFailure {
  *  section, the --json warnings, and the stderr warning stream so all three
  *  surfaces say the same thing and gate exit 2 identically. */
 export function trialGcFailureWarning(f: TrialGcFailure): string {
+  // Printed verbatim: the replaced case has two outcomes (marker deleted or
+  // not), and a tail appended here could only be right for one of them.
+  if (f.stage === "replaced") return `trial "${f.slug}": ${f.error}`;
   return f.stage === "unlink"
     ? `trial "${f.slug}": its entry was removed from ${f.clientPath}, but the marker ${f.markerPath} could not be deleted (${f.error}) -- delete that marker by hand`
     : `trial "${f.slug}": expired but could not be removed from ${f.clientPath} (${f.error}) -- still wired in; run \`yaw-mcp try-cleanup ${f.slug}\` or edit that file by hand`;
