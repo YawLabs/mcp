@@ -59,9 +59,33 @@ describe("capContent", () => {
     expect(notice?.text).toContain("Do not treat what you received as the whole answer");
   });
 
-  it("keeps the kept bytes under the ceiling", () => {
+  it("keeps the WHOLE RETURNED RESULT under the ceiling, notice included", () => {
+    // Measures the array actually handed back, not `bytesKept`. That field
+    // counts only the content blocks, so asserting on it passed while the
+    // real payload ran 387 bytes over on every cap value -- the notice was
+    // appended after the budget accounting. A cap that does not cap.
+    for (const cap of [1_000, 4_000, 10_000, 100_000]) {
+      const r = capContent([text("x".repeat(500_000))], cap);
+      expect(r.capped).toBe(true);
+      const actual = Buffer.byteLength(JSON.stringify(r.content), "utf8");
+      expect(actual, `cap=${cap} returned ${actual} bytes`).toBeLessThanOrEqual(cap);
+    }
+  });
+
+  it("stays under the ceiling with many blocks, not just one oversized one", () => {
+    // A different shape reaching the same budget: the loop keeps whole blocks
+    // until one crosses, so the accounting has to hold across iterations too.
+    const many = Array.from({ length: 200 }, (_, i) => text(`block ${i} ${"y".repeat(300)}`));
+    const r = capContent(many, 8_000);
+    expect(r.capped).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(r.content), "utf8")).toBeLessThanOrEqual(8_000);
+  });
+
+  it("reports bytesKept as the CONTENT it kept, excluding the notice", () => {
+    // The field is still useful and still means what it says -- it is just
+    // not the ceiling check. Pinned so the two do not get conflated again.
     const r = capContent([text("x".repeat(50_000))], 4_000);
-    expect(r.bytesKept).toBeLessThanOrEqual(4_000);
+    expect(r.bytesKept).toBeLessThan(4_000);
     expect(r.bytesRaw).toBeGreaterThan(40_000);
   });
 
@@ -112,6 +136,20 @@ describe("capContent", () => {
     expect(r.capped).toBe(true);
     expect(r.content).toHaveLength(1);
     expect(r.content[0]?.text).toContain("has been CUT");
+  });
+
+  it("exceeds a sub-notice ceiling rather than cutting silently -- the one exception", () => {
+    // A ceiling smaller than the notice cannot be honoured AND still say the
+    // result was cut. Reporting the cut wins: a silently truncated log reads
+    // to the model as a complete one, which is the failure this whole module
+    // exists to prevent. Pinned so the exception stays deliberate and known
+    // rather than turning up later as a surprise.
+    const r = capContent([text("z".repeat(10_000))], 10);
+    const actual = Buffer.byteLength(JSON.stringify(r.content), "utf8");
+    expect(actual).toBeGreaterThan(10);
+    // And it is ONLY the notice -- no content rode along past the budget.
+    expect(r.content).toHaveLength(1);
+    expect(r.bytesKept).toBe(0);
   });
 
   it("names the ops escape hatch so the ceiling is not a dead end", () => {
