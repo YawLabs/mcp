@@ -770,6 +770,11 @@ export class ConnectServer {
         this.toolFilters,
         resolveToolExposure(),
         this.sessionActivated,
+        // Hidden here, refused at the gate, but still ROUTED: dropping the
+        // route instead would make a call by name return `Unknown tool`,
+        // which reads as a typo and sends the model hunting for a name that
+        // is right there.
+        (wireName) => this.isToolDenied(wireName),
       ),
     }));
 
@@ -1137,6 +1142,7 @@ export class ConnectServer {
         userPath: this.profile.userPath,
         allow: this.profile.servers,
         block: this.profile.blocked,
+        blockedTools: this.profile.blockedTools,
       });
     }
     // Resolve the shadow-driven install-nudge gate once, from the env
@@ -1566,7 +1572,17 @@ export class ConnectServer {
       // just decided was the relevant one.
       return this.observed(
         this.attachGuideNudge(
-          await this.handleDiscoverWithAutoWarm(typeof args.context === "string" ? args.context : undefined, progress),
+          await this.handleDiscoverWithAutoWarm(
+            typeof args.context === "string" ? args.context : undefined,
+            progress,
+            // Single-server focus is a RENDER filter (see the param doc on
+            // handleDiscoverWithAutoWarm): it bounds which cards and tool
+            // names get printed without touching the ranker or the auto-warm
+            // decision, so it composes with the observation tick above rather
+            // than competing with it -- a focused discover still ages the
+            // other namespaces exactly like an unfocused one.
+            typeof args.server === "string" ? args.server : undefined,
+          ),
         ),
       );
     }
@@ -1637,6 +1653,32 @@ export class ConnectServer {
     if (name === META_TOOLS.secrets.name) {
       const serverArg = typeof args.server === "string" ? args.server : undefined;
       return this.observed(this.attachGuideNudge(await this.handleSecretsReport(serverArg)));
+    }
+
+    // Per-tool deny gate. Runs here, and the position is the property:
+    // AFTER every meta-tool branch, so the control surface the user manages
+    // the block WITH can never be blocked; and BEFORE the route snapshot,
+    // because the deferred branch below calls activateOne, which spawns the
+    // upstream's configured command with its vault-resolved env. A gate one
+    // block later would start the process and inject the credential before
+    // refusing -- enforcement that arrives after the side effect.
+    //
+    // The refusal is BRANDED as a routing fault. handleExec books a persisted
+    // 0.0 reliability outcome against the upstream for any step result that is
+    // not branded, and routes stay complete for a blocked tool -- so an
+    // unbranded refusal would punish a perfectly healthy server for the user's
+    // own policy. The exec preflight normally keeps this path unreachable from
+    // exec, but that is a UX layer a refactor could reorder.
+    if (this.isToolDenied(name)) {
+      return brandRoutingFault({
+        content: [
+          {
+            type: "text",
+            text: `Tool "${name}" is blocked by the "blockedTools" list in ${this.blockedToolsSource()}. Report the block to the user instead of routing around it (a shell command, another server); if it should be callable, the entry must be removed and this MCP client restarted.`,
+          },
+        ],
+        isError: true,
+      });
     }
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during
@@ -2134,23 +2176,110 @@ export class ConnectServer {
   // the score, and the line would just be chat noise.
   private static readonly MARKETPLACE_HINT_THRESHOLD = 5;
 
-  private handleDiscover(context?: string): { content: Array<{ type: string; text: string }> } {
-    return this.buildDiscoverOutput(context, /* warmedNamespace */ null);
+  // How many cached tool names a dormant server's `known tools:` line shows.
+  //
+  // That line was the single largest thing discover printed: on a 30-server
+  // install the tool names alone were 20,536 of the body's 22,712 bytes --
+  // 90% of a ~5,700-token reply, from the meta-tool whose entire purpose is
+  // keeping tools OUT of context. Capping at 5 removes about three quarters
+  // of it while leaving enough names to recognise what a server is for.
+  //
+  // A compile-time constant, deliberately not an env dial: the cap is a
+  // component of the rendered body, so a tunable one would have to be
+  // threaded into discoverCacheKey (whose comments already record three bugs
+  // from exactly that omission), and no correct value differs from this one.
+  // The recovery path is `server:` focus, which is bounded by one server
+  // rather than by a number the model has to guess.
+  private static readonly DISCOVER_TOOL_NAME_CAP = 5;
+
+  /** Is this flattened wire tool name denied by the resolved `blockedTools`?
+   *
+   *  Matched literally and case-sensitively against `<namespace>_<tool>` -- the
+   *  exact string tools/list advertises, buildToolRoutes keys on, the client
+   *  sends, and an exec step names. A single trailing `*` is a prefix match.
+   *
+   *  Namespace flattening means (ns `gh`, tool `actions_list`) and
+   *  (ns `gh_actions`, tool `list`) both render `gh_actions_list`, so a deny on
+   *  that string covers whichever upstream won the route collision. That is the
+   *  safe direction and is deliberately not disambiguated: a deny matching more
+   *  than the user pictured fails closed, one matching less fails open. */
+  private isToolDenied(wireName: string): boolean {
+    const denies = this.profile?.blockedTools;
+    if (!denies || denies.length === 0) return false;
+    for (const entry of denies) {
+      if (entry.endsWith("*")) {
+        const prefix = entry.slice(0, -1);
+        // A bare `*` is inert here as well as refused at load. Defence in
+        // depth on a claim three surfaces make -- the README, the JSON schema
+        // and the loader warning all promise a bare wildcard cannot match --
+        // and an empty prefix would otherwise deny EVERY tool, which is the
+        // one wrong answer that fails closed hard enough to look broken.
+        if (prefix !== "" && wireName.startsWith(prefix)) return true;
+      } else if (wireName === entry) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Which file the user has to edit. `blockedTools` merges across scopes, so
+   *  when both a project and a user-global config contributed we cannot say
+   *  which one carries THIS entry without re-reading them -- name both rather
+   *  than guess, since sending someone to the wrong file is worse than sending
+   *  them to two. */
+  private blockedToolsSource(): string {
+    if (!this.profile) return "your yaw-mcp config";
+    return this.profile.userPath
+      ? `whichever of ${this.profile.path} / ${this.profile.userPath} declares it (blockedTools merges across scopes)`
+      : this.profile.path;
+  }
+
+  /** read_tool's answer for a denied tool.
+   *
+   *  A schema is an invitation to call, and on a dormant server read_tool ends
+   *  by telling the model to activate and invoke -- so returning one for a
+   *  tool the gate will refuse sends the model down a path that cannot work.
+   *  It refuses in the gate's own words instead, which is also the wording
+   *  that names the file to edit. */
+  private deniedToolRead(wireName: string): { content: Array<{ type: string; text: string }>; isError: boolean } {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Tool "${wireName}" is blocked by the "blockedTools" list in ${this.blockedToolsSource()}. Its schema is withheld because a call would be refused. Report the block to the user instead of routing around it.`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  private handleDiscover(
+    context?: string,
+    focusNamespace?: string,
+  ): { content: Array<{ type: string; text: string }> } {
+    return this.buildDiscoverOutput(context, /* warmedNamespace */ null, focusNamespace);
   }
 
   private async handleDiscoverWithAutoWarm(
     context?: string,
     progress?: ProgressReporter,
+    // Focus is a RENDER concern only: it never reaches the ranker, the
+    // auto-activate thresholds or the prewarm claim below. So
+    // `discover(context: "...", server: "pg")` can render only pg's card
+    // while the banner reports that gh was auto-loaded -- correct, because
+    // the banner announces a session state change the model must know about,
+    // and suppressing it would hide an activation.
+    focusNamespace?: string,
   ): Promise<{ content: Array<{ type: string; text: string }> }> {
-    if (!context || !isAutoActivateEnabled()) return this.handleDiscover(context);
+    if (!context || !isAutoActivateEnabled()) return this.handleDiscover(context, focusNamespace);
 
     const activeServers = this.getProfiledActiveServers();
-    if (activeServers.length === 0) return this.handleDiscover(context);
+    if (activeServers.length === 0) return this.handleDiscover(context, focusNamespace);
 
     // Use the same ranker dispatch uses so discover + dispatch pick the
     // same winner for the same intent.
     const ranked = await this.twoStageRank(context, activeServers);
-    if (ranked.length === 0) return this.handleDiscover(context);
+    if (ranked.length === 0) return this.handleDiscover(context, focusNamespace);
 
     // Only auto-warm if one candidate dominates: top score clears the
     // floor and either stands alone or beats the runner-up by the
@@ -2164,7 +2293,7 @@ export class ConnectServer {
       top.score >= minScore &&
       (second === undefined || top.score / (second.score || 1e-6) >= margin);
 
-    if (!topWinsDecisively || !top) return this.handleDiscover(context);
+    if (!topWinsDecisively || !top) return this.handleDiscover(context, focusNamespace);
 
     // Already connected -- nothing to SPAWN, but under gateway exposure
     // "connected" is not "advertised": a prewarm-claimed winner, or one
@@ -2192,7 +2321,7 @@ export class ConnectServer {
         // tools/list surface moved.
         await this.notifyAllListsChanged();
       }
-      return this.buildDiscoverOutput(context, top.namespace);
+      return this.buildDiscoverOutput(context, top.namespace, focusNamespace);
     }
 
     progress?.(`Auto-warming top candidate "${top.namespace}"`);
@@ -2216,7 +2345,7 @@ export class ConnectServer {
     // Pass the namespace we ACTUALLY warmed, not a bare boolean: the
     // banner below must name the server twoStageRank picked, which is
     // not necessarily the head of the list the output renders.
-    const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null);
+    const output = this.buildDiscoverOutput(context, result.ok ? top.namespace : null, focusNamespace);
     if (result.ok) return output;
 
     // Auto-warm failed. Say WHY, in the same response: result.message carries
@@ -2255,7 +2384,11 @@ export class ConnectServer {
     this.discoverCache = null;
   }
 
-  private discoverCacheKey(context: string | undefined, warmedNamespace: string | null): string {
+  private discoverCacheKey(
+    context: string | undefined,
+    warmedNamespace: string | null,
+    focusNamespace: string | undefined,
+  ): string {
     const activeNamespaces = [...this.connections.entries()]
       .filter(([, c]) => c.status === "connected")
       .map(([ns]) => ns)
@@ -2280,20 +2413,26 @@ export class ConnectServer {
     // component changes, so without it a discover inside the 3s TTL would
     // still call the freshly-activated server "not advertised".
     const advertisedSignature = [...this.sessionActivated].sort().join(",");
-    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}`;
+    // Focus decides WHICH cards the body renders, so it is a key component
+    // for the same reason the three above it are. Without it a
+    // `discover(server: "gh")` followed inside the 3s TTL by
+    // `discover(server: "pg")` replays gh's card labelled as pg's -- and the
+    // back-to-back double call is exactly the pattern this memo exists for.
+    return `${this.configVersion ?? ""}|${context ?? ""}|${warmedNamespace ?? ""}|${activeNamespaces}|${filterSignature}|${advertisedSignature}|${focusNamespace ?? ""}`;
   }
 
   private buildDiscoverOutput(
     context: string | undefined,
     warmedNamespace: string | null,
+    focusNamespace?: string,
   ): { content: Array<{ type: string; text: string }> } {
-    const key = this.discoverCacheKey(context, warmedNamespace);
+    const key = this.discoverCacheKey(context, warmedNamespace, focusNamespace);
     const now = Date.now();
     const cached = this.discoverCache;
     if (cached && cached.key === key && cached.expires > now) {
       return cached.result;
     }
-    const result = this.buildDiscoverOutputImpl(context, warmedNamespace);
+    const result = this.buildDiscoverOutputImpl(context, warmedNamespace, focusNamespace);
     this.discoverCache = { key, result, expires: now + ConnectServer.DISCOVER_CACHE_TTL_MS };
     return result;
   }
@@ -2301,12 +2440,61 @@ export class ConnectServer {
   private buildDiscoverOutputImpl(
     context: string | undefined,
     warmedNamespace: string | null,
+    focusNamespace?: string,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
       return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
     }
 
-    const activeServers = this.getProfiledActiveServers();
+    const allProfiled = this.getProfiledActiveServers();
+
+    // Focus resolution. getProfiledActiveServers filters on isActive and the
+    // project profile ONLY, so a namespace missing from it but present in the
+    // config is disabled or profile-blocked -- there is no third state, and in
+    // particular it is never compliance-blocked: discover deliberately LISTS a
+    // below-grade server with an inline annotation rather than hiding it, which
+    // is why this must not route through the spawn gate.
+    // A focus MISS still has to report an auto-load that already happened.
+    // handleDiscoverWithAutoWarm never validates the focus: by the time the
+    // body is rendered it may have spawned a server, put it in sessionActivated
+    // and fired tools/list_changed. Returning a bare miss would leave the model
+    // holding tools it was never told about -- the one thing the banner exists
+    // to prevent. Same wording and same dash as the banner below, so the two
+    // cannot drift.
+    const warmPrefix = warmedNamespace ? `Auto-loaded "${warmedNamespace}" — top match for your query.\n\n` : "";
+    const focusMiss = (text: string): { content: Array<{ type: string; text: string }> } => ({
+      content: [{ type: "text", text: `${warmPrefix}${text}` }],
+    });
+
+    let focused: UpstreamServerConfig | undefined;
+    if (focusNamespace !== undefined) {
+      focused = allProfiled.find((srv) => srv.namespace === focusNamespace);
+      if (!focused) {
+        const configured = this.config.servers.find((srv) => srv.namespace === focusNamespace);
+        if (configured && configured.isActive === false) {
+          return focusMiss(
+            `"${focusNamespace}" is installed but disabled ("isActive": false in ~/.yaw-mcp/bundles.json). Call mcp_connect_discover with no arguments to list what is available.`,
+          );
+        }
+        if (configured) {
+          return focusMiss(`"${focusNamespace}" is not allowed by the project profile in effect.`);
+        }
+        const near = closestNames(
+          focusNamespace,
+          allProfiled.map((srv) => srv.namespace),
+          1,
+        )[0];
+        return focusMiss(
+          near
+            ? `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Did you mean: ${near}?`
+            : `"${focusNamespace}" is not in ~/.yaw-mcp/bundles.json. Call mcp_connect_discover with no arguments to list what is available.`,
+        );
+      }
+    }
+
+    // Every advisory block below reads the FULL profiled set (ranking, packs,
+    // overlaps, the marketplace threshold); only the card loop narrows.
+    const activeServers = focused ? [focused] : allProfiled;
 
     // Score and sort using corpus-wide BM25 when context is provided.
     // Servers that don't match any query term simply fall out of the
@@ -2353,7 +2541,7 @@ export class ConnectServer {
     // sees the short answer before the long list. Without this block
     // the relevance signal is easy to skim past — the per-server lines
     // carry a numeric score but no summary of WHY each matched.
-    if (context) {
+    if (context && !focused) {
       const matchedServers = sorted.filter((s) => {
         const score = scores.get(s.namespace);
         return score !== undefined && score > 0;
@@ -2376,7 +2564,15 @@ export class ConnectServer {
     // another server's `often loaded with "<ns>"` line -- naming something
     // `activate` can no longer load. The Suggested-packs block below filters
     // exactly the same way.
-    const installedNamespaces = new Set(activeServers.map((s) => s.namespace));
+    //
+    // Built from allProfiled, not activeServers, for the reason the block
+    // comment above the focus narrowing states: every advisory reads the FULL
+    // profiled set. A focused call collapses activeServers to ONE element, and
+    // buildCoUsageMap keeps a pack bucket only when a PEER survives the filter
+    // -- so a one-element set empties every bucket and the focused card loses
+    // the `often loaded with` line the same card carries in the full listing.
+    // Unfocused output is unchanged: activeServers === allProfiled there.
+    const installedNamespaces = new Set(allProfiled.map((s) => s.namespace));
     // Precompute the co-usage map once per discover call. Derived from
     // the PackDetector's current history — same signal `suggest` surfaces,
     // but delivered inline so the LLM doesn't need a second meta-tool
@@ -2401,7 +2597,7 @@ export class ConnectServer {
         if (b.frequency !== a.frequency) return b.frequency - a.frequency;
         return b.lastSeenAt - a.lastSeenAt;
       });
-    if (actionablePacks.length > 0) {
+    if (actionablePacks.length > 0 && !focused) {
       lines.push("Recurring packs (activate together — seen before):");
       for (const pack of actionablePacks.slice(0, 3)) {
         const nsJson = JSON.stringify(pack.namespaces);
@@ -2422,7 +2618,29 @@ export class ConnectServer {
     const exposure = resolveToolExposure();
     const isAdvertised = (namespace: string): boolean => exposure === "full" || this.sessionActivated.has(namespace);
 
+    // The SESSION token total, computed over every live connection rather than
+    // accumulated inside the card loop below. Two reasons, one new and one
+    // pre-existing. New: the loop can now render a single focused server, and a
+    // loop-derived total would report that one server's cost as the session's.
+    // Pre-existing: the loop's guard was `connection && tools.length > 0` with no
+    // status check, while the `totalTools` reduce that feeds the same sentence
+    // requires status "connected" -- so an advertised connection that had errored
+    // rendered "0 tools in context (~1,234 tokens)". Both counts now agree on
+    // what is in context: connected, advertised, post-filter.
+    // Set when a known-tools line was capped or dropped, so the footer that
+    // explains the recovery path appears only when there is something to
+    // recover. Deliberately NOT set for a server with an empty cache: it
+    // omitted nothing.
+    let omittedToolNames = false;
+
     let totalContextTokens = 0;
+    for (const conn of this.connections.values()) {
+      const ns = conn.config.namespace;
+      if (conn.status !== "connected" || !isAdvertised(ns)) continue;
+      const visible = this.visibleTools(ns, conn.tools);
+      if (visible.length > 0) totalContextTokens += estimateFromConnectedTools(visible).tokens;
+    }
+
     for (const server of sorted) {
       const connection = this.connections.get(server.namespace);
       // Apply per-tool filter to the advertised count so discover matches
@@ -2430,7 +2648,10 @@ export class ConnectServer {
       // still shown as the denominator so the model sees what's hidden.
       const filter = this.toolFilters.get(server.namespace);
       const total = connection?.tools.length ?? 0;
-      const exposed = connection ? (filter ? connection.tools.filter((t) => filter.has(t.name)).length : total) : 0;
+      const exposed = connection ? this.visibleTools(server.namespace, connection.tools).length : 0;
+      // The suffix still fires on a FILTER only: it reads `filtered: K of N`,
+      // which describes the model's own narrowing. A deny is the user's
+      // policy and is reported on the tool, not as a filter the model set.
       const filterSuffix = connection && filter ? ` (filtered: ${exposed} of ${total})` : "";
       const status = connection
         ? connection.status === "error"
@@ -2454,10 +2675,9 @@ export class ConnectServer {
       // total, which describes context actually spent.
       let costLabel = "";
       if (connection && connection.tools.length > 0) {
-        const visible = filter ? connection.tools.filter((t) => filter.has(t.name)) : connection.tools;
+        const visible = this.visibleTools(server.namespace, connection.tools);
         if (visible.length > 0) {
           const sample = estimateFromConnectedTools(visible);
-          if (isAdvertised(server.namespace)) totalContextTokens += sample.tokens;
           costLabel = ` — ${formatCostLabel(sample)}`;
         }
       } else {
@@ -2522,15 +2742,61 @@ export class ConnectServer {
       const usageHint = formatUsageHint(this.learning.get(server.namespace), coUsageMap.get(server.namespace) ?? []);
       if (usageHint) lines.push(`    ${usageHint}`);
 
-      // Show cached tool names for servers that aren't currently connected.
-      // Same merged list as the cost label above.
-      if (!connection) {
-        const cached = server.toolCache;
-        if (cached && cached.length > 0) {
-          const toolNames = cached.map((t) => t.name).join(", ");
-          lines.push(`    known tools: ${toolNames}`);
+      // Tool names. A dormant server renders from the cache (same merged list
+      // as the cost label above); a CONNECTED one renders only under focus,
+      // where the meta-tool's own description promises that server's complete
+      // list. The load-bearing case there is a connection the client never
+      // activated -- under gateway exposure tools/list withholds its tools, so
+      // without this the names appear NOWHERE in the session.
+      //
+      // RAW connection.tools, not this.visibleTools(): as the label below says,
+      // line describes what the SERVER offers, with policy annotated rather
+      // than omitted. Both shapes carry a bare `name`, which is all it reads.
+      if (!connection || focused) {
+        const names: Array<{ name: string }> | undefined = connection ? connection.tools : server.toolCache;
+        if (names && names.length > 0) {
+          // In the RANKED shape, a server the query did not match at all
+          // contributes nothing but noise here -- its card still names it, its
+          // type and its tool count, which is what the model needs to know it
+          // exists. rankServers only emits entries scoring above zero, so a
+          // non-matching namespace is ABSENT from the map rather than mapped to
+          // 0; `?? 0` is what makes the test fire at all. Bare `context`
+          // truthiness, matching every other branch in this function, so
+          // discover("") stays on the unranked path here too.
+          const dropped = focused === undefined && Boolean(context) && (scores.get(server.namespace) ?? 0) <= 0;
+          if (dropped) {
+            omittedToolNames = true;
+          } else {
+            // A focused call is bounded by one server and was explicitly asked
+            // for, so it renders the full list -- that is the recovery path the
+            // cap depends on existing.
+            const cap = focused ? names.length : ConnectServer.DISCOVER_TOOL_NAME_CAP;
+            const shown = names.slice(0, cap);
+            // Annotated, not omitted. This list describes what the SERVER
+            // offers, and a tool quietly missing from it reads as a yaw-mcp
+            // bug rather than as the policy the user themselves wrote.
+            const label = (t: { name: string }): string =>
+              this.isToolDenied(`${server.namespace}_${t.name}`) ? `${t.name} [blocked]` : t.name;
+            const hidden = names.length - shown.length;
+            if (hidden > 0) omittedToolNames = true;
+            const more = hidden > 0 ? ` (+${hidden} more)` : "";
+            lines.push(`    known tools: ${shown.map(label).join(", ")}${more}`);
+          }
         }
       }
+    }
+
+    // One short footer rather than a per-line pointer: the recovery hint is
+    // 75 bytes if repeated on every truncated server (2,250 across 30) versus
+    // 11 bytes for the marker plus one 112-byte line. Only when something was
+    // actually omitted -- an unconditional footer would move text that existing
+    // discover fixtures, all of them under the cap, never expected to move.
+    if (omittedToolNames && !focused) {
+      lines.push(
+        context
+          ? `\nTool lists show the first ${ConnectServer.DISCOVER_TOOL_NAME_CAP} names, for matching servers only; call mcp_connect_discover(server: "<namespace>") for one server's full list.`
+          : `\nTool lists show the first ${ConnectServer.DISCOVER_TOOL_NAME_CAP} names; call mcp_connect_discover(server: "<namespace>") for one server's full list.`,
+      );
     }
 
     // Overlapping tools block — detect bare tool names that appear in
@@ -2540,7 +2806,7 @@ export class ConnectServer {
     // alphabetical tie-break) to keep output bounded. Suppressed entirely
     // when no overlaps exist.
     const overlaps = computeToolOverlaps(this.connections.values());
-    if (overlaps.length > 0) {
+    if (!focused && overlaps.length > 0) {
       lines.push("\nOverlapping tools (same bare name in multiple servers):");
       const top = overlaps.slice(0, 5);
       for (let i = 0; i < top.length; i++) {
@@ -2567,7 +2833,7 @@ export class ConnectServer {
     // mergeToolCache clone per server on every uncached discover.
     const allInstalled = activeServers.map((s) => s.namespace);
     const bundleGaps = topPartialBundles(allInstalled, 3);
-    if (bundleGaps.length > 0) {
+    if (!focused && bundleGaps.length > 0) {
       lines.push("\nBundle completions (install to unlock curated stacks):");
       for (const { bundle, have, missing } of bundleGaps) {
         lines.push(`  ${bundle.id} — have: ${have.join(", ")}; add: ${missing.join(", ")}`);
@@ -2575,7 +2841,7 @@ export class ConnectServer {
     }
 
     const inactive = this.config.servers.filter((s) => !s.isActive);
-    if (inactive.length > 0) {
+    if (!focused && inactive.length > 0) {
       lines.push("\nDisabled servers:");
       for (const server of inactive) {
         lines.push(`  ${server.namespace} — ${server.name} ("isActive": false in bundles.json)`);
@@ -2587,7 +2853,10 @@ export class ConnectServer {
     // on (env or config); otherwise this is a no-op and the output above
     // is byte-identical to a build without the feature. See
     // buildInstallCandidatesLines + install-nudge.ts.
-    lines.push(...this.buildInstallCandidatesLines(activeServers));
+    // Gated on the CALL rather than on its output: this runs the offline
+    // shell-history scan and then records a per-CLI nudge cooldown, so
+    // suppressing only the lines would burn a nudge the user never saw.
+    if (!focused) lines.push(...this.buildInstallCandidatesLines(allProfiled));
 
     // Count CONNECTED connections only, the same slot definition the
     // concurrent-load cap uses (evaluateCapFor). An error-state entry is an
@@ -2607,8 +2876,7 @@ export class ConnectServer {
     const totalTools = Array.from(this.connections.values()).reduce((sum, c) => {
       const ns = c.config.namespace;
       if (c.status !== "connected" || !isAdvertised(ns)) return sum;
-      const f = this.toolFilters.get(ns);
-      return sum + (f ? c.tools.filter((t) => f.has(t.name)).length : c.tools.length);
+      return sum + this.visibleTools(ns, c.tools).length;
     }, 0);
     const tokenSummary = totalContextTokens > 0 ? ` (~${totalContextTokens.toLocaleString()} tokens)` : "";
     lines.push(`\n${activeCount} loaded in this session, ${totalTools} tools in context${tokenSummary}.`);
@@ -2624,7 +2892,7 @@ export class ConnectServer {
     // one-line pointer at the public catalog. No API is hit — the catalog
     // is a static browsable surface, so this is a URL hint, not a full
     // meta-tool.
-    if (this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
+    if (!focused && this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
       lines.push(
         "Browse the catalog at https://yaw.sh/mcp/catalog/ and add servers with `yaw-mcp add <slug>` — they land in ~/.yaw-mcp/bundles.json and load on the next client restart.",
       );
@@ -2917,6 +3185,21 @@ export class ConnectServer {
   // byte-identical modal inside the same activate call -- spending the whole
   // budget (and three spawn attempts plus their retry sleeps) before the user
   // has any chance to go fix the value somewhere else.
+  /** One predicate behind every count that claims to describe tools/list.
+   *  A tool hidden by a FILTER and a tool hidden by a DENY both leave the
+   *  advertised set, so both leave these numbers -- the difference between
+   *  them is what happens on a CALL, not on a list.
+   *
+   *  On the class rather than inside handleDiscover because activate makes the
+   *  same claim and got it wrong: both of its messages name a tool count, and
+   *  counting with the deny alone over-reported the surface of the very call
+   *  that had just narrowed it -- activate({server, tools: [...]}) installs the
+   *  filter BEFORE the connect loop runs. One predicate, one place. */
+  private visibleTools<T extends { name: string }>(namespace: string, tools: T[]): T[] {
+    const f = this.toolFilters.get(namespace);
+    return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
+  }
+
   private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
@@ -2927,10 +3210,19 @@ export class ConnectServer {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
       progress?.(`"${namespace}" already loaded`);
+      // The same predicate the fresh-connect path counts with, and the same one
+      // tools/list applies -- filter AND deny, not deny alone. The raw inventory
+      // reports a number that includes tools no client can see and the gate
+      // would refuse; counting with the deny alone then over-reported the very
+      // call that had just narrowed the surface, because
+      // activate({server, tools: [...]}) installs the filter before this loop
+      // runs. A re-activation narrowing gh to one tool answered "already loaded
+      // with 2 tools" while the tools/list it triggered carried one.
+      const visible = this.visibleTools(namespace, existing.tools).length;
       return {
         ok: true,
         isChanged: false,
-        message: `"${namespace}" is already loaded with ${existing.tools.length} tools.`,
+        message: `"${namespace}" is already loaded with ${visible} tools.`,
         serverId: existing.config.id,
       };
     }
@@ -3065,7 +3357,15 @@ export class ConnectServer {
           // just means we re-learn next time.
           this.scheduleStateSave();
 
-          const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
+          // The same predicate tools/list uses. Announcing the raw inventory
+          // told the model a denied tool had just been loaded, and the next
+          // call to it was refused by the gate -- the one advertised-surface
+          // claim the deny did not already cover. The FILTER belongs here for
+          // the same reason: a first activate carrying tools: [...] installs it
+          // before this runs, and this message ENUMERATES the names, so counting
+          // deny-only handed the model back the very tools it asked to hide.
+          const visible = this.visibleTools(namespace, connection.tools);
+          const toolNames = visible.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
           // server isn't permanently demoted for a transient past failure.
           this.activationFailures.delete(namespace);
@@ -3073,7 +3373,7 @@ export class ConnectServer {
             ok: true,
             isChanged: true,
             serverId: serverConfig.id,
-            message: `Loaded "${namespace}" — ${connection.tools.length} tools: ${toolNames}`,
+            message: `Loaded "${namespace}" — ${visible.length} tools: ${toolNames}`,
           };
         } catch (err) {
           lastError = err;
@@ -4288,6 +4588,7 @@ export class ConnectServer {
           isError: true,
         };
       }
+      if (this.isToolDenied(tool.namespacedName)) return this.deniedToolRead(tool.namespacedName);
       return {
         content: [
           {
@@ -4350,6 +4651,7 @@ export class ConnectServer {
           isError: true,
         };
       }
+      if (this.isToolDenied(tool.namespacedName)) return this.deniedToolRead(tool.namespacedName);
       return {
         content: [
           {
@@ -4389,9 +4691,18 @@ export class ConnectServer {
     // `type` and `headers` ride along so computeSecretsReport can pick the
     // channel that server actually uses. Dropping them here is what made the
     // report blind to every remote server's credentials.
+    //
+    // `command` and `url` ride along for the same reason, one level down:
+    // isRemoteEntry does not read `type` alone. validateEntry defaults a
+    // missing `"type"` to "local", so a hand-written url+headers entry is
+    // recognised only by the command-less-with-a-url fallback -- and passing
+    // neither field left that fallback permanently false here, which is the
+    // same blindness in a narrower case.
     let servers = this.getProfiledActiveServers().map((s) => ({
       namespace: s.namespace,
       type: s.type,
+      command: s.command,
+      url: s.url,
       env: s.env,
       headers: s.headers,
     }));
@@ -4468,6 +4779,11 @@ export class ConnectServer {
       }
       if (this.profile.servers?.length) lines.push(`  allow: ${this.profile.servers.join(", ")}`);
       if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
+      // The per-tool deny belongs here too. toProfile returns non-null for a
+      // blockedTools-ONLY config, so without this line health announces a
+      // profile and then displays none of the policy it is enforcing --
+      // exactly the surface the Profile.blockedTools doc comment points at.
+      if (this.profile.blockedTools?.length) lines.push(`  block tools: ${this.profile.blockedTools.join(", ")}`);
       lines.push("");
     }
 
@@ -4823,6 +5139,25 @@ export class ConnectServer {
           {
             type: "text",
             text: `exec: step "${key}": meta-tool "${step.tool}" cannot be called from exec; call it directly`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    // Blocked tools next, for the same reason and in the same shape: a step
+    // naming a denied tool can never run, and finding that out at step 4 costs
+    // the side effects of steps 1 through 3. Plain text, because the SHAPE is
+    // the phase marker -- `exec: ...` means nothing ran, while the
+    // {ok, failedStep, error, partial} envelope means execution started.
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (!this.isToolDenied(step.tool)) continue;
+      const key = stepBindingKey(step, i);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `exec: step "${key}": tool "${step.tool}" is blocked by the "blockedTools" list in ${this.blockedToolsSource()}; no step ran.`,
           },
         ],
         isError: true,

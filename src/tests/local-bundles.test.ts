@@ -204,60 +204,6 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].runtime).toBeUndefined();
   });
 
-  it("propagates a remote server's headers from bundles.json", async () => {
-    // Same whitelist trap again, and here it would have made the field
-    // unreachable: `headers` is the only credential channel a remote upstream
-    // has, since it spawns no process and its `env` is ignored by design.
-    writeBundles(synthHome, {
-      version: 1,
-      servers: [
-        {
-          namespace: "remotey",
-          name: "Remote",
-          type: "remote",
-          url: "https://mcp.example.test/mcp",
-          headers: { Authorization: "Bearer ${secret:tok}", "X-Trace": "1" },
-        },
-      ],
-    });
-    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-    expect(r.config?.servers[0].headers).toEqual({ Authorization: "Bearer ${secret:tok}", "X-Trace": "1" });
-  });
-
-  it("drops blank header values and blank header names", async () => {
-    // Blank is dropped for a DIFFERENT reason than `env`'s empty-string seed:
-    // nothing is inherited on a remote entry, so a blank header is a
-    // half-finished edit. Sending `Authorization:` with an empty value reads
-    // to a server as a malformed credential rather than as none at all.
-    writeBundles(synthHome, {
-      version: 1,
-      servers: [
-        {
-          namespace: "remotey",
-          name: "Remote",
-          type: "remote",
-          url: "https://mcp.example.test/mcp",
-          headers: { Authorization: "", "X-Blank": "   ", "  ": "v", "X-Good": " kept ", "X-Num": 42 },
-        },
-      ],
-    });
-    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-    // The surviving value keeps its own whitespace (a header value can
-    // legitimately contain spaces); only the NAME is trimmed.
-    expect(r.config?.servers[0].headers).toEqual({ "X-Good": " kept " });
-  });
-
-  it("treats a non-object headers value as absent", async () => {
-    for (const bad of ["Authorization: x", 42, null, ["a"]]) {
-      writeBundles(synthHome, {
-        version: 1,
-        servers: [{ namespace: "remotey", name: "Remote", type: "remote", url: "https://x.test/mcp", headers: bad }],
-      });
-      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
-      expect(r.config?.servers[0].headers, JSON.stringify(bad)).toBeUndefined();
-    }
-  });
-
   it("propagates a per-server complianceGrade from bundles.json", async () => {
     // Same whitelist trap as runtime and connectTimeoutMs, and this one
     // disabled a security-shaped feature rather than a tuning knob. grades.json
@@ -322,6 +268,147 @@ describe("loadLocalBundles", () => {
     });
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     expect(r.config?.servers[0].connectTimeoutMs).toBe(60000);
+  });
+
+  it("propagates a remote server's headers from bundles.json", async () => {
+    // Same fixed-whitelist trap as connectTimeoutMs above: a field missing
+    // from validateEntry's return is dropped at load, and bundles.json is the
+    // only server source. Without this line the credential never reaches the
+    // transport and the remote keeps answering 401 with nothing saying why.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "linear",
+          name: "Linear",
+          type: "remote",
+          url: "https://mcp.linear.app/mcp",
+          headers: { Authorization: "Bearer ${secret:linear}", "X-Tenant": "acme" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toEqual({
+      Authorization: "Bearer ${secret:linear}",
+      "X-Tenant": "acme",
+    });
+  });
+
+  it("warns on and drops a blank or non-string header value", async () => {
+    // Blank headers are dropped for a DIFFERENT reason than blank env values.
+    // An env "" is `add`'s marker for "required, nothing stored, comes from
+    // the shell", and loading it would clobber the inherited value. A header
+    // has no ambient fallback at all, so a blank one just claims a credential
+    // is configured while sending nothing -- and unlike env it warns, because
+    // this field exists to fix an auth failure the user is already staring at.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "api",
+          name: "Api",
+          type: "remote",
+          url: "https://example.test/mcp",
+          // A blank NAME and a value with meaningful surrounding whitespace
+          // ride along here: the name is trimmed and an empty one dropped,
+          // while the VALUE keeps its own spaces, because a header value can
+          // legitimately contain them. Only the name is trimmed.
+          headers: { Authorization: "   ", "X-Num": 42, "  ": "v", "X-Real": " keep " },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toEqual({ "X-Real": " keep " });
+    expect(r.warnings.some((w) => w.includes('ignoring header "Authorization" on "api" (empty value)'))).toBe(true);
+    expect(r.warnings.some((w) => w.includes('ignoring header "X-Num" on "api" (empty value)'))).toBe(true);
+  });
+
+  it("warns on and drops a header name outside the RFC 7230 token charset", async () => {
+    // Validated at LOAD rather than left to the transport: a bad name reaching
+    // `new Headers()` throws a TypeError that quotes the offending VALUE,
+    // which here is the credential. Rejecting the name here keeps the secret
+    // out of every error path.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "api",
+          name: "Api",
+          type: "remote",
+          url: "https://example.test/mcp",
+          headers: { "Bad Name": "x", "Also:Bad": "y", "Good-Name": "z" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toEqual({ "Good-Name": "z" });
+    expect(
+      r.warnings.some((w) => w.includes('ignoring header "Bad Name" on "api" (not a valid HTTP header name)')),
+    ).toBe(true);
+    expect(
+      r.warnings.some((w) => w.includes('ignoring header "Also:Bad" on "api" (not a valid HTTP header name)')),
+    ).toBe(true);
+  });
+
+  it("warns on and drops the two header names the MCP transport owns, case-insensitively", async () => {
+    // Not a preference -- silent corruption. The SDK merges caller headers
+    // LAST into `new Headers({ ...transportHeaders, ...callerHeaders })`, and
+    // Headers COMBINES a case-differing duplicate rather than replacing it:
+    // `new Headers({"mcp-session-id":"a","Mcp-Session-Id":"b"}).get("mcp-session-id")`
+    // reads back as "a, b". A user header under any casing of these names
+    // therefore corrupts the session id AFTER a successful initialize, and
+    // every later request fails against a URL that just worked. The mixed-case
+    // spellings below are the point of the case-insensitive check.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "api",
+          name: "Api",
+          type: "remote",
+          url: "https://example.test/mcp",
+          headers: { "Mcp-Session-Id": "hijack", "MCP-PROTOCOL-VERSION": "0", Authorization: "keep" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toEqual({ Authorization: "keep" });
+    expect(
+      r.warnings.some((w) =>
+        w.includes('ignoring header "Mcp-Session-Id" on "api" (reserved -- the MCP transport sets it)'),
+      ),
+    ).toBe(true);
+    expect(
+      r.warnings.some((w) =>
+        w.includes('ignoring header "MCP-PROTOCOL-VERSION" on "api" (reserved -- the MCP transport sets it)'),
+      ),
+    ).toBe(true);
+  });
+
+  it("warns on and drops a non-object headers field", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        { namespace: "a", name: "A", type: "remote", url: "https://a.test/mcp", headers: "Bearer x" },
+        { namespace: "b", name: "B", type: "remote", url: "https://b.test/mcp", headers: ["Bearer x"] },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toBeUndefined();
+    expect(r.config?.servers[1].headers).toBeUndefined();
+    expect(r.warnings.filter((w) => w.includes("expected an object of string values")).length).toBe(2);
+  });
+
+  it("leaves headers absent, and silent, on an entry that does not set them", async () => {
+    // Only a PRESENT key warns. Absent is the normal case for nearly every
+    // entry (and for every local one) and must stay quiet.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "node", args: ["/x"] }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toBeUndefined();
+    expect(r.warnings.some((w) => w.includes("header"))).toBe(false);
   });
 
   it("warns on and drops a non-positive or non-numeric connectTimeoutMs", async () => {

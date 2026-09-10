@@ -32,7 +32,7 @@ Your MCP client (Claude Code, Cursor, ...)
 | Meta-tool | What it does |
 |-----------|--------------|
 | `mcp_connect_dispatch` | Describe a task in plain English; picks the best server, loads its tools, exposes them in one call. The fast path. |
-| `mcp_connect_discover` | List available servers, optionally ranked by a context string. Auto-loads the top match when one clearly wins. |
+| `mcp_connect_discover` | List available servers, optionally ranked by a context string. Auto-loads the top match when one clearly wins. Tool-name lists are capped at five per server; pass `server` for one server's full list. |
 | `mcp_connect_activate` / `deactivate` | Load / unload specific servers by namespace. |
 | `mcp_connect_read_tool` | Return one tool's schema without loading its server. |
 | `mcp_connect_exec` | Run a short declarative pipeline of tool calls in one round-trip (`{"$ref": "<step>[.path]"}` splices prior outputs; no eval, max 16 steps). |
@@ -54,16 +54,18 @@ Servers auto-unload after ~10 tool calls to other servers, so context stays clea
 ### One command (recommended)
 
 ```bash
-npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode>
+npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli>
 ```
 
 This edits the chosen client's config (correct path + JSON shape for your OS) to launch yaw-mcp. On Windows it wraps `npx` in `cmd /c` (without which MCP clients hit `ENOENT` on the `npx.cmd` shim). Run it once per client.
 
 Useful flags:
 
-- `--scope user|project|local` -- which file to write (Claude Code + Cursor support project/local; VS Code is workspace-only; Claude Desktop is user-only).
+- `--scope user|project|local` -- which file to write. Claude Code and Cursor support project and local; VS Code and Gemini CLI support user and project; Claude Desktop and Windsurf are user-only.
 - `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
 - `--force` / `--skip` -- overwrite or leave an existing `mcp` entry (otherwise prompts on a TTY, refuses off-TTY).
+
+After it writes, install reports two things it did **not** change. First, how many servers `~/.yaw-mcp/bundles.json` gives yaw-mcp to serve -- and when that is none, the `yaw-mcp add <slug>` step to take *before* restarting the client, since yaw-mcp reads that file once at startup. Second, how many other MCP servers were already configured in the client file it just edited; those keep launching directly from the client, and installing yaw-mcp does not move them behind the broker. The count is a number, never the server names. Under `--all` the bundles.json line prints once for the run, while the per-client count prints under each client.
 
 Or do every detected client at once:
 
@@ -240,9 +242,48 @@ Malformed files log a warning and fall through (fail-open). yaw-mcp reads config
 
 Drop a `YAW-MCP.md` next to `config.json` in either `.yaw-mcp/` and yaw-mcp surfaces it via a `yaw-mcp://guide` MCP resource. The `discover`/`dispatch` descriptions tell the model to read it first, so project routing conventions ("use the `gh` server, not bash") and credential guidance stick without restating them each session. A user guide (`~/.yaw-mcp/YAW-MCP.md`) and a project guide are concatenated with the project one last; a missing file is skipped silently.
 
+### Finding a server
+
+```bash
+yaw-mcp search sql              # slug, name, tags, category, description
+yaw-mcp search                  # list the whole catalog
+yaw-mcp search sql --json       # machine-readable
+```
+
+Each match prints its runtime, tool count and the credentials it needs by name, so you know what an `add` will ask for before you run it. Nothing is written; `yaw-mcp add <slug>` is what installs. A slug that misses now suggests the closest real one rather than only naming a URL.
+
+### Changing a server without editing JSON
+
+```bash
+yaw-mcp set github isActive=false           # or: yaw-mcp disable github
+yaw-mcp set github runtime=oam              # host it on the oam runtime
+yaw-mcp set github connectTimeoutMs=60000   # slower handshake, this server only
+yaw-mcp set github env.GITHUB_TOKEN='${secret:gh}'   # point at the vault
+yaw-mcp set github env.OLD_VAR=             # remove one variable
+```
+
+Only the entry you name is rewritten, so comments and formatting elsewhere in `bundles.json` survive -- unlike `add` and `remove`, which rewrite the whole file. `enable` and `disable` are the same edit as `set <server> isActive=true|false`.
+
+Settable: `isActive`, `runtime`, `connectTimeoutMs`, `description`, and one `env.KEY` at a time. Everything else is refused, including `command`, `args` and `url` -- those decide which program yaw-mcp launches as you, and belong to `add`/`remove` or a deliberate edit. A trailing `=` clears a field; clearing a stored env value asks first, since it does not come back.
+
+### Blocking individual tools
+
+`blocked` turns a whole server off. `blockedTools` turns off individual tools on servers you otherwise want:
+
+```jsonc
+// .yaw-mcp/config.json
+{ "blockedTools": ["gh_delete_repo", "pg_drop_*"] }
+```
+
+Entries are the flattened `<namespace>_<tool>` names that appear in the tool list, matched literally and case-sensitively, with an optional single trailing `*` for a prefix match. A bare `*` is refused, and a bare tool name does not match across servers -- `<namespace>_<tool>` cannot be split back apart reliably, because a namespace may itself contain `_`. The broker's own `mcp_connect_*` tools cannot be blocked.
+
+The two keys act on different events. `blocked` is checked when a server would start; `blockedTools` is checked when a tool would be called, which is also what makes it cover a tool reached inside an `mcp_connect_exec` pipeline. A pipeline naming a blocked tool is refused before any step runs, rather than failing partway through. Denies merge across config scopes, so a project config can add one but never remove one, and there is no allow-list counterpart.
+
+A blocked tool is withheld from the tool list, so the model does not see it as an option, but it keeps its route: calling it by name returns an explicit refusal rather than an unknown-tool error that reads like a typo. `discover` still shows it in a server's known-tools line, marked `[blocked]`, since that line describes what the server offers.
+
 ## Local secret vault
 
-Rather than putting credentials in a client config, keep a value in an encrypted file on your own machine and reference it from any server's `env` with a `${secret:NAME}` placeholder:
+Rather than putting credentials in a client config, keep a value in an encrypted file on your own machine and reference it with a `${secret:NAME}` placeholder. A **local** server takes it in `env`, which becomes the child process's environment:
 
 ```jsonc
 "env": {
@@ -251,7 +292,16 @@ Rather than putting credentials in a client config, keep a value in an encrypted
 }
 ```
 
-At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env. If the passphrase is absent or a name isn't stored, the spawn is **refused** -- the literal `${secret:NAME}` is never passed through, since some servers would treat the placeholder as a real token. The value never leaves your machine.
+A **remote** (HTTP/SSE) server takes it in `headers`, which are sent on every request the transport makes:
+
+```jsonc
+{ "namespace": "linear", "type": "remote", "url": "https://mcp.linear.app/mcp",
+  "headers": { "Authorization": "Bearer ${secret:linear}" } }
+```
+
+The two are the local and remote halves of one mechanism: same vault, same placeholder, same refusal. `env` on a remote entry is ignored (it warns and tells you to use `headers`), and `headers` on a local entry is ignored the same way. A header name is dropped at load, with a warning, if its value is blank, if the name is not a valid HTTP header name, or if it is `Mcp-Session-Id` or `Mcp-Protocol-Version` in any casing -- the transport sets those, and a duplicate would corrupt the session rather than override it.
+
+When the server starts -- a spawn for a local one, a connect for a remote one -- if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env or onto the request headers. If the passphrase is absent or a name isn't stored, the start is **refused** -- the literal `${secret:NAME}` is never passed through, since some servers would treat the placeholder as a real token. The value never leaves your machine, and it is stripped out of error text before that text reaches a log or the model.
 
 ### Remote servers: `headers`
 

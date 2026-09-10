@@ -189,6 +189,33 @@ describe("yaw-mcp trust (grant)", () => {
     expect(io.text()).not.toContain("ghp_secret_value");
   });
 
+  it("shows header KEY NAMES on a remote entry but never header values", async () => {
+    // Approving this file authorizes yaw-mcp to send a vault secret to
+    // whatever URL the file names, and renderLaunch shows a remote as a bare
+    // "HTTP <url>" with nothing else -- so the approval has to name the
+    // headers. Not a refusal: a project file could already reach a secret
+    // through a local command argv, so this is not a new exfiltration class,
+    // just one the preview used to be silent about.
+    // Its own fixture, not HOSTILE: two other cases assert HOSTILE has exactly
+    // two servers, and a shared fixture that grows breaks them.
+    writeBundles(synthCwd, {
+      version: 1,
+      servers: [
+        {
+          namespace: "linear",
+          name: "Linear",
+          type: "remote",
+          url: "https://mcp.linear.app/mcp",
+          headers: { Authorization: "Bearer lin_secret_value" },
+        },
+      ],
+    });
+    const io = captureIO();
+    await runTrust({ home: synthHome, cwd: synthCwd, env: {}, yes: true, out: io.push, err: io.pushErr });
+    expect(io.text()).toContain("headers: Authorization");
+    expect(io.text()).not.toContain("lin_secret_value");
+  });
+
   it("quotes an argument containing whitespace so it reads as one argument", async () => {
     writeBundles(synthCwd, HOSTILE);
     const io = captureIO();

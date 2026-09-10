@@ -97,6 +97,20 @@ export function localBundlesPath(configDir: string): string {
  *  instead of maintaining an independent copy that drifts from the loader's. */
 export const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 
+/** RFC 7230 header-name token charset. Validated at LOAD rather than left to
+ *  the transport, because a bad name reaching `new Headers()` throws a
+ *  TypeError that quotes the offending VALUE -- which for these is a
+ *  credential. Rejecting the name here keeps the secret out of every error
+ *  path. Exported so tests pin the loader's own definition. */
+export const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/** Header names the MCP transport owns and a user entry must not set. Lowercase;
+ *  matching is case-insensitive. Deliberately NOT including `authorization`
+ *  (it is the whole point of the feature) or `content-type` / `accept`, which
+ *  the SDK sets after merging, so a user value there is cleanly overridden
+ *  rather than corrupted. */
+export const RESERVED_HEADER_NAMES = new Set(["mcp-session-id", "mcp-protocol-version"]);
+
 /** Coerce a raw entry from bundles.json into a strict UpstreamServerConfig.
  *  Returns null when required fields are missing or malformed so the loader
  *  can skip the entry with a warning instead of crashing the whole load. */
@@ -147,27 +161,82 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
         ) as Record<string, string>)
       : undefined;
   const url = typeof e.url === "string" ? e.url : undefined;
+
   // HTTP headers for a REMOTE server, the channel a remote upstream takes its
   // credential through (types.ts). Same fixed-whitelist rule as every field
   // above: absent here means dropped at load, and a `headers` block would have
   // been silently discarded.
   //
+  // Every rejection WARNS, following the connectTimeoutMs precedent below
+  // rather than env's silent filtering: a header exists to fix an
+  // authentication failure the user is already staring at, so dropping one
+  // without a word leaves the same 401 firing with nothing anywhere saying the
+  // setting was thrown away. Only a PRESENT `headers` key can warn -- absent is
+  // the normal case for nearly every entry, and for every local one.
+  //
   // Blank values are dropped for a DIFFERENT reason than `env`'s. There the
   // empty string is a deliberate "required, but not stored here" seed that
-  // would clobber an inherited shell value; here nothing is inherited, and a
-  // blank header is either a half-finished edit or a `${secret:...}` the user
-  // meant to fill in. Sending `Authorization:` with an empty value reads to a
-  // server as a malformed credential rather than as no credential, so the
-  // clearer failure is to omit it. Keys are trimmed and must be non-blank:
-  // a whitespace-only header name cannot be put on the wire at all.
-  const headers =
-    e.headers && typeof e.headers === "object" && !Array.isArray(e.headers)
-      ? (Object.fromEntries(
-          Object.entries(e.headers as Record<string, unknown>)
-            .filter(([k, v]) => k.trim() !== "" && typeof v === "string" && v.trim() !== "")
-            .map(([k, v]) => [k.trim(), v as string]),
-        ) as Record<string, string>)
-      : undefined;
+  // would clobber an inherited shell value; here nothing is inherited and no
+  // writer seeds one, so a blank header is either a half-finished edit or a
+  // `${secret:...}` the user meant to fill in -- it claims a credential is
+  // configured while sending nothing. Sending `Authorization:` with an empty
+  // value reads to a server as a malformed credential rather than as no
+  // credential, so the clearer failure is to omit it.
+  //
+  // Names are TRIMMED first and must then still be a real RFC 7230 token.
+  // Trimming REPAIRS the hand-edit artifact -- `" Authorization "` in a JSON
+  // file someone typed by hand -- rather than refusing it; the charset test
+  // catches what trimming cannot, and a whitespace-only name trims to "" and
+  // fails that same test, since the pattern requires at least one character.
+  // Checking the name at LOAD rather than leaving it to the transport is the
+  // point: a bad name reaching `new Headers()` throws a TypeError that quotes
+  // the offending VALUE, which for these is a credential.
+  let headers: Record<string, string> | undefined;
+  if (e.headers !== undefined) {
+    if (typeof e.headers !== "object" || e.headers === null || Array.isArray(e.headers)) {
+      warnings.push(`bundles.json: ignoring 'headers' on "${namespace}" (expected an object of string values)`);
+    } else {
+      const kept: Record<string, string> = {};
+      // Warnings quote the name AS WRITTEN, never the trimmed form, so the user
+      // can find the offending line in their own file. No warning in this block
+      // ever quotes a VALUE -- see the credential note above.
+      for (const [rawName, value] of Object.entries(e.headers as Record<string, unknown>)) {
+        if (typeof value !== "string" || value.trim() === "") {
+          warnings.push(`bundles.json: ignoring header "${rawName}" on "${namespace}" (empty value)`);
+          continue;
+        }
+        const name = rawName.trim();
+        if (!HTTP_HEADER_NAME_RE.test(name)) {
+          warnings.push(`bundles.json: ignoring header "${rawName}" on "${namespace}" (not a valid HTTP header name)`);
+          continue;
+        }
+        // The MCP transport owns these two. The SDK merges caller headers
+        // LAST into `new Headers({ ...transportHeaders, ...callerHeaders })`,
+        // and Headers COMBINES a case-differing duplicate rather than
+        // replacing it -- `{"mcp-session-id":"a","Mcp-Session-Id":"b"}` reads
+        // back as "a, b". So a user header under any casing of these names
+        // corrupts the session id AFTER a successful initialize, and every
+        // later request fails against a URL that just worked. Refused at
+        // load, case-insensitively, because the failure is silent corruption
+        // rather than a matter of preference.
+        if (RESERVED_HEADER_NAMES.has(name.toLowerCase())) {
+          warnings.push(
+            `bundles.json: ignoring header "${rawName}" on "${namespace}" (reserved -- the MCP transport sets it)`,
+          );
+          continue;
+        }
+        // Only the NAME is trimmed. The VALUE keeps its own whitespace -- a
+        // header value can legitimately carry spaces, and only its blankness
+        // was ever in question.
+        kept[name] = value;
+      }
+      // Undefined rather than {} when nothing survives, matching the env
+      // merge's "no empty husk" rule below: an empty map reads to every
+      // consumer as "headers are configured" while carrying nothing to send.
+      if (Object.keys(kept).length > 0) headers = kept;
+    }
+  }
+
   const description = typeof e.description === "string" ? e.description : undefined;
   // Per-server runtime override. "oam" hosts the server on the oam runtime
   // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`).
@@ -839,7 +908,7 @@ const BUNDLES_LOCK_POLL_MS = 20;
  *  (acquireUpgradeLock probes the recorded pid), so a crashed Yaw Terminal or
  *  `serve` never blocks an add/remove; what reaches the give-up path is a
  *  live-but-stuck holder, and "delete that lock file" is advice for that. */
-async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+export async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
   const dir = userConfigDir(home);
   // O_EXCL cannot create the sidecar in a dir that does not exist yet, and
   // acquireUpgradeLock reads that ENOENT as "no lock possible, proceed" --

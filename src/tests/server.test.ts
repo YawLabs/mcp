@@ -261,6 +261,247 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toContain("known tools: create_issue, list_prs");
     });
 
+    describe("discover bounds its tool lists", () => {
+      const eight = (prefix: string) => Array.from({ length: 8 }, (_, i) => ({ name: `${prefix}_${i + 1}` }));
+
+      it("truncates a dormant server's tool list and says how many are hidden", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.toolCache.set("gh", eight("t"));
+
+        const text = priv.handleDiscover().content[0].text;
+        // The number is pinned, not matched loosely: an off-by-one in the hidden
+        // count is exactly what a regex would let through.
+        expect(text).toContain("known tools: t_1, t_2, t_3, t_4, t_5 (+3 more)");
+        expect(text).not.toContain("t_6");
+      });
+
+      it("leaves a server at or below the cap byte-identical", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.toolCache.set("gh", [{ name: "a" }, { name: "b" }, { name: "c" }, { name: "d" }, { name: "e" }]);
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("known tools: a, b, c, d, e");
+        expect(text).not.toContain("(+");
+        expect(text).not.toContain("Tool lists show");
+      });
+
+      it("renders the recovery footer once, not once per truncated server", () => {
+        // Counting the LINE is the whole point of a short per-server marker plus
+        // one footer: repeating the hint on every server was the shape this
+        // rejected, at 75 bytes a line instead of 11.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "pg", name: "Postgres" }),
+          makeServerConfig({ namespace: "sl", name: "Slack" }),
+        ]);
+        priv.toolCache.set("gh", eight("g"));
+        priv.toolCache.set("pg", eight("p"));
+        priv.toolCache.set("sl", eight("s"));
+
+        const text = priv.handleDiscover().content[0].text;
+        const footers = text.split("\n").filter((l: string) => l.startsWith("Tool lists show the first"));
+        expect(footers).toHaveLength(1);
+        expect(footers[0]).toContain("mcp_connect_discover(server:");
+      });
+
+      it("renders the cap from the constant rather than a literal", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.toolCache.set("gh", eight("t"));
+
+        const cap = (ConnectServer as unknown as { DISCOVER_TOOL_NAME_CAP: number }).DISCOVER_TOOL_NAME_CAP;
+        expect(priv.handleDiscover().content[0].text).toContain(`first ${cap} names`);
+      });
+
+      it("drops the known-tools line for a server the query did not match", () => {
+        // rankServers only emits entries scoring above zero, so a non-matching
+        // namespace is ABSENT from the score map rather than mapped to 0 -- the
+        // `?? 0` in the drop rule is what makes this fire at all.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub", description: "github issues and pull requests" }),
+          makeServerConfig({ namespace: "redis", name: "Redis", description: "redis cache keys" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }, { name: "list_prs" }]);
+        priv.toolCache.set("redis", [{ name: "redis_get" }, { name: "redis_set" }]);
+
+        const text = priv.handleDiscover("github issues").content[0].text;
+        expect(text).toContain("create_issue");
+        // Its card is still there; only the tool names are gone.
+        expect(text).toContain("redis");
+        expect(text).not.toContain("redis_get");
+        expect(text).toContain("for matching servers only");
+      });
+
+      it("keeps every known-tools line in the unranked shape", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "redis", name: "Redis" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+        priv.toolCache.set("redis", [{ name: "redis_get" }]);
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("create_issue");
+        expect(text).toContain("redis_get");
+      });
+    });
+
+    describe("discover server: focus", () => {
+      it("renders one card with the full, uncapped tool list", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "pg", name: "Postgres" }),
+        ]);
+        priv.toolCache.set(
+          "gh",
+          Array.from({ length: 12 }, (_, i) => ({ name: `t_${i + 1}` })),
+        );
+        priv.toolCache.set("pg", [{ name: "query" }]);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        expect(text).toContain("t_12");
+        expect(text).not.toContain("(+");
+        expect(text).not.toContain("Tool lists show");
+        expect(text).not.toContain("Postgres");
+      });
+
+      it("suppresses the cross-server advisory blocks", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "old", name: "Old Server", isActive: false }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        for (const block of [
+          "Disabled servers:",
+          "Bundle completions",
+          "Recurring packs",
+          "Overlapping tools",
+          "https://yaw.sh/mcp/catalog/",
+        ]) {
+          expect(text).not.toContain(block);
+        }
+      });
+
+      it("suggests a close installed name on an unknown namespace", () => {
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+        expect(priv.handleDiscover(undefined, "gh-x").content[0].text).toContain("Did you mean: gh?");
+      });
+
+      it("distinguishes a disabled server from one that is not installed", () => {
+        // Two different problems with two different fixes: one is a JSON edit,
+        // the other is an install. getProfiledActiveServers filters on isActive
+        // and the profile only, so these are the only two states a miss can be.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "old", name: "Old Server", isActive: false })]);
+
+        const disabled = priv.handleDiscover(undefined, "old").content[0].text;
+        expect(disabled).toContain('"isActive": false');
+        expect(disabled).not.toContain("is not in ~/.yaw-mcp/bundles.json");
+
+        const absent = priv.handleDiscover(undefined, "zzz").content[0].text;
+        expect(absent).toContain("is not in ~/.yaw-mcp/bundles.json");
+      });
+
+      it("re-renders when only the focus changes inside the cache window", () => {
+        // The cache key's fourth omission bug, pre-empted: two focused calls
+        // inside the 3s TTL differ in nothing else, so without focus in the key
+        // the second replays the first server's card under the second's name.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ namespace: "pg", name: "Postgres" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+        priv.toolCache.set("pg", [{ name: "query" }]);
+
+        expect(priv.handleDiscover(undefined, "gh").content[0].text).toContain("GitHub");
+        const second = priv.handleDiscover(undefined, "pg").content[0].text;
+        expect(second).toContain("Postgres");
+        expect(second).not.toContain("GitHub");
+      });
+
+      it("keeps the focused server's tool list when the context does not match it", () => {
+        // The known-tools drop rule is
+        // `focused === undefined && Boolean(context) && (score ?? 0) <= 0`, and
+        // nothing else in the suite passes BOTH context and server. Only that
+        // first conjunct stops a focused card from dropping the very list it
+        // was asked to expand: gh scores zero against a query about redis, so
+        // without it discover({context, server: "gh"}) renders one card with no
+        // tools on it at all -- and focus suppresses the recovery footer that
+        // would otherwise tell the model where they went.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ namespace: "gh", name: "GitHub", description: "github issues and pull requests" }),
+          makeServerConfig({ namespace: "redis", name: "Redis", description: "redis cache keys" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }, { name: "list_prs" }]);
+        priv.toolCache.set("redis", [{ name: "redis_get" }]);
+
+        const text = priv.handleDiscover("redis cache keys", "gh").content[0].text;
+
+        expect(text).toContain("known tools: create_issue, list_prs");
+        // gh really did score zero -- rankServers omits a non-matching
+        // namespace, so no per-server relevance suffix is rendered for it. A
+        // match would make the assertion above vacuous. Matched on the open
+        // paren: the ranked HEADER says "ranked by relevance:" either way.
+        expect(text).not.toContain("(relevance:");
+        // Focus still bounds the render to the one card that was asked for.
+        expect(text).not.toContain("Redis");
+      });
+
+      it("keeps the co-usage peer that the full listing shows", () => {
+        // Focus exists to EXPAND one card, so that card must never be less
+        // informative than the same one in the full listing. The co-usage map
+        // is filtered by the installed set, every detected pack spans >=2
+        // namespaces, and focus used to narrow that set to one -- which
+        // emptied every bucket and silently dropped this line.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([
+          makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+          makeServerConfig({ id: "2", namespace: "pg", name: "Postgres" }),
+        ]);
+        priv.toolCache.set("gh", [{ name: "create_issue" }]);
+        // Two bursts of (gh, pg) -- enough for a detected pack.
+        const t0 = 1_000_000;
+        priv.packDetector.recordCall("gh", "create_issue", t0);
+        priv.packDetector.recordCall("pg", "query", t0 + 1000);
+        priv.packDetector.recordCall("gh", "create_issue", t0 + 300_000);
+        priv.packDetector.recordCall("pg", "query", t0 + 301_000);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        expect(text).toContain('often loaded with "pg"');
+        // Only the card LOOP narrows: the peer is named, its card is not.
+        expect(text).not.toContain("Postgres");
+      });
+
+      it("names the tools of a connected server the client never activated", () => {
+        // The unadvertised connection prewarm's claim and a deferred first
+        // tools/call both produce: tools/list withholds its tools under the
+        // default gateway exposure, so if the focused card omits them too the
+        // names appear NOWHERE in the session -- while the meta-tool's own
+        // description promises this call returns that server's complete list.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+        // The state under test: connected, never asked for by the client.
+        expect(priv.sessionActivated.size).toBe(0);
+
+        const text = priv.handleDiscover(undefined, "gh").content[0].text;
+        expect(text).toContain("known tools: create_issue, list_prs");
+      });
+    });
+
     it("surfaces a token-cost estimate per server line", () => {
       const priv = getPrivate(server);
       priv.config = makeConfig([
@@ -790,6 +1031,21 @@ describe("ConnectServer", () => {
       expect(priv.connections.has("gh")).toBe(true);
       expect(priv.toolCache.has("gh")).toBe(true);
       expect(priv.idleCallCounts.get("gh")).toBe(0);
+    });
+
+    it("names only the filtered tools in the very call that installs the filter", async () => {
+      // handleActivate installs the tools filter BEFORE the connect loop, so
+      // this message is rendered with it live. Counting and naming with the
+      // deny alone handed the model back the names it had just asked to hide --
+      // and tools/list, which applies both, then carried fewer tools than the
+      // activate that loaded them said it had.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "list_prs"]));
+
+      const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
+      expect(text).toContain("1 tools: gh_create_issue");
+      expect(text).not.toContain("gh_list_prs");
     });
 
     it("retries on first failure", async () => {
@@ -1865,6 +2121,18 @@ describe("ConnectServer", () => {
         const text = priv.handleHealth().content[0].text;
         expect(text).not.toContain("Profile:");
         expect(text).toContain("No servers loaded in this session");
+      });
+
+      it("shows the per-tool deny for a blockedTools-only profile", () => {
+        // toProfile returns non-null for a config carrying ONLY blockedTools,
+        // so health would print a bare Profile header with nothing under it --
+        // announcing a policy while displaying none of what it enforces.
+        const priv = getPrivate(server);
+        priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo", "pg_drop_*"] };
+
+        const text = priv.handleHealth().content[0].text;
+        expect(text).toContain("Profile: /h/.yaw-mcp/config.json");
+        expect(text).toContain("block tools: gh_delete_repo, pg_drop_*");
       });
     });
 
@@ -4837,6 +5105,55 @@ describe("read_tool honors the same policy gates as activate", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Tool: gh_create_issue");
   });
+
+  it("withholds the schema of a denied tool on the already-loaded fast path", async () => {
+    // A schema is an invitation to call, and read_tool's own output ends by
+    // telling the model to invoke -- so handing one back for a tool the gate
+    // will refuse sends it down a path that cannot work. The fast path returns
+    // before any spawn, so this is the one place the refusal has to come from
+    // the live tool list rather than from a transient connect.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "delete_repo"]));
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo"] };
+
+    const result = await priv.handleReadTool("gh", "delete_repo");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Its schema is withheld because a call would be refused");
+    // REPLACES the schema rather than annotating it -- a refusal still
+    // carrying the input contract would be the invitation it exists to remove.
+    expect(result.content[0].text).not.toContain("Input schema");
+    // Named in the gate's own words, so the model can say which file to edit.
+    expect(result.content[0].text).toContain("/h/.yaw-mcp/config.json");
+    // Per-tool, not per-server: the same server's allowed tool still reads.
+    const allowed = await priv.handleReadTool("gh", "create_issue");
+    expect(allowed.isError).toBeUndefined();
+    expect(allowed.content[0].text).toContain("Input schema");
+  });
+
+  it("withholds it on the transient-connect path too, and still tears the child down", async () => {
+    // The slow path only learns the tool is denied AFTER the transient spawn --
+    // the upstream tool list is what resolves the name -- so the refusal
+    // returns from inside the try block. Leaving the child behind would promote
+    // "read a blocked tool" into "activate", which is the one thing this
+    // meta-tool exists to avoid.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: ["gh_delete_repo"] };
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "delete_repo"]));
+
+    const result = await priv.handleReadTool("gh", "delete_repo");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Its schema is withheld because a call would be refused");
+    expect(result.content[0].text).not.toContain("Input schema");
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
+    // Transient means transient: the refusal must not leave the namespace
+    // loaded, or the next read_tool would take the fast path on a session the
+    // client never activated.
+    expect(priv.connections.has("gh")).toBe(false);
+  });
 });
 
 describe("per-tool filter rollback on a failed activation", () => {
@@ -4890,6 +5207,274 @@ describe("per-tool filter rollback on a failed activation", () => {
 
     await priv.handleActivate(["gh"], undefined, ["create_issue"]);
     expect([...(priv.toolFilters.get("gh") ?? [])]).toEqual(["create_issue"]);
+  });
+});
+
+describe("blockedTools deny gate", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  const withDeny = (priv: ReturnType<typeof getPrivate>, entries: string[], userPath?: string) => {
+    priv.profile = { path: "/h/.yaw-mcp/config.json", blockedTools: entries, ...(userPath ? { userPath } : {}) };
+  };
+
+  it("refuses a denied tool by name and names the file to edit", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    const result = await priv.handleToolCall("gh_delete_repo", {});
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('Tool "gh_delete_repo" is blocked');
+    expect(text).toContain("/h/.yaw-mcp/config.json");
+    // The model is told to report the block, not to work around it -- a
+    // refusal that only says "no" invites a shell command instead.
+    expect(text).toContain("instead of routing around it");
+  });
+
+  it("brands the refusal as a routing fault so no upstream is blamed for it", async () => {
+    // handleExec books a persisted 0.0 reliability outcome against the
+    // upstream for any step result that is NOT branded, and routes stay
+    // complete for a blocked tool -- so an unbranded refusal would punish a
+    // healthy server for the user's own policy.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    expect(isRoutingFaultResult(await priv.handleToolCall("gh_delete_repo", {}))).toBe(true);
+  });
+
+  it("refuses before the upstream is ever spawned", async () => {
+    // The gate sits before the deferred-activation branch, which calls
+    // activateOne and starts the configured command with its vault-resolved
+    // env. Enforcement that arrives after the side effect is not
+    // enforcement, so this asserts on connectToUpstream, not on the text.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.toolCache.set("gh", [{ name: "delete_repo" }]);
+    withDeny(priv, ["gh_delete_repo"]);
+    vi.mocked(connectToUpstream).mockClear();
+
+    const result = await priv.handleToolCall("gh_delete_repo", {});
+    expect(result.isError).toBe(true);
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("matches a trailing-star entry as a prefix, and nothing else", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "pg", name: "Postgres" })]);
+    withDeny(priv, ["pg_drop_*"]);
+
+    expect((await priv.handleToolCall("pg_drop_table", {})).isError).toBe(true);
+    expect((await priv.handleToolCall("pg_drop_", {})).isError).toBe(true);
+    const allowed = await priv.handleToolCall("pg_select", {});
+    expect(String(allowed.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("does not match a bare tool name across servers", async () => {
+    // `<namespace>_<tool>` cannot be unambiguously re-split, since a
+    // namespace may itself contain `_`. So a bare entry is read as
+    // namespace `create`, tool `issue` -- and must not silently deny every
+    // server's create_issue.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["create_issue"]);
+
+    const result = await priv.handleToolCall("gh_create_issue", {});
+    expect(String(result.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("never blocks a meta-tool, even when one is listed", async () => {
+    // The gate runs after every meta-tool branch on purpose: blocking one
+    // would disable the surface the user manages the block with.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["mcp_connect_discover"]);
+
+    const result = await priv.handleToolCall("mcp_connect_discover", {});
+    expect(result.isError).toBeFalsy();
+    expect(String(result.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("names both files when the deny could have come from either scope", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"], "/h/.yaw-mcp/global.json");
+
+    const text = (await priv.handleToolCall("gh_delete_repo", {})).content[0].text;
+    expect(text).toContain("whichever of");
+    expect(text).toContain("blockedTools merges across scopes");
+  });
+
+  it("changes nothing when no deny is configured", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.profile = null;
+
+    const result = await priv.handleToolCall("gh_delete_repo", {});
+    expect(String(result.content[0].text)).not.toContain("is blocked");
+  });
+
+  it("annotates a blocked tool in the dormant list rather than hiding it", () => {
+    // This list describes what the SERVER offers. A tool silently missing
+    // from it reads as a yaw-mcp bug rather than as the user's own policy.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.toolCache.set("gh", [{ name: "create_issue" }, { name: "delete_repo" }]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    expect(priv.handleDiscover().content[0].text).toContain("known tools: create_issue, delete_repo [blocked]");
+  });
+
+  it("counts only the visible tools when the server is already loaded", async () => {
+    // The fresh-connect path already filters, so the early return for an
+    // already-connected server was the one place left reporting a count
+    // tools/list does not carry -- inflated by exactly the tools the gate
+    // would refuse if the model went and called one.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "delete_repo"]));
+    withDeny(priv, ["gh_delete_repo"]);
+
+    const text = (await priv.handleActivate(["gh"])).content[0].text;
+    expect(text).toContain("already loaded with 1 tools");
+  });
+
+  it("counts the tools filter too, not just the deny", async () => {
+    // The sibling above covers the deny. A FILTER hides a tool from tools/list
+    // just as completely -- the difference is what happens on a CALL -- and it
+    // is installed by the same activate that lands on this early return, so
+    // counting deny-only over-reported the surface of the call that had just
+    // narrowed it. No deny here at all: the filter alone has to move the count.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue", "list_prs"]));
+    priv.profile = null;
+
+    const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
+    expect(text).toContain("already loaded with 1 tools");
+  });
+
+  it("withholds a denied tool from the advertised tools/list", async () => {
+    // The other half of the gate, from the SERVER side. setupHandlers passes
+    // isToolDenied into buildToolList as its deny predicate, so a denied tool
+    // never reaches the client's catalog at all. Dropping that argument
+    // re-advertises a tool every call to which is refused, which reads as a
+    // broken server rather than as the user's own policy.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "delete_repo"]));
+    withDeny(priv, ["gh_delete_repo"]);
+    // Gateway is the default exposure and the one this wiring has to hold
+    // under; an exported YAW_MCP_TOOL_EXPOSURE would otherwise decide which
+    // buildToolList branch the assertion lands on.
+    vi.stubEnv("YAW_MCP_TOOL_EXPOSURE", "");
+    try {
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+
+      expect(await listedUpstreamToolNames(priv)).toEqual(["gh_create_issue"]);
+      // Hidden, not unrouted -- the comment at the call site is explicit that
+      // the route survives, so calling the name lands on the block message
+      // instead of "Unknown tool", which reads as a typo.
+      expect(priv.toolRoutes.has("gh_delete_repo")).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("counts filter AND deny against the raw upstream total in discover", async () => {
+    // `exposed` is visibleTools (in the filter, not denied) while `total` stays
+    // the raw upstream count, so the suffix reads K of N. The two sibling tests
+    // each populate only ONE of the maps -- the filter test carries no deny,
+    // and the deny test runs against a dormant server that has no filter -- so
+    // the conjunction itself was never exercised. Counting either half alone
+    // reports 3 here.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["a", "b", "c", "d"]));
+    withDeny(priv, ["gh_c"]);
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["a", "b", "c"] });
+
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("loaded (2 tools) (filtered: 2 of 4)");
+    expect(text).toContain("1 loaded in this session, 2 tools in context");
+    // And the number is not merely internally consistent: it is what tools/list
+    // actually carries, which is the claim the count exists to make.
+    expect(await listedUpstreamToolNames(priv)).toEqual(["gh_a", "gh_b"]);
+  });
+
+  it("reports a load whose deny covers every tool as a 0-tool success", async () => {
+    // Activation genuinely succeeded: the child spawned, the connection is
+    // registered, it holds a cap slot and the namespace is advertised -- there
+    // is simply nothing left to advertise. The message renders from
+    // visibleTools, so it counts and names none. Pinned verbatim, dangling
+    // separator included, because that empty list is the ONLY signal the model
+    // gets that the load was a no-op; a future message that explains the deny
+    // should fail here and be re-pinned rather than drift unnoticed.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_*"]);
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar"]));
+
+    const result = await priv.handleActivate(["gh"]);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe('Loaded "gh" — 0 tools: ');
+    // Not rolled back: the cap slot and the child are really spent.
+    expect(priv.connections.has("gh")).toBe(true);
+    expect(priv.sessionActivated.has("gh")).toBe(true);
+    // ...and the advertised surface agrees with the count it just reported.
+    expect(await listedUpstreamToolNames(priv)).toEqual([]);
+  });
+
+  it("refuses an exec pipeline before any step runs", () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["gh_delete_repo"]);
+
+    return priv
+      .handleExec({
+        steps: [
+          { id: "s1", tool: "gh_list_repos", args: {} },
+          { id: "s2", tool: "gh_delete_repo", args: {} },
+        ],
+      })
+      .then((result: { isError?: boolean; content: Array<{ text: string }> }) => {
+        expect(result.isError).toBe(true);
+        const text = result.content[0].text;
+        expect(text).toContain('step "s2"');
+        expect(text).toContain("no step ran.");
+        // Plain text, not the {ok, failedStep, partial} envelope: the SHAPE
+        // is the phase marker, and a preflight refusal borrowing the
+        // envelope would assert the pipeline ran.
+        expect(text).not.toContain("partial");
+      });
+  });
+
+  it("reports the meta-tool refusal for a step that is both a meta-tool and denied", () => {
+    // Ordering contract: what makes a step illegal is the tool it names.
+    // Meta-tools are unblockable at the gate, so a "blocked" message here
+    // would describe a refusal that could never happen.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    withDeny(priv, ["mcp_connect_exec"]);
+
+    return priv
+      .handleExec({ steps: [{ id: "s1", tool: "mcp_connect_exec", args: {} }] })
+      .then((result: { content: Array<{ text: string }> }) => {
+        expect(result.content[0].text).toContain("cannot be called from exec");
+        expect(result.content[0].text).not.toContain("blockedTools");
+      });
   });
 });
 

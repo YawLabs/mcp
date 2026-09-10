@@ -12,7 +12,9 @@ import { parseDoctorArgs } from "../doctor-cmd.js";
 import { parseFoundryArgs } from "../foundry-cmd.js";
 import { parseInstallArgs, parseUninstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
+import { parseSetArgs } from "../local-set-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
+import { parseSearchArgs } from "../search-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
 import { parseSidecarsArgs } from "../sidecars-cmd.js";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
@@ -128,7 +130,7 @@ describe("renderScript — bash", () => {
   it("offers positional alternatives at the SAME argument position (one compgen word list)", () => {
     const s = renderScript("bash");
     // All four install clients complete at `install <TAB>`, not one per slot.
-    expect(s).toContain('compgen -W "claude-code claude-desktop cursor vscode"');
+    expect(s).toContain('compgen -W "claude-code claude-desktop cursor vscode windsurf gemini-cli"');
     // Same for bundles actions and completion shells.
     expect(s).toContain('compgen -W "list match"');
     expect(s).toContain('compgen -W "bash zsh fish powershell"');
@@ -207,7 +209,7 @@ describe("renderScript — zsh", () => {
 
   it("offers positional alternatives at the same _arguments slot", () => {
     const s = renderScript("zsh");
-    expect(s).toContain("'1: :(claude-code claude-desktop cursor vscode)'");
+    expect(s).toContain("'1: :(claude-code claude-desktop cursor vscode windsurf gemini-cli)'");
     expect(s).toContain("'1: :(bash zsh fish powershell)'");
     expect(s).toContain("'1: :(list match)'");
   });
@@ -220,7 +222,9 @@ describe("renderScript — zsh", () => {
     // occupy) were untabbable. bash, fish and powershell all offer flags there.
     // As option specs zsh offers them at every position.
     const s = renderScript("zsh");
-    const installLine = s.split("\n").find((l) => l.includes("'1: :(claude-code claude-desktop cursor vscode)'"));
+    const installLine = s
+      .split("\n")
+      .find((l) => l.includes("'1: :(claude-code claude-desktop cursor vscode windsurf gemini-cli)'"));
     expect(installLine, "no install _arguments line in the generated zsh script").toBeDefined();
     for (const flag of ["--list", "--all", "--scope", "--dry-run", "--help"]) {
       expect(installLine, `install flag missing from the zsh option specs: ${flag}`).toContain(`'${flag}'`);
@@ -286,7 +290,7 @@ describe("renderScript — fish", () => {
 
   it("offers positional alternatives at the same argument position", () => {
     const s = renderScript("fish");
-    expect(s).toContain('-a "claude-code claude-desktop cursor vscode"');
+    expect(s).toContain('-a "claude-code claude-desktop cursor vscode windsurf gemini-cli"');
     expect(s).toContain('-a "list match"');
   });
 
@@ -324,7 +328,7 @@ describe("renderScript — powershell", () => {
 
   it("offers positional alternatives at the same token position", () => {
     const s = renderScript("powershell");
-    expect(s).toContain("@('claude-code', 'claude-desktop', 'cursor', 'vscode')");
+    expect(s).toContain("@('claude-code', 'claude-desktop', 'cursor', 'vscode', 'windsurf', 'gemini-cli')");
     expect(s).toContain("@('list', 'match')");
   });
 
@@ -341,7 +345,7 @@ describe("renderScript — powershell", () => {
     expect(s).toContain("if ($argIndex -lt 0) {");
     // Slot 0 candidates are emitted under the normalized index.
     expect(s).toContain(
-      "if ($argIndex -eq 0) { $completions += @('claude-code', 'claude-desktop', 'cursor', 'vscode') }",
+      "if ($argIndex -eq 0) { $completions += @('claude-code', 'claude-desktop', 'cursor', 'vscode', 'windsurf', 'gemini-cli') }",
     );
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('bash', 'zsh', 'fish', 'powershell') }");
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('list', 'match') }");
@@ -438,6 +442,11 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   uninstall: parseUninstallArgs,
   add: parseAddArgs,
   remove: parseRemoveArgs,
+  search: parseSearchArgs,
+  set: parseSetArgs,
+  // enable/disable share set's parser: they ARE `set <target> isActive=<bool>`.
+  enable: parseSetArgs,
+  disable: parseSetArgs,
   list: parseListArgs,
   sidecars: parseSidecarsArgs,
   trust: parseTrustArgs,

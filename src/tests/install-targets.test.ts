@@ -17,13 +17,23 @@ import {
 } from "../install-targets.js";
 
 describe("INSTALL_TARGETS metadata", () => {
-  it("includes the four expected clients", () => {
+  it("includes the six expected clients", () => {
     expect(INSTALL_TARGETS.map((t) => t.clientId).sort()).toEqual([
       "claude-code",
       "claude-desktop",
       "cursor",
+      "gemini-cli",
       "vscode",
+      "windsurf",
     ]);
+  });
+
+  it("keeps claude-code FIRST in declaration order", () => {
+    // autoDetectClient returns the first usable probe slot in array order and
+    // documents claude-code-first as an invariant, so a new row must be
+    // APPENDED. An insert would silently change which client `try` picks on
+    // machines where two are configured.
+    expect(INSTALL_TARGETS[0].clientId).toBe("claude-code");
   });
 
   it("Claude Desktop is marked unavailable on Linux (no Linux build)", () => {
@@ -40,9 +50,33 @@ describe("INSTALL_TARGETS metadata", () => {
     expect(vscode?.jsonShape).toBe("servers");
   });
 
-  it("Claude Code + Desktop + Cursor all use `mcpServers` root key", () => {
+  it("every client except VS Code uses the `mcpServers` root key", () => {
     const mcpServerClients = INSTALL_TARGETS.filter((t) => t.jsonShape === "mcpServers").map((t) => t.clientId);
-    expect(mcpServerClients.sort()).toEqual(["claude-code", "claude-desktop", "cursor"]);
+    expect(mcpServerClients.sort()).toEqual(["claude-code", "claude-desktop", "cursor", "gemini-cli", "windsurf"]);
+  });
+
+  it("agrees with itself about the root key on every scope", () => {
+    // jsonShape is documentation; containerPath is what actually gets
+    // written. Nothing in src/ reads jsonShape, so the two can disagree
+    // silently -- and a row whose containerPath names the wrong key writes a
+    // file the client parses and ignores.
+    for (const t of INSTALL_TARGETS) {
+      for (const sc of t.scopes) {
+        const resolved = resolveInstallPath({
+          clientId: t.clientId,
+          scope: sc.scope,
+          // Each target on an OS it actually supports -- Claude Desktop is
+          // macOS/Windows only, and resolveInstallPath refuses the pair.
+          os: t.availableOn[0],
+          home: "/h",
+          projectDir: "/p",
+          appData: "/a",
+        });
+        expect(resolved.containerPath[resolved.containerPath.length - 1], `${t.clientId}/${sc.scope}`).toBe(
+          t.jsonShape,
+        );
+      }
+    }
   });
 
   it("every client lists at least one scope", () => {
@@ -480,12 +514,15 @@ describe("resolveInstallPath — Cursor", () => {
 });
 
 describe("resolveInstallPath — VS Code", () => {
-  it("only supports project/workspace scope", () => {
+  it("lists the user scope FIRST, then the workspace one", () => {
+    // Order is not cosmetic: enumerateProbeSlots walks this array, so it
+    // decides --list and doctor row order, and every other multi-scope client
+    // puts user first.
     const vscode = INSTALL_TARGETS.find((t) => t.clientId === "vscode");
-    expect(vscode?.scopes.map((s) => s.scope)).toEqual(["project"]);
+    expect(vscode?.scopes.map((s) => s.scope)).toEqual(["user", "project"]);
   });
 
-  it("resolves to <project>/.vscode/mcp.json", () => {
+  it("resolves the workspace scope to <project>/.vscode/mcp.json", () => {
     const r = resolveInstallPath({
       clientId: "vscode",
       scope: "project",
@@ -494,6 +531,69 @@ describe("resolveInstallPath — VS Code", () => {
       projectDir: "/home/alice/repo",
     });
     expect(r.absolute).toMatch(/[\\/]\.vscode[\\/]mcp\.json$/);
+  });
+
+  it("resolves the user scope per-OS, and keeps the `servers` key on both", () => {
+    const linux = resolveInstallPath({
+      clientId: "vscode",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+    });
+    expect(linux.absolute).toBe(join("/home/alice", ".config", "Code", "User", "mcp.json"));
+    expect(linux.containerPath).toEqual(["servers"]);
+
+    const macos = resolveInstallPath({
+      clientId: "vscode",
+      scope: "user",
+      os: "macos",
+      home: "/Users/alice",
+    });
+    expect(macos.absolute).toBe(join("/Users/alice", "Library", "Application Support", "Code", "User", "mcp.json"));
+
+    // %APPDATA% is resolved by the CALLER and handed in, never read from the
+    // environment here -- that purity is what keeps install's write, --list,
+    // doctor and try naming the same file.
+    const windows = resolveInstallPath({
+      clientId: "vscode",
+      scope: "user",
+      os: "windows",
+      home: "C:\\Users\\alice",
+      appData: "C:\\Users\\alice\\AppData\\Roaming",
+    });
+    expect(windows.absolute).toBe(join("C:\\Users\\alice\\AppData\\Roaming", "Code", "User", "mcp.json"));
+    expect(windows.display).toBe("%APPDATA%\\Code\\User\\mcp.json");
+  });
+});
+
+describe("resolveInstallPath — Windsurf and Gemini CLI", () => {
+  it("resolves Windsurf to one cross-platform user file", () => {
+    // The `~` expansion is %USERPROFILE% on Windows, so one join covers all
+    // three OSes. Windsurf has no workspace config at all.
+    for (const os of ["linux", "macos", "windows"] as const) {
+      const r = resolveInstallPath({ clientId: "windsurf", scope: "user", os, home: "/h" });
+      expect(r.absolute).toBe(join("/h", ".codeium", "windsurf", "mcp_config.json"));
+      expect(r.containerPath).toEqual(["mcpServers"]);
+    }
+    const windsurf = INSTALL_TARGETS.find((t) => t.clientId === "windsurf");
+    expect(windsurf?.scopes.map((s) => s.scope)).toEqual(["user"]);
+  });
+
+  it("resolves both Gemini CLI scopes to settings.json", () => {
+    const user = resolveInstallPath({ clientId: "gemini-cli", scope: "user", os: "linux", home: "/h" });
+    expect(user.absolute).toBe(join("/h", ".gemini", "settings.json"));
+
+    const project = resolveInstallPath({
+      clientId: "gemini-cli",
+      scope: "project",
+      os: "linux",
+      home: "/h",
+      projectDir: "/p",
+    });
+    expect(project.absolute).toBe(join("/p", ".gemini", "settings.json"));
+    // mcpServers is a TOP-LEVEL key, distinct from the sibling `mcp` object
+    // that holds Gemini's own discovery knobs.
+    expect(project.containerPath).toEqual(["mcpServers"]);
   });
 });
 
