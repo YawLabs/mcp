@@ -653,6 +653,37 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "  Install method is ${CYAN}npm install -g @yawlabs/mcp${NC} (or ${CYAN}npx -y @yawlabs/mcp${NC})."
   echo ""
+  # Behaviour-change prompt, deliberately BEFORE the release confirm rather
+  # than folded into it. This package has real installs, and the failure it
+  # guards is not a bug -- it is a default that changes without an opt-in, so
+  # an already-working setup does something different on its next upgrade with
+  # nothing in the user's own config having moved. Nothing else in this script
+  # can detect that: it is a judgement about intent, not a property of the
+  # diff, so the only place to catch it is a human answering out loud before
+  # the irreversible steps.
+  #
+  # Answering "y" does not gate anything further; naming the off switch is the
+  # whole point, because a default-on change with no documented way back is
+  # the shape that costs users. It rides inside the same SKIP_CONFIRM branch,
+  # so -y / SKIP_CONFIRM=1 skips it exactly like the confirm below.
+  echo -e "${YELLOW}Does v${VERSION} change behaviour for an EXISTING user who opts into nothing?${NC}"
+  echo "  A new default, a new ceiling, a changed threshold, a newly-enforced rule."
+  read -p "Behaviour change with no opt-in? (y/N) " -n 1 -r BEHAVIOUR_REPLY || BEHAVIOUR_REPLY=""
+  echo
+  if [[ $BEHAVIOUR_REPLY =~ ^[Yy]$ ]]; then
+    echo "  Then it needs an off switch, and CHANGELOG.md must name it."
+    read -p "  Off switch (env var / flag), or blank to abort: " -r OFF_SWITCH || OFF_SWITCH=""
+    if [ -z "${OFF_SWITCH// /}" ]; then
+      echo "Aborted: a default-on behaviour change ships with a documented way back, or it does not ship."
+      exit 0
+    fi
+    if ! grep -qF "$OFF_SWITCH" CHANGELOG.md 2>/dev/null; then
+      echo "Aborted: '${OFF_SWITCH}' does not appear in CHANGELOG.md -- document it there first."
+      exit 0
+    fi
+    echo -e "  ${CYAN}${OFF_SWITCH}${NC} found in CHANGELOG.md."
+  fi
+  echo ""
   # Non-interactive stdin (piped, nohup, an agent harness) gets EOF from
   # `read`, which returns non-zero -- under `set -e` that used to kill the run
   # with the generic "Release failed at line NNN" banner, as if a gate had
