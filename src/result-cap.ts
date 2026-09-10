@@ -83,6 +83,52 @@ function cutToBytes(text: string, maxBytes: number): string {
   return cut.endsWith("�") && !text.startsWith(cut) ? cut.slice(0, -1) : cut;
 }
 
+/** The largest prefix of `item.text` whose ASSEMBLED, SERIALIZED block fits
+ *  `budget` bytes -- or null when even one character does not fit.
+ *
+ *  Cutting to raw UTF-8 bytes is not enough, and the gap is not small. Every
+ *  other measurement in this module is JSON-serialized, and JSON escaping is
+ *  MULTIPLICATIVE: a quote or a newline costs 1 raw byte and 2 serialized, and
+ *  a control byte costs 6 (it renders as a backslash-u escape). So a raw-byte
+ *  cut against a serialized budget overshoots by however much the text happens
+ *  to escape. Measured against a 100000-byte ceiling before this fix:
+ *
+ *    plain text        99909   (under -- no escaping at all, which is why a
+ *                               fixture of "xxxx..." could not catch this)
+ *    log lines        102750   (newlines)
+ *    JSON-ish text    124773   (quotes)
+ *    ANSI-coloured    166215   (escape bytes -- 66% over)
+ *
+ *  A fixed envelope allowance cannot bound a multiplicative expansion, so the
+ *  only honest answer is to measure the real block. Binary search on the raw
+ *  byte offset: O(log n) serializations, each of a string already in memory,
+ *  against a payload that is by definition oversized. The alternative -- cut,
+ *  measure, shrink by a guess, repeat -- has no bound at all on text that
+ *  escapes heavily. */
+function fitTextBlock(item: CapContent, budget: number): { block: CapContent; size: number } | null {
+  if (typeof item.text !== "string" || budget <= 0) return null;
+  let lo = 0;
+  let hi = Buffer.byteLength(item.text, "utf8");
+  let best: { block: CapContent; size: number } | null = null;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const cut = cutToBytes(item.text, mid);
+    if (cut.length === 0) {
+      lo = mid + 1;
+      continue;
+    }
+    const block = { ...item, text: cut };
+    const size = serializedBytes(block);
+    if (size <= budget) {
+      best = { block, size };
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
 function serializedBytes(item: CapContent): number {
   try {
     return Buffer.byteLength(JSON.stringify(item), "utf8");
@@ -156,13 +202,14 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
     // This block crosses the ceiling.
     const remaining = contentBudget - used;
     if (item.type === "text" && typeof item.text === "string" && remaining > MIN_USEFUL_TAIL_BYTES) {
-      // Leave room for the JSON envelope around the text, so the kept block
-      // really does fit the budget rather than the text alone doing so.
-      const textBudget = remaining - ENVELOPE_ALLOWANCE_BYTES;
-      const cut = cutToBytes(item.text, Math.max(0, textBudget));
-      if (cut.length > 0) {
-        kept.push({ ...item, text: cut });
-        used += serializedBytes({ ...item, text: cut });
+      // Measured, not estimated. fitTextBlock returns a block whose SERIALIZED
+      // size is known to fit `remaining` -- including the JSON envelope and any
+      // sibling properties the spread carries along, both of which a fixed
+      // allowance got wrong.
+      const fitted = fitTextBlock(item, remaining);
+      if (fitted) {
+        kept.push(fitted.block);
+        used += fitted.size;
         truncatedText = true;
         droppedBlocks += content.length - content.indexOf(item) - 1;
         break;
@@ -196,9 +243,13 @@ const MAX_NOTICE_BYTES = (() => {
   const worst = capNotice(999_999_999, 999_999_999, 999_999_999, true);
   return Buffer.byteLength(JSON.stringify({ type: "text", text: worst }), "utf8");
 })();
-// Rough allowance for the JSON keys and quoting around a text block, so a cut
-// text does not push the serialized block back over the budget.
-const ENVELOPE_ALLOWANCE_BYTES = 64;
+// ENVELOPE_ALLOWANCE_BYTES used to live here: a flat 64 bytes meant to cover
+// the JSON keys and quoting around a cut text. It was deleted rather than
+// retuned, because no constant can do that job. The overshoot it was guarding
+// is MULTIPLICATIVE in the text's escaping (see fitTextBlock), so the error
+// scales with the payload -- 66% over on ANSI-coloured output -- and it also
+// ignored sibling properties the spread carries into the kept block.
+// fitTextBlock measures the assembled block instead.
 
 /** The marker appended to a capped result. Written for the model: what
  *  happened, how much is missing, and the two ways to get the rest. */

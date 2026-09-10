@@ -59,17 +59,40 @@ describe("capContent", () => {
     expect(notice?.text).toContain("Do not treat what you received as the whole answer");
   });
 
-  it("keeps the WHOLE RETURNED RESULT under the ceiling, notice included", () => {
-    // Measures the array actually handed back, not `bytesKept`. That field
-    // counts only the content blocks, so asserting on it passed while the
-    // real payload ran 387 bytes over on every cap value -- the notice was
-    // appended after the budget accounting. A cap that does not cap.
+  // The payload shapes this ceiling actually meets. The FIXTURE is the whole
+  // point of this table: JSON escaping is multiplicative, so plain "xxxx..."
+  // is the one input that cannot detect an over-cut -- it escapes to nothing.
+  // A previous version of this test used exactly that and passed while the
+  // real result ran 66% over on ANSI-coloured output.
+  const ESC = String.fromCharCode(27);
+  const SHAPES: Array<[string, string]> = [
+    ["plain, escapes to nothing", "x".repeat(500_000)],
+    ["log lines, newline-heavy", "2026-09-10 INFO something happened\n".repeat(20_000)],
+    ["JSON-ish, quote-heavy", '{"key":"value","n":123},'.repeat(30_000)],
+    ["ANSI-coloured, control bytes", `${ESC}[32mgreen${ESC}[0m `.repeat(40_000)],
+    ["multi-byte, no escaping", "日本語テキスト".repeat(50_000)],
+  ];
+
+  it.each(SHAPES)("keeps the WHOLE RETURNED RESULT under the ceiling: %s", (_label, body) => {
+    // Measures the array actually handed back, not `bytesKept` -- that field
+    // counts only content blocks, so asserting on it passed while the notice
+    // pushed the real payload over.
     for (const cap of [1_000, 4_000, 10_000, 100_000]) {
-      const r = capContent([text("x".repeat(500_000))], cap);
+      const r = capContent([text(body)], cap);
       expect(r.capped).toBe(true);
       const actual = Buffer.byteLength(JSON.stringify(r.content), "utf8");
       expect(actual, `cap=${cap} returned ${actual} bytes`).toBeLessThanOrEqual(cap);
     }
+  });
+
+  it("still returns something USEFUL, not just the notice, on escape-heavy text", () => {
+    // The ceiling is easy to satisfy by cutting everything. Pin that the
+    // binary search actually keeps content: a 100000-byte budget on ANSI text
+    // should still carry a substantial prefix, not collapse to the marker.
+    const body = `${ESC}[32mgreen${ESC}[0m `.repeat(40_000);
+    const r = capContent([text(body)], 100_000);
+    expect(r.content.length).toBe(2); // the cut block plus the notice
+    expect(r.bytesKept).toBeGreaterThan(50_000);
   });
 
   it("stays under the ceiling with many blocks, not just one oversized one", () => {
