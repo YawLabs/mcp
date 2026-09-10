@@ -94,6 +94,12 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       "--project-dir",
       "--os",
       "--force",
+      // --repair is the flag a setup script reaches for (replace a drifted
+      // entry, no prompt) and --keep-legacy is the opt-out from the trim
+      // install now performs by default. Both change what a re-run DOES, so
+      // hiding them from the tab-completion is hiding the idempotence surface.
+      "--repair",
+      "--keep-legacy",
       "--skip",
       "--dry-run",
       "--list",
@@ -102,6 +108,17 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
       // helpRequested), so it completes here like every other subcommand.
       "--help",
     ],
+  },
+  // The subtract side. Same client list as `install` -- one INSTALL_CLIENTS
+  // constant feeds both, so a new client cannot appear in one and not the
+  // other. --force / -y gate the destructive write (confirm on a TTY, refuse
+  // off one), so they MUST be completable for the same reason `remove`'s are:
+  // a user who cannot tab --force will not discover how to script it.
+  {
+    name: "uninstall",
+    description: "Remove the yaw-mcp entry from an MCP client",
+    positional: [[...INSTALL_CLIENTS]],
+    flags: ["--scope", "--project-dir", "--os", "--force", "--yes", "--keep-legacy", "--dry-run", "--help"],
   },
   // Local servers -- manage ~/.yaw-mcp/bundles.json (no account).
   {

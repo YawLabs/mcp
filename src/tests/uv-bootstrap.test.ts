@@ -17,34 +17,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { compareVersions } from "../oam-spawn.js";
 import {
   __resetUvBootstrap,
+  buildUvSpawn,
   onPath,
   resolveUvSpawn,
   runCommand,
   UV_EXTRACT_TIMEOUT_MS,
   UV_VERSION,
+  uvLaunchKind,
   uvTarget,
 } from "../uv-bootstrap.js";
 
-// Is uv reachable on this machine? Probed ONCE here instead of inside each
-// test: the previous shape returned early when uv was absent, so the test
-// reported GREEN while asserting nothing. `it.skipIf` makes the skip show up
-// in the runner output, which is the honest signal.
-//
-// The spawn options MATCH onPath's (uv-bootstrap.ts): win32 needs shell:true
-// so a PATHEXT shim (uv.cmd / uv.bat) resolves. A shell-less probe here
-// false-NEGATIVES on exactly such a host and silently skips all five tests
-// below -- on the Windows shim shape they exist to protect.
-const UV_PRESENT =
-  spawnSync("uv", ["--version"], {
-    stdio: "ignore",
-    shell: process.platform === "win32",
-    windowsHide: process.platform === "win32",
-  }).status === 0;
+// Only ONE test below needs to know whether uv is reachable, and it asks
+// through the resolver's own onPath at the moment it decides -- so the test
+// and the code can no longer disagree. The module-level probe that used to
+// live here gated five tests on a single early spawn: it made them skip
+// wholesale on a host without uv, and it could not see the resolver timing
+// its own probe out under load. The rewrite cases are pure now and need no
+// probe at all.
 
 describe("resolveUvSpawn", () => {
   beforeEach(() => {
@@ -184,81 +177,81 @@ describe("resolveUvSpawn with uv present", () => {
   // memo between tests. The exact command is what pins the PATH-hit branch: a
   // widened "bare or bootstrapped path" matcher used here would have stayed
   // green through a regression that downloaded despite uv being on PATH.
-  //
-  // UV_PRESENT (a spawnSync at module load) and onPath (an async spawn with
-  // a 3s cap, inside the code under test) are two DIFFERENT probes of the
-  // same question, and under this suite's ~4x CPU oversubscription they
-  // disagree: onPath loses its race, resolveUv falls through to the
-  // bootstrapped cache copy, and the assertion fails against a regression
-  // that never happened -- observed on a full-suite run that passed
-  // standalone. So each case re-probes through the module's OWN onPath
-  // immediately before asserting, making the branch under test and the
-  // test's precondition one measurement. The exact-command assertions are
-  // preserved rather than widened, which is the whole point of them.
-  //
-  // The guard SKIPS rather than returning. An early `return` leaves vitest
-  // printing a green check for a body that asserted nothing -- the exact shape
-  // the header comment above says `it.skipIf` was adopted to remove, and a
-  // systematic probe failure would have shown as five passes. `ctx.skip`
-  // renders the reason and counts in the "skipped" summary, so the honest
-  // signal survives.
-  const SKIP_REASON = "onPath('uv') missed under load -- probe disagreement, not a regression";
-  async function uvReachable(): Promise<boolean> {
-    return onPath("uv");
-  }
 
-  it.skipIf(!UV_PRESENT)("returns the bare `uv` when uv is on PATH", async (ctx) => {
-    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
+  // The REWRITE cases below drive buildUvSpawn directly, with uvBin pinned to
+  // the literal "uv". Going through resolveUvSpawn dragged in ensureUv and its
+  // live 3s PATH probe, which made these depend on the machine twice over:
+  // they skipped entirely on a host with no uv -- protecting nothing on
+  // exactly the hosts the uvx rewrite exists for -- and under full-suite
+  // contention the probe timed out, ensureUv fell through to a cached binary,
+  // and the assertion on the bare "uv" failed. Four different tests failed
+  // across four runs, each passing in isolation. The rewrite never needed to
+  // know how uvBin was found, so these now run everywhere and cannot flake.
+
+  it("rewrites uvx to `uv tool run`", () => {
+    // uvx is sugar for `uv tool run`. Passing uvx through unchanged broke when
+    // uv.exe was reachable but uvx.exe was not (Windows PATHEXT cases, or
+    // partial installs). Always-rewriting means the spawn target is always uv.
+    expect(buildUvSpawn("uvx", "uv", ["mcp-server-fetch"])).toEqual({
+      command: "uv",
+      args: ["tool", "run", "mcp-server-fetch"],
+    });
+  });
+
+  it("preserves additional args when rewriting uvx", () => {
+    expect(buildUvSpawn("uvx", "uv", ["--from", "mcp-server-fetch", "--transport", "stdio"])).toEqual({
+      command: "uv",
+      args: ["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"],
+    });
+  });
+
+  it("rewrites uvx with empty args", () => {
+    expect(buildUvSpawn("uvx", "uv", [])).toEqual({ command: "uv", args: ["tool", "run"] });
+  });
+
+  it("passes a uv launch through, carrying its args", () => {
+    expect(buildUvSpawn("uv", "uv", ["--version"])).toEqual({ command: "uv", args: ["--version"] });
+  });
+
+  it("uses whatever binary it is handed, cached absolute path included", () => {
+    // The other half of the contract, and the half the old tests could never
+    // assert: on a cache hit uvBin is an absolute path, and the rewrite must
+    // target it rather than the bare name.
+    const cached = "/var/cache/yaw-mcp/uv/0.12.10/uv";
+    expect(buildUvSpawn("uvx", cached, ["x"])).toEqual({ command: cached, args: ["tool", "run", "x"] });
+    expect(buildUvSpawn("uv", cached, ["x"])).toEqual({ command: cached, args: ["x"] });
+  });
+
+  it("recognises bare names with a Windows executable extension, any casing", async () => {
+    // `"command": "uvx.exe"` is an ordinary config shape on Windows; exact
+    // string equality used to pass it through untouched -- no bootstrap when
+    // uv was missing, and no `uv tool run` rewrite. This is uvLaunchKind's
+    // job, so it is asserted on uvLaunchKind rather than through a spawn.
+    expect(uvLaunchKind("uvx.exe")).toBe("uvx");
+    expect(uvLaunchKind("UVX.EXE")).toBe("uvx");
+    expect(uvLaunchKind("uv.exe")).toBe("uv");
+    // ...and the rewrite that kind then selects.
+    expect(buildUvSpawn(uvLaunchKind("uvx.exe") as "uvx", "uv", ["mcp-server-fetch"])).toEqual({
+      command: "uv",
+      args: ["tool", "run", "mcp-server-fetch"],
+    });
+  });
+
+  it("resolves to the bare `uv` when uv really is on PATH", async (ctx) => {
+    // The one case that genuinely needs the live probe. Its precondition is
+    // asked through the SAME function the resolver decides on, at the same
+    // moment, so the test and the code can no longer disagree: under load this
+    // skips with a visible reason instead of failing with a confusing one.
+    if (!(await onPath("uv"))) {
+      // ctx.skip(), not a bare return: a return reports GREEN while asserting
+      // nothing, which is the exact shape this file's header already warns
+      // about. A skip says so in the runner output.
+      ctx.skip();
+      return;
+    }
     const result = await resolveUvSpawn("uv", ["--version"]);
     expect(result.command).toBe("uv");
     expect(result.args).toEqual(["--version"]);
-  });
-
-  it.skipIf(!UV_PRESENT)("rewrites uvx to `uv tool run` when uv is reachable", async (ctx) => {
-    // uvx is sugar for `uv tool run`. Previously we passed uvx
-    // through unchanged when uv was on PATH, which broke when uv.exe
-    // was reachable but uvx.exe wasn't (Windows PATHEXT cases, or
-    // partial installs). Always-rewriting means the spawn target is
-    // always uv, which we've already confirmed is reachable.
-    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
-    const result = await resolveUvSpawn("uvx", ["mcp-server-fetch"]);
-    expect(result.command).toBe("uv");
-    expect(result.args).toEqual(["tool", "run", "mcp-server-fetch"]);
-  });
-
-  it.skipIf(!UV_PRESENT)("preserves additional args when rewriting uvx", async (ctx) => {
-    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
-    const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
-    expect(result.command).toBe("uv");
-    expect(result.args).toEqual(["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"]);
-  });
-
-  it.skipIf(!UV_PRESENT)("rewrites uvx with empty args", async (ctx) => {
-    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
-    const result = await resolveUvSpawn("uvx", []);
-    expect(result.command).toBe("uv");
-    expect(result.args).toEqual(["tool", "run"]);
-  });
-
-  it.skipIf(!UV_PRESENT)("recognises bare names with a Windows executable extension, any casing", async (ctx) => {
-    // `"command": "uvx.exe"` is an ordinary config shape on Windows; exact
-    // string equality used to pass it through untouched -- no bootstrap when
-    // uv was missing, and no `uv tool run` rewrite.
-    if (!(await uvReachable())) ctx.skip(SKIP_REASON);
-    const exe = await resolveUvSpawn("uvx.exe", ["mcp-server-fetch"]);
-    expect(exe.command).toBe("uv");
-    expect(exe.args).toEqual(["tool", "run", "mcp-server-fetch"]);
-
-    const upper = await resolveUvSpawn("UVX.EXE", ["mcp-server-fetch"]);
-    expect(upper.command).toBe("uv");
-    expect(upper.args).toEqual(["tool", "run", "mcp-server-fetch"]);
-
-    // The bare name, not the `uv.exe` spelling the config carried: the spawn
-    // target is whatever ensureUv resolved, and on the PATH-hit branch that is
-    // the literal "uv".
-    const uvExe = await resolveUvSpawn("uv.exe", ["--version"]);
-    expect(uvExe.command).toBe("uv");
-    expect(uvExe.args).toEqual(["--version"]);
   });
 });
 

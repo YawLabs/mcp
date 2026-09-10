@@ -30,9 +30,46 @@ export function resolveServerCap(env: NodeJS.ProcessEnv = process.env): number {
   return n;
 }
 
+// Token ceiling across every loaded server's advertised tool surface.
+// 0 (the default) leaves it off, and the server-count cap above is the only
+// gate -- which is the honest default, because the estimate is an estimate.
+//
+// It exists because the count cap alone measures the wrong thing. Its own
+// header says the point is to "keep tool-list tokens bounded", but a slot is
+// a slot: six 3-tool servers and six 60-tool servers both sit exactly at a
+// cap of 6, and only one of those fits in a context the model can still
+// reason about. cost-estimate.ts has computed the real number all along and
+// nothing read it outside a discover label.
+export const DEFAULT_TOOL_TOKEN_CAP = 0;
+
+export function resolveToolTokenCap(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.YAW_MCP_TOOL_TOKEN_CAP;
+  if (raw === undefined || raw === "") return DEFAULT_TOOL_TOKEN_CAP;
+  // Same strict digit-run parse as resolveServerCap, for the same reason:
+  // parseInt's prefix parsing turns "0x2000" and "0abc" into 0, which is the
+  // DISABLE sentinel here too, so a typo would silently remove the ceiling.
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_TOOL_TOKEN_CAP;
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(n)) return DEFAULT_TOOL_TOKEN_CAP;
+  return n;
+}
+
 export interface LoadedSlot {
   namespace: string;
   idleCount: number;
+  /** Estimated tool-surface tokens (cost-estimate.ts). Absent when the
+   *  caller could not estimate -- such a slot contributes 0 to the token
+   *  total and renders without a token figure, so an unknown never
+   *  manufactures a refusal. */
+  tokens?: number;
+}
+
+/** What a candidate would ADD, for the token ceiling. Optional throughout:
+ *  with no estimate, only the count cap can refuse. */
+export interface CapContext {
+  tokenCap?: number;
+  candidateTokens?: number;
 }
 
 // A discriminated union, not `{ allow: boolean; message?: string }`: the
@@ -52,8 +89,14 @@ export type CapDecision = { allow: true } | { allow: false; message: string };
 // Ordering: the error lists loaded servers by descending idleCount
 // (most-idle first) so the LLM's attention lands on the cheapest
 // thing to drop, followed by read_tool as a zero-activation fallback.
-export function evaluateServerCap(namespace: string, loaded: LoadedSlot[], cap: number): CapDecision {
-  if (cap === 0) return { allow: true }; // disabled
+export function evaluateServerCap(
+  namespace: string,
+  loaded: LoadedSlot[],
+  cap: number,
+  context: CapContext = {},
+): CapDecision {
+  const tokenCap = context.tokenCap ?? 0;
+  if (cap === 0 && tokenCap === 0) return { allow: true }; // both disabled
   // Self-allowance: the candidate already occupies one of the slots the
   // CALLER passed in, so admitting it costs nothing. It covers exactly what
   // is in `loaded` and nothing else -- server.ts's evaluateCapFor puts the
@@ -64,18 +107,72 @@ export function evaluateServerCap(namespace: string, loaded: LoadedSlot[], cap: 
   // here; the post-elicitation retry stays unblocked because it passes
   // skipCap, not because of this line.
   if (loaded.some((s) => s.namespace === namespace)) return { allow: true };
-  if (loaded.length < cap) return { allow: true };
+
+  // Token ceiling first when both are armed. It is the more informative
+  // refusal: "you are at 6 servers" says nothing about which to drop, while
+  // the token message names the figure that is actually over budget. A
+  // caller under the count cap can still be over the token cap, which is
+  // the whole point of having the second dimension.
+  if (tokenCap > 0 && context.candidateTokens !== undefined) {
+    const loadedTokens = loaded.reduce((sum, s) => sum + (s.tokens ?? 0), 0);
+    const projected = loadedTokens + context.candidateTokens;
+    if (projected > tokenCap) {
+      return {
+        allow: false,
+        message: tokenRefusal(namespace, loaded, context.candidateTokens, loadedTokens, tokenCap),
+      };
+    }
+  }
+
+  if (cap === 0 || loaded.length < cap) return { allow: true };
 
   const sorted = [...loaded].sort((a, b) => {
     if (b.idleCount !== a.idleCount) return b.idleCount - a.idleCount;
     return a.namespace.localeCompare(b.namespace);
   });
-  const list = sorted
-    .map((s) => (s.idleCount > 0 ? `"${s.namespace}" (idle ${s.idleCount})` : `"${s.namespace}"`))
-    .join(", ");
+  const list = sorted.map(describeSlot).join(", ");
 
   return {
     allow: false,
     message: `Cannot load "${namespace}" — already at the ${cap}-server concurrent cap. Loaded: ${list}. Free a slot with mcp_connect_deactivate, or use mcp_connect_read_tool to inspect one tool without loading its server. Ops can change the limit via YAW_MCP_SERVER_CAP.`,
   };
+}
+
+// One loaded server, as the refusal renders it: how stale it is, and how much
+// it costs -- the two facts the model needs to choose a victim.
+//
+// The two fields are omitted for different reasons, and only one of them is
+// about zero. `idleCount` is a plain number, and "idle 0" says nothing worth
+// the width, so a zero is dropped. `tokens` is optional, and an ABSENT one is
+// an unknown -- rendering it as "~0 tokens" would assert the server is free.
+// A tokens of exactly 0 is a real measurement (a connected upstream that
+// advertises no tools) and prints, because knowing a slot costs nothing is
+// exactly what tells the model that dropping it will not help.
+function describeSlot(s: LoadedSlot): string {
+  const facts: string[] = [];
+  if (s.idleCount > 0) facts.push(`idle ${s.idleCount}`);
+  if (s.tokens !== undefined) facts.push(`~${s.tokens} tokens`);
+  return facts.length > 0 ? `"${s.namespace}" (${facts.join(", ")})` : `"${s.namespace}"`;
+}
+
+// Ordered by token cost, descending -- the count-cap message sorts by
+// idleness because a slot is a slot there, but here the model is over a
+// TOKEN budget and the cheapest way back under it is to drop the most
+// expensive server, which is not usually the most idle one.
+function tokenRefusal(
+  namespace: string,
+  loaded: LoadedSlot[],
+  candidateTokens: number,
+  loadedTokens: number,
+  tokenCap: number,
+): string {
+  const sorted = [...loaded].sort((a, b) => {
+    const at = a.tokens ?? 0;
+    const bt = b.tokens ?? 0;
+    if (bt !== at) return bt - at;
+    return a.namespace.localeCompare(b.namespace);
+  });
+  const list = sorted.map(describeSlot).join(", ");
+  const over = loadedTokens + candidateTokens - tokenCap;
+  return `Cannot load "${namespace}" — its ~${candidateTokens} tokens of tools would put the loaded surface at ~${loadedTokens + candidateTokens}, over the ~${tokenCap}-token ceiling by ~${over}. Loaded, most expensive first: ${list}. Free the budget with mcp_connect_deactivate, or use mcp_connect_read_tool to inspect one tool without loading its server. Ops can change the limit via YAW_MCP_TOOL_TOKEN_CAP.`;
 }

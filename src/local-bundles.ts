@@ -212,33 +212,57 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   }
   const url = typeof e.url === "string" ? e.url : undefined;
 
-  // Remote-only HTTP request headers (types.ts). Every rejection here WARNS,
-  // following the connectTimeoutMs precedent below -- and matched by env's
-  // shape rejections above, which took this block's reasoning: a header exists
-  // to fix an authentication failure the user is already staring at, so
-  // dropping one without a word leaves the same 401 firing with nothing saying
-  // the setting was thrown away.
+  // HTTP headers for a REMOTE server, the channel a remote upstream takes its
+  // credential through (types.ts). Same fixed-whitelist rule as every field
+  // above: absent here means dropped at load, and a `headers` block would have
+  // been silently discarded.
   //
-  // Blank values are dropped for a DIFFERENT reason than env's, and unlike
-  // env's they WARN. An env "" is `add`'s marker for "required, nothing
-  // stored, comes from the shell": loading it would clobber the inherited
-  // value, and every server `add` writes carries one, so saying so would be
-  // noise on an ordinary config. A header has no ambient fallback and no
-  // writer seeds one, so a blank header simply claims a credential is
-  // configured while sending nothing -- always worth a word.
+  // Every rejection WARNS, following the connectTimeoutMs precedent below --
+  // and now matched by env's shape rejections above, which took their
+  // reasoning from this block: a header exists to fix an authentication
+  // failure the user is already staring at, so dropping one without a word
+  // leaves the same 401 firing with nothing anywhere saying the setting was
+  // thrown away. (This sentence used to contrast with "env's silent
+  // filtering". That stopped being true when a non-map env and a non-string
+  // env VALUE started warning; only the blank-value drop is still silent, for
+  // the reason the next paragraph gives.) Only a PRESENT `headers` key can
+  // warn -- absent is the normal case for nearly every entry, and for every
+  // local one.
+  //
+  // Blank values are dropped for a DIFFERENT reason than `env`'s. There the
+  // empty string is a deliberate "required, but not stored here" seed that
+  // would clobber an inherited shell value; here nothing is inherited and no
+  // writer seeds one, so a blank header is either a half-finished edit or a
+  // `${secret:...}` the user meant to fill in -- it claims a credential is
+  // configured while sending nothing. Sending `Authorization:` with an empty
+  // value reads to a server as a malformed credential rather than as no
+  // credential, so the clearer failure is to omit it.
+  //
+  // Names are TRIMMED first and must then still be a real RFC 7230 token.
+  // Trimming REPAIRS the hand-edit artifact -- `" Authorization "` in a JSON
+  // file someone typed by hand -- rather than refusing it; the charset test
+  // catches what trimming cannot, and a whitespace-only name trims to "" and
+  // fails that same test, since the pattern requires at least one character.
+  // Checking the name at LOAD rather than leaving it to the transport is the
+  // point: a bad name reaching `new Headers()` throws a TypeError that quotes
+  // the offending VALUE, which for these is a credential.
   let headers: Record<string, string> | undefined;
   if (e.headers !== undefined) {
     if (typeof e.headers !== "object" || e.headers === null || Array.isArray(e.headers)) {
       warnings.push(`bundles.json: ignoring 'headers' on "${namespace}" (expected an object of string values)`);
     } else {
       const kept: Record<string, string> = {};
-      for (const [name, value] of Object.entries(e.headers as Record<string, unknown>)) {
+      // Warnings quote the name AS WRITTEN, never the trimmed form, so the user
+      // can find the offending line in their own file. No warning in this block
+      // ever quotes a VALUE -- see the credential note above.
+      for (const [rawName, value] of Object.entries(e.headers as Record<string, unknown>)) {
         if (typeof value !== "string" || value.trim() === "") {
-          warnings.push(`bundles.json: ignoring header "${name}" on "${namespace}" (empty value)`);
+          warnings.push(`bundles.json: ignoring header "${rawName}" on "${namespace}" (empty value)`);
           continue;
         }
+        const name = rawName.trim();
         if (!HTTP_HEADER_NAME_RE.test(name)) {
-          warnings.push(`bundles.json: ignoring header "${name}" on "${namespace}" (not a valid HTTP header name)`);
+          warnings.push(`bundles.json: ignoring header "${rawName}" on "${namespace}" (not a valid HTTP header name)`);
           continue;
         }
         // The MCP transport owns these two. The SDK merges caller headers
@@ -252,12 +276,18 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
         // rather than a matter of preference.
         if (RESERVED_HEADER_NAMES.has(name.toLowerCase())) {
           warnings.push(
-            `bundles.json: ignoring header "${name}" on "${namespace}" (reserved -- the MCP transport sets it)`,
+            `bundles.json: ignoring header "${rawName}" on "${namespace}" (reserved -- the MCP transport sets it)`,
           );
           continue;
         }
+        // Only the NAME is trimmed. The VALUE keeps its own whitespace -- a
+        // header value can legitimately carry spaces, and only its blankness
+        // was ever in question.
         kept[name] = value;
       }
+      // Undefined rather than {} when nothing survives, matching the env
+      // merge's "no empty husk" rule below: an empty map reads to every
+      // consumer as "headers are configured" while carrying nothing to send.
       if (Object.keys(kept).length > 0) headers = kept;
     }
   }
@@ -302,6 +332,29 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     );
   }
 
+  // Per-server compliance grade. Carried for the same reason as `runtime` and
+  // `connectTimeoutMs` above -- the return below is a fixed whitelist, so a
+  // field missing from it is DROPPED -- and this was the next instance of that
+  // bug. hydrateComplianceGrades (server.ts) and runList both say outright
+  // that bundles.json "never carries a grade of its own", which was true only
+  // because this line was missing: grades.json, written by `yaw-mcp audit`
+  // one server at a time, was the sole supplier, so on a fresh install every
+  // server was ungraded and YAW_MCP_MIN_COMPLIANCE gated nothing at all.
+  // `yaw-mcp add` now records the catalog's published grade here.
+  //
+  // Any non-empty string is passed through, NOT just A-F, and that is
+  // deliberate: compliance.ts three-way classifies a grade as graded,
+  // ungraded, or UNRECOGNIZED, and treats the third as a signal of
+  // misconfiguration or tampering rather than a synonym for ungraded.
+  // Narrowing here would make that arm unreachable from the one file a user
+  // hand-edits, which is exactly where a garbled letter is worth reporting.
+  // Uppercased to match the grades cache's own normalization so "a" and "A"
+  // cannot rank differently.
+  const complianceGrade =
+    typeof e.complianceGrade === "string" && e.complianceGrade.trim() !== ""
+      ? (e.complianceGrade.trim().toUpperCase() as UpstreamServerConfig["complianceGrade"])
+      : undefined;
+
   // Default isActive=true in local mode -- if the user wrote a server
   // into bundles.json they presumably want it loadable. Toggle off with
   // explicit `"isActive": false`.
@@ -327,6 +380,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     connectTimeoutMs,
     description,
     runtime,
+    complianceGrade,
   };
 }
 
@@ -950,6 +1004,13 @@ export async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Pr
  * fall back to "server" when nothing survives. Always returns a NAMESPACE_RE-
  * valid string (never null), so callers don't need a failure branch.
  */
+// Re-exported, not redefined. The predicate lives in types.ts alongside the
+// UpstreamServerConfig it describes, so meta-tools can read it without
+// importing this module's fs/lock/auto-upgrade dependency chain -- and so the
+// CLI surfaces that import it from here cannot drift from the one the
+// secrets report uses.
+export { isRemoteEntry } from "./types.js";
+
 export function deriveNamespace(name: string): string {
   let ns = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (ns.length === 0) return "server";
@@ -1079,13 +1140,45 @@ function mergeServerEntry(
     merged[k] = v;
   }
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
+  // The mirror of the rule below, and it has to exist for the same reason:
+  // the two launch shapes are exclusive, and half-converting leaves an entry
+  // whose renderers disagree with what it does. Without this, `add <name>
+  // --url ...` over a stdio entry wrote type:"remote" WITH the stale command
+  // and args -- and since every renderer prefers command, `list` then showed
+  // an npx launch line for a server that connects over HTTP, while the
+  // launch-change note printed above it announced the swap. The note was
+  // right; the write was half-done.
+  const convertedToRemote = typeof incoming.url === "string" && incoming.command === undefined;
+  if (convertedToRemote) {
+    delete merged.command;
+    delete merged.args;
+    // The stdio transport goes too: it belongs to the shape being replaced,
+    // and upstream warns about a remote entry declaring it.
+    if (merged.transport === "stdio") delete merged.transport;
+    // `env` goes with them. A remote entry spawns no process, so upstream.ts
+    // warns and ignores it; leaving it behind keeps a credential in
+    // bundles.json that nothing will ever use and no surface will explain.
+    delete merged.env;
+  }
   if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
     delete merged.url;
+    // `headers` belongs to the remote shape exactly as `url` does, so it goes
+    // with it. Dropping only the url left a converted entry holding a live
+    // credential it can never send: after `add x --url ... --header
+    // 'Authorization: Bearer <token>'` then `add x --command "npx -y ..."`,
+    // the stdio entry still carried the bearer token, in plaintext, in a file
+    // the user now believes describes a local server -- and it would silently
+    // come back into use if they ever converted the entry to remote again.
+    delete merged.headers;
   }
 
   const storedEnv = envStrings(base.env);
   const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
-  if (storedEnv || incomingEnv) {
+  // Skipped entirely on a conversion to remote. This block rebuilds `env`
+  // from the STORED entry, so it undoes the delete above and puts the stdio
+  // credential straight back -- the delete alone looked right and changed
+  // nothing on disk.
+  if (!convertedToRemote && (storedEnv || incomingEnv)) {
     const env: Record<string, string> = {};
     // Carry the stored env forward, MINUS any blank seed the incoming entry no
     // longer lists. A blank value is not data -- it is `add`'s "this key is
@@ -1307,8 +1400,17 @@ function resolveUpsertTarget(
   // to hand-add a remote server -- counts as a change too: joining only
   // command/args rendered it as "" and a "nothing stored" guard then
   // swallowed the note, while the merge carried the stale url along.
+  //
+  // The gate asks whether the incoming entry has a launch at all, not whether
+  // it is a stdio one. Keying on `incoming.command` meant the note fired for
+  // remote -> stdio but never for stdio -> remote: `add <name> --url ...` over
+  // an app-added stdio entry exited 0 with a bare "Updated" line, silently
+  // converting someone's one-click-installed server into a remote endpoint --
+  // the exact swap this note exists to make loud, in the direction that
+  // became reachable when `add --url` shipped.
   let launchChanged: LaunchChange | undefined;
-  if (typeof stored.slug !== "string" && typeof incoming.command === "string") {
+  const incomingHasLaunch = typeof incoming.command === "string" || typeof incoming.url === "string";
+  if (typeof stored.slug !== "string" && incomingHasLaunch) {
     const from = launchShapeOf(stored);
     const to = launchShapeOf(incoming);
     if (!sameLaunch(from, to)) launchChanged = { from, to };

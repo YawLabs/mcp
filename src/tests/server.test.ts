@@ -2763,6 +2763,55 @@ describe("ConnectServer", () => {
       expect(conn.health.lastErrorMessage).toBeUndefined();
     });
 
+    it("books nothing against a healthy server when the client cancels the call", async () => {
+      // Measured against the pre-fix build: one Esc press on a slow-but-healthy
+      // server left mcp_connect_health reporting "calls: 1, errors: 1 (100%)"
+      // with the user's own cancel reason stored as the server's last error,
+      // and persisted recordOutcome(ns, 0.0) down-ranking it in dispatch and
+      // discover for every later session. The call is a non-observation: the
+      // user withdrew it while the server was still working normally.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      const controller = new AbortController();
+      conn.client.callTool = vi.fn().mockImplementation(async () => {
+        controller.abort("user pressed Esc");
+        throw Object.assign(new Error("MCP error -32001: user pressed Esc"), { code: -32001 });
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+      const recordOutcome = vi.spyOn(priv.learning, "recordOutcome");
+
+      const result = await priv.handleToolCall("gh_create_issue", {}, { signal: controller.signal });
+
+      expect(result.isError).toBe(true);
+      // Health is untouched -- not "booked without the error", which would
+      // dilute a genuinely flaky server's rate toward 0 instead of leaving it.
+      expect(conn.health.totalCalls).toBe(0);
+      expect(conn.health.errorCount).toBe(0);
+      expect(conn.health.lastErrorMessage).toBeUndefined();
+      // And nothing is written to the cross-session record either.
+      expect(recordOutcome).not.toHaveBeenCalled();
+    });
+
+    it("still books a genuine -32001 timeout, which looks identical apart from the signal", async () => {
+      // The guard keys on the abort, not the error code -- so a real timeout
+      // carrying the same -32001 must still count against the server.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockRejectedValue(Object.assign(new Error("MCP error -32001: Request timed out"), { code: -32001 }));
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("gh_create_issue", {}, { signal: new AbortController().signal });
+      expect(result.isError).toBe(true);
+      expect(conn.health.totalCalls).toBe(1);
+      expect(conn.health.errorCount).toBe(1);
+    });
+
     it("tracks error health on failed tool calls", async () => {
       const priv = getPrivate(server);
       const conn = makeConnection("gh", ["create_issue"]);
@@ -3439,8 +3488,13 @@ describe("ConnectServer", () => {
       expect(parsed.ok).toBe(true);
       // "second" step output: single text item -> parsed as string.
       expect(parsed.result).toBe("PR #42 body");
-      // Both steps should have landed in the output map.
-      expect(Object.keys(parsed.steps).sort()).toEqual(["first", "second"]);
+      // Small intermediates ride along even with an explicit `return`: the
+      // values a caller cannot reconstruct after a side effect are small, and
+      // losing them to save a few hundred bytes is a bad trade. `stepKeys` is
+      // added either way. See the large-payload case below for the other half.
+      expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "stepKeys", "steps"]);
+      expect(parsed.stepKeys.slice().sort()).toEqual(["first", "second"]);
+      expect(parsed.steps.first).toBe(42);
       // The second upstream call must have received the resolved value,
       // not the raw $ref marker -- otherwise the resolver never fired.
       // "42" parses as the number 42 via JSON.parse, so number (not string).
@@ -3450,6 +3504,142 @@ describe("ConnectServer", () => {
         name: "get_pr",
         arguments: { number: 42 },
       });
+    });
+
+    it("keeps every output when no `return` selects one", async () => {
+      // The other half of the contract. Without an explicit `return` the
+      // caller has not said which value it wants, `result` is just the last
+      // step's, and the intermediates are the only view of what the pipeline
+      // computed -- so they stay. Trimming here would remove data on behalf
+      // of a caller who never asked for anything narrower.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["list_prs", "get_pr"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "42" }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "PR #42 body" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "first", tool: "gh_list_prs", args: {} },
+          { id: "second", tool: "gh_get_pr", args: {} },
+        ],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ok).toBe(true);
+      expect(parsed.result).toBe("PR #42 body");
+      expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "steps"]);
+      // `first` is the NUMBER 42: parseStepPayload JSON-parses a single text
+      // block, so "42" lands as a number, exactly as the $ref test above
+      // notes. Asserting the string here was my error, not the code's.
+      expect(parsed.steps).toEqual({ first: 42, second: "PR #42 body" });
+      expect(parsed.stepKeys).toBeUndefined();
+    });
+
+    it("shrinks the payload when `return` names a step, rather than echoing what it skipped", async () => {
+      // The point of the change, stated as a measurement rather than a shape:
+      // the documented example is `a = list(); b = get(a[0]); return b`, and
+      // the reason to write `return b` is to not be handed `a` again. Here
+      // the skipped step is a large list, so an echo is unmistakable.
+      const priv = getPrivate(server);
+      const bigList = JSON.stringify(Array.from({ length: 200 }, (_, i) => ({ number: i, title: `pr ${i}` })));
+      const conn = makeConnection("gh", ["list_prs", "get_pr"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: bigList }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "PR #0 body" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const steps = [
+        { id: "a", tool: "gh_list_prs", args: {} },
+        { id: "b", tool: "gh_get_pr", args: { number: { $ref: "a.0.number" } } },
+      ];
+      const selected = await priv.handleToolCall("mcp_connect_exec", { steps, return: "b" });
+      const text = selected.content[0].text;
+
+      expect(JSON.parse(text).result).toBe("PR #0 body");
+      // Over the echo budget, so the list the caller did not select is dropped,
+      // along with a second copy of the value it did.
+      expect(text).not.toContain("pr 199");
+      expect(text.match(/PR #0 body/g)).toHaveLength(1);
+      expect(JSON.parse(text).steps).toBeUndefined();
+      // stepKeys must SURVIVE the drop -- it is the caller's only remaining
+      // record of which steps ran, including the side-effecting one it would
+      // have to name in a follow-up `return`. Asserting only that `steps` is
+      // gone would stay green if a refactor emitted a bare {ok, result}.
+      expect(JSON.parse(text).stepKeys).toEqual(["a", "b"]);
+      // And it is dramatically smaller than the un-selected form would be.
+      expect(text.length).toBeLessThan(bigList.length / 10);
+    });
+
+    it("keeps a small side-effect result even when `return` names a later step", async () => {
+      // The case that makes the budget necessary rather than merely nice. exec
+      // declares idempotentHint:false, and this file's own preflight test says
+      // re-running a pipeline whose step 0 files an issue "files a second
+      // one". So on `a = create_issue(); b = comment(a.number); return b`,
+      // dropping `a` destroys the new issue's number with no safe way to get
+      // it back -- and "re-run with a different return" is the one recovery
+      // the rest of the file treats as a hazard. Small payload, so it stays.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue", "comment"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: '{"number":4242,"url":"https://x.test/i/4242"}' }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "commented" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "a", tool: "gh_create_issue", args: {} },
+          { id: "b", tool: "gh_comment", args: { n: { $ref: "a.number" } } },
+        ],
+        return: "b",
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.result).toBe("commented");
+      // The irreplaceable part of the side effect survives.
+      expect(parsed.steps.a).toEqual({ number: 4242, url: "https://x.test/i/4242" });
+    });
+
+    it("does not let a large RETURNED value evict a small binding the caller cannot rebuild", async () => {
+      // The budget is measured over what would be DROPPED, not over every
+      // binding. Counting the returned value buys nothing -- it rides in
+      // `result` either way -- and counting it broke the exact case the budget
+      // exists for: create_issue (tiny, irreplaceable) then a large fetch that
+      // uses it, returning the large one. Measured on the old predicate: 5,067
+      // bytes weighed in order to discard 51 bytes of issue number, while the
+      // 5,000-byte value was transmitted regardless.
+      const priv = getPrivate(server);
+      const big = JSON.stringify({ body: "x".repeat(5000) });
+      const conn = makeConnection("gh", ["create_issue", "fetch_big"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: '{"number":4242}' }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: big }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "a", tool: "gh_create_issue", args: {} },
+          { id: "b", tool: "gh_fetch_big", args: { n: { $ref: "a.number" } } },
+        ],
+        return: "b",
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      // The big value the caller asked for is delivered...
+      expect(parsed.result).toEqual({ body: "x".repeat(5000) });
+      // ...and the tiny one it cannot get back a second time is still here,
+      // because dropping it would have saved 51 bytes on a 5 KB response.
+      expect(parsed.steps.a).toEqual({ number: 4242 });
     });
 
     it("fails the whole pipeline and surfaces partial outputs when a step errors", async () => {
@@ -7141,5 +7331,335 @@ describe("discover match summary", () => {
     // The cap still applies -- five hits, so the last description-only match
     // is the one that falls off, not the name match.
     expect(summary).not.toContain("list_commits");
+  });
+});
+
+describe("find_tool", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  // A cold server whose tool list is known only from the persisted cache --
+  // the case find_tool exists for. Nothing here is connected.
+  const cold = (namespace: string, tools: Array<{ name: string; description?: string }>) =>
+    makeServerConfig({ namespace, name: namespace, toolCache: tools });
+
+  it("refuses an empty query instead of returning the whole catalog", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }])]);
+    const result = await priv.handleToolCall("mcp_connect_find_tool", { query: "   " });
+    expect(result.content[0].text).toContain("needs a query");
+    expect(result.content[0].text).not.toContain("create_issue");
+  });
+
+  it("coerces a non-string query rather than throwing out of the tokenizer", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }])]);
+    // The low-level Server does not validate against inputSchema, so this
+    // shape really can arrive from a misbehaving client.
+    const result = await priv.handleToolCall("mcp_connect_find_tool", { query: 42 });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("needs a query");
+  });
+
+  it("says so plainly when nothing is installed", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([]);
+    const result = await priv.handleToolCall("mcp_connect_find_tool", { query: "create an issue" });
+    expect(result.content[0].text).toContain("yaw-mcp add");
+  });
+
+  it("finds a tool on a server that has never been loaded", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "create_issue", description: "Open a new issue" }]),
+      cold("pg", [{ name: "query", description: "Run SQL" }]),
+    ]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("gh_create_issue");
+    expect(text).not.toContain("pg_query");
+    // Nothing was contacted: a cold hit must SAY its schema is unavailable
+    // rather than omit the line, which reads as "takes no arguments".
+    expect(text).toContain("schema not loaded");
+  });
+
+  it("carries the input schema for a hit on a loaded server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue", description: "Open a new issue" }])]);
+    priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("[loaded]");
+    expect(text).toContain("input schema");
+    expect(text).not.toContain("schema not loaded");
+  });
+
+  it("reports no match without inventing one", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue", description: "Open a new issue" }])]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "resize an image" })).content[0].text;
+    expect(text).toContain("No configured server has a tool matching");
+    expect(text).not.toContain("gh_create_issue");
+  });
+
+  it("caps at the default limit and says how many were withheld", async () => {
+    const priv = getPrivate(server);
+    const many = Array.from({ length: 14 }, (_, i) => ({ name: `issue_op_${i}`, description: "issue work" }));
+    priv.config = makeConfig([cold("gh", many)]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue" })).content[0].text;
+    expect(text).toContain("(10 of 14)");
+    expect(text).toContain("4 more match");
+  });
+
+  it("honours an explicit limit", async () => {
+    const priv = getPrivate(server);
+    const many = Array.from({ length: 14 }, (_, i) => ({ name: `issue_op_${i}`, description: "issue work" }));
+    priv.config = makeConfig([cold("gh", many)]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 3 })).content[0].text;
+    expect(text).toContain("(3 of 14)");
+    expect(text).toContain("11 more match");
+  });
+
+  it("clamps a hostile limit to the ceiling rather than dumping the catalog", async () => {
+    const priv = getPrivate(server);
+    const many = Array.from({ length: 80 }, (_, i) => ({ name: `issue_op_${i}`, description: "issue work" }));
+    priv.config = makeConfig([cold("gh", many)]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 9999 })).content[0].text;
+    expect(text).toContain("(50 of 80)");
+  });
+
+  it("clamps a zero or negative limit up to one", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }, { name: "close_issue" }])]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue", limit: 0 })).content[0].text;
+    expect(text).toContain("(1 of 2)");
+  });
+
+  it("names the namespace to activate, and the runners-up", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "create_issue", description: "issue" }]),
+      cold("linear", [{ name: "issue_create", description: "issue" }]),
+    ]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("mcp_connect_activate");
+    expect(text).toMatch(/server "(gh|linear)"/);
+    expect(text).toContain("(or ");
+  });
+
+  it("does not offer runners-up when every hit is on one server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "create_issue" }, { name: "close_issue" }])]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "issue" })).content[0].text;
+    expect(text).toContain('server "gh"');
+    expect(text).not.toContain("(or ");
+  });
+
+  it("skips a server the active profile excludes", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      cold("gh", [{ name: "create_issue", description: "issue" }]),
+      cold("linear", [{ name: "issue_create", description: "issue" }]),
+    ]);
+    priv.profile = { servers: ["gh"] };
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("gh_create_issue");
+    expect(text).not.toContain("linear_issue_create");
+  });
+
+  it("prefers the in-session tool cache over the persisted one", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([cold("gh", [{ name: "stale_tool", description: "old" }])]);
+    priv.toolCache.set("gh", [{ name: "create_issue", description: "Open a new issue" }]);
+    const text = (await priv.handleToolCall("mcp_connect_find_tool", { query: "create issue" })).content[0].text;
+    expect(text).toContain("gh_create_issue");
+    expect(text).not.toContain("stale_tool");
+  });
+});
+
+describe("observation meta-tools advance the idle clock", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv("YAW_MCP_IDLE_THRESHOLD", "");
+    vi.stubEnv("MCP_CONNECT_IDLE_THRESHOLD", "");
+    server = new ConnectServer();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  // Every meta-tool that only READS. The clock used to advance solely on
+  // proxied calls, so a session that spoke exclusively to the broker never
+  // ticked at all and held every child process for as long as the client
+  // stayed connected.
+  const OBSERVATIONS: Array<[string, Record<string, unknown>]> = [
+    ["mcp_connect_health", {}],
+    ["mcp_connect_suggest", {}],
+    ["mcp_connect_find_tool", { query: "anything" }],
+    ["mcp_connect_bundles", { action: "list" }],
+    ["mcp_connect_discover", {}],
+  ];
+
+  for (const [name, args] of OBSERVATIONS) {
+    it(`${name} ages every loaded server by one`, async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+      priv.connections.set("gh", makeConnection("gh", ["create_issue"]));
+      priv.idleCallCounts.set("gh", 0);
+
+      await priv.handleToolCall(name, args);
+      expect(priv.idleCallCounts.get("gh")).toBe(1);
+    });
+  }
+
+  it("credits nothing, so no server is spared by an observation", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("slack", makeConnection("slack"));
+    priv.idleCallCounts.set("gh", 3);
+    priv.idleCallCounts.set("slack", 0);
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.idleCallCounts.get("gh")).toBe(4);
+    expect(priv.idleCallCounts.get("slack")).toBe(1);
+  });
+
+  it("reaps a server that crosses the threshold on meta traffic alone", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.idleCallCounts.set("gh", resolveIdleThreshold() - 1);
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.connections.has("gh")).toBe(false);
+  });
+
+  it("does not add a phantom entry to the recent-call history", async () => {
+    // The adaptive threshold is computed from that history. An observation
+    // credits no namespace, so it must not push a record -- doing so would
+    // let meta traffic buy a server extra patience it never earned.
+    const priv = getPrivate(server);
+    priv.connections.set("gh", makeConnection("gh"));
+    const before = priv.recentToolCalls.length;
+
+    await priv.handleToolCall("mcp_connect_health", {});
+    expect(priv.recentToolCalls.length).toBe(before);
+  });
+
+  it("does not age the server activate just loaded", async () => {
+    // activate is NOT an observation: it IS the loaded set. runActivateOne
+    // resets the namespace it loads, so an activate immediately followed by a
+    // discover leaves the fresh server at zero, not one.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.idleCallCounts.set("gh", 0);
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(priv.idleCallCounts.get("gh") ?? 0).toBe(0);
+  });
+
+  it("does not age anything on deactivate", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    priv.connections.set("gh", makeConnection("gh"));
+    priv.connections.set("slack", makeConnection("slack"));
+    priv.idleCallCounts.set("slack", 2);
+
+    await priv.handleToolCall("mcp_connect_deactivate", { server: "gh" });
+    expect(priv.idleCallCounts.get("slack")).toBe(2);
+  });
+});
+
+describe("activate reports a tool filter name that matches nothing", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  const withGh = (priv: any) => {
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("gh", ["create_issue", "list_issues"]));
+  };
+
+  it("names the tool that does not exist, and what the server does offer", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    const text = r.content[0].text;
+    expect(text).toContain("create_issu");
+    expect(text).toContain("does not exist");
+    expect(text).toContain("create_issue");
+    expect(text).toContain("list_issues");
+  });
+
+  it("says nothing when every requested name is real", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issue"] });
+    expect(r.content[0].text).not.toContain("does not exist");
+  });
+
+  it("says nothing when no filter was requested", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    expect(r.content[0].text).not.toContain("does not exist");
+  });
+
+  it("repeats the warning when the same bad filter is re-sent", async () => {
+    // The second call changes nothing, so the surface does not move -- but
+    // the model repeating its typo still needs to be told, every time.
+    const priv = getPrivate(server);
+    withGh(priv);
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    expect(r.content[0].text).toContain("does not exist");
+  });
+
+  it("lists several bad names in one note, sorted", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", {
+      server: "gh",
+      tools: ["zebra", "alpha", "create_issue"],
+    });
+    const text = r.content[0].text;
+    expect(text).toContain("alpha, zebra");
+    expect(text).toContain("tools you asked to keep");
+  });
+
+  it("uses singular wording for one bad name", async () => {
+    const priv = getPrivate(server);
+    withGh(priv);
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["nope"] });
+    expect(r.content[0].text).toContain("the tool you asked to keep does not exist");
+  });
+
+  it("stays silent when the server's tool list is unknown", async () => {
+    // An unknown list cannot falsify a name. Guessing would report a real
+    // tool as missing on every cold server.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    vi.mocked(connectToUpstream).mockResolvedValue(makeConnection("gh", []));
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["anything"] });
+    expect(r.content[0].text).not.toContain("does not exist");
+  });
+
+  it("stays silent when the activation failed and the filter was rolled back", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "gh" })]);
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("spawn failed"));
+    const r = await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["create_issu"] });
+    expect(r.content[0].text).not.toContain("does not exist");
+    expect(priv.toolFilters.has("gh")).toBe(false);
   });
 });

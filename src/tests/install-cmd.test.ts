@@ -15,14 +15,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type BundlesSummary,
   DRY_RUN_ENV_PLACEHOLDER,
+  deepEqualJson,
+  describeEntryDiff,
   directClientEntries,
   INSTALL_USAGE,
   mergeClientConfig,
   mergePermissionsAllow,
   NO_CONFIG_FLAG_DEPRECATION,
   parseInstallArgs,
+  parseUninstallArgs,
   readEntryAt,
+  removePermissionsAllow,
   runInstall,
+  runUninstall,
   summarizeBundles,
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
@@ -605,6 +610,15 @@ describe("runInstall -- bundles.json summary", () => {
   it("does not read bundles.json on a refusal", async () => {
     // The throwing fixture IS the assertion: it fails loudly if the read is
     // ever hoisted above the refusals.
+    //
+    // NOT OAM_PROBE_FORBIDDEN, unlike the refusals that return before the
+    // probe: a COLLISION refusal is decided by comparing the stored entry
+    // against the candidate one, and building that candidate is what probes
+    // oam -- so the probe legitimately runs here, ahead of the refusal. What
+    // must not escape is the runtime CLAIM, which the buffered `runtimeLines`
+    // hold back and "refuses a collision WITHOUT first claiming a runtime"
+    // pins. The bundles read has no such reason to move: it stays below every
+    // refusal, and this test is what says so.
     mkdirSync(join(synthHome, ".claude"), { recursive: true });
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "x" } } }));
     const cap = captureIo();
@@ -614,7 +628,7 @@ describe("runInstall -- bundles.json summary", () => {
       os: "linux",
       home: synthHome,
       io: cap.io,
-      oamProbe: OAM_PROBE_FORBIDDEN,
+      oamProbe: OAM_ABSENT,
       bundlesSummary: BUNDLES_FORBIDDEN,
     });
     expect(r.exitCode).toBe(1);
@@ -1078,7 +1092,12 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
     expect(settings.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
   });
 
-  it("warns when a legacy `mcp.hosting` entry is present in the client config", async () => {
+  it("TRIMS a legacy `mcp.hosting` entry in the same write, by default", async () => {
+    // Install used to detect this entry, print "remove it to avoid running
+    // yaw-mcp twice", and hand the file back with both brokers still wired --
+    // a hazard the tool created, named, and left. The trim rides the same
+    // atomic write as the entry, so the file is never on disk holding one
+    // without the other.
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx", args: ["-y", "@yawlabs/mcp"] } } }),
@@ -1093,15 +1112,37 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toMatch(/Removed the legacy "mcp\.hosting" entry/);
+    expect(cap.stdout()).not.toMatch(/entry remains/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(client.mcpServers["mcp.hosting"]).toBeUndefined();
+  });
+
+  it("--keep-legacy leaves the legacy entry AND still names the hazard", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx", args: ["-y", "@yawlabs/mcp"] } } }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      keepLegacy: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
     expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry remains/);
     expect(cap.stdout()).toMatch(/running yaw-mcp twice/);
-    // New entry written without removing the legacy one (commit chose no auto-migration).
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
     expect(client.mcpServers["mcp.hosting"]).toBeDefined();
   });
 
-  it("--dry-run with a legacy entry says `would remain`, not `remains`", async () => {
+  it("--dry-run promises the trim it would perform, and performs none", async () => {
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx" } } }),
@@ -1117,8 +1158,31 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toMatch(/Would also remove the legacy "mcp\.hosting" entry/);
+    // File is untouched on dry-run -- both the add and the trim.
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(client.mcpServers["mcp.hosting"]).toBeDefined();
+  });
+
+  it("--dry-run --keep-legacy says `would remain`, not `remains`", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { "mcp.hosting": { command: "npx" } } }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      keepLegacy: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
     expect(cap.stdout()).toMatch(/legacy "mcp\.hosting" entry .* would remain/);
-    // File is untouched on dry-run.
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
   });
@@ -3249,11 +3313,14 @@ describe("runInstall — legacy allow-patterns are never stripped", () => {
     return settingsPath;
   }
 
-  it("keeps mcp__yaw_mcp__* while the legacy `yaw-mcp` entry is still wired", async () => {
-    // install does NOT remove the legacy mcpServers entry -- it only warns
-    // that it "remains". Stripping its allow-pattern in the same run revoked
-    // a still-running server's grant, so Claude Code re-prompted on every one
-    // of its tool calls until the user deleted the entry by hand.
+  it("keeps mcp__yaw_mcp__* even though this run trims the legacy `yaw-mcp` entry", async () => {
+    // The trim is scoped to the ONE container this run writes;
+    // ~/.claude/settings.json is GLOBAL and its allow-list also covers a legacy
+    // entry wired in some repo's .mcp.json or under another project's local
+    // scope -- containers a user-scope install never reads. Stripping the
+    // pattern here revoked a still-running server's grant, so Claude Code
+    // re-prompted on every one of its tool calls. Three dead wildcards are
+    // harmless; a revoked live grant is not.
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { "yaw-mcp": { command: "npx", args: ["-y", "@yawlabs/mcp"] } } }),
@@ -3271,8 +3338,7 @@ describe("runInstall — legacy allow-patterns are never stripped", () => {
       oamProbe: OAM_ABSENT,
     });
     expect(r.exitCode).toBe(0);
-    // The warning still fires -- the entry is what should go, not the grant.
-    expect(cap.stdout()).toMatch(/legacy "yaw-mcp" entry remains/);
+    expect(cap.stdout()).toMatch(/Removed the legacy "yaw-mcp" entry/);
     const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
       .allow;
     expect(allow).toContain("mcp__yaw_mcp__*");
@@ -3726,5 +3792,968 @@ describe("runInstall --all — an all-refused run", () => {
     expect(r.exitCode).toBe(0);
     expect(r.written).toHaveLength(0);
     expect(cap.stdout()).toContain(OAM_INSTALL_SH);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idempotence: a re-run over an entry that already matches.
+// ---------------------------------------------------------------------------
+
+describe("runInstall — idempotence (re-run over an entry that already matches)", () => {
+  /** Run a fresh install and hand back the exact bytes it wrote. The fixture
+   *  is install's OWN output rather than a hand-written entry on purpose: the
+   *  claim under test is "re-running install is a no-op", and only the entry
+   *  install actually produces on this machine can test that. A literal here
+   *  would drift the moment buildLaunchEntry changes. */
+  async function seedByInstalling(extra: Partial<Parameters<typeof runInstall>[0]> = {}): Promise<string> {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      ...extra,
+    });
+    expect(r.exitCode).toBe(0);
+    return readFileSync(join(synthHome, ".claude.json"), "utf8");
+  }
+
+  it("re-running off a TTY exits 0 instead of refusing, and writes nothing", async () => {
+    // THE defect. install decided its collision behaviour on a bare presence
+    // test, so a byte-identical healthy entry took the same path as a stale
+    // one: exit 1 off a TTY. doctor prescribes `rerun yaw-mcp install
+    // <client>` as the fix for several launch faults, and that advice hit this
+    // refusal in every script and CI job.
+    const before = await seedByInstalling();
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.stderr()).toBe("");
+    expect(cap.stdout()).toContain("is already correct");
+    expect(cap.stdout()).toContain("Nothing to do");
+    // Not merely "the same content": the same BYTES. A rewrite that happens to
+    // round-trip still moves mtime, still races a live Claude Code session,
+    // and still shows up in a backup diff.
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("never reaches the prompt on a TTY, even with a promptAnswer seam armed", async () => {
+    // promptAnswer:"abort" would exit 1 if the collision branch were entered.
+    // Exit 0 is proof the identical path short-circuits ahead of it.
+    await seedByInstalling();
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: true },
+      promptAnswer: "abort",
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+  });
+
+  it("claims no Runtime for a write it is not making", async () => {
+    // Every Runtime line is a claim about an entry this run is about to write.
+    // The no-op path writes none, so "will run on oam" / the oam-absent tip
+    // would describe a merge that did not happen.
+    await seedByInstalling();
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).not.toContain("Runtime:");
+    expect(cap.stdout()).not.toContain(OAM_INSTALL_SH);
+  });
+
+  it("counts a carried-over env as identical -- it is what the re-run would write", async () => {
+    // buildLaunchEntry emits no env, and the carry-over puts the user's back on
+    // the entry -- so the entry this run WOULD write equals the stored one,
+    // env and all. Comparing the built entry against the stored one (rather
+    // than the bare newEntry) is what makes that come out right.
+    await seedByInstalling();
+    const raw = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    raw.mcpServers[ENTRY_NAME].env = { OAM_BIN: "/opt/oam/bin/oam" };
+    const before = `${JSON.stringify(raw, null, 2)}\n`;
+    writeFileSync(join(synthHome, ".claude.json"), before);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    // And the "Kept existing env" line is NOT printed: nothing was kept,
+    // because nothing was replaced.
+    expect(cap.stdout()).not.toContain("Kept existing env");
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("ignores key ORDER: a reordered entry is still identical", async () => {
+    await seedByInstalling();
+    const parsed = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    const e = parsed.mcpServers[ENTRY_NAME];
+    parsed.mcpServers[ENTRY_NAME] = { args: e.args, command: e.command };
+    const before = `${JSON.stringify(parsed, null, 2)}\n`;
+    writeFileSync(join(synthHome, ".claude.json"), before);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("an extra key on the stored entry is a DIFFERENCE, not a match", async () => {
+    // readEntryAt's sanitized view drops keys it does not model, so comparing
+    // against THAT would call this identical and decline to fix the very thing
+    // a re-run is for. The comparison reads the RAW stored value.
+    await seedByInstalling();
+    const parsed = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    parsed.mcpServers[ENTRY_NAME].type = "stdio";
+    writeFileSync(join(synthHome, ".claude.json"), `${JSON.stringify(parsed, null, 2)}\n`);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain("type: would be removed");
+  });
+
+  it("still patches a missing permissions.allow on an otherwise-identical entry", async () => {
+    // "Identical" is about the ENTRY, not the run: doctor sends users back to
+    // install for a missing grant too, and returning early on the entry match
+    // would make that advice a no-op that fixes nothing.
+    await seedByInstalling();
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ["Bash(git *)"] } }), "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain("is already correct");
+    expect(r.written).toEqual([settingsPath]);
+    const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
+      .allow;
+    expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+
+  it("trims a legacy entry beside an otherwise-identical one, without a prompt", async () => {
+    await seedByInstalling();
+    const parsed = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    parsed.mcpServers["yaw-mcp"] = { command: "npx", args: ["-y", "@yawlabs/mcp"] };
+    writeFileSync(join(synthHome, ".claude.json"), `${JSON.stringify(parsed, null, 2)}\n`);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain("is already correct");
+    expect(cap.stdout()).toMatch(/Removed the legacy "yaw-mcp" entry/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(client.mcpServers["yaw-mcp"]).toBeUndefined();
+  });
+
+  it("--dry-run on an identical entry previews the no-op, not an add", async () => {
+    const before = await seedByInstalling();
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.wouldWrite).toEqual([]);
+    expect(cap.stdout()).toContain("Nothing to do");
+    expect(cap.stdout()).not.toContain("would add the following");
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("--all is idempotent end to end: a second run writes nothing and exits 0", async () => {
+    // The consolidated `--all` refusal was the loudest face of the defect: a
+    // second `install --all` in a setup script reported "N/N client installs
+    // failed" for N healthy configs.
+    const first = captureIo();
+    const r1 = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      io: first.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r1.exitCode).toBe(0);
+    expect(r1.written.length).toBeGreaterThan(0);
+
+    const second = captureIo();
+    const r2 = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      all: true,
+      io: { ...second.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r2.exitCode).toBe(0);
+    expect(r2.written).toEqual([]);
+    expect(second.stderr()).not.toMatch(/already have a/);
+    expect(second.stdout()).toMatch(/clients installed successfully/);
+  });
+});
+
+describe("runInstall — a DIFFERING entry shows what differs", () => {
+  const seedStale = (entry: Record<string, unknown>): void => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: entry } }, null, 2)}\n`,
+    );
+  };
+
+  it("the off-TTY refusal names the fields, and keeps the phrase --all matches on", async () => {
+    // runInstallAll consolidates N refusals by matching the `already has a
+    // "mcp" entry and stdin is not a TTY` phrase, so the diff has to be
+    // appended AFTER it rather than spliced into it.
+    seedStale({ command: "old-broker", args: ["--serve"] });
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain(`already has a "${ENTRY_NAME}" entry and stdin is not a TTY`);
+    expect(cap.stderr()).toContain('command: "old-broker" -> "npx"');
+    expect(cap.stderr()).toContain("args:");
+    expect(cap.stderr()).toContain("--repair");
+  });
+
+  it("names env KEYS and never env values", async () => {
+    // README tells users to keep YAW_MCP_VAULT_PASSPHRASE in that block, and
+    // this message lands in the transcript people paste into bug reports.
+    seedStale({ command: "old", args: [], env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2", KEEP: "yes" } });
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(1);
+    // The env is CARRIED OVER, so it is not part of the diff at all here --
+    // and either way the secret must not appear.
+    expect(cap.stderr()).not.toContain("hunter2");
+    expect(cap.stdout()).not.toContain("hunter2");
+  });
+
+  it("--repair replaces a drifted entry with no prompt", async () => {
+    seedStale({ command: "old", args: ["--serve"] });
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      repair: true,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+  });
+
+  it("--repair over an ALREADY-correct entry is the same no-op", async () => {
+    // What makes it usable unconditionally in a post-upgrade fixup: it does not
+    // rewrite a healthy entry just because the flag was passed.
+    const capA = captureIo();
+    await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: capA.io,
+      oamProbe: OAM_ABSENT,
+    });
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      repair: true,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("--repair and --skip are refused as contradictory (exit 2)", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      repair: true,
+      skip: true,
+      io: cap.io,
+      oamProbe: OAM_PROBE_FORBIDDEN,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.stderr()).toMatch(/--repair and --skip are mutually exclusive/);
+  });
+
+  it("the TTY prompt shows the diff above the [o]verwrite question", async () => {
+    seedStale({ command: "old-broker", args: [] });
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true },
+      oamProbe: OAM_ABSENT,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write("o\n");
+    const r = await pending;
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain('command: "old-broker" -> "npx"');
+    expect(cap.stdout()).toContain("[o]verwrite");
+  });
+});
+
+describe("describeEntryDiff / deepEqualJson", () => {
+  it("treats an explicitly-undefined key as absent", () => {
+    // `{env: undefined}` and `{}` serialize identically, so a writer could
+    // never produce the difference Object.keys would report.
+    expect(deepEqualJson({ command: "npx", env: undefined }, { command: "npx" })).toBe(true);
+  });
+
+  it("is order-insensitive but not type-blind", () => {
+    expect(deepEqualJson({ a: 1, b: 2 }, { b: 2, a: 1 })).toBe(true);
+    expect(deepEqualJson({ a: 1 }, { a: "1" })).toBe(false);
+    expect(deepEqualJson([1, 2], [2, 1])).toBe(false);
+  });
+
+  it("names a non-object stored entry by shape", () => {
+    expect(describeEntryDiff("nope", { command: "npx" })).toEqual(["the stored entry is a string, not an object"]);
+  });
+
+  it("reports env as a key-set change with the values withheld", () => {
+    const d = describeEntryDiff(
+      { command: "npx", env: { SECRET: "s3cr3t", KEPT: "x" } },
+      { command: "npx", env: { KEPT: "x" } },
+    );
+    expect(d).toEqual(["env: drops SECRET (values not shown)"]);
+    expect(d.join(" ")).not.toContain("s3cr3t");
+  });
+
+  it("names an unmodelled key without echoing its value", () => {
+    const d = describeEntryDiff({ command: "npx", secretHeader: "Bearer abc" }, { command: "npx" });
+    expect(d).toEqual(["secretHeader: would be removed (value not shown)"]);
+    expect(d.join(" ")).not.toContain("Bearer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `yaw-mcp uninstall <client>`
+// ---------------------------------------------------------------------------
+
+describe("parseUninstallArgs", () => {
+  it("rejects empty argv with usage", () => {
+    const r = parseUninstallArgs([]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("Usage:");
+  });
+
+  it("--help is a help-flagged parse failure, so index.ts routes it to stdout + exit 0", () => {
+    const r = parseUninstallArgs(["--help"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.help).toBe(true);
+      expect(r.error).toContain("Usage: yaw-mcp uninstall");
+    }
+  });
+
+  it("accepts the client plus scope/project-dir/force/keep-legacy/dry-run", () => {
+    const r = parseUninstallArgs([
+      "claude-code",
+      "--scope",
+      "local",
+      "--project-dir",
+      "/repo",
+      "--force",
+      "--keep-legacy",
+      "--dry-run",
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options).toMatchObject({
+        clientId: "claude-code",
+        scope: "local",
+        projectDir: "/repo",
+        force: true,
+        keepLegacy: true,
+        dryRun: true,
+      });
+    }
+  });
+
+  it("takes -y / --yes as --force, the spelling the sibling destructive verbs use", () => {
+    for (const flag of ["-y", "--yes"]) {
+      const r = parseUninstallArgs(["cursor", flag]);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.options.force).toBe(true);
+    }
+  });
+
+  it("rejects an unknown flag rather than treating it as the client", () => {
+    const r = parseUninstallArgs(["-x", "claude-code"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Unknown flag: -x/);
+  });
+
+  it("rejects an unknown client by name", () => {
+    const r = parseUninstallArgs(["emacs"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Unknown client: emacs/);
+  });
+
+  it("refuses a cross-OS run but allows it under --dry-run", () => {
+    const other = CURRENT_OS === "linux" ? "macos" : "linux";
+    const refused = parseUninstallArgs(["claude-code", "--os", other]);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.error).toMatch(/does not match this machine/);
+    expect(parseUninstallArgs(["claude-code", "--os", other, "--dry-run"]).ok).toBe(true);
+  });
+});
+
+describe("runUninstall", () => {
+  /** Install first, so the fixture is exactly what uninstall has to undo. */
+  async function installFirst(): Promise<void> {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+  }
+
+  it("removes the entry and drops the allow-pattern, in one run", async () => {
+    await installFirst();
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    expect(
+      (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions.allow,
+    ).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
+    const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
+      .allow;
+    expect(allow).not.toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    expect(r.written).toEqual([join(synthHome, ".claude.json"), settingsPath]);
+  });
+
+  it("preserves every sibling server and unrelated key", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify(
+        {
+          model: "claude-opus-4-7",
+          mcpServers: { spend: { url: "https://x" }, [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } },
+        },
+        null,
+        2,
+      ),
+    );
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.model).toBe("claude-opus-4-7");
+    expect(client.mcpServers.spend).toEqual({ url: "https://x" });
+    expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
+  });
+
+  it("preserves the user's comments (JSONC round-trip, not parse+stringify)", async () => {
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      [
+        "{",
+        "  // keep me",
+        '  "mcpServers": {',
+        `    "${ENTRY_NAME}": { "command": "npx", "args": [] },`,
+        '    "spend": { "url": "https://x" }',
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const raw = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    expect(raw).toContain("// keep me");
+    expect(parseJsonc(raw)).toEqual({ mcpServers: { spend: { url: "https://x" } } });
+  });
+
+  it("is idempotent: nothing to remove is exit 0, not an error", async () => {
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: { ...cap.io, isTTY: false },
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.stdout()).toContain("Nothing to do");
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+  });
+
+  it("does not need --force to report that there is nothing to remove", async () => {
+    // The confirmation gate fires only when something is actually going to be
+    // deleted -- refusing to no-op off a TTY would break cleanup scripts for
+    // no safety gain.
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+    });
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("refuses off a TTY without --force, after showing what it would remove", async () => {
+    await installFirst();
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.stdout()).toContain(`entry:    "${ENTRY_NAME}"`);
+    expect(cap.stdout()).toContain("launch:   $ npx");
+    expect(cap.stderr()).toMatch(/Re-run with --force/);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("a declined prompt is exit 1 and leaves the file alone", async () => {
+    await installFirst();
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      promptAnswer: "n",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/Aborted/);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  it("a bare Enter at the prompt declines (default NO)", async () => {
+    await installFirst();
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true },
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write("\n");
+    const r = await pending;
+    expect(r.exitCode).toBe(1);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
+  });
+
+  it("EOF at the prompt declines rather than hanging", async () => {
+    await installFirst();
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true },
+    });
+    stdin.end();
+    const r = await pending;
+    expect(r.exitCode).toBe(1);
+  });
+
+  it("Ctrl+C at the prompt is a cancel: exit 130", async () => {
+    await installFirst();
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true, terminal: true },
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(r.exitCode).toBe(130);
+    expect(cap.stderr()).toMatch(/Cancelled/);
+  });
+
+  it("--dry-run lists the removals and performs none, with no prompt", async () => {
+    await installFirst();
+    const before = readFileSync(join(synthHome, ".claude.json"), "utf8");
+    const settingsBefore = readFileSync(join(synthHome, ".claude", "settings.json"), "utf8");
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      io: { ...cap.io, isTTY: false },
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toEqual([join(synthHome, ".claude.json"), join(synthHome, ".claude", "settings.json")]);
+    expect(cap.stdout()).toContain("dry run: would remove");
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(before);
+    expect(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8")).toBe(settingsBefore);
+  });
+
+  it("takes a legacy entry with it by default, and keeps it under --keep-legacy", async () => {
+    const seed = (): void => {
+      writeFileSync(
+        join(synthHome, ".claude.json"),
+        JSON.stringify(
+          { mcpServers: { [ENTRY_NAME]: { command: "npx", args: [] }, "yaw-mcp": { command: "npx", args: [] } } },
+          null,
+          2,
+        ),
+      );
+    };
+    seed();
+    const capA = captureIo();
+    expect(
+      (
+        await runUninstall({
+          clientId: "claude-code",
+          scope: "user",
+          os: "linux",
+          home: synthHome,
+          force: true,
+          io: capA.io,
+        })
+      ).exitCode,
+    ).toBe(0);
+    let client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers["yaw-mcp"]).toBeUndefined();
+
+    seed();
+    const capB = captureIo();
+    expect(
+      (
+        await runUninstall({
+          clientId: "claude-code",
+          scope: "user",
+          os: "linux",
+          home: synthHome,
+          force: true,
+          keepLegacy: true,
+          io: capB.io,
+        })
+      ).exitCode,
+    ).toBe(0);
+    client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(client.mcpServers["yaw-mcp"]).toBeDefined();
+  });
+
+  it("cleans up a lingering allow-pattern even when the entry is already gone", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ["Bash(git *)", CLAUDE_CODE_ALLOW_PATTERN] } }));
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([settingsPath]);
+    const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
+      .allow;
+    expect(allow).toEqual(["Bash(git *)"]);
+  });
+
+  it("leaves the legacy allow-wildcards alone -- the global list can serve a container this run never reads", async () => {
+    await installFirst();
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    settings.permissions.allow.push("mcp__yaw_mcp__*");
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
+      .allow;
+    expect(allow).toContain("mcp__yaw_mcp__*");
+    expect(allow).not.toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+
+  it("refuses a malformed client config rather than rewriting bytes it could not parse", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "{ not json");
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/is not valid JSON/);
+    expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe("{ not json");
+  });
+
+  it("removes the local-scope entry from projects[<dir>] without touching other projects", async () => {
+    const other = join(synthCwd, "other");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify(
+        {
+          projects: {
+            [projectsKey(synthCwd)]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: [] } } },
+            [projectsKey(other)]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: [] } } },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.projects[projectsKey(synthCwd)].mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(client.projects[projectsKey(other)].mcpServers[ENTRY_NAME]).toBeDefined();
+  });
+
+  it("refuses --project-dir at a scope that resolves none (exit 2)", async () => {
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      projectDir: synthCwd,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.stderr()).toMatch(/cannot honor --project-dir/);
+  });
+
+  it("refuses Claude Desktop on Linux, like install does", async () => {
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-desktop",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.stderr()).toMatch(/is not available on linux/);
+  });
+
+  it("says what it did NOT delete, so `uninstall` is not read as `wipe my servers`", async () => {
+    await installFirst();
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain("bundles.json are untouched");
+    expect(cap.stdout()).toContain("yaw-mcp install claude-code");
+  });
+
+  it("install -> uninstall -> install returns the file to the same entry", async () => {
+    await installFirst();
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    const capU = captureIo();
+    await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: capU.io,
+    });
+    const capI = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...capI.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const again = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(again.mcpServers[ENTRY_NAME]).toEqual(after.mcpServers[ENTRY_NAME]);
+  });
+});
+
+describe("removePermissionsAllow", () => {
+  it("returns the SAME object when there is nothing to drop", () => {
+    const existing = { permissions: { allow: ["Bash(git *)"] } };
+    expect(removePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN])).toBe(existing);
+    const noPerms = { model: "x" };
+    expect(removePermissionsAllow(noPerms, [CLAUDE_CODE_ALLOW_PATTERN])).toBe(noPerms);
+    const nonArray = { permissions: { allow: "nope" } };
+    expect(removePermissionsAllow(nonArray, [CLAUDE_CODE_ALLOW_PATTERN])).toBe(nonArray);
+  });
+
+  it("preserves every other key, every other element, and non-strings", () => {
+    const out = removePermissionsAllow(
+      { model: "x", permissions: { deny: ["y"], allow: ["Bash(git *)", CLAUDE_CODE_ALLOW_PATTERN, { rule: 1 }] } },
+      [CLAUDE_CODE_ALLOW_PATTERN],
+    );
+    expect(out).toEqual({ model: "x", permissions: { deny: ["y"], allow: ["Bash(git *)", { rule: 1 }] } });
+  });
+
+  it("leaves an emptied allow as [] rather than deleting the key", () => {
+    const out = removePermissionsAllow({ permissions: { allow: [CLAUDE_CODE_ALLOW_PATTERN] } }, [
+      CLAUDE_CODE_ALLOW_PATTERN,
+    ]);
+    expect(out).toEqual({ permissions: { allow: [] } });
   });
 });

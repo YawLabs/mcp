@@ -9,6 +9,7 @@
 import { MAX_EXEC_STEPS } from "./exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { collectMalformedSecretRefs, collectSecretRefNames } from "./secrets-vault.js";
+import { isRemoteEntry } from "./types.js";
 
 // Numbers the descriptions below quote to the model, interpolated from the
 // constants that actually enforce them rather than retyped. learning.ts
@@ -187,6 +188,33 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  findTool: {
+    name: "mcp_connect_find_tool",
+    description:
+      'Search for a TOOL across every configured server by what it DOES, when you do not know which server has it. Ranks tool names and descriptions from all servers -- loaded and not -- and returns the matches with the namespace to activate. Nothing is loaded and no server is contacted, so this costs no context beyond the reply. Use it when the capability is clear but its home is not ("something that can resize an image", "a way to list pull requests"); use `mcp_connect_dispatch` instead when you want the right server LOADED in one step, and `mcp_connect_read_tool` when you already know both the server and the tool and just want its schema. A match on a loaded server carries its full input schema; a match on a server that has never been loaded carries name and description only, from cache -- activate it, or call `mcp_connect_read_tool`, to see the arguments.',
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query: {
+          type: "string",
+          description:
+            'What the tool should DO, in plain words -- "create a github issue", "query postgres", "resize an image". Matched against every configured server tool name and description.',
+        },
+        limit: {
+          type: "number",
+          description: "Maximum matches to return. Default 10.",
+        },
+      },
+      required: ["query"],
+    },
+    annotations: {
+      title: "Find a Tool",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
   suggest: {
     name: "mcp_connect_suggest",
     description:
@@ -255,7 +283,7 @@ export const META_TOOLS = {
     description: [
       "Run a short DECLARATIVE pipeline of upstream tool calls in a single round-trip. Use this when you already know the exact 2-4 tool calls to make and one call's output feeds another's args — e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: there is no expression language, no loops, no branching, no arithmetic. The only control flow is sequential step execution; the only data-flow primitive is `{\"$ref\": \"<stepId>[.path.to.value]\"}` which substitutes a prior step's output (or a nested field of it) into the next step's args. Paths support dot keys and `[N]` / `.N` array indexing. Each step's `tool` is a namespaced upstream tool name: an already-loaded server is called directly, and a not-yet-loaded server whose tools are known from cache is loaded on first use exactly as a direct tools/call would be — that adds its tools to this session, and can still be refused (server cap, compliance floor). A name that is neither loaded nor cached fails the step.",
       `Max ${MAX_EXEC_STEPS} steps per exec.`,
-      "If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success returns `{ ok: true, result: <return-step output>, steps: { ...all outputs } }`. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
+      "If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success the shape depends on whether you named a `return`: WITH one you get `{ ok: true, result: <that step's output>, stepKeys: [...] }` — plus `steps` as well while the intermediate outputs stay small (about 4 KB), so a created issue's id survives while a long list you skipped is not replayed at you; WITHOUT one you get `{ ok: true, result: <last step's output>, steps: { ...all outputs } }`. Name a `return` whenever you only need one value: it is what stops a LARGE intermediate output (a long list you only wanted one element of) from being replayed back into your context. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
     ].join(" "),
     inputSchema: {
       type: "object" as const,
@@ -297,7 +325,7 @@ export const META_TOOLS = {
         return: {
           type: "string",
           description:
-            "Optional: id of the step whose output should be surfaced as `result`. Defaults to the last step's id (or its positional index).",
+            "Optional: id of the step whose output should be surfaced as `result`. Defaults to the last step's id (or its positional index). Naming a step is NOT just a selection: it also adds `stepKeys`, and once the intermediate outputs exceed roughly 4 KB it drops `steps` from the response so a large payload you skipped is not replayed back to you. Below that they are all still returned.",
         },
       },
       required: ["steps"],
@@ -339,7 +367,18 @@ export interface SecretsReportRow {
  * malformed spans) out. Servers with no references at all are omitted.
  */
 export function computeSecretsReport(
-  servers: Array<{ namespace: string; env?: Record<string, string>; headers?: Record<string, string> }>,
+  // `command` and `url` are here for isRemoteEntry, not for this function:
+  // the predicate falls back to command-less-with-a-url because validateEntry
+  // defaults a missing `"type"` to "local", so a hand-written url+headers
+  // entry is invisible to a `type`-only test.
+  servers: Array<{
+    namespace: string;
+    type?: string;
+    command?: string;
+    url?: string;
+    env?: Record<string, string>;
+    headers?: Record<string, string>;
+  }>,
   vaultKeys: Set<string>,
 ): SecretsReportRow[] {
   const rows: SecretsReportRow[] = [];
@@ -353,19 +392,18 @@ export function computeSecretsReport(
     // which reads as "this server needs no secrets". collectSecretRefNames owns
     // the fresh-instance rule for every name-only caller (upstream.ts's spawn
     // audit and doctor's vault section are the others).
-    // Scan env AND headers as one map. A remote server carries its refs in
-    // headers, which resolve through the same vault and refuse the connect
-    // the same way, so scanning env alone reported "this server needs no
-    // secrets" about one that will not connect. A name colliding between the
-    // two is harmless: both collectors read only the `${secret:NAME}` refs out
-    // of VALUES, and a report row is per-server, not per-key.
-    const scanned = { ...(server.env ?? {}), ...(server.headers ?? {}) };
-    const referenced = collectSecretRefNames(scanned);
+    // A remote server's credentials ride in `headers`, not `env` -- see
+    // isRemoteEntry. Scanning `env` for one meant every remote
+    // server was omitted from this report, which reads as "needs no
+    // secrets" about the exact server whose activation is about to be
+    // refused fail-closed for a missing name.
+    const credentials = isRemoteEntry(server) ? server.headers : server.env;
+    const referenced = collectSecretRefNames(credentials);
     // The strict scanner above cannot see a reference a typo has put outside
     // SECRET_REF_RE, while resolveServerEnv refuses the spawn over it. Without
     // this column the report said "gh: injected" about a server that will not
     // start, and said nothing at all about one whose only ref is the typo.
-    const malformed = collectMalformedSecretRefs(scanned);
+    const malformed = collectMalformedSecretRefs(credentials);
     if (referenced.size === 0 && malformed.length === 0) continue;
     const injectedSecrets: string[] = [];
     const missing: string[] = [];

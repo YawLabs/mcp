@@ -98,19 +98,70 @@ describe("computeSecretsReport (names only, never values)", () => {
     expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: ["missing_one"], malformed: [] }]);
   });
 
-  it("scans a remote server headers, not just env", () => {
-    // A remote carries its credential in headers, which resolve through the
-    // same vault and refuse the connect the same way. Scanning env alone
-    // reported "this server needs no secrets" about one that will not connect.
+  it("reads a REMOTE server's credentials from headers, not env", () => {
+    // The only channel a remote server has. It spawns no process, so
+    // upstream.ts warns and ignores its `env` -- but it resolves `headers`
+    // through the SAME fail-closed resolveServerEnv immediately before it
+    // builds the transport. Scanning `env` for one omitted the server
+    // entirely, which reads as "needs no secrets" about the exact server
+    // whose connect is about to be refused for a missing name.
     const servers = [
-      { namespace: "linear", headers: { Authorization: "Bearer ${secret:lin}" } },
-      { namespace: "both", env: { A: "${secret:gh}" }, headers: { Authorization: "${secret:missing_one}" } },
+      {
+        namespace: "notion",
+        type: "remote",
+        headers: { Authorization: "Bearer ${secret:NOTION_TOKEN}" },
+      },
     ];
-    const rows = computeSecretsReport(servers, new Set(["gh", "lin"]));
-    expect(rows).toEqual([
-      { server: "linear", injectedSecrets: ["lin"], missing: [], malformed: [] },
-      { server: "both", injectedSecrets: ["gh"], missing: ["missing_one"], malformed: [] },
-    ]);
+    const rows = computeSecretsReport(servers, new Set(["OTHER"]));
+    expect(rows).toEqual([{ server: "notion", injectedSecrets: [], missing: ["NOTION_TOKEN"], malformed: [] }]);
+  });
+
+  it("sees a url+headers entry that omits `type`, which validateEntry calls local", () => {
+    // isRemoteEntry does not read `type` alone, and this is the case that
+    // forced the fallback: validateEntry defaults a missing `"type"` to
+    // "local", so a hand-written url+headers entry looks local and its only
+    // credential looks like a channel nothing uses. The report reaches the
+    // predicate through the caller's projection, so this also pins that
+    // `command` and `url` are actually threaded through -- passing neither
+    // leaves the fallback permanently false and the row silently absent.
+    const servers = [
+      {
+        namespace: "notype",
+        url: "https://mcp.example.test/mcp",
+        headers: { Authorization: "Bearer ${secret:LINEAR_TOKEN}" },
+      },
+    ];
+    const rows = computeSecretsReport(servers, new Set());
+    expect(rows).toEqual([{ server: "notype", injectedSecrets: [], missing: ["LINEAR_TOKEN"], malformed: [] }]);
+  });
+
+  it("ignores a remote server's env, which is never sent anywhere", () => {
+    // Not merely unused -- reporting it would promise a credential the
+    // transport will never carry.
+    const servers = [{ namespace: "notion", type: "remote", env: { TOKEN: "${secret:NEVER_SENT}" } }];
+    expect(computeSecretsReport(servers, new Set())).toEqual([]);
+  });
+
+  it("still reads env for a local server that also carries headers", () => {
+    // `headers` is meaningless on a local entry, and reading it there would
+    // invent a requirement the spawn does not have.
+    const servers = [
+      {
+        namespace: "gh",
+        type: "local",
+        env: { GITHUB_TOKEN: "${secret:gh}" },
+        headers: { Authorization: "Bearer ${secret:IGNORED}" },
+      },
+    ];
+    const rows = computeSecretsReport(servers, new Set(["gh"]));
+    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [], malformed: [] }]);
+  });
+
+  it("names a malformed ref in a remote server's headers", () => {
+    const servers = [{ namespace: "notion", type: "remote", headers: { A: "${secret:notion token}" } }];
+    const rows = computeSecretsReport(servers, new Set());
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.malformed.length).toBeGreaterThan(0);
   });
 
   it("names a reference the strict regex cannot parse in its own `malformed` column", () => {

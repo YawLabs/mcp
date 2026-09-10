@@ -234,7 +234,15 @@ export async function resolveServerEnv(
   const lead = subject.charAt(0).toUpperCase() + subject.slice(1);
   const passphrase = vaultPassphrase();
   if (typeof passphrase !== "string" || passphrase.length === 0) {
-    log("warn", `${lead} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, { keys: refKeys });
+    // `namespace` rides along with the keys. Without it this line says a
+    // server is waiting on the vault without saying WHICH, and on a config
+    // with several credentialed servers that is the only fact the reader
+    // needs -- the thrown error carries it, but the log is what a user
+    // grepping their client's stderr actually sees.
+    log("warn", `${lead} carries \${secret:...} refs but YAW_MCP_VAULT_PASSPHRASE is not set`, {
+      namespace,
+      keys: refKeys,
+    });
     throw new VaultPassphraseRequiredError(
       `vault locked: ${subject} references \${secret:...} but YAW_MCP_VAULT_PASSPHRASE is not set`,
       namespace,

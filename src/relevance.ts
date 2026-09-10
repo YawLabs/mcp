@@ -531,6 +531,64 @@ function scoreAgainstIndex(queryTerms: string[], index: RankingIndex): RankedRes
 // descending by score, only including entries with score > 0 (matches at
 // least one query term in some field). Zero-score servers are omitted so
 // the caller can cleanly tell "no match" from "weak match".
+/** One tool, ranked across every configured server. */
+export interface RankedTool {
+  namespace: string;
+  /** Bare tool name as the upstream declares it, e.g. "create_issue". */
+  name: string;
+  description?: string;
+  score: number;
+}
+
+/** Rank TOOLS across servers, rather than ranking the servers that hold them.
+ *
+ *  rankServers answers "which server should I load", which is the right
+ *  question when the caller knows the shape of the task. It is the wrong one
+ *  when the caller knows the CAPABILITY and not its home -- and until this
+ *  existed, that caller had nowhere to go: read_tool demands the namespace up
+ *  front, and discover's "Matches for your query" block is prose capped at
+ *  five servers by five tools with no schemas.
+ *
+ *  Scored by term overlap rather than the full BM25 index above, deliberately.
+ *  That index is server-shaped: a document is a whole server, so its IDF is
+ *  computed over server-sized documents and its length normalization divides
+ *  by a server's total field length. Reusing it per tool would give a tool on
+ *  a 60-tool server a systematically different score from the identical tool
+ *  on a 3-tool one. The weighting still mirrors FIELD_WEIGHTS (a name hit
+ *  outweighs a description hit) so the two rankers agree about what "matches"
+ *  means, and the same tokenizers are used on both sides so a term that
+ *  survives for one survives for the other. */
+export function rankTools(query: string, servers: RankableServer[]): RankedTool[] {
+  const queryTerms = new Set(tokenizeQuery(query));
+  if (queryTerms.size === 0 || servers.length === 0) return [];
+
+  const out: RankedTool[] = [];
+  for (const server of servers) {
+    for (const tool of server.tools) {
+      // tokenize(), not a private split: the identifier-aware tokenizer is
+      // what turns `create_issue` into ["create","issue"] AND keeps the joined
+      // form, so a query of "issue" and a query of "create_issue" both hit.
+      const nameTerms = new Set(tokenize(tool.name));
+      const descTerms = new Set(tokenize(tool.description));
+      let score = 0;
+      for (const term of queryTerms) {
+        if (nameTerms.has(term)) score += FIELD_WEIGHTS.toolName;
+        else if (descTerms.has(term)) score += FIELD_WEIGHTS.toolDescription;
+      }
+      // A namespace hit is worth something but must not carry a tool on its
+      // own: "github" should surface github's tools BELOW a tool actually
+      // named for what was asked, on any server.
+      if (score > 0 && queryTerms.has(server.namespace.toLowerCase())) score += 0.5;
+      if (score > 0) out.push({ namespace: server.namespace, name: tool.name, description: tool.description, score });
+    }
+  }
+  // Ties broken by namespace then name so the order is stable across calls --
+  // an unstable list reads as churn to a model comparing two responses.
+  return out.sort(
+    (a, b) => b.score - a.score || a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name),
+  );
+}
+
 export function rankServers(context: string, servers: RankableServer[]): RankedResult[] {
   // Identifier floor on the query, not the prose floor: "use pg" has to
   // survive tokenization or the short-namespace fix on the document side is

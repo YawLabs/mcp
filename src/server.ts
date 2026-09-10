@@ -49,7 +49,7 @@ import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
-import { createProgressReporter, type ProgressReporter } from "./progress.js";
+import { createProgressReporter, isProgressRequested, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
   brandRoutingFault,
@@ -59,6 +59,7 @@ import {
   buildResourceRoutes,
   buildToolList,
   buildToolRoutes,
+  isCancelledResult,
   isRoutingFaultResult,
   type PromptRoute,
   type ResourceRoute,
@@ -71,7 +72,8 @@ import {
 import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
-import { type RankableServer, rankServers, tokenize, tokenizeQuery } from "./relevance.js";
+import { type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
+import { type CapContent, capContent, resolveMaxResultBytes } from "./result-cap.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
   firstResultText,
@@ -88,7 +90,13 @@ import {
   shouldSample,
 } from "./sampling-rank.js";
 import { listKeys, loadVault, vaultPath } from "./secrets-vault.js";
-import { type CapDecision, evaluateServerCap, type LoadedSlot, resolveServerCap } from "./server-cap.js";
+import {
+  type CapDecision,
+  evaluateServerCap,
+  type LoadedSlot,
+  resolveServerCap,
+  resolveToolTokenCap,
+} from "./server-cap.js";
 import { maybeRefreshSidecars } from "./sidecar-refresh.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import {
@@ -205,6 +213,17 @@ export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
  *  budget: these credentials are the child's, not yaw-mcp's, so a wrong
  *  GITHUB_TOKEN says nothing about the next server's. */
 const MAX_CREDENTIAL_PROMPTS = 2;
+
+/** How many bytes of intermediate step output an exec echoes back when the
+ *  caller named an explicit `return`.
+ *
+ *  Under it, every binding rides along: the values a caller cannot reconstruct
+ *  after a side-effecting step (an issue number, a created URL) are small, and
+ *  losing them to save a few hundred bytes is a bad trade. Over it, only
+ *  `stepKeys` -- that is the large skipped payload whose replay this exists to
+ *  avoid. Sized well above a handful of ids and well below a list worth
+ *  paging through. */
+export const EXEC_ECHO_BUDGET_BYTES = 4096;
 
 // Last baseline the clamp warning in resolveIdleThreshold fired for. Keyed on
 // the VALUE, not a boolean, so a session (or a test) that changes the env to a
@@ -654,6 +673,12 @@ export class ConnectServer {
   // field (not static) so tests can override per-instance without
   // poisoning other instances or re-importing the module.
   private serverCap = resolveServerCap();
+  // Off by default (0). When ops arm it, it gates activation on the ESTIMATED
+  // token cost of the loaded tool surface rather than the server count -- the
+  // dimension the count cap has always claimed to bound. Read once at
+  // construction, like serverCap, so a mid-session env change can't move the
+  // ceiling under a decision already in flight.
+  private toolTokenCap = resolveToolTokenCap();
 
   // Delay before runActivateOne's single retry. One fixed step, not
   // exponential backoff. An instance field (not a literal at the call site)
@@ -1010,13 +1035,20 @@ export class ConnectServer {
   }
 
   // Overlay the A-F grades `yaw-mcp audit` cached in ~/.yaw-mcp/grades.json
-  // onto the loaded server list. That cache is the ONLY supplier of
-  // `complianceGrade` in local mode — validateEntry drops unknown fields, so
-  // a grade never rides along in bundles.json. Without this overlay every
-  // server is permanently ungraded, which silently disables the
-  // YAW_MCP_MIN_COMPLIANCE gate (ungraded always passes) and blanks the
-  // `[A]`-`[F]` badge in discover. Mirrors the same overlay `yaw-mcp list`
-  // applies (local-add-cmd.ts runList) so the CLI and the server agree.
+  // onto the loaded server list, and note the DIRECTION: the cache goes on
+  // top. A bundles.json entry can now carry a grade of its own -- `yaw-mcp
+  // add` records the catalog's published one, and validateEntry passes it
+  // through -- so the two suppliers can disagree, and the locally-measured
+  // letter has to win. The cached one was produced by running the suite
+  // against the bytes on THIS machine; the config one is a claim the catalog
+  // published at add time, about a version that may since have moved.
+  //
+  // This overlay used to be the only supplier, which is what made
+  // YAW_MCP_MIN_COMPLIANCE inert on a fresh install: `audit` has to be run
+  // per server by hand, so until it had been, every server was ungraded, and
+  // ungraded always passes. Also blanks the `[A]`-`[F]` badge in discover.
+  // Mirrors the same overlay `yaw-mcp list` applies (local-add-cmd.ts
+  // runList) so the CLI and the server agree.
   //
   // `home` is a parameter rather than a field so tests can point it at a
   // synthetic ~/.yaw-mcp without running the whole of start().
@@ -1511,7 +1543,11 @@ export class ConnectServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
-    extra?: { sendNotification?: any; _meta?: Record<string, unknown> },
+    // `signal` rides along with the two progress fields because the SDK's
+    // RequestHandlerExtra has always carried it -- it was simply never read,
+    // so a downstream cancel aborted this handler and left the upstream call
+    // running. The proxy path below forwards it.
+    extra?: { sendNotification?: any; _meta?: Record<string, unknown>; signal?: AbortSignal },
     // When deferLearning is set (exec steps), the proxy path does NOT record
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
@@ -1539,11 +1575,23 @@ export class ConnectServer {
       // survive the `!context` falsiness check and throw a TypeError inside
       // the BM25 tokenizer -- surfacing as a raw JSON-RPC internal error
       // instead of a tool result.
-      return this.attachGuideNudge(
-        await this.handleDiscoverWithAutoWarm(
-          typeof args.context === "string" ? args.context : undefined,
-          progress,
-          typeof args.server === "string" ? args.server : undefined,
+      // Ticked like every other observation meta-tool. Auto-warm is safe
+      // under it: runActivateOne resets the namespace it just loaded to zero
+      // idle, so the tick below ages everything EXCEPT the server discover
+      // just decided was the relevant one.
+      return this.observed(
+        this.attachGuideNudge(
+          await this.handleDiscoverWithAutoWarm(
+            typeof args.context === "string" ? args.context : undefined,
+            progress,
+            // Single-server focus is a RENDER filter (see the param doc on
+            // handleDiscoverWithAutoWarm): it bounds which cards and tool
+            // names get printed without touching the ranker or the auto-warm
+            // decision, so it composes with the observation tick above rather
+            // than competing with it -- a focused discover still ages the
+            // other namespaces exactly like an unfocused one.
+            typeof args.server === "string" ? args.server : undefined,
+          ),
         ),
       );
     }
@@ -1583,28 +1631,37 @@ export class ConnectServer {
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.health.name) {
-      return this.attachGuideNudge(this.handleHealth());
+      return this.observed(this.attachGuideNudge(this.handleHealth()));
     }
     if (name === META_TOOLS.read_tool.name) {
       const serverArg = typeof args.server === "string" ? args.server : "";
       const toolArg = typeof args.tool === "string" ? args.tool : "";
       const result = await this.handleReadTool(serverArg, toolArg, progress);
-      return this.attachGuideNudge(result);
+      return this.observed(this.attachGuideNudge(result));
     }
     if (name === META_TOOLS.suggest.name) {
-      return this.attachGuideNudge(this.handleSuggest());
+      return this.observed(this.attachGuideNudge(this.handleSuggest()));
+    }
+    if (name === META_TOOLS.findTool.name) {
+      // typeof guard like every sibling arg: the low-level Server does not
+      // validate input against inputSchema, so a non-string query from a
+      // misbehaving client would otherwise reach the tokenizer and throw a
+      // raw TypeError out as a JSON-RPC internal error.
+      const q = typeof args.query === "string" ? args.query : "";
+      const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? args.limit : undefined;
+      return this.observed(this.attachGuideNudge(this.handleFindTool(q, limit)));
     }
     if (name === META_TOOLS.exec.name) {
-      const result = await this.handleExec(args);
+      const result = await this.handleExec(args, extra?.signal);
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
       const action = args.action === "match" ? "match" : "list";
-      return this.attachGuideNudge(this.handleBundles(action));
+      return this.observed(this.attachGuideNudge(this.handleBundles(action)));
     }
     if (name === META_TOOLS.secrets.name) {
       const serverArg = typeof args.server === "string" ? args.server : undefined;
-      return this.attachGuideNudge(await this.handleSecretsReport(serverArg));
+      return this.observed(this.attachGuideNudge(await this.handleSecretsReport(serverArg)));
     }
 
     // Per-tool deny gate. Runs here, and the position is the property:
@@ -1840,7 +1897,20 @@ export class ConnectServer {
     // between the initial lookup and this call can't misdirect us.
     let result: { content: Array<{ type: string; text?: string }>; isError?: boolean };
     try {
-      result = await routeToolCall(name, args, routes, this.connections);
+      result = await routeToolCall(name, args, routes, this.connections, {
+        // Cancellation crosses the hop: the SDK sends notifications/cancelled
+        // upstream and rejects the pending call, instead of leaving it to run
+        // to CALL_TIMEOUT after the client that wanted it has gone.
+        signal: extra?.signal,
+        // Relay upstream progress under the DOWNSTREAM token, and only when
+        // the client asked -- see isProgressRequested. `progress` is the same
+        // reporter the meta-tool branches use, so its monotonic clamp keeps
+        // the sequence legal even if activation already emitted under this
+        // token earlier in the call.
+        onprogress: isProgressRequested(extra)
+          ? (p) => progress(p.message ?? `${route?.namespace ?? "upstream"} working`, p.progress, p.total)
+          : undefined,
+      });
     } finally {
       if (callNamespace !== undefined) {
         const remaining = (this.inflightCalls.get(callNamespace) ?? 1) - 1;
@@ -1864,6 +1934,14 @@ export class ConnectServer {
       // every fault emitter attaches), not by text: an upstream error that
       // happens to contain a marker phrase must still be booked.
       const routingFault = result.isError === true && isRoutingFaultResult(result);
+      // A client-cancelled call is the OTHER kind of non-observation. It is
+      // not yaw-mcp's fault (so not a routing fault) and not the upstream's
+      // (so not an error to book): the user withdrew the request while a
+      // healthy server was still working on it. Same structural brand check
+      // as above, for the same reason -- the abort rejects as -32001, which a
+      // real MCP_CALL_TIMEOUT also does, so text and code cannot separate them.
+      const cancelled = result.isError === true && isCancelledResult(result);
+      const nonObservation = routingFault || cancelled;
       // A routing fault is a NON-observation for health, not a success: it
       // must skip totalCalls and totalLatencyMs as well as errorCount.
       // Booking the call without the error would dilute a genuinely flaky
@@ -1871,7 +1949,7 @@ export class ConnectServer {
       // totalCalls), push totalCalls past the observation floor with zero
       // real upstream observations, and drag average latency toward the
       // fault's near-0ms -- the opposite bias, not neutrality.
-      if (connForHealth && !routingFault) {
+      if (connForHealth && !nonObservation) {
         connForHealth.health.totalCalls++;
         connForHealth.health.totalLatencyMs += latencyMs;
         if (result.isError) {
@@ -1914,6 +1992,39 @@ export class ConnectServer {
           log("warn", "pruneContent failed", { error: err?.message });
         }
       }
+
+      // Hard ceiling, applied AFTER pruning and to EVERY result -- error and
+      // structured included, where the prune pass deliberately stands down.
+      // Pruning is a savings pass that gives up when the win is marginal, so
+      // it bounds nothing: a tool returning a whole log file walks through it
+      // untouched. This is the one door in the broker that was never watched,
+      // and a single oversized reply undoes every other budget in the process.
+      //
+      // The cut is LOUD by construction (capContent appends a marker saying
+      // what was dropped), because a silently truncated log reads to the model
+      // as a complete one. structuredContent is NOT capped -- the proxy passes
+      // it through verbatim and cutting one side of a structured/text pair
+      // would make the two disagree -- so a structured-output tool can still
+      // return an unbounded payload. Named here rather than implied.
+      try {
+        const maxBytes = resolveMaxResultBytes();
+        if (maxBytes > 0 && Array.isArray(result.content)) {
+          const cr = capContent(result.content as CapContent[], maxBytes);
+          if (cr.capped) {
+            result.content = cr.content as typeof result.content;
+            log("warn", "Tool result exceeded the size ceiling and was cut", {
+              namespace: route.namespace,
+              tool: route.originalName,
+              bytesRaw: cr.bytesRaw,
+              maxBytes,
+            });
+          }
+        }
+      } catch (err: any) {
+        // Same posture as the pruner above: a ceiling that throws must not
+        // fail the user's call.
+        log("warn", "capContent failed", { error: err?.message });
+      }
       // Cross-session learning signal — GRADED, not binary. recordOutcome
       // records both the dispatch (denominator) and a quality-weighted
       // credit in [0,1]: a clean-but-empty or error-shaped 200 no longer
@@ -1922,7 +2033,7 @@ export class ConnectServer {
       // cross-session reliability block in handleHealth all read — activation
       // success is deliberately NOT counted here (see handleDispatch). Exec
       // steps defer it (opts.deferLearning) for step-level attribution.
-      if (!opts?.deferLearning && !routingFault) {
+      if (!opts?.deferLearning && !nonObservation) {
         const reward = computeOutcomeReward(result);
         this.learning.recordOutcome(route.namespace, reward);
         this.scheduleStateSave();
@@ -3007,7 +3118,11 @@ export class ConnectServer {
     for (const [ns, conn] of this.connections) {
       const ownDeadSlot = ns === namespace && conn.status === "error";
       if ((conn.status === "connected" || ownDeadSlot) && !this.prewarmNamespaces.has(ns)) {
-        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        loadedSlots.push({
+          namespace: ns,
+          idleCount: this.idleCallCounts.get(ns) ?? 0,
+          tokens: this.estimateTokensFor(ns),
+        });
         counted.add(ns);
       }
     }
@@ -3015,11 +3130,38 @@ export class ConnectServer {
       // Skip self (not reserved yet), anything already counted as a
       // live connection, and prewarm-claimed reservations.
       if (ns !== namespace && !counted.has(ns) && !this.prewarmNamespaces.has(ns)) {
-        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+        loadedSlots.push({
+          namespace: ns,
+          idleCount: this.idleCallCounts.get(ns) ?? 0,
+          tokens: this.estimateTokensFor(ns),
+        });
         counted.add(ns);
       }
     }
-    return evaluateServerCap(namespace, loadedSlots, this.serverCap);
+    return evaluateServerCap(namespace, loadedSlots, this.serverCap, {
+      tokenCap: this.toolTokenCap,
+      candidateTokens: this.estimateTokensFor(namespace),
+    });
+  }
+
+  /** Estimated tool-surface tokens for one namespace, live if it is
+   *  connected and from the cache if it is not.
+   *
+   *  Returns undefined when neither source has a tool list -- an unknown, not
+   *  a zero. evaluateServerCap treats the two differently on purpose: a zero
+   *  claims the server is free and would let an unmeasured 60-tool upstream
+   *  slip under a token ceiling, while an undefined simply leaves the token
+   *  dimension out of the decision for that slot. A candidate with no
+   *  estimate cannot be refused by the token cap at all, which is the right
+   *  way to fail: the count cap still applies, and a guess is not grounds to
+   *  refuse a load. */
+  private estimateTokensFor(namespace: string): number | undefined {
+    const conn = this.connections.get(namespace);
+    if (conn && conn.tools.length > 0) return estimateFromConnectedTools(conn.tools).tokens;
+    const config = (this.config?.servers ?? []).find((s) => s.namespace === namespace);
+    const cache = config ? this.mergeToolCache(config).toolCache : this.toolCache.get(namespace);
+    if (!cache || cache.length === 0) return undefined;
+    return estimateFromToolCache(cache).tokens;
   }
 
   // The policy gates every SPAWN path shares, in one place and one order:
@@ -3717,6 +3859,12 @@ export class ConnectServer {
     // Set when this call INSTALLED a filter, so a failed activation can put
     // the previous state back. `prev: undefined` means "there was none".
     let installedFilter: { namespace: string; prev: Set<string> | undefined } | null = null;
+    // The namespace this call asked to FILTER, whether or not the filter is
+    // new. Distinct from installedFilter, which is only set when the surface
+    // actually moved -- re-sending the same filter changes nothing and leaves
+    // that null, and keying the unmatched-name note on it meant a model that
+    // repeated its typo was told about it exactly once and then never again.
+    let filterRequestedFor: string | null = null;
     if (toolsFilter && namespaces.length === 1) {
       const ns = namespaces[0];
       // Dedup + drop empty strings. If the resulting set is empty we
@@ -3730,6 +3878,7 @@ export class ConnectServer {
           filtersChanged = true;
         }
       } else {
+        filterRequestedFor = ns;
         // Compare sets by size + membership to decide whether the
         // tools/list surface actually moved. Prevents a spurious
         // list_changed notification when the same filter is re-sent.
@@ -3800,6 +3949,10 @@ export class ConnectServer {
           if (installedFilter.prev) this.toolFilters.set(namespace, installedFilter.prev);
           else this.toolFilters.delete(namespace);
           installedFilter = null;
+          // Rolled back, so there is no filter left to report unmatched names
+          // against -- and the server never came up, so its tool list is
+          // unknown anyway.
+          filterRequestedFor = null;
           // The surface never actually moved, so don't announce that it did.
           filtersChanged = false;
         }
@@ -3827,10 +3980,52 @@ export class ConnectServer {
       await this.notifyAllListsChanged();
     }
 
+    // A filter name that matched NOTHING is a silent hole otherwise. The
+    // filter narrows the advertised list by name (proxy.ts), so a typo or a
+    // guessed-at tool name simply produces a smaller list -- the model asked
+    // for `create_issu`, got a server advertising nothing, and was told
+    // "Loaded gh". It then reasons about why its tool "is not working" with
+    // no way to discover that the name was never real.
+    //
+    // Reported in the REPLY, not only the log: the model is the one that has
+    // to correct the name, and it cannot read stderr.
+    if (filterRequestedFor) {
+      const ns = filterRequestedFor;
+      const unmatched = this.unmatchedFilterNames(ns);
+      if (unmatched.length > 0) {
+        const conn = this.connections.get(ns);
+        const offered = conn ? conn.tools.map((t) => t.name) : [];
+        const plural = unmatched.length === 1;
+        const lead = `Note: the ${plural ? "tool" : "tools"} you asked to keep ${plural ? "does" : "do"} not exist on "${ns}": ${unmatched.join(", ")}.`;
+        const fix =
+          offered.length > 0
+            ? ` That server offers: ${offered.join(", ")}. Re-run mcp_connect_activate with a name from that list, or omit "tools" to advertise all of them.`
+            : " It advertises no tools at all right now, so the filter hides nothing that exists.";
+        results.push(lead + fix);
+      }
+    }
+
     return {
       content: [{ type: "text", text: results.join("\n") }],
       isError: anyError || (anyCapped && !anyChanged) ? true : undefined,
     };
+  }
+
+  /** Filter names for `namespace` that match no tool the server actually
+   *  offers. Empty when there is no filter, or when the tool list is unknown
+   *  -- an unknown list cannot falsify a name, and guessing would report a
+   *  real tool as missing on every cold server. */
+  private unmatchedFilterNames(namespace: string): string[] {
+    const filter = this.toolFilters.get(namespace);
+    if (!filter || filter.size === 0) return [];
+    const conn = this.connections.get(namespace);
+    const known =
+      conn && conn.status === "connected"
+        ? conn.tools.map((t) => t.name)
+        : (this.toolCache.get(namespace) ?? []).map((t) => t.name);
+    if (known.length === 0) return [];
+    const have = new Set(known);
+    return [...filter].filter((n) => !have.has(n)).sort();
   }
 
   // Background refinement of a just-recorded heuristic reward via the optional
@@ -4193,6 +4388,39 @@ export class ConnectServer {
     await this.trackUsageForNamespaces([calledNamespace]);
   }
 
+  /** Age every loaded server by one and run the reaper, crediting none.
+   *
+   *  The idle clock used to advance only on PROXIED calls, so a session that
+   *  spoke exclusively to the broker -- discover, find_tool, health, secrets --
+   *  never ticked at all, and six upstream child processes stayed spawned for
+   *  as long as the client stayed connected. Nothing was ever "idle" because
+   *  nothing was ever counted.
+   *
+   *  Only the observation meta-tools go through here. `activate` and
+   *  `deactivate` do not: they ARE the loaded set, and activate resets the
+   *  namespace it just loaded. `dispatch` and `exec` do not: they route to
+   *  real servers and tick through their own paths, exec deliberately once
+   *  for a whole pipeline.
+   *
+   *  A server evicted this way is not lost -- it keeps its learned toolCache,
+   *  stays advertised as a deferred route, and re-activates lazily on the
+   *  first call to one of its tools. The cost of being wrong here is one
+   *  re-spawn, which is the trade the reaper already makes everywhere else. */
+  private async trackObservation(): Promise<void> {
+    // The empty array is the whole point: `called` is empty, so no namespace
+    // is credited and every connected one ages by one.
+    await this.trackUsageForNamespaces([]);
+  }
+
+  /** Run `result`, then charge the session one idle tick. Awaits the handler
+   *  FIRST -- read_tool can connect a server for the length of the call, and
+   *  ticking before it returns would age a set the handler is still changing. */
+  private async observed<T>(result: T | Promise<T>): Promise<T> {
+    const resolved = await result;
+    await this.trackObservation();
+    return resolved;
+  }
+
   // Idle bookkeeping for one logical unit of work. A direct tool call names
   // exactly one namespace; an exec pipeline names every namespace its steps
   // touched and ticks the rest ONCE, so a long pipeline can't age (and evict)
@@ -4479,8 +4707,21 @@ export class ConnectServer {
     const vault = await loadVault(vaultPath()).catch(() => null);
     const vaultKeys = new Set(vault ? listKeys(vault) : []);
 
+    // `type` and `headers` ride along so computeSecretsReport can pick the
+    // channel that server actually uses. Dropping them here is what made the
+    // report blind to every remote server's credentials.
+    //
+    // `command` and `url` ride along for the same reason, one level down:
+    // isRemoteEntry does not read `type` alone. validateEntry defaults a
+    // missing `"type"` to "local", so a hand-written url+headers entry is
+    // recognised only by the command-less-with-a-url fallback -- and passing
+    // neither field left that fallback permanently false here, which is the
+    // same blindness in a narrower case.
     let servers = this.getProfiledActiveServers().map((s) => ({
       namespace: s.namespace,
+      type: s.type,
+      command: s.command,
+      url: s.url,
       env: s.env,
       headers: s.headers,
     }));
@@ -4632,6 +4873,92 @@ export class ConnectServer {
   // observed in this session. Observation only — never activates
   // anything. Ranked by frequency primarily, with recency as a tiebreak
   // so the hottest-most-recent pattern sits at the top.
+  /** Cap on what find_tool returns when the caller names no limit.
+   *
+   *  A number, not "everything that matched": the point of the tool is to
+   *  spend less context than activating servers to look, and a bare term
+   *  against a 30-server setup can match a hundred tools. Ten is enough to
+   *  choose from and small enough that the reply stays cheap. */
+  private static readonly FIND_TOOL_DEFAULT_LIMIT = 10;
+  private static readonly FIND_TOOL_MAX_LIMIT = 50;
+
+  /** Search every configured server's tools by what they do.
+   *
+   *  Reads only what is already known -- live tool lists for loaded servers,
+   *  cached names and descriptions for the rest -- so it contacts nothing and
+   *  activates nothing. That is the whole point: the caller who knows the
+   *  capability but not its home previously had to activate servers to look,
+   *  which is the context cost this broker exists to avoid.
+   *
+   *  A loaded server's match carries its input schema, because it is already
+   *  in memory and free. A cold server's does not, and the reply SAYS so per
+   *  match rather than leaving the model to infer it -- a silently absent
+   *  schema reads as "this tool takes no arguments", which is a worse answer
+   *  than "activate it to see". */
+  private handleFindTool(query: string, limit?: number): { content: Array<{ type: string; text: string }> } {
+    const servers = this.getProfiledActiveServers();
+    if (servers.length === 0) {
+      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
+    }
+    if (query.trim() === "") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: 'find_tool needs a query describing what the tool should do, e.g. { "query": "create a github issue" }.',
+          },
+        ],
+      };
+    }
+
+    const cap = Math.max(
+      1,
+      Math.min(limit ?? ConnectServer.FIND_TOOL_DEFAULT_LIMIT, ConnectServer.FIND_TOOL_MAX_LIMIT),
+    );
+    const ranked = rankTools(
+      query,
+      servers.map((s) => this.rankableFor(s)),
+    );
+    if (ranked.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No configured server has a tool matching "${query}". Use mcp_connect_discover to see what is available, or \`yaw-mcp add <slug>\` to install a server that does.`,
+          },
+        ],
+      };
+    }
+
+    const shown = ranked.slice(0, cap);
+    const lines: string[] = [`Tools matching "${query}" (${shown.length} of ${ranked.length}):`, ""];
+    for (const hit of shown) {
+      const connection = this.connections.get(hit.namespace);
+      const live = connection?.status === "connected" ? connection.tools.find((t) => t.name === hit.name) : undefined;
+      lines.push(`  ${hit.namespace}_${hit.name}${live ? " [loaded]" : ""}`);
+      if (hit.description) lines.push(`    ${hit.description}`);
+      if (live) {
+        lines.push(`    input schema: ${JSON.stringify(live.inputSchema)}`);
+      } else {
+        lines.push(`    schema not loaded -- activate "${hit.namespace}", or use mcp_connect_read_tool.`);
+      }
+    }
+    if (ranked.length > shown.length) {
+      lines.push("", `${ranked.length - shown.length} more match; raise "limit" to see them.`);
+    }
+    // The namespaces behind the shown matches, in first-appearance order, so
+    // the model can act without re-deriving them from the lines above.
+    const namespaces = [...new Set(shown.map((h) => h.namespace))];
+    const primary = namespaces[0];
+    const alsoTry = namespaces.slice(1);
+    lines.push(
+      "",
+      alsoTry.length > 0
+        ? `To use one: mcp_connect_activate with server "${primary}" (or ${alsoTry.join(", ")}).`
+        : `To use one: mcp_connect_activate with server "${primary}".`,
+    );
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
   private handleSuggest(): { content: Array<{ type: string; text: string }> } {
     const detected = this.packDetector.detectChains();
     if (detected.length === 0) {
@@ -4781,6 +5108,10 @@ export class ConnectServer {
   // top level of the model's reasoning.
   private async handleExec(
     args: Record<string, unknown>,
+    // The downstream request's abort signal, forwarded to each step so a
+    // cancelled pipeline actually stops. Deliberately NOT the whole `extra`:
+    // see the step dispatch below for why exec withholds the progress half.
+    signal?: AbortSignal,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const validation = validateExecRequest(args);
     if (!validation.ok) {
@@ -4988,8 +5319,13 @@ export class ConnectServer {
       // and pack-detector logic so exec steps behave identically to
       // direct calls — the caller pays no per-step cost in surprises.
       //
-      // `extra` is omitted so exec steps don't fight for the top-level
-      // progress token; the exec itself emits no progress.
+      // The progress half of `extra` is still withheld so exec steps don't
+      // fight for the top-level progress token; the exec itself emits no
+      // progress. The SIGNAL is forwarded, though: that reasoning was only
+      // ever about the token, and without it a cancelled pipeline kept
+      // dispatching its remaining steps. Passing an object carrying nothing
+      // but `signal` keeps the old behaviour exactly -- createProgressReporter
+      // returns its no-op when there is no token and no sendNotification.
       // Step-level (process) reward: defer the proxy path's learning signal
       // and attribute credit per step here, using the $ref dependency graph
       // so a step that fails on bad INPUT it consumed from an upstream step
@@ -5012,10 +5348,15 @@ export class ConnectServer {
       }
       let stepResult: { content: Array<{ type: string; text?: string }>; isError?: boolean };
       try {
-        stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, {
-          deferLearning: true,
-          deferIdleTracking: true,
-        });
+        stepResult = await this.handleToolCall(
+          step.tool,
+          resolvedArgs,
+          { signal },
+          {
+            deferLearning: true,
+            deferIdleTracking: true,
+          },
+        );
       } catch (err) {
         // Every ordinary exit from this method settles idle tracking (and
         // with it releases the pins). An unexpected throw must not be the
@@ -5034,7 +5375,12 @@ export class ConnectServer {
         // emitters attach), not by text -- an upstream error that happens to
         // contain a marker phrase must still count against the upstream.
         const routingFault = isRoutingFaultResult(stepResult);
-        if (stepNs && !routingFault) {
+        // A cancelled step is the same non-observation as in handleToolCall:
+        // exec forwards the downstream signal, so aborting a pipeline rejects
+        // its in-flight step, and blaming the server for a call the user
+        // withdrew would dock a healthy namespace on every cancel.
+        const stepCancelled = isCancelledResult(stepResult);
+        if (stepNs && !routingFault && !stepCancelled) {
           // Invalid-params is recognized either by the transport-level code
           // tag ("[code=-32602]") OR by classifyError on a structured isError
           // body (the common MCP self-validation pattern, which carries no
@@ -5111,19 +5457,49 @@ export class ConnectServer {
     // server between two steps of this exec.
     await settleIdleTracking();
 
+    // An EXPLICIT `return` is the caller telling us which output it wants,
+    // and echoing `steps` anyway hands back everything it just said it did
+    // not -- plus a verbatim second copy of the value it did. The tool exists
+    // to spend fewer tokens than the equivalent back-to-back calls; on the
+    // documented example (`a = gh_list_prs(); b = gh_get_pr(a[0].number);
+    // return b`) it was returning the whole PR list and `b` twice.
+    //
+    // Dropping them UNCONDITIONALLY was wrong, and the reason is in this same
+    // file. exec declares idempotentHint:false, and the preflight hoist exists
+    // precisely because step 0 can FILE AN ISSUE -- its test says re-running
+    // "files a second one". So on `a = create_issue(); b = comment(a.number);
+    // return b`, discarding `a` destroys the new issue's number and URL, and
+    // the recovery this comment used to suggest -- re-run naming a different
+    // `return` -- is the one action the rest of the file treats as a hazard.
+    //
+    // Size separates the two cases, and separates them cleanly: the bindings a
+    // caller cannot reconstruct are small (an id, a URL, a status), while the
+    // ones worth not replaying are large (the 200-element list the caller
+    // wanted one element of). So keep every intermediate while the whole set
+    // is small, and fall back to names only once echoing it is the cost this
+    // change was made to avoid. `stepKeys` is present on both explicit-return
+    // shapes, so "which steps ran" never depends on the size.
+    //
+    // Measured over the bindings that would actually be DROPPED, not over all
+    // of them. The returned value rides in `result` either way, so counting it
+    // buys nothing and actively breaks the case this budget exists for: on
+    // `a = create_issue(); b = fetch_big(a.id); return b`, a large `b` pushed
+    // the total over the ceiling and took the tiny, irreplaceable `a` with it
+    // -- 5,067 bytes measured to discard 51 bytes of issue number, while `b`
+    // was transmitted regardless. The cost being avoided is the EXTRA payload
+    // of echoing what the caller skipped, so that is what gets weighed.
+    const skipped = Object.fromEntries(Object.entries(bindings).filter(([k]) => k !== returnKey));
+    const body = !explicitReturn
+      ? { ok: true, result: finalResult, steps: bindings }
+      : JSON.stringify(skipped).length > EXEC_ECHO_BUDGET_BYTES
+        ? { ok: true, result: finalResult, stepKeys }
+        : { ok: true, result: finalResult, stepKeys, steps: bindings };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              ok: true,
-              result: finalResult,
-              steps: bindings,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(body, null, 2),
         },
       ],
     };

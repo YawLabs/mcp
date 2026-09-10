@@ -5,7 +5,7 @@ import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
 import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
 import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
-import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
+import { INSTALL_USAGE, parseInstallArgs, parseUninstallArgs, runInstall, runUninstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { parseSetArgs, parseToggleArgs, runEnableDisable, runSet } from "./local-set-cmd.js";
 import { log } from "./logger.js";
@@ -14,6 +14,7 @@ import { parseSearchArgs, runSearch } from "./search-cmd.js";
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
+import { registerShutdownTriggers } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseTrustArgs, runTrust } from "./trust-cmd.js";
@@ -123,6 +124,24 @@ if (subcommand === "compliance") {
         : undefined;
     run("install", parsed, (options) => runInstall({ ...options, claudeConfigDir }));
   }
+} else if (subcommand === "uninstall") {
+  // Rides the shared parse-then-dispatch tail: parseUninstallArgs signals
+  // --help the ordinary way (`{ ok: false, error: USAGE, help: true }`), so
+  // unlike `install` it needs no branch of its own for it.
+  //
+  // CLAUDE_CONFIG_DIR is read HERE, not inside runUninstall, for the same
+  // hermeticity reason install does it: the tests call the runner directly and
+  // must not inherit a wrapper's env. It matters as much on the subtract side
+  // -- under a Yaw Mode overlay the entry lives in the wrapper's dir, and an
+  // uninstall that ignored the redirect would report "nothing to do" while the
+  // real entry stayed wired.
+  const claudeConfigDir =
+    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
+      ? process.env.CLAUDE_CONFIG_DIR
+      : undefined;
+  run("uninstall", parseUninstallArgs(process.argv.slice(3)), (options) =>
+    runUninstall({ ...options, claudeConfigDir }),
+  );
 } else if (subcommand === "doctor") {
   // Argv parsing lives in doctor-cmd.ts (parseDoctorArgs) like every sibling
   // subcommand's, so the completion / help tests can import it -- importing
@@ -193,6 +212,9 @@ if (subcommand === "compliance") {
     install --list           List which MCP clients are installed on this
                              machine (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
+    uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
+                             for Claude Code, its permissions.allow grant).
+                             Your servers in bundles.json are untouched.
 
   Local servers (no account):
     add <slug>               Add an MCP server from the yaw.sh/mcp catalog to
@@ -279,6 +301,9 @@ if (subcommand === "compliance") {
 
   Environment variables:
     YAW_MCP_SERVER_CAP            Max concurrently active servers (default 6).
+    YAW_MCP_TOOL_TOKEN_CAP        Ceiling on the ESTIMATED tokens of the loaded
+                               tool surface, checked alongside SERVER_CAP
+                               (default: off).
     YAW_MCP_MIN_COMPLIANCE        Minimum grade to auto-activate (A|B|C|D|F).
     YAW_MCP_AUTO_LOAD             Auto-activate the namespaces of the highest-
                                ranked recurring pack at startup, subject to
@@ -301,6 +326,9 @@ if (subcommand === "compliance") {
                                managed tree; explicit pins and ranges are
                                never moved (default: on).
     YAW_MCP_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
+    YAW_MCP_MAX_RESULT_BYTES      Hard ceiling on ONE proxied tool result; over it
+                               the reply is CUT and says so (default 100000,
+                               \`0\` disables).
     YAW_MCP_TOOL_EXPOSURE         How much of the catalog tools/list advertises.
                                \`gateway\` (default) exposes the meta-tools
                                plus loaded servers only; \`full\` restores the
@@ -577,8 +605,12 @@ async function runServer(): Promise<void> {
     process.exit(0);
   };
 
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  // SIGTERM/SIGINT plus stdin end/close. The stdin half is what makes this
+  // work on Windows, where a client ends the broker by closing the pipe
+  // rather than by signalling it; without it shutdown() never ran there and
+  // the upstream servers this process spawned were never torn down. See
+  // shutdown-triggers.ts for why stdin is not resumed here.
+  registerShutdownTriggers(shutdown, { proc: process, stdin: process.stdin });
 
   server.start({ config }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);

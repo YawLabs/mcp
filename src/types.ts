@@ -67,6 +67,35 @@ export interface UpstreamServerConfig {
   runtime?: "oam" | "node";
 }
 
+/** Does this entry connect over HTTP rather than spawning a process?
+ *
+ *  Which decides WHICH map carries its credentials: a local server's ride in
+ *  `env`, substituted into the child at spawn; a remote server's ride in
+ *  `headers`, resolved immediately before the transport is built. Reading the
+ *  wrong one either invents a cause or hides a real one.
+ *
+ *  `type` alone is not enough. validateEntry (local-bundles.ts) defaults
+ *  anything without an explicit `"type": "remote"` to "local", so a
+ *  hand-written url+headers entry that omits the field reads as local and its
+ *  headers -- the only credential it has -- get treated as a channel nothing
+ *  uses. The url fallback is the same shape test renderLaunch and pinGaps in
+ *  trust-cmd.ts already apply.
+ *
+ *  It lives here, in the module that owns UpstreamServerConfig and imports
+ *  nothing at runtime, so every surface that has to agree on the answer can
+ *  reach it: local-bundles re-exports it for the CLI, and meta-tools reads it
+ *  for the secrets report without taking on the bundles loader's whole
+ *  dependency chain.
+ *
+ *  KNOWN DISAGREEMENT with the connector, worth closing separately: a
+ *  command-less url entry that omits `type` is called remote here, while
+ *  upstream.ts refuses it with "command is required for local servers" and
+ *  never sends its headers. The entry fails either way, but the diagnostic
+ *  currently names the vault rather than the missing `type`. */
+export function isRemoteEntry(entry: { type?: string; command?: string; url?: string }): boolean {
+  return entry.type === "remote" || (!entry.command && entry.url !== undefined);
+}
+
 export interface ConnectConfig {
   servers: UpstreamServerConfig[];
   configVersion: string;

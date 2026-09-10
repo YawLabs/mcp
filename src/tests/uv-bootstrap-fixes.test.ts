@@ -270,3 +270,41 @@ describe("ensureUv rejection memo clear (fix 2)", () => {
     expect(spawnCallCount).toBeGreaterThan(countBefore);
   });
 });
+
+// ── A timeout is not an answer: resolveUv retries an inconclusive probe ──
+describe("inconclusive PATH probe", () => {
+  it("retries once when the probe times out, instead of concluding uv is absent", async () => {
+    // The production half of the flake that plagued this suite. A 3s budget
+    // lapsing under load says nothing about whether uv is installed, but it
+    // was reported as absence -- so a loaded machine silently swapped the
+    // user's uv for a cached copy, or spent a ~20MB download installing one
+    // it already had. This module's own header records the same failure from
+    // the other direction: a shell-less probe was reverted for false-
+    // negativing on Windows shims and causing exactly that download.
+    //
+    // A hung child is precisely the shape contention produces.
+    vi.useFakeTimers();
+    spawnMode.hang = true;
+    try {
+      // ensureUv proceeds to the cache/bootstrap after two dead probes and
+      // fails there with no network; the probe COUNT is what is under test.
+      const pending = ensureUv().catch(() => "failed-past-the-probe");
+      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await pending;
+      // Twice, not once: the first timeout is inconclusive, not negative.
+      expect(spawnCallCount).toBe(2);
+    } finally {
+      spawnMode.hang = false;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a clean absence, so a genuinely missing uv bootstraps at once", async () => {
+    // The cost control. An ENOENT is a real answer, and paying a second 3s
+    // window for it would delay every Python activation on a host with no uv.
+    // spawnMode defaults emit 'error' immediately -- the absent shape.
+    await ensureUv().catch(() => undefined);
+    expect(spawnCallCount).toBe(1);
+  });
+});

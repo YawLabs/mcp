@@ -7,6 +7,7 @@ import { type CatalogServer, DEFAULT_CATALOG_URL, type FetchCatalog } from "../c
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
 import { deriveNamespace, loadLocalBundles, removeUserBundle, upsertUserBundle } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+import type { UpstreamServerConfig } from "../types.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -19,6 +20,11 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
 });
+
+// A grade cell carrying a real ESC, as a repo-shipped bundles.json could.
+// Built from a char code so the literal never sits in this file (where a
+// stray copy-paste would put a control byte into source).
+const ESCAPE_GRADE = `${String.fromCharCode(27)}[2J${String.fromCharCode(27)}[H`;
 
 function captureIO(): { out: string[]; err: string[]; text: () => string; errText: () => string } {
   const out: string[] = [];
@@ -129,6 +135,98 @@ describe("parseAddArgs", () => {
   it("parses --env KEY=value", () => {
     const r = parseAddArgs(["github", "--env", "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_x"]);
     expect(r.ok && r.options.envOverrides?.GITHUB_PERSONAL_ACCESS_TOKEN).toBe("ghp_x");
+  });
+
+  // Defining a server directly. Before these flags the catalog's 80 entries
+  // were the only thing `add` could reach, and anything else meant hand-editing
+  // bundles.json -- the exact friction the command exists to remove.
+
+  it("takes a launch line with --command", () => {
+    const r = parseAddArgs(["mytool", "--command", "npx -y @scope/my-mcp@latest"]);
+    expect(r.ok && r.options.command).toBe("npx -y @scope/my-mcp@latest");
+  });
+
+  it("takes a url and repeatable headers with --url", () => {
+    const r = parseAddArgs([
+      "remotey",
+      "--url",
+      "https://mcp.example.test/mcp",
+      "--header",
+      "Authorization: Bearer ${secret:tok}",
+      "--header",
+      "X-Trace: 1",
+    ]);
+    expect(r.ok && r.options.url).toBe("https://mcp.example.test/mcp");
+    expect(r.ok && r.options.headers).toEqual({ Authorization: "Bearer ${secret:tok}", "X-Trace": "1" });
+  });
+
+  it("splits a header on the FIRST colon, so a value keeps its own", () => {
+    // `Bearer` blobs and URLs contain colons; a greedy split truncates them.
+    const r = parseAddArgs(["r", "--url", "https://a.test/mcp", "--header", "X-Endpoint: https://b.test:8443/x"]);
+    expect(r.ok && r.options.headers).toEqual({ "X-Endpoint": "https://b.test:8443/x" });
+  });
+
+  it("refuses --command together with --url", () => {
+    const r = parseAddArgs(["x", "--command", "npx foo", "--url", "https://a.test/mcp"]);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.error).toContain("mutually exclusive");
+  });
+
+  it("refuses a flag that belongs to the other mode instead of dropping it", () => {
+    // Accepting-and-ignoring is how a user ends up unable to work out why the
+    // token they passed is not being sent.
+    const header = parseAddArgs(["x", "--command", "npx foo", "--header", "A: b"]);
+    expect(!header.ok && header.error).toContain("--header applies to a remote server");
+
+    const transport = parseAddArgs(["x", "--command", "npx foo", "--transport", "sse"]);
+    expect(!transport.ok && transport.error).toContain("--transport applies to a remote server");
+
+    // `env` is not merely unused on a remote entry -- upstream.ts ignores it
+    // outright, because there is no child process to put it in.
+    const env = parseAddArgs(["x", "--url", "https://a.test/mcp", "--env", "FOO=bar"]);
+    expect(!env.ok && env.error).toContain("--env does not apply to a remote server");
+  });
+
+  it("rejects a malformed --header rather than guessing", () => {
+    for (const bad of ["no-colon", ":novalue", "Bad Name: v", "A:", "A:    "]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", bad]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("rejects a header value carrying a newline or NUL", () => {
+    // Refused while the user is still looking at the command that made the
+    // typo. upstream.ts refuses it at connect time too, which is the
+    // load-bearing guard since bundles.json is hand-editable.
+    for (const bad of ["a\rb", "a\nb", "a\0b"]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", `X-H: ${bad}`]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+      expect(!r.ok && r.error).toContain("newline or NUL");
+    }
+  });
+
+  it("rejects a --transport that is not one of the two real ones", () => {
+    const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--transport", "websocket"]);
+    expect(r.ok).toBe(false);
+  });
+
+  it("rejects a value-taking flag that swallowed the next flag", () => {
+    // `--command --dry-run` would otherwise set command="--dry-run" and
+    // silently drop the dry run -- the same trap --catalog already guards.
+    for (const argv of [
+      ["x", "--command", "--dry-run"],
+      ["x", "--url", "--json"],
+      ["x", "--description", "--json"],
+    ]) {
+      expect(parseAddArgs(argv).ok, argv.join(" ")).toBe(false);
+    }
+  });
+
+  it("names what the missing positional IS, per mode", () => {
+    expect(!parseAddArgs(["--command", "npx foo"]).ok && parseAddArgs(["--command", "npx foo"])).toMatchObject({
+      error: expect.stringContaining("server name"),
+    });
+    expect(parseAddArgs(["a", "b"])).toMatchObject({ error: expect.stringContaining("server slug") });
   });
   it("rejects malformed --env", () => {
     expect(parseAddArgs(["github", "--env", "nope"]).ok).toBe(false);
@@ -303,6 +401,494 @@ describe("runAdd", () => {
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     const entry = loaded.config?.servers.find((s) => s.namespace === "tailscale");
     expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-x");
+  });
+
+  it("writes a local entry from --command without fetching the catalog at all", async () => {
+    // The no-fetch part is the point, not an optimisation: the catalog being
+    // a curated front door rather than the only door means a server it does
+    // not list must not depend on reaching it. It also makes this the one
+    // add path that works offline.
+    const io = captureIO();
+    let fetched = false;
+    const r = await runAdd({
+      slug: "mytool",
+      command: "npx -y @scope/my-mcp@latest --flag",
+      description: "does a thing",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => {
+        fetched = true;
+        return [];
+      },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(fetched).toBe(false);
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("local");
+    expect(entry?.command).toBe("npx");
+    // Tokenized by the same splitter the catalog's launch lines use, so a
+    // quoted argument behaves identically however the entry was added.
+    expect(entry?.args).toEqual(["-y", "@scope/my-mcp@latest", "--flag"]);
+    expect(entry?.description).toBe("does a thing");
+  });
+
+  it("never prints a header VALUE in --json, the way env is already redacted", async () => {
+    // headers is the credential channel for a remote server, so an
+    // Authorization value here is a live bearer token -- and this envelope is
+    // what gets piped into CI logs and pasted into bug reports. Shipped
+    // briefly printing `envKeys: [...]` next to a full `Bearer <token>` in one
+    // output. A ${secret:NAME} reference would be safe to print, but the
+    // envelope cannot tell the reader which one it holds without printing it.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer LITERAL-TOKEN-abc123" },
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    const stdout = io2.out.join("");
+    expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
+    const parsed = JSON.parse(stdout);
+    expect(parsed.entry.headers).toBeUndefined();
+    expect(parsed.entry.headerNames).toEqual(["Authorization"]);
+  });
+
+  it("renders a remote --dry-run as its url, not as an undefined command", async () => {
+    // The preview hand-rolled `command + args`, which a remote entry has
+    // neither of -- so every --url dry run printed a literal
+    // "command: undefined ". renderLaunch already knows the url shape.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer LITERAL-TOKEN-abc123" },
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    const stdout = io2.out.join("");
+    expect(stdout).toContain("HTTP https://mcp.example.test/mcp");
+    expect(stdout).not.toContain("undefined");
+    // Same redaction as the json envelope: names, never values.
+    expect(stdout).toContain("header names: Authorization");
+    expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
+  });
+
+  it("warns when a header references a secret the vault does not hold", async () => {
+    // Otherwise the refusal surfaces in the user's MCP client at the next
+    // session, far from the command that caused it. A warning, not a refusal:
+    // storing the secret after wiring the server is a reasonable order.
+    const io2 = captureIO();
+    const r = await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:nope}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const err = io2.err.join("");
+    expect(err).toContain("nope");
+    expect(err).toContain("not stored in your vault");
+    expect(err).toContain("yaw-mcp secrets set nope");
+  });
+
+  it("stays quiet when the referenced secret IS stored", async () => {
+    // The other half: a warning that fires on a correctly-configured entry is
+    // noise that trains the user to ignore it.
+    // A minimal on-disk vault. The check reads NAMES only (listKeys), never a
+    // value, so an entry needs no real ciphertext -- and writing the file
+    // directly keeps this test off the passphrase/KDF path it is not about.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "secrets.json"),
+      // A FULL entry shape. `{ realkey: {} }` looks like it would do -- the
+      // check reads names only -- but loadVault throws VaultEntryCorruptError
+      // on an entry missing iv/ciphertext/authTag, and danglingSecretRefs
+      // swallows that into []. The test then passed because the vault was
+      // unreadable, not because the name was found: green for the opposite
+      // reason to the one it claimed.
+      JSON.stringify({
+        salt: Buffer.alloc(16).toString("base64"),
+        entries: { realkey: { iv: "x", ciphertext: "y", authTag: "z" } },
+      }),
+    );
+    const io2 = captureIO();
+    await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:realkey}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("ignores a remote entry's stale env refs, which upstream never reads", async () => {
+    // Unioning env and headers looked harmless and was not: converting an
+    // entry to remote leaves its env behind, and warning about a ref in it
+    // invents a cause -- upstream logs "Ignoring env on a remote server" and
+    // connects anyway, so nothing is refused over it. This is the same
+    // failure doctor's vault section is written to avoid, and the two would
+    // have contradicted each other on the same file.
+    const io2 = captureIO();
+    const common = {
+      slug: "ent",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, command: "npx -y m", envOverrides: { TOK: "${secret:absent}" } });
+    const file = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { servers: Array<Record<string, unknown>> };
+    for (const srv of parsed.servers) delete srv.slug;
+    writeFileSync(file, JSON.stringify(parsed));
+
+    io2.err.length = 0;
+    await runAdd({ ...common, url: "https://x.test/mcp" });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("warns about a MALFORMED ref, which is the typo half of the case it exists for", async () => {
+    // A missing name and an unparseable span fail identically at resolve
+    // time. Reporting only the half that still parses would miss the mistyped
+    // name this warning was added to catch.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "typo",
+      url: "https://c.test/mcp",
+      headers: { Authorization: "Bearer ${secret:my token}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    const err = io2.err.join("");
+    expect(err).toContain("not a parseable");
+    // Bounded display form, never the raw span: an unterminated ${secret: runs
+    // to the end of a value that can itself be a credential.
+    expect(err).toContain("<malformed ref>");
+    expect(err).not.toContain("my token}");
+  });
+
+  it("names the command SHAPE when several secrets are missing, not just the first", async () => {
+    // "Store them with `secrets set aa`" hands over a command that stores one
+    // of the names it just listed, with nothing saying a second run is needed.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "multi",
+      command: "npx -y m",
+      envOverrides: { A: "${secret:aa}", B: "${secret:bb}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    const err = io2.err.join("");
+    expect(err).toContain("aa, bb");
+    expect(err).toContain("secrets set <name>");
+    expect(err).not.toContain("secrets set aa`");
+  });
+
+  it("stays silent when the vault itself is unreadable, leaving that to doctor", async () => {
+    // Deliberate, and worth pinning because it is the reason the test above
+    // needs a valid entry: a corrupt vault makes loadVault throw, and this
+    // check swallows it rather than failing an otherwise-good add. It does
+    // mean one malformed entry hides the warning for every ref -- acceptable
+    // because `yaw-mcp doctor` reports an unreadable vault explicitly, and
+    // guessing here would be worse.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(
+      join(synthHome, CONFIG_DIRNAME, "secrets.json"),
+      JSON.stringify({ salt: Buffer.alloc(16).toString("base64"), entries: { broken: {} } }),
+    );
+    const io2 = captureIO();
+    await runAdd({
+      slug: "linear",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:definitelyabsent}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("is silent about a vault it cannot read, rather than guessing", async () => {
+    // No vault at all is the ordinary first-run state; failing or nagging
+    // there would fire on every add before the user has stored anything.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "plain",
+      command: "npx -y plain-mcp",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    });
+    expect(io2.err.join("")).not.toContain("not stored in your vault");
+  });
+
+  it("says so out loud when a --url add converts a slug-less stdio entry", async () => {
+    // The note is what stops someone's one-click-installed server being turned
+    // into a remote endpoint silently. It used to be gated on the INCOMING
+    // entry having a command, so it fired for remote -> stdio and never for
+    // stdio -> remote -- the direction that only became reachable when
+    // `add --url` shipped.
+    const io2 = captureIO();
+    const common = {
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, slug: "appadded", command: "npx -y old-mcp" });
+    // Emulate an app-written entry: no slug, which is the weaker identity
+    // signal the note exists to protect.
+    const file = join(synthHome, CONFIG_DIRNAME, "bundles.json");
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { servers: Array<Record<string, unknown>> };
+    for (const srv of parsed.servers) delete srv.slug;
+    writeFileSync(file, JSON.stringify(parsed));
+
+    io2.err.length = 0;
+    await runAdd({ ...common, slug: "appadded", url: "https://c.test/mcp" });
+    const err = io2.err.join("");
+    expect(err).toContain("launch command changed");
+    expect(err).toContain("npx -y old-mcp");
+    expect(err).toContain("HTTP https://c.test/mcp");
+  });
+
+  it("drops the stored headers when a remote entry is converted back to local", async () => {
+    // Through two real runAdd calls against a real bundles.json, because the
+    // bug is what ends up ON DISK. `headers` belongs to the remote shape
+    // exactly as `url` does, and the merge dropped only the url -- so the
+    // converted stdio entry kept a live bearer token it can never send, in
+    // plaintext, in a file the user now believes describes a local server.
+    const io2 = captureIO();
+    const common = {
+      slug: "mytool",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, url: "https://a.test/mcp", headers: { Authorization: "Bearer LIVE-TOKEN" } });
+    await runAdd({ ...common, command: "npx -y new-mcp" });
+
+    const raw = readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8");
+    expect(raw).not.toContain("LIVE-TOKEN");
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("local");
+    expect(entry?.command).toBe("npx");
+    expect(entry?.url).toBeUndefined();
+    expect(entry?.headers).toBeUndefined();
+  });
+
+  it("drops the stored launch and env when a local entry is converted to remote", async () => {
+    // The mirror of the test above, which is the direction that was covered.
+    // A remote entry literal carries no `command`, and the merge's launch
+    // cleanup was gated on the incoming entry HAVING one -- so converting the
+    // other way left the dead npx launch and its plaintext credential on disk
+    // while the server actually connected over HTTPS.
+    const io2 = captureIO();
+    const common = {
+      slug: "mytool",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s: string) => io2.out.push(s),
+      err: (s: string) => io2.err.push(s),
+    };
+    await runAdd({ ...common, command: "npx -y old-mcp", envOverrides: { OLD_TOKEN: "LOCAL-SECRET" } });
+    await runAdd({ ...common, url: "https://a.test/mcp", headers: { Authorization: "Bearer LIVE-TOKEN" } });
+
+    const raw = readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8");
+    expect(raw).not.toContain("LOCAL-SECRET");
+    expect(raw).not.toContain("old-mcp");
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("remote");
+    expect(entry?.url).toBe("https://a.test/mcp");
+    expect(entry?.command).toBeUndefined();
+    expect(entry?.args).toBeUndefined();
+    expect(entry?.env).toBeUndefined();
+  });
+
+  it("reports the launch swap when a slug-less entry is converted to remote [#1]", async () => {
+    // The mirror of "a slug-less namespace match merges but reports the launch
+    // swap LOUDLY". launchChanged was gated on the INCOMING entry carrying a
+    // `command`, which a remote entry literal never does -- so this direction
+    // changed where the server actually connects and printed nothing at all.
+    await upsertUserBundle(
+      // App-shaped: no slug field at all.
+      { namespace: "mytool", name: "MyTool", command: "docker", args: ["run", "old/tool"], isActive: true },
+      { home: synthHome },
+    );
+    const errLines: string[] = [];
+    await runAdd({
+      slug: "mytool",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      url: "https://a.test/mcp",
+      out: () => {},
+      err: (s: string) => errLines.push(s),
+    });
+    const errText = errLines.join("");
+    expect(errText).toContain("launch command changed");
+    expect(errText).toContain("docker run old/tool");
+    expect(errText).toContain("https://a.test/mcp");
+  });
+
+  it("writes a remote entry from --url, with headers and no command", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:tok}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "remotey");
+    expect(entry?.type).toBe("remote");
+    expect(entry?.url).toBe("https://mcp.example.test/mcp");
+    expect(entry?.transport).toBe("streamable-http");
+    expect(entry?.headers).toEqual({ Authorization: "Bearer ${secret:tok}" });
+    // The two shapes are exclusive: a stray `command: ""` on a remote entry
+    // would read to the loader as a stdio server with no executable.
+    expect(entry?.command).toBeUndefined();
+    expect(entry?.args).toBeUndefined();
+  });
+
+  it("honours --transport sse on a remote entry", async () => {
+    const io = captureIO();
+    await runAdd({
+      slug: "ssey",
+      url: "https://mcp.example.test/sse",
+      transport: "sse",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "ssey")?.transport).toBe("sse");
+  });
+
+  it("refuses a url it could never connect to, at add time rather than at connect time", async () => {
+    // upstream.ts does classify a malformed url as a permanent config error,
+    // but that is a failure the user meets in their next session. Refusing
+    // here keeps the unusable entry out of bundles.json entirely.
+    for (const url of ["not-a-url", "ftp://a.test/mcp", "//a.test/mcp"]) {
+      const io = captureIO();
+      const r = await runAdd({
+        slug: "bad",
+        url,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode, url).toBe(2);
+      expect(r.written, url).toEqual([]);
+    }
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "bad")).toBeUndefined();
+  });
+
+  it("refuses a --command with no executable in it", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "empty",
+      command: '""',
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // The same degenerate quoted-empty launch line the catalog path already
+    // refuses -- it would otherwise be written as a server with no command
+    // and fail opaquely at spawn time.
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("records the catalog's compliance grade so the floor has something to gate on", async () => {
+    // End of the chain this fix reconnected. The catalog publishes an A-F
+    // grade; before, `add` dropped it and validateEntry dropped it again, so
+    // grades.json -- written only by a manual `yaw-mcp audit` -- was the sole
+    // supplier. Until the user ran that per server, everything was ungraded,
+    // ungraded always passes, and YAW_MCP_MIN_COMPLIANCE refused nothing.
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "graded",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => [
+        { slug: "graded", name: "Graded", install: { command: "npx -y graded-mcp" }, complianceGrade: "B" },
+      ],
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "graded")?.complianceGrade).toBe("B");
+  });
+
+  it("writes no grade for an ungraded catalog entry, leaving it to pass as before", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "plain",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => [{ slug: "plain", name: "Plain", install: { command: "npx -y plain-mcp" } }],
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "plain")?.complianceGrade).toBeUndefined();
   });
 
   it("treats a whitespace-only --env required value as missing (no blank-ish persist)", async () => {
@@ -483,7 +1069,7 @@ describe("runAdd", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(io.text()).toContain('would write Fetch as namespace "fetch"');
-    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    expect(io.text()).toContain("launch: $ npx -y @yawlabs/fetch-mcp");
   });
 
   it("--dry-run text says 'would update' once the entry exists, and lists env KEY names only", async () => {
@@ -869,7 +1455,7 @@ describe("runAdd re-add preserves user state", () => {
     expect(r.exitCode).toBe(0);
     expect(io.text()).toContain('would update Fetch as namespace "fetch"');
     expect(io.text()).toMatch(/would stay disabled and NOT load/);
-    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    expect(io.text()).toContain("launch: $ npx -y @yawlabs/fetch-mcp");
     // ...and a dry run still writes nothing: the stale entry is untouched.
     expect(rawServers()[0].isActive).toBe(false);
     expect(rawServers()[0].args).toEqual(["-y", "stale"]);
@@ -2078,6 +2664,38 @@ describe("runList", () => {
       gradesReader: async () => ({}),
     });
     expect(io.text()).toMatch(/fetch\s+Fetch\s+active\s+-\s/);
+  });
+
+  it("neuters control bytes in a GRADE that came from bundles.json", async () => {
+    // GRADE reads like a validated A-F letter, but validateEntry accepts any
+    // non-blank string from bundles.json and only trims and uppercases it --
+    // neither of which touches an ESC. bundles.json is a file a repo can
+    // ship, so an entry carrying a clear-screen escape would wipe the
+    // screen and home the cursor in the middle of the table it is a cell of.
+    await upsertUserBundle(
+      {
+        namespace: "evil",
+        name: "Evil",
+        command: "npx",
+        args: ["-y", "x"],
+        isActive: true,
+        complianceGrade: ESCAPE_GRADE as UpstreamServerConfig["complianceGrade"],
+      },
+      { home: synthHome },
+    );
+    const io = captureIO();
+    await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    const text = io.text();
+    expect(text).toContain("evil");
+    // The raw ESC never reaches the terminal; displaySafe renders it visibly.
+    expect(text).not.toContain(ESCAPE_GRADE);
+    expect(text.includes(String.fromCharCode(27))).toBe(false);
   });
 
   it("reads the real grades.json when no reader override is supplied", async () => {
