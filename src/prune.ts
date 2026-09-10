@@ -14,7 +14,13 @@
 //   * KEEP false, 0, empty strings — those can be load-bearing
 //     ("error": "" meaning success, "deleted": false, etc.).
 //   * Text-mode: strip trailing whitespace per line and collapse runs
-//     of 3+ blank lines into 2. No content is removed, just formatting.
+//     of 3+ blank lines into 2 -- but only after CLASSIFYING THE BLOCK.
+//     Trailing whitespace and blank runs are formatting in prose and
+//     CONTENT in a unified diff, inside a fenced code block, and at a
+//     Markdown hard line break, and none of the three can be recognized
+//     from one line in isolation. See the block-classification note above
+//     pruneWhitespace for the three rules and for what is deliberately
+//     still NOT preserved.
 //   * JSON mode is SKIPPED entirely when re-serializing would change a
 //     number. Pruning round-trips through JSON.parse + JSON.stringify, so
 //     an int64 id like 12345678901234567890 (ordinary in SQL and REST MCP
@@ -215,6 +221,119 @@ function canonicalDecimal(s: string): string | null {
   return `${sign === "-" ? "-" : ""}${significant}e${pow}`;
 }
 
+// --- block classification ---------------------------------------------
+//
+// A per-line decision cannot answer a block-level question, and both text
+// rules ask one. Trailing whitespace and blank-line runs are formatting in
+// prose and CONTENT in three shapes upstream servers return constantly:
+//
+//   * A UNIFIED DIFF. The context line for an empty source line is a lone
+//     " ", so stripping it leaves a hunk git refuses to apply; a `+`/`-`
+//     line carries the file's own trailing bytes verbatim; and the
+//     `@@ -a,b +c,d @@` header COUNTS the lines that follow it, so
+//     collapsing a blank run inside a hunk invalidates the count. Nothing
+//     about that is visible from the line being stripped -- the hunk header
+//     several lines up is what gives it its meaning. So a patch is
+//     ALL-OR-NOTHING: the whole text comes back byte-faithful, exactly the
+//     way JSON mode bails on the whole document when one number would not
+//     survive the round-trip.
+//   * A FENCED CODE BLOCK. Everything between the fences is literal, and a
+//     fence is precisely where an embedded diff, Markdown sample or
+//     whitespace-significant payload lives when it is quoted inside prose.
+//     A blank-run collapse in there deletes lines from the code the model is
+//     being shown and shifts every line number after it, so both rules are
+//     off between the fences. Whether a line is inside one is only knowable
+//     by scanning from the top of the document.
+//   * A MARKDOWN HARD LINE BREAK -- two or more trailing spaces on a line
+//     that another line follows. Stripping it joins the two lines when the
+//     text is rendered.
+//
+// NOT preserved, stated rather than implied, because the module's contract
+// has to match what the code does:
+//
+//   * A hard break in text carrying NO Markdown structural signal (no ATX
+//     heading, no fence). "line one   " followed by "line two" is a hard
+//     break in a README and trailing junk in a log, and the two are not
+//     distinguishable from the text -- so the signal gates it. Guessing
+//     "everything with two trailing spaces is Markdown" would disable the
+//     module's primary text rule for ordinary CLI output and logs, which is
+//     most of what flows through here; guessing the other way is what
+//     corrupts a README. A false POSITIVE on the gate costs savings only.
+//   * Trailing TABS, and a SINGLE trailing space. Neither is a CommonMark
+//     hard break, so both still prune everywhere.
+
+/** Per line: is it inside a fenced code block (fence lines included)?
+ *
+ *  CommonMark shape: up to three leading spaces, then three or more
+ *  backticks or tildes; the closer uses the same character, is at least as
+ *  long, and carries nothing but whitespace after it. An opening backtick
+ *  fence's info string may not itself contain a backtick.
+ *
+ *  An UNCLOSED opener fences the rest of the document. That is the safe
+ *  direction: it costs savings, never content. */
+function classifyFencedLines(lines: string[]): boolean[] {
+  const fenced: boolean[] = new Array(lines.length).fill(false);
+  let openChar: string | null = null;
+  let openLength = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\r$/, "");
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (openChar === null) {
+      if (m && !(m[1][0] === "`" && m[2].includes("`"))) {
+        openChar = m[1][0];
+        openLength = m[1].length;
+        fenced[i] = true;
+      }
+      continue;
+    }
+    fenced[i] = true;
+    if (m && m[1][0] === openChar && m[1].length >= openLength && m[2].trim() === "") {
+      openChar = null;
+      openLength = 0;
+    }
+  }
+  return fenced;
+}
+
+/** Is this text a unified diff?
+ *
+ *  The hunk header is the signal: every patch carrying content has one, and
+ *  `@@ -1,4 +1,4 @@` is not a shape prose takes, so this classifies without
+ *  the fuzzy "does it look like a diff" guessing the module avoids
+ *  everywhere else. `diff --git` is accepted too, so a content-free patch (a
+ *  pure rename or mode change) is recognized as well.
+ *
+ *  FENCED lines are skipped deliberately: a diff quoted inside a Markdown
+ *  code fence is already protected by the fence rule, and treating it as a
+ *  patch would cost the surrounding prose its pruning for no gain. */
+function looksLikePatch(lines: string[], fenced: boolean[]): boolean {
+  for (let i = 0; i < lines.length; i++) {
+    if (fenced[i]) continue;
+    if (lines[i].startsWith("diff --git ")) return true;
+    if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(lines[i])) return true;
+  }
+  return false;
+}
+
+/** Does this text carry a Markdown structural signal -- an ATX heading or a
+ *  fence? That is what makes a two-trailing-space line a hard break rather
+ *  than trailing junk; see the NOT-preserved note above for why the gate is
+ *  here at all. */
+function looksLikeMarkdown(lines: string[], fenced: boolean[]): boolean {
+  return fenced.some(Boolean) || lines.some((line) => /^ {0,3}#{1,6}(?:\s|\r?$)/.test(line));
+}
+
+/** A Markdown hard line break: two or more trailing SPACES on a non-blank
+ *  line that a non-blank line follows. The lookahead is the block context --
+ *  trailing spaces before a BLANK line are insignificant even in Markdown,
+ *  so those still prune. */
+function isHardLineBreak(line: string, next: string | undefined): boolean {
+  if (next === undefined) return false;
+  if (!/ {2}\r?$/.test(line)) return false;
+  if (line.trim() === "") return false;
+  return next.trim() !== "";
+}
+
 // CRLF-aware on purpose: a Windows-hosted MCP server that shells out (git,
 // filesystem, any CLI wrapper) returns \r\n line endings, and an LF-only
 // version of these rules was a silent no-op there — the trailing-space
@@ -223,11 +342,37 @@ function canonicalDecimal(s: string): string | null {
 // byte-faithful); only the collapsed blank run is rewritten, in the style
 // the run itself used.
 function pruneWhitespace(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => line.replace(/[ \t]+(?=\r?$)/, ""))
-    .join("\n")
-    .replace(/(?:\r?\n){3,}/g, (run) => (run.includes("\r") ? "\r\n\r\n" : "\n\n"));
+  const lines = text.split("\n");
+  const fenced = classifyFencedLines(lines);
+  // Classify BEFORE any per-line edit -- a patch comes back untouched.
+  if (looksLikePatch(lines, fenced)) return text;
+  const markdown = looksLikeMarkdown(lines, fenced);
+
+  const stripped = lines.map((line, i) => {
+    if (fenced[i]) return line;
+    if (markdown && isHardLineBreak(line, lines[i + 1])) return line;
+    return line.replace(/[ \t]+(?=\r?$)/, "");
+  });
+
+  // Collapse per contiguous NON-fenced run of lines rather than over the
+  // whole document: a run inside a fence is left alone, and no run is
+  // collapsed across a fence boundary. With no fence at all this is one
+  // chunk covering the whole text, i.e. the original single regex pass.
+  const parts: string[] = [];
+  let i = 0;
+  while (i < stripped.length) {
+    const inFence = fenced[i];
+    let j = i;
+    while (j < stripped.length && fenced[j] === inFence) j++;
+    const chunk = stripped.slice(i, j).join("\n");
+    parts.push(inFence ? chunk : collapseBlankRuns(chunk));
+    i = j;
+  }
+  return parts.join("\n");
+}
+
+function collapseBlankRuns(chunk: string): string {
+  return chunk.replace(/(?:\r?\n){3,}/g, (run) => (run.includes("\r") ? "\r\n\r\n" : "\n\n"));
 }
 
 // Walk a parsed JSON tree, dropping keys/elements whose value is

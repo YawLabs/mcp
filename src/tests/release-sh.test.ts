@@ -683,3 +683,183 @@ describe("release.sh non-interactive confirm brake", () => {
     expect(r.status).toBe(0);
   });
 });
+
+describe("release.sh registry_has_version", () => {
+  const fn = extractBlock("registry_has_version() {", "}");
+  const dir = newTmp("release-reg-");
+
+  /** Run the helper with `curl` stubbed to return `body`, or to fail like a
+   *  `curl -f` against an unreachable/erroring registry when body is null.
+   *  The stub APPENDS the argv it saw to curl-args.log in `cwd`. */
+  function run(body: string | null, want = "0.81.0", calls = 1): { out: string; args: string[] } {
+    const log = `curl-args-${Math.abs(hash(`${body}${want}${calls}`))}.log`;
+    const curlStub =
+      body === null
+        ? `curl() { printf '%s\\n' "$*" >> "${log}"; return 22; }`
+        : `curl() { printf '%s\\n' "$*" >> "${log}"; printf '%s' "$FAKE_BODY"; }`;
+    const script = [
+      curlStub,
+      fn,
+      `for _ in $(seq 1 ${calls}); do if registry_has_version "${want}"; then echo "HIT"; else echo "MISS"; fi; done`,
+    ].join("\n");
+    const r = runBash(script, dir, { FAKE_BODY: body ?? "" });
+    let args: string[] = [];
+    try {
+      args = readFileSync(join(dir, log), "utf8").split("\n").filter(Boolean);
+    } catch {
+      // No log means curl was never called, which the caller asserts on.
+    }
+    return { out: r.out, args };
+  }
+
+  const listing = (version: string) =>
+    JSON.stringify({ servers: [{ server: { name: "io.github.YawLabs/mcp", version } }] });
+
+  it("hits when the registry lists that exact version", () => {
+    expect(run(listing("0.81.0")).out).toContain("HIT");
+  });
+
+  it("misses when the registry lists a different version", () => {
+    expect(run(listing("0.80.0")).out).toContain("MISS");
+  });
+
+  it("fails OPEN on an unreachable registry or an unparseable body", () => {
+    // Both call sites treat a miss as "not published yet": step 5 falls
+    // through to publish, the final verification retries. Neither may be
+    // wedged by a registry outage.
+    expect(run(null).out).toContain("MISS");
+    expect(run("<html>502 Bad Gateway</html>").out).toContain("MISS");
+    expect(run("").out).toContain("MISS");
+  });
+
+  it("busts the CDN cache on every read", () => {
+    // The registry serves this endpoint through a cache (X-Registry-Cache:
+    // MISS then STALE on the same URL seconds apart). An un-busted read can
+    // answer with a pre-publish body, which turns step 5's idempotence probe
+    // into the duplicate-publish abort it exists to prevent.
+    const { args } = run(listing("0.81.0"), "0.81.0", 3);
+    expect(args).toHaveLength(3);
+    for (const a of args) {
+      expect(a).toContain("Cache-Control: no-cache");
+      expect(a).toMatch(/[?&]_=\d+/);
+    }
+    // Per-call uniqueness is what actually moves the cache key: two reads in
+    // the same second must not resolve to the same URL.
+    const busters = args.map((a) => /[?&]_=(\d+)/.exec(a)?.[1]);
+    expect(new Set(busters).size).toBeGreaterThan(1);
+  });
+
+  it("asks for the version it was given, not a hardcoded one", () => {
+    const { args } = run(listing("1.2.3"), "1.2.3");
+    expect(args[0]).toContain("version=1.2.3");
+    expect(args[0]).toContain("search=io.github.YawLabs/mcp");
+  });
+});
+
+describe("release.sh published-tarball content check", () => {
+  const block = extractBlock(
+    'PUBLISHED_INTEGRITY=$(npm view "@yawlabs/mcp@${VERSION}" dist.integrity 2>/dev/null | tr -d \'[:space:]\' || echo "")',
+    "fi",
+  );
+  const dir = newTmp("release-tar-");
+
+  function run(opts: { published: string; pack: string; publishedThisRun: boolean }): RunResult {
+    const body = [
+      STUB_HELPERS,
+      'VERSION="0.81.0"',
+      `NPM_PUBLISHED_THIS_RUN=${opts.publishedThisRun}`,
+      // `view` answers with the registry's integrity, anything else is the
+      // `pack --dry-run --json` call.
+      `npm() { if [ "$1" = "view" ]; then printf '%s\\n' "$FAKE_VIEW"; else printf '%s' "$FAKE_PACK"; fi; }`,
+      block,
+    ].join("\n");
+    return runBash(body, dir, { FAKE_VIEW: opts.published, FAKE_PACK: opts.pack });
+  }
+
+  const packJson = (integrity: string) => JSON.stringify([{ name: "@yawlabs/mcp", integrity }]);
+  const SHA = "sha512-6XXgP7XuMcMERl3hLlBERq7nKu8LvKis2i0FhyBi7m+DDFuBcASncrTJDNSjHU4fxb/a+liqWpRsFY6MPMOOww==";
+  const OTHER = "sha512-hgrrVtBEDbnOQI0kBjaYz0uSMc8P9n8EKGJhnmi+n9wobTkbv3X7+S+8Dn5OTLXL8biqzBe8uQgqqGyacWeQkA==";
+
+  it("confirms when the published tarball is the tarball this run packed", () => {
+    const r = run({ published: SHA, pack: packJson(SHA), publishedThisRun: true });
+    expect(r.out).toContain("INFO npm tarball: content matches this build");
+  });
+
+  it("flags a mismatch on a version this run published", () => {
+    // The version string would still say 0.81.0 here. Only the content check
+    // can see that npm is serving bytes this build did not produce.
+    const r = run({ published: OTHER, pack: packJson(SHA), publishedThisRun: true });
+    expect(r.out).toContain("WARN npm is serving a DIFFERENT tarball");
+    expect(r.out).toContain(OTHER);
+    expect(r.out).toContain(SHA);
+  });
+
+  it("reads a mismatch on a SKIPPED publish as post-tag drift, not an anomaly", () => {
+    // The documented recovery shape: the version was already live and a fix
+    // was committed after the tag, so HEAD legitimately differs from what
+    // shipped. Same fact, different conclusion -- and it must not read as a
+    // corrupted publish.
+    const r = run({ published: OTHER, pack: packJson(SHA), publishedThisRun: false });
+    expect(r.out).toContain("already on npm and its tarball differs");
+    expect(r.out).not.toContain("DIFFERENT tarball");
+  });
+
+  it("says the comparison could not run rather than passing it", () => {
+    // Fail-open, but never SILENTLY: an unreadable side must not look like a
+    // match. Both directions -- registry unreachable, and a pack that emitted
+    // no parseable JSON.
+    expect(run({ published: "", pack: packJson(SHA), publishedThisRun: true }).out).toContain(
+      "WARN Could not compare the published tarball",
+    );
+    expect(run({ published: SHA, pack: "npm ERR! segfault", publishedThisRun: true }).out).toContain(
+      "WARN Could not compare the published tarball",
+    );
+  });
+
+  it("never fails the release -- the publish has already gone out", () => {
+    const r = run({ published: OTHER, pack: packJson(SHA), publishedThisRun: true });
+    expect(r.status).toBe(0);
+  });
+});
+
+describe("release.sh MCP-registry read-back", () => {
+  const block = extractBlock("REGISTRY_FINAL=false", "fi");
+  const dir = newTmp("release-rb-");
+
+  function run(hitOnTry: number | null): RunResult {
+    const body = [
+      STUB_HELPERS,
+      'VERSION="0.81.0"',
+      "TRIES=0",
+      "sleep() { :; }",
+      `registry_has_version() { TRIES=$((TRIES + 1)); if [ -n "${hitOnTry ?? ""}" ] && [ "$TRIES" -ge "${hitOnTry ?? 0}" ]; then return 0; fi; return 1; }`,
+      block,
+      'echo "TRIES=$TRIES"',
+    ].join("\n");
+    return runBash(body, dir);
+  }
+
+  it("confirms the registry channel instead of inferring it from an exit code", () => {
+    // The block this replaces did not exist: mcp-publisher's exit code was
+    // the only evidence, while the banner claimed the registry listing.
+    const r = run(1);
+    expect(r.out).toContain("INFO MCP registry: io.github.YawLabs/mcp@0.81.0");
+    expect(r.out).toContain("TRIES=1");
+  });
+
+  it("polls past the registry's read-path lag", () => {
+    const r = run(2);
+    expect(r.out).toContain("INFO MCP registry:");
+    expect(r.out).toContain("TRIES=2");
+  });
+
+  it("warns, with the recovery, when three reads do not list it", () => {
+    const r = run(null);
+    expect(r.out).toContain("WARN The MCP registry does not list");
+    expect(r.out).toContain("TRIES=3");
+    expect(r.out).toContain("Re-run ./release.sh 0.81.0");
+    // A missing listing is not a release failure -- npm already has the
+    // version and cannot take it back.
+    expect(r.status).toBe(0);
+  });
+});

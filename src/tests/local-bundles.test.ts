@@ -270,6 +270,49 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].connectTimeoutMs).toBe(60000);
   });
 
+  it("infers type remote for a command-less url entry that omits the field", async () => {
+    // The two readers used to disagree about this exact entry: isRemoteEntry
+    // called it remote via its url fallback, so doctor reported its headers as
+    // a vault credential, while upstream.ts refused it with "command is
+    // required for local servers" and never sent them. Deciding it here means
+    // there is one answer before any reader sees the config.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "notype",
+          name: "NoType",
+          url: "https://mcp.example.test/mcp",
+          headers: { Authorization: "Bearer ${secret:tok}" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].type).toBe("remote");
+    expect(r.config?.servers[0].headers).toEqual({ Authorization: "Bearer ${secret:tok}" });
+  });
+
+  it("leaves a url+command entry local, because that shape is genuinely ambiguous", async () => {
+    // Inferring here would silently pick a transport for the user. An explicit
+    // `type` is the only honest resolution, so the default stands and the
+    // connector's own error is what they see.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "both", name: "Both", command: "npx", args: ["-y", "x"], url: "https://x.test/mcp" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].type).toBe("local");
+  });
+
+  it("an explicit type wins over the inference", async () => {
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "forced", name: "Forced", type: "local", url: "https://x.test/mcp" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].type).toBe("local");
+  });
+
   it("propagates a remote server's headers from bundles.json", async () => {
     // Same fixed-whitelist trap as connectTimeoutMs above: a field missing
     // from validateEntry's return is dropped at load, and bundles.json is the

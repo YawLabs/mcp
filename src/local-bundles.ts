@@ -130,7 +130,22 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // Default type to "local" -- bundles.json is the local-mode file by
   // definition. Existing configs use "local" for stdio/spawned
   // servers and "remote" for HTTP/SSE; users can override via the field.
-  const type: "local" | "remote" = e.type === "remote" ? "remote" : "local";
+  //
+  // INFERRED, not merely defaulted, when the entry carries a `url` and no
+  // `command`: that shape can only be remote. A flat default to "local" made
+  // the config's two readers disagree about the same entry -- isRemoteEntry
+  // (types.ts) calls it remote via its url fallback, so `doctor` reported its
+  // headers as a vault credential, while upstream.ts refused it with
+  // "command is required for local servers" and never sent them. The entry
+  // failed either way; the cost was that the diagnostic named the vault when
+  // the real fault was the missing field. Inferring here fixes it at the
+  // source: one answer, decided once, before any reader sees the entry.
+  //
+  // A url+command entry is NOT inferred -- that is genuinely ambiguous, and an
+  // explicit `"type"` is the only honest way to resolve it, so it keeps the
+  // "local" default and the connector's own error stands.
+  const inferredRemote = e.type === undefined && typeof e.url === "string" && typeof e.command !== "string";
+  const type: "local" | "remote" = e.type === "remote" || inferredRemote ? "remote" : "local";
   const transport =
     e.transport === "streamable-http" || e.transport === "sse" || e.transport === "stdio"
       ? (e.transport as "stdio" | "streamable-http" | "sse")

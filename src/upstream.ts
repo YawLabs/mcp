@@ -18,6 +18,7 @@ import {
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { isCredentialEnvName } from "./credentials.js";
 import { defaultRuntime } from "./default-runtime.js";
 import {
   INTERNAL_SECRET_ENV_KEYS,
@@ -695,6 +696,31 @@ function secretMatchVariants(value: string): string[] {
   return variants;
 }
 
+/** The credential-shaped slice of the PARENT env -- the half of the child's
+ *  environment no caller hands in. See the SCOPE section of
+ *  redactSecretsInOutput below for why it belongs in the redaction map and why
+ *  the selector is credentials.ts's classifier rather than a name regex.
+ *
+ *  Read FRESH on every call rather than memoized at module load:
+ *  scrubInternalSecretsFromProcessEnv mutates process.env at runtime, and a
+ *  cached snapshot would keep matching a value that is no longer there (or
+ *  miss one set after boot). This runs only on a failure path, where an
+ *  Object.entries walk over the env is not measurable next to the spawn that
+ *  just died.
+ *
+ *  The >=8-char floor is applied here as well as in the caller's replace loop,
+ *  for the same reason secretMatchVariants applies it: a short value must not
+ *  re-enter matching as a longer encoding of itself. */
+function credentialShapedParentEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v !== "string" || v.length < SECRET_MATCH_MIN_LENGTH) continue;
+    if (!isCredentialEnvName(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 /**
  * Redact secret values out of captured stderr before embedding it in error
  * messages. A server that crashes during init often echoes the bad value
@@ -755,19 +781,36 @@ function secretMatchVariants(value: string): string[] {
  * away this function's most important property: it cannot mangle output that
  * does not contain the secret. That trade has not been made here.
  *
- * SCOPE -- documented rather than widened. Every call site hands this the
- * RESOLVED SERVER ENV only (the values yaw-mcp itself injected from bundles.json
- * and the vault). The child ALSO receives the whole inherited parent env
- * (`stripInternalSecretsFromEnv(process.env)`, spread under serverEnv at the
- * spawn), and nothing here scans that: a credential the user exported in their
- * shell or put in the CLIENT's env block (GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY,
- * NPM_TOKEN) that a crashing child echoes on stderr reaches the
- * ActivationError -- and so the LLM and the log -- unredacted. That is the
- * contract README promises (redaction of what yaw-mcp injects), not an
- * oversight in the loop below. The natural hardening, should it be wanted, is
- * to pass a merged map: resolvedServerEnv plus the parent entries whose KEY
- * matches /(TOKEN|SECRET|PASS|API_?KEY|CREDENTIAL)/i, keeping the >=8-char
- * guard so PATH / HOME are never mangled.
+ * SCOPE -- two sources, and the second is why this does not take the caller's
+ * word for it. Call sites hand in the RESOLVED SERVER ENV (the values yaw-mcp
+ * itself injected from bundles.json and the vault, or the resolved request
+ * headers on a remote). But the child ALSO receives the whole inherited parent
+ * env (`stripInternalSecretsFromEnv(process.env)`, spread under serverEnv at
+ * the spawn), so a credential the user exported in their own shell or put in
+ * the CLIENT's env block -- GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY, NPM_TOKEN --
+ * is equally available for a crashing child to echo on stderr, and that tail
+ * reaches the ActivationError, the log, and the model's context. So the
+ * credential-shaped part of process.env is merged in HERE rather than at the
+ * call sites: this is the choke point every caller already goes through, and a
+ * future call site cannot forget to pass it.
+ *
+ * WHICH parent entries, and why not the obvious regex. Selection is by KEY
+ * NAME through credentials.ts's isCredentialEnvName -- the same classifier
+ * that decides what the user may be asked to type into a secret prompt. A
+ * plain /(TOKEN|SECRET|PASS|API_?KEY|CREDENTIAL)/i is the tempting spelling
+ * and it is wrong in the expensive direction: it matches BYPASS_CACHE,
+ * COMPASS_HOME and MONKEY_CAGE, and this function REPLACES the values it is
+ * given, so a false positive on a low-entropy value mangles ordinary
+ * diagnostic output. The segment-and-suffix rules in credentials.ts were
+ * written against exactly those names. The >=8-char floor below is the second
+ * gate, which is what keeps PATH / HOME / a short version string intact even
+ * if a name slips through.
+ *
+ * STILL NOT COVERED: a credential parked in a key that does not READ as one
+ * (`MY_THING=ghp_...`). Catching that needs value-shape or entropy matching,
+ * which is the trade the section above refuses -- so it is a limit, not a
+ * TODO. Values are matched by exact substring either way; nothing here
+ * inspects the child's stderr for credential SHAPES.
  */
 function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
@@ -803,13 +846,24 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
     seen.add(variant);
     entries.push([k, variant]);
   };
-  for (const [k, v] of Object.entries(env)) {
-    if (typeof v !== "string") continue;
-    claim(k, v);
+  //
+  // TWO SOURCES, resolved env FIRST in both passes. When the same value sits
+  // under a server-env key and a parent-env key (the common shape: the user
+  // exports GITHUB_TOKEN and the bundle passes it straight through), the
+  // dedupe keeps whichever claimed it, and the SERVER key is the more
+  // specific of the two -- it names the bundles.json entry to edit.
+  const sources: Array<Record<string, string>> = [env, credentialShapedParentEnv()];
+  for (const source of sources) {
+    for (const [k, v] of Object.entries(source)) {
+      if (typeof v !== "string") continue;
+      claim(k, v);
+    }
   }
-  for (const [k, v] of Object.entries(env)) {
-    if (typeof v !== "string") continue;
-    for (const variant of secretMatchVariants(v)) claim(k, variant);
+  for (const source of sources) {
+    for (const [k, v] of Object.entries(source)) {
+      if (typeof v !== "string") continue;
+      for (const variant of secretMatchVariants(v)) claim(k, variant);
+    }
   }
   // Replace longest values first. When one secret value is a substring of
   // another (e.g. a token and that same token with a suffix), a short-first

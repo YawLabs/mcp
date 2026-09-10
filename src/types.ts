@@ -87,11 +87,12 @@ export interface UpstreamServerConfig {
  *  for the secrets report without taking on the bundles loader's whole
  *  dependency chain.
  *
- *  KNOWN DISAGREEMENT with the connector, worth closing separately: a
- *  command-less url entry that omits `type` is called remote here, while
- *  upstream.ts refuses it with "command is required for local servers" and
- *  never sends its headers. The entry fails either way, but the diagnostic
- *  currently names the vault rather than the missing `type`. */
+ *  The url fallback and validateEntry now agree rather than merely coexisting:
+ *  validateEntry INFERS `type: "remote"` for a command-less url entry, so by
+ *  the time any reader sees a loaded config the two answers are the same one.
+ *  The fallback still earns its place for callers holding an entry that never
+ *  went through validateEntry -- `add`'s in-flight entry before it is written,
+ *  and any hand-built object in a test. */
 export function isRemoteEntry(entry: { type?: string; command?: string; url?: string }): boolean {
   return entry.type === "remote" || (!entry.command && entry.url !== undefined);
 }

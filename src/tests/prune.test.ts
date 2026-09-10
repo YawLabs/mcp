@@ -417,6 +417,76 @@ describe("pruneContent", () => {
     expect(parsed.empty0).toBeUndefined();
     expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
   });
+
+  // -------------------------------------------------------------------
+  // Text-mode BLOCK classification. Every case here is built so the
+  // pre-fix rules would have cleared MIN_SAVINGS_RATIO and actually
+  // applied -- otherwise the savings gate returns the original and the
+  // assertion passes without pinning anything.
+  // -------------------------------------------------------------------
+
+  it("leaves a unified diff byte-faithful (a stripped ' ' context line stops the hunk applying)", () => {
+    // 40 context lines for empty source lines: each is a lone " " that the
+    // per-line strip turns into "", which is no longer a context line at
+    // all -- git refuses the hunk, and the @@ header's line count is wrong
+    // besides. Big enough that the strip would have saved ~5%.
+    const context = " \n".repeat(40);
+    const raw = `diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1,44 +1,44 @@\n${context}-old line here\n+new line here\n`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toBe(raw);
+    expect(r.bytesPruned).toBe(r.bytesRaw);
+  });
+
+  it("leaves a bare hunk header patch alone even without the `diff --git` line", () => {
+    const raw = `@@ -1,42 +1,42 @@\n${" \n".repeat(40)}-a\n+b\n`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    expect(r.content[0].text).toBe(raw);
+  });
+
+  it("does not collapse blank runs or strip inside a fenced code block", () => {
+    const fence = "```py\ndef a():\n    return 1   \n\n\n\n\ndef b():\n    return 2\n```";
+    // Single trailing space, not two: inside a fenced (therefore Markdown)
+    // document a two-space ending IS a hard break and would be kept, which
+    // would make this case prove nothing about the fence.
+    const prose = `${"prose line with trailing junk \n".repeat(20)}`;
+    const raw = `${prose}\n${fence}\nafter   \n`;
+    const r = pruneContent([{ type: "text", text: raw }]);
+    const out = r.content[0].text;
+    // Fence body verbatim: the blank run and the trailing spaces survive.
+    expect(out).toContain("    return 1   \n\n\n\n\ndef b():");
+    // Prose outside it still prunes, so this is not a whole-text bail.
+    expect(out).toContain("prose line with trailing junk\n");
+    expect(out).toContain("after\n");
+    expect(r.bytesPruned).toBeLessThan(r.bytesRaw);
+  });
+
+  it("treats an unclosed fence as fencing the rest of the document", () => {
+    const raw = `# Title\n\n${"pad line\n".repeat(30)}\`\`\`\nkept   \n\n\n\nkept too   \n`;
+    const out = pruneContent([{ type: "text", text: raw }]).content[0].text;
+    expect(out).toContain("kept   \n\n\n\nkept too   \n");
+  });
+
+  it("keeps Markdown hard line breaks when the text carries Markdown structure", () => {
+    // A heading is the structural signal. The hard-break lines keep their
+    // two trailing spaces; tabs and single trailing spaces still prune, and
+    // so does a two-space line followed by a BLANK one.
+    const raw = `# Notes\n\n${"filler with a tab\t\n".repeat(30)}first half  \nsecond half  \nplain\ntrailing one \nbefore blank  \n\ndone\n`;
+    const out = pruneContent([{ type: "text", text: raw }]).content[0].text;
+    expect(out).toContain("first half  \nsecond half  \nplain\n");
+    expect(out).toContain("trailing one\n");
+    expect(out).toContain("before blank\n\ndone");
+    expect(out).not.toContain("filler with a tab\t");
+  });
+
+  it("still strips a two-space ending in text with no Markdown signal", () => {
+    // The deliberate limit: "line one  " in a log is trailing junk, and the
+    // module's primary text rule stays on for it. Pinned so a future widening
+    // of the hard-break rule to ALL text is a visible decision.
+    const raw = `${"log line  \n".repeat(30)}tail  \nend\n`;
+    const out = pruneContent([{ type: "text", text: raw }]).content[0].text;
+    expect(out).toContain("log line\n");
+    expect(out).toContain("tail\nend");
+  });
 });
 
 // Same footgun as resolveArgs in exec-engine.ts: JSON.parse yields

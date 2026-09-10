@@ -46,7 +46,7 @@ npm test
 - TypeScript, strict mode
 - Formatting and linting are enforced by the project's linter — run `lint:fix` and let the tooling handle it
 - No unnecessary abstractions — keep code simple and direct
-- Add tests for new functionality
+- Add tests for new functionality, and verify each one actually gates the change: break the code deliberately and confirm a named test goes red. A test that passes both before and after your change is proving nothing, and that is not a rare failure — it is the normal outcome of writing the test after the fix
 
 ## For AI Coding Agents
 

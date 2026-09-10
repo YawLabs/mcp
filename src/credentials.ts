@@ -170,13 +170,36 @@ function isCredentialShaped(name: string): boolean {
   return CREDENTIAL_SUBSTRINGS.some((s) => name.includes(s));
 }
 
+/** Does this ENVIRONMENT VARIABLE NAME read as a credential? The shape test
+ *  plus the infrastructure deny-list, composed once so the two consumers
+ *  cannot drift: the elicitation path below, which decides what the user is
+ *  asked to type into a secret prompt, and upstream.ts's stderr redactor,
+ *  which decides which inherited parent-env values are masked out of an
+ *  ActivationError before it reaches the log and the model.
+ *
+ *  Uppercased first, because an env var is not guaranteed ALL_CAPS on Windows
+ *  (`Path`, `ProgramFiles`) while the sets above are. That is safe in the
+ *  direction that matters: the folded name is tested against the same
+ *  segment/suffix rules, which are exactly the ones written to refuse
+ *  BYPASS / COMPASS / MONKEY_CAGE / TOKENIZER_PATH -- a naive
+ *  /(TOKEN|SECRET|PASS|API_?KEY|CREDENTIAL)/i would match the first three.
+ *
+ *  Distinct from detectMissingCredentials's use: that one additionally
+ *  requires isAllCaps, because its input is a NAME SCRAPED OUT OF PROSE
+ *  where casing is the evidence that a name was meant at all. A key read
+ *  from process.env needs no such proof. */
+export function isCredentialEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return isCredentialShaped(upper) && !IGNORED.has(upper);
+}
+
 export function detectMissingCredentials(stderrOrMessage: string | undefined): string[] {
   if (!stderrOrMessage) return [];
   const found = new Set<string>();
   for (const re of MISSING_PATTERNS) {
     for (const match of stderrOrMessage.matchAll(re)) {
       const name = match[1];
-      if (name && isAllCaps(name) && isCredentialShaped(name) && !IGNORED.has(name)) found.add(name);
+      if (name && isAllCaps(name) && isCredentialEnvName(name)) found.add(name);
     }
   }
   return [...found];

@@ -55,6 +55,18 @@ The same shape rule fixed the write side: converting an entry to remote with `ad
 
 Closing stdin now shuts the broker down, so a client that exits without a signal no longer leaves the process and every server it spawned running. A tool call the client cancels is no longer booked as an upstream error, and progress notifications are forwarded across the upstream hop instead of being dropped at the proxy.
 
+**Fixed -- response pruning stops corrupting a diff, a code fence and a Markdown line break**
+
+The text-mode rules decided each line on its own, and both of them ask a question only the surrounding block can answer. The context line a unified diff uses for an empty source line is a lone space, so trimming trailing whitespace turned it into an empty line and left a hunk `git apply` refuses -- on the output of every filesystem and git MCP server, with pruning on by default. The same trim erased Markdown hard line breaks (two trailing spaces), and the blank-run collapse deleted lines from inside fenced code blocks, shifting every line number after them.
+
+Pruning now classifies before it edits. A patch comes back byte-faithful in full, the way JSON mode already bails on a document carrying a number that would not survive the round-trip. Fenced code blocks are left alone, and no blank run is collapsed across a fence boundary. A hard line break survives in text that carries Markdown structure. Trailing tabs and single trailing spaces still prune everywhere, and `YAW_MCP_PRUNE_RESPONSES=0` still turns the whole pass off.
+
+**Fixed -- a credential from your own shell is redacted out of a failed server's stderr, not just the ones yaw-mcp injected**
+
+A server that crashes on start often echoes the credential it rejected, and that stderr tail rides into the activation error, the log, and your client's context. Redaction covered the values yaw-mcp injected from `bundles.json` and the vault -- but the child also inherits your whole environment, so a `GITHUB_TOKEN` or `AWS_SECRET_ACCESS_KEY` you exported in your own shell was equally available for the child to echo and reached the model unmasked.
+
+Credential-named variables in the inherited environment are now redacted too, to the same `***NAME***` marker that names which credential to rotate. Selection reuses the classifier the missing-credential prompt already uses, which is why `BYPASS_CACHE`, `COMPASS_HOME` and `MONKEY_CAGE` are not mangled the way a `TOKEN|SECRET|PASS|KEY` regex would mangle them, and the 8-character floor still keeps short diagnostic values readable. What reaches your client on a failed start, and what is masked first, is now written down under Trust & security in the README.
+
 **Fixed -- smaller things**
 
 `activate` now says so when a `tools` filter names a tool that does not exist, instead of quietly advertising a smaller list and leaving the model to wonder why its tool "is not working". Observation meta-tools advance the idle clock, so a session that speaks only to the broker no longer holds every upstream child process for the life of the connection. `list` neuters control bytes in the compliance grade, which comes from a file a repo can ship. A bare `*` in `blockedTools` no longer denies every tool. `enable` and `disable` no longer die with the `set` parser's usage text. And the uv PATH probe treats a timeout as inconclusive rather than as absent.
