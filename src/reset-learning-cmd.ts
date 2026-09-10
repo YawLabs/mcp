@@ -116,12 +116,16 @@ export interface ResetLearningOptions {
   env?: NodeJS.ProcessEnv;
   /** Skip the confirmation. Required off a TTY.
    *
-   *  REQUIRES A DISPATCHER CHANGE TO BE REACHABLE FROM THE CLI. Every other
-   *  subcommand goes through index.ts's generic `run(...)`, which threads the
-   *  parsed options into the runner; `reset-learning` is hand-rolled and calls
-   *  `runResetLearning()` with NO arguments (index.ts, the reset-learning
-   *  branch), so a `--force` the parser accepts is dropped before it gets
-   *  here. Passing `parsed.options` there is the one-line fix. */
+   *  This shipped UNREACHABLE for one commit and the gap is worth keeping in
+   *  view: `reset-learning` is hand-rolled rather than riding index.ts's
+   *  generic `run(...)` tail, which is what threads parsed options into a
+   *  runner, and the branch called `runResetLearning()` with no arguments --
+   *  so a `--force` the parser accepted was dropped before it arrived, leaving
+   *  the confirmation with no bypass and the command unusable off a TTY. The
+   *  dispatcher passes `parsed.options` now, and a CLI-level test drives the
+   *  real dispatch rather than the runner directly, because a unit test that
+   *  calls `runResetLearning({force: true})` passes either way. Any future
+   *  hand-rolled branch here has the same hazard. */
   force?: boolean;
   /** Override for tests; defaults to process.stdout.write. */
   out?: (s: string) => void;
