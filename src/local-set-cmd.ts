@@ -435,7 +435,12 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
     // 2), while one that IS a stored display name resolves. Ordering it before
     // the read refused every imported server by its own name.
     if (idx < 0 && !SET_TARGET_RE.test(target)) {
-      printErr(`yaw-mcp set: "${target}" is not a valid server name.`);
+      // ${verb}, like the two sibling refusals in this runner. This one was
+      // missed when those were fixed, so `enable`/`disable` still named `set`
+      // here -- a command the user did not type, sending them to the wrong
+      // --help. Three copies of one message is why it drifted; they are only
+      // consistent because a test now asserts all three.
+      printErr(`yaw-mcp ${verb}: "${target}" is not a valid server name.`);
       return { exitCode: 2, written: [] };
     }
     if (idx < 0) {

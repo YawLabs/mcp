@@ -169,7 +169,11 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exitCode = 2;
   } else {
-    dispatch("reset-learning", runResetLearning());
+    // parsed.options, not (): this branch is hand-rolled rather than riding the
+    // generic run(...) tail, and calling with no arguments dropped the --force
+    // the parser had just accepted -- leaving the confirmation gate with no
+    // working bypass, so the command could not be used off a TTY at all.
+    dispatch("reset-learning", runResetLearning(parsed.options));
   }
 } else if (subcommand === "sidecars") {
   run("sidecars", parseSidecarsArgs(process.argv.slice(3)), runSidecarsInstall);

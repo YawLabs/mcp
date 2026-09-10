@@ -131,3 +131,77 @@ export function log(level: LogLevel, msg: string, data?: Record<string, unknown>
     // failure of whatever the caller was actually doing.
   }
 }
+
+// --- writers for a CLI's own stdout / stderr ---------------------------------
+//
+// WHY THIS EXISTS. `yaw-mcp call` is built for scripts, hooks and pipelines,
+// so an early-exiting consumer -- `yaw-mcp call fake med {} | head -1` -- is
+// the NORMAL case, not an edge one. When `head` exits it closes the read end,
+// and the next write to stdout emits 'error' (EPIPE) on the stream. With no
+// listener Node treats that as an unhandled 'error' event and takes the
+// process down where it stands, which is mid-await inside the tool call: the
+// `finally` in transient-upstream.ts never runs, disconnectFromUpstream is
+// SKIPPED, and the spawned upstream is left orphaned. It also exits 1, the
+// code `call` documents for "the tool answered with an error", so a script
+// branching on $? reads a successful call as a failed one.
+//
+// WHY NOT JUST try/catch THE WRITE. On a pipe the failure arrives as an EVENT,
+// not as a throw -- the write returns normally and the error lands a tick
+// later (confirmed against a built binary on win32: the stack said "Emitted
+// 'error' event on Socket instance"). A catch around the write covers the
+// synchronous shape only, so both are handled here.
+//
+// WHY IT IS NOT guardStderrErrors ABOVE. That guard defers to a host's own
+// 'error' listener and deliberately keeps no latch, because its only job is
+// "do not die". This one additionally has to KNOW the stream broke so it can
+// stop writing, which means owning a listener rather than relying on someone
+// else's -- so it latches per stream, and only ever on a listener it attached
+// itself, which is the case the no-latch note up there was warning about.
+
+/** Streams whose consumer has gone. Keyed on the stream rather than held in
+ *  the writer's closure so two writers over ONE stream (a command that builds
+ *  one for stdout and one for stderr, then is handed the same fd twice by
+ *  `2>&1`) share a single verdict instead of each having to learn it. */
+const brokenStreams = new WeakSet<NodeJS.WritableStream>();
+
+/** Streams this module has already attached its 'error' listener to. Without
+ *  it a second writer over the same stream stacks a second listener, and ten
+ *  of those trip Node's MaxListenersExceededWarning on stdout. */
+const guardedStreams = new WeakSet<NodeJS.WritableStream>();
+
+/**
+ * A `write` for a CLI's own stdout or stderr that treats a dead consumer as
+ * "stop writing", not as "die". Returns a plain writer so a caller can keep
+ * using it exactly like `(s) => stream.write(s)`.
+ *
+ * ANY error on the stream marks it broken, not just EPIPE: once a stream has
+ * failed there is nowhere for the remaining output to go, and a second write
+ * only re-emits the same error. Nothing is reported when that happens --
+ * `| head -1` is an ordinary shell idiom, and a diagnostic about it would be
+ * noise on every correct use.
+ *
+ * The caller keeps its own exit code. A consumer leaving early says nothing
+ * about whether the tool answered, so the code the command computed stands.
+ */
+export function createStreamWriter(stream: NodeJS.WritableStream): (s: string) => void {
+  if (!guardedStreams.has(stream)) {
+    guardedStreams.add(stream);
+    try {
+      stream.on("error", () => {
+        brokenStreams.add(stream);
+      });
+    } catch {
+      // An embedding host may substitute a stdout/stderr stub with no
+      // EventEmitter surface. The try/catch on the write below still holds.
+    }
+  }
+  return (s: string): void => {
+    if (brokenStreams.has(stream)) return;
+    try {
+      stream.write(s);
+    } catch {
+      // The synchronous shape of the same failure.
+      brokenStreams.add(stream);
+    }
+  };
+}

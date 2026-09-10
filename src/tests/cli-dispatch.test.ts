@@ -13,7 +13,7 @@
 // dist is absent so a bare `npm test` on a fresh clone still works.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -196,6 +196,35 @@ describe("CLI dispatch -- argv errors go to stderr and exit 2", () => {
     expect(r.code).toBe(2);
     expect(r.stderr).toContain("unknown argument");
     expect(r.stdout).toBe("");
+  });
+
+  it("threads --force through the hand-rolled reset-learning branch", () => {
+    // Drives the REAL dispatcher on purpose. reset-learning does not ride the
+    // generic run(...) tail that threads parsed options into a runner -- its
+    // branch is hand-rolled, and it called runResetLearning() with no
+    // arguments, so a --force the parser had just accepted was dropped before
+    // it arrived. The confirmation gate then had no bypass and the command was
+    // unusable off a TTY, which is every script and CI job.
+    //
+    // A unit test on the runner cannot catch this: runResetLearning({force:
+    // true}) always honoured the flag. Only the dispatch is broken, so only a
+    // spawn proves it. runCli's stdin is not a TTY, so an unbypassed
+    // confirmation shows up as the off-TTY refusal.
+    //
+    // The state file MUST exist first. The confirmation is gated on it being
+    // there -- a missing one falls straight through to the exit-0 no-op, so on
+    // a bare HOME this passes whether or not --force survives the dispatcher.
+    // The first version of this test did exactly that and its mutation
+    // survived, which is the only reason the seeding is here.
+    const stateFile = join(workDir, ".yaw-mcp", "state.json");
+    mkdirSync(dirname(stateFile), { recursive: true });
+    writeFileSync(stateFile, JSON.stringify({ version: 2, learning: { gh: { dispatched: 3, succeeded: 2 } } }), "utf8");
+
+    const r = runCli(["reset-learning", "--force"]);
+    expect(r.stderr).not.toContain("Re-run with --force");
+    expect(r.code).toBe(0);
+    // The bypass has to have actually deleted it, not merely not-refused.
+    expect(existsSync(stateFile)).toBe(false);
   });
 
   it("suggests the closest subcommand for a typo", () => {
