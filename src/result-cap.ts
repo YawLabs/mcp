@@ -19,8 +19,15 @@
 //      than no cap: the model reads a cut-off log as a complete one and
 //      reasons confidently from a partial answer.
 //   2. It never edits a value it cannot cut honestly. `structuredContent` is
-//      passed through verbatim by the proxy and is NOT capped here -- see
-//      the note on capResult.
+//      passed through verbatim by the proxy and is NOT capped here, so a
+//      structured-output tool can still return an unbounded payload. That is
+//      the same carve-out pruneContent makes one step earlier in server.ts,
+//      and for the same reason: per MCP 2025-06-18 the structured value and
+//      the text block are two representations of ONE result, so editing only
+//      the side we can measure would leave them disagreeing -- a worse answer
+//      for a reader than the bytes either edit would have saved. Stated here
+//      rather than cross-referenced; an earlier version of this line pointed
+//      at "the note on capResult", which does not exist.
 
 /** One MCP content block. Structurally identical to prune.ts's `Content`,
  *  redeclared rather than imported so this module carries no dependency on

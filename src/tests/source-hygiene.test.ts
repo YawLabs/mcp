@@ -81,6 +81,21 @@ function firstControlByte(buf: Buffer): { offset: number; byte: number } | null 
 }
 
 describe("tracked source carries no raw control bytes", () => {
+  it("actually scanned the tree, rather than an empty list", () => {
+    // A coverage FLOOR, because "no offenders" and "no files" are the same
+    // green. `git ls-files` is CWD-relative, so a drift in REPO_ROOT would
+    // narrow the scan to a subdirectory -- or to nothing -- and the assertion
+    // below would still pass. That is the identical shape to the `git grep -I`
+    // bug in the sibling scanner: a check that reports clean on what it never
+    // read. The exact number is not the point and would be churn; the point is
+    // that it is the whole repo and not a corner of it.
+    const files = trackedFiles();
+    expect(files.length).toBeGreaterThan(100);
+    // And that it reached the two directories that matter here.
+    expect(files.some((f) => f.startsWith("src/"))).toBe(true);
+    expect(files.some((f) => f.startsWith("src/tests/"))).toBe(true);
+  });
+
   it("finds none anywhere in the tracked tree", () => {
     const offenders: string[] = [];
     for (const rel of trackedFiles()) {
