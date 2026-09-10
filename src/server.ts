@@ -1231,6 +1231,26 @@ export class ConnectServer {
    *  running config exactly as it was -- someone saving a broken JSON must not
    *  cost them the servers they already have loaded. */
   private async maybeReloadBundles(): Promise<void> {
+    // The way back. Live reload is the change in this release that alters what
+    // an existing install does with nothing in the user's own config having
+    // moved: a session that used to ignore bundles.json until restart now acts
+    // on it mid-run. That is the whole feature, and it is exactly the shape
+    // that needs an off switch -- someone editing bundles.json as a scratch
+    // file mid-session, or hitting a reconcile that behaves badly against
+    // their setup, needs a recovery that is not "downgrade the package".
+    //
+    // Checked FIRST, ahead of even the shuttingDown latch, so that setting it
+    // restores the pre-reload behaviour exactly rather than approximately:
+    // nothing is stat'd, nothing is re-read, no watch set is consulted, and
+    // the fingerprint is never adopted -- so unsetting it mid-session picks up
+    // whatever the file says at the next boundary, rather than treating edits
+    // made while it was off as already-seen.
+    //
+    // `0` and `false` are the two spellings YAW_MCP_AUTO_UPGRADE already
+    // accepts; anything else, including unset, leaves reload on.
+    const reloadOptOut = process.env.YAW_MCP_CONFIG_RELOAD;
+    if (reloadOptOut === "0" || reloadOptOut?.toLowerCase() === "false") return;
+
     // A reload during teardown would spawn nothing but could still notify a
     // closing transport, and shuttingDown is the latch every other
     // connection-touching path already reads.

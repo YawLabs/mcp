@@ -130,6 +130,12 @@ const ENV_KEYS = [
   // has to be saved and cleared like every other knob here, or the developer's
   // shell picks the exposure the assertions run at.
   "YAW_MCP_TOOL_EXPOSURE",
+  // The live-reload opt-out. Saved and cleared like the rest: a developer who
+  // has turned reload off in their own shell would otherwise silently disable
+  // the feature under every reload test in this file, and they would all still
+  // pass -- the assertions are mostly "the config moved", and a session that
+  // never reloads cannot move it.
+  "YAW_MCP_CONFIG_RELOAD",
 ] as const;
 
 let synthHome: string;
@@ -161,6 +167,7 @@ beforeEach(() => {
   delete process.env.YAW_MCP_SERVER_CAP;
   delete process.env.YAW_MCP_TRUST_PROJECT;
   delete process.env.YAW_MCP_TOOL_EXPOSURE;
+  delete process.env.YAW_MCP_CONFIG_RELOAD;
 
   cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(synthCwd);
 
@@ -957,6 +964,59 @@ describe("ConnectServer -- live bundles.json reload", () => {
     await priv.handleToolCall("mcp_connect_health", {});
 
     expect(applied).not.toHaveBeenCalled();
+  });
+
+  it("stays off entirely under YAW_MCP_CONFIG_RELOAD=0, and resumes when it is unset", async () => {
+    // The documented way back. This release changes what an existing install
+    // does with nothing in the user's own config having moved, so the opt-out
+    // has to restore the OLD behaviour exactly -- and the second half is the
+    // half worth pinning, because "exactly" is a claim the comment on the
+    // check makes and only a test can keep.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+
+    process.env.YAW_MCP_CONFIG_RELOAD = "0";
+    const applied = vi.spyOn(priv, "applyReloadedBundles");
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_discover", {});
+
+    // Not merely "the new server did not appear" -- nothing was read at all,
+    // which is the pre-reload behaviour rather than an approximation of it.
+    expect(applied).not.toHaveBeenCalled();
+    expect(namespacesOf(priv).sort()).toEqual(["gh"]);
+
+    // And the edit made while it was off is NOT treated as already-seen. The
+    // check sits ahead of the fingerprint stat precisely so that turning it
+    // back on picks up whatever the file says now; if the fingerprint had been
+    // adopted while off, `linear` would stay invisible for the rest of the
+    // session and the only recovery would be the restart this release removed.
+    delete process.env.YAW_MCP_CONFIG_RELOAD;
+    await priv.handleToolCall("mcp_connect_discover", {});
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
+  });
+
+  it("accepts `false` as well as `0`, the two spellings AUTO_UPGRADE takes", async () => {
+    writeBundles(synthHome, [serverEntry("gh")]);
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    for (const spelling of ["false", "FALSE", "False"]) {
+      process.env.YAW_MCP_CONFIG_RELOAD = spelling;
+      const applied = vi.spyOn(priv, "applyReloadedBundles");
+      rewriteBundles(synthHome, [serverEntry("gh"), serverEntry(`ns${spelling.toLowerCase()}`)]);
+      await priv.handleToolCall("mcp_connect_discover", {});
+      expect(applied, `${spelling} did not turn reload off`).not.toHaveBeenCalled();
+      applied.mockRestore();
+    }
+
+    // Anything else leaves it ON -- an opt-out that swallowed a typo would
+    // silently disable the feature for someone who meant to keep it.
+    process.env.YAW_MCP_CONFIG_RELOAD = "no";
+    rewriteBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    await priv.handleToolCall("mcp_connect_discover", {});
+    expect(namespacesOf(priv).sort()).toEqual(["gh", "linear"]);
   });
 
   it("does not reload on a PROXIED tool call", async () => {

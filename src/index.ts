@@ -385,6 +385,12 @@ if (subcommand === "compliance") {
                                self-upgrade check at server startup (default:
                                stale global installs are upgraded in the
                                background -- npm, pnpm, and bun globals alike).
+    YAW_MCP_CONFIG_RELOAD         Set to \`0\` to stop re-reading bundles.json
+                               while the session runs, restoring the pre-0.81
+                               behaviour where an edit takes effect only after
+                               an MCP client restart (default: the file is
+                               re-read at meta-tool boundaries, so \`yaw-mcp
+                               add\` and \`enable\` land without a restart).
     YAW_MCP_SIDECAR_REFRESH       Set to \`0\` to disable the background check
                                that keeps managed sidecars (\`yaw-mcp sidecars
                                install\`) current. When a managed tree exists,
