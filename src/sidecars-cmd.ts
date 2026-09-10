@@ -53,6 +53,7 @@ import { acquireUpgradeLock } from "./auto-upgrade.js";
 import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import {
   isRegistrySpec,
   nodeLaunchKind,
@@ -738,14 +739,18 @@ async function unhostedReasons(
 
 export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Promise<SidecarsInstallResult> {
   const home = opts.home ?? homedir();
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
   const lines: string[] = [];
   const print = (s = "") => {
     lines.push(s);
     if (!opts.json) write(`${s}\n`);
   };
 
-  const printErr = opts.err ?? ((s: string) => process.stderr.write(`${s}\n`));
+  // Same guard as `write` above, in this shape because this one appends the
+  // newline its callers omit: createStreamWriter returns a plain writer, so
+  // the newline goes on the way in rather than through a second wrapper.
+  const printErrStream = createStreamWriter(process.stderr);
+  const printErr = opts.err ?? ((s: string) => printErrStream(`${s}\n`));
 
   const bundles = await loadLocalBundles({ cwd: opts.cwd, home });
   // Surface the loader's diagnostics, the way bundles-cmd and local-add-cmd

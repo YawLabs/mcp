@@ -75,6 +75,7 @@ import {
   projectFileIsHonoured,
   untrustedProjectWarning,
 } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import {
   compareVersions,
   isOamCommand,
@@ -702,7 +703,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   if (opts.json) return runDoctorJson(opts);
 
   const lines: string[] = [];
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
   const print = (s = ""): void => {
     lines.push(s);
     write(`${s}\n`);
@@ -904,7 +905,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // captures only stdout still sees them. The text WARNINGS section above
   // is part of the human report (stdout); the stderr stream below is the
   // always-on signal.
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  const writeErr = opts.err ?? createStreamWriter(process.stderr);
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErr(`warning: ${w}\n`);
   }
@@ -939,7 +940,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
 // can consume the diagnostic without parsing the text layout.
 async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const lines: string[] = [];
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
 
   // Same collection prologue as the text path -- option defaults, config load,
   // project-trust fold, CLAUDE_CONFIG_DIR -- so `doctor --json` reports the
@@ -1170,7 +1171,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // Always-on warning stream: mirrors the text path so JSON-mode pipelines
   // that capture stdout (the JSON blob) still surface config warnings on
   // stderr even when the exit code is 0.
-  const writeErrJson = opts.err ?? ((s: string) => process.stderr.write(s));
+  const writeErrJson = opts.err ?? createStreamWriter(process.stderr);
   if (config.warnings.length > 0) {
     for (const w of config.warnings) writeErrJson(`warning: ${w}\n`);
   }

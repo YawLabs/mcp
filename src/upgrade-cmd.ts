@@ -75,6 +75,7 @@ import { spawn } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
+import { createStreamWriter } from "./logger.js";
 import { compareVersions, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 
 declare const __VERSION__: string;
@@ -872,8 +873,8 @@ export async function detectSea(): Promise<boolean> {
 }
 
 export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<UpgradeCommandResult> {
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
+  const writeErr = opts.err ?? createStreamWriter(process.stderr);
   const lines: string[] = [];
   const print = (s = ""): void => {
     lines.push(s);

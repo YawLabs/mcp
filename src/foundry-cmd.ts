@@ -30,6 +30,7 @@ import {
   traceDropReason,
 } from "./foundry-corpus.js";
 import { loadLocalBundles } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 import { loadState, statePath } from "./persistence.js";
 import type { RankableServer } from "./relevance.js";
@@ -147,8 +148,8 @@ export async function defaultLoadServers(cwd: string | undefined, home: string):
 }
 
 export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ exitCode: number; lines: string[] }> {
-  const write = opts.write ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.writeErr ?? ((s: string) => process.stderr.write(s));
+  const write = opts.write ?? createStreamWriter(process.stdout);
+  const writeErr = opts.writeErr ?? createStreamWriter(process.stderr);
   const lines: string[] = [];
   const print = (s = ""): void => {
     lines.push(s);

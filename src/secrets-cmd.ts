@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { createStreamWriter } from "./logger.js";
 import { type AuditEvent, readAuditLog } from "./secrets-audit.js";
 import {
   getSecret,
@@ -984,8 +985,8 @@ async function readStdinValue(
 export async function runSecrets(
   opts: SecretsCommandOptions,
   io: SecretsIo = {
-    out: (s) => process.stdout.write(s),
-    err: (s) => process.stderr.write(s),
+    out: createStreamWriter(process.stdout),
+    err: createStreamWriter(process.stderr),
   },
 ): Promise<SecretsCommandResult> {
   const home = opts.home ?? homedir();

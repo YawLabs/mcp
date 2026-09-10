@@ -79,6 +79,7 @@ import {
 } from "./install-targets.js";
 import { parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { deriveNamespace, type LaunchShape, previewUpsertUserBundle, upsertUserBundle } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 import { displayArg, displaySafe } from "./trust-cmd.js";
 import { TRIAL_ENTRY_PREFIX } from "./try-cmd.js";
@@ -556,8 +557,8 @@ interface ImportedEntry {
 }
 
 export async function runImport(opts: ImportCommandOptions): Promise<ImportCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const errOut = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const errOut = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => errOut(`${s}\n`);
 

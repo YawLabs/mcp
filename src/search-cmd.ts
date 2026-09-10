@@ -12,6 +12,7 @@
 
 import { type CatalogServer, defaultFetchCatalog, type FetchCatalog, normalizeCatalogUrl } from "./catalog.js";
 import { type CatalogMatch, matchCatalog, suggestCatalogSlugs } from "./catalog-search.js";
+import { createStreamWriter } from "./logger.js";
 
 export const SEARCH_USAGE = `Usage: yaw-mcp search [<text>...] [flags]
 
@@ -176,8 +177,8 @@ function renderJson(
 }
 
 export async function runSearch(opts: SearchCommandOptions): Promise<SearchCommandResult> {
-  const out = opts.out ?? ((s: string) => process.stdout.write(s));
-  const err = opts.err ?? ((s: string) => process.stderr.write(s));
+  const out = opts.out ?? createStreamWriter(process.stdout);
+  const err = opts.err ?? createStreamWriter(process.stderr);
   const print = (s = ""): void => out(`${s}\n`);
   const printErr = (s: string): void => err(`${s}\n`);
 

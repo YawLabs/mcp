@@ -17,6 +17,7 @@
 // shipping a subcommand a day.
 
 import { INSTALL_TARGETS } from "./install-targets.js";
+import { createStreamWriter } from "./logger.js";
 
 export type CompletionShell = "bash" | "zsh" | "fish" | "powershell";
 
@@ -302,7 +303,7 @@ export function parseCompletionArgs(
 }
 
 export async function runCompletion(opts: CompletionCommandOptions): Promise<CompletionCommandResult> {
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
   const lines: string[] = [];
 
   // No missing-shell guard: parseCompletionArgs (above) rejects an absent or

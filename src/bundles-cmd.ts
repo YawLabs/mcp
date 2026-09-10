@@ -45,6 +45,7 @@ import {
 } from "./bundles.js";
 import { isAllowed, loadYawMcpConfig } from "./config-loader.js";
 import { loadLocalBundles } from "./local-bundles.js";
+import { createStreamWriter } from "./logger.js";
 
 export type BundlesAction = "list" | "match";
 
@@ -123,8 +124,8 @@ export function parseBundlesArgs(
 }
 
 export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promise<BundlesCommandResult> {
-  const write = opts.out ?? ((s: string) => process.stdout.write(s));
-  const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
+  const write = opts.out ?? createStreamWriter(process.stdout);
+  const writeErr = opts.err ?? createStreamWriter(process.stderr);
   // Three transcripts, not one: `lines` stays the interleaved emission-order
   // record every existing caller reads, while `stdout` / `stderr` keep the two
   // streams separable. A `--json` consumer of the returned result could not
