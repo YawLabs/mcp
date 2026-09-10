@@ -8,26 +8,31 @@ import {
   scrubForWarning,
 } from "../health-score.js";
 
+// The result-byte counters every ConnectionHealth carries (types.ts). Spelled
+// once, and spread into the fixtures below, so the health literals in this file
+// stay about the thing each test is actually asserting.
+const ZERO_BYTES = { resultBytesUpstream: 0, resultBytesDownstream: 0 };
+
 describe("errorRateFactor", () => {
   it("returns 1.0 when health is undefined", () => {
     expect(errorRateFactor(undefined)).toBe(1.0);
   });
 
   it("returns 1.0 below the observation floor", () => {
-    expect(errorRateFactor({ totalCalls: 2, errorCount: 2, totalLatencyMs: 0 })).toBe(1.0);
+    expect(errorRateFactor({ totalCalls: 2, errorCount: 2, totalLatencyMs: 0, ...ZERO_BYTES })).toBe(1.0);
   });
 
   it("returns 1.0 for perfect reliability", () => {
-    expect(errorRateFactor({ totalCalls: 10, errorCount: 0, totalLatencyMs: 0 })).toBe(1.0);
+    expect(errorRateFactor({ totalCalls: 10, errorCount: 0, totalLatencyMs: 0, ...ZERO_BYTES })).toBe(1.0);
   });
 
   it("applies linear penalty for low error rates", () => {
-    expect(errorRateFactor({ totalCalls: 10, errorCount: 1, totalLatencyMs: 0 })).toBeCloseTo(0.9);
+    expect(errorRateFactor({ totalCalls: 10, errorCount: 1, totalLatencyMs: 0, ...ZERO_BYTES })).toBeCloseTo(0.9);
   });
 
   it("floors at 0.5 for high error rates", () => {
-    expect(errorRateFactor({ totalCalls: 10, errorCount: 8, totalLatencyMs: 0 })).toBe(0.5);
-    expect(errorRateFactor({ totalCalls: 10, errorCount: 10, totalLatencyMs: 0 })).toBe(0.5);
+    expect(errorRateFactor({ totalCalls: 10, errorCount: 8, totalLatencyMs: 0, ...ZERO_BYTES })).toBe(0.5);
+    expect(errorRateFactor({ totalCalls: 10, errorCount: 10, totalLatencyMs: 0, ...ZERO_BYTES })).toBe(0.5);
   });
 });
 
@@ -59,43 +64,57 @@ describe("activationFailureFactor", () => {
 
 describe("healthFactor", () => {
   it("returns 1.0 when both signals are clean", () => {
-    expect(healthFactor({ totalCalls: 5, errorCount: 0, totalLatencyMs: 10 }, undefined)).toBe(1.0);
+    expect(healthFactor({ totalCalls: 5, errorCount: 0, totalLatencyMs: 10, ...ZERO_BYTES }, undefined)).toBe(1.0);
   });
 
   it("takes the strictest penalty", () => {
     const now = 1_000_000;
     // 50% error rate = 0.5 factor; recent activation failure also 0.5.
-    expect(healthFactor({ totalCalls: 10, errorCount: 5, totalLatencyMs: 10 }, { at: now, message: "x" }, now)).toBe(
-      0.5,
-    );
+    expect(
+      healthFactor(
+        { totalCalls: 10, errorCount: 5, totalLatencyMs: 10, ...ZERO_BYTES },
+        { at: now, message: "x" },
+        now,
+      ),
+    ).toBe(0.5);
   });
 
   it("picks the worse of two signals", () => {
     const now = 1_000_000;
     // Healthy history but recent activation failure should still penalize.
-    expect(healthFactor({ totalCalls: 10, errorCount: 0, totalLatencyMs: 10 }, { at: now, message: "x" }, now)).toBe(
-      0.5,
-    );
+    expect(
+      healthFactor(
+        { totalCalls: 10, errorCount: 0, totalLatencyMs: 10, ...ZERO_BYTES },
+        { at: now, message: "x" },
+        now,
+      ),
+    ).toBe(0.5);
   });
 });
 
 describe("formatHealthWarning", () => {
   it("returns null when both signals are clean", () => {
     expect(formatHealthWarning(undefined, undefined)).toBeNull();
-    expect(formatHealthWarning({ totalCalls: 0, errorCount: 0, totalLatencyMs: 0 }, undefined)).toBeNull();
-    expect(formatHealthWarning({ totalCalls: 10, errorCount: 0, totalLatencyMs: 5 }, undefined)).toBeNull();
+    expect(
+      formatHealthWarning({ totalCalls: 0, errorCount: 0, totalLatencyMs: 0, ...ZERO_BYTES }, undefined),
+    ).toBeNull();
+    expect(
+      formatHealthWarning({ totalCalls: 10, errorCount: 0, totalLatencyMs: 5, ...ZERO_BYTES }, undefined),
+    ).toBeNull();
   });
 
   it("hides low-sample error rates to avoid over-fitting to one flake", () => {
     // 2/2 is 100% fail -- but below the 3-call observation floor. Silent.
-    expect(formatHealthWarning({ totalCalls: 2, errorCount: 2, totalLatencyMs: 5 }, undefined)).toBeNull();
+    expect(
+      formatHealthWarning({ totalCalls: 2, errorCount: 2, totalLatencyMs: 5, ...ZERO_BYTES }, undefined),
+    ).toBeNull();
   });
 
   it("surfaces a sub-30% nonzero error rate so the ranking penalty isn't silent", () => {
     // 1 of 5 = 20% error, above the observation floor. errorRateFactor
     // down-ranks this (factor 0.8), so the health block must show it rather
     // than staying silent below the old 30% warn threshold.
-    const w = formatHealthWarning({ totalCalls: 5, errorCount: 1, totalLatencyMs: 5 }, undefined);
+    const w = formatHealthWarning({ totalCalls: 5, errorCount: 1, totalLatencyMs: 5, ...ZERO_BYTES }, undefined);
     expect(w).toBe("warn: 1 of 5 calls failed");
   });
 
@@ -106,33 +125,35 @@ describe("formatHealthWarning", () => {
     // line at a negligible penalty -- that would train the model to skip a
     // fine server. Reverting the WARN_RATE_FLOOR gate in formatHealthWarning
     // to rate>0 would surface this line and fail the assertion.
-    expect(formatHealthWarning({ totalCalls: 100, errorCount: 1, totalLatencyMs: 5 }, undefined)).toBeNull();
+    expect(
+      formatHealthWarning({ totalCalls: 100, errorCount: 1, totalLatencyMs: 5, ...ZERO_BYTES }, undefined),
+    ).toBeNull();
   });
 
   it("appends the last error message once the rate clears WARN_RATE_FLOOR", () => {
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 3, totalLatencyMs: 5, lastErrorMessage: "503 Service Unavailable" },
+      { totalCalls: 10, errorCount: 3, totalLatencyMs: 5, ...ZERO_BYTES, lastErrorMessage: "503 Service Unavailable" },
       undefined,
     );
     expect(w).toBe("warn: 3 of 10 calls failed: 503 Service Unavailable");
   });
 
   it("omits the tail message when there is no lastErrorMessage", () => {
-    const w = formatHealthWarning({ totalCalls: 10, errorCount: 4, totalLatencyMs: 5 }, undefined);
+    const w = formatHealthWarning({ totalCalls: 10, errorCount: 4, totalLatencyMs: 5, ...ZERO_BYTES }, undefined);
     expect(w).toBe("warn: 4 of 10 calls failed");
   });
 
   // The counters never decay, so totalCalls is the all-time total for the
   // process, not a rolling window. The line must not say "of the last M".
   it("does not claim a recency window the counters do not carry", () => {
-    const w = formatHealthWarning({ totalCalls: 10, errorCount: 4, totalLatencyMs: 5 }, undefined);
+    const w = formatHealthWarning({ totalCalls: 10, errorCount: 4, totalLatencyMs: 5, ...ZERO_BYTES }, undefined);
     expect(w).not.toContain("of last");
   });
 
   it("reports a recent activation failure in preference to error rate", () => {
     const now = 1_000_000;
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: "bad call" },
+      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, ...ZERO_BYTES, lastErrorMessage: "bad call" },
       { at: now - 90_000, message: "spawn ENOENT npx" },
       now,
     );
@@ -153,7 +174,7 @@ describe("formatHealthWarning", () => {
     // claimed "last activation failed 1m ago" on every discover() until the
     // clock caught up.
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 0, totalLatencyMs: 5 },
+      { totalCalls: 10, errorCount: 0, totalLatencyMs: 5, ...ZERO_BYTES },
       { at: now + 5 * 60_000, message: "spawn ENOENT npx" },
       now,
     );
@@ -163,7 +184,7 @@ describe("formatHealthWarning", () => {
   it("collapses whitespace and truncates very long error messages", () => {
     const long = "x".repeat(500);
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: long },
+      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, ...ZERO_BYTES, lastErrorMessage: long },
       undefined,
     );
     // 120-char cap (117 + "...") on the tail, not on the warning prefix.
@@ -183,6 +204,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
         totalCalls: 10,
         errorCount: 3,
         totalLatencyMs: 5,
+        ...ZERO_BYTES,
         lastErrorMessage: "GET https://api.example.com/v1/x?api_key=abc123secretvalue&page=2 failed",
       },
       undefined,
@@ -202,6 +224,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
         totalCalls: 10,
         errorCount: 5,
         totalLatencyMs: 5,
+        ...ZERO_BYTES,
         lastErrorMessage: "401 rejected Authorization: Bearer eyJhbGciOiJIUzI1NiJ9dEADbEEF",
       },
       undefined,
@@ -216,6 +239,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
         totalCalls: 10,
         errorCount: 5,
         totalLatencyMs: 5,
+        ...ZERO_BYTES,
         lastErrorMessage: "config error: ghp_AbCdEf0123456789zzzz is not valid",
       },
       undefined,
@@ -237,7 +261,13 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     // elsewhere where a bare category would not. Over-scrubbing would be as
     // bad a regression as leaking.
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: "502 bad gateway (upstream unreachable)" },
+      {
+        totalCalls: 10,
+        errorCount: 5,
+        totalLatencyMs: 5,
+        ...ZERO_BYTES,
+        lastErrorMessage: "502 bad gateway (upstream unreachable)",
+      },
       undefined,
     );
     expect(w).toBe("warn: 5 of 10 calls failed: 502 bad gateway (upstream unreachable)");
@@ -259,6 +289,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
         totalCalls: 10,
         errorCount: 5,
         totalLatencyMs: 5,
+        ...ZERO_BYTES,
         lastErrorMessage: "401 rejected NOTION_API_KEY=abc123def456",
       },
       undefined,
@@ -377,7 +408,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     const pretty = '{\n  "token":\n    "abc123secret"\n}';
     for (const msg of [split, pretty]) {
       const viaRate = formatHealthWarning(
-        { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: msg },
+        { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, ...ZERO_BYTES, lastErrorMessage: msg },
         undefined,
       );
       expect(viaRate).toContain("5 of 10 calls failed");
@@ -389,7 +420,10 @@ describe("formatHealthWarning -- credential scrubbing", () => {
       expect(viaActivation).toContain("<redacted>");
     }
     expect(
-      formatHealthWarning({ totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: split }, undefined),
+      formatHealthWarning(
+        { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, ...ZERO_BYTES, lastErrorMessage: split },
+        undefined,
+      ),
     ).toBe("warn: 5 of 10 calls failed: GITHUB_TOKEN: <redacted>");
     expect(formatHealthWarning(undefined, { at: now - 60_000, message: pretty }, now)).toBe(
       'warn: last activation failed 1m ago: { "token": "<redacted>" }',
@@ -414,7 +448,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
       expect(scrubForWarning(line)).toBe(line);
     }
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: "API key required" },
+      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, ...ZERO_BYTES, lastErrorMessage: "API key required" },
       undefined,
     );
     expect(w).toBe("warn: 5 of 10 calls failed: API key required");
@@ -548,6 +582,7 @@ describe("formatHealthWarning -- credential scrubbing", () => {
         totalCalls: 10,
         errorCount: 5,
         totalLatencyMs: 5,
+        ...ZERO_BYTES,
         lastErrorMessage: `api_key=${"S".repeat(200)} then 502 bad gateway`,
       },
       undefined,
@@ -562,7 +597,13 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     // fits under the cap raw exceeds it once redacted. The cut runs last, so
     // the emitted excerpt still honours the cap and ends in the ellipsis.
     const w = formatHealthWarning(
-      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: `${"y".repeat(110)} token=x` },
+      {
+        totalCalls: 10,
+        errorCount: 5,
+        totalLatencyMs: 5,
+        ...ZERO_BYTES,
+        lastErrorMessage: `${"y".repeat(110)} token=x`,
+      },
       undefined,
     );
     expect(w!.endsWith("...")).toBe(true);

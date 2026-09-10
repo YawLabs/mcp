@@ -16,6 +16,7 @@ import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { registerShutdownTriggers } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
+import { parseStatusArgs, runStatus } from "./status-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseTrustArgs, runTrust } from "./trust-cmd.js";
 import { parseTryArgs, parseTryCleanupArgs, runTry, runTryCleanup } from "./try-cmd.js";
@@ -190,6 +191,11 @@ if (subcommand === "compliance") {
   run(subcommand, parseToggleArgs(process.argv.slice(3), subcommand === "enable"), runEnableDisable);
 } else if (subcommand === "list") {
   run("list", parseListArgs(process.argv.slice(3)), runList);
+} else if (subcommand === "status") {
+  // The one poll-safe snapshot command. It reads and never writes, so unlike
+  // every neighbour here it is safe for a GUI to spawn on a timer -- see the
+  // contract at the top of status-cmd.ts.
+  run("status", parseStatusArgs(process.argv.slice(3)), runStatus);
 } else if (subcommand === "secrets") {
   run("secrets", parseSecretsArgs(process.argv.slice(3)), runSecrets);
 } else if (subcommand === "trust") {
@@ -249,6 +255,11 @@ if (subcommand === "compliance") {
     try-cleanup <slug>       Remove a wired trial early.
 
   Inspection:
+    status                   One read-only snapshot: servers loaded, which are
+                             active and graded, whether the secret vault is
+                             locked, and cross-session call counts. Writes
+                             nothing and makes no network call, so a GUI can
+                             poll it. \`--json\` is the machine-readable form.
     doctor                   Diagnose setup: config, token, clients, learning,
                              upgrade, flaky-namespace reliability rollup.
     servers [<filter>]       DEPRECATED -- account mode is gone; this always
@@ -455,8 +466,10 @@ if (subcommand === "compliance") {
     2. <project>/.yaw-mcp/config.json         project-shared (checked in)
     3. ~/.yaw-mcp/config.json                 user-global default
 
-  yaw-mcp reads config at startup. Restart the MCP client (or kill yaw-mcp;
-  the client will respawn it) after editing any config.
+  yaw-mcp reads these config.json files ONCE, at startup. Restart the MCP
+  client (or kill yaw-mcp; the client will respawn it) after editing one.
+  bundles.json is the exception and needs no restart: it is re-read at the
+  next mcp_connect_* call.
 
   The \`token\` and \`apiBase\` config keys, and the \`--token\` /
   \`--no-yaw-mcp-config\` install flags, are deprecated and ignored -- yaw-mcp

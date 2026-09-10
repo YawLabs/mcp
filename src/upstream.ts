@@ -45,6 +45,7 @@ import type {
   UpstreamServerConfig,
   UpstreamToolDef,
 } from "./types.js";
+import { sanitizeUpstreamInstructions } from "./upstream-instructions.js";
 import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 /**
@@ -922,13 +923,20 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
  * (#server-<id>); that dashboard is gone and the URL 404s, so naming the local
  * file and namespace is both accurate and more actionable -- the LLM can tell
  * the user exactly what to open.
+ *
+ * It does NOT order a restart. This suffix rides every activation and connect
+ * failure into the text the LLM reads and relays, so it is the most-read
+ * sentence yaw-mcp prints -- and "then restart this MCP client" stopped being
+ * true when bundles.json became a live re-read at meta-tool boundaries. The
+ * fixed entry is loaded by the next activate, which is both cheaper and the
+ * thing the reader was about to do anyway.
  */
 function withConfigPointer(message: string, config: UpstreamServerConfig): string {
   if (!config.namespace) return message;
   // ASCII arrow on purpose: this suffix rides every activation error into the
   // stderr log, and a `->` survives a Windows console codepage where the
   // Unicode arrow renders as mojibake and then gets pasted into bug reports.
-  return `${message} -> Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
+  return `${message} -> Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then activate it again -- the edit is picked up on the next mcp_connect_* call, with no client restart.`;
 }
 
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
@@ -1791,7 +1799,17 @@ async function connectToUpstreamOnce(
       tools,
       resources,
       prompts,
-      health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
+      health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0, resultBytesUpstream: 0, resultBytesDownstream: 0 },
+      // What the server said about itself at initialize. The SDK stashes the
+      // field during the handshake and getInstructions() reads it back, so it
+      // is available from here on and nothing extra goes over the wire.
+      //
+      // Sanitized before it is stored, not before it is shown: the value on
+      // the connection is the one every future reader will reach for, and the
+      // moment a RAW copy lives there, a reader that forgets the fence puts
+      // third-party text straight into a model's context. See
+      // upstream-instructions.ts.
+      instructions: sanitizeUpstreamInstructions(client.getInstructions()),
       status: "connected" as const,
     });
 

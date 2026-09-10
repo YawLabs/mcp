@@ -657,6 +657,20 @@ describe("runEnableDisable", () => {
     expect(read().servers[0].isActive).toBe(true);
   });
 
+  it("does not order a restart -- a running broker applies the toggle itself", async () => {
+    // `yaw-mcp disable gh` used to end on "Restart your MCP client (or
+    // yaw-mcp) to apply." A running broker now re-reads bundles.json at its
+    // next meta-tool boundary and unloads the server there, so the restart is
+    // work the user does not have to do -- and telling them to do it is the
+    // one instruction they are most likely to follow.
+    writeBundles(SAMPLE);
+    const cap = capture();
+    await runEnableDisable({ target: "gh", enabled: false, home: synthHome, ...cap });
+    expect(read().servers[0].isActive).toBe(false);
+    expect(cap.text()).not.toMatch(/Restart your MCP client/);
+    expect(cap.text()).toContain("no client restart");
+  });
+
   it("ignores any assignments the caller passes", async () => {
     // The verb IS the assignment; accepting a second one would make
     // `yaw-mcp enable gh runtime=oam` silently do two things.

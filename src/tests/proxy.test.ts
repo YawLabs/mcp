@@ -18,6 +18,11 @@ import {
 } from "../proxy.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 
+// The result-byte counters every ConnectionHealth carries (types.ts). Spelled
+// once, and spread into the fixtures below, so the health literals in this file
+// stay about the thing each test is actually asserting.
+const ZERO_BYTES = { resultBytesUpstream: 0, resultBytesDownstream: 0 };
+
 function makeInactiveServer(
   namespace: string,
   cachedTools: Array<{ name: string; description?: string }>,
@@ -56,7 +61,7 @@ function makeConnection(
       name,
       namespacedName: `${namespace}_${name}`,
     })),
-    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
+    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0, ...ZERO_BYTES },
     status: "connected",
   } as UpstreamConnection;
 }

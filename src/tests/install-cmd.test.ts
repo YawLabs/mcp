@@ -541,7 +541,7 @@ const BUNDLES_FORBIDDEN = (): never => {
 };
 
 describe("runInstall -- bundles.json summary", () => {
-  it("tells a user with no servers what to add, and says it before the restart line", async () => {
+  it("tells a user with no servers what to add, and says it before the Done line", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -557,9 +557,17 @@ describe("runInstall -- bundles.json summary", () => {
     expect(out).toContain("Servers: none configured yet");
     expect(out).toContain("`yaw-mcp add <slug>`");
     expect(out).toContain("/h/.yaw-mcp/bundles.json");
-    // The index comparison is the assertion that matters: the advice ends with
-    // "add before you restart", and Done is the restart instruction. Printed
-    // after Done it would tell the user to act before a step already taken.
+    // The advice no longer hangs off the restart. It used to end "yaw-mcp
+    // reads that file once at startup -- so add before you restart", which
+    // stopped being true when bundles.json became a live re-read: a running
+    // broker picks a newly-added server up at its next meta-tool boundary.
+    expect(out).not.toContain("once at startup");
+    expect(out).not.toContain("before you restart");
+    expect(out).toContain("no client restart");
+    // Still printed BEFORE the Done block, which owns the one restart this
+    // command legitimately asks for: restarting the CLIENT so it launches
+    // yaw-mcp at all. Advice after it reads as an afterthought to a finished
+    // step.
     expect(out.indexOf("Servers: none")).toBeLessThan(out.indexOf("Done:"));
   });
 

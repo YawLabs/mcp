@@ -812,7 +812,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
         `Note: this entry is "isActive": false, so it stays disabled and will NOT load. Run \`yaw-mcp enable ${finalNamespace}\` to turn it on.`,
       );
     } else {
-      print("Restart your MCP client (or yaw-mcp) to pick it up.");
+      print("A running yaw-mcp picks it up on its next mcp_connect_* call -- no client restart.");
     }
   }
 
@@ -1210,7 +1210,9 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     }
     return { exitCode: 0, written: [] };
   }
-  print(`Removed "${matched}" from ${res.path}. Restart your MCP client to apply.`);
+  print(
+    `Removed "${matched}" from ${res.path}. A running yaw-mcp unloads it on its next mcp_connect_* call -- no client restart.`,
+  );
 
   // Honest warning: a project-local bundles.json shadows the user-global file,
   // so the server may keep loading from there even after this removal.
