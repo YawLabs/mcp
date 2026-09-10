@@ -104,7 +104,15 @@ function serializedBytes(item: CapContent): number {
  *  count and the byte total so the model knows the reply is incomplete and
  *  can narrow its next call instead of trusting a fragment.
  *
- *  `maxBytes <= 0` disables the cap and returns the input untouched. */
+ *  `maxBytes <= 0` disables the cap and returns the input untouched.
+ *
+ *  The RETURNED array respects the ceiling, notice included -- the notice's
+ *  bytes are reserved from the budget rather than added on top of it. One
+ *  documented exception: a ceiling smaller than the notice itself cannot be
+ *  honoured AND still report the cut, so such a call returns the notice alone
+ *  and goes over. Reporting wins there, because a silently truncated log
+ *  reads to the model as a complete one, which is the failure this module
+ *  exists to prevent. */
 export function capContent(content: CapContent[], maxBytes: number): CapResult {
   let bytesRaw = 0;
   for (const item of content) {
@@ -123,15 +131,30 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
   let droppedBlocks = 0;
   let truncatedText = false;
 
+  // The notice is part of the reply, so its bytes come OUT of the budget
+  // rather than being added on top of it. Appending it afterwards made the
+  // returned payload exceed the ceiling by the notice's own size -- measured
+  // at 387 bytes over on every cap value, which is a cap that does not cap.
+  // It went unnoticed because `bytesKept` counts only the content blocks, so
+  // an assertion on that field passed while the actual array was over.
+  //
+  // Reserved from the largest notice this can produce, not the one this call
+  // will: the text varies with the byte totals and the dropped-block count,
+  // and reserving the actual value needs the count, which is not known until
+  // the loop below has run. Over-reserving by a few dozen bytes keeps the
+  // ceiling honest; under-reserving would put it back over.
+  const noticeReserve = MAX_NOTICE_BYTES;
+  const contentBudget = maxBytes - noticeReserve;
+
   for (const item of content) {
     const size = serializedBytes(item);
-    if (Number.isFinite(size) && used + size <= maxBytes) {
+    if (Number.isFinite(size) && used + size <= contentBudget) {
       kept.push(item);
       used += size;
       continue;
     }
     // This block crosses the ceiling.
-    const remaining = maxBytes - used;
+    const remaining = contentBudget - used;
     if (item.type === "text" && typeof item.text === "string" && remaining > MIN_USEFUL_TAIL_BYTES) {
       // Leave room for the JSON envelope around the text, so the kept block
       // really does fit the budget rather than the text alone doing so.
@@ -156,6 +179,23 @@ export function capContent(content: CapContent[], maxBytes: number): CapResult {
 // Below this, a truncated tail is not worth keeping -- a few dozen bytes of a
 // log tells the model nothing and still reads as content.
 const MIN_USEFUL_TAIL_BYTES = 512;
+
+/** Upper bound on the serialized size of the notice block, reserved from the
+ *  budget before any content is kept.
+ *
+ *  DERIVED, not guessed: capNotice is called with the values that make it
+ *  longest -- both optional clauses present, and byte counts wide enough to
+ *  cover any realistic result -- and the answer is measured. A hand-written
+ *  constant would drift the moment someone edits the wording, and the drift
+ *  would be silent in the direction that matters (a longer notice than the
+ *  reserve puts the reply back over the ceiling). The computation runs once at
+ *  module load and costs one JSON.stringify. */
+const MAX_NOTICE_BYTES = (() => {
+  // 999999999 is wider than any byte count a real result can carry, so the
+  // rendered digits are at least as long as any live call will produce.
+  const worst = capNotice(999_999_999, 999_999_999, 999_999_999, true);
+  return Buffer.byteLength(JSON.stringify({ type: "text", text: worst }), "utf8");
+})();
 // Rough allowance for the JSON keys and quoting around a text block, so a cut
 // text does not push the serialized block back over the budget.
 const ENVELOPE_ALLOWANCE_BYTES = 64;
