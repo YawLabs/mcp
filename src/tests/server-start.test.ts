@@ -442,6 +442,38 @@ describe("ConnectServer.start() — transport + config load", () => {
     expect(priv.toolRoutes.has("gh_gh_live")).toBe(true);
   });
 
+  it("carries a loader warning through to what discover shows the model", async () => {
+    // The WIRING test. The render side is unit-tested in server.test.ts by
+    // setting configWarnings directly, which cannot catch the loader ->
+    // field -> discover chain being cut: drop the retention assignment and
+    // that unit test still passes while every model sees a clean listing of
+    // a broken install. This drives the REAL loader over a real file, so it
+    // fails if any link goes.
+    //
+    // env as a bare string is the hand-edit shape: the loader throws away
+    // every variable, and the entry still loads and still renders [ready].
+    writeBundles(synthHome, [serverEntry("gh", { env: "TOKEN=abc" })]);
+
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    const text = priv.handleDiscover().content[0].text;
+    expect(text).toContain("ignoring 'env' on \"gh\"");
+    expect(text.indexOf("ignoring")).toBeLessThan(text.indexOf("Installed MCP servers"));
+  });
+
+  it("shows no warning banner when bundles.json is clean", async () => {
+    // Same path, the silence half: a normal config must not put a banner at
+    // the top of every discover call.
+    writeBundles(synthHome, [serverEntry("gh")]);
+
+    const { priv, prewarmed } = await startServer();
+    await prewarmed;
+
+    const text = priv.handleDiscover().content[0].text;
+    expect(text.startsWith("Installed MCP servers")).toBe(true);
+  });
+
   it("drops a duplicate namespace from bundles.json, keeping the first entry", async () => {
     writeBundles(synthHome, [
       serverEntry("dup", { name: "First" }),

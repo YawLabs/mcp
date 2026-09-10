@@ -32,7 +32,7 @@ import { appendFoundryTrace, isFoundryEnabled, redactIntent } from "./foundry.js
 import { closestNames } from "./fuzzy.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
-import { type ActivationFailure, formatHealthWarning, healthFactor } from "./health-score.js";
+import { type ActivationFailure, formatHealthWarning, healthFactor, scrubForWarning } from "./health-score.js";
 import {
   ADAPTIVE_MAX,
   ADAPTIVE_MIN,
@@ -475,6 +475,13 @@ export class ConnectServer {
   private clientBridge: DownstreamClientBridge;
   private connections = new Map<string, UpstreamConnection>();
   private config: ConnectConfig | null = null;
+  /** bundles.json warnings from the last load, kept so DISCOVER can show them.
+   *  They were logged to stderr and dropped, which is invisible to the only
+   *  reader that matters here: stderr is the server's log, not the tool result,
+   *  so an LLM asking what is installed saw a config-broken server rendered
+   *  exactly like a healthy one. The CLI already surfaces these (list prints
+   *  them, doctor exits 2 on them) -- this is the third surface. */
+  private configWarnings: string[] = [];
   private configVersion: string | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
   private resourceRoutes = new Map<string, ResourceRoute>();
@@ -1183,6 +1190,8 @@ export class ConnectServer {
       return { config: null, path: null, warnings: [] };
     });
     for (const w of result.warnings) log("warn", "bundles.json warning", { warning: w });
+    // Kept, not just logged -- see the field. handleDiscover renders these.
+    this.configWarnings = result.warnings;
     this.config = result.config ?? { servers: [], configVersion: "" };
     // Deduplicate by namespace -- keep first occurrence. The routing
     // state assumes one server per namespace, so a duplicate in
@@ -2521,7 +2530,17 @@ export class ConnectServer {
       sorted = activeServers;
     }
 
-    const lines: string[] = [context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n"];
+    const lines: string[] = [];
+    // FIRST, above the listing: a server whose config was partly thrown away is
+    // rendered below with the same [ready] marker as a healthy one, so without
+    // this the model reads a confident inventory of a broken install and
+    // activates something that cannot authenticate. Named on the tool result
+    // rather than left on stderr, which no model reads.
+    if (this.configWarnings.length > 0) {
+      for (const w of this.configWarnings) lines.push(`! ${w}`);
+      lines.push("Fix bundles.json (or run `yaw-mcp doctor` for the full report), then restart this server.\n");
+    }
+    lines.push(context ? "Servers ranked by relevance:\n" : "Installed MCP servers:\n");
     if (warmedNamespace) {
       lines.push(`Auto-loaded "${warmedNamespace}" — top match for your query.\n`);
     }
@@ -4806,7 +4825,17 @@ export class ConnectServer {
         lines.push(`    avg latency: ${avgLatency}ms`);
         lines.push(`    idle: ${idleCount}/${idleLimit} until auto-unload`);
         if (h.lastErrorMessage) {
-          lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
+          // SCRUBBED, like the discover-side warning. lastErrorMessage is the
+          // upstream tool-call error text stored verbatim above, so it can carry
+          // whatever credential the upstream chose to echo -- and this line is
+          // read by the LLM. formatHealthWarning already runs the same scrubber
+          // through truncateForWarning, so discover was safe while THIS renderer
+          // of the same field was not: one field, two readers, one of them
+          // unprotected. Not redactSecretsInOutput -- that one is private to
+          // upstream.ts and keyed to a resolved server env this call does not
+          // have; scrubForWarning is pattern-based and is exported for exactly
+          // this reuse.
+          lines.push(`    last error: ${scrubForWarning(h.lastErrorMessage)} at ${h.lastErrorAt}`);
         }
       }
     }

@@ -142,24 +142,74 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // semantics.
   const command = typeof e.command === "string" ? e.command : undefined;
   const args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === "string") : undefined;
-  // String values only -- and DROP blank ones. `yaw-mcp add` seeds every
-  // required key with "" to record the requirement while deliberately NOT
-  // persisting the ambient shell value ("" means "nothing stored; the server
-  // depends on that var being in the shell wherever yaw-mcp launches"). The
-  // spawn env is `{ ...parentEnv, ...serverEnv }` (upstream.ts), so a loaded
-  // "" would CLOBBER the inherited shell value and start the server with the
-  // var blanked -- the opposite of what `add` prints. Dropping blanks here
+  // String values only -- and DROP blank ones, in SILENCE. `yaw-mcp add` seeds
+  // every required key with "" to record the requirement while deliberately
+  // NOT persisting the ambient shell value ("" means "nothing stored; the
+  // server depends on that var being in the shell wherever yaw-mcp launches").
+  // The spawn env is `{ ...parentEnv, ...serverEnv }` (upstream.ts), so a
+  // loaded "" would CLOBBER the inherited shell value and start the server with
+  // the var blanked -- the opposite of what `add` prints. Dropping blanks here
   // keeps the on-disk seed intact (the raw file still documents the required
   // keys for the removal preview and `add --json`) while every loader
   // consumer (spawn, `audit`, `list`) sees only the values actually stored.
   // Trim-blank, not just === "", matching the add path's uniform treatment of
-  // whitespace-only values as missing.
-  const env =
-    e.env && typeof e.env === "object" && !Array.isArray(e.env)
-      ? (Object.fromEntries(
-          Object.entries(e.env as Record<string, unknown>).filter(([, v]) => typeof v === "string" && v.trim() !== ""),
-        ) as Record<string, string>)
-      : undefined;
+  // whitespace-only values as missing. That drop is the ONE that must stay
+  // quiet: `add` writes a seed for every required key of every server it
+  // writes, so warning about it would fire on an ordinary user's config on
+  // every single load.
+  //
+  // Every OTHER rejection WARNS, following the headers precedent below rather
+  // than the blanket silence this block used to apply: an env var
+  // authenticates for exactly the reason a header does, so dropping one
+  // without a word leaves the same auth failure firing with nothing saying the
+  // setting was thrown away. Two shapes reach it, and neither is ever
+  // deliberate:
+  //
+  //   * `env` present but NOT a map -- a bare string ("GITHUB_TOKEN=abc"), a
+  //     null, an array. A hand-edit produces all three, and the old expression
+  //     answered `undefined` for every one, so EVERY variable vanished while
+  //     `list` showed the server active, `doctor` printed "All good" and
+  //     discover reported it ready. The server then started with no
+  //     credentials and failed at runtime with an auth error pointing nowhere.
+  //   * a non-string VALUE inside a real map -- a number, a null, an object.
+  //     That is a stored credential being dropped, and `yaw-mcp set` REFUSES
+  //     this exact shape ("env.KEY on ... is a number ..., not a string --
+  //     remove it by hand") rather than treating it as absent, so a loader
+  //     that ignored it silently contradicted its own sibling command.
+  //
+  // A non-map env still LOADS THE ENTRY, with no env, rather than skipping it.
+  // Refusing to load is a much bigger behavioural change than warning: a
+  // remote entry can authenticate via `headers` instead, and a stdio one can
+  // rely on the ambient shell, so skipping would break servers that work
+  // today. It also keeps `set`'s stated premise true (local-set-cmd.ts: "The
+  // LOADER tolerates it (a non-object env is ignored, so the entry still
+  // loads), which is exactly why one survives long enough to reach this
+  // command") -- and `set` is where the user is sent to fix the field.
+  //
+  // A present-but-empty map still yields `{}` rather than undefined, exactly as
+  // the old expression did. `configVersion` is a hash of the loaded server
+  // list, so changing that shape would churn it for every such entry for no
+  // gain.
+  let env: Record<string, string> | undefined;
+  if (e.env !== undefined) {
+    if (typeof e.env !== "object" || e.env === null || Array.isArray(e.env)) {
+      warnings.push(
+        `bundles.json: ignoring 'env' on "${namespace}" (expected an object of string values) -- the server will start with none of its variables set`,
+      );
+    } else {
+      const kept: Record<string, string> = {};
+      for (const [key, value] of Object.entries(e.env as Record<string, unknown>)) {
+        if (typeof value !== "string") {
+          warnings.push(`bundles.json: ignoring env "${key}" on "${namespace}" (expected a string value)`);
+          continue;
+        }
+        // `add`'s requirement marker. Dropped without a word -- see above.
+        if (value.trim() === "") continue;
+        kept[key] = value;
+      }
+      env = kept;
+    }
+  }
   const url = typeof e.url === "string" ? e.url : undefined;
 
   // HTTP headers for a REMOTE server, the channel a remote upstream takes its
@@ -167,12 +217,17 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
   // above: absent here means dropped at load, and a `headers` block would have
   // been silently discarded.
   //
-  // Every rejection WARNS, following the connectTimeoutMs precedent below
-  // rather than env's silent filtering: a header exists to fix an
-  // authentication failure the user is already staring at, so dropping one
-  // without a word leaves the same 401 firing with nothing anywhere saying the
-  // setting was thrown away. Only a PRESENT `headers` key can warn -- absent is
-  // the normal case for nearly every entry, and for every local one.
+  // Every rejection WARNS, following the connectTimeoutMs precedent below --
+  // and now matched by env's shape rejections above, which took their
+  // reasoning from this block: a header exists to fix an authentication
+  // failure the user is already staring at, so dropping one without a word
+  // leaves the same 401 firing with nothing anywhere saying the setting was
+  // thrown away. (This sentence used to contrast with "env's silent
+  // filtering". That stopped being true when a non-map env and a non-string
+  // env VALUE started warning; only the blank-value drop is still silent, for
+  // the reason the next paragraph gives.) Only a PRESENT `headers` key can
+  // warn -- absent is the normal case for nearly every entry, and for every
+  // local one.
   //
   // Blank values are dropped for a DIFFERENT reason than `env`'s. There the
   // empty string is a deliberate "required, but not stored here" seed that

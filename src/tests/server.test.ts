@@ -460,6 +460,39 @@ describe("ConnectServer", () => {
         expect(text).not.toContain("Redis");
       });
 
+      it("names a bundles.json warning above the listing", () => {
+        // A server whose config was partly thrown away renders with the same
+        // [ready] marker as a healthy one, so the model reads a confident
+        // inventory of a broken install and activates something that cannot
+        // authenticate. The warning existed but went only to stderr -- the
+        // server log, not the tool result -- so the one reader that acts on
+        // this text never saw it. list and doctor already surface it.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.configWarnings = [`bundles.json: ignoring 'env' on "gh" (expected an object of string values)`];
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text).toContain("ignoring 'env' on \"gh\"");
+        // Above the listing, not buried under it.
+        expect(text.indexOf("ignoring")).toBeLessThan(text.indexOf("Installed MCP servers"));
+        // Still lists the server -- it does load; the point is that the model
+        // is told the config is broken, not that the entry vanishes.
+        expect(text).toContain("gh");
+      });
+
+      it("stays quiet when the config loaded cleanly", () => {
+        // The silence pin. Every normal config has zero warnings, so a header
+        // that rendered unconditionally would put noise at the top of every
+        // discover call the model ever makes.
+        const priv = getPrivate(server);
+        priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+        priv.configWarnings = [];
+
+        const text = priv.handleDiscover().content[0].text;
+        expect(text.startsWith("Installed MCP servers")).toBe(true);
+        expect(text).not.toContain("Fix bundles.json");
+      });
+
       it("keeps the co-usage peer that the full listing shows", () => {
         // Focus exists to EXPAND one card, so that card must never be less
         // informative than the same one in the full listing. The co-usage map
@@ -2079,6 +2112,32 @@ describe("ConnectServer", () => {
 
       const result = priv.handleHealth();
       expect(result.content[0].text).toContain("last error: timeout at 2026-01-01T00:00:00Z");
+    });
+
+    it("scrubs a credential out of the stored upstream error", async () => {
+      // lastErrorMessage is the upstream tool-call error text stored VERBATIM
+      // (see the health booking in handleToolCall), so it carries whatever the
+      // upstream chose to echo -- and this line goes to the LLM. discover was
+      // already safe because formatHealthWarning scrubs; this renderer of the
+      // SAME field was not, so the field had two readers and one of them was
+      // unprotected. The benign "timeout" fixture above cannot catch that.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.health = {
+        totalCalls: 5,
+        errorCount: 1,
+        totalLatencyMs: 100,
+        lastErrorMessage: "401 rejected Authorization: Bearer eyJhbGciOiJIUzI1NiJ9dEADbEEF",
+        lastErrorAt: "2026-01-01T00:00:00Z",
+      };
+      priv.connections.set("gh", conn);
+
+      const text = priv.handleHealth().content[0].text;
+      expect(text).not.toContain("eyJhbGciOiJIUzI1NiJ9dEADbEEF");
+      // Scrubbed, not swallowed -- the reader still learns what went wrong.
+      expect(text).toContain("401 rejected");
+      expect(text).toContain("<redacted>");
     });
 
     describe("profile header block", () => {
