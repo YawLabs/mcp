@@ -45,6 +45,7 @@ import type {
   UpstreamServerConfig,
   UpstreamToolDef,
 } from "./types.js";
+import { sanitizeUpstreamInstructions } from "./upstream-instructions.js";
 import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 /**
@@ -1798,7 +1799,17 @@ async function connectToUpstreamOnce(
       tools,
       resources,
       prompts,
-      health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
+      health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0, resultBytesUpstream: 0, resultBytesDownstream: 0 },
+      // What the server said about itself at initialize. The SDK stashes the
+      // field during the handshake and getInstructions() reads it back, so it
+      // is available from here on and nothing extra goes over the wire.
+      //
+      // Sanitized before it is stored, not before it is shown: the value on
+      // the connection is the one every future reader will reach for, and the
+      // moment a RAW copy lives there, a reader that forgets the fence puts
+      // third-party text straight into a model's context. See
+      // upstream-instructions.ts.
+      instructions: sanitizeUpstreamInstructions(client.getInstructions()),
       status: "connected" as const,
     });
 

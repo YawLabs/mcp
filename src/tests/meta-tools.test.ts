@@ -79,6 +79,20 @@ describe("mcp_connect_exec description matches what handleExec does", () => {
     );
   });
 
+  it("tells the model which refusals cost a side effect and which do not", () => {
+    // Drift tripwire for the spawn-gate preflight in handleExec. The two
+    // refusals land in different SHAPES on purpose -- a policy refusal is
+    // decided before step 0 and returns plain `exec: ...` text meaning nothing
+    // ran, a cap refusal fails mid-pipeline and returns the envelope with
+    // `partial` -- and the difference is exactly what tells the model whether
+    // re-running is free or files a second issue. A description that still
+    // said a compliance refusal "fails the step" would be teaching it the
+    // wrong recovery.
+    const d = META_TOOLS.exec.description;
+    expect(d).toContain("decided before step 0 runs and refuses the whole pipeline with nothing done");
+    expect(d).toContain("a server-cap refusal is only knowable when the step is reached");
+  });
+
   it("declares the step item schema closed so a misspelled `arguments` key is not silently legal", () => {
     // Without this a step written as {tool, arguments:{...}} reads as a legal
     // extension and dispatches the tool with no arguments at all.

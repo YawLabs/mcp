@@ -197,6 +197,38 @@ export interface ConnectionHealth {
   totalCalls: number;
   errorCount: number;
   totalLatencyMs: number;
+  /**
+   * Result bytes this connection has returned, booked as a PAIR because
+   * neither number is the answer on its own.
+   *
+   * `resultBytesUpstream` is the body the upstream server sent;
+   * `resultBytesDownstream` is the same body after pruneContent and
+   * capContent have run, i.e. what handleToolCall handed back. The product
+   * claims to spend less of the model's context than talking to the servers
+   * directly, and the DELTA between these two is the only part of that claim
+   * this process can measure -- upstream alone says how chatty a server is,
+   * downstream alone says what a session cost, and neither says what was
+   * saved. They are booked at one site, together, for that reason.
+   *
+   * Required, not optional, for the same reason the three counters above are:
+   * every live connection is born with them at 0 (upstream.ts), so an
+   * `undefined` would mean nothing a reader could act on while forcing a
+   * `?? 0` on every consumer and making "returned no bytes" indistinguishable
+   * from "never measured".
+   *
+   * Both count SERIALIZED body bytes (content, plus structuredContent when
+   * the upstream sent one) -- the closest measurable proxy for context spend,
+   * not a token count, and nothing here claims otherwise.
+   *
+   * Two known limits, named rather than implied. An exec step books what the
+   * STEP returned, though exec's own envelope may forward less of it
+   * downstream, so for exec-heavy sessions `resultBytesDownstream` is an
+   * upper bound and the saving it implies is a lower bound. And a result
+   * whose body cannot be serialized books NOTHING on either side, so the
+   * pair can never record a trim that did not happen.
+   */
+  resultBytesUpstream: number;
+  resultBytesDownstream: number;
   lastErrorMessage?: string;
   lastErrorAt?: string;
 }
@@ -211,6 +243,20 @@ export interface UpstreamConnection {
   resources: UpstreamResourceDef[];
   prompts: UpstreamPromptDef[];
   health: ConnectionHealth;
+  /**
+   * The upstream's own `instructions` from its initialize response, already
+   * sanitized and length-bounded by sanitizeUpstreamInstructions -- NOT the
+   * raw field. Undefined when the server sent none, or sent nothing that
+   * survived sanitizing.
+   *
+   * Stored in its safe form on purpose: this is untrusted third-party text
+   * bound for an LLM context, and a raw copy sitting on the connection is a
+   * copy some future reader renders without going through the fence. The
+   * remaining step before it is shown is fenceUpstreamInstructions, which
+   * attributes and delimits it. See upstream-instructions.ts for the threat
+   * model both halves answer.
+   */
+  instructions?: string;
   status: ConnectionStatus;
   error?: string;
 }
