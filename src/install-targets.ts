@@ -326,21 +326,44 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
  *
  *  Claude Code writes those keys with FORWARD slashes on every OS — a Windows
  *  checkout appears as "C:/Users/me/repo", never "C:\\Users\\me\\repo" (every
- *  project key in a real Windows ~/.claude.json uses `/`). `resolve(cwd)` on
- *  win32 hands us the backslash spelling, and writing it verbatim creates a
- *  NEW sibling key Claude Code never reads: install prints Done, doctor and
+ *  project key in a real Windows ~/.claude.json uses `/`). The lookup is an
+ *  exact, case-sensitive match on that string, so any other spelling is a NEW
+ *  sibling key Claude Code never reads: install prints Done, doctor and
  *  --list confirm "installed" (they compute the same wrong key), and /mcp
- *  shows nothing. Normalize the KEY only — the config-file path itself stays
- *  platform-native.
+ *  shows nothing. Two spellings reach us that way, and both are fixed in the
+ *  KEY only — the config-file path itself stays platform-native:
+ *
+ *  - Backslashes. `resolve(cwd)` on win32 hands us "C:\\...", so every `\`
+ *    becomes `/`.
+ *  - A lower-case drive letter. Claude Code looks the entry up under the
+ *    directory it runs in, spelled the way the shell reported it, and Git
+ *    Bash and PowerShell both report an UPPER-case drive letter even after
+ *    `cd c:/repo` -- so Claude Code started there reads "C:/repo". `resolve()`
+ *    keeps the drive letter's case as given, so `--project-dir c:/repo` (or a
+ *    drive-relative "c:repo") used to write "c:/repo", a key those sessions
+ *    never read. The leading drive letter is upper-cased; nothing else is --
+ *    the shells keep the rest of the path as typed (Git Bash reports
+ *    `cd c:/users` as "C:\\users"), so folding more would break a match.
+ *
+ *  Residual caveat: cmd.exe keeps the drive letter as typed, so a Claude Code
+ *  started after `cd /d c:\\repo` in cmd looks under "c:/repo" and does not
+ *  see the "C:/repo" entry written here. Starting it from Git Bash or
+ *  PowerShell, or after `cd /d C:\\repo`, reads the entry. (Measured against
+ *  Claude Code 2.1.268 with both keys present: each session read only the
+ *  key matching its own drive-letter case.)
  *
  *  Scoped to Windows-shaped paths (drive letter or UNC) so a POSIX directory
- *  whose name legitimately contains a backslash is not mangled.
+ *  whose name legitimately contains a backslash is not mangled. A UNC path has
+ *  no drive letter, so only its separators change.
  *
  *  Exported for tests: the Windows-shape branch is unreachable through
  *  resolveInstallPath on a POSIX runner (isAbsolute("C:\\...") is false
  *  there, so resolve() rewrites the fixture first). */
 export function claudeCodeProjectKey(projectDir: string): string {
-  return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(projectDir) ? projectDir.replace(/\\/g, "/") : projectDir;
+  if (/^[A-Za-z]:[\\/]/.test(projectDir)) {
+    return projectDir[0].toUpperCase() + projectDir.slice(1).replace(/\\/g, "/");
+  }
+  return projectDir.startsWith("\\\\") ? projectDir.replace(/\\/g, "/") : projectDir;
 }
 
 function pathFor(

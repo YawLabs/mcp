@@ -156,11 +156,15 @@ describe("resolveInstallPath — Claude Code", () => {
     });
     const key = r.containerPath[1];
     expect(isAbsolute(key)).toBe(true);
-    // resolve() spells the key with the HOST separator, but Claude Code
-    // writes projects[] keys with forward slashes on every OS — so on a
-    // Windows runner the key is the normalized spelling (no-op on POSIX,
-    // where resolve() already emits `/`).
-    const expected = resolve(rel).replace(/\\/g, "/");
+    // resolve() spells the key with the HOST separator and keeps the drive
+    // letter's case, but Claude Code's projects[] keys use forward slashes on
+    // every OS and an upper-case drive letter — so on a Windows runner the
+    // key is the normalized spelling, even when the runner's cwd came from a
+    // cmd.exe `cd /d c:\...` (no-op on POSIX, where resolve() already emits
+    // `/` and there is no drive letter).
+    const expected = resolve(rel)
+      .replace(/\\/g, "/")
+      .replace(/^[a-z]:/, (d) => d.toUpperCase());
     expect(key).toBe(expected);
     expect(r.containerPath).toEqual(["projects", expected, "mcpServers"]);
   });
@@ -1089,6 +1093,71 @@ describe("claudeCodeProjectKey (projects[] key spelling)", () => {
     // containing a backslash must not be mangled.
     expect(claudeCodeProjectKey("/home/alice/weird\\name")).toBe("/home/alice/weird\\name");
   });
+
+  // The lookup is case-sensitive, and Claude Code looks under its cwd as the
+  // shell reported it: Git Bash and PowerShell report "C:" even after
+  // `cd c:/...`. resolve() keeps a typed lower-case drive letter, so without
+  // the fold `--project-dir c:/repo` wrote a "c:/repo" key those sessions
+  // never read -- while install, doctor and --list all agreed it was there.
+  it("upper-cases a lower-case drive letter (forward-slash input)", () => {
+    expect(claudeCodeProjectKey("c:/Users/me/repo")).toBe("C:/Users/me/repo");
+  });
+
+  it("upper-cases a lower-case drive letter (backslash input)", () => {
+    expect(claudeCodeProjectKey("c:\\Users\\me\\repo")).toBe("C:/Users/me/repo");
+  });
+
+  it("upper-cases the drive root itself", () => {
+    expect(claudeCodeProjectKey("d:\\")).toBe("D:/");
+  });
+
+  it("folds ONLY the drive letter -- the rest of the path keeps its case", () => {
+    // The shells keep the rest as typed (Git Bash: `cd c:/users` -> C:\users),
+    // so Claude Code's key does too; folding more would break the match.
+    expect(claudeCodeProjectKey("d:\\users\\Me\\REPO")).toBe("D:/users/Me/REPO");
+  });
+
+  it("upper-cases nothing in a UNC path, which has no drive letter", () => {
+    expect(claudeCodeProjectKey("\\\\c\\share\\repo")).toBe("//c/share/repo");
+    expect(claudeCodeProjectKey("\\\\server\\Share\\repo")).toBe("//server/Share/repo");
+  });
+
+  it("upper-cases nothing in a POSIX path, drive-ish or not", () => {
+    // /c/... is Git Bash's own spelling of C:\ -- still a POSIX string here.
+    expect(claudeCodeProjectKey("/c/users/me/repo")).toBe("/c/users/me/repo");
+    expect(claudeCodeProjectKey("/home/alice/c:/repo")).toBe("/home/alice/c:/repo");
+  });
+
+  // Through the resolver every caller funnels through. Windows-only: on a
+  // POSIX runner "c:..." is not absolute, so resolve() turns it into a POSIX
+  // path under the cwd before the key is built.
+  it.runIf(process.platform === "win32")(
+    "resolveInstallPath keys a lower-case drive under the upper-case one, relative or absolute",
+    () => {
+      // Drive-relative "c:<name>" is NOT absolute, so resolveInstallPath
+      // resolves it -- and resolve() keeps the typed lower-case drive.
+      const rel = "c:yaw-drive-case-rel";
+      const resolvedRel = resolve(rel);
+      // Precondition, so this cannot pass vacuously if resolve() ever starts
+      // folding the drive itself.
+      expect(resolvedRel.slice(0, 2)).toBe("c:");
+      const cases: Array<[string, string]> = [
+        [rel, `C:${resolvedRel.slice(2).split("\\").join("/")}`],
+        ["c:/Users/me/repo", "C:/Users/me/repo"],
+        ["c:\\Users\\me\\repo", "C:/Users/me/repo"],
+      ];
+      for (const [projectDir, key] of cases) {
+        const r = resolveInstallPath({
+          clientId: "claude-code",
+          scope: "local",
+          os: "windows",
+          home: "C:\\Users\\me",
+          projectDir,
+        });
+        expect(r.containerPath).toEqual(["projects", key, "mcpServers"]);
+      }
+    },
+  );
 });
 
 describe("isProjectLocalEntry", () => {

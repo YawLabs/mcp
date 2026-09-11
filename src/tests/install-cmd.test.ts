@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runDoctor } from "../doctor-cmd.js";
 import {
   type BundlesSummary,
   DRY_RUN_ENV_PLACEHOLDER,
@@ -71,10 +72,13 @@ afterEach(() => {
 });
 
 /** The projects[] key install writes for a project dir: Claude Code spells
- *  those keys with forward slashes on every OS, so a host-native fixture path
- *  (backslashes on a Windows runner) must be normalized before indexing into
- *  the written JSON. No-op on POSIX. */
-const projectsKey = (dir: string): string => dir.replace(/\\/g, "/");
+ *  those keys with forward slashes and an upper-case drive letter, so a
+ *  host-native fixture path (backslashes on a Windows runner) must be
+ *  normalized before indexing into the written JSON. Deliberately NOT
+ *  claudeCodeProjectKey: an independent spelling of the rule, so a regression
+ *  in that helper cannot also rewrite the expectation. No-op on POSIX fixture
+ *  paths, which are absolute and so never start with a drive letter. */
+const projectsKey = (dir: string): string => dir.replace(/\\/g, "/").replace(/^[a-z]:/, (d) => d.toUpperCase());
 
 /** One of `--all`'s per-client header lines (`-- cursor (user) --`).
  *
@@ -4869,4 +4873,92 @@ describe("a DIRECTORY at the client config path", () => {
     expect(cap.stderr()).toContain("is a directory, not a file");
     expect(cap.stderr()).not.toContain("EISDIR");
   });
+});
+
+describe("Claude Code local scope -- a lower-case --project-dir drive letter", () => {
+  // Claude Code looks projects[] up under its cwd as the shell reported it,
+  // and Git Bash / PowerShell report "C:" even after `cd c:/...`. A
+  // lower-case --project-dir used to write a "c:/..." key: install printed
+  // Done, and --list handed the SAME lower-case dir agreed (same wrong key),
+  // so only a probe from the directory as the shell spells it -- which is
+  // what Claude Code does -- came up empty. Windows-only: on a POSIX runner
+  // "c:..." is not a drive path at all.
+  it.runIf(process.platform === "win32")(
+    "install writes the upper-case key, and --list, doctor and uninstall all find it",
+    async () => {
+      // mkdtemp under tmpdir(): an upper-case drive, as the shell reports it.
+      expect(synthCwd).toMatch(/^[A-Z]:/);
+      const lowerDir = synthCwd[0].toLowerCase() + synthCwd.slice(1);
+      const key = projectsKey(synthCwd);
+      expect(key).toMatch(/^[A-Z]:\//);
+
+      const inst = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "local",
+        os: "windows",
+        home: synthHome,
+        cwd: synthCwd,
+        projectDir: lowerDir,
+        io: inst.io,
+        oamProbe: OAM_ABSENT,
+        bundlesSummary: BUNDLES_EMPTY,
+      });
+      expect(r.exitCode).toBe(0);
+      const written = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+      // Byte-exact, and the ONLY key: no lower-case sibling beside it.
+      expect(Object.keys(written.projects)).toEqual([key]);
+      expect(written.projects[key].mcpServers[ENTRY_NAME]).toBeDefined();
+
+      const localRow = (out: string): string =>
+        out.split("\n").find((l) => /^\s*Claude Code\s+local\s/.test(l)) ?? "(no Claude Code local row)";
+      // --list from the directory as the shell spells it (upper-case drive),
+      // i.e. where Claude Code itself runs...
+      const listHere = captureIo();
+      await runInstall({ listOnly: true, os: "windows", home: synthHome, cwd: synthCwd, io: listHere.io });
+      expect(localRow(listHere.stdout())).toMatch(/\binstalled\s*$/);
+      expect(localRow(listHere.stdout())).not.toMatch(/not installed/);
+      // ...and handed the same lower-case --project-dir install got.
+      const listLower = captureIo();
+      await runInstall({
+        listOnly: true,
+        os: "windows",
+        home: synthHome,
+        cwd: synthCwd,
+        projectDir: lowerDir,
+        io: listLower.io,
+      });
+      expect(localRow(listLower.stdout())).toMatch(/\binstalled\s*$/);
+      expect(localRow(listLower.stdout())).not.toMatch(/not installed/);
+
+      // doctor, from the directory as the shell spells it.
+      const doctorOut: string[] = [];
+      await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "windows",
+        out: (s) => doctorOut.push(s),
+        err: () => {},
+      });
+      expect(doctorOut.join("")).toContain(`Claude Code (local): OK -- has "${ENTRY_NAME}" entry`);
+
+      // uninstall handed the lower-case dir removes exactly what install wrote.
+      const un = captureIo();
+      const u = await runUninstall({
+        clientId: "claude-code",
+        scope: "local",
+        os: "windows",
+        home: synthHome,
+        cwd: synthCwd,
+        projectDir: lowerDir,
+        force: true,
+        io: un.io,
+      });
+      expect(u.exitCode).toBe(0);
+      const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+      expect(Object.keys(after.projects)).toEqual([key]);
+      expect(after.projects[key].mcpServers?.[ENTRY_NAME]).toBeUndefined();
+    },
+  );
 });
