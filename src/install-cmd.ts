@@ -2169,12 +2169,16 @@ function statusFor(p: ClientProbeResult): string {
   // config that has nothing to do with yaw-mcp.
   if (p.hasLegacyEntry) return `legacy: ${p.legacyEntryName ?? "unknown"}`;
   if (!p.exists) return "not installed";
-  // `other-entries` promises OTHER SERVERS in the file -- the --list help
-  // defines it that way -- and a file merely existing does not deliver that:
-  // `uninstall` of the only entry leaves an empty `{"mcpServers": {}}`, and a
-  // client config can exist for its other settings with no server object at
-  // all. Every such row used to read `other-entries`, claiming servers the
-  // file does not have.
+  // `other-entries` promises OTHER SERVERS in the list this row reads -- the
+  // slot's container object (`mcpServers`; `servers` for VS Code;
+  // `projects[<dir>].mcpServers` for Claude Code's local scope), not the
+  // whole file, and the --list help defines it that way -- and a file merely
+  // existing does not deliver that: `uninstall` of the only entry leaves an
+  // empty `{"mcpServers": {}}`, a client config can exist for its other
+  // settings with no server object at all, and Claude Code's user and local
+  // rows read the same .claude.json, so a server in one row's list is not in
+  // the other's. Every such row used to read `other-entries`, claiming
+  // servers its list does not have.
   return p.containerEntries > 0 ? "other-entries" : "no-entries";
 }
 

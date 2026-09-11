@@ -392,8 +392,11 @@ export interface ClientProbeResult {
   path: string;
   exists: boolean;
   hasMcpEntry: boolean;
-  /** How many keys the JSON object at the slot's container path (`mcpServers`
-   *  / `servers`) holds, yaw-mcp's own entry and any legacy one included. 0
+  /** How many keys the JSON object at the slot's container path holds
+   *  (`mcpServers`; `servers` for VS Code; `projects[<dir>].mcpServers` for
+   *  Claude Code's local scope), yaw-mcp's own entry and any legacy one
+   *  included. That object only, never the whole file: Claude Code's user and
+   *  local slots read the same .claude.json and each counts its own list. 0
    *  when there is nothing to count: no file, a file that could not be read or
    *  parsed, or one that parses with no such object or an empty one (what
    *  `uninstall` leaves behind once it removes the last entry). `install

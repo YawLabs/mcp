@@ -2677,9 +2677,10 @@ describe("runInstall --list (read-only)", () => {
   });
 
   // Byte-exact fixtures, each a file that EXISTS and parses but names no
-  // server. `other-entries` is defined by the help as "the file exists with
-  // other servers in it", which none of these do, so each one used to be
-  // reported as holding servers it does not have.
+  // server. `other-entries` is defined by the help as "the list holds other
+  // servers" -- the list the row reads, here the top-level mcpServers -- which
+  // none of these do, so each one used to be reported as holding servers it
+  // does not have.
   it.each([
     ["an empty mcpServers object", '{"mcpServers": {}}'],
     ["no mcpServers key at all", '{"numStartups": 3}'],
@@ -2727,6 +2728,40 @@ describe("runInstall --list (read-only)", () => {
     const r = await runInstall({ os: "linux", home: synthHome, cwd: synthCwd, listOnly: true, io: list.io });
     expect(r.exitCode).toBe(0);
     expect(listRow(list.stdout(), "Cursor", "user")).toEqual(["Cursor", "user", "~/.cursor/mcp.json", "no-entries"]);
+  });
+
+  // Claude Code's user and local rows read ONE file, ~/.claude.json, and each
+  // reads its own list in it: the top-level `mcpServers` for user, this
+  // project's `projects[<dir>].mcpServers` for local. The status is about the
+  // row's list, so a server in one list must not make the other row claim it
+  // -- and a server under ANOTHER project is in neither list.
+  it.each([
+    [
+      "a user-level server",
+      (_key: string) => ({ mcpServers: { spend: { url: "https://x" } } }),
+      "other-entries",
+      "no-entries",
+    ],
+    [
+      "a server in this project's local list",
+      (key: string) => ({ projects: { [key]: { mcpServers: { spend: { url: "https://x" } } } } }),
+      "no-entries",
+      "other-entries",
+    ],
+    [
+      "a server in another project's local list",
+      (_key: string) => ({ projects: { "/elsewhere": { mcpServers: { spend: { url: "https://x" } } } } }),
+      "no-entries",
+      "no-entries",
+    ],
+  ])("scopes the Claude Code user and local status to each row's own list in the shared ~/.claude.json: %s", async (_label, fixture, userStatus, localStatus) => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(fixture(projectsKey(synthCwd))), "utf8");
+    const cap = captureIo();
+    const r = await runInstall({ os: "linux", home: synthHome, cwd: synthCwd, listOnly: true, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(listRow(out, "Claude Code", "user")).toEqual(["Claude Code", "user", "~/.claude.json", userStatus]);
+    expect(listRow(out, "Claude Code", "local")).toEqual(["Claude Code", "local", "~/.claude.json", localStatus]);
   });
 
   it("reports `malformed` for unparseable client config", async () => {
