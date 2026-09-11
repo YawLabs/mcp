@@ -53,7 +53,6 @@ import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { Writable } from "node:stream";
 import { atomicWriteFile } from "./atomic-write.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
@@ -194,6 +193,13 @@ export interface InstallCommandOptions {
    *  describes the CLIENT FILE this plan just wrote and differs per client.
    *  Also suppresses the READ, so an --all run loads bundles.json once. */
   suppressBundlesNote?: boolean;
+  /** Internal, set by `--all`: on the off-TTY collision refusal, print only
+   *  this client's half -- the file and what differs -- and leave the half
+   *  every refusing client shares ("stdin is not a TTY" and the flags that
+   *  answer it) to the ONE hint runInstallAll prints after its loop. The diff
+   *  is never deferred: it differs per client, and it is what the user needs
+   *  to pick between --repair, --force and --skip. */
+  deferCollisionHint?: boolean;
 }
 
 /** The oam-absent Runtime line. Shared so `--all`'s single copy and the
@@ -362,6 +368,14 @@ export interface InstallResult {
   messages: string[];
   /** Process exit code. 0 = success, non-zero = refused/error. */
   exitCode: number;
+  /** True when the run stopped at the off-TTY collision refusal (exit 2): a
+   *  DIFFERING entry is in place, there was no TTY to ask on, and nothing
+   *  answered up front -- no --force/--repair/--skip, and no --dry-run (a
+   *  preview takes the overwrite branch, so it never refuses). `install --all`
+   *  counts a client as refused rather than failed from this field -- never by
+   *  matching the refusal's prose, which is how it once swallowed the diff
+   *  with it. */
+  collisionRefused?: boolean;
 }
 
 const USAGE =
@@ -384,11 +398,17 @@ const USAGE =
   // asks the user to make, and the three flags that answer it were named in
   // the synopsis and explained nowhere. Off a TTY there is no prompt to fall
   // back on: the run refuses (exit 2) naming these, so a reader who cannot
-  // find out what they mean is stuck.
+  // find out what they mean is stuck. The exit codes are spelled out because
+  // they are the contract a setup script branches on: 2 is "re-run with one of
+  // these flags", 1 is "something is actually wrong" -- and --all keeps that
+  // distinction instead of flattening every non-success to 1.
   "  When a different `" +
   ENTRY_NAME +
   "` entry is already in the config, install asks on a TTY\n" +
-  "  and refuses without one. Answer up front with:\n" +
+  "  and refuses without one, showing what differs (exit 2; a real failure, such\n" +
+  "  as a malformed config, exits 1). Under --all the run exits 2 when every\n" +
+  "  client that did not succeed was refused this way, and 1 if any one failed.\n" +
+  "  Answer up front with:\n" +
   "  --force     Overwrite whatever is there.\n" +
   "  --repair    Replace an entry that has DRIFTED from what install writes; a\n" +
   "              no-op when it already matches, so a fixup script can run it\n" +
@@ -962,14 +982,19 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       }
       decision = answer;
     } else {
-      // The `already has a "<entry>" entry and stdin is not a TTY` phrase is
-      // load-bearing beyond its reading: runInstallAll matches on it to
-      // consolidate N identical refusals into one hint. The diff is appended
-      // AFTER it so that match survives.
+      // Under --all only this client's half prints here -- the file and the
+      // diff, under the client's own header. The half every refusing client
+      // shares (no TTY, and the flags that answer it) is printed ONCE by
+      // runInstallAll, which learns of the refusal from `collisionRefused`
+      // below. It used to learn of it by matching this message's prose on
+      // stderr, and swallowed the whole message -- diff included -- with it.
+      const differs = `  It differs from the entry install would write:\n${diffBlock}`;
       err(
-        `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry and stdin is not a TTY.\n` +
-          `  It differs from the entry install would write:\n${diffBlock}\n` +
-          "  Re-run with --repair to bring it up to date, --force to overwrite, --skip to leave it, or --dry-run to preview.",
+        opts.deferCollisionHint
+          ? `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry -- left untouched.\n${differs}`
+          : `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry and stdin is not a TTY.\n` +
+              `${differs}\n` +
+              "  Re-run with --repair to bring it up to date, --force to overwrite, --skip to leave it, or --dry-run to preview.",
       );
       // Exit 2, not 1: this is a confirmation that could not be asked for off
       // a TTY, which is what `remove`, `set`, `uninstall` and `secrets remove`
@@ -977,7 +1002,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // "needs a flag" from "the write failed" without parsing the prose --
       // and 1 stays available for the failures that really are failures (an
       // unreadable config, a malformed one, a refused write).
-      return { written: [], wouldWrite: [], messages, exitCode: 2 };
+      return { written: [], wouldWrite: [], messages, exitCode: 2, collisionRefused: true };
     }
     if (decision === "abort") {
       err("Aborted.");
@@ -2209,9 +2234,20 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
  *  scope where supported). For clients without a user scope, falls back to
  *  the first non-project scope; clients that ONLY have project scopes
  *  (vscode) are included just when --project-dir is passed, otherwise
- *  skipped. Aggregates results; exit code 0 only if every attempted
- *  install succeeded. Mirrors the per-client run behavior: prompts/--force/
- *  --skip flags propagate. */
+ *  skipped. Mirrors the per-client run behavior: prompts and
+ *  --force/--repair/--skip propagate.
+ *
+ *  Exit code, aggregated from the per-client results:
+ *    0  every planned client succeeded -- written, already correct, or left
+ *       alone by --skip / a "skip" answer.
+ *    2  nothing failed, but at least one client was REFUSED: a differing entry
+ *       with no TTY to ask on and no --force/--repair/--skip or --dry-run to
+ *       answer it. The code the single-client refusal returns, for the same
+ *       reason: a script can tell "re-run with a flag" from "the write failed"
+ *       without parsing prose.
+ *    1  at least one client failed outright (an unreadable or malformed
+ *       config, a refused write, an abort or cancel at the prompt), refused
+ *       clients or not -- a flag alone will not make that run succeed. */
 async function runInstallAll(
   opts: InstallCommandOptions,
   log: (s: string) => void,
@@ -2269,34 +2305,15 @@ async function runInstallAll(
   const aggregateWouldWrite: string[] = [];
   let failed = 0;
   let succeeded = 0;
-  // Collision-without-flag refusals (non-TTY, no --force/--skip) all carry
-  // the same fix -- re-run --all with --force or --skip. Under --all they'd
-  // otherwise stack up as N identical per-client "already has entry and
-  // stdin is not a TTY" stderr lines. Capture each sub-install's stderr,
-  // suppress that specific refusal, and emit ONE consolidated hint below.
-  const collisionClients: string[] = [];
-  const realStderr = opts.io?.stderr ?? process.stderr;
-  const isCollisionRefusal = (s: string): boolean =>
-    s.includes(`already has a "${ENTRY_NAME}" entry and stdin is not a TTY`);
+  // Clients whose sub-install stopped at the off-TTY collision refusal. Kept
+  // apart from `failed` because nothing went wrong for them: the run needs an
+  // answer only a flag can give, which is what exit 2 says (see the contract
+  // above). Each prints its own file and diff under its header
+  // (deferCollisionHint); the part they all share -- no TTY, and the flags
+  // that answer it -- prints ONCE below instead of N identical times.
+  const refusedClients: string[] = [];
   for (const plan of plans) {
     log(`-- ${plan.clientId} (${plan.scope}) --`);
-    let sawCollision = false;
-    // Per-call stderr: replay every line to the real stderr EXCEPT the
-    // collision-without-flag refusal, which we consolidate.
-    const subStderr = new Writable({
-      write(chunk: Buffer | string, _enc, cb): void {
-        const text = chunk.toString();
-        if (isCollisionRefusal(text)) sawCollision = true;
-        else realStderr.write(text);
-        cb();
-      },
-    }) as unknown as NodeJS.WritableStream;
-    const baseIo = opts.io ?? {
-      stdin: process.stdin,
-      stdout: process.stdout,
-      stderr: process.stderr,
-      isTTY: Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY),
-    };
     const result = await runInstall({
       ...opts,
       listOnly: false,
@@ -2309,6 +2326,8 @@ async function runInstallAll(
       // Same consolidation, one line down: printed once after the loop.
       suppressOamAbsentNote: true,
       suppressBundlesNote: true,
+      // And the collision refusal's shared half, printed once after the loop.
+      deferCollisionHint: true,
       clientId: plan.clientId,
       scope: plan.scope,
       // Only the plans whose scope actually resolves a path from --project-dir
@@ -2317,19 +2336,16 @@ async function runInstallAll(
       // one the moment --project-dir was passed to pull the project-only
       // client (vscode) into the run.
       projectDir: plan.usesProjectDir ? opts.projectDir : undefined,
-      io: { ...baseIo, stderr: subStderr },
     });
-    if (sawCollision) collisionClients.push(plan.clientId);
     aggregateWritten.push(...result.written);
     aggregateWouldWrite.push(...result.wouldWrite);
     // Splice each sub-install's trail in right where it printed, between this
-    // client's header and the blank line that closes it -- MINUS the collision
-    // refusals the shim above swallowed. `messages` is documented as exactly
-    // what was printed, so splicing an unprinted refusal in (once per colliding
-    // client, on top of the consolidated line below) made the returned trail
-    // disagree with the transcript the user saw.
-    messages.push(...result.messages.filter((m) => !isCollisionRefusal(m)));
+    // client's header and the blank line that closes it. It goes in whole:
+    // `messages` is documented as exactly what was printed, and nothing a
+    // sub-install prints is filtered on the way out any more.
+    messages.push(...result.messages);
     if (result.exitCode === 0) succeeded += 1;
+    else if (result.collisionRefused) refusedClients.push(plan.clientId);
     else failed += 1;
     log("");
   }
@@ -2368,28 +2384,50 @@ async function runInstallAll(
     logInstallTail(log, err, { names: [], where: "", clientLabel: "" }, bundles);
   }
 
-  if (collisionClients.length > 0) {
+  const refused = refusedClients.length;
+  const them = refused === 1 ? "it" : "them";
+  if (refused > 0) {
+    // --repair first, as in the single-client refusal: it is the flag
+    // INSTALL_USAGE documents for an entry that has drifted from what install
+    // writes, and a differing entry is the only thing that refuses here.
     err(
-      `yaw-mcp install --all: ${collisionClients.length} client${collisionClients.length === 1 ? "" : "s"} already have a "${ENTRY_NAME}" entry (${collisionClients.join(", ")}) and stdin is not a TTY.\n  Re-run \`yaw-mcp install --all --force\` to overwrite them, or \`--skip\` to leave them untouched.`,
+      `yaw-mcp install --all: ${refused} client${refused === 1 ? " already has" : "s already have"} a differing "${ENTRY_NAME}" entry (${refusedClients.join(", ")}) and stdin is not a TTY.\n` +
+        `  Re-run \`yaw-mcp install --all --repair\` to bring ${them} up to date, \`--force\` to overwrite ${them}, \`--skip\` to leave ${them} untouched, or \`--dry-run\` to preview.`,
     );
   }
 
   const totalPlanned = plans.length;
-  if (failed === 0) {
-    log(`Done: ${succeeded}/${totalPlanned} clients installed successfully.`);
-    return {
-      written: aggregateWritten,
-      wouldWrite: aggregateWouldWrite,
-      messages,
-      exitCode: 0,
-    };
+  const plural = (n: number): string => (n === 1 ? "" : "s");
+  if (failed === 0 && refused === 0) {
+    // A dry run wrote nothing, so it must not close on "installed
+    // successfully" -- the last line of the transcript is the one a user reads
+    // as the verdict.
+    log(
+      opts.dryRun
+        ? `Dry run: ${succeeded}/${totalPlanned} client${plural(totalPlanned)} would be installed; nothing written.`
+        : `Done: ${succeeded}/${totalPlanned} client${plural(totalPlanned)} installed successfully.`,
+    );
+    return { written: aggregateWritten, wouldWrite: aggregateWouldWrite, messages, exitCode: 0 };
   }
-  err(`${failed}/${totalPlanned} client install${failed === 1 ? "" : "s"} failed. ${succeeded} succeeded.`);
+  // Failures and refusals are counted apart, in the prose as in the exit code.
+  // (A dry run takes the overwrite branch of the collision ladder, so it never
+  // refuses; the dry-run wording below still covers the pair generically.)
+  const noun = opts.dryRun ? "preview" : "install";
+  const whatFailed = `${failed}/${totalPlanned} client ${noun}${plural(failed)} failed`;
+  const whatRefused = `${refused === 1 ? "was" : "were"} refused (see the flags above)`;
+  const notDone =
+    failed === 0
+      ? `${refused}/${totalPlanned} client ${noun}${plural(refused)} ${whatRefused}.`
+      : refused === 0
+        ? `${whatFailed}.`
+        : `${whatFailed} and ${refused} ${whatRefused}.`;
+  const tail = opts.dryRun ? `${succeeded} would be installed; nothing written.` : `${succeeded} succeeded.`;
+  err(`${opts.dryRun ? "Dry run: " : ""}${notDone} ${tail}`);
   return {
     written: aggregateWritten,
     wouldWrite: aggregateWouldWrite,
     messages,
-    exitCode: 1,
+    exitCode: failed > 0 ? 1 : 2,
   };
 }
 
