@@ -63,7 +63,7 @@ Useful flags:
 
 - `--scope user|project|local` -- which file to write. Claude Code and Cursor support project and local; VS Code and Gemini CLI support user and project; Claude Desktop and Windsurf are user-only.
 - `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
-- `--force` / `--skip` -- overwrite or leave an existing `mcp` entry (otherwise prompts on a TTY, refuses off-TTY).
+- `--repair` / `--force` / `--skip` -- what to do about an existing `mcp` entry that differs from the one install writes (otherwise install prompts on a TTY and refuses off one). `--repair` brings it up to date and keeps the string values in its `env` block (where the [secret vault](#local-secret-vault) has you put `YAW_MCP_VAULT_PASSPHRASE`), and is a no-op on an entry that already matches. `--force` overwrites it outright, `env` included, naming each key it drops. `--skip` leaves it untouched.
 
 After it writes, install reports two things it did **not** change. First, how many servers `~/.yaw-mcp/bundles.json` gives yaw-mcp to serve -- and when that is none, the `yaw-mcp add <slug>` step still to take -- though no longer *before* a restart, since yaw-mcp re-reads that file while the session runs and picks up a server added afterwards on the next `mcp_connect_*` call. Second, how many other MCP servers were already configured in the client file it just edited; those keep launching directly from the client, and installing yaw-mcp does not move them behind the broker. The count is a number, never the server names. Under `--all` the bundles.json line prints once for the run, while the per-client count prints under each client.
 
