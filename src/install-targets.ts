@@ -342,15 +342,22 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
  *    keeps the drive letter's case as given, so `--project-dir c:/repo` (or a
  *    drive-relative "c:repo") used to write "c:/repo", a key those sessions
  *    never read. The leading drive letter is upper-cased; nothing else is --
- *    the shells keep the rest of the path as typed (Git Bash reports
- *    `cd c:/users` as "C:\\users"), so folding more would break a match.
+ *    Git Bash and PowerShell keep the rest of the path as typed (`cd c:/users`
+ *    in Git Bash and `cd c:\\users` in PowerShell both report "C:\\users"),
+ *    so folding more would break a match.
  *
- *  Residual caveat: cmd.exe keeps the drive letter as typed, so a Claude Code
- *  started after `cd /d c:\\repo` in cmd looks under "c:/repo" and does not
- *  see the "C:/repo" entry written here. Starting it from Git Bash or
- *  PowerShell, or after `cd /d C:\\repo`, reads the entry. (Measured against
- *  Claude Code 2.1.268 with both keys present: each session read only the
- *  key matching its own drive-letter case.)
+ *  Residual caveat: cmd.exe keeps the drive letter as typed -- after
+ *  `cd c:\\users`, with or without /d, it reports "c:\\Users" (the rest
+ *  corrected to on-disk case) -- so a Claude Code started from a cmd prompt
+ *  whose cwd has a lower-case drive looks under "c:/..." and does not see the
+ *  "C:/..." entry written here, while doctor run from that prompt still
+ *  reports it OK. That includes a bare `install --scope local` run from the
+ *  same prompt, which used to write the matching lower-case key and now
+ *  writes the upper-case one: the trade favours Git Bash and PowerShell,
+ *  whose sessions never read a lower-case key. Starting Claude Code from Git
+ *  Bash or PowerShell, or after `cd /d C:\\...`, reads the entry. (Measured
+ *  against Claude Code 2.1.268 with both keys present: each session read only
+ *  the key matching its own drive-letter case.)
  *
  *  Scoped to Windows-shaped paths (drive letter or UNC) so a POSIX directory
  *  whose name legitimately contains a backslash is not mangled. A UNC path has

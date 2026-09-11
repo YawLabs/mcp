@@ -1112,8 +1112,9 @@ describe("claudeCodeProjectKey (projects[] key spelling)", () => {
   });
 
   it("folds ONLY the drive letter -- the rest of the path keeps its case", () => {
-    // The shells keep the rest as typed (Git Bash: `cd c:/users` -> C:\users),
-    // so Claude Code's key does too; folding more would break the match.
+    // Git Bash and PowerShell keep the rest as typed (`cd c:/users` ->
+    // C:\users), so Claude Code's key does too; folding more would break the
+    // match.
     expect(claudeCodeProjectKey("d:\\users\\Me\\REPO")).toBe("D:/users/Me/REPO");
   });
 
