@@ -393,7 +393,7 @@ Common ones (run `yaw-mcp --help` for the full list):
 
 | Variable | Description |
 |----------|-------------|
-| `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. Counts servers that are loaded and advertising tools, not upstream processes: startup pre-warm briefly spawns servers it never advertises (see `YAW_MCP_PREWARM`), so the live child count can exceed this for a few milliseconds on a first session. |
+| `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. Counts servers that are loaded and advertising tools, not upstream processes: startup pre-warm briefly spawns servers it never advertises (see `YAW_MCP_PREWARM`), so on a first session the live child count can exceed this by up to the pre-warm batch size of three, each extra child closing as soon as its tool list is read. |
 | `YAW_MCP_MIN_COMPLIANCE` | Minimum grade (`A`-`F`) an installed server must report before `activate` loads it. |
 | `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution -- set it in yaw-mcp's own env, not the upstream server's. Clients supporting elicitation prompt for it instead. |
 | `YAW_MCP_TRUST_PROJECT` | `1` skips the consent check on a project-local `.yaw-mcp/bundles.json` and loads it unconditionally. CI/automation only -- it lets any repo you run yaw-mcp inside spawn commands as you. Default: the file must be approved with `yaw-mcp trust`. |
