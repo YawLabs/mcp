@@ -204,6 +204,16 @@ The exit code was wrong too, which is the half a script would have noticed: the 
 
 The guard itself shipped earlier in this release for `yaw-mcp call`, and the fix is that every other command now uses it: one no-op listener per stream, the stream latched broken so later writes are dropped rather than re-raising, and the caller's exit code left alone. Two regression guards, because this returns by way of a NEW command being added with its own raw writer rather than by the old ones changing back: a scan that fails on any subcommand writing straight to a process stream, and a spawn of the real binary against a reader that closes the pipe mid-write.
 
+**Fixed -- `activate` stops claiming a tool that answers from a different server**
+
+Two namespaces can flatten to one wire name: a server called `gh` with a tool named `actions_list`, and a server called `gh_actions` with a tool named `list`, both produce `gh_actions_list`. `tools/list` has always deduped that correctly and the router has always been consistent about who wins -- the first one loaded -- but `activate` enumerated the server's own inventory without asking who actually owned each name. So loading the second one reported `Loaded "gh_actions" -- 2 tools: gh_actions_list, gh_actions_run`, naming a tool that answers from `gh`. The model then called it and reached the wrong server, and the loser's own `list` had no reachable name at all. The collision was logged to stderr, which the model never sees.
+
+`activate` now counts and names only what the namespace actually serves, and when something is shadowed it says so: which wire name, which namespace holds it, which of this server's tools is unreachable, and the two ways out -- unload the holder, or rename one of the namespaces. Both message sites moved, the fresh load and the already-loaded one, so a re-activation cannot quietly go back to the old count. With no collision the text is byte-identical to before.
+
+The advice is tested rather than asserted: a test takes the remedy the message offers, unloads the holder, and checks that the name really does move to the other server and that the re-activation then reports the full set with no note. Routing is untouched -- first loaded still wins, in both `tools/list` and the router, exactly as before.
+
+Not covered by this change, and worth knowing: `discover`'s per-server tool counts and its session-wide "N tools in context" total come from the same unfiltered inventory, so they still over-count a shadowed tool the same way `activate` used to.
+
 **Fixed -- smaller things**
 
 `activate` now says so when a `tools` filter names a tool that does not exist, instead of quietly advertising a smaller list and leaving the model to wonder why its tool "is not working". Observation meta-tools advance the idle clock, so a session that speaks only to the broker no longer holds every upstream child process for the life of the connection. `list` neuters control bytes in the compliance grade, which comes from a file a repo can ship. A bare `*` in `blockedTools` no longer denies every tool. `enable` and `disable` no longer die with the `set` parser's usage text. And the uv PATH probe treats a timeout as inconclusive rather than as absent.
