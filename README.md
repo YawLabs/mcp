@@ -393,13 +393,14 @@ Common ones (run `yaw-mcp --help` for the full list):
 
 | Variable | Description |
 |----------|-------------|
-| `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. |
+| `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. Counts servers that are loaded and advertising tools, not upstream processes: startup pre-warm briefly spawns servers it never advertises (see `YAW_MCP_PREWARM`), so on a first session the live child count can exceed this by up to the pre-warm batch size of three, each extra child closing as soon as its tool list is read. |
 | `YAW_MCP_MIN_COMPLIANCE` | Minimum grade (`A`-`F`) an installed server must report before `activate` loads it. |
 | `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution -- set it in yaw-mcp's own env, not the upstream server's. Clients supporting elicitation prompt for it instead. |
 | `YAW_MCP_TRUST_PROJECT` | `1` skips the consent check on a project-local `.yaw-mcp/bundles.json` and loads it unconditionally. CI/automation only -- it lets any repo you run yaw-mcp inside spawn commands as you. Default: the file must be approved with `yaw-mcp trust`. |
 | `YAW_MCP_AUTO_ACTIVATE` | `0` disables discover auto-loading a clearly-winning server. Default on. |
 | `YAW_MCP_AUTO_UPGRADE` | `0` disables the background self-upgrade check at startup. Default on. |
 | `YAW_MCP_SIDECAR_REFRESH` | `0` disables the daily background check that keeps managed sidecars current. Only ever runs if you have run `yaw-mcp sidecars install`; explicit pins and semver ranges are never moved. Default on. |
+| `YAW_MCP_PREWARM` | `0` stops yaw-mcp spawning a server at startup just to learn its tool list. Learning is rare -- the list persists and is only re-learned once it ages out -- but the session that does it starts the upstream twice, once to read the list and once for the activate that follows, which matters if the server startup is not idempotent. Off, a server whose tools are not already known shows none of them until you activate it; `discover` still lists it. Default on. |
 | `OAM_BIN` | Path to the `oam` binary to use instead of the one on `PATH`. A path that does not exist is reported by `doctor` as an unusable oam (fix the variable), not as oam being absent. |
 | `OAM_MAX_HEAP_MB` | Raises the V8 heap cap oam applies to a hosted server (4 GiB by default since oam 0.9.2). Set it in that server's `env` when a hosted sidecar dies with a heap out-of-memory error, or give that server `"runtime": "node"`. |
 | `YAW_MCP_AUTO_LOAD` | `1` pre-activates the top recurring pack at startup (needs persistence). Default off. |

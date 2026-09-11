@@ -10,6 +10,18 @@
 // Default is 6 — large enough for the common "2-3 task areas, each
 // with 1-2 servers" shape, small enough to keep tool-list tokens
 // bounded. Ops can raise or lower via YAW_MCP_SERVER_CAP.
+//
+// What it does NOT bound is how many upstream CHILD PROCESSES exist at
+// once. It counts servers that are LOADED -- connected and advertising
+// tools into the model's context -- which is the resource it is defending.
+// Startup pre-warm (prewarmDormantServers in server.ts) spawns a dormant
+// server purely to read its tool list, advertises nothing, and closes the
+// child as soon as that list is in hand, so it is exempt from this check in
+// both directions. While it runs, every dormant server is spawned --
+// including ones an activate would be refused for -- and the live child
+// count can run up to pre-warm's batch size above the cap before settling
+// back. Deliberate, and brief; a user who needs the process count itself
+// bounded turns pre-warm off with YAW_MCP_PREWARM=0.
 
 export const DEFAULT_SERVER_CAP = 6;
 

@@ -151,6 +151,36 @@ export function isAutoLoadEnabled(): boolean {
   return raw === "1" || raw.toLowerCase() === "true";
 }
 
+// Startup pre-warm of dormant servers. Default ON; set YAW_MCP_PREWARM=0
+// (or "false") to suppress it. The one reason to: pre-warm LEARNS a
+// dormant server's tools by spawning it, and it throws that child away
+// once the list is in hand, so a session that learns a server starts that
+// server twice -- once here, once for the activate that follows. Rare, not
+// per-session: a learned list is persisted to state.json and is only
+// re-learned once it ages past TOOLCACHE_REFRESH_MS. (With
+// YAW_MCP_DISABLE_PERSISTENCE set nothing carries it across, so every
+// session re-learns every server whose bundles.json entry does not carry a
+// toolCache of its own.) Rare is not never, though, and an upstream whose
+// startup is not idempotent (it takes a lock, binds a port, opens a DB
+// session, writes a login audit event) does that side effect twice each
+// time, the second being the one the user actually asked for.
+//
+// Off costs what pre-warm buys: a server whose tools are not already known
+// advertises none of them in tools/list until it is activated (see
+// getDeferredServers), though `mcp_connect_discover` still lists the
+// server itself -- it reads getProfiledActiveServers, not the tool cache --
+// and activating it by namespace works exactly as before.
+export function isPrewarmEnabled(): boolean {
+  // `0` and `false` are the two off spellings YAW_MCP_AUTO_UPGRADE and
+  // YAW_MCP_CONFIG_RELOAD already accept; anything else, including unset,
+  // leaves pre-warm on. Trimmed -- which widens nothing, both off spellings
+  // are still exactly those two -- for the cmd.exe reason isAutoLoadEnabled
+  // documents: `set VAR=0 && yaw-mcp serve` delivers "0 ", and a check that
+  // did not trim would silently ignore the opt-out on Windows.
+  const raw = process.env.YAW_MCP_PREWARM?.trim().toLowerCase();
+  return !(raw === "0" || raw === "false");
+}
+
 // Last unrecognized YAW_MCP_TOOL_EXPOSURE value the warning in
 // resolveToolExposure fired for. Null means "nothing warned about yet".
 let exposureWarnedFor: string | null = null;
@@ -1807,7 +1837,45 @@ export class ConnectServer {
   // learned cache had nowhere to persist). A learned list past
   // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
   // re-learned weekly instead of only at the 30-day persistence expiry.
+  //
+  // The child it spawns is DISCARDED: the tool list is what this wants, and
+  // holding the upstream open would mean N idle processes for the session.
+  // So a session that LEARNS a server runs that server's startup twice --
+  // once here, once for the activate that follows -- and there is no way
+  // around that while the only way to read a server's tools is to run it.
+  // Idempotent startups pay a spawn for a list that then persists; a startup
+  // that takes a lock, binds a port, opens a DB session or writes a login
+  // audit event does that side effect twice. YAW_MCP_PREWARM=0 is the escape
+  // hatch for the second kind (isPrewarmEnabled says what turning it off
+  // costs).
+  //
+  // Cap-exempt in both directions, deliberately -- the reasoning is at the
+  // cap check in runActivateOne. The consequence to know is that the
+  // concurrent-server cap does not bound LIVE CHILD PROCESSES: this pass
+  // spawns every dormant server, including ones an activate would be refused
+  // for, so up to CONCURRENCY more children can be alive than the cap allows
+  // loaded servers. Each is closed as soon as its tool list is in hand -- a
+  // transient spike, never a retained server. server-cap.ts says the same
+  // from its side.
   private async prewarmDormantServers(): Promise<void> {
+    // Checked FIRST, ahead of the dormant scan, so an opt-out really does
+    // mean "spawn nothing at startup" rather than "scan, then decline".
+    // Said out loud once per session, because turning this off has a
+    // visible consequence a user will otherwise report as a bug: a server
+    // they just enabled shows none of its tools in tools/list until they
+    // activate it. Only when the var is actually set -- the default path
+    // stays silent.
+    if (!isPrewarmEnabled()) {
+      log(
+        "info",
+        "Pre-warm disabled by YAW_MCP_PREWARM; servers with no learned tool list stay unadvertised until activated",
+        {
+          value: process.env.YAW_MCP_PREWARM,
+        },
+      );
+      return;
+    }
+
     // An already-connected namespace is never dormant, even when its
     // learned cache is past the refresh window: runActivateOne stamps a
     // fresh learnedAt on every real activation, and the connections here
