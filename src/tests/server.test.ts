@@ -1090,7 +1090,7 @@ describe("ConnectServer", () => {
       vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue", "list_prs"]));
 
       const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
-      expect(text).toContain("1 tools: gh_create_issue");
+      expect(text).toContain("1 tool: gh_create_issue");
       expect(text).not.toContain("gh_list_prs");
     });
 
@@ -1818,11 +1818,11 @@ describe("ConnectServer", () => {
 
       const text = priv.handleDiscover().content[0].text;
       // Count reflects the filtered (exposed) tool set …
-      expect(text).toContain("loaded (1 tools)");
+      expect(text).toContain("loaded (1 tool)");
       // … and the indicator shows how many are hidden behind the filter.
       expect(text).toContain("filtered: 1 of 3");
       // Session summary counts only exposed tools, not the full upstream.
-      expect(text).toContain("1 loaded in this session, 1 tools in context");
+      expect(text).toContain("1 loaded in this session, 1 tool in context");
     });
 
     it("multi-server activate ignores tools and clears any existing filter", async () => {
@@ -5094,7 +5094,7 @@ describe("activate tells the truth about a flattened-name collision", () => {
     // The loser used to claim "2 tools: gh_actions_list, gh_actions_run",
     // naming a tool that reaches gh. Only what it serves is counted or named.
     const [headline] = loser.split("\n");
-    expect(headline).toBe('Loaded "gh_actions" — 1 tools: gh_actions_run');
+    expect(headline).toBe('Loaded "gh_actions" — 1 tool: gh_actions_run');
     // ...and the name it lost is attributed, so the model can go to the right
     // server instead of calling gh_actions_list and silently getting gh.
     expect(loser).toContain('1 tool of "gh_actions" cannot be called');
@@ -5120,7 +5120,7 @@ describe("activate tells the truth about a flattened-name collision", () => {
     await priv.handleActivate(["gh_actions"]);
     const again = (await priv.handleActivate(["gh_actions"])).content[0].text;
 
-    expect(again).toContain('"gh_actions" is already loaded with 1 tools.');
+    expect(again).toContain('"gh_actions" is already loaded with 1 tool.');
     expect(again).toContain('"list" flattens to gh_actions_list, already served by "gh"');
   });
 
@@ -5601,7 +5601,7 @@ describe("blockedTools deny gate", () => {
     withDeny(priv, ["gh_delete_repo"]);
 
     const text = (await priv.handleActivate(["gh"])).content[0].text;
-    expect(text).toContain("already loaded with 1 tools");
+    expect(text).toContain("already loaded with 1 tool");
   });
 
   it("counts the tools filter too, not just the deny", async () => {
@@ -5616,7 +5616,7 @@ describe("blockedTools deny gate", () => {
     priv.profile = null;
 
     const text = (await priv.handleActivate(["gh"], undefined, ["create_issue"])).content[0].text;
-    expect(text).toContain("already loaded with 1 tools");
+    expect(text).toContain("already loaded with 1 tool");
   });
 
   it("withholds a denied tool from the advertised tools/list", async () => {
@@ -6334,7 +6334,7 @@ describe("discover cache key covers tool filters", () => {
 
     const text = priv.handleDiscover().content[0].text;
     expect(text).toContain("filtered: 1 of 3");
-    expect(text).toContain("loaded (1 tools)");
+    expect(text).toContain("loaded (1 tool)");
   });
 });
 
@@ -8150,7 +8150,7 @@ describe("upstream instructions at activation", () => {
 
     const text = (await priv.handleActivate(["gh"])).content[0].text;
 
-    expect(text).toBe('Loaded "gh" — 1 tools: gh_create_issue');
+    expect(text).toBe('Loaded "gh" — 1 tool: gh_create_issue');
   });
 
   it("puts the fenced block after every line yaw-mcp wrote itself", async () => {

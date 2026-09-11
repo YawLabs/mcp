@@ -243,7 +243,7 @@ export async function runSearch(opts: SearchCommandOptions): Promise<SearchComma
 
   print(
     query === ""
-      ? `${matches.length} servers in the Yaw MCP catalog:`
+      ? `${matches.length} ${matches.length === 1 ? "server" : "servers"} in the Yaw MCP catalog:`
       : `${matches.length} ${matches.length === 1 ? "match" : "matches"} for "${query}":`,
   );
   print();

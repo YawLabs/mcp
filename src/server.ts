@@ -3304,7 +3304,7 @@ export class ConnectServer {
         ? connection.status === "error"
           ? "ERROR (disconnected, will auto-reconnect on use)"
           : isAdvertised(server.namespace)
-            ? `loaded (${exposed} tools)${filterSuffix}`
+            ? `loaded (${exposed} ${exposed === 1 ? "tool" : "tools"})${filterSuffix}`
             : "connected (not advertised — activate to expose)"
         : "ready";
 
@@ -3526,7 +3526,9 @@ export class ConnectServer {
       return sum + this.visibleTools(ns, c.tools).length;
     }, 0);
     const tokenSummary = totalContextTokens > 0 ? ` (~${totalContextTokens.toLocaleString()} tokens)` : "";
-    lines.push(`\n${activeCount} loaded in this session, ${totalTools} tools in context${tokenSummary}.`);
+    lines.push(
+      `\n${activeCount} loaded in this session, ${totalTools} ${totalTools === 1 ? "tool" : "tools"} in context${tokenSummary}.`,
+    );
     lines.push(
       context
         ? "Use mcp_connect_dispatch(intent) to load the best server in one step, or mcp_connect_activate to pick explicitly."
@@ -4015,7 +4017,9 @@ export class ConnectServer {
       return {
         ok: true,
         isChanged: false,
-        message: `"${namespace}" is already loaded with ${served.length} tools.${this.shadowedToolNote(namespace, shadowed)}`,
+        message: `"${namespace}" is already loaded with ${served.length} ${
+          served.length === 1 ? "tool" : "tools"
+        }.${this.shadowedToolNote(namespace, shadowed)}`,
         serverId: existing.config.id,
       };
     }
@@ -4178,7 +4182,9 @@ export class ConnectServer {
             await disconnectFromUpstream(connection).catch(() => {});
             return this.staleLaunchRefusal(namespace, stale);
           }
-          progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
+          progress?.(
+            `"${namespace}" loaded ${connection.tools.length} ${connection.tools.length === 1 ? "tool" : "tools"}`,
+          );
           this.connections.set(namespace, connection);
           this.idleCallCounts.set(namespace, 0);
           const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
@@ -4212,7 +4218,9 @@ export class ConnectServer {
             ok: true,
             isChanged: true,
             serverId: serverConfig.id,
-            message: `Loaded "${namespace}" — ${served.length} tools: ${toolNames}${this.shadowedToolNote(namespace, shadowed)}`,
+            message: `Loaded "${namespace}" — ${served.length} ${
+              served.length === 1 ? "tool" : "tools"
+            }: ${toolNames}${this.shadowedToolNote(namespace, shadowed)}`,
           };
         } catch (err) {
           lastError = err;
@@ -4954,7 +4962,7 @@ export class ConnectServer {
       };
     }
 
-    progress?.(`Ranking ${activeServers.length} servers…`);
+    progress?.(`Ranking ${activeServers.length} ${activeServers.length === 1 ? "server" : "servers"}…`);
     const rankedRaw = await this.twoStageRank(trimmed, activeServers);
     // Apply health-aware penalty: recent activation failures and high
     // error rates shrink the score so dispatch prefers working servers
