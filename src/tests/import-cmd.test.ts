@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseImportArgs, runImport } from "../import-cmd.js";
-import { CURRENT_OS, resolveInstallPath } from "../install-targets.js";
+import { CURRENT_OS, INSTALL_TARGETS, resolveInstallPath } from "../install-targets.js";
 import { loadLocalBundles } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
@@ -112,6 +112,38 @@ describe("parseImportArgs", () => {
     const r = parseImportArgs(["--help"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.help).toBe(true);
+  });
+});
+
+describe("runImport -- a client yaw-mcp cannot configure on this OS", () => {
+  it("refuses Claude Desktop on Linux with the undocumented-path reason and an import-shaped remedy", async () => {
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-desktop", os: "linux", home: synthHome, cwd: synthCwd, ...cap });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toBe(
+      "yaw-mcp import: Claude Desktop on linux is not supported yet.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
+        "  Add those servers to yaw-mcp yourself instead, with `yaw-mcp add <slug>`.\n",
+    );
+    expect(cap.text()).toBe("");
+  });
+
+  it("does not advertise --os, a flag import does not have, for a client with no build on this OS", async () => {
+    // No real client is missing an OS without a reason today, so cursor is
+    // made to be one for the length of this test and then put back.
+    const cursor = INSTALL_TARGETS.find((t) => t.clientId === "cursor");
+    if (!cursor) throw new Error("INSTALL_TARGETS lost cursor");
+    const saved = cursor.availableOn;
+    cursor.availableOn = ["macos", "windows"];
+    try {
+      const cap = capture();
+      const r = await runImport({ clientId: "cursor", os: "linux", home: synthHome, cwd: synthCwd, ...cap });
+      expect(r.exitCode).toBe(2);
+      expect(cap.errText()).toBe("yaw-mcp import: Cursor is not available on linux.\n  Pick a different client.\n");
+    } finally {
+      cursor.availableOn = saved;
+    }
   });
 });
 

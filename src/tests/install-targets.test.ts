@@ -9,6 +9,7 @@ import {
   ENTRY_NAME,
   escapeCmdArg,
   INSTALL_TARGETS,
+  type InstallOS,
   isCmdShimLauncher,
   isProjectLocalEntry,
   resolveAppDataDir,
@@ -36,11 +37,34 @@ describe("INSTALL_TARGETS metadata", () => {
     expect(INSTALL_TARGETS[0].clientId).toBe("claude-code");
   });
 
-  it("Claude Desktop is marked unavailable on Linux (no Linux build)", () => {
+  it("Claude Desktop is left off Linux for an undocumented config path, not a missing build", () => {
     const cd = INSTALL_TARGETS.find((t) => t.clientId === "claude-desktop");
     expect(cd?.availableOn).not.toContain("linux");
     expect(cd?.availableOn).toContain("macos");
     expect(cd?.availableOn).toContain("windows");
+    // Byte-exact: the refusal in every verb, doctor and `install --list` all
+    // read this one string, so a drift here is a drift everywhere at once.
+    expect(cd?.notConfigurableOn?.linux).toBe(
+      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file",
+    );
+  });
+
+  it("notConfigurableOn names only OSes missing from availableOn, where Claude Code and Cursor work", () => {
+    // A reason on an OS the client IS available on would be dead text. And the
+    // refusal's remedy names Claude Code and Cursor by name, so both must be
+    // configurable on every OS a reason is recorded for.
+    let seen = 0;
+    for (const t of INSTALL_TARGETS) {
+      for (const os of Object.keys(t.notConfigurableOn ?? {}) as InstallOS[]) {
+        seen++;
+        expect(t.availableOn).not.toContain(os);
+        for (const alt of ["claude-code", "cursor"]) {
+          expect(INSTALL_TARGETS.find((x) => x.clientId === alt)?.availableOn).toContain(os);
+        }
+      }
+    }
+    // Not vacuous: the loop above must have checked the claude-desktop entry.
+    expect(seen).toBeGreaterThan(0);
   });
 
   it("VS Code uses the `servers` root key, not `mcpServers`", () => {
@@ -447,10 +471,15 @@ describe("resolveInstallPath — Claude Desktop", () => {
     expect(isAbsolute(ambient.absolute)).toBe(true);
   });
 
-  it("Linux is refused (no Linux build)", () => {
+  it("Linux is refused with the undocumented-path reason, not 'not available'", () => {
+    // An Error instance makes toThrow compare the WHOLE message, not a substring.
     expect(() =>
       resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "linux", home: "/home/alice" }),
-    ).toThrow(/not available on linux/);
+    ).toThrow(
+      new Error(
+        "Claude Desktop cannot be configured on linux: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file",
+      ),
+    );
   });
 });
 

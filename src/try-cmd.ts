@@ -843,10 +843,10 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // cannot honour that (today: none, after VS Code gained one -- so this is
   // the branch that keeps the rule true if a project-only client is added).
   const tryTarget = INSTALL_TARGETS.find((t) => t.clientId === clientId);
-  // A client this OS does not have is refused HERE, in the same sentence
-  // `install` uses, rather than at resolveInstallPath -- whose bare throw
-  // ("Claude Desktop is not available on linux") reached the user as a
-  // resolver internal with nothing to do about it. Exit 2: the argv named a
+  // A client yaw-mcp cannot configure on this OS is refused HERE, in the same
+  // sentence `install` uses, rather than at resolveInstallPath -- whose bare
+  // throw reached the user as a resolver internal with nothing to do about
+  // it. Exit 2: the argv named a
   // client that cannot work on this machine, which is a usage error, and the
   // same code install's identical refusal returns.
   //

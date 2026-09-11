@@ -14,6 +14,7 @@ import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type BundlesSummary,
+  clientUnavailableMessage,
   DRY_RUN_ENV_PLACEHOLDER,
   deepEqualJson,
   describeEntryDiff,
@@ -31,7 +32,13 @@ import {
   summarizeBundles,
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
-import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME } from "../install-targets.js";
+import {
+  CLAUDE_CODE_ALLOW_PATTERN,
+  CURRENT_OS,
+  ENTRY_NAME,
+  INSTALL_TARGETS,
+  type InstallOS,
+} from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe, oamNoBinaryReason } from "../oam-spawn.js";
 
@@ -2288,7 +2295,10 @@ describe("runInstall — settings.json that changes between its read and its pat
 });
 
 describe("runInstall — Claude Desktop on Linux refused", () => {
-  it("exits 2 with helpful message", async () => {
+  it("exits 2 saying the config path is undocumented, not that the app does not exist", async () => {
+    // Claude Desktop for Linux ships as a beta; the old message ("Anthropic
+    // ships Claude Desktop on macOS and Windows only") told its users the app
+    // they were running did not exist. Byte-exact, so neither half can drift.
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-desktop",
@@ -2299,8 +2309,45 @@ describe("runInstall — Claude Desktop on Linux refused", () => {
       oamProbe: OAM_PROBE_FORBIDDEN,
     });
     expect(r.exitCode).toBe(2);
-    expect(cap.stderr()).toMatch(/not available on linux/i);
-    expect(cap.stderr()).toMatch(/Claude Code or Cursor/);
+    expect(r.written).toEqual([]);
+    expect(cap.stderr()).toBe(
+      "yaw-mcp install: Claude Desktop on linux is not supported yet.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
+        "  Install into Claude Code or Cursor instead, or add the entry by hand.\n",
+    );
+  });
+});
+
+describe("clientUnavailableMessage", () => {
+  const desktop = INSTALL_TARGETS.find((t) => t.clientId === "claude-desktop");
+  const cursor = INSTALL_TARGETS.find((t) => t.clientId === "cursor");
+  if (!desktop || !cursor) throw new Error("INSTALL_TARGETS lost claude-desktop or cursor");
+  const head =
+    "Claude Desktop on linux is not supported yet.\n" +
+    "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n  ";
+
+  it("words the remedy per verb, and never uses the caller's generic fix, for a client that ships but cannot be configured", () => {
+    expect(clientUnavailableMessage("install", desktop, "linux", "GENERIC")).toBe(
+      `yaw-mcp install: ${head}Install into Claude Code or Cursor instead, or add the entry by hand.`,
+    );
+    expect(clientUnavailableMessage("uninstall", desktop, "linux", "GENERIC")).toBe(
+      `yaw-mcp uninstall: ${head}Remove the entry by hand if you added one.`,
+    );
+    expect(clientUnavailableMessage("import", desktop, "linux", "GENERIC")).toBe(
+      `yaw-mcp import: ${head}Add those servers to yaw-mcp yourself instead, with \`yaw-mcp add <slug>\`.`,
+    );
+    expect(clientUnavailableMessage("try", desktop, "linux", "GENERIC")).toBe(
+      `yaw-mcp try: ${head}Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.`,
+    );
+  });
+
+  it("keeps 'not available' plus the caller's fix for an OS the table records no reason for", () => {
+    // No real client is missing an OS without a reason today, so a synthetic
+    // one stands in: the branch still has to say what it said before.
+    const noLinux = { ...cursor, availableOn: ["macos", "windows"] as InstallOS[] };
+    expect(clientUnavailableMessage("install", noLinux, "linux", "Pick a different client.")).toBe(
+      "yaw-mcp install: Cursor is not available on linux.\n  Pick a different client.",
+    );
   });
 });
 
@@ -2572,8 +2619,11 @@ describe("runInstall --list (read-only)", () => {
     expect(out).toContain("CLIENT");
     expect(out).toContain("SCOPE");
     expect(out).toContain("STATUS");
-    // Claude Desktop is unavailable on linux.
-    expect(out).toMatch(/Claude Desktop\s+user\s+\(n\/a\)\s+unavailable/);
+    // Claude Desktop ships on linux (a beta) but its config path is
+    // undocumented: "not supported yet", not "unavailable" -- the user may be
+    // running it.
+    expect(out).toMatch(/Claude Desktop\s+user\s+\(n\/a\)\s+not supported yet/);
+    expect(out).not.toMatch(/\bunavailable\b/);
     // Nothing seeded, so every other client reads "not installed".
     expect(out).toContain("not installed");
     // No row's STATUS is a bare `installed`. Asserted on the row SHAPE, not on
@@ -2707,10 +2757,16 @@ describe("runInstall --all", () => {
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
     // Cursor user → ~/.cursor/mcp.json exists.
     expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
-    // Claude Desktop is unavailable on linux, so skipped — no claude_desktop_config.
+    // Claude Desktop ships on linux (a beta) but its config path is
+    // undocumented, so --all skips it -- and SAYS so, by name and reason,
+    // rather than leaving a Linux Desktop user to wonder where it went.
     // VS Code is no longer skipped: it has a user scope now, which is the
     // whole point -- it was the one supported client --all visibly refused.
     const out = cap.stdout();
+    expect(out).toContain(
+      "\n  skip claude-desktop: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file\n",
+    );
+    expect(out).not.toContain("-- claude-desktop");
     expect(out).not.toContain("skip vscode");
     expect(existsSync(join(synthHome, ".config", "Code", "User", "mcp.json"))).toBe(true);
     // And the two new clients ride the same table-driven planner.
@@ -4698,7 +4754,11 @@ describe("runUninstall", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(2);
-    expect(cap.stderr()).toMatch(/is not available on linux/);
+    expect(cap.stderr()).toBe(
+      "yaw-mcp uninstall: Claude Desktop on linux is not supported yet.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
+        "  Remove the entry by hand if you added one.\n",
+    );
   });
 
   it("says what it did NOT delete, so `uninstall` is not read as `wipe my servers`", async () => {

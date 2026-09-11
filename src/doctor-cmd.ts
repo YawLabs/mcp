@@ -418,6 +418,11 @@ export interface ClientProbeResult {
    *  whose wording node reshapes across versions. */
   unreadableCode: string | null;
   unavailable: boolean;
+  /** On an `unavailable` row whose client DOES ship on this OS but that
+   *  yaw-mcp cannot configure there (Claude Desktop on Linux), the reason from
+   *  INSTALL_TARGETS' `notConfigurableOn`; absent on every other row.
+   *  Additive JSON field. */
+  unavailableReason?: string;
   /** An absolute launch `command` in the entry that no longer exists on disk,
    *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
    *  PATH-resolved and cannot be verified cheaply. This catches the failure
@@ -622,7 +627,7 @@ function isTransientRead(c: ClientProbeResult): boolean {
 }
 
 /** True when the probe found a config file whose CONTENTS are known: it is on
- *  disk, on a client available on this OS, and doctor could both read and
+ *  disk, on a client yaw-mcp can configure on this OS, and doctor could both read and
  *  parse it. This is the gate `yaw-mcp try`'s auto-detect picks "the client
  *  the user is actively using" by. Both failure kinds are excluded on
  *  purpose: `malformed` always was, but `unreadable` (split out of it later)
@@ -2141,7 +2146,11 @@ function schemaSuffix(f: LoadedConfigFile): string {
  *  Centralises the per-state wording so the renderer in `runDoctor`
  *  doesn't carry a nested ternary tree as more states get added. */
 function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
-  if (c.unavailable) return "unavailable on this OS";
+  if (c.unavailable) {
+    return c.unavailableReason !== undefined
+      ? `not supported on this OS yet -- ${c.unavailableReason}`
+      : "unavailable on this OS";
+  }
   // A READ failure, named as one. It used to fall into the malformed line
   // below and send the user hunting for a syntax error in a file that is a
   // directory, or that the process simply cannot open. No install hint: on
@@ -2254,7 +2263,10 @@ interface ProbeSlot {
  *  classifyProbeContent are both typed against it, so a field added to
  *  ClientProbeResult that neither sets is a compile error rather than an
  *  `undefined` in the --json blob. */
-type ProbeClassification = Omit<ClientProbeResult, "clientId" | "scope" | "path" | "exists" | "unavailable">;
+type ProbeClassification = Omit<
+  ClientProbeResult,
+  "clientId" | "scope" | "path" | "exists" | "unavailable" | "unavailableReason"
+>;
 
 // The "nothing found" probe skeleton, in ONE place. classifyProbeContent
 // returns this shape from four separate exits (empty file, non-object JSON,
@@ -2303,6 +2315,7 @@ function unreadableProbe(err: unknown): ProbeClassification {
 function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
   for (const target of INSTALL_TARGETS) {
     if (!target.availableOn.includes(opts.os)) {
+      const why = target.notConfigurableOn?.[opts.os];
       yield {
         result: {
           clientId: target.clientId,
@@ -2311,6 +2324,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           exists: false,
           unavailable: true,
           ...EMPTY_PROBE,
+          ...(why !== undefined ? { unavailableReason: why } : {}),
         },
         read: null,
       };
