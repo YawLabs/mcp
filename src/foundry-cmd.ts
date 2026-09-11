@@ -201,7 +201,9 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
       else if (reason === "empty-tokens") emptyTokens++;
     }
     printErr(
-      `yaw-mcp foundry: ${traces.length} traces but 0 usable entries -- ${unknownChosen} chose a server that is not in the local catalog (${servers.length} servers) and ${emptyTokens} carried no tokens.`,
+      `yaw-mcp foundry: ${traces.length} ${traces.length === 1 ? "trace" : "traces"} but 0 usable entries -- ${unknownChosen} chose a server that is not in the local catalog (${servers.length} ${
+        servers.length === 1 ? "server" : "servers"
+      }) and ${emptyTokens} carried no tokens.`,
     );
     // 1, not 2: this is a runtime outcome (the harvest and the catalog do not
     // overlap), and 2 means "you typed the command wrong" everywhere else in
@@ -258,7 +260,11 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
     return { exitCode: 0, lines };
   }
 
-  print(`Wrote ${corpus.entries.length} entries (from ${traces.length} traces) to ${outPath}`);
+  print(
+    `Wrote ${corpus.entries.length} ${corpus.entries.length === 1 ? "entry" : "entries"} (from ${traces.length} ${
+      traces.length === 1 ? "trace" : "traces"
+    }) to ${outPath}`,
+  );
   print(
     `BM25-floor accuracy on this corpus: top-1 ${(score.top1 * 100).toFixed(1)}%, top-3 ${(score.top3 * 100).toFixed(1)}%`,
   );

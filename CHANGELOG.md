@@ -238,7 +238,7 @@ Nothing else moves. A machine with no `bundles.json` at all still exits 0 from `
 
 **Fixed -- smaller things**
 
-`activate` now says so when a `tools` filter names a tool that does not exist, instead of quietly advertising a smaller list and leaving the model to wonder why its tool "is not working". Observation meta-tools advance the idle clock, so a session that speaks only to the broker no longer holds every upstream child process for the life of the connection. `list` neuters control bytes in the compliance grade, which comes from a file a repo can ship. A bare `*` in `blockedTools` no longer denies every tool. `enable` and `disable` no longer die with the `set` parser's usage text. And the uv PATH probe treats a timeout as inconclusive rather than as absent.
+`activate` now says so when a `tools` filter names a tool that does not exist, instead of quietly advertising a smaller list and leaving the model to wonder why its tool "is not working". Observation meta-tools advance the idle clock, so a session that speaks only to the broker no longer holds every upstream child process for the life of the connection. `list` neuters control bytes in the compliance grade, which comes from a file a repo can ship. A bare `*` in `blockedTools` no longer denies every tool. `enable` and `disable` no longer die with the `set` parser's usage text. The uv PATH probe treats a timeout as inconclusive rather than as absent. And eight messages that printed a count in front of a hardcoded plural -- `Loaded "gh_actions" — 1 tools`, `loaded (1 tools)`, `Ranking 1 servers` -- now say `1 tool` and `1 server`, which matters mostly because an LLM reads several of them back.
 
 **Changed (BREAKING) -- `exec` stops echoing skipped step outputs when `return` names one**
 
