@@ -84,7 +84,7 @@ import {
   probeOam,
   resolveStableNpmEntry,
 } from "./oam-spawn.js";
-import { userConfigDir } from "./paths.js";
+import { tildePath, userConfigDir } from "./paths.js";
 import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
 
 export interface InstallCommandOptions {
@@ -2168,8 +2168,14 @@ function statusFor(p: ClientProbeResult): string {
   // hasLegacyEntry/legacyEntryName and left the row indistinguishable from a
   // config that has nothing to do with yaw-mcp.
   if (p.hasLegacyEntry) return `legacy: ${p.legacyEntryName ?? "unknown"}`;
-  if (p.exists) return "other-entries";
-  return "not installed";
+  if (!p.exists) return "not installed";
+  // `other-entries` promises OTHER SERVERS in the file -- the --list help
+  // defines it that way -- and a file merely existing does not deliver that:
+  // `uninstall` of the only entry leaves an empty `{"mcpServers": {}}`, and a
+  // client config can exist for its other settings with no server object at
+  // all. Every such row used to read `other-entries`, claiming servers the
+  // file does not have.
+  return p.containerEntries > 0 ? "other-entries" : "no-entries";
 }
 
 // `os` is the os being LISTED, not process.platform: --list is the one install
@@ -2185,30 +2191,13 @@ function statusFor(p: ClientProbeResult): string {
 // rooted in THIS machine's home dir either way, which is why a cross-OS write
 // is refused and only --list / --dry-run ever reach here.
 function displayPath(abs: string, home: string, os: InstallOS): string {
-  if (abs === "(n/a)") return abs;
-  // The prefix has to END AT A SEPARATOR (or at the end of the string) to mean
-  // "under home". A bare startsWith also matched a SIBLING that merely shares
-  // the prefix -- `C:\Users\jeff-old\.cursor\mcp.json` against a home of
-  // `C:\Users\jeff` -- and rendered it as `~\-old\.cursor\mcp.json`, a path the
-  // user does not have, in the column whose whole job is to be pasteable. A
-  // home that already ends in a separator (a drive root, `/`) carries its own
-  // boundary, so the next character is part of the tail.
-  const afterHome = abs.slice(home.length, home.length + 1);
-  const endsAtBoundary = afterHome === "" || afterHome === "/" || afterHome === "\\" || /[\\/]$/.test(home);
-  if (home && abs.startsWith(home) && endsAtBoundary) {
-    const sep = os === "windows" ? "\\" : "/";
-    // Only characters that are separators on the HOST that built `absolute`
-    // are rewritten. A blanket class would treat a backslash as a separator
-    // on a POSIX host, where it is a legal filename character, and would
-    // mangle the component containing it.
-    const hostSep = process.platform === "win32" ? /[\\/]/g : /\//g;
-    const tail = abs
-      .slice(home.length)
-      .replace(/^[\\/]/, "")
-      .replace(hostSep, sep);
-    return `~${sep}${tail}`;
-  }
-  return abs;
+  // The match itself -- separator-agnostic, case-folded where the filesystem
+  // is, anchored on a separator so a sibling like `C:\Users\jeff-old` never
+  // renders as `~\-old\...` -- lives in tildePath (paths.ts), so the next
+  // home-relative display reuses it instead of re-deriving it with a raw
+  // prefix compare; src/tests/home-prefix-compare.test.ts scans for one. The
+  // `(n/a)` sentinel is not absolute, so it comes back exactly as it went in.
+  return tildePath(abs, home, os === "windows" ? "\\" : "/");
 }
 
 /** `yaw-mcp install --all` — install into every available client (user

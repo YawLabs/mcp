@@ -247,8 +247,10 @@ if (subcommand === "compliance") {
                              The STATUS column is about YAW-MCP, not about the
                              client: \`installed\` means yaw-mcp is configured
                              in that file, \`other-entries\` that the file
-                             exists with other servers in it, \`not installed\`
-                             that the file is absent (read-only; no writes).
+                             exists with other servers in it, \`no-entries\`
+                             that it exists with no servers in it, and
+                             \`not installed\` that the file is absent
+                             (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
     uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
                              for Claude Code, its permissions.allow grant).

@@ -392,6 +392,14 @@ export interface ClientProbeResult {
   path: string;
   exists: boolean;
   hasMcpEntry: boolean;
+  /** How many keys the JSON object at the slot's container path (`mcpServers`
+   *  / `servers`) holds, yaw-mcp's own entry and any legacy one included. 0
+   *  when there is nothing to count: no file, a file that could not be read or
+   *  parsed, or one that parses with no such object or an empty one (what
+   *  `uninstall` leaves behind once it removes the last entry). `install
+   *  --list` tells `other-entries` from `no-entries` by it. Additive JSON
+   *  field. */
+  containerEntries: number;
   /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced so
    *  upgraded users know to trim by hand — nothing in the runtime writes
    *  this key anymore. */
@@ -2264,6 +2272,7 @@ type ProbeClassification = Omit<ClientProbeResult, "clientId" | "scope" | "path"
 // as `undefined` there while every other exit reported it properly.
 const EMPTY_PROBE: Readonly<ProbeClassification> = {
   hasMcpEntry: false,
+  containerEntries: 0,
   hasLegacyEntry: false,
   legacyEntryName: null,
   malformed: false,
@@ -2581,6 +2590,7 @@ function classifyProbeContent(
     }
     return {
       hasMcpEntry: ENTRY_NAME in container,
+      containerEntries: Object.keys(container).length,
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
