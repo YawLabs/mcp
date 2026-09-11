@@ -157,10 +157,11 @@ describe("resolveInstallPath — Claude Code", () => {
     const key = r.containerPath[1];
     expect(isAbsolute(key)).toBe(true);
     // resolve() spells the key with the HOST separator and keeps the drive
-    // letter's case, but Claude Code's projects[] keys use forward slashes on
-    // every OS and an upper-case drive letter — so on a Windows runner the
-    // key is the normalized spelling, even when the runner's cwd came from a
-    // cmd.exe `cd /d c:\...` (no-op on POSIX, where resolve() already emits
+    // letter's case, but the projects[] key install writes uses forward slashes
+    // on every OS and an upper-case drive letter (the spelling Claude Code
+    // reads whenever its cwd has an upper-case drive) — so on a Windows runner
+    // the key is the normalized spelling, even when the runner's cwd came from
+    // a cmd.exe `cd /d c:\...` (no-op on POSIX, where resolve() already emits
     // `/` and there is no drive letter).
     const expected = resolve(rel)
       .replace(/\\/g, "/")

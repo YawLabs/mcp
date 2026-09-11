@@ -348,16 +348,20 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
  *
  *  Residual caveat: cmd.exe keeps the drive letter as typed -- after
  *  `cd c:\\users`, with or without /d, it reports "c:\\Users" (the rest
- *  corrected to on-disk case) -- so a Claude Code started from a cmd prompt
- *  whose cwd has a lower-case drive looks under "c:/..." and does not see the
- *  "C:/..." entry written here, while doctor run from that prompt still
- *  reports it OK. That includes a bare `install --scope local` run from the
- *  same prompt, which used to write the matching lower-case key and now
- *  writes the upper-case one: the trade favours Git Bash and PowerShell,
- *  whose sessions never read a lower-case key. Starting Claude Code from Git
- *  Bash or PowerShell, or after `cd /d C:\\...`, reads the entry. (Measured
- *  against Claude Code 2.1.268 with both keys present: each session read only
- *  the key matching its own drive-letter case.)
+ *  corrected to on-disk case) -- and a Git Bash started from that prompt
+ *  inherits the lower-case drive and keeps it until it runs a `cd` of its
+ *  own. A Claude Code started from either looks under "c:/..." and does not
+ *  see the "C:/..." entry written here, while doctor run there still reports
+ *  it OK. That includes a bare `install --scope local` run from such a shell,
+ *  which used to write the matching lower-case key and now writes the
+ *  upper-case one: the trade favours PowerShell, which reports "C:" even for
+ *  a cwd it inherited as "c:\\...", and any Git Bash that has run a `cd`.
+ *  Starting Claude Code from PowerShell, after `cd .` in that Git Bash, or
+ *  after `cd /d C:\\...` in cmd reads the entry. (Measured against Claude
+ *  Code 2.1.268 with both keys present: each session read only the key
+ *  matching its own drive-letter case -- cmd and a Git Bash started from it
+ *  read "c:/...", while that Git Bash after `cd .`, a PowerShell started from
+ *  it, and cmd after `cd /d C:\\...` read "C:/...".)
  *
  *  Scoped to Windows-shaped paths (drive letter or UNC) so a POSIX directory
  *  whose name legitimately contains a backslash is not mangled. A UNC path has

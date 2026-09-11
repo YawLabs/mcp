@@ -71,8 +71,10 @@ afterEach(() => {
   rmSync(synthCwd, { recursive: true, force: true });
 });
 
-/** The projects[] key install writes for a project dir: Claude Code spells
- *  those keys with forward slashes and an upper-case drive letter, so a
+/** The projects[] key install writes for a project dir: forward slashes and
+ *  an upper-case drive letter -- the spelling Claude Code reads whenever its
+ *  cwd has an upper-case drive (a cmd prompt, or a Git Bash started from
+ *  one, can still hand it a lower-case "c:") -- so a
  *  host-native fixture path (backslashes on a Windows runner) must be
  *  normalized before indexing into the written JSON. Deliberately NOT
  *  claudeCodeProjectKey: an independent spelling of the rule, so a regression
