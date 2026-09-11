@@ -5051,6 +5051,144 @@ describe("activation always refreshes the routing table", () => {
   });
 });
 
+describe("activate tells the truth about a flattened-name collision", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  // `${namespace}_${tool}` is not injective: (gh, actions_list) and
+  // (gh_actions, list) both flatten to gh_actions_list. buildToolRoutes and
+  // buildToolList agree on ONE owner (first writer), which is correct and
+  // tested in proxy.test.ts -- what is under test here is what the LOSER is
+  // told, because activate rendered its message from the server's own
+  // inventory and so announced a tool that a call hands to somebody else.
+  const collidingPair = () => [
+    makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+    makeServerConfig({ id: "2", namespace: "gh_actions", name: "GitHub Actions" }),
+  ];
+  const collidingConnections = () => {
+    vi.mocked(connectToUpstream)
+      .mockResolvedValueOnce(makeConnection("gh", ["actions_list", "create_issue"]))
+      .mockResolvedValueOnce(makeConnection("gh_actions", ["list", "run"]));
+  };
+
+  it("names only the tools the losing namespace actually serves", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    collidingConnections();
+
+    const winner = (await priv.handleActivate(["gh"])).content[0].text;
+    const loser = (await priv.handleActivate(["gh_actions"])).content[0].text;
+
+    // The winner owns the name and is reported exactly as it always was.
+    expect(winner).toBe('Loaded "gh" — 2 tools: gh_actions_list, gh_create_issue');
+    // The loser used to claim "2 tools: gh_actions_list, gh_actions_run",
+    // naming a tool that reaches gh. Only what it serves is counted or named.
+    const [headline] = loser.split("\n");
+    expect(headline).toBe('Loaded "gh_actions" — 1 tools: gh_actions_run');
+    // ...and the name it lost is attributed, so the model can go to the right
+    // server instead of calling gh_actions_list and silently getting gh.
+    expect(loser).toContain('1 tool of "gh_actions" cannot be called');
+    expect(loser).toContain('"list" flattens to gh_actions_list, already served by "gh"');
+    expect(loser).toContain("mcp_connect_deactivate");
+
+    // The claim is checked against the surfaces it describes, not just itself.
+    expect(await listedUpstreamToolNames(priv)).toEqual(["gh_actions_list", "gh_create_issue", "gh_actions_run"]);
+    expect(priv.toolRoutes.get("gh_actions_list")).toEqual({ namespace: "gh", originalName: "actions_list" });
+  });
+
+  it("reports the same split on the already-loaded path", async () => {
+    // The early return for a connected server counts rather than enumerates,
+    // and it was counting the same inflated inventory. Both messages have to
+    // agree about what this namespace serves or a re-activate silently
+    // restores the wrong number.
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    collidingConnections();
+
+    await priv.handleActivate(["gh"]);
+    await priv.handleActivate(["gh_actions"]);
+    const again = (await priv.handleActivate(["gh_actions"])).content[0].text;
+
+    expect(again).toContain('"gh_actions" is already loaded with 1 tools.');
+    expect(again).toContain('"list" flattens to gh_actions_list, already served by "gh"');
+  });
+
+  it("says nothing about collisions when no name collides", async () => {
+    // The note is appended, never substituted, so a session without a
+    // collision -- which is nearly all of them -- must read exactly as before.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ id: "2", namespace: "linear", name: "Linear" }),
+    ]);
+    priv.profile = null;
+    vi.mocked(connectToUpstream)
+      .mockResolvedValueOnce(makeConnection("gh", ["actions_list", "create_issue"]))
+      .mockResolvedValueOnce(makeConnection("linear", ["list", "run"]));
+
+    const first = (await priv.handleActivate(["gh"])).content[0].text;
+    const second = (await priv.handleActivate(["linear"])).content[0].text;
+
+    expect(first).toBe('Loaded "gh" — 2 tools: gh_actions_list, gh_create_issue');
+    expect(second).toBe('Loaded "linear" — 2 tools: linear_list, linear_run');
+  });
+
+  it("the remedy it offers actually frees the name", async () => {
+    // The message tells the model to unload the shadowing namespace. That is a
+    // claim about yaw-mcp's own behaviour, so it is pinned: deactivate rebuilds
+    // the routes, the name moves, and the re-activate reports the full set with
+    // no collision note left.
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    collidingConnections();
+
+    await priv.handleActivate(["gh"]);
+    await priv.handleActivate(["gh_actions"]);
+    await priv.handleDeactivate(["gh"]);
+
+    expect(priv.toolRoutes.get("gh_actions_list")).toEqual({ namespace: "gh_actions", originalName: "list" });
+    const freed = (await priv.handleActivate(["gh_actions"])).content[0].text;
+    expect(freed).toBe('"gh_actions" is already loaded with 2 tools.');
+  });
+
+  it("caps the names it lists and says how many it left out", async () => {
+    // Bounded output: the note rides on a message whose job is to stay small,
+    // but a truncated list must not read as a complete one.
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    const bare = ["t1", "t2", "t3", "t4", "t5", "t6"];
+    vi.mocked(connectToUpstream)
+      .mockResolvedValueOnce(
+        makeConnection(
+          "gh",
+          bare.map((t) => `actions_${t}`),
+        ),
+      )
+      .mockResolvedValueOnce(makeConnection("gh_actions", bare));
+
+    await priv.handleActivate(["gh"]);
+    const loser = (await priv.handleActivate(["gh_actions"])).content[0].text;
+
+    expect(loser).toContain('Loaded "gh_actions" — 0 tools: ');
+    expect(loser).toContain('6 tools of "gh_actions" cannot be called');
+    expect(loser).toContain('"t5" flattens to gh_actions_t5, already served by "gh"');
+    expect(loser).not.toContain("gh_actions_t6,");
+    expect(loser).toContain("; and 1 more.");
+  });
+});
+
 describe("idle reaper vs in-flight tool calls", () => {
   let server: ConnectServer;
 

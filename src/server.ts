@@ -2650,6 +2650,16 @@ export class ConnectServer {
   // rather than by a number the model has to guess.
   private static readonly DISCOVER_TOOL_NAME_CAP = 5;
 
+  // How many shadowed tools an activate message names before it falls back to
+  // a count (shadowedToolNote). A collision needs the two namespaces to
+  // prefix-overlap, so in practice one or two names are involved -- but the
+  // number is bounded by the smaller server's whole inventory, and this
+  // sentence rides on a message whose entire job is to stay small. Same value
+  // and same reasoning as the discover cap above; the overflow is reported as
+  // "and N more" rather than dropped, so the model is never told the list is
+  // complete when it is not.
+  private static readonly SHADOWED_TOOL_NAME_CAP = 5;
+
   /** Is this flattened wire tool name denied by the resolved `blockedTools`?
    *
    *  Thin bind of the shared predicate (spawn-gate.ts) to this session's
@@ -3771,6 +3781,89 @@ export class ConnectServer {
     return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
   }
 
+  /** Which of a namespace's VISIBLE tools it actually SERVES, and which ones
+   *  only look like its own.
+   *
+   *  `${namespace}_${tool}` is not injective: (ns=`gh`, tool=`actions_list`)
+   *  and (ns=`gh_actions`, tool=`list`) both flatten to `gh_actions_list`, so
+   *  two loaded servers can claim one wire name. buildToolRoutes resolves that
+   *  to exactly one owner (first writer wins, and buildToolList agrees), which
+   *  leaves the loser's tool with no name any caller can reach: a direct
+   *  tools/call and an mcp_connect_exec step both resolve the wire name
+   *  through that one table, and tools/list advertises it once.
+   *
+   *  Both activate messages used to render straight from visibleTools, which
+   *  is the server's OWN inventory and knows nothing about the rest of the
+   *  session. The losing side was therefore told it had loaded a tool that a
+   *  call would hand to somebody else, and the only record of the collision
+   *  was a stderr warning the model never sees. The verdict has to come from
+   *  the route table, so it is asked for here.
+   *
+   *  Built into a LOCAL rather than through rebuildRoutes(): that assigns
+   *  this.toolRoutes, which handleToolCall snapshots at entry precisely
+   *  because a rebuild can land mid-call, and this runs on the prewarm path
+   *  too, where the connection may be torn down again. `quiet` because the
+   *  activation this sits inside rebuilds the real table moments later and
+   *  would otherwise log every collision twice.
+   *
+   *  Deferred servers are deliberately left out of the build: buildToolRoutes
+   *  adds a deferred route only where no active connection has already taken
+   *  the name, so they cannot change the owner of a name an active namespace
+   *  holds -- and `namespace` is active by the time either caller asks. */
+  private splitShadowedTools<T extends { name: string; namespacedName: string }>(
+    namespace: string,
+    tools: T[],
+  ): { served: T[]; shadowed: Array<{ tool: T; owner: string }> } {
+    const routes = buildToolRoutes(this.connections, [], true);
+    const served: T[] = [];
+    const shadowed: Array<{ tool: T; owner: string }> = [];
+    for (const tool of this.visibleTools(namespace, tools)) {
+      const owner = routes.get(tool.namespacedName)?.namespace;
+      // An absent route means nothing else claimed the name either, so there
+      // is nobody to attribute it to; count it as served rather than invent a
+      // collision.
+      if (owner !== undefined && owner !== namespace) shadowed.push({ tool, owner });
+      else served.push(tool);
+    }
+    return { served, shadowed };
+  }
+
+  /** The sentence appended to an activate message when the namespace lost a
+   *  name to another one, or "" when it did not.
+   *
+   *  Empty string on the common path so a session with no collisions sees the
+   *  message it has always seen. The text names the WIRE name (what the model
+   *  would have called), the namespace that actually answers it, and the bare
+   *  tool on this server that is now unreachable -- the three facts needed to
+   *  either go call the right server on purpose or stop trying.
+   *
+   *  The unload remedy is a claim about yaw-mcp's own behaviour, so it has a
+   *  test: deactivating the owner rebuilds the routes and the name moves to
+   *  this server. The rename remedy needs none -- two namespaces that no
+   *  longer share a prefix cannot flatten onto one name -- but it is the
+   *  operator's move, not the model's, so the note offers both. */
+  private shadowedToolNote(
+    namespace: string,
+    shadowed: Array<{ tool: { name: string; namespacedName: string }; owner: string }>,
+  ): string {
+    if (shadowed.length === 0) return "";
+    const shown = shadowed.slice(0, ConnectServer.SHADOWED_TOOL_NAME_CAP);
+    const entries = shown
+      .map((s) => `"${s.tool.name}" flattens to ${s.tool.namespacedName}, already served by "${s.owner}"`)
+      .join("; ");
+    const hidden = shadowed.length - shown.length;
+    const more = hidden > 0 ? `; and ${hidden} more` : "";
+    const one = shadowed.length === 1;
+    const subject = one ? "1 tool" : `${shadowed.length} tools`;
+    return (
+      `\nName collision: ${subject} of "${namespace}" cannot be called.` +
+      ` ${entries}${more}.` +
+      ` ${one ? "That name routes" : "Those names route"} to the namespace shown instead of "${namespace}".` +
+      ` Unload that namespace with mcp_connect_deactivate, or rename one of the colliding namespaces in bundles.json,` +
+      ` to free ${one ? "the name" : "the names"}.`
+    );
+  }
+
   /** Why THIS activation may take tens of seconds, or "" when it should not.
    *
    *  A first activation of an `npx` / `uvx` / `docker` server pays for a
@@ -3820,11 +3913,17 @@ export class ConnectServer {
       // activate({server, tools: [...]}) installs the filter before this loop
       // runs. A re-activation narrowing gh to one tool answered "already loaded
       // with 2 tools" while the tools/list it triggered carried one.
-      const visible = this.visibleTools(namespace, existing.tools).length;
+      //
+      // It is also the same ROUTE split the fresh-connect path reports, and
+      // for the same reason: a tool whose flattened name another loaded
+      // namespace already owns is not one this server serves, however plainly
+      // it sits in its own inventory. Counting it answered "already loaded
+      // with 2 tools" for a server exactly one of whose tools a call reaches.
+      const { served, shadowed } = this.splitShadowedTools(namespace, existing.tools);
       return {
         ok: true,
         isChanged: false,
-        message: `"${namespace}" is already loaded with ${visible} tools.`,
+        message: `"${namespace}" is already loaded with ${served.length} tools.${this.shadowedToolNote(namespace, shadowed)}`,
         serverId: existing.config.id,
       };
     }
@@ -4005,8 +4104,15 @@ export class ConnectServer {
           // the same reason: a first activate carrying tools: [...] installs it
           // before this runs, and this message ENUMERATES the names, so counting
           // deny-only handed the model back the very tools it asked to hide.
-          const visible = this.visibleTools(namespace, connection.tools);
-          const toolNames = visible.map((t) => t.namespacedName).join(", ");
+          // The ROUTE table goes on top of that predicate, because the
+          // predicate only knows this server's own inventory. Two namespaces
+          // can flatten onto one wire name, tools/list and dispatch hand it to
+          // a single owner, and the loser's tool becomes uncallable -- so
+          // enumerating straight from the inventory told the model it had just
+          // loaded a tool that belongs to a different server. See
+          // splitShadowedTools.
+          const { served, shadowed } = this.splitShadowedTools(namespace, connection.tools);
+          const toolNames = served.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
           // server isn't permanently demoted for a transient past failure.
           this.activationFailures.delete(namespace);
@@ -4014,7 +4120,7 @@ export class ConnectServer {
             ok: true,
             isChanged: true,
             serverId: serverConfig.id,
-            message: `Loaded "${namespace}" — ${visible.length} tools: ${toolNames}`,
+            message: `Loaded "${namespace}" — ${served.length} tools: ${toolNames}${this.shadowedToolNote(namespace, shadowed)}`,
           };
         } catch (err) {
           lastError = err;

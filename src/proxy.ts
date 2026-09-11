@@ -214,6 +214,15 @@ export function buildToolList(
 export function buildToolRoutes(
   activeConnections: Map<string, UpstreamConnection>,
   inactiveWithCache: UpstreamServerConfig[] = [],
+  // Suppress the two collision warnings below. Off by default, so every
+  // existing caller keeps logging exactly what it logged before. It is for a
+  // caller that builds a THROWAWAY table to ASK a question about routing
+  // rather than to serve calls from -- runActivateOne wants to know which
+  // namespace won a name before its message claims that name -- and whose
+  // activation rebuilds the real table moments later, which logs the same
+  // collision again. Routing decisions are identical either way; only the
+  // logging moves.
+  quiet = false,
 ): Map<string, ToolRoute> {
   const routes = new Map<string, ToolRoute>();
 
@@ -235,11 +244,13 @@ export function buildToolRoutes(
         // DIFFERENT upstream's tool -- and a later-activated server could
         // silently capture an earlier one's traffic. The two surfaces must
         // agree on the winner; first is the safe direction to agree on.
-        log("warn", "Tool route collision; keeping the first upstream, ignoring the later one", {
-          tool: tool.namespacedName,
-          keptNamespace: existing.namespace,
-          ignoredNamespace: conn.config.namespace,
-        });
+        if (!quiet) {
+          log("warn", "Tool route collision; keeping the first upstream, ignoring the later one", {
+            tool: tool.namespacedName,
+            keptNamespace: existing.namespace,
+            ignoredNamespace: conn.config.namespace,
+          });
+        }
         continue;
       }
       routes.set(tool.namespacedName, {
@@ -262,7 +273,7 @@ export function buildToolRoutes(
       const namespacedName = `${server.namespace}_${cached.name}`;
       const existing = routes.get(namespacedName);
       if (existing) {
-        if (existing.deferred && existing.namespace !== server.namespace) {
+        if (!quiet && existing.deferred && existing.namespace !== server.namespace) {
           log("warn", "Deferred tool route collision; earlier cached server wins", {
             tool: namespacedName,
             winningNamespace: existing.namespace,
