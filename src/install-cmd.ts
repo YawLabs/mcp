@@ -2109,7 +2109,8 @@ function statusFor(p: ClientProbeResult): string {
   if (p.hasMcpEntry) return "installed";
   // A file whose only yaw-mcp wiring is a PRE-RENAME entry is an upgrade
   // pending, not somebody else's config: `install <client>` has something
-  // specific to do there (write `mcp`, then tell the user to trim the old key).
+  // specific to do there (write `mcp` and remove the old key in the same
+  // write, unless --keep-legacy).
   // Folding it into "other-entries" threw away the probe's own
   // hasLegacyEntry/legacyEntryName and left the row indistinguishable from a
   // config that has nothing to do with yaw-mcp.

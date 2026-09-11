@@ -7,10 +7,12 @@
 //
 // These run BOTH commands against one fixture. The remedy on each surface comes
 // from one helper (unparseableConfigFix / blockedContainerFix in
-// install-targets.ts), and the parity tests pin that both call it -- a surface
-// that goes back to its own literal goes red here. The last test in each group
-// FOLLOWS the advice and checks that the named command then succeeds, because
-// advice whose text matches is still wrong if the step does not work.
+// install-targets.ts), and the parity tests compare each surface's text with
+// that helper's output -- a surface whose wording drifts from the helper goes
+// red here. They pin the rendered words, not the call: a surface that swapped
+// the helper for an identical literal would stay green. Each group also has a
+// test that FOLLOWS the advice and checks that the named command then succeeds,
+// because advice whose text matches is still wrong if the step does not work.
 //
 // `import --remove-originals` is the third surface: when it refuses to remove
 // the originals it names `yaw-mcp install <client>` as the way forward, and it
@@ -254,11 +256,24 @@ describe("a container key install cannot splice into -- doctor no longer says 'r
     );
   });
 
-  it("following the advice works: once the key is an object, the named command succeeds", async () => {
-    const path = writeFile(cursorUserFile(), '{"mcpServers": [{"command": "x"}]}');
+  it("following the advice works: install refuses the array as it stands, then succeeds once the key is an object", async () => {
+    const blocked = '{"mcpServers": [{"command": "x"}]}';
+    const path = writeFile(cursorUserFile(), blocked);
+    expect((await doctor()).text).toContain(blockedContainerFix("run `yaw-mcp install cursor`"));
+    // The named command, run before the by-hand step, is refused and leaves the
+    // array's entries alone -- which is why the line leads with that step.
+    const refused = await install();
+    expect(refused.exitCode).toBe(1);
+    expect(readFileSync(path, "utf8")).toBe(blocked);
+    // Follow the advice: make the key an object, then run the named command.
     writeFileSync(path, '{"mcpServers": {}}');
     const i = await install();
     expect(i.exitCode).toBe(0);
+    const written = parseJsonc(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(written.mcpServers[ENTRY_NAME]).toBeDefined();
+    const row = (await doctor()).snapshot.clients.find((c) => c.clientId === "cursor" && c.scope === "user");
+    expect(row?.containerBlocked).toBe(null);
+    expect(row?.hasMcpEntry).toBe(true);
   });
 });
 
