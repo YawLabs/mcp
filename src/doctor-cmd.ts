@@ -56,8 +56,11 @@ import {
 } from "./default-runtime.js";
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import {
+  blockedContainerFix,
   CURRENT_OS,
+  describeJsonShape,
   ENTRY_NAME,
+  findBlockedContainerSegment,
   findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -65,6 +68,7 @@ import {
   type InstallScope,
   resolveAppDataDir,
   resolveInstallPath,
+  unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import {
@@ -417,6 +421,13 @@ export interface ClientProbeResult {
    *  see clientCannotLaunch) from a real one WITHOUT parsing the message,
    *  whose wording node reshapes across versions. */
   unreadableCode: string | null;
+  /** The container key install cannot splice its entry into, worded for a
+   *  message (`"mcpServers" is an array of 2`), or null. Set only for a key
+   *  findBlockedContainerSegment reports as NOT reparable -- the shape install
+   *  REFUSES with exit 1. A reparable one (null, a scalar, an empty array)
+   *  stays null: install replaces it with `{}`, so the ordinary "run install"
+   *  line is true there. Additive JSON field. */
+  containerBlocked: string | null;
   unavailable: boolean;
   /** An absolute launch `command` in the entry that no longer exists on disk,
    *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
@@ -691,7 +702,12 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
   for (const c of clients) {
     if (!clientCannotLaunch(c)) continue;
     const { client, status } = describeClient(c);
-    const key = `${c.path}\0${client}\0${status}`;
+    // Malformed is file-level, but its line names the row's OWN install
+    // command (a project-scope file needs `--scope project`), so the status
+    // text now differs per scope and cannot be the key. Keyed on the state
+    // instead; the folded line keeps the first grouped row's wording -- for
+    // Claude Code's (user, local) pair on ~/.claude.json, the user scope's.
+    const key = `${c.path}\0${client}\0${c.malformed ? "malformed" : status}`;
     const seen = grouped.get(key);
     if (seen) seen.scopes.push(c.scope);
     else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });
@@ -2157,7 +2173,20 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     }
     return `exists but could not be read (${c.unreadable}) -- check the file and its permissions, then rerun doctor`;
   }
-  if (c.malformed) return "exists but JSON is malformed -- fix or rerun `yaw-mcp install`";
+  // install REFUSES this file (exit 1, --force included -- see
+  // unparseableConfigFix), so the old "fix or rerun `yaw-mcp install`" offered
+  // a rerun that could only hit that refusal. The remedy is install's own,
+  // from the one helper both surfaces call, and names this row's command.
+  if (c.malformed) {
+    return `exists but JSON is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``)}`;
+  }
+  // The same trap one level down: the file parses, but a key on the way to the
+  // entry holds a non-empty array, which install refuses rather than drop (see
+  // findBlockedContainerSegment). It used to fall through to "present, no
+  // entry -- run install", and running it exits 1.
+  if (c.containerBlocked !== null) {
+    return `present, but ${c.containerBlocked}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``)}`;
+  }
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
   // and the combined branch used to swallow it -- a config carrying both a
@@ -2202,7 +2231,10 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
   }
   if (c.hasLegacyEntry) {
-    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
+    // No "then remove it by hand": install trims the legacy entry in the same
+    // write that adds the new one (unless --keep-legacy), so after following
+    // this line there is nothing left to remove.
+    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate; install removes the legacy entry as it writes the new one`;
   }
   if (c.exists) return `present, no "${ENTRY_NAME}" entry -- run \`${installCmd}\``;
   return `not configured -- run \`${installCmd}\``;
@@ -2269,6 +2301,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   malformed: false,
   unreadable: null,
   unreadableCode: null,
+  containerBlocked: null,
   launchCommandMissing: null,
   launchRuntime: null,
   launchOamNotAbsolute: null,
@@ -2516,6 +2549,17 @@ function classifyProbeContent(
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
     if (!container) {
+      // walkContainer answers "is there a container", and null covers two
+      // shapes install treats differently: an absent or reparable key (install
+      // writes one) and a non-empty array (install refuses). Only the second
+      // changes what doctor should advise, so ask install's own question.
+      const blocked = findBlockedContainerSegment(parsed as Record<string, unknown>, containerPath);
+      if (blocked !== null && !blocked.reparable) {
+        return {
+          ...EMPTY_PROBE,
+          containerBlocked: `"${blocked.path.join(".")}" is ${describeJsonShape(blocked.value)}`,
+        };
+      }
       return { ...EMPTY_PROBE };
     }
     const legacyEntryName = findLegacyEntry(container);
@@ -2586,6 +2630,7 @@ function classifyProbeContent(
       malformed: false,
       unreadable: null,
       unreadableCode: null,
+      containerBlocked: null,
       launchCommandMissing,
       launchRuntime,
       launchOamNotAbsolute,

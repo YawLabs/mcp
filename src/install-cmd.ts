@@ -57,10 +57,13 @@ import { Writable } from "node:stream";
 import { atomicWriteFile } from "./atomic-write.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
+  blockedContainerFix,
   buildLaunchEntry,
   CLAUDE_CODE_ALLOW_PATTERN,
   CURRENT_OS,
+  describeJsonShape,
   ENTRY_NAME,
+  findBlockedContainerSegment,
   findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -71,6 +74,7 @@ import {
   resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
+  unparseableConfigFix,
 } from "./install-targets.js";
 import { editJsoncEntry, parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { loadLocalBundles, localBundlesPath } from "./local-bundles.js";
@@ -728,8 +732,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       try {
         const parsed = parseJsonc(raw);
         if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          // The remedy is shared with doctor's CLIENTS line for this same file
+          // (see unparseableConfigFix), so the two surfaces cannot disagree
+          // about what gets a user past this refusal.
           err(
-            `yaw-mcp install: ${resolved.absolute} is not a JSON object -- refusing to overwrite. Edit by hand or rename the file and re-run.`,
+            `yaw-mcp install: ${resolved.absolute} is not a JSON object -- refusing to overwrite it; ${unparseableConfigFix("re-run")}.`,
           );
           return { written: [], wouldWrite: [], messages, exitCode: 1 };
         }
@@ -737,7 +744,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         rawClient = raw;
       } catch (e) {
         err(
-          `yaw-mcp install: ${resolved.absolute} is not valid JSON (${(e as Error).message}). Refusing to overwrite. Fix the file or rename it and re-run.`,
+          `yaw-mcp install: ${resolved.absolute} is not valid JSON (${(e as Error).message}) -- refusing to overwrite it; ${unparseableConfigFix("re-run")}.`,
         );
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }
@@ -1064,7 +1071,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       const keyPath = blocked.path.join(".");
       if (!blocked.reparable) {
         err(
-          `yaw-mcp install: "${keyPath}" in ${resolved.absolute} is ${describeJsonShape(blocked.value)}, not a JSON object -- refusing to overwrite. Make it an object (or remove the key) and re-run.`,
+          `yaw-mcp install: "${keyPath}" in ${resolved.absolute} is ${describeJsonShape(blocked.value)}, not a JSON object -- refusing to overwrite it; ${blockedContainerFix("re-run")}.`,
         );
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }
@@ -1649,68 +1656,6 @@ export function readNested(root: Record<string, unknown>, containerPath: string[
     cur = (cur as Record<string, unknown>)[key];
   }
   return cur;
-}
-
-/** A key along the container path whose existing value is not an object, and so
- *  cannot have the launch entry spliced into it. */
-export interface BlockedContainerSegment {
-  /** Full key path to the offending key, for naming it in a message. */
-  path: string[];
-  /** What is there instead of an object. */
-  value: unknown;
-  /** Whether replacing it with `{}` throws nothing away -- see
-   *  `findBlockedContainerSegment`. */
-  reparable: boolean;
-}
-
-/**
- * First key along `containerPath` that holds a non-object, or null when the
- * chain is spliceable as-is.
- *
- * jsonc-parser's `modify` materializes MISSING intermediate keys but throws
- * "Can not add index to parent of type null" on one that exists and holds a
- * non-object -- an internal message naming neither the file nor the key. The
- * pre-existing top-level check catches only a non-object ROOT, so `"mcpServers":
- * null` (hand-edited, or written by a tool that emptied it) reached the splice
- * and failed the whole install. Walking the chain here is what lets the caller
- * either repair the key or refuse while naming it.
- *
- * `reparable` splits the two shapes deliberately. null, a scalar, and an empty
- * array hold no server definitions, so replacing them with `{}` loses nothing
- * and restores the behaviour of the pre-splice merge path (which overwrote any
- * non-object container). A NON-EMPTY array can hold real entries in the wrong
- * shape, and silently dropping those to write ours is not a repair -- that case
- * is the caller's refusal.
- */
-export function findBlockedContainerSegment(
-  root: Record<string, unknown>,
-  containerPath: string[],
-): BlockedContainerSegment | null {
-  let node: Record<string, unknown> = root;
-  for (let i = 0; i < containerPath.length; i++) {
-    const value = node[containerPath[i]];
-    // Absent from here down: jsonc-parser builds the rest of the chain itself.
-    if (value === undefined) return null;
-    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-      node = value as Record<string, unknown>;
-      continue;
-    }
-    return {
-      path: containerPath.slice(0, i + 1),
-      value,
-      reparable: value === null || !Array.isArray(value) || value.length === 0,
-    };
-  }
-  return null;
-}
-
-/** How to name a non-object container value in a message. Shape, not contents:
- *  a `~/.claude.json` value can be arbitrarily large and the user needs to know
- *  WHICH key is wrong, not to have it echoed back. */
-function describeJsonShape(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return value.length === 0 ? "an empty array" : `an array of ${value.length}`;
-  return `a ${typeof value}`;
 }
 
 /**
