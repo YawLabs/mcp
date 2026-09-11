@@ -7,6 +7,7 @@ import { type CatalogServer, DEFAULT_CATALOG_URL, type FetchCatalog } from "../c
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "../local-add-cmd.js";
 import { deriveNamespace, loadLocalBundles, removeUserBundle, upsertUserBundle } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
+import { runStatus } from "../status-cmd.js";
 import type { UpstreamServerConfig } from "../types.js";
 
 let synthHome: string;
@@ -2635,7 +2636,10 @@ describe("runList", () => {
     writeUserBundlesRaw("{ not json");
     const io = captureIO();
     const r = await runList({ home: synthHome, cwd: synthCwd, out: (s) => io.out.push(s), err: (s) => io.err.push(s) });
-    expect(r.exitCode).toBe(0);
+    // 1, same as the directory-shaped file below: invalid JSON is the other
+    // way a bundles.json that IS there cannot be loaded, and the two shapes
+    // must not report differently.
+    expect(r.exitCode).toBe(1);
     // Warnings go to stderr, and stdout now says the file could not be READ
     // rather than reusing the no-file line -- "No local servers configured.
     // Add one with `yaw-mcp add <slug>`" was an all-clear plus advice that
@@ -3718,11 +3722,66 @@ describe("runList -- an unreadable bundles.json is not an empty one", () => {
       err: (s) => io.err.push(s),
       gradesReader: async () => ({}),
     });
-    expect(r.exitCode).toBe(0);
+    // Non-zero, because a script gating on `list` was the reader this branch
+    // left behind: it printed the right sentence and then exited 0, which a
+    // caller reads as "succeeded, zero servers" over a config yaw-mcp cannot
+    // load. 1 is the CLI's generic-failure code; 2 is argv/usage here.
+    expect(r.exitCode).toBe(1);
     expect(io.text()).not.toContain("No local servers configured");
     expect(io.text()).toContain(join(synthHome, CONFIG_DIRNAME, "bundles.json"));
     // The diagnostic itself still goes to stderr, where it always did.
     expect(io.errText()).toMatch(/warning:/);
+  });
+
+  it("reports the same failure through --json, document and all", async () => {
+    // The two surfaces have to agree about whether the run succeeded. --json
+    // still emits its document -- `warnings` is where a machine consumer reads
+    // what is wrong -- but the exit code is the text path's.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), { recursive: true });
+    const io = captureIO();
+    const r = await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      json: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    expect(r.exitCode).toBe(1);
+    const payload = JSON.parse(io.text()) as { servers: unknown[]; warnings: string[] };
+    expect(payload.servers).toEqual([]);
+    expect(payload.warnings.join(" ")).toContain(join(synthHome, CONFIG_DIRNAME, "bundles.json"));
+  });
+
+  it("agrees with `status` about the same broken file", async () => {
+    // Asserted against each other rather than against a literal: `list` and
+    // `status` answer the same question about the same file, so the contract
+    // is that they cannot disagree -- and the assertion stays honest if the
+    // code they converge on ever moves. (`doctor` deliberately says 2 for this
+    // instead; its documented rule is that any warning is a 2.)
+    mkdirSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), { recursive: true });
+    const listIo = captureIO();
+    const list = await runList({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => listIo.out.push(s),
+      err: (s) => listIo.err.push(s),
+      gradesReader: async () => ({}),
+    });
+    const statusIo = captureIO();
+    const status = await runStatus({
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => statusIo.out.push(s),
+      err: (s) => statusIo.err.push(s),
+    });
+    expect(list.exitCode).toBe(status.exitCode);
+    // Pinned as non-zero too, so the pair passing by both returning 0 -- the
+    // exact bug -- cannot satisfy this test.
+    expect(list.exitCode).not.toBe(0);
   });
 
   it("still says `No local servers configured` when there really are none", async () => {
