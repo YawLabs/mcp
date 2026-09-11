@@ -73,7 +73,7 @@ import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
 import { type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
-import { type CapContent, capContent, resolveMaxResultBytes } from "./result-cap.js";
+import { type CapContent, capContent, resolveMaxResultBytes, serializedBytes } from "./result-cap.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
   firstResultText,
@@ -414,27 +414,34 @@ export function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean>
  *  it is a handful of bytes and is not part of the body either pass operates
  *  on.
  *
+ *  The content half goes through result-cap.ts's serializedBytes rather than
+ *  its own JSON.stringify, because the result cap reports the SAME quantity in
+ *  its "exceeded the size ceiling" warning and the two used to be measured two
+ *  different ways -- this one serialized the array, the cap summed its blocks,
+ *  and the two came out N+1 bytes apart on an N-block result. An operator
+ *  reading both lines for one call was reading two numbers for one thing. They
+ *  now differ only where the quantity genuinely differs: the cap sees the body
+ *  AFTER pruning, and it never sees structuredContent at all.
+ *
  *  Returns null, NOT 0, when the body cannot be serialized -- a cyclic object,
  *  a BigInt, a stringify that throws for any other reason. Callers book both
  *  ends of a measurement or neither, so an unmeasurable body records nothing;
  *  a 0 here would read as "the server returned nothing", which is the opposite
  *  of what an unserializable payload means. result-cap.ts makes the same
  *  distinction for the same reason, and resolves it the other way (Infinity)
- *  because its job is to REFUSE what it cannot measure, not to count it.
+ *  because its job is to REFUSE what it cannot measure, not to count it -- so
+ *  the non-finite it returns is translated here rather than propagated.
  *
  *  Exported for its own unit test: a body that arrives over the wire has been
  *  through JSON.parse and is acyclic by construction, so the null branch is
  *  unreachable through handleToolCall and would otherwise ship untested. */
 export function measureResultBytes(result: { content?: unknown; structuredContent?: unknown }): number | null {
-  try {
-    let bytes = Buffer.byteLength(JSON.stringify(result.content ?? []), "utf8");
-    if (result.structuredContent !== undefined) {
-      bytes += Buffer.byteLength(JSON.stringify(result.structuredContent), "utf8");
-    }
-    return bytes;
-  } catch {
-    return null;
-  }
+  const bytes = serializedBytes(result.content ?? []);
+  if (!Number.isFinite(bytes)) return null;
+  if (result.structuredContent === undefined) return bytes;
+  const structured = serializedBytes(result.structuredContent);
+  if (!Number.isFinite(structured)) return null;
+  return bytes + structured;
 }
 
 // Words that are never content terms but clear relevance.ts's 3-char prose
@@ -2436,11 +2443,28 @@ export class ConnectServer {
           const cr = capContent(result.content as CapContent[], maxBytes);
           if (cr.capped) {
             result.content = cr.content as typeof result.content;
+            // `bytesRaw` is the content array alone, because that is the body
+            // that was compared against `maxBytes` and the figure the notice
+            // quotes to the model -- folding uncappable bytes into it would
+            // make both of those sentences false. But structuredContent rides
+            // through untouched, and an operator reconciling this line against
+            // the health counter (which books content and structuredContent
+            // together) would otherwise be left with an unexplained gap the
+            // size of a payload nothing here bounded. So it is named, next to
+            // the number rather than inside it. Omitted when there is none,
+            // and when it will not serialize -- the cap logs what it measured,
+            // never a guess.
+            const structuredBytes = hasStructuredContent
+              ? serializedBytes((result as { structuredContent?: unknown }).structuredContent)
+              : 0;
             log("warn", "Tool result exceeded the size ceiling and was cut", {
               namespace: route.namespace,
               tool: route.originalName,
               bytesRaw: cr.bytesRaw,
               maxBytes,
+              ...(Number.isFinite(structuredBytes) && structuredBytes > 0
+                ? { bytesStructuredUncapped: structuredBytes }
+                : {}),
             });
           }
         }
