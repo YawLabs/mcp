@@ -732,9 +732,10 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       try {
         const parsed = parseJsonc(raw);
         if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-          // The remedy is shared with doctor's CLIENTS line for this same file
-          // (see unparseableConfigFix), so the two surfaces cannot disagree
-          // about what gets a user past this refusal.
+          // The remedy is shared with doctor's CLIENTS line and import's
+          // refusal to remove originals for this same file (see
+          // unparseableConfigFix), so those surfaces cannot disagree about what
+          // gets a user past this refusal.
           err(
             `yaw-mcp install: ${resolved.absolute} is not a JSON object -- refusing to overwrite it; ${unparseableConfigFix("re-run")}.`,
           );

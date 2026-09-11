@@ -898,14 +898,16 @@ export function describeJsonShape(value: unknown): string {
  *  JSON object: invalid JSON, or valid JSON whose root is an array, a scalar or
  *  null. `yaw-mcp install` refuses such a file with exit 1 and writes nothing,
  *  and it refuses before --force, --repair, --skip or --dry-run is acted on --
- *  none of them gets past it (install-cmd.test.ts pins each).
+ *  none of them gets past it (client-config-remedy.test.ts pins each).
  *
- *  ONE wording for both places that describe the state: install's refusal and
- *  doctor's CLIENTS line for the same file. Doctor used to say "fix or rerun
- *  `yaw-mcp install`", and a bare rerun is exactly what hits the refusal, so
- *  half of that advice could never work. `then` is the step once the file
- *  parses: install passes "re-run" (the user just typed the command), doctor
- *  passes the install command for the row it is describing. */
+ *  ONE wording for every place that describes the state: install's refusal,
+ *  doctor's CLIENTS line for the same file, and import's refusal to remove
+ *  originals when this is the file install would write. Doctor used to say
+ *  "fix or rerun `yaw-mcp install`", and a bare rerun is exactly what hits the
+ *  refusal, so half of that advice could never work. `then` is the step once
+ *  the file parses: install passes "re-run" (the user just typed the command),
+ *  doctor passes the install command for the row it is describing, and import
+ *  passes that command plus its own re-run. */
 export function unparseableConfigFix(then: string): string {
   return `fix the JSON by hand, or move the file aside, then ${then}`;
 }
@@ -913,8 +915,8 @@ export function unparseableConfigFix(then: string): string {
 /** The by-hand fix for a container key install cannot splice its entry into:
  *  one findBlockedContainerSegment reports as NOT reparable (a non-empty
  *  array -- null, a scalar and an empty array are replaced with `{}` instead).
- *  Shared by install's refusal and doctor's CLIENTS line, for the same reason
- *  as unparseableConfigFix. */
+ *  Shared by install's refusal, doctor's CLIENTS line and import's refusal to
+ *  remove originals, for the same reason as unparseableConfigFix. */
 export function blockedContainerFix(then: string): string {
   return `make it an object (or remove the key), then ${then}`;
 }

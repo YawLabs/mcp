@@ -11,6 +11,11 @@
 // that goes back to its own literal goes red here. The last test in each group
 // FOLLOWS the advice and checks that the named command then succeeds, because
 // advice whose text matches is still wrong if the step does not work.
+//
+// `import --remove-originals` is the third surface: when it refuses to remove
+// the originals it names `yaw-mcp install <client>` as the way forward, and it
+// did so even when install refuses the very file it would write. Its group, at
+// the end, runs import, follows the advice, and re-runs import.
 
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,8 +23,16 @@ import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runDoctor } from "../doctor-cmd.js";
+import { runImport } from "../import-cmd.js";
 import { runInstall } from "../install-cmd.js";
-import { blockedContainerFix, ENTRY_NAME, unparseableConfigFix } from "../install-targets.js";
+import {
+  blockedContainerFix,
+  ENTRY_NAME,
+  type InstallClientId,
+  type InstallScope,
+  resolveInstallPath,
+  unparseableConfigFix,
+} from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
 import type { OamProbe } from "../oam-spawn.js";
 
@@ -262,5 +275,188 @@ describe("a lone legacy entry -- doctor does not send the user to remove what in
     const written = parseJsonc(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
     expect(written.mcpServers[ENTRY_NAME]).toBeDefined();
     expect(written.mcpServers["mcp.hosting"]).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// import --remove-originals refuses to remove the originals when the client has
+// no yaw-mcp entry, and names `yaw-mcp install <client>` as the way forward. It
+// read every other scope's container through a helper that turned "cannot
+// parse" into "no entry", so for the very file doctor now flags it still said
+// "Run `yaw-mcp install cursor` first" -- and that install exits 1 on it. These
+// pin that the refusal names install's own by-hand step when the file install
+// writes is one it refuses, and keeps the plain advice when it is not.
+
+/** Cursor's project-scope file for the test's project directory. */
+const cursorProjectFile = (): string => join(cwd, ".cursor", "mcp.json");
+
+/** A client config with one server of the user's own and no yaw-mcp entry. */
+const PROJECT_SERVERS = '{"mcpServers": {"github": {"command": "npx", "args": ["-y", "gh"]}}}';
+
+async function importRemoving(clientId: InstallClientId = "cursor", scope: InstallScope = "project") {
+  const out: string[] = [];
+  const err: string[] = [];
+  const r = await runImport({
+    clientId,
+    scope,
+    // resolveInstallSite refuses --project-dir on a scope that does not read it.
+    projectDir: scope === "user" ? undefined : cwd,
+    os: "linux",
+    home,
+    cwd,
+    removeOriginals: true,
+    out: (s) => out.push(s),
+    err: (s) => err.push(s),
+  });
+  return { exitCode: r.exitCode, stdout: out.join(""), stderr: err.join("") };
+}
+
+describe("import --remove-originals -- a client config install refuses gets install's remedy, not 'run install first'", () => {
+  it("the reported repro, byte for byte: an unparseable user file while importing at project scope", async () => {
+    const user = writeFile(cursorUserFile(), TRUNCATED);
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    const r = await importRemoving();
+    expect(r.exitCode).toBe(0);
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project} (mcpServers), and ${user} is not valid JSON, so Cursor would be left with no way to reach them. \`yaw-mcp install cursor\` refuses to overwrite ${user}; fix the JSON by hand, or move the file aside, then run \`yaw-mcp install cursor\` and re-run this with --remove-originals.\n`,
+    );
+    expect(r.stderr).not.toContain("Run `yaw-mcp install cursor` first");
+    // The refusal itself is unchanged: neither file is touched.
+    expect(readFileSync(project, "utf8")).toBe(PROJECT_SERVERS);
+    expect(readFileSync(user, "utf8")).toBe(TRUNCATED);
+  });
+
+  it("a non-empty array under the container key, byte for byte", async () => {
+    const user = writeFile(cursorUserFile(), '{"mcpServers": [{"command": "x"}]}');
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    const r = await importRemoving();
+    expect(r.exitCode).toBe(0);
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project} (mcpServers), and "mcpServers" in ${user} is an array of 1, not a JSON object, so Cursor would be left with no way to reach them. \`yaw-mcp install cursor\` refuses to overwrite "mcpServers" in ${user}; make it an object (or remove the key), then run \`yaw-mcp install cursor\` and re-run this with --remove-originals.\n`,
+    );
+    expect(readFileSync(project, "utf8")).toBe(PROJECT_SERVERS);
+  });
+
+  it("a root that parses but is not an object: the same remedy install and doctor give", async () => {
+    const user = writeFile(cursorUserFile(), "[]");
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    const r = await importRemoving();
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project} (mcpServers), and ${user} is not a JSON object, so Cursor would be left with no way to reach them. \`yaw-mcp install cursor\` refuses to overwrite ${user}; ${unparseableConfigFix("run `yaw-mcp install cursor` and re-run this with --remove-originals")}.\n`,
+    );
+  });
+
+  it("a directory where the user file belongs: named the way install names it", async () => {
+    const user = cursorUserFile();
+    mkdirSync(user, { recursive: true });
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    const r = await importRemoving();
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project} (mcpServers), and ${user} is a directory, not a file, so Cursor would be left with no way to reach them. \`yaw-mcp install cursor\` cannot read ${user}; move or remove it, then run \`yaw-mcp install cursor\` and re-run this with --remove-originals.\n`,
+    );
+    // The wording import claims to share with install's describeUnreadableConfig.
+    const i = await install();
+    expect(i.exitCode).toBe(1);
+    expect(i.stderr).toContain(`${user} is a directory, not a file -- move or remove it, then re-run.`);
+  });
+
+  it.each([
+    {
+      shape: "an unparseable file moved aside",
+      setup: (u: string) => writeFile(u, TRUNCATED),
+      follow: (u: string) => renameSync(u, `${u}.bak`),
+    },
+    {
+      shape: "an unparseable file fixed by hand",
+      setup: (u: string) => writeFile(u, TRUNCATED),
+      follow: (u: string) => writeFileSync(u, '{"mcpServers": {}}'),
+    },
+    {
+      shape: "a blocked container made an object",
+      setup: (u: string) => writeFile(u, '{"mcpServers": [{"command": "x"}]}'),
+      follow: (u: string) => writeFileSync(u, '{"mcpServers": {}}'),
+    },
+    {
+      shape: "a directory moved aside",
+      setup: (u: string) => mkdirSync(u, { recursive: true }),
+      follow: (u: string) => renameSync(u, `${u}.aside`),
+    },
+  ])("following the advice works: $shape, then the named install, then the re-run removes the original", async ({
+    setup,
+    follow,
+  }) => {
+    const user = cursorUserFile();
+    setup(user);
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    expect((await importRemoving()).stderr).toContain("Not removing the originals");
+    follow(user);
+    expect((await install()).exitCode).toBe(0);
+    const again = await importRemoving();
+    expect(again.exitCode).toBe(0);
+    expect(again.stderr).not.toContain("Not removing the originals");
+    const after = parseJsonc(readFileSync(project, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(after.mcpServers).toEqual({});
+  });
+
+  it("a refused file that is NOT the one install writes keeps 'run install first' -- and that step works", async () => {
+    // Imported from the USER file; the project file beside it is cut off. A
+    // bare install writes the user file, so the plain advice is true here --
+    // but the cut-off file is named for what it is, not as "no entry".
+    const user = writeFile(cursorUserFile(), PROJECT_SERVERS);
+    const project = writeFile(cursorProjectFile(), TRUNCATED);
+    const r = await importRemoving("cursor", "user");
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${user} (mcpServers), and ${project} is not valid JSON, so Cursor would be left with no way to reach them. Run \`yaw-mcp install cursor\` first, then re-run this with --remove-originals.\n`,
+    );
+    expect((await install()).exitCode).toBe(0);
+    const again = await importRemoving("cursor", "user");
+    expect(again.stderr).not.toContain("Not removing the originals");
+    const after = parseJsonc(readFileSync(user, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(Object.keys(after.mcpServers)).toEqual([ENTRY_NAME]);
+  });
+
+  // The shapes install writes over by itself: an empty file is treated as
+  // absent, and null / a scalar / an empty array under the key is replaced with
+  // `{}`. For these "run install first" is true and must stay.
+  it.each([
+    ["an empty file", ""],
+    ["a whitespace-only file", "  \n"],
+    ["a null container", '{"mcpServers": null}'],
+    ["an empty-array container", '{"mcpServers": []}'],
+  ])("%s is no refusal, so the advice stays 'run install first' -- and that install succeeds", async (_label, bytes) => {
+    const user = writeFile(cursorUserFile(), bytes);
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    const r = await importRemoving();
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project} (mcpServers) or ${user} (mcpServers), so Cursor would be left with no way to reach them. Run \`yaw-mcp install cursor\` first, then re-run this with --remove-originals.\n`,
+    );
+    expect((await install()).exitCode).toBe(0);
+  });
+
+  it("an absent user file is no refusal either -- install creates it", async () => {
+    const user = cursorUserFile();
+    const project = writeFile(cursorProjectFile(), PROJECT_SERVERS);
+    const r = await importRemoving();
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project} (mcpServers) or ${user} (mcpServers), so Cursor would be left with no way to reach them. Run \`yaw-mcp install cursor\` first, then re-run this with --remove-originals.\n`,
+    );
+    expect((await install()).exitCode).toBe(0);
+  });
+
+  it("one clause per fault: Claude Code's user and local scopes share one unparseable ~/.claude.json", async () => {
+    const claudeJson = writeFile(join(home, ".claude.json"), TRUNCATED);
+    const project = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "project",
+      os: "linux",
+      projectDir: cwd,
+      home,
+    });
+    writeFile(project.absolute, PROJECT_SERVERS);
+    const r = await importRemoving("claude-code", "project");
+    expect(r.stderr).toContain(
+      `Not removing the originals: no yaw-mcp entry in ${project.absolute} (${project.containerPath.join(".")}), and ${claudeJson} is not valid JSON, so Claude Code would be left with no way to reach them. \`yaw-mcp install claude-code\` refuses to overwrite ${claudeJson}; ${unparseableConfigFix("run `yaw-mcp install claude-code` and re-run this with --remove-originals")}.\n`,
+    );
+    expect(r.stderr.split("is not valid JSON").length - 1).toBe(1);
   });
 });
