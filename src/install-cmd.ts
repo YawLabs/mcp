@@ -27,8 +27,13 @@
 //
 // Failure semantics:
 //   - Existing client file with malformed JSON  → refuse, point at the file.
-//   - Existing `mcp` entry                      → prompt (TTY) or refuse
-//                                                  with --force/--skip flag.
+//   - Existing `mcp` entry that differs         → prompt (TTY) or refuse
+//                                                  (exit 2) off one, unless
+//                                                  --repair (keeps its env),
+//                                                  --force (drops it) or
+//                                                  --skip answers up front.
+//                                                  One that already matches
+//                                                  is a no-op.
 //   - Client file changed between read + write  → refuse, ask for a re-run
 //                                                  (see the fingerprint check
 //                                                  ahead of atomicWriteFile).
@@ -941,14 +946,19 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // because the drop is otherwise visible only as one `env: drops ...` diff
   // line. It names only the keys --repair would have kept: a non-string value
   // is filtered out by readEntryAt on both paths, so claiming --repair keeps
-  // it would be false (the diff line still names it). "Dropping", not
-  // "Dropped": the line prints before the write, which can still fail.
+  // it would be false (the diff line still names it). The same filter is why
+  // the parenthetical speaks of THESE keys rather than of "an entry's env":
+  // --repair does not keep a non-string value either. Sorted (the "Kept" line
+  // too), so a multi-key drop names its keys in the order the `env: drops ...`
+  // diff line does rather than the same set twice in two orders. "Dropping",
+  // not "Dropped": the line prints before the write, which can still fail.
   if (carryableEnv) {
-    const keys = Object.keys(carryableEnv).join(", ");
+    const keyList = Object.keys(carryableEnv).sort();
+    const keys = keyList.join(", ");
     if (opts.force) {
       runtimeLines.push(
         `${opts.dryRun ? "Would drop" : "Dropping"} existing env on the ${ENTRY_NAME} entry (--force): ${keys}. ` +
-          "(--repair keeps an entry's env; --force does not.)",
+          `(--repair would keep ${keyList.length === 1 ? "it" : "them"}; --force does not.)`,
       );
     } else {
       runtimeLines.push(`Kept existing env on the ${ENTRY_NAME} entry: ${keys}`);
@@ -994,7 +1004,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       return { written: [], wouldWrite: [], messages, exitCode: 0 };
     } else if (opts.promptAnswer) decision = opts.promptAnswer;
     else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {
-      const answer = await promptCollision(resolved.absolute, diff, opts.io);
+      const answer = await promptCollision(resolved.absolute, diff, opts.io, entryToWrite !== newEntry);
       if (answer === "skip") {
         log(`Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`);
         return { written: [], wouldWrite: [], messages, exitCode: 0 };
@@ -1225,11 +1235,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // instead), and README tells users to put YAW_MCP_VAULT_PASSPHRASE in
     // exactly that block. So the preview keeps its KEYS (the "Kept existing
     // env" line already names them, and the user needs to see the block
-    // survives the overwrite) and masks every VALUE. A live run writes the real values to the file; the
-    // preview is the one output that exists to be pasted somewhere. Gated on
-    // the carry-over rather than on `env` being present so the placeholder
-    // stays truthful: buildLaunchEntry emits no env of its own here, so an
-    // env on the entry can only have come from the user's file.
+    // survives the overwrite) and masks every VALUE. A live run writes the
+    // real values to the file; the preview is the one output that exists to
+    // be pasted somewhere. Gated on the carry-over rather than on `env` being
+    // present so the placeholder stays truthful: buildLaunchEntry emits no env
+    // of its own here, so an env on the entry can only have come from the
+    // user's file.
     //
     // `clientJson === null` is the identical-entry, nothing-to-trim case: the
     // preview must promise exactly what the real run would do, and the real run
@@ -1656,10 +1667,16 @@ function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
   return a.mtimeMs === b.mtimeMs && a.size === b.size;
 }
 
+/** `keepsEnv`: the entry an [o]verwrite answer writes carries the stored
+ *  entry's env (runInstall's carry-over runs on this path). The question says
+ *  so because `--force`, which USAGE also calls an overwrite, DROPS that env,
+ *  and the diff above the question lists only what changes -- so a kept env
+ *  would otherwise go unmentioned and "overwrite" would mean two things. */
 async function promptCollision(
   path: string,
   diff: string[],
   io: InstallCommandOptions["io"],
+  keepsEnv: boolean,
 ): Promise<"overwrite" | "skip" | "abort" | "cancelled"> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
@@ -1676,7 +1693,7 @@ async function promptCollision(
       rl,
       `${path} already has an "${ENTRY_NAME}" entry that differs from the one install would write:\n` +
         `${indentDiff(diff, "    ")}\n` +
-        "  [o]verwrite, [s]kip, or [a]bort? (default: skip) ",
+        `  [o]verwrite${keepsEnv ? " (keeping its env)" : ""}, [s]kip, or [a]bort? (default: skip) `,
     );
     if (raw === QUESTION_CANCELLED) return "cancelled";
     const answer = raw.trim().toLowerCase();
