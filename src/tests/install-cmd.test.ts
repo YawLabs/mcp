@@ -76,6 +76,20 @@ afterEach(() => {
  *  the written JSON. No-op on POSIX. */
 const projectsKey = (dir: string): string => dir.replace(/\\/g, "/");
 
+/** The four cells of the one `install --list` row for CLIENT + SCOPE. Split
+ *  on the two-space gutter the table pads with, so a single space inside a
+ *  cell (`not installed`, `Application Support`) stays in it. Comparing cells
+ *  is what makes a PATH or STATUS assertion byte-exact, where a regex over
+ *  the whole table matches a prefix of the cell as happily as the cell. */
+function listRow(out: string, client: string, scope: string): string[] {
+  const rows = out
+    .split("\n")
+    .map((l) => l.trim().split(/ {2,}/))
+    .filter((cells) => cells[0] === client && cells[1] === scope);
+  expect(rows, `exactly one ${client} (${scope}) row in:\n${out}`).toHaveLength(1);
+  return rows[0];
+}
+
 /** One of `--all`'s per-client header lines (`-- cursor (user) --`).
  *
  *  ASCII, and pinned as ASCII: install renders the separator with `--` today
@@ -2662,6 +2676,94 @@ describe("runInstall --list (read-only)", () => {
     expect(out).toMatch(/^0\/\d+ client scopes have yaw-mcp configured on linux\./m);
   });
 
+  // Byte-exact fixtures, each a file that EXISTS and parses but names no
+  // server. `other-entries` is defined by the help as "the list holds other
+  // servers" -- the list the row reads, here the top-level mcpServers -- which
+  // none of these do, so each one used to be reported as holding servers it
+  // does not have.
+  it.each([
+    ["an empty mcpServers object", '{"mcpServers": {}}'],
+    ["no mcpServers key at all", '{"numStartups": 3}'],
+    ["an empty JSON object", "{}"],
+    ["a whitespace-only file", " \n"],
+  ])("reports `no-entries`, not `other-entries`, for %s", async (_label, bytes) => {
+    writeFileSync(join(synthHome, ".claude.json"), bytes, "utf8");
+    const cap = captureIo();
+    const r = await runInstall({ os: "linux", home: synthHome, cwd: synthCwd, listOnly: true, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    expect(listRow(cap.stdout(), "Claude Code", "user")).toEqual([
+      "Claude Code",
+      "user",
+      "~/.claude.json",
+      "no-entries",
+    ]);
+  });
+
+  it("reports `no-entries` for the file `uninstall` leaves behind", async () => {
+    // The reported repro, end to end: install one client, uninstall it, list.
+    const cap = captureIo();
+    const i = await runInstall({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(i.exitCode).toBe(0);
+    const u = await runUninstall({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(u.exitCode).toBe(0);
+    // The premise, pinned: uninstall keeps the file and leaves the container
+    // EMPTY rather than deleting either.
+    expect(parseJsonc(readFileSync(join(synthHome, ".cursor", "mcp.json"), "utf8"))).toEqual({ mcpServers: {} });
+    const list = captureIo();
+    const r = await runInstall({ os: "linux", home: synthHome, cwd: synthCwd, listOnly: true, io: list.io });
+    expect(r.exitCode).toBe(0);
+    expect(listRow(list.stdout(), "Cursor", "user")).toEqual(["Cursor", "user", "~/.cursor/mcp.json", "no-entries"]);
+  });
+
+  // Claude Code's user and local rows read ONE file, ~/.claude.json, and each
+  // reads its own list in it: the top-level `mcpServers` for user, this
+  // project's `projects[<dir>].mcpServers` for local. The status is about the
+  // row's list, so a server in one list must not make the other row claim it
+  // -- and a server under ANOTHER project is in neither list.
+  it.each([
+    [
+      "a user-level server",
+      (_key: string) => ({ mcpServers: { spend: { url: "https://x" } } }),
+      "other-entries",
+      "no-entries",
+    ],
+    [
+      "a server in this project's local list",
+      (key: string) => ({ projects: { [key]: { mcpServers: { spend: { url: "https://x" } } } } }),
+      "no-entries",
+      "other-entries",
+    ],
+    [
+      "a server in another project's local list",
+      (_key: string) => ({ projects: { "/elsewhere": { mcpServers: { spend: { url: "https://x" } } } } }),
+      "no-entries",
+      "no-entries",
+    ],
+  ])("scopes the Claude Code user and local status to each row's own list in the shared ~/.claude.json: %s", async (_label, fixture, userStatus, localStatus) => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(fixture(projectsKey(synthCwd))), "utf8");
+    const cap = captureIo();
+    const r = await runInstall({ os: "linux", home: synthHome, cwd: synthCwd, listOnly: true, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(listRow(out, "Claude Code", "user")).toEqual(["Claude Code", "user", "~/.claude.json", userStatus]);
+    expect(listRow(out, "Claude Code", "local")).toEqual(["Claude Code", "local", "~/.claude.json", localStatus]);
+  });
+
   it("reports `malformed` for unparseable client config", async () => {
     writeFileSync(join(synthHome, ".claude.json"), "{not valid json", "utf8");
     const cap = captureIo();
@@ -3675,6 +3777,26 @@ describe("runInstall --list — display + flag handling", () => {
     // assertions above while being a shape neither OS uses.
     const cursorRow = listedOs === "windows" ? "~\\.cursor\\mcp.json" : "~/.cursor/mcp.json";
     expect(out).toContain(cursorRow);
+  });
+
+  it("keeps the `~` when home is spelled with forward slashes (Git Bash / CI USERPROFILE)", async () => {
+    // On win32 os.homedir() returns USERPROFILE verbatim, so a shell exporting
+    // `USERPROFILE=C:/Users/x` hands install a forward-slash home while every
+    // probed path is rebuilt with path.join and comes back with backslashes.
+    // The old raw prefix compare never matched that pair, and every row
+    // printed its full absolute path. On a POSIX host the replace below is a
+    // no-op and this is an ordinary row check.
+    const fwdHome = synthHome.replace(/\\/g, "/");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    writeFileSync(join(synthHome, ".cursor", "mcp.json"), '{"mcpServers": {}}', "utf8");
+    const listedOs = process.platform === "win32" ? "windows" : "linux";
+    const s = listedOs === "windows" ? "\\" : "/";
+    const cap = captureIo();
+    const r = await runInstall({ os: listedOs, home: fwdHome, cwd: synthCwd, listOnly: true, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(listRow(out, "Cursor", "user")).toEqual(["Cursor", "user", `~${s}.cursor${s}mcp.json`, "no-entries"]);
+    expect(listRow(out, "Claude Code", "user")).toEqual(["Claude Code", "user", `~${s}.claude.json`, "not installed"]);
   });
 });
 

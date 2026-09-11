@@ -245,9 +245,13 @@ if (subcommand === "compliance") {
     install --list           Show every MCP client config location on this
                              machine and whether yaw-mcp is wired into each.
                              The STATUS column is about YAW-MCP, not about the
-                             client: \`installed\` means yaw-mcp is configured
-                             in that file, \`other-entries\` that the file
-                             exists with other servers in it, \`not installed\`
+                             client, and about the one server list that row
+                             reads in its file (Claude Code's user and local
+                             rows read the same .claude.json, each its own
+                             list): \`installed\` means yaw-mcp is in that list,
+                             \`other-entries\` that the list holds other
+                             servers, \`no-entries\` that the file exists but
+                             has no server in that list, and \`not installed\`
                              that the file is absent (read-only; no writes).
     install --all            Configure every installed MCP client in one go.
     uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
