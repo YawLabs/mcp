@@ -277,7 +277,7 @@ describe("a container key install cannot splice into -- doctor no longer says 'r
   });
 });
 
-describe("a lone legacy entry -- doctor does not send the user to remove what install removes", () => {
+describe("a legacy entry -- doctor does not send the user to remove what install removes", () => {
   it("doctor says install migrates it, and install does remove the legacy key", async () => {
     const path = writeFile(cursorUserFile(), '{"mcpServers": {"mcp.hosting": {"command": "npx"}}}');
     const d = await doctor();
@@ -290,6 +290,101 @@ describe("a lone legacy entry -- doctor does not send the user to remove what in
     const written = parseJsonc(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
     expect(written.mcpServers[ENTRY_NAME]).toBeDefined();
     expect(written.mcpServers["mcp.hosting"]).toBeUndefined();
+  });
+
+  // The same fact on the three cannot-launch lines, where it rides as a trailer.
+  // Each line's remedy is an install run, and install removes the legacy entry
+  // in the same write -- off a TTY too, once the collision refusal's --repair is
+  // added. The trailer used to say "remove it once the working entry is back",
+  // sending the user to delete by hand an entry that run had already removed.
+  // Only the bare-oam line offers a step that is not an install run (OAM_BIN),
+  // so only it keeps a by-hand clause, and scoped to that step.
+  const CANNOT_LAUNCH = [
+    {
+      state: "a launch command that does not exist",
+      says: "its launch command does not exist",
+      entry: () => ({ command: join(home, "gone", "oam"), args: ["run", "x.js"] }),
+      byHandForOamBin: false,
+    },
+    {
+      state: "an oam entry file that does not exist",
+      says: "oam cannot fetch it on demand",
+      entry: () => ({
+        command: writeFile(join(home, "bin", "oam"), ""),
+        args: ["run", "--no-check", join(home, "gone", "broker.js")],
+      }),
+      byHandForOamBin: false,
+    },
+    {
+      state: "a bare oam command",
+      says: "resolves against the client's PATH",
+      entry: () => ({ command: "oam", args: ["run", "--no-check", writeFile(join(home, "broker.js"), "")] }),
+      byHandForOamBin: true,
+    },
+  ];
+
+  const cursorUserRow = (text: string): string => text.split("\n").find((l) => l.includes("Cursor (user):")) ?? "";
+
+  it("the launch-missing line, byte for byte: install removes the legacy entry, nothing by hand", async () => {
+    const gone = join(home, "gone", "oam");
+    writeFile(
+      cursorUserFile(),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] }, "mcp.hosting": { command: "npx" } },
+      }),
+    );
+    const d = await doctor();
+    expect(d.text).toContain(
+      `Cursor (user): has "${ENTRY_NAME}" entry, but its launch command does not exist: ${gone} -- the client cannot start yaw-mcp; rerun ` +
+        '`yaw-mcp install cursor`; legacy "mcp.hosting" entry also present -- install removes it as it writes the working entry\n',
+    );
+  });
+
+  it.each(
+    CANNOT_LAUNCH,
+  )("$state plus a legacy entry: install --repair removes the legacy key, and doctor never asked for it by hand", async ({
+    says,
+    entry,
+    byHandForOamBin,
+  }) => {
+    const path = writeFile(
+      cursorUserFile(),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: entry(), "mcp.hosting": { command: "npx" } } }),
+    );
+    const row = cursorUserRow((await doctor()).text);
+    expect(row).toContain(says);
+    expect(row).toContain(
+      'legacy "mcp.hosting" entry also present -- install removes it as it writes the working entry',
+    );
+    expect(row).not.toContain("remove it once the working entry is back");
+    const [, afterTrailer] = row.split("install removes it as it writes the working entry");
+    if (byHandForOamBin) {
+      // The one by-hand clause, and it names the step that does not trim.
+      expect(afterTrailer).toBe(
+        "; if you set OAM_BIN instead of rerunning install, remove it by hand once the working entry is back",
+      );
+    } else {
+      expect(afterTrailer).toBe("");
+      expect(row).not.toContain("by hand");
+    }
+    // Off a TTY the named rerun is refused with --repair named, and writes
+    // nothing: the legacy key is still there at this point.
+    const refused = await install();
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("Re-run with --repair");
+    const before = parseJsonc(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(before.mcpServers["mcp.hosting"]).toBeDefined();
+    // Follow it: the legacy key goes in the same write as the working entry.
+    const i = await install({ repair: true });
+    expect(i.exitCode).toBe(0);
+    const written = parseJsonc(readFileSync(path, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(written.mcpServers[ENTRY_NAME]).toBeDefined();
+    expect(written.mcpServers["mcp.hosting"]).toBeUndefined();
+    const after = (await doctor()).snapshot.clients.find((c) => c.clientId === "cursor" && c.scope === "user");
+    expect(after?.hasLegacyEntry).toBe(false);
+    expect(after?.launchCommandMissing).toBe(null);
+    expect(after?.launchOamEntryMissing).toBe(null);
+    expect(after?.launchOamNotAbsolute).toBe(null);
   });
 });
 

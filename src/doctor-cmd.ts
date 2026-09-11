@@ -2192,16 +2192,25 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // and the combined branch used to swallow it -- a config carrying both a
   // legacy entry and a rotted absolute command reported "OK" and told the user
   // to remove the OTHER entry, leaving only the broken one. When both are true
-  // the legacy trim hint is appended rather than dropped, so neither problem
-  // goes unnamed.
+  // the legacy entry is named rather than dropped, so neither problem goes
+  // unnamed.
   //
   // Hoisted above all THREE cannot-launch branches, not just the first: a
   // bare `oam` command (or a rotted oam entry file) plus a legacy entry used
   // to report only the launch problem, so fixing it took two doctor runs --
   // the legacy hint only appeared once the first fault was gone. All three
-  // states mean "cannot start", so all three carry the same trim hint.
+  // states mean "cannot start", so all three carry the same trailer.
+  //
+  // "install removes it", not "remove it once the working entry is back": each
+  // line's remedy is an install run, and install trims the legacy entry in the
+  // same write as the working one (unless --keep-legacy) -- off a TTY too, where
+  // the collision refusal names --repair and that run trims. The old wording
+  // sent the user to remove by hand an entry that run had already removed, the
+  // claim the lone-legacy line below dropped for the same reason. Only the
+  // bare-oam line offers a step that is not an install run (OAM_BIN), so only
+  // it adds a by-hand clause, scoped to that step.
   const legacy = c.hasLegacyEntry
-    ? `; legacy "${c.legacyEntryName}" entry also present -- remove it once the working entry is back`
+    ? `; legacy "${c.legacyEntryName}" entry also present -- install removes it as it writes the working entry`
     : "";
   if (c.launchCommandMissing) {
     return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
@@ -2213,7 +2222,10 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}`;
   }
   if (c.launchOamNotAbsolute) {
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}`;
+    const legacyOamBin = c.hasLegacyEntry
+      ? `${legacy}; if you set OAM_BIN instead of rerunning install, remove it by hand once the working entry is back`
+      : "";
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacyOamBin}`;
   }
   // Below the cannot-launch branches and above the OK ones: doctor knows
   // neither. The path is absolute on the OS the entry was written for, and
