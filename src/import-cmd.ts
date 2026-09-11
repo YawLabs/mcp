@@ -936,8 +936,8 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     }
   }
 
-  // Peel the entries out of the RAW BYTES with jsonc-parser, one key at a
-  // time, exactly as `uninstall` and `try-cleanup` do. A parse-and-reserialize
+  // Peel the entries out of the RAW BYTES with removeJsoncEntry (jsonc.ts), one
+  // key at a time, exactly as `uninstall` and `try-cleanup` do. A parse-and-reserialize
   // would take the user's comments -- and, in ~/.claude.json, the rest of
   // their Claude Code state -- with it.
   //

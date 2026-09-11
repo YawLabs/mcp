@@ -1107,9 +1107,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     }
     try {
       const next = editJsoncEntry(raw, resolved.containerPath, entryName, entry);
-      // Preserve the file's existing trailing-newline convention if present;
-      // editJsoncEntry returns the user's bytes verbatim outside the edit
-      // region, so a file that ended without a newline still won't.
+      // editJsoncEntry leaves the user's bytes alone outside what it splices,
+      // so a file that already ends in a newline keeps exactly the one it had;
+      // one that does not is given one here.
       return { ok: true, json: next.endsWith("\n") ? next : `${next}\n` };
     } catch (e) {
       printErr(

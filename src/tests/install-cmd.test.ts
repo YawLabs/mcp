@@ -4870,3 +4870,116 @@ describe("a DIRECTORY at the client config path", () => {
     expect(cap.stderr()).not.toContain("EISDIR");
   });
 });
+
+// The splice into an EXISTING client config must leave every other member's
+// bytes where they were. It used to re-render the entry before ours (expanded
+// onto new lines in a 2-space step inside a 4-space file) and hand that entry's
+// `// comment` to ours; uninstall deleted a comment trailing the entry before
+// ours. Whole-file toBe on purpose: the parsed VALUES were always right.
+describe("install / uninstall keep the neighbouring entries' bytes", () => {
+  const lf = (...lines: string[]): string => lines.join("\n");
+
+  it("cursor: install adds one separator comma and our lines; uninstall restores the file exactly", async () => {
+    const path = join(synthHome, ".cursor", "mcp.json");
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    const sibling =
+      '        "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }';
+    const before = lf("{", '    "mcpServers": {', `${sibling} // fs server`, "    }", "}", "");
+    writeFileSync(path, before, "utf8");
+
+    const inst = captureIo();
+    const r = await runInstall({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: inst.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = readFileSync(path, "utf8");
+    // The entry's VALUE is pinned elsewhere; here it is rendered back in the
+    // file's own 4-space step at the sibling's indent, which is the point.
+    const entry = (parseJsonc(after) as { mcpServers: Record<string, unknown> }).mcpServers[ENTRY_NAME];
+    const rendered = JSON.stringify(entry, null, 4).split("\n").join("\n        ");
+    expect(after).toBe(
+      lf(
+        "{",
+        '    "mcpServers": {',
+        `${sibling}, // fs server`,
+        `        "${ENTRY_NAME}": ${rendered}`,
+        "    }",
+        "}",
+        "",
+      ),
+    );
+
+    const un = captureIo();
+    const u = await runUninstall({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: un.io,
+    });
+    expect(u.exitCode).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  it("gemini-cli: uninstall removes exactly our line; the comments around it survive", async () => {
+    const path = join(synthHome, ".gemini", "settings.json");
+    mkdirSync(join(synthHome, ".gemini"), { recursive: true });
+    const head = [
+      "{",
+      '  "theme": "dark", // mine',
+      '  "mcpServers": {',
+      '    "filesystem": { "command": "x" }, // keep me',
+    ];
+    const tail = ['    "other": { "command": "y" } /* tail */', "  }", "}", ""];
+    writeFileSync(
+      path,
+      lf(...head, `    "${ENTRY_NAME}": { "command": "npx", "args": ["-y", "@yawlabs/mcp"] },`, ...tail),
+      "utf8",
+    );
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "gemini-cli",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(lf(...head, ...tail));
+  });
+
+  it("claude-code: the permissions.allow patch re-renders only the array, in the file's step", async () => {
+    const settingsPath = join(synthHome, ".claude", "settings.json");
+    mkdirSync(join(synthHome, ".claude"), { recursive: true });
+    const open = ["{", "    // user settings", '    "model": "opus", // pinned', '    "permissions": {'];
+    const close = ['        "deny": []', "    }", "}", ""];
+    writeFileSync(settingsPath, lf(...open, '        "allow": ["Bash(ls)"], // mine', ...close), "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(settingsPath, "utf8")).toBe(
+      lf(
+        ...open,
+        '        "allow": [',
+        '            "Bash(ls)",',
+        `            ${JSON.stringify(CLAUDE_CODE_ALLOW_PATTERN)}`,
+        "        ], // mine",
+        ...close,
+      ),
+    );
+  });
+});

@@ -1026,8 +1026,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   // Two write paths, mirroring try-cmd:
   //   - file pre-exists with object content -> splice the entry into the
-  //     ORIGINAL bytes via jsonc-parser, so comments, key order and the
-  //     user's indentation all survive;
+  //     ORIGINAL bytes via editJsoncEntry (jsonc.ts), so comments, key order,
+  //     the neighbouring entries and the user's indentation all survive;
   //   - file missing or empty -> nothing to preserve, so build the object and
   //     render it (this path also materializes a missing container chain).
   //
@@ -1095,12 +1095,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     try {
       let next = editJsoncEntry(spliceSource, containerPath, ENTRY_NAME, entryToWrite);
       // Trimmed in the SAME pass as the entry, so the file never lands on disk
-      // holding one without the other. Both edits go through jsonc-parser, so
+      // holding one without the other. Both edits are splices (jsonc.ts), so
       // the user's comments and formatting survive the removal exactly as they
       // survive the upsert.
       if (trimLegacy) next = removeJsoncEntry(next, containerPath, legacyEntry as string);
-      // editJsoncEntry returns the user's bytes verbatim outside the edited
-      // span, so a file that already ends in a newline keeps exactly the one it
+      // editJsoncEntry leaves the user's bytes alone outside what it splices,
+      // so a file that already ends in a newline keeps exactly the one it
       // had (never doubled). A file that does NOT is terminated here rather
       // than left unterminated -- POSIX tools and diffs both want the newline,
       // and install is rewriting the file anyway.
@@ -1667,9 +1667,10 @@ export interface BlockedContainerSegment {
  * First key along `containerPath` that holds a non-object, or null when the
  * chain is spliceable as-is.
  *
- * jsonc-parser's `modify` materializes MISSING intermediate keys but throws
- * "Can not add index to parent of type null" on one that exists and holds a
- * non-object -- an internal message naming neither the file nor the key. The
+ * editJsoncEntry materializes MISSING intermediate keys, but a key that exists
+ * and holds a non-object is left to jsonc-parser's `modify`, which throws
+ * "Can not add index to parent of type null" -- an internal message naming
+ * neither the file nor the key. The
  * pre-existing top-level check catches only a non-object ROOT, so `"mcpServers":
  * null` (hand-edited, or written by a tool that emptied it) reached the splice
  * and failed the whole install. Walking the chain here is what lets the caller
@@ -1689,7 +1690,7 @@ export function findBlockedContainerSegment(
   let node: Record<string, unknown> = root;
   for (let i = 0; i < containerPath.length; i++) {
     const value = node[containerPath[i]];
-    // Absent from here down: jsonc-parser builds the rest of the chain itself.
+    // Absent from here down: editJsoncEntry builds the rest of the chain itself.
     if (value === undefined) return null;
     if (typeof value === "object" && value !== null && !Array.isArray(value)) {
       node = value as Record<string, unknown>;
@@ -2764,7 +2765,7 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     try {
       let next = rawClient;
       // Both removals in ONE pass so the file never lands on disk holding one
-      // key without the other, and both through jsonc-parser so the user's
+      // key without the other, and both as splices (jsonc.ts) so the user's
       // comments and formatting survive.
       if (hasEntry) next = removeJsoncEntry(next, containerPath, ENTRY_NAME);
       if (trimLegacy) next = removeJsoncEntry(next, containerPath, legacyEntry as string);
