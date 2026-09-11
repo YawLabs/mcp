@@ -2798,7 +2798,10 @@ describe("runInstall --all", () => {
     // Seed BOTH user-scope clients (claude-code, cursor) with an existing
     // yaw-mcp entry so each sub-install collides. Non-TTY + no --force/--skip
     // => each would emit its own "already has entry and stdin is not a TTY"
-    // refusal. The consolidated path collapses them into one hint.
+    // refusal. The consolidated path collapses the SHARED half into one hint
+    // (each client's own diff still prints under its header -- see the
+    // "a DRIFTED entry off a TTY" describe), and exits 2: every client that
+    // did not succeed was refused, and none failed.
     const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
     mkdirSync(join(synthHome, ".cursor"), { recursive: true });
@@ -2813,14 +2816,15 @@ describe("runInstall --all", () => {
       io: cap.io,
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     const stderr = cap.stderr();
     // Exactly ONE "not a TTY" line, naming both clients, with the re-run hint.
     const ttyLines = stderr.split("\n").filter((l) => /stdin is not a TTY/.test(l));
     expect(ttyLines).toHaveLength(1);
     expect(stderr).toContain("claude-code");
     expect(stderr).toContain("cursor");
-    expect(stderr).toMatch(/--all --force/);
+    expect(stderr).toMatch(/--all --repair/);
+    expect(stderr).toMatch(/--force/);
     expect(stderr).toMatch(/--skip/);
   });
 
@@ -3741,12 +3745,12 @@ describe("runInstall --all — an all-refused run", () => {
     writeFileSync(join(synthHome, ".gemini", "settings.json"), JSON.stringify(seeded), "utf8");
   };
 
-  it("returns a trail with only the CONSOLIDATED refusal, not the swallowed per-client ones", async () => {
-    // The per-client stderr shim suppresses each sub-install's refusal, but the
-    // sub-install had already pushed it into its own `messages`, and those were
-    // spliced into the parent trail wholesale -- so the returned trail carried N
-    // lines the user never saw, plus the consolidated line, while `messages` is
-    // documented as exactly what was printed.
+  it("returns a trail with ONE shared refusal hint, matching the transcript", async () => {
+    // `messages` is documented as exactly what was printed. The shared half of
+    // the refusal ("stdin is not a TTY" and the flags) is printed once, after
+    // the loop, so it must appear once in the trail too -- not once per client
+    // on top of the consolidated line, which is what a trail that disagreed
+    // with the transcript used to carry.
     seedBothColliding();
     const cap = captureIo();
     const r = await runInstall({
@@ -3757,10 +3761,11 @@ describe("runInstall --all — an all-refused run", () => {
       io: cap.io,
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    // Every client refused, none failed: the "needs a flag" code.
+    expect(r.exitCode).toBe(2);
     const refusals = r.messages.filter((m) => /stdin is not a TTY/.test(m));
     expect(refusals).toHaveLength(1);
-    expect(refusals[0]).toContain("--all --force");
+    expect(refusals[0]).toContain("--all --repair");
     // The trail matches the transcript: one refusal on each side.
     expect(cap.stderr().split("stdin is not a TTY").length - 1).toBe(1);
   });
@@ -3779,7 +3784,7 @@ describe("runInstall --all — an all-refused run", () => {
       io: cap.io,
       oamProbe: OAM_ABSENT,
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(cap.stdout()).not.toContain(OAM_INSTALL_SH);
   });
 
@@ -4056,8 +4061,147 @@ describe("runInstall — idempotence (re-run over an entry that already matches)
     });
     expect(r2.exitCode).toBe(0);
     expect(r2.written).toEqual([]);
-    expect(second.stderr()).not.toMatch(/already have a/);
+    // No refusal of either shape: the consolidated hint says "already has" for
+    // one client and "already have" for several, and both carry this phrase.
+    expect(second.stderr()).not.toMatch(/stdin is not a TTY/);
     expect(second.stdout()).toMatch(/clients installed successfully/);
+  });
+});
+
+describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
+  // The drift here is the one a real user produces: a first `install --all`
+  // writes every client, then one client's entry grows an extra arg. The
+  // fixtures below are byte-exact, so the entry that first run writes is
+  // ASSERTED (installFresh) rather than assumed -- otherwise the diff line
+  // could describe some other entry and still pass.
+  const FRESH_ENTRY = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
+  const DIFF = 'args: ["-y","@yawlabs/mcp@latest","--stale-flag"] -> ["-y","@yawlabs/mcp@latest"]';
+  const cursorPath = (): string => join(synthHome, ".cursor", "mcp.json");
+  const allOpts = { os: "linux" as const, all: true, oamProbe: OAM_ABSENT };
+
+  const installFresh = async (): Promise<void> => {
+    const cap = captureIo();
+    const r = await runInstall({ ...allOpts, home: synthHome, cwd: synthCwd, io: cap.io });
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(cursorPath(), "utf8")).mcpServers[ENTRY_NAME]).toEqual(FRESH_ENTRY);
+  };
+  const drift = (path: string): void => {
+    const j = JSON.parse(readFileSync(path, "utf8"));
+    j.mcpServers[ENTRY_NAME].args.push("--stale-flag");
+    writeFileSync(path, `${JSON.stringify(j, null, 2)}\n`);
+  };
+  const rerun = async (extra: Partial<Parameters<typeof runInstall>[0]> = {}) => {
+    const cap = captureIo();
+    const r = await runInstall({ ...allOpts, home: synthHome, cwd: synthCwd, io: cap.io, ...extra });
+    return { r, stdout: cap.stdout(), stderr: cap.stderr() };
+  };
+
+  it("prints the drifted client's diff under its OWN header instead of swallowing it", async () => {
+    // The --all shim used to match the refusal's prose on stderr and drop the
+    // whole chunk, so the cursor section showed only Target/File and the user
+    // was told to pick a flag without seeing what any of them would change.
+    await installFresh();
+    drift(cursorPath());
+    const { r, stderr } = await rerun();
+    const refusal =
+      `yaw-mcp install: ${cursorPath()} already has a "${ENTRY_NAME}" entry -- left untouched.\n` +
+      "  It differs from the entry install would write:\n" +
+      `    ${DIFF}`;
+    // In the trail, between cursor's header and the next client's.
+    const header = r.messages.indexOf("-- cursor (user) --");
+    const next = r.messages.findIndex((m, i) => i > header && CLIENT_HEADER_LINE.test(m));
+    const at = r.messages.indexOf(refusal);
+    expect(header).toBeGreaterThanOrEqual(0);
+    expect(at).toBeGreaterThan(header);
+    expect(at).toBeLessThan(next);
+    // On stderr byte for byte, exactly once -- the trail matches the transcript.
+    expect(stderr.split(`${refusal}\n`).length - 1).toBe(1);
+    // A refusal, not a write.
+    expect(readFileSync(cursorPath(), "utf8")).toContain("--stale-flag");
+  });
+
+  it("exits 2 when the only non-success was a refusal, with a hint that leads with --repair", async () => {
+    // 2 is what the single-client refusal returns, so a script can tell "re-run
+    // with a flag" from "the write failed"; --all used to flatten it to 1.
+    await installFresh();
+    drift(cursorPath());
+    const { r, stderr } = await rerun();
+    expect(r.exitCode).toBe(2);
+    expect(stderr).toContain(
+      `yaw-mcp install --all: 1 client already has a differing "${ENTRY_NAME}" entry (cursor) and stdin is not a TTY.\n` +
+        "  Re-run `yaw-mcp install --all --repair` to bring it up to date, `--force` to overwrite it, `--skip` to leave it untouched, or `--dry-run` to preview.\n" +
+        "1/5 client install was refused (see the flags above). 4 succeeded.\n",
+    );
+    expect(r.messages[r.messages.length - 1]).toBe(
+      "1/5 client install was refused (see the flags above). 4 succeeded.",
+    );
+  });
+
+  it("says 'clients already have' and 'them' for more than one refusal, and each shows its own diff", async () => {
+    await installFresh();
+    drift(join(synthHome, ".claude.json"));
+    drift(cursorPath());
+    const { r, stderr } = await rerun();
+    expect(r.exitCode).toBe(2);
+    expect(stderr).toContain(
+      `yaw-mcp install --all: 2 clients already have a differing "${ENTRY_NAME}" entry (claude-code, cursor) and stdin is not a TTY.\n` +
+        "  Re-run `yaw-mcp install --all --repair` to bring them up to date, `--force` to overwrite them, `--skip` to leave them untouched, or `--dry-run` to preview.\n" +
+        "2/5 client installs were refused (see the flags above). 3 succeeded.\n",
+    );
+    expect(stderr.split(`already has a "${ENTRY_NAME}" entry -- left untouched.`).length - 1).toBe(2);
+  });
+
+  it("exits 1 when a real failure rides along with a refusal -- and still shows the refusal", async () => {
+    // A flag alone will not make this run succeed, so it is not a "needs a
+    // flag" exit. The malformed file is the canonical real failure (exit 1 on
+    // the single-client path too).
+    await installFresh();
+    drift(cursorPath());
+    writeFileSync(join(synthHome, ".gemini", "settings.json"), "{oops", "utf8");
+    const { r, stderr } = await rerun();
+    expect(r.exitCode).toBe(1);
+    expect(stderr).toContain("1/5 client install failed and 1 was refused (see the flags above). 3 succeeded.\n");
+    expect(stderr).toContain(`    ${DIFF}\n`);
+    expect(stderr).toContain("`yaw-mcp install --all --repair`");
+  });
+
+  it("--all --repair does what the hint promises: the drifted entry comes back up to date, exit 0", async () => {
+    await installFresh();
+    drift(cursorPath());
+    const { r, stderr, stdout } = await rerun({ repair: true });
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(cursorPath(), "utf8")).mcpServers[ENTRY_NAME]).toEqual(FRESH_ENTRY);
+    expect(stderr).not.toMatch(/stdin is not a TTY/);
+    expect(stdout).toContain("Done: 5/5 clients installed successfully.\n");
+  });
+
+  it("--all --dry-run previews the drifted entry's diff and writes nothing, as the hint promises", async () => {
+    await installFresh();
+    drift(cursorPath());
+    const before = readFileSync(cursorPath(), "utf8");
+    const { r, stdout } = await rerun({ dryRun: true });
+    expect(r.exitCode).toBe(0);
+    expect(stdout).toContain(`Would overwrite existing "${ENTRY_NAME}" entry.\n  ${DIFF}\n`);
+    expect(readFileSync(cursorPath(), "utf8")).toBe(before);
+  });
+
+  it("--dry-run closes on what WOULD be installed, never 'installed successfully'", async () => {
+    // Nothing is written on a dry run, so its last line -- the one a user reads
+    // as the verdict -- must not say the clients were installed.
+    const { r, stdout } = await rerun({ dryRun: true });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(r.messages[r.messages.length - 1]).toBe("Dry run: 5/5 clients would be installed; nothing written.");
+    expect(stdout).not.toContain("installed successfully");
+  });
+
+  it("a dry run that could not preview a client says so in dry-run terms, exit 1", async () => {
+    mkdirSync(join(synthHome, ".gemini"), { recursive: true });
+    writeFileSync(join(synthHome, ".gemini", "settings.json"), "{oops", "utf8");
+    const { r, stdout, stderr } = await rerun({ dryRun: true });
+    expect(r.exitCode).toBe(1);
+    expect(stderr).toContain("Dry run: 1/5 client preview failed. 4 would be installed; nothing written.\n");
+    expect(stdout).not.toContain("installed successfully");
   });
 });
 
@@ -4069,10 +4213,10 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
     );
   };
 
-  it("the off-TTY refusal names the fields, and keeps the phrase --all matches on", async () => {
-    // runInstallAll consolidates N refusals by matching the `already has a
-    // "mcp" entry and stdin is not a TTY` phrase, so the diff has to be
-    // appended AFTER it rather than spliced into it.
+  it("the off-TTY refusal names the fields, why it refused, and the flags", async () => {
+    // The single-client refusal carries all three halves in one message. (Under
+    // --all the "not a TTY" + flags half is printed once for the run instead;
+    // runInstallAll reads the refusal from `collisionRefused`, not this prose.)
     seedStale({ command: "old-broker", args: ["--serve"] });
     const cap = captureIo();
     const r = await runInstall({
