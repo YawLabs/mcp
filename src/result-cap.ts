@@ -68,7 +68,18 @@ export interface CapResult {
   /** True when anything was dropped. The caller logs on this rather than
    *  comparing byte counts, so a no-op cap stays silent. */
   capped: boolean;
+  /** Serialized size of the body handed in, array framing included -- the
+   *  number the notice quotes to the model and the caller logs. Measured by
+   *  serializedBytes, the same function health's upstream figure goes through,
+   *  so the two cannot be measured two different ways for one call. */
   bytesRaw: number;
+  /** Serialized size of the content blocks KEPT, summed per block and
+   *  excluding the notice -- deliberately not the same shape as `bytesRaw`
+   *  above, because this one is the budget the loop spent rather than a body
+   *  anything else measures. Nothing outside this module reads it, so it has
+   *  no counterpart to drift from; `bytesRaw - bytesKept` is therefore an
+   *  approximation of what was cut, off by the framing, and is not what the
+   *  health counters use to report the saving. */
   bytesKept: number;
 }
 
@@ -141,14 +152,33 @@ function fitTextBlock(item: CapContent, budget: number): { block: CapContent; si
   return best;
 }
 
-function serializedBytes(item: CapContent): number {
+/** Serialized size, in UTF-8 bytes, of ONE content block or of a WHOLE content
+ *  array -- whichever it is handed. JSON.stringify treats the two identically,
+ *  and that is the point: an array measured this way carries its own `[`, `]`
+ *  and separating commas, and the same call on a single block does not.
+ *
+ *  The one rule for "how big is this body", exported so server.ts's
+ *  measureResultBytes uses it instead of a second copy. It had a second copy,
+ *  and the two disagreed: capContent summed the blocks while measureResultBytes
+ *  serialized the array, so the byte total in the "result exceeded the size
+ *  ceiling" warning came out exactly the array framing BELOW the total health
+ *  booked for the very same call -- 2 bytes on a one-block result, N+1 on N
+ *  blocks. Measured on a 204814-byte text block: 208703 summed per block
+ *  against 208705 for the array. Two bytes do not matter; an operator deciding
+ *  whether to move the ceiling reading two different numbers for one quantity
+ *  does, and the only durable fix for that is one function rather than two that
+ *  happen to agree.
+ *
+ *  Infinity, NOT zero, when the value cannot be serialized -- a cyclic block, a
+ *  BigInt, a toJSON that throws. An unmeasurable payload is exactly the kind
+ *  this ceiling exists to stop, and calling it free would let it through every
+ *  time. measureResultBytes draws the same distinction and resolves it the
+ *  other way (null), because its job is to record a measurement rather than to
+ *  refuse one. */
+export function serializedBytes(value: unknown): number {
   try {
-    return Buffer.byteLength(JSON.stringify(item), "utf8");
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
   } catch {
-    // A cyclic or otherwise unserializable block cannot be measured. Treat it
-    // as over-budget rather than as free: an unmeasurable block is exactly
-    // the kind this ceiling exists to stop, and calling it zero would let it
-    // through every time.
     return Number.POSITIVE_INFINITY;
   }
 }
@@ -172,14 +202,34 @@ function serializedBytes(item: CapContent): number {
  *  reads to the model as a complete one, which is the failure this module
  *  exists to prevent. */
 export function capContent(content: CapContent[], maxBytes: number): CapResult {
-  let bytesRaw = 0;
-  for (const item of content) {
-    const b = serializedBytes(item);
-    bytesRaw += Number.isFinite(b) ? b : 0;
+  // Measured as the ARRAY, not as the sum of its blocks, so that this number
+  // and the one health books for the same call come out of one function --
+  // see serializedBytes. The difference is the array's own framing: brackets
+  // plus the commas between blocks, N+1 bytes on N blocks.
+  //
+  // An array that will not serialize as a whole still has to report a number,
+  // and Infinity is not one, so fall back to summing the blocks that do
+  // serialize -- the behaviour this had unconditionally. That fallback is the
+  // one case where the two sites can still disagree, and it is unreachable
+  // through handleToolCall: a body off the wire has been through JSON.parse
+  // and is acyclic by construction, which is the same reason measureResultBytes
+  // documents its null branch as reachable only from a unit test.
+  let bytesRaw = serializedBytes(content);
+  if (!Number.isFinite(bytesRaw)) {
+    bytesRaw = 0;
+    for (const item of content) {
+      const b = serializedBytes(item);
+      bytesRaw += Number.isFinite(b) ? b : 0;
+    }
   }
   if (maxBytes <= 0 || content.length === 0) {
     return { content, capped: false, bytesRaw, bytesKept: bytesRaw };
   }
+  // The per-block check is not redundant with the total above it. A finite
+  // array measurement already implies every block serialized -- but the
+  // fallback that produced `bytesRaw` when it did NOT is a sum that skips the
+  // unmeasurable blocks, and that sum can land under the ceiling. This is what
+  // keeps a body the module cannot measure out of the untouched-passthrough.
   if (bytesRaw <= maxBytes && content.every((i) => Number.isFinite(serializedBytes(i)))) {
     return { content, capped: false, bytesRaw, bytesKept: bytesRaw };
   }

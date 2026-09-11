@@ -194,15 +194,35 @@ describe("capContent", () => {
   });
 
   it("does not cap a result that sits exactly on the ceiling", () => {
-    // Measured PER BLOCK, the way capContent sums it. Measuring the array
-    // instead adds two bytes for the brackets, which put this fixture two
-    // under the ceiling -- where an off-by-one in the comparison is
-    // invisible.
-    const one = text("a".repeat(100));
-    const size = Buffer.byteLength(JSON.stringify(one), "utf8");
-    expect(capContent([one], size).capped).toBe(false);
+    // Measured as the ARRAY, the way capContent measures it -- brackets
+    // included. The fixture has to sit EXACTLY on the boundary or an
+    // off-by-one in the comparison is invisible, so measuring the block alone
+    // (two bytes less) would leave this one under the ceiling and prove
+    // nothing.
+    const content = [text("a".repeat(100))];
+    const size = Buffer.byteLength(JSON.stringify(content), "utf8");
+    expect(capContent(content, size).capped).toBe(false);
     // And one byte under it does cap, which pins the boundary from the other
     // side.
-    expect(capContent([one], size - 1).capped).toBe(true);
+    expect(capContent(content, size - 1).capped).toBe(true);
+  });
+
+  it("counts the array's own framing, so the total matches what the body serializes to", () => {
+    // The number in the "exceeded the size ceiling" warning and the number
+    // health books upstream for the same call are one quantity. They were
+    // measured two ways -- this summed the blocks, measureResultBytes
+    // serialized the array -- so they disagreed by the framing: the brackets,
+    // plus a comma between each pair of blocks.
+    for (const n of [1, 2, 5]) {
+      const content = Array.from({ length: n }, (_, i) => text(`${i}`.repeat(2_000)));
+      const summed = content.reduce((acc, b) => acc + Buffer.byteLength(JSON.stringify(b), "utf8"), 0);
+      const serialized = Buffer.byteLength(JSON.stringify(content), "utf8");
+      // The gap this fixture exists to expose, pinned so a fixture that cannot
+      // tell the two rules apart fails here rather than passing silently.
+      expect(serialized - summed).toBe(n + 1);
+      // Both sides of the ceiling: a capped body and an untouched one.
+      expect(capContent(content, 1_000).bytesRaw).toBe(serialized);
+      expect(capContent(content, 1_000_000).bytesRaw).toBe(serialized);
+    }
   });
 });

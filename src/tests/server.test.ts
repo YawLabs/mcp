@@ -40,6 +40,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 
 import { CONFIG_DIRNAME } from "../paths.js";
 import { isRoutingFaultResult } from "../proxy.js";
+import { capContent } from "../result-cap.js";
 import {
   ConnectServer,
   computeToolOverlaps,
@@ -8010,6 +8011,100 @@ describe("measureResultBytes", () => {
     // server.ts does not enforce it; an absent one is zero bytes of body, and
     // returning null would suppress the booking of a real call.
     expect(measureResultBytes({})).toBe(Buffer.byteLength("[]", "utf8"));
+  });
+
+  it("books the same number the result cap reports for the same body", () => {
+    // One real call returning 204814 bytes of text produced TWO totals for one
+    // quantity: health said 207991 upstream and the cap's stderr warning said
+    // 207989. The gap was the array's own framing -- this site serialized the
+    // array, the cap summed its blocks -- so it grew with the block count
+    // rather than staying at two. Both now go through one function.
+    //
+    // Deliberately a cross-module assertion: neither module's own suite could
+    // catch this, because each was self-consistent. The disagreement existed
+    // only between them.
+    for (const n of [1, 2, 7]) {
+      const content = Array.from({ length: n }, (_, i) => ({ type: "text", text: `row ${i}\n`.repeat(9_000) }));
+      expect(measureResultBytes({ content })).toBe(capContent(content, 100_000).bytesRaw);
+    }
+  });
+
+  it("counts structuredContent, which the cap cannot see, so the two differ by exactly that", () => {
+    // The one gap left between the two sites, pinned rather than left to be
+    // rediscovered as drift. structuredContent bypasses the pruner and the cap
+    // by design, so the cap's total is the content array alone while this one
+    // is the whole body -- a real difference in quantity, not two rules for
+    // one. handleToolCall names the bypassed bytes in the same warning line so
+    // an operator can close the arithmetic.
+    const content = [{ type: "text", text: "x".repeat(200_000) }];
+    const structuredContent = { rows: [1, 2, 3], note: "mirrored" };
+    expect(measureResultBytes({ content, structuredContent })).toBe(
+      capContent(content, 100_000).bytesRaw + Buffer.byteLength(JSON.stringify(structuredContent), "utf8"),
+    );
+  });
+});
+
+describe("the result cap's warning and the health counter describe one call", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await server.shutdown();
+  });
+
+  it("books a total the operator can reconcile against the warning line", async () => {
+    // The two unit tests above pin the measuring functions. This one pins the
+    // two SURFACES an operator actually reads, which is where the numbers were
+    // seen to disagree: health rendered one total and the stderr warning
+    // another for the same call, two bytes apart, and nothing in either
+    // module's own suite could see it.
+    //
+    // log() drops warn-level lines when LOG_LEVEL is `error`, so an operator
+    // shell exporting that would turn this red for reasons unrelated to bytes.
+    vi.stubEnv("LOG_LEVEL", "warn");
+    const writes: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") writes.push(chunk);
+      return true;
+    });
+
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const conn = makeConnection("gh", ["big"]);
+    // structuredContent both stands the pruner down and rides through the cap
+    // untouched, so the body the cap measured is the upstream body verbatim --
+    // which is what makes the arithmetic below exact rather than approximate.
+    const structuredContent = { rows: 42, note: "mirrors the text block" };
+    const content = [{ type: "text", text: "log line\n".repeat(30_000) }];
+    conn.client.callTool = vi.fn().mockResolvedValue({ content, structuredContent });
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await priv.handleToolCall("gh_big", {});
+
+    const line = writes.find((w) => w.includes("exceeded the size ceiling"));
+    expect(line, "the cap did not warn -- the fixture is under the ceiling").toBeDefined();
+    const warned = JSON.parse((line as string).trim());
+
+    // What the cap measured against its ceiling: the content array, framing
+    // included. Not the sum of its blocks, which is what it used to report.
+    expect(warned.bytesRaw).toBe(Buffer.byteLength(JSON.stringify(content), "utf8"));
+    expect(warned.maxBytes).toBe(100_000);
+    // The bytes the cap is documented not to touch, named next to the number
+    // rather than folded into it -- folding them in would falsify both
+    // `maxBytes` beside it and the notice the model reads.
+    expect(warned.bytesStructuredUncapped).toBe(Buffer.byteLength(JSON.stringify(structuredContent), "utf8"));
+
+    // And the operator's arithmetic closes exactly: the two figures in the
+    // warning add up to the one health books upstream. That is the whole
+    // claim, and it was off by the array's brackets.
+    const health = priv.connections.get("gh").health;
+    expect(health.resultBytesUpstream).toBe(warned.bytesRaw + warned.bytesStructuredUncapped);
   });
 });
 
