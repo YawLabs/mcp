@@ -31,7 +31,7 @@ import {
   summarizeBundles,
   TOKEN_FLAG_DEPRECATION,
 } from "../install-cmd.js";
-import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME } from "../install-targets.js";
+import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME, INSTALL_TARGETS } from "../install-targets.js";
 import { parseJsonc } from "../jsonc.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe, oamNoBinaryReason } from "../oam-spawn.js";
 
@@ -2795,13 +2795,14 @@ describe("runInstall --all", () => {
   });
 
   it("consolidates collision-without-flag refusals into ONE hint", async () => {
-    // Seed BOTH user-scope clients (claude-code, cursor) with an existing
-    // yaw-mcp entry so each sub-install collides. Non-TTY + no --force/--skip
-    // => each would emit its own "already has entry and stdin is not a TTY"
-    // refusal. The consolidated path collapses the SHARED half into one hint
-    // (each client's own diff still prints under its header -- see the
-    // "a DRIFTED entry off a TTY" describe), and exits 2: every client that
-    // did not succeed was refused, and none failed.
+    // Seed two of the clients --all plans on linux (claude-code, cursor) with
+    // a differing yaw-mcp entry so each sub-install collides. Non-TTY + no
+    // --force/--repair/--skip => each refuses. Under --all a refusing client
+    // prints only its own half under its header ("already has a ... entry --
+    // left untouched." and its diff -- see the "a DRIFTED entry off a TTY"
+    // describe); the SHARED half ("stdin is not a TTY" and the flags) prints
+    // once, as one hint. The run exits 2: every client that did not succeed
+    // was refused, and none failed.
     const seeded = { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify(seeded), "utf8");
     mkdirSync(join(synthHome, ".cursor"), { recursive: true });
@@ -2818,14 +2819,18 @@ describe("runInstall --all", () => {
     });
     expect(r.exitCode).toBe(2);
     const stderr = cap.stderr();
-    // Exactly ONE "not a TTY" line, naming both clients, with the re-run hint.
-    const ttyLines = stderr.split("\n").filter((l) => /stdin is not a TTY/.test(l));
+    // Exactly ONE "not a TTY" line, naming both clients, with the re-run hint
+    // on the line after it. Checked on those two lines rather than all of
+    // stderr: cursor's own refusal prints its path (.cursor/mcp.json), so a
+    // whole-stderr match on "cursor" passes whether the hint names it or not.
+    const lines = stderr.split("\n");
+    const ttyLines = lines.filter((l) => /stdin is not a TTY/.test(l));
     expect(ttyLines).toHaveLength(1);
-    expect(stderr).toContain("claude-code");
-    expect(stderr).toContain("cursor");
-    expect(stderr).toMatch(/--all --repair/);
-    expect(stderr).toMatch(/--force/);
-    expect(stderr).toMatch(/--skip/);
+    expect(ttyLines[0]).toContain("(claude-code, cursor)");
+    const hint = lines[lines.indexOf(ttyLines[0]) + 1];
+    expect(hint).toContain("`yaw-mcp install --all --repair`");
+    expect(hint).toContain("`--force`");
+    expect(hint).toContain("`--skip`");
   });
 
   it("--all --force overwrites colliding clients without the consolidated hint", async () => {
@@ -4149,6 +4154,8 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
         "2/5 client installs were refused (see the flags above). 3 succeeded.\n",
     );
     expect(stderr.split(`already has a "${ENTRY_NAME}" entry -- left untouched.`).length - 1).toBe(2);
+    // ...and each of the two carries its own diff, not just its header line.
+    expect(stderr.split(`    ${DIFF}\n`).length - 1).toBe(2);
   });
 
   it("exits 1 when a real failure rides along with a refusal -- and still shows the refusal", async () => {
@@ -4202,6 +4209,27 @@ describe("runInstall --all -- a DRIFTED entry off a TTY", () => {
     expect(r.exitCode).toBe(1);
     expect(stderr).toContain("Dry run: 1/5 client preview failed. 4 would be installed; nothing written.\n");
     expect(stdout).not.toContain("installed successfully");
+  });
+
+  it("a one-client run says 'client', not 'clients', on both the Done and the Dry-run line", async () => {
+    // No OS plans exactly one client, so the singular is reachable only by
+    // narrowing the table for this test; without it, a hard-coded "clients" in
+    // either closing line passed the whole suite. Restored in `finally` --
+    // every other test reads the same array.
+    const saved = INSTALL_TARGETS.splice(0, INSTALL_TARGETS.length);
+    try {
+      INSTALL_TARGETS.push(...saved.filter((t) => t.clientId === "cursor"));
+      const dry = await rerun({ dryRun: true });
+      expect(dry.r.exitCode).toBe(0);
+      expect(dry.r.messages[dry.r.messages.length - 1]).toBe(
+        "Dry run: 1/1 client would be installed; nothing written.",
+      );
+      const real = await rerun();
+      expect(real.r.exitCode).toBe(0);
+      expect(real.r.messages[real.r.messages.length - 1]).toBe("Done: 1/1 client installed successfully.");
+    } finally {
+      INSTALL_TARGETS.splice(0, INSTALL_TARGETS.length, ...saved);
+    }
   });
 });
 

@@ -369,10 +369,12 @@ export interface InstallResult {
   /** Process exit code. 0 = success, non-zero = refused/error. */
   exitCode: number;
   /** True when the run stopped at the off-TTY collision refusal (exit 2): a
-   *  DIFFERING entry is in place, there was no TTY to ask on, and no
-   *  --force/--repair/--skip answered up front. `install --all` counts a
-   *  client as refused rather than failed from this field -- never by matching
-   *  the refusal's prose, which is how it once swallowed the diff with it. */
+   *  DIFFERING entry is in place, there was no TTY to ask on, and nothing
+   *  answered up front -- no --force/--repair/--skip, and no --dry-run (a
+   *  preview takes the overwrite branch, so it never refuses). `install --all`
+   *  counts a client as refused rather than failed from this field -- never by
+   *  matching the refusal's prose, which is how it once swallowed the diff
+   *  with it. */
   collisionRefused?: boolean;
 }
 
@@ -2245,9 +2247,10 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
  *    0  every planned client succeeded -- written, already correct, or left
  *       alone by --skip / a "skip" answer.
  *    2  nothing failed, but at least one client was REFUSED: a differing entry
- *       with no TTY to ask on and no --force/--repair/--skip. The code the
- *       single-client refusal returns, for the same reason: a script can tell
- *       "re-run with a flag" from "the write failed" without parsing prose.
+ *       with no TTY to ask on and no --force/--repair/--skip or --dry-run to
+ *       answer it. The code the single-client refusal returns, for the same
+ *       reason: a script can tell "re-run with a flag" from "the write failed"
+ *       without parsing prose.
  *    1  at least one client failed outright (an unreadable or malformed
  *       config, a refused write, an abort or cancel at the prompt), refused
  *       clients or not -- a flag alone will not make that run succeed. */
