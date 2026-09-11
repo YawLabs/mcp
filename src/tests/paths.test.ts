@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Confines the candidate probe to the synthetic trees a test created. OUTSIDE
@@ -63,10 +63,22 @@ describe("tildePath", () => {
     expect(tildePath("/home/u-old/.cursor/mcp.json", "/home/u", "/")).toBe("/home/u-old/.cursor/mcp.json");
   });
 
-  it("leaves a path outside home, a relative label and an empty home untouched", () => {
+  it("leaves a path outside home untouched", () => {
     expect(tildePath("/etc/x.json", "/home/u", "/")).toBe("/etc/x.json");
-    expect(tildePath("(n/a)", "/home/u", "/")).toBe("(n/a)");
-    expect(tildePath("/home/u/x.json", "", "/")).toBe("/home/u/x.json");
+  });
+
+  // path.resolve anchors a relative path on the cwd, and resolves an empty
+  // home TO the cwd. The two guards that keep both out are only observable
+  // where that anchor would match, so these fixtures sit there: a home above
+  // the cwd, and a path under it. With a home like /home/u both pass with the
+  // guards deleted.
+  it("leaves a relative label untouched even when the cwd is under home", () => {
+    expect(tildePath("(n/a)", dirname(process.cwd()), "/")).toBe("(n/a)");
+  });
+
+  it("leaves a path untouched when home is empty, even one under the cwd", () => {
+    const underCwd = join(process.cwd(), "x.json");
+    expect(tildePath(underCwd, "", "/")).toBe(underCwd);
   });
 
   it("treats a root home as already ending at a separator", () => {
