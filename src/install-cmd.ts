@@ -29,8 +29,9 @@
 //   - Existing client file with malformed JSON  → refuse, point at the file.
 //   - Existing `mcp` entry that differs         → prompt (TTY) or refuse
 //                                                  (exit 2) off one, unless
-//                                                  --repair (keeps its env),
-//                                                  --force (drops it) or
+//                                                  --repair (keeps its env's
+//                                                  string values), --force
+//                                                  (drops all of it) or
 //                                                  --skip answers up front.
 //                                                  One that already matches
 //                                                  is a no-op.
@@ -106,7 +107,8 @@ export interface InstallCommandOptions {
    *  entry written carries no `env` from the one it replaces (the carry-over in
    *  runInstall is skipped), so this is the flag that purges a wrong
    *  YAW_MCP_VAULT_PASSPHRASE or a stale OAM_BIN; install names each env key it
-   *  drops. Mutually exclusive with `repair`, which keeps that env. */
+   *  drops. Mutually exclusive with `repair`, which keeps that env's string
+   *  values. */
   force?: boolean;
   /** Replace an existing entry that DIFFERS from the one this run would write,
    *  without prompting, KEEPING the existing entry's string-valued `env`.
@@ -678,13 +680,14 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // And --force with --repair, for the same reason. The pair used to be
   // allowed as agreeing ("do not prompt, write the entry"), which held only
   // while the two flags wrote byte-identical entries. They no longer do:
-  // --force drops the existing entry's env and --repair keeps it, so honoring
-  // either one silently discards the other -- and picking the env-dropping one
-  // is how a scripted run loses a vault passphrase nobody asked it to remove.
+  // --force drops the existing entry's env and --repair keeps its string
+  // values, so honoring either one silently discards the other -- and picking
+  // the env-dropping one is how a scripted run loses a vault passphrase nobody
+  // asked it to remove.
   if (opts.force && opts.repair) {
     err(
       "yaw-mcp install: --force and --repair are mutually exclusive -- --force drops the existing entry's env, " +
-        "--repair keeps it. Pass one.",
+        "--repair keeps its string values. Pass one.",
     );
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
@@ -952,13 +955,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // too), so a multi-key drop names its keys in the order the `env: drops ...`
   // diff line does rather than the same set twice in two orders. "Dropping",
   // not "Dropped": the line prints before the write, which can still fail.
+  //
+  // carriedKeys is shared with the TTY prompt and the off-TTY hint below. Both
+  // name the kept keys rather than saying "its env", for the same readEntryAt
+  // reason, and in the same sorted order.
+  const carriedKeys = carryableEnv ? Object.keys(carryableEnv).sort() : [];
   if (carryableEnv) {
-    const keyList = Object.keys(carryableEnv).sort();
-    const keys = keyList.join(", ");
+    const keys = carriedKeys.join(", ");
     if (opts.force) {
       runtimeLines.push(
         `${opts.dryRun ? "Would drop" : "Dropping"} existing env on the ${ENTRY_NAME} entry (--force): ${keys}. ` +
-          `(--repair would keep ${keyList.length === 1 ? "it" : "them"}; --force does not.)`,
+          `(--repair would keep ${carriedKeys.length === 1 ? "it" : "them"}; --force does not.)`,
       );
     } else {
       runtimeLines.push(`Kept existing env on the ${ENTRY_NAME} entry: ${keys}`);
@@ -1004,7 +1011,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       return { written: [], wouldWrite: [], messages, exitCode: 0 };
     } else if (opts.promptAnswer) decision = opts.promptAnswer;
     else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {
-      const answer = await promptCollision(resolved.absolute, diff, opts.io, entryToWrite !== newEntry);
+      const answer = await promptCollision(
+        resolved.absolute,
+        diff,
+        opts.io,
+        entryToWrite !== newEntry ? carriedKeys : [],
+      );
       if (answer === "skip") {
         log(`Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`);
         return { written: [], wouldWrite: [], messages, exitCode: 0 };
@@ -1018,11 +1030,14 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       //
       // When the stored entry has env to carry, the two write flags stop being
       // interchangeable, and this line is where a scripted user picks one: the
-      // diff above was computed WITH the env carried (no `env:` line), so
-      // nothing here would warn that --force removes it.
+      // diff above was computed WITH the env carried, so it has no `env:` line
+      // for the carried keys and nothing here would warn that --force removes
+      // them. It names those keys rather than saying --repair keeps "its env":
+      // a non-string value is filtered out by readEntryAt, goes on either flag,
+      // and is named by the `env: drops ...` line of the diff above.
       const flagHint = carryableEnv
-        ? "  Re-run with --repair to bring it up to date (keeping its env), --force to overwrite it outright " +
-          "(dropping its env), --skip to leave it, or --dry-run to preview."
+        ? `  Re-run with --repair to bring it up to date (keeping env: ${carriedKeys.join(", ")}), ` +
+          "--force to overwrite it outright (dropping its env), --skip to leave it, or --dry-run to preview."
         : "  Re-run with --repair to bring it up to date, --force to overwrite, --skip to leave it, or --dry-run to preview.";
       err(
         `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry and stdin is not a TTY.\n` +
@@ -1667,16 +1682,20 @@ function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
   return a.mtimeMs === b.mtimeMs && a.size === b.size;
 }
 
-/** `keepsEnv`: the entry an [o]verwrite answer writes carries the stored
- *  entry's env (runInstall's carry-over runs on this path). The question says
- *  so because `--force`, which USAGE also calls an overwrite, DROPS that env,
- *  and the diff above the question lists only what changes -- so a kept env
- *  would otherwise go unmentioned and "overwrite" would mean two things. */
+/** `keptEnvKeys`: the stored env keys that the entry an [o]verwrite answer
+ *  writes carries over (runInstall's carry-over runs on this path), sorted;
+ *  empty when it carries none. The question names them because `--force`,
+ *  which USAGE also calls an overwrite, DROPS that env, and the diff above the
+ *  question lists only what changes -- so a kept env would otherwise go
+ *  unmentioned and "overwrite" would mean two things. KEYS, not "its env":
+ *  readEntryAt filters out a non-string value, so an overwrite of a mixed env
+ *  does not keep all of it, and the diff line above the question names the
+ *  key that goes. */
 async function promptCollision(
   path: string,
   diff: string[],
   io: InstallCommandOptions["io"],
-  keepsEnv: boolean,
+  keptEnvKeys: string[],
 ): Promise<"overwrite" | "skip" | "abort" | "cancelled"> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
@@ -1693,7 +1712,7 @@ async function promptCollision(
       rl,
       `${path} already has an "${ENTRY_NAME}" entry that differs from the one install would write:\n` +
         `${indentDiff(diff, "    ")}\n` +
-        `  [o]verwrite${keepsEnv ? " (keeping its env)" : ""}, [s]kip, or [a]bort? (default: skip) `,
+        `  [o]verwrite${keptEnvKeys.length > 0 ? ` (keeping env: ${keptEnvKeys.join(", ")})` : ""}, [s]kip, or [a]bort? (default: skip) `,
     );
     if (raw === QUESTION_CANCELLED) return "cancelled";
     const answer = raw.trim().toLowerCase();
@@ -2447,7 +2466,7 @@ async function runInstallAll(
   // that would strip a vault passphrase out of every client at once.
   if (collisionClients.length > 0) {
     err(
-      `yaw-mcp install --all: ${collisionClients.length} client${collisionClients.length === 1 ? "" : "s"} already have a "${ENTRY_NAME}" entry (${collisionClients.join(", ")}) and stdin is not a TTY.\n  Re-run \`yaw-mcp install --all --repair\` to bring them up to date (keeping each entry's env), \`--force\` to overwrite them outright (dropping it), or \`--skip\` to leave them untouched.`,
+      `yaw-mcp install --all: ${collisionClients.length} client${collisionClients.length === 1 ? "" : "s"} already have a "${ENTRY_NAME}" entry (${collisionClients.join(", ")}) and stdin is not a TTY.\n  Re-run \`yaw-mcp install --all --repair\` to bring them up to date (keeping the string values in each entry's env), \`--force\` to overwrite them outright (dropping all of it), or \`--skip\` to leave them untouched.`,
     );
   }
 

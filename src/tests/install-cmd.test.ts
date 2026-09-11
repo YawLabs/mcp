@@ -3046,8 +3046,8 @@ describe("runInstall --all", () => {
     // used to name `--all --force` alone, the one copy-paste that strips a
     // vault passphrase out of every client at once.
     expect(stderr.split("\n")).toContain(
-      "  Re-run `yaw-mcp install --all --repair` to bring them up to date (keeping each entry's env), " +
-        "`--force` to overwrite them outright (dropping it), or `--skip` to leave them untouched.",
+      "  Re-run `yaw-mcp install --all --repair` to bring them up to date (keeping the string values in each " +
+        "entry's env), `--force` to overwrite them outright (dropping all of it), or `--skip` to leave them untouched.",
     );
   });
 
@@ -3188,7 +3188,7 @@ describe("install usage", () => {
     expect(INSTALL_USAGE).toMatch(/local-only/);
   });
 
-  it("says --force drops the old entry's env and --repair keeps it", () => {
+  it("says --force drops the old entry's env and --repair keeps its string values", () => {
     // The usage used to say only "--force  Overwrite whatever is there." while
     // the code carried the old env across on --force exactly as on --repair.
     expect(INSTALL_USAGE).toContain(
@@ -4461,11 +4461,36 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
     expect(cap.stderr()).not.toContain("hunter2");
     expect(cap.stdout()).not.toContain("hunter2");
     // ...which is exactly why the hint has to say it: the diff above shows no
-    // env change, and --force would drop the whole block.
+    // env change, and --force would drop the whole block. Keys sorted, not in
+    // the order they were stored.
     expect(cap.stderr().split("\n")).toContain(
-      "  Re-run with --repair to bring it up to date (keeping its env), --force to overwrite it outright " +
-        "(dropping its env), --skip to leave it, or --dry-run to preview.",
+      "  Re-run with --repair to bring it up to date (keeping env: KEEP, YAW_MCP_VAULT_PASSPHRASE), " +
+        "--force to overwrite it outright (dropping its env), --skip to leave it, or --dry-run to preview.",
     );
+  });
+
+  it("the off-TTY hint names only the env keys --repair keeps when a stored value is not a string", async () => {
+    // readEntryAt filters a non-string value out of the carry-over, so --repair
+    // does NOT keep all of this env. The diff says DEBUG goes; the hint under
+    // it must not then claim the env is kept.
+    seedStale({ command: "old", args: [], env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2", DEBUG: 1 } });
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, isTTY: false },
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(2);
+    const lines = cap.stderr().split("\n");
+    expect(lines).toContain("    env: drops DEBUG (values not shown)");
+    expect(lines).toContain(
+      "  Re-run with --repair to bring it up to date (keeping env: YAW_MCP_VAULT_PASSPHRASE), " +
+        "--force to overwrite it outright (dropping its env), --skip to leave it, or --dry-run to preview.",
+    );
+    expect(cap.stderr()).not.toContain("hunter2");
   });
 
   it("--repair replaces a drifted entry with no prompt", async () => {
@@ -4531,12 +4556,12 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
 
   it("--force and --repair are refused as contradictory (exit 2), per client and under --all", async () => {
     // Allowed while the two wrote byte-identical entries; they no longer do
-    // (--force drops env, --repair keeps it), so honoring either silently
+    // (--force drops env, --repair keeps its string values), so honoring either silently
     // discards the other. Refused above the --all dispatch, so --all says it
     // once rather than once per planned client -- and before the oam probe.
     const expected = [
       "yaw-mcp install: --force and --repair are mutually exclusive -- --force drops the existing entry's env, " +
-        "--repair keeps it. Pass one.\n",
+        "--repair keeps its string values. Pass one.\n",
     ];
     for (const target of [{ clientId: "cursor" as const, scope: "user" as const }, { all: true }]) {
       const cap = captureIo();
@@ -4576,7 +4601,7 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
     expect(cap.stdout()).toContain('command: "old-broker" -> "npx"');
     expect(cap.stdout()).toContain("[o]verwrite");
     // No env to keep, so the question must not claim to keep one.
-    expect(cap.stdout()).not.toContain("keeping its env");
+    expect(cap.stdout()).not.toContain("(keeping");
   });
 
   it("the TTY prompt says an [o]verwrite keeps the stored env, which --force would drop", async () => {
@@ -4597,10 +4622,43 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
     stdin.write("o\n");
     const r = await pending;
     expect(r.exitCode).toBe(0);
-    expect(cap.stdout()).toContain("[o]verwrite (keeping its env), [s]kip, or [a]bort?");
+    expect(cap.stdout()).toContain("[o]verwrite (keeping env: YAW_MCP_VAULT_PASSPHRASE), [s]kip, or [a]bort?");
     expect(cap.stdout()).not.toContain("env: drops");
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].env).toStrictEqual({ YAW_MCP_VAULT_PASSPHRASE: "hunter2" });
+  });
+
+  it("the TTY prompt names only the env keys an [o]verwrite keeps when a stored value is not a string", async () => {
+    // With a numeric DEBUG beside the passphrase the diff says DEBUG goes, so
+    // a question claiming to keep "its env" directly under it was false. Keys
+    // sorted, not in the order they were stored.
+    seedStale({
+      command: "old-broker",
+      args: [],
+      env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2", OAM_BIN: "/x/oam", DEBUG: 1 },
+    });
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true },
+      oamProbe: OAM_ABSENT,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write("o\n");
+    const r = await pending;
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout().split("\n")).toContain("    env: drops DEBUG (values not shown)");
+    expect(cap.stdout()).toContain("[o]verwrite (keeping env: OAM_BIN, YAW_MCP_VAULT_PASSPHRASE), [s]kip, or [a]bort?");
+    expect(cap.stdout()).not.toContain("hunter2");
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].env).toStrictEqual({
+      OAM_BIN: "/x/oam",
+      YAW_MCP_VAULT_PASSPHRASE: "hunter2",
+    });
   });
 });
 
