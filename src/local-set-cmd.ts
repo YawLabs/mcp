@@ -643,7 +643,7 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       }
     }
 
-    // Apply one edit at a time against the RUNNING text: jsonc-parser computes
+    // Apply one edit at a time against the RUNNING text: editJsoncPath computes
     // offsets against the text it is handed, so two edits against one source
     // corrupt each other.
     let text = rawText;
