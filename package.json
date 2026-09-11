@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp",
-  "version": "0.80.0",
+  "version": "1.0.0",
   "mcpName": "io.github.YawLabs/mcp",
   "description": "One install, every MCP server, managed from yaw.sh/mcp. Runs locally: no account, no sign-in.",
   "license": "SEE LICENSE IN LICENSE.md",
