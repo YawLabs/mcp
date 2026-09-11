@@ -242,6 +242,29 @@ describe("editJsoncEntry -- insert leaves the previous entry's bytes alone", () 
     );
   });
 
+  it("copies the container's own member step when it differs from the file's shallowest indent", () => {
+    // Top level at 2 spaces, this container's members 4 deeper than its line:
+    // the new value's step comes from the members, not from the file.
+    const src = lf("{", '  "mcpServers": {', '      "a": 1', "  }", "}", "");
+    expect(editJsoncEntry(src, ["mcpServers"], "mcp", ENTRY)).toBe(
+      lf(
+        "{",
+        '  "mcpServers": {',
+        '      "a": 1,',
+        '      "mcp": {',
+        '          "command": "npx",',
+        '          "args": [',
+        '              "-y",',
+        '              "@yawlabs/mcp"',
+        "          ]",
+        "      }",
+        "  }",
+        "}",
+        "",
+      ),
+    );
+  });
+
   it("a minified document stays minified, into a non-empty and an empty container alike", () => {
     expect(editJsoncEntry('{"mcpServers":{"a":1}}', ["mcpServers"], "mcp", ENTRY)).toBe(
       '{"mcpServers":{"a":1,"mcp":{"command":"npx","args":["-y","@yawlabs/mcp"]}}}',
@@ -276,6 +299,13 @@ describe("editJsoncEntry -- replacing a value", () => {
         "}",
         "",
       ),
+    );
+  });
+
+  it("a value in a one-line container is replaced compact, on that line (claude-code permissions)", () => {
+    const src = lf("{", '  "permissions": { "allow": ["Bash(ls)"] } // mine', "}", "");
+    expect(editJsoncEntry(src, ["permissions"], "allow", ["Bash(ls)", "mcp__mcp__*"])).toBe(
+      lf("{", '  "permissions": { "allow": ["Bash(ls)","mcp__mcp__*"] } // mine', "}", ""),
     );
   });
 
@@ -394,6 +424,20 @@ describe("removeJsoncEntry -- removal takes the entry's own lines and nothing of
     const out = removeJsoncEntry(src, ["s"], "mcp");
     expect(out).toBe(lf("{", '  "s": {', '    "a": 1', '    , "b": 3', "  }", "}", ""));
     expect(JSON.parse(out)).toEqual({ s: { a: 1, b: 3 } });
+  });
+
+  it("comma-first style, FIRST member: its separator is on the next line, so the member and that comma go", () => {
+    const src = lf("{", '  "s": {', '    "mcp": 2', '    , "a": 1', '    , "b": 3', "  }", "}", "");
+    const out = removeJsoncEntry(src, ["s"], "mcp");
+    expect(out).toBe(lf("{", '  "s": {', '    "a": 1', '    , "b": 3', "  }", "}", ""));
+    expect(JSON.parse(out)).toEqual({ s: { a: 1, b: 3 } });
+  });
+
+  it("comma-first style, FIRST member with a comment before its separator: the comment goes with it", () => {
+    const src = lf("{", '  "s": {', '    "mcp": 2 // ours', '    , "a": 1', "  }", "}", "");
+    const out = removeJsoncEntry(src, ["s"], "mcp");
+    expect(out).toBe(lf("{", '  "s": {', '    "a": 1', "  }", "}", ""));
+    expect(JSON.parse(out)).toEqual({ s: { a: 1 } });
   });
 });
 

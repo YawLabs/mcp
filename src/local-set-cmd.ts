@@ -643,9 +643,9 @@ export async function runSet(opts: SetCommandOptions): Promise<SetCommandResult>
       }
     }
 
-    // Apply one edit at a time against the RUNNING text: editJsoncPath computes
-    // offsets against the text it is handed, so two edits against one source
-    // corrupt each other.
+    // Apply one edit at a time against the RUNNING text: editJsoncPath returns
+    // the whole text it is handed with its one edit applied, so two edits
+    // against one source would each drop the other.
     let text = rawText;
     const applied: string[] = [];
     const jsonChanges: Array<Record<string, unknown>> = [];

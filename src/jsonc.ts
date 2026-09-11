@@ -169,17 +169,25 @@ export function parseJsonc(src: string): unknown {
 //     in front of it -- plus the one separator comma JSON needs straight after
 //     that member's value when it did not already have one;
 //   - REMOVE: the member's own line(s), taking its comma and any comment on
-//     those lines with it, plus -- only when it was the LAST member -- the
-//     separator comma after the previous member's value (that member's
-//     comment stays);
+//     those lines with it. A member that shares a line with other text (a
+//     one-line container, comma-first style) instead loses the member through
+//     its comma plus the blank run on one side of it, and an only member whose
+//     braces would then hold nothing but blank space takes that space too
+//     (`{ "mcp": 1 }` becomes `{}`). Either way, plus -- only when it was the
+//     LAST member -- the separator comma after the previous member's value
+//     (that member's comment stays);
 //   - REPLACE: the old value's own span.
 //
 // New text copies the file's own style: the indent step (a tab, or N spaces)
 // from the container's existing members, the line ending from the file's
 // first line break (a CRLF file stays CRLF), and a trailing comma after the
-// new member when the member before it had one. A member added to a container
-// written on ONE line goes on that line, compact; an empty `{}` in a multi-
-// line file is opened onto lines of its own. Where the file has nothing to
+// new member when the member before it had one. A member added where the
+// container's `}` follows its last member on the same line -- a one-line
+// container, or a multi-line one closed straight after its last member -- goes
+// on that line, compact; an empty `{}` in a multi-line file is opened onto
+// lines of its own. A replaced value is written compact when its container
+// sits on one line and pretty-printed otherwise, so a one-line array inside a
+// multi-line object comes back expanded. Where the file has nothing to
 // copy, the defaults are two spaces and \n -- JSON.stringify(_, null, 2), the
 // house style for generated config blobs.
 //
@@ -196,9 +204,9 @@ export function parseJsonc(src: string): unknown {
 // unparseable document, a delete under a container that does not exist
 // ("Can not delete in empty document"), a parent that is not an object where a
 // key is needed ("Can not add index to parent of type ..."), and array
-// insert/remove. Callers rely on those messages -- see
-// findBlockedContainerSegment in install-cmd.ts and peelEntryFromConfig in
-// try-cmd.ts.
+// insert/remove. No caller matches on that text: findBlockedContainerSegment
+// in install-cmd.ts and peelEntryFromConfig in try-cmd.ts check for those
+// shapes BEFORE calling rather than catching the throw.
 //
 // All helpers are STRING in, STRING out; the caller does the disk IO
 // (atomicWriteFile etc.). Offsets are computed against the text each call is
@@ -214,7 +222,7 @@ const FORMATTING_OPTIONS: FormattingOptions = {
 // jsonc-parser declares its token kinds (`SyntaxKind`) as an ambient const
 // enum, which this repo's `isolatedModules` setting does not let us read at
 // runtime, so the kinds the splicer needs are spelled as their values here.
-// A wrong value fails the splice tests in jsonc.test.ts.
+// A wrong value fails the splice tests in src/tests/jsonc-splice.test.ts.
 const TOKEN_CLOSE_BRACE = 2;
 const TOKEN_COMMA = 5;
 const TOKEN_LINE_COMMENT = 12;
@@ -557,8 +565,10 @@ export function editJsoncEntry(src: string, containerPath: string[], entryName: 
  *
  *  Same rationale as `editJsoncEntry`: a read-modify-write that goes through
  *  JSON.parse + JSON.stringify drops user comments; this deletes the entry's
- *  own line(s) and, when it was the last entry, the comma before it -- and
- *  nothing else.
+ *  own line(s) -- or, on a line it shares, the entry through its comma plus
+ *  the blank run beside it, closing up braces left holding only blank space --
+ *  and, when it was the last entry, the comma before it. No other member's
+ *  text or comment is touched.
  *
  *  ASYMMETRY, on purpose: the byte-for-byte guarantee covers the NO-OP path
  *  only. On a real removal the leading UTF-8 BOM is stripped and NOT re-emitted
@@ -602,10 +612,10 @@ export function removeJsoncEntry(src: string, containerPath: string[], entryName
  *
  *  TWO THINGS TO KNOW BEFORE USING IT.
  *
- *  Edits CANNOT be batched against one source text. Each call re-parses and
- *  returns offsets into the text it was handed, so two edits computed against
- *  the same input corrupt each other. Apply them one at a time, each against
- *  the result of the last.
+ *  Edits CANNOT be batched against one source text. Each call re-parses the
+ *  text it is handed and returns that whole text with its one edit applied,
+ *  so two calls against the same input each drop the other's edit. Apply them
+ *  one at a time, each against the result of the last.
  *
  *  Deleting under a MISSING intermediate object throws rather than no-opping:
  *  with an undefined value there is nothing to wrap and no container to delete
