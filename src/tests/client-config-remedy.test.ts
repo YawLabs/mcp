@@ -73,12 +73,15 @@ function writeFile(path: string, bytes: string): string {
   return path;
 }
 
-async function doctor() {
+/** `env` is a parameter so one test can run doctor twice over one fixture, with
+ *  and without OAM_BIN, and compare the bytes. Every other call takes the empty
+ *  default. */
+async function doctor(env: NodeJS.ProcessEnv = {}) {
   const lines: string[] = [];
   const r = await runDoctor({
     cwd,
     home,
-    env: {},
+    env,
     os: "linux",
     out: (s) => lines.push(s),
     err: () => {},
@@ -297,14 +300,20 @@ describe("a legacy entry -- doctor does not send the user to remove what install
   // in the same write -- off a TTY too, once the collision refusal's --repair is
   // added. The trailer used to say "remove it once the working entry is back",
   // sending the user to delete by hand an entry that run had already removed.
-  // Only the bare-oam line offers a step that is not an install run (OAM_BIN),
-  // so only it keeps a by-hand clause, and scoped to that step.
+  //
+  // All THREE, the bare-oam line included. It kept a by-hand clause for the
+  // reader who "set OAM_BIN instead of rerunning install" -- a state that does
+  // not exist. OAM_BIN is read inside yaw-mcp's own process, so it steers which
+  // binary INSTALL writes; the client spawns the stored bare `oam` against its
+  // own PATH, and doctor computes this row from that stored token and is handed
+  // no env at all. Setting it cannot restore the working entry, so it cannot
+  // leave a legacy entry outliving one -- pinned below by the OAM_BIN test,
+  // which runs doctor over one fixture twice and compares the bytes.
   const CANNOT_LAUNCH = [
     {
       state: "a launch command that does not exist",
       says: "its launch command does not exist",
       entry: () => ({ command: join(home, "gone", "oam"), args: ["run", "x.js"] }),
-      byHandForOamBin: false,
     },
     {
       state: "an oam entry file that does not exist",
@@ -313,13 +322,11 @@ describe("a legacy entry -- doctor does not send the user to remove what install
         command: writeFile(join(home, "bin", "oam"), ""),
         args: ["run", "--no-check", join(home, "gone", "broker.js")],
       }),
-      byHandForOamBin: false,
     },
     {
       state: "a bare oam command",
       says: "resolves against the client's PATH",
       entry: () => ({ command: "oam", args: ["run", "--no-check", writeFile(join(home, "broker.js"), "")] }),
-      byHandForOamBin: true,
     },
   ];
 
@@ -345,7 +352,6 @@ describe("a legacy entry -- doctor does not send the user to remove what install
   )("$state plus a legacy entry: install --repair removes the legacy key, and doctor never asked for it by hand", async ({
     says,
     entry,
-    byHandForOamBin,
   }) => {
     const path = writeFile(
       cursorUserFile(),
@@ -357,16 +363,11 @@ describe("a legacy entry -- doctor does not send the user to remove what install
       'legacy "mcp.hosting" entry also present -- install removes it as it writes the working entry',
     );
     expect(row).not.toContain("remove it once the working entry is back");
+    // The trailer is the END of the line on all three: nothing walks it back,
+    // and no clause after it asks for a by-hand removal.
     const [, afterTrailer] = row.split("install removes it as it writes the working entry");
-    if (byHandForOamBin) {
-      // The one by-hand clause, and it names the step that does not trim.
-      expect(afterTrailer).toBe(
-        "; if you set OAM_BIN instead of rerunning install, remove it by hand once the working entry is back",
-      );
-    } else {
-      expect(afterTrailer).toBe("");
-      expect(row).not.toContain("by hand");
-    }
+    expect(afterTrailer).toBe("");
+    expect(row).not.toContain("by hand");
     // Off a TTY the named rerun is refused with --repair named, and writes
     // nothing: the legacy key is still there at this point.
     const refused = await install();
@@ -385,6 +386,58 @@ describe("a legacy entry -- doctor does not send the user to remove what install
     expect(after?.launchCommandMissing).toBe(null);
     expect(after?.launchOamEntryMissing).toBe(null);
     expect(after?.launchOamNotAbsolute).toBe(null);
+  });
+
+  /** The bare-`oam` fixture: a launch command the client resolves against its
+   *  own PATH, plus a legacy entry. Shared by the two tests below so the
+   *  byte-exact wording and the OAM_BIN comparison cannot drift apart. */
+  const writeBareOamPlusLegacy = (): string =>
+    writeFile(
+      cursorUserFile(),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "oam", args: ["run", "--no-check", writeFile(join(home, "broker.js"), "")] },
+          "mcp.hosting": { command: "npx" },
+        },
+      }),
+    );
+
+  it("the bare-oam line, byte for byte: OAM_BIN is a precondition of the rerun, and nothing is left by hand", async () => {
+    writeBareOamPlusLegacy();
+    const d = await doctor();
+    expect(d.text).toContain(
+      `Cursor (user): has "${ENTRY_NAME}" entry with a bare "oam" command -- it resolves against the client's PATH, ` +
+        "which a GUI-launched client does not inherit from your shell; rerun `yaw-mcp install cursor` to write an " +
+        'absolute path (set OAM_BIN to oam\'s full path first if install cannot find it); legacy "mcp.hosting" ' +
+        "entry also present -- install removes it as it writes the working entry\n",
+    );
+    // Not "or set OAM_BIN": the var is not a second remedy. Nothing it can do
+    // rewrites this entry, so no branch of this line may offer it as one.
+    expect(d.text).not.toContain("or set OAM_BIN");
+  });
+
+  it("setting OAM_BIN changes nothing doctor says about the entry", async () => {
+    writeBareOamPlusLegacy();
+    // The value install would be told to use: an absolute path to a real file,
+    // the shape the line's parenthetical asks for.
+    const oamBin = writeFile(join(home, "opt", "oam"), "");
+    const withOut = await doctor();
+    const withSet = await doctor({ OAM_BIN: oamBin });
+    // Whole output, not just the row: doctor is handed the var and still has
+    // nowhere to spend it on a client entry. (The OAM RUNTIME section does read
+    // a real OAM_BIN through probeOam -- seamed to OAM_ABSENT here, which is
+    // what makes the rest of the report comparable.) Only the run's own header
+    // timestamp is normalised away; it differs between any two runs, OAM_BIN or
+    // not, and runDoctor has no clock seam to pin it with.
+    const stamp = (t: string): string => t.replace(/^yaw-mcp doctor -- .*$/m, "yaw-mcp doctor");
+    expect(stamp(withSet.text)).toBe(stamp(withOut.text));
+    expect(withSet.exitCode).toBe(withOut.exitCode);
+    const row = cursorUserRow(withSet.text);
+    expect(row).toContain('has "mcp" entry with a bare "oam" command');
+    // The var's own name appears once, inside the rerun's parenthetical, and
+    // the path it was set to appears nowhere.
+    expect(row.split("OAM_BIN").length - 1).toBe(1);
+    expect(withSet.text).not.toContain(oamBin);
   });
 });
 

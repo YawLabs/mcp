@@ -2206,9 +2206,21 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // same write as the working one (unless --keep-legacy) -- off a TTY too, where
   // the collision refusal names --repair and that run trims. The old wording
   // sent the user to remove by hand an entry that run had already removed, the
-  // claim the lone-legacy line below dropped for the same reason. Only the
-  // bare-oam line offers a step that is not an install run (OAM_BIN), so only
-  // it adds a by-hand clause, scoped to that step.
+  // claim the lone-legacy line below dropped for the same reason.
+  //
+  // The bare-oam line carries the SAME trailer, with no by-hand clause of its
+  // own. It used to read as if OAM_BIN were a second remedy that leaves the
+  // legacy entry behind, but setting OAM_BIN cannot bring the working entry
+  // back, so that state does not exist. OAM_BIN is read only inside yaw-mcp's
+  // OWN process (probeOamUncached, oam-spawn.ts): it changes which binary
+  // INSTALL resolves and writes, never what the client spawns -- the client
+  // runs the stored bare `oam` against its own PATH. This line is computed from
+  // that stored token alone (launchOamNotAbsolute, below; renderClientStatus is
+  // not even handed an env), so doctor's output does not move when the var is
+  // set. Install's own lines pair it with a re-run for the same reason
+  // (install-cmd.ts, the two "Set OAM_BIN to oam's full path and re-run install"
+  // runtime lines), so this one names it as a precondition of the rerun rather
+  // than as an alternative to it.
   const legacy = c.hasLegacyEntry
     ? `; legacy "${c.legacyEntryName}" entry also present -- install removes it as it writes the working entry`
     : "";
@@ -2222,10 +2234,7 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}`;
   }
   if (c.launchOamNotAbsolute) {
-    const legacyOamBin = c.hasLegacyEntry
-      ? `${legacy}; if you set OAM_BIN instead of rerunning install, remove it by hand once the working entry is back`
-      : "";
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacyOamBin}`;
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path (set OAM_BIN to oam's full path first if install cannot find it)${legacy}`;
   }
   // Below the cannot-launch branches and above the OK ones: doctor knows
   // neither. The path is absolute on the OS the entry was written for, and
