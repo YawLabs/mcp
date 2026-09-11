@@ -45,7 +45,7 @@ describe("INSTALL_TARGETS metadata", () => {
     // Byte-exact: the refusal in every verb, doctor and `install --list` all
     // read this one string, so a drift here is a drift everywhere at once.
     expect(cd?.notConfigurableOn?.linux).toBe(
-      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file",
+      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
     );
   });
 
@@ -89,8 +89,9 @@ describe("INSTALL_TARGETS metadata", () => {
         const resolved = resolveInstallPath({
           clientId: t.clientId,
           scope: sc.scope,
-          // Each target on an OS it actually supports -- Claude Desktop is
-          // macOS/Windows only, and resolveInstallPath refuses the pair.
+          // Each target on an OS yaw-mcp can configure it on -- Claude Desktop
+          // only on macOS/Windows (see notConfigurableOn), and
+          // resolveInstallPath refuses the pair.
           os: t.availableOn[0],
           home: "/h",
           projectDir: "/p",
@@ -477,7 +478,7 @@ describe("resolveInstallPath — Claude Desktop", () => {
       resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "linux", home: "/home/alice" }),
     ).toThrow(
       new Error(
-        "Claude Desktop cannot be configured on linux: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file",
+        "Claude Desktop cannot be configured on linux: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
       ),
     );
   });

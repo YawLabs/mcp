@@ -27,12 +27,23 @@
 //     and Windows only. So linux stays out of claude-desktop's
 //     `availableOn`, and every verb refuses there with the
 //     `notConfigurableOn.linux` reason rather than write a guessed path the
-//     app may never read. Checked 2026-09-11: the install article
+//     app may never read. Checked 2026-09-11, and none of these names a
+//     Linux path for that file: the install article
 //     (support.claude.com/en/articles/10065433-install-claude-desktop), the
-//     Linux page (code.claude.com/docs/en/desktop-linux) and the MCP guide
-//     (modelcontextprotocol.io/docs/develop/connect-local-servers) name no
-//     Linux path. Once one does, add "linux" to `availableOn` and the path
-//     to pathFor, and drop the reason.
+//     Linux page (code.claude.com/docs/en/desktop-linux), the Desktop
+//     reference (code.claude.com/docs/en/desktop -- Anthropic's own
+//     `claude mcp add-from-claude-desktop` is documented there "On macOS and
+//     WSL" only) and the MCP guide
+//     (modelcontextprotocol.io/docs/develop/connect-local-servers -- its
+//     "available for macOS and Windows" predates the Linux beta, so it is no
+//     source for where the app ships). Closest is the 3P configuration page
+//     (claude.com/docs/third-party/claude-desktop/configuration): it gives
+//     the Linux logs dir (~/.config/Claude/logs/) and an admin-deployed
+//     /etc/claude-desktop/managed-settings.json that can carry
+//     `managedMcpServers` -- a managed-deployment file, not the per-user
+//     config install writes, so it is no target either. Once a page names
+//     claude_desktop_config.json's Linux path, add "linux" to `availableOn`
+//     and the path to pathFor, and drop the reason.
 //   • On Windows, `npx` is a `.cmd` shim; MCP clients that spawn it
 //     directly get ENOENT. The launch entry must be
 //     `{ command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcp@latest"] }`.
@@ -82,10 +93,11 @@ export interface InstallTarget {
   availableOn: InstallOS[];
   /** An OS the client DOES ship on but that is still left out of
    *  `availableOn`, mapped to the reason, worded as one clause. The refusal
-   *  (install, uninstall, import, try), doctor and `install --list` all read
-   *  it from here, so the claim about a third party lives in one place. An OS
-   *  missing from `availableOn` with no entry here is reported as one the
-   *  client is not available on. */
+   *  (install, uninstall, import, try), the resolver's throw, doctor and the
+   *  `--all` skip line print it; `install --list` only keys its "not
+   *  supported yet" label off its presence. Either way the claim about a
+   *  third party lives in one place. An OS missing from `availableOn` with no
+   *  entry here is reported as one the client is not available on. */
   notConfigurableOn?: Partial<Record<InstallOS, string>>;
   /** Extra user-facing caveats (e.g., "restart the app after editing"). */
   notes?: string;
@@ -127,9 +139,11 @@ export const INSTALL_TARGETS: InstallTarget[] = [
     jsonShape: "mcpServers",
     availableOn: ["macos", "windows"],
     // Not "no Linux build" -- there is one, a beta. What is missing is a
-    // documented config path; the header note lists the sources checked.
+    // documented Linux path for claude_desktop_config.json; the header note
+    // lists the sources checked.
     notConfigurableOn: {
-      linux: "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file",
+      linux:
+        "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
     },
     // ASCII `--`, not an em-dash: install prints this verbatim (`Note: ...`),
     // and Claude Desktop is a Windows client -- on a console whose codepage is
@@ -430,7 +444,7 @@ function pathFor(
     }
     // linux -- unreachable: availableOn leaves it out (see notConfigurableOn),
     // and resolveInstallPath refuses before it gets here. Belt and suspenders.
-    throw new Error("Claude Desktop's config file location on Linux is undocumented");
+    throw new Error("Claude Desktop's claude_desktop_config.json location on Linux is undocumented");
   }
 
   if (client === "cursor") {

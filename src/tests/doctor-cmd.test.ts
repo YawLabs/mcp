@@ -528,14 +528,14 @@ describe("runDoctor — client detection", () => {
     const cd = r.snapshot.clients.find((c) => c.clientId === "claude-desktop");
     expect(cd?.unavailable).toBe(true);
     expect(cd?.unavailableReason).toBe(
-      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file",
+      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
     );
     // The field rides ONLY on that row.
     expect(r.snapshot.clients.filter((c) => c.unavailableReason !== undefined).map((c) => c.clientId)).toEqual([
       "claude-desktop",
     ]);
     expect(cap.text()).toContain(
-      "Claude Desktop (user): not supported on this OS yet -- Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file\n",
+      "Claude Desktop (user): not supported on this OS yet -- Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json\n",
     );
     expect(cap.text()).not.toContain("unavailable on this OS");
   });

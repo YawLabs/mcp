@@ -123,8 +123,8 @@ describe("runImport -- a client yaw-mcp cannot configure on this OS", () => {
     expect(r.written).toEqual([]);
     expect(cap.errText()).toBe(
       "yaw-mcp import: Claude Desktop on linux is not supported yet.\n" +
-        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
-        "  Add those servers to yaw-mcp yourself instead, with `yaw-mcp add <slug>`.\n",
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
+        '  Add those servers to yaw-mcp yourself instead: `yaw-mcp add <slug>` for a catalog server, or `yaw-mcp add <name> --command "<launch line>"` for any other.\n',
     );
     expect(cap.text()).toBe("");
   });

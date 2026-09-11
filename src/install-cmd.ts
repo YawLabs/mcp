@@ -432,12 +432,12 @@ export function describeUnreadableConfig(cmd: string, path: string, err: unknown
  *  Two shapes. A client that is simply not available on the OS gets the
  *  caller's `genericFix` -- the flags differ per verb (`try` and `import` have
  *  no --os, so they must not advertise one). A client that DOES ship on the
- *  OS but has no documented config path -- INSTALL_TARGETS'
- *  `notConfigurableOn`, today only Claude Desktop on Linux -- says so instead
- *  of "not available": the app IS available there, and a message denying it
- *  is a false claim about a third party. No flag fixes that case, so its
- *  remedy is another client or a hand edit. The reason itself is read from
- *  the table, never restated here. */
+ *  OS but has no documented path for the config file yaw-mcp writes --
+ *  INSTALL_TARGETS' `notConfigurableOn`, today only Claude Desktop on Linux --
+ *  says so instead of "not available": the app IS available there, and a
+ *  message denying it is a false claim about a third party. No flag fixes
+ *  that case, so its remedy is another client or a hand edit. The reason
+ *  itself is read from the table, never restated here. */
 export function clientUnavailableMessage(
   cmd: string,
   target: (typeof INSTALL_TARGETS)[number],
@@ -455,7 +455,8 @@ export function clientUnavailableMessage(
       fix = "Remove the entry by hand if you added one.";
       break;
     case "import":
-      fix = "Add those servers to yaw-mcp yourself instead, with `yaw-mcp add <slug>`.";
+      fix =
+        'Add those servers to yaw-mcp yourself instead: `yaw-mcp add <slug>` for a catalog server, or `yaw-mcp add <name> --command "<launch line>"` for any other.';
       break;
     case "try":
       fix = "Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.";
@@ -2169,8 +2170,9 @@ async function runInstallList(
 }
 
 function statusFor(p: ClientProbeResult): string {
-  // A client that ships on this OS but has no documented config path is not
-  // "unavailable" -- the user may be running it. `doctor` prints the reason.
+  // A client that ships on this OS but has no documented path for the config
+  // file yaw-mcp writes is not "unavailable" -- the user may be running it.
+  // `doctor` prints the reason.
   if (p.unavailable) return p.unavailableReason !== undefined ? "not supported yet" : "unavailable";
   if (p.malformed) return "malformed";
   // A READ failure (a directory at the path, EACCES, a win32 EBUSY from an
@@ -2231,10 +2233,10 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
 
 /** `yaw-mcp install --all` — install into every client yaw-mcp supports on
  *  this OS (user scope where supported), naming any it skips -- including a
- *  client that ships here but has no documented config path
- *  (`notConfigurableOn`). For clients without a user scope, falls back to
- *  the first non-project scope; clients that ONLY have project scopes
- *  (vscode) are included just when --project-dir is passed, otherwise
+ *  client that ships here but has no documented path for the config file
+ *  yaw-mcp writes (`notConfigurableOn`). For clients without a user scope,
+ *  falls back to the first non-project scope; clients that ONLY have project
+ *  scopes (vscode) are included just when --project-dir is passed, otherwise
  *  skipped. Aggregates results; exit code 0 only if every attempted
  *  install succeeded. Mirrors the per-client run behavior: prompts/--force/
  *  --skip flags propagate. */
@@ -2266,10 +2268,13 @@ async function runInstallAll(
   const skipped: Array<{ clientId: InstallClientId; reason: string }> = [];
   // A client that ships on this OS but that yaw-mcp cannot configure is named
   // rather than silently left out: on a Linux box running the Claude Desktop
-  // beta, `--all` otherwise reads as having forgotten it.
+  // beta, `--all` otherwise reads as having forgotten it. No availableOn
+  // check: a reason is only ever recorded for an OS missing from
+  // `availableOn` (install-targets.test.ts pins that), so a client skipped
+  // here is never also one of `targets`.
   for (const t of INSTALL_TARGETS) {
     const why = t.notConfigurableOn?.[os];
-    if (why !== undefined && !t.availableOn.includes(os)) skipped.push({ clientId: t.clientId, reason: why });
+    if (why !== undefined) skipped.push({ clientId: t.clientId, reason: why });
   }
   for (const t of targets) {
     const userScope = t.scopes.find((s) => s.scope === "user");

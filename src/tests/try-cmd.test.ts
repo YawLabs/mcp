@@ -2502,7 +2502,7 @@ describe("runTry -- refusals that were resolver internals", () => {
     // advertise one.
     expect(cap.errText()).toBe(
       "yaw-mcp try: Claude Desktop on linux is not supported yet.\n" +
-        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
         "  Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.\n",
     );
   });

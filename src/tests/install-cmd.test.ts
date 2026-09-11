@@ -2312,7 +2312,7 @@ describe("runInstall — Claude Desktop on Linux refused", () => {
     expect(r.written).toEqual([]);
     expect(cap.stderr()).toBe(
       "yaw-mcp install: Claude Desktop on linux is not supported yet.\n" +
-        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
         "  Install into Claude Code or Cursor instead, or add the entry by hand.\n",
     );
   });
@@ -2324,7 +2324,7 @@ describe("clientUnavailableMessage", () => {
   if (!desktop || !cursor) throw new Error("INSTALL_TARGETS lost claude-desktop or cursor");
   const head =
     "Claude Desktop on linux is not supported yet.\n" +
-    "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n  ";
+    "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n  ";
 
   it("words the remedy per verb, and never uses the caller's generic fix, for a client that ships but cannot be configured", () => {
     expect(clientUnavailableMessage("install", desktop, "linux", "GENERIC")).toBe(
@@ -2334,7 +2334,7 @@ describe("clientUnavailableMessage", () => {
       `yaw-mcp uninstall: ${head}Remove the entry by hand if you added one.`,
     );
     expect(clientUnavailableMessage("import", desktop, "linux", "GENERIC")).toBe(
-      `yaw-mcp import: ${head}Add those servers to yaw-mcp yourself instead, with \`yaw-mcp add <slug>\`.`,
+      `yaw-mcp import: ${head}Add those servers to yaw-mcp yourself instead: \`yaw-mcp add <slug>\` for a catalog server, or \`yaw-mcp add <name> --command "<launch line>"\` for any other.`,
     );
     expect(clientUnavailableMessage("try", desktop, "linux", "GENERIC")).toBe(
       `yaw-mcp try: ${head}Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.`,
@@ -2454,8 +2454,8 @@ describe("runInstall — --project-dir at a scope that resolves none", () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-desktop",
-      // macos, so this is the not-available-on-linux refusal's sibling and not
-      // that refusal itself -- claude-desktop ships on macos and windows.
+      // macos, so this is the Linux refusal's sibling and not that refusal
+      // itself -- yaw-mcp configures claude-desktop on macos and windows.
       os: "macos",
       home: synthHome,
       cwd: synthCwd,
@@ -2764,7 +2764,7 @@ describe("runInstall --all", () => {
     // whole point -- it was the one supported client --all visibly refused.
     const out = cap.stdout();
     expect(out).toContain(
-      "\n  skip claude-desktop: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file\n",
+      "\n  skip claude-desktop: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json\n",
     );
     expect(out).not.toContain("-- claude-desktop");
     expect(out).not.toContain("skip vscode");
@@ -4756,7 +4756,7 @@ describe("runUninstall", () => {
     expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toBe(
       "yaw-mcp uninstall: Claude Desktop on linux is not supported yet.\n" +
-        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads its MCP config file.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
         "  Remove the entry by hand if you added one.\n",
     );
   });

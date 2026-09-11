@@ -59,7 +59,7 @@ npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode|win
 
 This edits the chosen client's config (correct path + JSON shape for your OS) to launch yaw-mcp. On Windows it wraps `npx` in `cmd /c` (without which MCP clients hit `ENOENT` on the `npx.cmd` shim). Run it once per client.
 
-Claude Desktop on Linux is not supported yet. Anthropic ships a Linux beta but has not documented where it reads its MCP config file, so `install claude-desktop` refuses on Linux rather than write a guessed path, and `--all` skips it. Add the entry by hand, or use another client.
+Claude Desktop on Linux is not supported yet. Anthropic ships a Linux beta but has not documented where it reads `claude_desktop_config.json`, so `install claude-desktop` refuses on Linux rather than write a guessed path, and `--all` skips it. Add the entry by hand, or use another client.
 
 Useful flags:
 
