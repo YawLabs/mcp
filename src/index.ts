@@ -391,6 +391,18 @@ if (subcommand === "compliance") {
                                an MCP client restart (default: the file is
                                re-read at meta-tool boundaries, so \`yaw-mcp
                                add\` and \`enable\` land without a restart).
+    YAW_MCP_PREWARM               Set to \`0\` to stop spawning servers at
+                               startup to learn their tool lists. Learning
+                               is rare -- the list persists, and is re-learned
+                               only once it ages out -- but the session that
+                               does it starts the upstream twice, here and
+                               again for the activate that follows, which
+                               matters if that startup is not idempotent
+                               (takes a lock, binds a port, writes a login
+                               audit event). Off, a server whose tools are
+                               not already known advertises none of them
+                               until you activate it; \`discover\` still
+                               lists it (default: on).
     YAW_MCP_SIDECAR_REFRESH       Set to \`0\` to disable the background check
                                that keeps managed sidecars (\`yaw-mcp sidecars
                                install\`) current. When a managed tree exists,

@@ -40,6 +40,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 
 import { CONFIG_DIRNAME } from "../paths.js";
 import { isRoutingFaultResult } from "../proxy.js";
+import { capContent } from "../result-cap.js";
 import {
   ConnectServer,
   computeToolOverlaps,
@@ -5051,6 +5052,144 @@ describe("activation always refreshes the routing table", () => {
   });
 });
 
+describe("activate tells the truth about a flattened-name collision", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  // `${namespace}_${tool}` is not injective: (gh, actions_list) and
+  // (gh_actions, list) both flatten to gh_actions_list. buildToolRoutes and
+  // buildToolList agree on ONE owner (first writer), which is correct and
+  // tested in proxy.test.ts -- what is under test here is what the LOSER is
+  // told, because activate rendered its message from the server's own
+  // inventory and so announced a tool that a call hands to somebody else.
+  const collidingPair = () => [
+    makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+    makeServerConfig({ id: "2", namespace: "gh_actions", name: "GitHub Actions" }),
+  ];
+  const collidingConnections = () => {
+    vi.mocked(connectToUpstream)
+      .mockResolvedValueOnce(makeConnection("gh", ["actions_list", "create_issue"]))
+      .mockResolvedValueOnce(makeConnection("gh_actions", ["list", "run"]));
+  };
+
+  it("names only the tools the losing namespace actually serves", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    collidingConnections();
+
+    const winner = (await priv.handleActivate(["gh"])).content[0].text;
+    const loser = (await priv.handleActivate(["gh_actions"])).content[0].text;
+
+    // The winner owns the name and is reported exactly as it always was.
+    expect(winner).toBe('Loaded "gh" — 2 tools: gh_actions_list, gh_create_issue');
+    // The loser used to claim "2 tools: gh_actions_list, gh_actions_run",
+    // naming a tool that reaches gh. Only what it serves is counted or named.
+    const [headline] = loser.split("\n");
+    expect(headline).toBe('Loaded "gh_actions" — 1 tools: gh_actions_run');
+    // ...and the name it lost is attributed, so the model can go to the right
+    // server instead of calling gh_actions_list and silently getting gh.
+    expect(loser).toContain('1 tool of "gh_actions" cannot be called');
+    expect(loser).toContain('"list" flattens to gh_actions_list, already served by "gh"');
+    expect(loser).toContain("mcp_connect_deactivate");
+
+    // The claim is checked against the surfaces it describes, not just itself.
+    expect(await listedUpstreamToolNames(priv)).toEqual(["gh_actions_list", "gh_create_issue", "gh_actions_run"]);
+    expect(priv.toolRoutes.get("gh_actions_list")).toEqual({ namespace: "gh", originalName: "actions_list" });
+  });
+
+  it("reports the same split on the already-loaded path", async () => {
+    // The early return for a connected server counts rather than enumerates,
+    // and it was counting the same inflated inventory. Both messages have to
+    // agree about what this namespace serves or a re-activate silently
+    // restores the wrong number.
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    collidingConnections();
+
+    await priv.handleActivate(["gh"]);
+    await priv.handleActivate(["gh_actions"]);
+    const again = (await priv.handleActivate(["gh_actions"])).content[0].text;
+
+    expect(again).toContain('"gh_actions" is already loaded with 1 tools.');
+    expect(again).toContain('"list" flattens to gh_actions_list, already served by "gh"');
+  });
+
+  it("says nothing about collisions when no name collides", async () => {
+    // The note is appended, never substituted, so a session without a
+    // collision -- which is nearly all of them -- must read exactly as before.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ id: "2", namespace: "linear", name: "Linear" }),
+    ]);
+    priv.profile = null;
+    vi.mocked(connectToUpstream)
+      .mockResolvedValueOnce(makeConnection("gh", ["actions_list", "create_issue"]))
+      .mockResolvedValueOnce(makeConnection("linear", ["list", "run"]));
+
+    const first = (await priv.handleActivate(["gh"])).content[0].text;
+    const second = (await priv.handleActivate(["linear"])).content[0].text;
+
+    expect(first).toBe('Loaded "gh" — 2 tools: gh_actions_list, gh_create_issue');
+    expect(second).toBe('Loaded "linear" — 2 tools: linear_list, linear_run');
+  });
+
+  it("the remedy it offers actually frees the name", async () => {
+    // The message tells the model to unload the shadowing namespace. That is a
+    // claim about yaw-mcp's own behaviour, so it is pinned: deactivate rebuilds
+    // the routes, the name moves, and the re-activate reports the full set with
+    // no collision note left.
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    collidingConnections();
+
+    await priv.handleActivate(["gh"]);
+    await priv.handleActivate(["gh_actions"]);
+    await priv.handleDeactivate(["gh"]);
+
+    expect(priv.toolRoutes.get("gh_actions_list")).toEqual({ namespace: "gh_actions", originalName: "list" });
+    const freed = (await priv.handleActivate(["gh_actions"])).content[0].text;
+    expect(freed).toBe('"gh_actions" is already loaded with 2 tools.');
+  });
+
+  it("caps the names it lists and says how many it left out", async () => {
+    // Bounded output: the note rides on a message whose job is to stay small,
+    // but a truncated list must not read as a complete one.
+    const priv = getPrivate(server);
+    priv.config = makeConfig(collidingPair());
+    priv.profile = null;
+    const bare = ["t1", "t2", "t3", "t4", "t5", "t6"];
+    vi.mocked(connectToUpstream)
+      .mockResolvedValueOnce(
+        makeConnection(
+          "gh",
+          bare.map((t) => `actions_${t}`),
+        ),
+      )
+      .mockResolvedValueOnce(makeConnection("gh_actions", bare));
+
+    await priv.handleActivate(["gh"]);
+    const loser = (await priv.handleActivate(["gh_actions"])).content[0].text;
+
+    expect(loser).toContain('Loaded "gh_actions" — 0 tools: ');
+    expect(loser).toContain('6 tools of "gh_actions" cannot be called');
+    expect(loser).toContain('"t5" flattens to gh_actions_t5, already served by "gh"');
+    expect(loser).not.toContain("gh_actions_t6,");
+    expect(loser).toContain("; and 1 more.");
+  });
+});
+
 describe("idle reaper vs in-flight tool calls", () => {
   let server: ConnectServer;
 
@@ -7872,6 +8011,100 @@ describe("measureResultBytes", () => {
     // server.ts does not enforce it; an absent one is zero bytes of body, and
     // returning null would suppress the booking of a real call.
     expect(measureResultBytes({})).toBe(Buffer.byteLength("[]", "utf8"));
+  });
+
+  it("books the same number the result cap reports for the same body", () => {
+    // One real call returning 204814 bytes of text produced TWO totals for one
+    // quantity: health said 207991 upstream and the cap's stderr warning said
+    // 207989. The gap was the array's own framing -- this site serialized the
+    // array, the cap summed its blocks -- so it grew with the block count
+    // rather than staying at two. Both now go through one function.
+    //
+    // Deliberately a cross-module assertion: neither module's own suite could
+    // catch this, because each was self-consistent. The disagreement existed
+    // only between them.
+    for (const n of [1, 2, 7]) {
+      const content = Array.from({ length: n }, (_, i) => ({ type: "text", text: `row ${i}\n`.repeat(9_000) }));
+      expect(measureResultBytes({ content })).toBe(capContent(content, 100_000).bytesRaw);
+    }
+  });
+
+  it("counts structuredContent, which the cap cannot see, so the two differ by exactly that", () => {
+    // The one gap left between the two sites, pinned rather than left to be
+    // rediscovered as drift. structuredContent bypasses the pruner and the cap
+    // by design, so the cap's total is the content array alone while this one
+    // is the whole body -- a real difference in quantity, not two rules for
+    // one. handleToolCall names the bypassed bytes in the same warning line so
+    // an operator can close the arithmetic.
+    const content = [{ type: "text", text: "x".repeat(200_000) }];
+    const structuredContent = { rows: [1, 2, 3], note: "mirrored" };
+    expect(measureResultBytes({ content, structuredContent })).toBe(
+      capContent(content, 100_000).bytesRaw + Buffer.byteLength(JSON.stringify(structuredContent), "utf8"),
+    );
+  });
+});
+
+describe("the result cap's warning and the health counter describe one call", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await server.shutdown();
+  });
+
+  it("books a total the operator can reconcile against the warning line", async () => {
+    // The two unit tests above pin the measuring functions. This one pins the
+    // two SURFACES an operator actually reads, which is where the numbers were
+    // seen to disagree: health rendered one total and the stderr warning
+    // another for the same call, two bytes apart, and nothing in either
+    // module's own suite could see it.
+    //
+    // log() drops warn-level lines when LOG_LEVEL is `error`, so an operator
+    // shell exporting that would turn this red for reasons unrelated to bytes.
+    vi.stubEnv("LOG_LEVEL", "warn");
+    const writes: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      if (typeof chunk === "string") writes.push(chunk);
+      return true;
+    });
+
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    const conn = makeConnection("gh", ["big"]);
+    // structuredContent both stands the pruner down and rides through the cap
+    // untouched, so the body the cap measured is the upstream body verbatim --
+    // which is what makes the arithmetic below exact rather than approximate.
+    const structuredContent = { rows: 42, note: "mirrors the text block" };
+    const content = [{ type: "text", text: "log line\n".repeat(30_000) }];
+    conn.client.callTool = vi.fn().mockResolvedValue({ content, structuredContent });
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+
+    await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+    await priv.handleToolCall("gh_big", {});
+
+    const line = writes.find((w) => w.includes("exceeded the size ceiling"));
+    expect(line, "the cap did not warn -- the fixture is under the ceiling").toBeDefined();
+    const warned = JSON.parse((line as string).trim());
+
+    // What the cap measured against its ceiling: the content array, framing
+    // included. Not the sum of its blocks, which is what it used to report.
+    expect(warned.bytesRaw).toBe(Buffer.byteLength(JSON.stringify(content), "utf8"));
+    expect(warned.maxBytes).toBe(100_000);
+    // The bytes the cap is documented not to touch, named next to the number
+    // rather than folded into it -- folding them in would falsify both
+    // `maxBytes` beside it and the notice the model reads.
+    expect(warned.bytesStructuredUncapped).toBe(Buffer.byteLength(JSON.stringify(structuredContent), "utf8"));
+
+    // And the operator's arithmetic closes exactly: the two figures in the
+    // warning add up to the one health books upstream. That is the whole
+    // claim, and it was off by the array's brackets.
+    const health = priv.connections.get("gh").health;
+    expect(health.resultBytesUpstream).toBe(warned.bytesRaw + warned.bytesStructuredUncapped);
   });
 });
 

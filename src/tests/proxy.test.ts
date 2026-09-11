@@ -499,6 +499,33 @@ describe("buildToolRoutes — active-vs-active collisions", () => {
     expect(rebuilt.get("gh_actions_list")?.namespace).toBe(advertisedFrom);
   });
 
+  it("still resolves the same owner when the caller asks for a quiet build", () => {
+    // `quiet` exists for a caller that builds a THROWAWAY table to ASK who
+    // owns a name -- runActivateOne, before its message claims one -- and
+    // whose activation rebuilds the real table moments later and logs the
+    // collision from there. Without it the operator sees every collision
+    // twice per activation. The routing answer must be unchanged: if the
+    // flag ever gated more than the log, activate would report against a
+    // different table from the one that serves the call.
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["actions_list"]));
+    connections.set("gh_actions", makeConnection("gh_actions", ["list"]));
+    // Two IDLE servers that flatten together as well, so both warnings in
+    // this function are on the loud path and both have to fall silent.
+    const deferred = [
+      makeInactiveServer("ci", [{ name: "run_list" }]),
+      makeInactiveServer("ci_run", [{ name: "list" }]),
+    ];
+
+    const loud = withCapturedStderr(() => buildToolRoutes(connections, deferred));
+    const quiet = withCapturedStderr(() => buildToolRoutes(connections, deferred, true));
+
+    expect(loud.writes.some((w) => w.includes("Tool route collision"))).toBe(true);
+    expect(loud.writes.some((w) => w.includes("Deferred tool route collision"))).toBe(true);
+    expect(quiet.writes.some((w) => w.includes("collision"))).toBe(false);
+    expect(quiet.value).toEqual(loud.value);
+  });
+
   it("does NOT warn when one connection repeats a namespaced name against itself", () => {
     // Same namespace on both sides is not an operator-fixable collision --
     // there is no second upstream to rename -- so it must stay quiet.

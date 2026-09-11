@@ -1351,7 +1351,12 @@ export const LIST_USAGE = `Usage: yaw-mcp list [--json]
   project-local file wins over user-global), with the compliance grade
   \`yaw-mcp audit\` last cached for each. --json for machine output.
   Env vars appear as \`envKeys\` -- key NAMES only, never the stored
-  values (same posture as \`add --json\`).`;
+  values (same posture as \`add --json\`).
+
+  Exits 0 when the file was read -- including a machine with no servers
+  configured yet, which is not a fault. Exits 1 when bundles.json is there
+  and could not be read or parsed, in both modes, so a script gating on
+  \`list\` does not read a broken config as an empty machine.`;
 
 export interface ListCommandOptions {
   json?: boolean;
@@ -1443,6 +1448,32 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   // that captured stdout alone.
   for (const w of loaded.warnings) printErr(`warning: ${w}`);
 
+  // A bundles.json that is THERE and could not be used. The predicate is
+  // `install`'s (summarizeBundles in install-cmd.ts): a null config WITH a
+  // path means the file was found and could not be parsed, while a null path
+  // means there was nothing to find. Computed here, above the --json return,
+  // because both surfaces have to report it the same way.
+  //
+  // It is exit 1, the CLI's generic-failure code (2 is argv/usage, emitted by
+  // index.ts's shared parse-then-dispatch tail). This is the same condition
+  // and the same code `status` documents at the top of status-cmd.ts --
+  // "genuinely unreadable: a bundles.json is present but could not be read or
+  // parsed, so we cannot say what this machine loads" -- and the same one
+  // `sidecars install` returns for its own `Could not read <path>` branch.
+  // `doctor` reports 2 for the same file instead, which is not a
+  // disagreement: doctor's documented gate is UNCONDITIONALLY "any warning is
+  // a 2" (doctor-cmd.ts), and 0.77.0's CHANGELOG entry says in as many words
+  // that a script keying on that 2 is the point of it.
+  //
+  // This branch printed a correct diagnostic and then exited 0, so a script
+  // gating on `yaw-mcp list` saw success over a config yaw-mcp cannot load,
+  // with zero servers available.
+  //
+  // Carried as the PATH rather than a boolean so the branch below still
+  // narrows it for the message; a bare boolean does not, and re-spelling the
+  // predicate there is how the two drift apart.
+  const unreadablePath = loaded.config === null ? loaded.path : null;
+
   // Overlay the compliance grades `yaw-mcp audit` cached in ~/.yaw-mcp/
   // grades.json. This is the ONLY reader of that cache in local mode -- without
   // it, `audit` would be write-only and the grade would never reach a human.
@@ -1488,7 +1519,10 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
       return entry;
     });
     print(JSON.stringify({ path: loaded.path, servers: jsonServers, warnings: loaded.warnings }, null, 2));
-    return { exitCode: 0, written: [] };
+    // Same code the text path returns below. The document is still emitted --
+    // `warnings` is where a --json consumer reads what is wrong -- but the two
+    // surfaces must not disagree about whether this run succeeded.
+    return { exitCode: unreadablePath === null ? 0 : 1, written: [] };
   }
 
   if (servers.length === 0) {
@@ -1498,14 +1532,10 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
     // one with `yaw-mcp add <slug>`" -- under a `warning:` most readers skim,
     // which reads as an all-clear over a config yaw-mcp cannot load AND hands
     // out advice that does not work (`add` refuses that same file).
-    //
-    // The predicate is `install`'s (summarizeBundles in install-cmd.ts): a null
-    // config WITH a path means the file was found and could not be used, while
-    // a null path means there was nothing to find.
-    if (loaded.config === null && loaded.path !== null) {
-      print(`Could not read ${displaySafe(loaded.path)} -- yaw-mcp has nothing to load from it.`);
+    if (unreadablePath !== null) {
+      print(`Could not read ${displaySafe(unreadablePath)} -- yaw-mcp has nothing to load from it.`);
       print("The `warning:` line above says what is wrong; `yaw-mcp doctor` prints the same detail.");
-      return { exitCode: 0, written: [] };
+      return { exitCode: 1, written: [] };
     }
     print("No local servers configured. Add one with `yaw-mcp add <slug>`");
     print("(browse the catalog at https://yaw.sh/mcp/catalog/).");

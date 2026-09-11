@@ -73,7 +73,7 @@ import { type Content, pruneContent } from "./prune.js";
 import { findTool, formatReadToolOutput, formatToolNotFound, normalizeToolName } from "./read-tool.js";
 import { RedispatchTracker } from "./redispatch.js";
 import { type RankableServer, rankServers, rankTools, tokenize, tokenizeQuery } from "./relevance.js";
-import { type CapContent, capContent, resolveMaxResultBytes } from "./result-cap.js";
+import { type CapContent, capContent, resolveMaxResultBytes, serializedBytes } from "./result-cap.js";
 import { computeOutcomeReward } from "./reward.js";
 import {
   firstResultText,
@@ -149,6 +149,36 @@ export function isAutoLoadEnabled(): boolean {
   const raw = process.env.YAW_MCP_AUTO_LOAD?.trim();
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
+}
+
+// Startup pre-warm of dormant servers. Default ON; set YAW_MCP_PREWARM=0
+// (or "false") to suppress it. The one reason to: pre-warm LEARNS a
+// dormant server's tools by spawning it, and it throws that child away
+// once the list is in hand, so a session that learns a server starts that
+// server twice -- once here, once for the activate that follows. Rare, not
+// per-session: a learned list is persisted to state.json and is only
+// re-learned once it ages past TOOLCACHE_REFRESH_MS. (With
+// YAW_MCP_DISABLE_PERSISTENCE set nothing carries it across, so every
+// session re-learns every server whose bundles.json entry does not carry a
+// toolCache of its own.) Rare is not never, though, and an upstream whose
+// startup is not idempotent (it takes a lock, binds a port, opens a DB
+// session, writes a login audit event) does that side effect twice each
+// time, the second being the one the user actually asked for.
+//
+// Off costs what pre-warm buys: a server whose tools are not already known
+// advertises none of them in tools/list until it is activated (see
+// getDeferredServers), though `mcp_connect_discover` still lists the
+// server itself -- it reads getProfiledActiveServers, not the tool cache --
+// and activating it by namespace works exactly as before.
+export function isPrewarmEnabled(): boolean {
+  // `0` and `false` are the two off spellings YAW_MCP_AUTO_UPGRADE and
+  // YAW_MCP_CONFIG_RELOAD already accept; anything else, including unset,
+  // leaves pre-warm on. Trimmed -- which widens nothing, both off spellings
+  // are still exactly those two -- for the cmd.exe reason isAutoLoadEnabled
+  // documents: `set VAR=0 && yaw-mcp serve` delivers "0 ", and a check that
+  // did not trim would silently ignore the opt-out on Windows.
+  const raw = process.env.YAW_MCP_PREWARM?.trim().toLowerCase();
+  return !(raw === "0" || raw === "false");
 }
 
 // Last unrecognized YAW_MCP_TOOL_EXPOSURE value the warning in
@@ -414,27 +444,34 @@ export function settledWithin(p: Promise<unknown>, ms: number): Promise<boolean>
  *  it is a handful of bytes and is not part of the body either pass operates
  *  on.
  *
+ *  The content half goes through result-cap.ts's serializedBytes rather than
+ *  its own JSON.stringify, because the result cap reports the SAME quantity in
+ *  its "exceeded the size ceiling" warning and the two used to be measured two
+ *  different ways -- this one serialized the array, the cap summed its blocks,
+ *  and the two came out N+1 bytes apart on an N-block result. An operator
+ *  reading both lines for one call was reading two numbers for one thing. They
+ *  now differ only where the quantity genuinely differs: the cap sees the body
+ *  AFTER pruning, and it never sees structuredContent at all.
+ *
  *  Returns null, NOT 0, when the body cannot be serialized -- a cyclic object,
  *  a BigInt, a stringify that throws for any other reason. Callers book both
  *  ends of a measurement or neither, so an unmeasurable body records nothing;
  *  a 0 here would read as "the server returned nothing", which is the opposite
  *  of what an unserializable payload means. result-cap.ts makes the same
  *  distinction for the same reason, and resolves it the other way (Infinity)
- *  because its job is to REFUSE what it cannot measure, not to count it.
+ *  because its job is to REFUSE what it cannot measure, not to count it -- so
+ *  the non-finite it returns is translated here rather than propagated.
  *
  *  Exported for its own unit test: a body that arrives over the wire has been
  *  through JSON.parse and is acyclic by construction, so the null branch is
  *  unreachable through handleToolCall and would otherwise ship untested. */
 export function measureResultBytes(result: { content?: unknown; structuredContent?: unknown }): number | null {
-  try {
-    let bytes = Buffer.byteLength(JSON.stringify(result.content ?? []), "utf8");
-    if (result.structuredContent !== undefined) {
-      bytes += Buffer.byteLength(JSON.stringify(result.structuredContent), "utf8");
-    }
-    return bytes;
-  } catch {
-    return null;
-  }
+  const bytes = serializedBytes(result.content ?? []);
+  if (!Number.isFinite(bytes)) return null;
+  if (result.structuredContent === undefined) return bytes;
+  const structured = serializedBytes(result.structuredContent);
+  if (!Number.isFinite(structured)) return null;
+  return bytes + structured;
 }
 
 // Words that are never content terms but clear relevance.ts's 3-char prose
@@ -1807,7 +1844,45 @@ export class ConnectServer {
   // learned cache had nowhere to persist). A learned list past
   // TOOLCACHE_REFRESH_MS counts as dormant again so @latest drift gets
   // re-learned weekly instead of only at the 30-day persistence expiry.
+  //
+  // The child it spawns is DISCARDED: the tool list is what this wants, and
+  // holding the upstream open would mean N idle processes for the session.
+  // So a session that LEARNS a server runs that server's startup twice --
+  // once here, once for the activate that follows -- and there is no way
+  // around that while the only way to read a server's tools is to run it.
+  // Idempotent startups pay a spawn for a list that then persists; a startup
+  // that takes a lock, binds a port, opens a DB session or writes a login
+  // audit event does that side effect twice. YAW_MCP_PREWARM=0 is the escape
+  // hatch for the second kind (isPrewarmEnabled says what turning it off
+  // costs).
+  //
+  // Cap-exempt in both directions, deliberately -- the reasoning is at the
+  // cap check in runActivateOne. The consequence to know is that the
+  // concurrent-server cap does not bound LIVE CHILD PROCESSES: this pass
+  // spawns every dormant server, including ones an activate would be refused
+  // for, so up to CONCURRENCY more children can be alive than the cap allows
+  // loaded servers. Each is closed as soon as its tool list is in hand -- a
+  // transient spike, never a retained server. server-cap.ts says the same
+  // from its side.
   private async prewarmDormantServers(): Promise<void> {
+    // Checked FIRST, ahead of the dormant scan, so an opt-out really does
+    // mean "spawn nothing at startup" rather than "scan, then decline".
+    // Said out loud once per session, because turning this off has a
+    // visible consequence a user will otherwise report as a bug: a server
+    // they just enabled shows none of its tools in tools/list until they
+    // activate it. Only when the var is actually set -- the default path
+    // stays silent.
+    if (!isPrewarmEnabled()) {
+      log(
+        "info",
+        "Pre-warm disabled by YAW_MCP_PREWARM; servers with no learned tool list stay unadvertised until activated",
+        {
+          value: process.env.YAW_MCP_PREWARM,
+        },
+      );
+      return;
+    }
+
     // An already-connected namespace is never dormant, even when its
     // learned cache is past the refresh window: runActivateOne stamps a
     // fresh learnedAt on every real activation, and the connections here
@@ -2436,11 +2511,28 @@ export class ConnectServer {
           const cr = capContent(result.content as CapContent[], maxBytes);
           if (cr.capped) {
             result.content = cr.content as typeof result.content;
+            // `bytesRaw` is the content array alone, because that is the body
+            // that was compared against `maxBytes` and the figure the notice
+            // quotes to the model -- folding uncappable bytes into it would
+            // make both of those sentences false. But structuredContent rides
+            // through untouched, and an operator reconciling this line against
+            // the health counter (which books content and structuredContent
+            // together) would otherwise be left with an unexplained gap the
+            // size of a payload nothing here bounded. So it is named, next to
+            // the number rather than inside it. Omitted when there is none,
+            // and when it will not serialize -- the cap logs what it measured,
+            // never a guess.
+            const structuredBytes = hasStructuredContent
+              ? serializedBytes((result as { structuredContent?: unknown }).structuredContent)
+              : 0;
             log("warn", "Tool result exceeded the size ceiling and was cut", {
               namespace: route.namespace,
               tool: route.originalName,
               bytesRaw: cr.bytesRaw,
               maxBytes,
+              ...(Number.isFinite(structuredBytes) && structuredBytes > 0
+                ? { bytesStructuredUncapped: structuredBytes }
+                : {}),
             });
           }
         }
@@ -2649,6 +2741,16 @@ export class ConnectServer {
   // The recovery path is `server:` focus, which is bounded by one server
   // rather than by a number the model has to guess.
   private static readonly DISCOVER_TOOL_NAME_CAP = 5;
+
+  // How many shadowed tools an activate message names before it falls back to
+  // a count (shadowedToolNote). A collision needs the two namespaces to
+  // prefix-overlap, so in practice one or two names are involved -- but the
+  // number is bounded by the smaller server's whole inventory, and this
+  // sentence rides on a message whose entire job is to stay small. Same value
+  // and same reasoning as the discover cap above; the overflow is reported as
+  // "and N more" rather than dropped, so the model is never told the list is
+  // complete when it is not.
+  private static readonly SHADOWED_TOOL_NAME_CAP = 5;
 
   /** Is this flattened wire tool name denied by the resolved `blockedTools`?
    *
@@ -3771,6 +3873,89 @@ export class ConnectServer {
     return tools.filter((t) => (!f || f.has(t.name)) && !this.isToolDenied(`${namespace}_${t.name}`));
   }
 
+  /** Which of a namespace's VISIBLE tools it actually SERVES, and which ones
+   *  only look like its own.
+   *
+   *  `${namespace}_${tool}` is not injective: (ns=`gh`, tool=`actions_list`)
+   *  and (ns=`gh_actions`, tool=`list`) both flatten to `gh_actions_list`, so
+   *  two loaded servers can claim one wire name. buildToolRoutes resolves that
+   *  to exactly one owner (first writer wins, and buildToolList agrees), which
+   *  leaves the loser's tool with no name any caller can reach: a direct
+   *  tools/call and an mcp_connect_exec step both resolve the wire name
+   *  through that one table, and tools/list advertises it once.
+   *
+   *  Both activate messages used to render straight from visibleTools, which
+   *  is the server's OWN inventory and knows nothing about the rest of the
+   *  session. The losing side was therefore told it had loaded a tool that a
+   *  call would hand to somebody else, and the only record of the collision
+   *  was a stderr warning the model never sees. The verdict has to come from
+   *  the route table, so it is asked for here.
+   *
+   *  Built into a LOCAL rather than through rebuildRoutes(): that assigns
+   *  this.toolRoutes, which handleToolCall snapshots at entry precisely
+   *  because a rebuild can land mid-call, and this runs on the prewarm path
+   *  too, where the connection may be torn down again. `quiet` because the
+   *  activation this sits inside rebuilds the real table moments later and
+   *  would otherwise log every collision twice.
+   *
+   *  Deferred servers are deliberately left out of the build: buildToolRoutes
+   *  adds a deferred route only where no active connection has already taken
+   *  the name, so they cannot change the owner of a name an active namespace
+   *  holds -- and `namespace` is active by the time either caller asks. */
+  private splitShadowedTools<T extends { name: string; namespacedName: string }>(
+    namespace: string,
+    tools: T[],
+  ): { served: T[]; shadowed: Array<{ tool: T; owner: string }> } {
+    const routes = buildToolRoutes(this.connections, [], true);
+    const served: T[] = [];
+    const shadowed: Array<{ tool: T; owner: string }> = [];
+    for (const tool of this.visibleTools(namespace, tools)) {
+      const owner = routes.get(tool.namespacedName)?.namespace;
+      // An absent route means nothing else claimed the name either, so there
+      // is nobody to attribute it to; count it as served rather than invent a
+      // collision.
+      if (owner !== undefined && owner !== namespace) shadowed.push({ tool, owner });
+      else served.push(tool);
+    }
+    return { served, shadowed };
+  }
+
+  /** The sentence appended to an activate message when the namespace lost a
+   *  name to another one, or "" when it did not.
+   *
+   *  Empty string on the common path so a session with no collisions sees the
+   *  message it has always seen. The text names the WIRE name (what the model
+   *  would have called), the namespace that actually answers it, and the bare
+   *  tool on this server that is now unreachable -- the three facts needed to
+   *  either go call the right server on purpose or stop trying.
+   *
+   *  The unload remedy is a claim about yaw-mcp's own behaviour, so it has a
+   *  test: deactivating the owner rebuilds the routes and the name moves to
+   *  this server. The rename remedy needs none -- two namespaces that no
+   *  longer share a prefix cannot flatten onto one name -- but it is the
+   *  operator's move, not the model's, so the note offers both. */
+  private shadowedToolNote(
+    namespace: string,
+    shadowed: Array<{ tool: { name: string; namespacedName: string }; owner: string }>,
+  ): string {
+    if (shadowed.length === 0) return "";
+    const shown = shadowed.slice(0, ConnectServer.SHADOWED_TOOL_NAME_CAP);
+    const entries = shown
+      .map((s) => `"${s.tool.name}" flattens to ${s.tool.namespacedName}, already served by "${s.owner}"`)
+      .join("; ");
+    const hidden = shadowed.length - shown.length;
+    const more = hidden > 0 ? `; and ${hidden} more` : "";
+    const one = shadowed.length === 1;
+    const subject = one ? "1 tool" : `${shadowed.length} tools`;
+    return (
+      `\nName collision: ${subject} of "${namespace}" cannot be called.` +
+      ` ${entries}${more}.` +
+      ` ${one ? "That name routes" : "Those names route"} to the namespace shown instead of "${namespace}".` +
+      ` Unload that namespace with mcp_connect_deactivate, or rename one of the colliding namespaces in bundles.json,` +
+      ` to free ${one ? "the name" : "the names"}.`
+    );
+  }
+
   /** Why THIS activation may take tens of seconds, or "" when it should not.
    *
    *  A first activation of an `npx` / `uvx` / `docker` server pays for a
@@ -3820,11 +4005,17 @@ export class ConnectServer {
       // activate({server, tools: [...]}) installs the filter before this loop
       // runs. A re-activation narrowing gh to one tool answered "already loaded
       // with 2 tools" while the tools/list it triggered carried one.
-      const visible = this.visibleTools(namespace, existing.tools).length;
+      //
+      // It is also the same ROUTE split the fresh-connect path reports, and
+      // for the same reason: a tool whose flattened name another loaded
+      // namespace already owns is not one this server serves, however plainly
+      // it sits in its own inventory. Counting it answered "already loaded
+      // with 2 tools" for a server exactly one of whose tools a call reaches.
+      const { served, shadowed } = this.splitShadowedTools(namespace, existing.tools);
       return {
         ok: true,
         isChanged: false,
-        message: `"${namespace}" is already loaded with ${visible} tools.`,
+        message: `"${namespace}" is already loaded with ${served.length} tools.${this.shadowedToolNote(namespace, shadowed)}`,
         serverId: existing.config.id,
       };
     }
@@ -4005,8 +4196,15 @@ export class ConnectServer {
           // the same reason: a first activate carrying tools: [...] installs it
           // before this runs, and this message ENUMERATES the names, so counting
           // deny-only handed the model back the very tools it asked to hide.
-          const visible = this.visibleTools(namespace, connection.tools);
-          const toolNames = visible.map((t) => t.namespacedName).join(", ");
+          // The ROUTE table goes on top of that predicate, because the
+          // predicate only knows this server's own inventory. Two namespaces
+          // can flatten onto one wire name, tools/list and dispatch hand it to
+          // a single owner, and the loser's tool becomes uncallable -- so
+          // enumerating straight from the inventory told the model it had just
+          // loaded a tool that belongs to a different server. See
+          // splitShadowedTools.
+          const { served, shadowed } = this.splitShadowedTools(namespace, connection.tools);
+          const toolNames = served.map((t) => t.namespacedName).join(", ");
           // Activation succeeded — clear any stale penalty so a recovered
           // server isn't permanently demoted for a transient past failure.
           this.activationFailures.delete(namespace);
@@ -4014,7 +4212,7 @@ export class ConnectServer {
             ok: true,
             isChanged: true,
             serverId: serverConfig.id,
-            message: `Loaded "${namespace}" — ${visible.length} tools: ${toolNames}`,
+            message: `Loaded "${namespace}" — ${served.length} tools: ${toolNames}${this.shadowedToolNote(namespace, shadowed)}`,
           };
         } catch (err) {
           lastError = err;
