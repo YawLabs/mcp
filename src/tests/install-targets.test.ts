@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   buildLaunchEntry,
   claudeCodeContainerPaths,
+  claudeCodeContainerPathVariants,
   claudeCodeProjectKey,
   ENTRY_NAME,
   escapeCmdArg,
@@ -16,6 +17,7 @@ import {
   resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
+  resolveInstallSites,
   sameClaudeCodeProjectKey,
 } from "../install-targets.js";
 
@@ -1416,5 +1418,89 @@ describe("claudeCodeContainerPaths (the one place a projects[] key is resolved)"
     expect(out[0]).not.toBe(containerPath);
     out[0][1] = "mutated";
     expect(containerPath[1]).toBe("C:/repo");
+  });
+
+  it("answers the same over a KEY LISTER as over a parsed root", () => {
+    // The two spellings exist because a consumer holding BYTES must not parse
+    // a client config itself. They have to agree, or the drive-case fold would
+    // depend on which one a consumer happened to reach for.
+    const root = { projects: { "c:/repo": { mcpServers: {} }, "D:/other": {} } };
+    const keysAt = (prefix: readonly string[]): readonly string[] =>
+      prefix.length === 1 && prefix[0] === "projects" ? Object.keys(root.projects) : [];
+    for (const path of [local("C:/repo"), local("c:/repo"), local("/posix/repo"), ["mcpServers"]]) {
+      expect(claudeCodeContainerPathVariants(path, keysAt)).toEqual(claudeCodeContainerPaths(root, path));
+    }
+  });
+});
+
+describe("resolveInstallSites", () => {
+  const base = { os: "linux" as InstallOS, home: "/home/u" };
+
+  it("gives a single-site row one site at its resolved path, with the scope's effective format", () => {
+    const sites = resolveInstallSites({ ...base, clientId: "cursor", scope: "user" });
+    expect(sites).toHaveLength(1);
+    expect(sites[0].id).toBe("default");
+    expect(sites[0].detectDir).toBeNull();
+    expect(sites[0].resolved).toEqual(resolveInstallPath({ ...base, clientId: "cursor", scope: "user" }));
+    expect(sites[0].format).toBe("jsonc");
+  });
+
+  it("applies the SCOPE's strictJson, so one site is read and written at one strictness", () => {
+    // Every (client, scope) pair, against the format the row plus the scope
+    // declare. Derived rather than spelled out: a row that lands with a strict
+    // scope is covered the day it lands.
+    for (const target of INSTALL_TARGETS) {
+      if (!target.availableOn.includes("linux")) continue;
+      for (const scope of target.scopes) {
+        const sites = resolveInstallSites({
+          ...base,
+          clientId: target.clientId,
+          scope: scope.scope,
+          projectDir: scope.requiresProjectDir ? "/home/u/proj" : undefined,
+        });
+        const expected = scope.strictJson === true && target.config.format === "jsonc" ? "json" : target.config.format;
+        for (const site of sites) {
+          expect(site.format, `${target.clientId} ${scope.scope}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it("fans a row with a sites hook out to every declared copy, all at one format", () => {
+    const sites = resolveInstallSites({ ...base, clientId: "cline", scope: "user" });
+    expect(sites.length).toBeGreaterThan(1);
+    expect(sites[0].id).toBe("shared");
+    expect(sites[0].detectDir).toBeNull();
+    // Every editor copy is CONDITIONAL: it is written only where that editor's
+    // Cline storage dir exists.
+    for (const site of sites.slice(1)) expect(site.detectDir, site.id).not.toBeNull();
+    expect(new Set(sites.map((s) => s.format))).toEqual(new Set(["json"]));
+    expect(new Set(sites.map((s) => s.id)).size).toBe(sites.length);
+    // The first site is the one `resolvePath` answers with, so a caller that
+    // only wants "the" file agrees with the fan-out's head.
+    expect(sites[0].resolved).toEqual(resolveInstallPath({ ...base, clientId: "cline", scope: "user" }));
+  });
+
+  it("refuses exactly what resolveInstallPath refuses, with the same message", () => {
+    const cases = [
+      { clientId: "claude-desktop" as const, scope: "user" as const, os: "linux" as InstallOS },
+      { clientId: "claude-code" as const, scope: "local" as const, os: "linux" as InstallOS },
+    ];
+    for (const c of cases) {
+      let fromPath = "";
+      let fromSites = "";
+      try {
+        resolveInstallPath({ ...base, ...c });
+      } catch (e) {
+        fromPath = (e as Error).message;
+      }
+      try {
+        resolveInstallSites({ ...base, ...c });
+      } catch (e) {
+        fromSites = (e as Error).message;
+      }
+      expect(fromPath, `${c.clientId} ${c.scope} should throw`).not.toBe("");
+      expect(fromSites).toBe(fromPath);
+    }
   });
 });

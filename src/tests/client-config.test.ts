@@ -25,6 +25,7 @@ import {
   carryableEnvOf,
   classifyClientConfig,
   composeEntry,
+  containerKeysAt,
   describeValueShape,
   type EntryAddress,
   type EntryTransform,
@@ -438,6 +439,32 @@ describe("the view", () => {
     });
     expect(view.addressIndex).toBe(0);
     expect(view.read.kind === "ok" && view.read.containerPresent).toBe(true);
+  });
+
+  it("lists the keys at a prefix, so a consumer can enumerate variants without parsing", () => {
+    const raw = '{"projects":{"C:/repo":{"mcpServers":{}},"c:/repo":{}},"mcpServers":{"mcp":{}}}';
+    expect(containerKeysAt(raw, site(), ["projects"])).toEqual(["C:/repo", "c:/repo"]);
+    expect(containerKeysAt(raw, site(), ["mcpServers"])).toEqual(["mcp"]);
+  });
+
+  it("lists nothing for an absent, unparseable, prefix-less or missing-container read", () => {
+    // Each of these degrades to "no variants", which leaves the canonical
+    // container path -- never a throw, because this runs on the read path of
+    // every verb.
+    expect(containerKeysAt(null, site(), ["projects"])).toEqual([]);
+    expect(containerKeysAt("{ not json", site(), ["projects"])).toEqual([]);
+    expect(containerKeysAt("[1,2]", site(), ["projects"])).toEqual([]);
+    expect(containerKeysAt('{"projects":7}', site(), ["projects"])).toEqual([]);
+    expect(containerKeysAt('{"mcpServers":{}}', site(), ["projects"])).toEqual([]);
+    expect(containerKeysAt('{"projects":{"a":{}}}', site(), [])).toEqual([]);
+  });
+
+  it("leaves the site it was handed alone", () => {
+    // It classifies at a DIFFERENT container path, and a mutated site would
+    // send the read that follows to the wrong container.
+    const s = site();
+    containerKeysAt('{"projects":{"a":{}}}', s, ["projects"]);
+    expect(s.resolved.containerPath).toEqual(["mcpServers"]);
   });
 });
 

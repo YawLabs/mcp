@@ -430,6 +430,12 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       why: "claudeCodeContainerPaths itself -- the one raw read of the projects object, which the fold is built from",
     },
     {
+      shape: "INDEX for (const candidate of keysAt([PROJECTS_KEY])) {",
+      why:
+        "claudeCodeContainerPathVariants asking its key lister for the projects keys -- the same one read as " +
+        "above, for the caller that holds the file's BYTES rather than a parsed root and so must not parse it",
+    },
+    {
       shape: "INDEX out.push([PROJECTS_KEY, candidate, ...containerPath.slice(2)]);",
       why: "claudeCodeContainerPaths building one variant path per case-variant key it found",
     },

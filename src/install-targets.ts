@@ -78,12 +78,14 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { type ConfigSite, effectiveConfigFormat } from "./client-config.js";
 import {
   type ClientEnvValues,
   defineTarget,
   type InlineTarget,
   type InstallOS,
   type InstallScope,
+  type InstallScopeSpec,
   type LaunchEntry,
   LEGACY_ENTRY_NAMES,
   type ModularTarget,
@@ -306,6 +308,64 @@ export interface ResolvePathOptions {
 }
 
 export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
+  const { target, base } = resolveTargetBase(opts);
+  // A MODULAR row resolves its own path; the six inline ids keep their
+  // `pathFor` branches, whose bytes (and their `display` spellings) are pinned
+  // per client. Testing `resolvePath` first is also what narrows `target` to
+  // InlineTarget below, so the switch can end in an exhaustiveness check.
+  if (target.resolvePath) return target.resolvePath(base);
+  return pathFor(target.clientId, base.scope, base.os, {
+    home: base.home,
+    appData: base.appData,
+    projectDir: base.projectDir,
+    claudeConfigDir: base.env.claudeConfigDir,
+  });
+}
+
+/** Every FILE one (client, scope) reads and writes, as `ConfigSite`s the
+ *  client-config core can classify and edit.
+ *
+ *  One site for every row but Cline, whose `sites` hook fans one pair out to a
+ *  shared file plus one copy per editor its extension has run in. The
+ *  effective FORMAT is applied here, once, from the target's `config` narrowed
+ *  by the scope's `strictJson` -- so a consumer cannot read a site with one
+ *  strictness and write it with another.
+ *
+ *  Validates exactly as `resolveInstallPath` does, and throws the same
+ *  messages, because it shares that function's first half. `selectSites` in
+ *  client-config.ts is what drops a conditional site whose editor is not
+ *  installed; this returns every DECLARED site so a caller can report the
+ *  difference. */
+export function resolveInstallSites(opts: ResolvePathOptions): ConfigSite[] {
+  const { target, scopeSpec, base } = resolveTargetBase(opts);
+  const format = effectiveConfigFormat(target.config, scopeSpec);
+  if (target.sites) return target.sites(base).map((site) => ({ ...site, format }));
+  return [
+    {
+      // "default" rather than the client id: the id names the SITE within a
+      // target, and every single-site row has exactly one.
+      id: "default",
+      label: target.label,
+      resolved: resolveInstallPath(opts),
+      format,
+      detectDir: null,
+    },
+  ];
+}
+
+/** The target, its scope spec and the `PathBase` one resolve runs against --
+ *  the shared first half of `resolveInstallPath` and `resolveInstallSites`.
+ *
+ *  Shared rather than copied because every refusal in it is a CONTRACT: the
+ *  unknown-client, unsupported-scope, unavailable-OS and missing-project-dir
+ *  throws are what `resolveInstallSite` in install-cmd.ts pre-empts with its
+ *  own worded errors, and two copies of this validation would be two places
+ *  for that agreement to drift. */
+function resolveTargetBase(opts: ResolvePathOptions): {
+  target: InstallTarget;
+  scopeSpec: InstallScopeSpec;
+  base: PathBase;
+} {
   const home = opts.home ?? homedir();
   // PURE: this resolver reads NO environment, and `appData` defaults off `home`
   // alone. It used to consult process.env.APPDATA whenever the caller passed no
@@ -371,17 +431,7 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
     scope,
     env,
   };
-  // A MODULAR row resolves its own path; the six inline ids keep their
-  // `pathFor` branches, whose bytes (and their `display` spellings) are pinned
-  // per client. Testing `resolvePath` first is also what narrows `target` to
-  // InlineTarget below, so the switch can end in an exhaustiveness check.
-  if (target.resolvePath) return target.resolvePath(base);
-  return pathFor(target.clientId, scope, os, {
-    home,
-    appData,
-    projectDir: absoluteProjectDir ?? "",
-    claudeConfigDir: cfgDir,
-  });
+  return { target, scopeSpec, base };
 }
 
 /** The `projects[...]` key Claude Code uses for `projectDir` in ~/.claude.json.
@@ -522,17 +572,41 @@ export function sameClaudeCodeProjectKey(a: string, b: string): boolean {
  *  POSIX/UNC project keys get exactly one path back, so every other client and
  *  every non-Windows checkout is untouched. */
 export function claudeCodeContainerPaths(root: unknown, containerPath: readonly string[]): string[][] {
+  return claudeCodeContainerPathVariants(containerPath, (prefix) => {
+    if (prefix.length !== 1 || prefix[0] !== PROJECTS_KEY) return [];
+    if (typeof root !== "object" || root === null || Array.isArray(root)) return [];
+    const projects = (root as Record<string, unknown>)[PROJECTS_KEY];
+    if (typeof projects !== "object" || projects === null || Array.isArray(projects)) return [];
+    // Own keys only, in the file's own order, so the result is deterministic
+    // and an inherited member cannot conjure a path that is not in the JSON.
+    return Object.keys(projects as Record<string, unknown>);
+  });
+}
+
+/** `claudeCodeContainerPaths` over a KEY LISTER instead of a parsed root.
+ *
+ *  The rule is the same and lives here, where the `projects[...]` question
+ *  belongs; only the way the candidate keys are obtained differs. A consumer
+ *  holding a parsed object calls `claudeCodeContainerPaths` above; a consumer
+ *  holding the client config's BYTES passes `containerKeysAt` from
+ *  client-config.ts, and so never parses a client config itself -- which is
+ *  what lets the drive-case fold work for every syntax rather than only for
+ *  the ones whose parse a consumer happens to have inlined.
+ *
+ *  `keysAt` is asked for the keys at ONE prefix (`["projects"]`) and may
+ *  answer `[]` for anything else, including a file that does not parse: the
+ *  canonical path is always returned, so "no keys" degrades to "write where
+ *  writes go". */
+export function claudeCodeContainerPathVariants(
+  containerPath: readonly string[],
+  keysAt: (prefix: readonly string[]) => readonly string[],
+): string[][] {
   const canonical = [...containerPath];
   if (containerPath.length < 2 || containerPath[0] !== PROJECTS_KEY) return [canonical];
   const key = containerPath[1];
   if (!WINDOWS_DRIVE_PATH.test(key)) return [canonical];
-  if (typeof root !== "object" || root === null || Array.isArray(root)) return [canonical];
-  const projects = (root as Record<string, unknown>)[PROJECTS_KEY];
-  if (typeof projects !== "object" || projects === null || Array.isArray(projects)) return [canonical];
   const out: string[][] = [canonical];
-  // Own keys only, in the file's own order, so the result is deterministic and
-  // an inherited member cannot conjure a path that is not in the JSON.
-  for (const candidate of Object.keys(projects as Record<string, unknown>)) {
+  for (const candidate of keysAt([PROJECTS_KEY])) {
     if (candidate !== key && sameClaudeCodeProjectKey(candidate, key)) {
       out.push([PROJECTS_KEY, candidate, ...containerPath.slice(2)]);
     }

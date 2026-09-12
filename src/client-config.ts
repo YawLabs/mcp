@@ -812,6 +812,26 @@ function makeView(
   };
 }
 
+/** The keys present in the container at `prefix` inside `raw`, read with
+ *  `site`'s own adapter -- `[]` for a file that is absent, does not parse, or
+ *  has nothing at that prefix.
+ *
+ *  This is what lets a consumer enumerate candidate container paths WITHOUT
+ *  parsing a client config itself. Claude Code's drive-letter-case fold is
+ *  the one live user: the set of `projects[...]` keys a file carries is a
+ *  question about the file, and the rule for which of them name the same
+ *  project is a question about Claude Code -- so the keys come from here and
+ *  the rule stays in install-targets.ts (`claudeCodeContainerPathVariants`).
+ *
+ *  Sync, and takes bytes rather than a path, so the async and the sync read
+ *  paths can both use it on text they already hold. */
+export function containerKeysAt(raw: string | null, site: ConfigSite, prefix: readonly string[]): readonly string[] {
+  if (raw === null || prefix.length === 0) return [];
+  const at: ConfigSite = { ...site, resolved: { ...site.resolved, containerPath: [...prefix] } };
+  const read = classifyClientConfig(raw, at).read;
+  return read.kind === "ok" ? read.entries.map((entry) => entry.key) : [];
+}
+
 export interface ReadSeam {
   /** Reads the file's bytes. The seam doctor's probe already has, kept so its
    *  EBUSY and EISDIR tests keep working. */
