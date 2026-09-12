@@ -1,0 +1,4 @@
+[mcp_servers.mcp]
+command = "C:\\Users\\me\\.oam\\bin\\oam.exe"
+args = ["run", "--no-check", "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@yawlabs\\mcp\\dist\\index.js"]
+startup_timeout_sec = 60.0

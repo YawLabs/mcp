@@ -1,0 +1,3 @@
+[mcp_servers]
+mcp.command = "npx"
+mcp.args = ["-y", "@yawlabs/mcp@latest"]

@@ -1,0 +1,8 @@
+# Codex config
+model = "gpt-5"
+
+# yaw-mcp broker -- do not edit by hand
+
+# the other one
+[mcp_servers.sib]
+command = "node"
