@@ -69,8 +69,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** The object at `segments`, or null when any segment is missing or holds a
- *  non-object. The same walk `readNested` and doctor's container walk do, with
- *  the "and it must be an object" test folded in. */
+ *  non-object. The one walk of a JSON-family container: every consumer used
+ *  to carry a copy of it, and doctor is the last one that still does. */
 function containerAt(root: Record<string, unknown>, segments: readonly string[]): Record<string, unknown> | null {
   let cursor: unknown = root;
   for (const key of segments) {
