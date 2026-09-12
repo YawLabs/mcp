@@ -363,6 +363,22 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
         "goes to. Nothing to fold -- an absent file carries no drive-case sibling key to find",
     },
   ],
+  "src/client-config-toml.ts": [
+    {
+      shape: "LOOP for (const key of containerPath)",
+      why:
+        "containerValue: reads the container the splice is about to edit, on the path it was handed. " +
+        "Codex has no per-project container key, so there is no drive-case sibling to fold",
+    },
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
+      why: "readTomlConfig: the classify walk, which reports a non-table segment as `blocked` rather than folding",
+    },
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
+      why: "canonTomlConfig: drops the touched entries from the container for the post-write compare",
+    },
+  ],
   "src/doctor-cmd.ts": [
     {
       shape: "CALL walkContainer(root: Record<string, unknown>, path: string[])",

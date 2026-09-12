@@ -93,6 +93,7 @@ import {
   type ResolvedPath,
 } from "./install-target-model.js";
 import { CLINE_TARGET } from "./target-cline.js";
+import { CODEX_CLI_TARGET } from "./target-codex-cli.js";
 import { CONTINUE_TARGET } from "./target-continue.js";
 import { ZED_TARGET } from "./target-zed.js";
 
@@ -249,6 +250,9 @@ const TARGET_ROWS = [
   ZED_TARGET,
   CLINE_TARGET,
   CONTINUE_TARGET,
+  // Importing this row is also what registers the "toml" config adapter (see
+  // its module header), so the format is readable exactly when a row uses it.
+  CODEX_CLI_TARGET,
 ] as const satisfies readonly (InlineTarget | ModularTarget)[];
 
 /** Derived from the rows, never hand-kept beside them: `defineTarget`'s

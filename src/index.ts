@@ -603,6 +603,12 @@ if (subcommand === "compliance") {
                                Continue's own IDE core does -- note that
                                resolves against ITS working directory, not
                                this one, so an absolute value is safer.
+    CODEX_HOME                    Codex's own state directory, honored by the
+                               same four commands when they locate
+                               <dir>/config.toml (it defaults to ~/.codex).
+                               Codex requires the directory to EXIST and be a
+                               directory; an empty value counts as unset. It
+                               does not move a project's .codex/config.toml.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when
