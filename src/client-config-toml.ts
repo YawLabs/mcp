@@ -592,13 +592,31 @@ function lineStartBefore(text: string, end: number): number {
  *  structural" block: the `#` skip here in normal state, entering and leaving
  *  both single-line string states, the in-string backslash skip (twice, once
  *  per basic-string state), the bracket AND brace halves of the depth count,
- *  and the two multi-line terminators with their extra-quote runs. That block
- *  also pins the guards that must NOT exist -- a `#` skip inside either
- *  multi-line state, or a backslash skip inside either LITERAL one, is the
- *  obvious symmetry fix and is wrong, because a literal string has no escapes
- *  and a `#` inside any string is a character.
+ *  and the two multi-line terminators with their extra-quote runs.
  *
- *  So: before adding, deleting or "tidying" a branch here, delete it and run
+ *  That block also pins the guards that must NOT exist, and as a SET for the
+ *  same reason -- the symmetry argument that produces one of them produces all
+ *  of them. Four kinds, across the four string states:
+ *
+ *   - a `#` comment skip in ANY string state, single-line or multi-line. A `#`
+ *     inside a string is a character.
+ *   - a backslash escape skip in either LITERAL state. A literal string has no
+ *     escapes.
+ *   - counting bracket or brace depth inside any string state. A bracket
+ *     inside a string is text.
+ *   - letting the OTHER quote end a single-line string: `'` is ordinary inside
+ *     `"..."`, and `"` is ordinary inside `'...'`.
+ *
+ *  Each of the twelve was inserted and measured, and FIVE left the whole suite
+ *  green until the assertions were written: the `#` skip in single-line
+ *  `literal` (the `basic` half was caught only incidentally, by a `#` in g20's
+ *  bracketed value), depth counting in both multi-line states, and either
+ *  wrong-quote terminator. Their failure mode is the same false refusal as a
+ *  deleted guard, and reached the same way -- an UNBALANCED bracket that stops
+ *  being cancelled, so depth never returns to 0 and every later line reads as
+ *  continuation.
+ *
+ *  So: before adding, deleting or "tidying" a branch here, change it and run
  *  that block. If nothing goes red, the branch is not what you think it is. */
 function scanSpan(
   text: string,
@@ -1274,29 +1292,55 @@ function applyEdits(text: string, edits: SpanEdit[]): string {
  *  then gives up ONE adjacent blank line so the deletion cannot leave a double
  *  blank, a blank line at EOF, or a file that opens on an empty line.
  *
- *  The blank taken is the one BEFORE the region, which is the one the insert
- *  put there. A region at the very start of the file has no blank before it,
- *  so there the blank after it goes instead.
+ *  The blank taken is the one BEFORE the region. A region at the very start of
+ *  the file has no blank before it, so there the blank after it goes instead.
+ *  Nothing here knows WHO put that blank there, which is the whole of what
+ *  follows.
  *
- *  That is what makes `remove(upsert(x))` return `x` BYTE FOR BYTE for the
- *  ordinary shapes -- a container whose last table is followed by a blank
- *  line, by end of file, or by a comment that already had a blank line above
- *  it, plus a file with no container at all. It is NOT a general identity, and
- *  the exception is ADDITIVE WHITESPACE ONLY. Measured, two mechanisms, and
- *  in each the result is `x` plus exactly ONE line break:
+ *  `remove(upsert(x))` is therefore not an identity, and the deviation is NOT
+ *  additive-only. `insertEdit` puts one blank line in FRONT of the new block
+ *  when the line before the anchor is not blank, and one BEHIND it when the
+ *  line at the anchor is not blank; of those two this function takes back only
+ *  the one in FRONT. (The blank-AFTER branch above needs the region to start
+ *  at the top of the file, which an insert never produces -- a file with
+ *  nothing but whitespace never reaches the splice at all.) Three outcomes
+ *  follow from that one asymmetry. Measured over the 150-shape enumeration in
+ *  the test file ("remove(upsert(x)) is byte-exact, one line break longer, or
+ *  SHORTER"): 98 byte-exact, 38 longer, 14 shorter.
  *
- *   - the container's last table is followed IMMEDIATELY by a comment, with no
- *     blank line between (whether the comment ends the file or another section
- *     follows it). The insert puts a blank on each side of the new block; the
- *     remove can only take back the one BEFORE, so the comment keeps a blank
- *     line above it that `x` did not have.
- *   - `x` has no trailing line break at all. The insert gives the last line
- *     one before appending, and nothing gives it back.
+ *  "Blank" throughout means `isBlankLine`: empty, or nothing but spaces and
+ *  tabs.
  *
- *  Nothing of `x` is ever dropped and the meaning is unchanged -- what is lost
- *  in those shapes is only the claim to byte equality. The round-trip tests
- *  pin both halves: the shapes that are byte-exact, and the three that come
- *  back one line break longer. */
+ *   - BYTE-EXACT (98). The insert's front blank was the only whitespace it
+ *     added and this function took that same blank back: a container whose
+ *     last table is followed by a blank line, by end of file, or by a blank
+ *     line and then a comment; and a file with no container at all whose last
+ *     line is not blank.
+ *   - ONE LINE BREAK LONGER (38). The insert added a break it never gets back.
+ *     Either the line AT the anchor was not blank, so a blank went in BEHIND
+ *     the block -- and what that line IS (a comment, another section's header,
+ *     a root key) does not enter into it -- or the anchor sat at end of file
+ *     and `x` had no trailing line break, so the insert gave its last line one
+ *     before appending.
+ *   - SHORTER: BYTES OF `x` ARE DROPPED (14). The insert added NO front blank,
+ *     because the line before the anchor was ALREADY blank -- and this
+ *     function takes the blank before the region regardless, so the blank it
+ *     eats is `x`'s. Reachable only when the container has no table at all,
+ *     since only then does the anchor sit at end of file with `x`'s own last
+ *     line in front of it. A no-container file ending in a blank line comes
+ *     back without it, and one ending in a whitespace-only line loses the
+ *     spaces or tabs as well.
+ *
+ *  So two of the sentences this comment used to carry were false: bytes of `x`
+ *  CAN be dropped, and "a file with no container at all" is byte-exact only
+ *  while it does not end on a blank line. What IS true in all three classes is
+ *  that the meaning survives -- the same test asserts `canonTomlConfig` is
+ *  equal going in and coming out for every one of the 150 shapes.
+ *
+ *  Taking the blank before stays the right rule for a remove read on its own:
+ *  leaving it would put a blank line at EOF, or a double blank mid-file, in
+ *  the config the user keeps. The round trip is what gives way, and only in
+ *  whitespace. */
 function deleteSectionEdits(text: string, sections: readonly TomlSection[]): SpanEdit[] {
   const spans = sections.map((s) => ({ start: s.start, end: s.contentEnd })).sort((a, b) => a.start - b.start);
   const regions: Array<{ start: number; end: number }> = [];

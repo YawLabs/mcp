@@ -1455,6 +1455,100 @@ describe("a byte that only LOOKS structural", () => {
     }
   });
 
+  // The three tests below finish the must-not-exist set the one above starts.
+  // Each of the twelve insertable guards (a `#` skip in any of the four string
+  // states, a backslash skip in either literal state, depth counting in any of
+  // the four, either wrong-quote terminator) was inserted into scanSpan and
+  // measured against this file. FIVE left it entirely green: the `#` skip in
+  // single-line `literal`, depth counting in mlBasic and in mlLiteral, and
+  // both wrong-quote terminators. They are pinned here.
+  //
+  // The witness is always an UNBALANCED bracket or brace. A balanced pair
+  // inside a string cancels out even when the guard miscounts it, which is
+  // exactly why g01/g02 (a header inside a multi-line block, brackets
+  // balanced) survived the depth mutations.
+
+  /** The two-server file the guard cases are measured on, with `value` as a
+   *  sibling's key. Every `value` below was written to a scratch CODEX_HOME's
+   *  config.toml in this shape and handed to a real codex-cli 0.144.0;
+   *  `codex mcp list --json` returned BOTH `mcp` and `other` every time, so a
+   *  scan that misses a table is never "the file was broken". */
+  const twoServers = (value: string): string =>
+    `[mcp_servers.other]\ncommand = "node"\n${value}\n\n[mcp_servers.mcp]\ncommand = "old"\n`;
+
+  /** Both tables seen, both servers read, and the splice not refused -- the
+   *  three things every one of these mutations breaks together. */
+  const seesBothTables = (value: string, label: string): void => {
+    const raw = twoServers(value);
+    expect(
+      scanTomlSections(raw).sections.map((s) => s.keyPath),
+      label,
+    ).toEqual([
+      ["mcp_servers", "other"],
+      ["mcp_servers", "mcp"],
+    ]);
+    bothServers(raw);
+    // The refusal this whole class produces, named so it cannot be mistaken
+    // for a cosmetic miss: `the "mcp" entry is not written as a
+    // [mcp_servers.mcp] table`.
+    expect(() => upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER), label).not.toThrow();
+    // ...and the sibling's value survives the write byte for byte.
+    expect(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER), label).toContain(value);
+  };
+
+  it("a `#` inside a SINGLE-LINE string is content too, in both quote styles", () => {
+    // The same guard-that-must-not-exist as the multi-line pair above, one
+    // state lower. The LITERAL half was the gap -- inserting the `#` comment
+    // skip into scanSpan's single-line `literal` state left all 158 tests in
+    // this file green. The BASIC half was caught only incidentally, by the
+    // `#1` inside g20's bracketed `X-Note:` value, so it is pinned here on
+    // purpose rather than left depending on one fixture's header text.
+    //
+    // Mechanism: the skip jumps to end of line, so the `]` that closes the
+    // array is never counted, depth never returns to 0, and every later line
+    // -- `[mcp_servers.mcp]` included -- reads as bracket continuation.
+    const TICK = String.fromCharCode(0x27);
+    const HASH = String.fromCharCode(0x23);
+    seesBothTables(`paths = [${TICK}a${HASH}b${TICK}, ${TICK}c${TICK}]`, "literal, # inside an array");
+    seesBothTables(`paths = [${QUOTE}a${HASH}b${QUOTE}, ${QUOTE}c${QUOTE}]`, "basic, # inside an array");
+    seesBothTables(`other2 = { c = ${QUOTE}a${HASH}b${QUOTE} }`, "basic, # inside an inline table");
+    seesBothTables(`other2 = { c = ${TICK}a${HASH}b${TICK} }`, "literal, # inside an inline table");
+  });
+
+  it("a bracket inside a multi-line block is text, so its depth must not be counted", () => {
+    // The bracket/brace depth count belongs to the NORMAL state only. Adding
+    // it to either multi-line state is the symmetry fix, and BOTH halves were
+    // unpinned: an unbalanced `[` or `{` inside a `"""` or `'''` block then
+    // leaves depth above zero for the rest of the file.
+    const TICK = String.fromCharCode(0x27);
+    const TQ = QUOTE.repeat(3);
+    const TT = TICK.repeat(3);
+    for (const [open, close, name] of [
+      [TQ, TQ, "mlBasic"],
+      [TT, TT, "mlLiteral"],
+    ]) {
+      seesBothTables(`note = ${open}an open [ bracket${close}`, `${name}, unbalanced [ on one line`);
+      seesBothTables(`note = ${open}a close ] bracket${close}`, `${name}, unbalanced ] on one line`);
+      seesBothTables(`note = ${open}line one [\nline two${close}`, `${name}, unbalanced [ across lines`);
+      seesBothTables(`note = ${open}line one {\nline two${close}`, `${name}, unbalanced { across lines`);
+    }
+  });
+
+  it("the OTHER quote character does not end a single-line string", () => {
+    // `'` is an ordinary character inside `"..."` and `"` is ordinary inside
+    // `'...'`. Letting either close the other is a state-machine "tidy" and
+    // both directions left this file green: the string ends early, the rest of
+    // the line is read as structure, and a bracket that was text gets counted.
+    //
+    // An apostrophe in a basic string is not a contrived shape -- `don't` in
+    // an `args` entry is the ordinary way to hit it.
+    const TICK = String.fromCharCode(0x27);
+    seesBothTables(`args = [${QUOTE}don${TICK}t [x]${QUOTE}]`, "apostrophe inside a basic string");
+    seesBothTables(`args = [${QUOTE}it${TICK}s fine${QUOTE}, ${QUOTE}y${QUOTE}]`, "apostrophe, bracket after");
+    seesBothTables(`other2 = { c = ${QUOTE}don${TICK}t${QUOTE} }`, "apostrophe in a basic inline-table value");
+    seesBothTables(`args = [${TICK}say ${QUOTE}hi${QUOTE} [x]${TICK}]`, "double quote inside a literal string");
+  });
+
   it("a multi-line INLINE table's lines are its value, not the container's", () => {
     // `other = {` ... `}` across lines is TOML 1.1 and BOTH smol-toml 1.8.0
     // and codex 0.144.0 accept it. The brace half of the bracket-depth
@@ -1628,11 +1722,7 @@ describe("the line-shaped decisions around the edit", () => {
     expect(tomlEntryNames(readTomlConfig(next, CONTAINER))).toEqual([ENTRY]);
   });
 
-  it("remove(upsert(x)) is x byte for byte for the ordinary shapes, and ADDS one line break for three others", () => {
-    // The identity the `deleteSectionEdits` comment claims, and its exact
-    // limit. Measured, not asserted in prose: the round trip never drops a
-    // byte of `x`, but in three shapes it comes back with one MORE line break
-    // than it went in with.
+  it("remove(upsert(x)) is x byte for byte for the ordinary shapes", () => {
     for (const x of [
       lf("[mcp_servers.a]", 'command = "x"', "", "[tui]", 'theme = "d"'),
       lf("[mcp_servers.a]", 'command = "x"'),
@@ -1645,31 +1735,197 @@ describe("the line-shaped decisions around the edit", () => {
         x,
       );
     }
+  });
 
-    // ...and the three that gain exactly one line break. Two mechanisms:
-    // a comment with no blank line above it gets one (the insert adds a blank
-    // on each side and the remove can only take back the one BEFORE), and a
-    // file with no final break gets one (the insert adds it; nothing removes
-    // it again).
-    const additive: Array<[string, string]> = [
+  it("ADDS one line break whenever the line AT the insert anchor is not blank", () => {
+    // The `deleteSectionEdits` comment used to call this "two mechanisms" and
+    // enumerate two shapes. It is ONE rule with one cause: `insertEdit` puts a
+    // blank line BEHIND the block whenever the line at the anchor is not
+    // blank, and the remove only ever takes back the one in FRONT. What that
+    // line happens to BE -- a comment, another section's header, a root key --
+    // does not enter into it, which is why listing shapes undercounted.
+    const additive: Array<[string, string, string]> = [
       [
+        "a comment immediately after the container's last table",
         lf("[mcp_servers.a]", 'command = "x"', "# trailing note"),
         lf("[mcp_servers.a]", 'command = "x"', "", "# trailing note"),
       ],
       [
+        "a comment, then another section",
         lf("[mcp_servers.a]", 'command = "x"', "# note", "[tui]", 'theme = "d"'),
         lf("[mcp_servers.a]", 'command = "x"', "", "# note", "[tui]", 'theme = "d"'),
       ],
-      ["model = 'gpt-5'", lf("model = 'gpt-5'")],
+      [
+        // The third mechanism the old comment missed entirely: no comment
+        // anywhere, just a section header on the very next line.
+        "another SECTION immediately after, no blank between",
+        lf("[mcp_servers.a]", 'command = "x"', "[tui]", 'theme = "d"'),
+        lf("[mcp_servers.a]", 'command = "x"', "", "[tui]", 'theme = "d"'),
+      ],
+      [
+        "a detached sub-table, then a section immediately after",
+        lf("[mcp_servers.a]", 'command = "x"', "[mcp_servers.a.env]", 'K = "v"', "[tui]", "t = 1"),
+        lf("[mcp_servers.a]", 'command = "x"', "[mcp_servers.a.env]", 'K = "v"', "", "[tui]", "t = 1"),
+      ],
+      [
+        // x has no trailing line break: the insert gives its last line one
+        // before appending, and nothing gives it back.
+        "no trailing line break at all",
+        "model = 'gpt-5'",
+        lf("model = 'gpt-5'"),
+      ],
+      [
+        "no trailing line break, container present",
+        '[mcp_servers.a]\ncommand = "x"',
+        lf("[mcp_servers.a]", 'command = "x"'),
+      ],
     ];
-    for (const [x, expected] of additive) {
+    for (const [label, x, expected] of additive) {
+      const back = removeTomlEntry(upsertTomlEntry(x, CONTAINER, ENTRY, BROKER), CONTAINER, ENTRY);
+      expect(back, label).toBe(expected);
+      expect(back.length - x.length, label).toBe(1);
+      expect(canonTomlConfig(back, CONTAINER), label).toBe(canonTomlConfig(x, CONTAINER));
+    }
+  });
+
+  it("DROPS bytes of x when the file has no container and ends on a blank line", () => {
+    // The claim this replaces said "Nothing of `x` is ever dropped" and listed
+    // "a file with no container at all" among the byte-exact shapes. Both are
+    // false, and in the same case.
+    //
+    // Mechanism, from the intermediate: with no container table the anchor is
+    // end of file, so when x's OWN last line is already blank the insert adds
+    // no blank in front -- and the remove takes "the blank before the region"
+    // regardless of who put it there. That blank is x's. A whitespace-only
+    // last line loses its spaces or tabs with it.
+    //
+    // Bytes, so a future change to the rule cannot pass by being merely
+    // plausible. Every `back` here was also read off disk with xxd.
+    const CR = String.fromCharCode(0x0d);
+    const TAB = String.fromCharCode(0x09);
+    const subtractive: Array<[string, string, number]> = [
+      // "model = 'gpt-5'" + blank line -> the blank is gone.
+      ["model = 'gpt-5'\n\n", "model = 'gpt-5'\n", -1],
+      // ...and three spaces plus the break go together.
+      ["model = 'gpt-5'\n   \n", "model = 'gpt-5'\n", -4],
+      [`model = 'gpt-5'\n${TAB}\n`, "model = 'gpt-5'\n", -2],
+      // A whitespace-only last line with NO final break: the insert gives it
+      // one (+1), then the whole line is deleted (-4).
+      ["model = 'gpt-5'\n   ", "model = 'gpt-5'\n", -3],
+      // Not just root keys -- any file with no [mcp_servers.*] table.
+      ['[tui]\ntheme = "d"\n\n', '[tui]\ntheme = "d"\n', -1],
+      // CRLF loses two bytes, not one.
+      [`[tui]${CR}\ntheme = "d"${CR}\n${CR}\n`, `[tui]${CR}\ntheme = "d"${CR}\n`, -2],
+      // The blank need not be the whole tail: a trailing comment keeps its
+      // own line and the blank AFTER it is the one that goes.
+      ["model = 'gpt-5'\n\n# n\n\n", "model = 'gpt-5'\n\n# n\n", -1],
+      // A BOM does not change it.
+      [`${BOM}model = 'gpt-5'\n\n`, `${BOM}model = 'gpt-5'\n`, -1],
+    ];
+    for (const [x, expected, delta] of subtractive) {
       const back = removeTomlEntry(upsertTomlEntry(x, CONTAINER, ENTRY, BROKER), CONTAINER, ENTRY);
       expect(back, JSON.stringify(x)).toBe(expected);
-      // Additive, and additive ONLY: one line break longer, nothing of x lost,
-      // and it still means what it meant.
-      expect(back.length - x.length, JSON.stringify(x)).toBe(1);
+      expect(back.length - x.length, JSON.stringify(x)).toBe(delta);
+      // Whitespace only: it still MEANS what it meant, which is the one claim
+      // the old comment made that survives.
       expect(canonTomlConfig(back, CONTAINER), JSON.stringify(x)).toBe(canonTomlConfig(x, CONTAINER));
     }
+  });
+
+  it("remove(upsert(x)) is byte-exact, one line break longer, or SHORTER -- 98 / 38 / 14", () => {
+    // The three classes counted rather than sampled, and the RULE that decides
+    // which, checked against every shape. The counts are what make the
+    // `deleteSectionEdits` comment's numbers verifiable instead of remembered;
+    // a change to the insert or the delete that moves any shape between
+    // classes fails here with the shape named.
+    const bodies: Array<[string, string[]]> = [
+      ["no-container", ["model = 'gpt-5'"]],
+      ["container-last", ["[mcp_servers.a]", 'command = "x"']],
+      ["container-then-section", ["[mcp_servers.a]", 'command = "x"', "", "[tui]", 'theme = "d"']],
+    ];
+    const tails: Array<[string, string[]]> = [
+      ["none", []],
+      ["blank", [""]],
+      ["blank,blank", ["", ""]],
+      ["spaces", ["   "]],
+      ["tab", [String.fromCharCode(0x09)]],
+      ["comment", ["# note"]],
+      ["blank,comment", ["", "# note"]],
+      ["comment,blank", ["# note", ""]],
+      ["section", ["[tui2]", 'theme = "e"']],
+      ["blank,section", ["", "[tui2]", 'theme = "e"']],
+      ["comment,section", ["# note", "[tui2]", 'theme = "e"']],
+      ["blank,comment,section", ["", "# note", "[tui2]", 'theme = "e"']],
+      ["rootkey", ["extra = 1"]],
+      ["blank,rootkey", ["", "extra = 1"]],
+    ];
+
+    /** True when `back` is `x` with exactly one line break inserted somewhere
+     *  -- the honest test of "additive", since the break often lands in the
+     *  MIDDLE of x (above a comment, above a section header) rather than at
+     *  the end. */
+    const oneBreakInserted = (x: string, back: string): boolean => {
+      for (const br of [`${String.fromCharCode(0x0d)}\n`, "\n", String.fromCharCode(0x0d)]) {
+        if (back.length !== x.length + br.length) continue;
+        for (let i = 0; i <= x.length; i++) if (x.slice(0, i) + br + x.slice(i) === back) return true;
+      }
+      return false;
+    };
+
+    const counts = { exact: 0, additive: 0, subtractive: 0, other: 0 };
+    const misruled: string[] = [];
+    for (const [bn, blines] of bodies) {
+      for (const [tn, tlines] of tails) {
+        for (const eol of ["\n", `${String.fromCharCode(0x0d)}\n`]) {
+          for (const trailing of [true, false]) {
+            const lines = [...blines, ...tlines];
+            // "no trailing break" on a blank last line would just be a
+            // shorter tail, already enumerated.
+            if (!trailing && lines[lines.length - 1] === "") continue;
+            const x = lines.join(eol) + (trailing ? eol : "");
+            const label = `${bn} | ${tn} | ${eol === "\n" ? "LF" : "CRLF"} | ${trailing ? "break" : "nobreak"}`;
+            const back = removeTomlEntry(upsertTomlEntry(x, CONTAINER, ENTRY, BROKER), CONTAINER, ENTRY);
+
+            const cls =
+              back === x
+                ? "exact"
+                : oneBreakInserted(x, back)
+                  ? "additive"
+                  : back.length < x.length
+                    ? "subtractive"
+                    : "other";
+            counts[cls as keyof typeof counts]++;
+
+            // The rule, stated in the `deleteSectionEdits` comment, predicting
+            // the class from x alone.
+            const scan = scanTomlSections(x);
+            const inContainer = scan.sections.filter((s) => s.keyPath[0] === CONTAINER[0]);
+            const endsWithBreak = /[\r\n]$/.test(x);
+            const trimmedOnce = endsWithBreak ? x.replace(/\r\n$|[\r\n]$/, "") : x;
+            const lastBreak = Math.max(
+              trimmedOnce.lastIndexOf("\n"),
+              trimmedOnce.lastIndexOf(String.fromCharCode(0x0d)),
+            );
+            const lastLineBlank = /^[ \t]*$/.test(trimmedOnce.slice(lastBreak + 1));
+            let predicted: string;
+            if (inContainer.length === 0 && lastLineBlank) predicted = "subtractive";
+            else {
+              const at = inContainer.length > 0 ? inContainer[inContainer.length - 1].contentEnd : x.length;
+              const anchorLineBlank = at >= x.length || /^[ \t]*$/.test(/^[^\r\n]*/.exec(x.slice(at))?.[0] ?? "");
+              predicted = (!endsWithBreak && at >= x.length) || !anchorLineBlank ? "additive" : "exact";
+            }
+            if (predicted !== cls) misruled.push(`${label}: rule said ${predicted}, measured ${cls}`);
+
+            // Whatever the class, the MEANING is preserved. That is the one
+            // unqualified promise the round trip makes.
+            expect(canonTomlConfig(back, CONTAINER), label).toBe(canonTomlConfig(x, CONTAINER));
+          }
+        }
+      }
+    }
+
+    expect(misruled).toEqual([]);
+    expect(counts).toEqual({ exact: 98, additive: 38, subtractive: 14, other: 0 });
   });
 });
 
