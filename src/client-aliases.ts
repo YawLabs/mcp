@@ -7,12 +7,13 @@
 // in doctor, once under each name, and would tell `try`'s auto-detect that
 // there are two clients to probe where there is one file.
 //
-// THE TABLE IS EMPTY IN THIS BUILD, deliberately. Every consumer already
-// routes through `resolveClientArg` and `clientChoices`, and every expectation
-// that names the id list DERIVES from them, so filling the table is a one-hunk
-// change in this file -- which is exactly what the empty table is here to make
-// possible. `clientChoices` returns the canonical ids unchanged while it is
-// empty, so nothing about today's output depends on the table being non-empty.
+// The table holds ONE row, `mcp`. It was landed as the one-hunk change the
+// empty table was built to make possible: every consumer already routes
+// through `resolveClientArg` and `clientChoices`, and every expectation that
+// names the id list DERIVES from them, so no other file changed to add it.
+// The literal list of alias ids is spelled in exactly one place, and it is a
+// test (client-aliases.test.ts), not this module -- the same arrangement
+// client-config-boundary.test.ts uses for the canonical client ids.
 
 import { INSTALL_TARGETS, type InstallClientId, type InstallScope } from "./install-targets.js";
 
@@ -36,9 +37,32 @@ export interface ClientAlias {
   label: string;
 }
 
-/** Empty by design -- see the header. A sibling package fills this one array
- *  and nothing else. */
-export const CLIENT_ALIASES: readonly ClientAlias[] = [];
+export const CLIENT_ALIASES: readonly ClientAlias[] = [
+  // `mcp` is Claude Code's PROJECT scope under a second name: the same
+  // `<project>/.mcp.json`, the same `mcpServers` container and the same launch
+  // entry `install claude-code --scope project` writes. Claude Code's docs
+  // call that scope "a `.mcp.json` file at your project's root directory" with
+  // the root key `mcpServers` (code.claude.com/docs/en/mcp, "Project scope").
+  //
+  // Pinning the scope is what makes it name that file at all: claude-code's
+  // three scopes include `user`, and `resolveInstallSite` prefers `user` when
+  // no `--scope` is given, so an alias that pinned nothing would resolve
+  // `install mcp` to `~/.claude.json` -- the wrong file under the right name.
+  //
+  // Nothing claude-code's project scope does is re-implemented here, because
+  // the alias is gone before any of it runs: the row's
+  // `hooks.permissionsPatch` (the `permissions.allow += ["mcp__mcp__*"]` patch
+  // of `<project>/.claude/settings.json`), the approve-on-restart Done line,
+  // and whatever strictness that scope declares through `strictJson` all key
+  // off the resolved (client, scope) and never off the spelling. The tests
+  // drive BOTH spellings through the same assertions rather than assume it.
+  {
+    id: "mcp",
+    clientId: "claude-code",
+    scope: "project",
+    label: "Claude Code's project scope -- the project-root .mcp.json",
+  },
+];
 
 /** The ids `verb` accepts, canonical rows first in table order, then the
  *  aliases in table order.
