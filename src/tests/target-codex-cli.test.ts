@@ -533,9 +533,18 @@ describe("install refuses rather than corrupt a file", () => {
     const position = view.read.kind === "malformed" ? view.read.position : null;
     expect(position).toMatchObject({ line: 2, column: 15 });
     expect(raw.slice(0, position?.offset ?? 0).endsWith('command = "npx')).toBe(true);
-    const withoutBom = classifyClientConfig(fixture("f10-malformed"), siteFor(), { transform: CODEX.entry });
-    const plain = withoutBom.read.kind === "malformed" ? withoutBom.read.position : null;
-    expect(position?.offset).toBe((plain?.offset ?? 0) + 1);
+    // On the FIRST line there is no line break to count from, so this is the
+    // case the BOM term carries on its own: a mutation that drops it moves
+    // this offset one byte left, onto the BOM itself.
+    const firstLine = `${String.fromCharCode(0xfeff)}command = "npx\n`;
+    const broken = classifyClientConfig(firstLine, siteFor(), { transform: CODEX.entry });
+    const at = broken.read.kind === "malformed" ? broken.read.position : null;
+    expect(at).toMatchObject({ line: 1 });
+    // The parser counted the column from the byte AFTER the BOM, so the
+    // offset is the BOM plus that many characters. Without the BOM term the
+    // offset lands one byte earlier, inside the text the column excludes.
+    expect(at?.offset).toBe(1 + ((at?.column ?? 0) - 1));
+    expect(firstLine.slice(0, at?.offset ?? 0)).toBe(`${String.fromCharCode(0xfeff)}command = "npx`);
   });
 
   it("writes nothing into a malformed file, whichever edit is asked for (f10)", () => {
