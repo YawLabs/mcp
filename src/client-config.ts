@@ -1007,7 +1007,20 @@ function verifyEdits(
   for (const edit of edits) {
     if (edit.op !== "repair") touched.add(edit.key);
   }
-  const reread = adapter.classify(after, address, undefined);
+  let reread = adapter.classify(after, address, undefined);
+  // A removal can legitimately empty the DOCUMENT, and `absent` is this
+  // module's own word for "no file, or a file that is empty or whitespace-only"
+  // -- so an emptied file is read back exactly, not unreadable. It cannot
+  // happen in the JSON family, which leaves a residue (`{"mcpServers": {}}`);
+  // a TOML file whose only table was ours comes back as zero bytes, which
+  // Codex reads as an empty table. Treating it as an empty container keeps
+  // every check below meaningful (no entries, so a removed key is gone and no
+  // neighbour moved) instead of refusing the one uninstall that empties a
+  // file. An UPSERT that produced an empty file is still a refusal: the entry
+  // it claims to have written would not be there.
+  if (reread.kind === "absent" && edits.every((edit) => edit.op === "remove")) {
+    reread = { kind: "ok", containerPresent: false, entries: [], unloadable: null };
+  }
   if (reread.kind !== "ok") {
     throw new ClientConfigWriteError(
       `writing to ${where} would have produced a file yaw-mcp cannot read back (${reread.kind}) -- nothing was written`,
