@@ -17,12 +17,13 @@
 //     load.
 //
 //   WRITE -- our own table-span splice (below). No npm TOML library
-//     round-trips comments: smol-toml has no serializer at all, and the ones
-//     that do re-render the document (`stringify(parse('a = 1.0'))` is
-//     `'a = 1'`). Delegating to `codex mcp add` is worse: it re-serializes
-//     EVERY entry, so installing yaw-mcp would rewrite the user's other
-//     servers (`20` comes back `20.0`, env keys get re-sorted, unknown keys
-//     are dropped).
+//     round-trips comments. smol-toml 1.8.0 does export a `stringify`, but it
+//     re-renders the document from the PARSED value, so formatting and
+//     comments are gone: measured on 1.8.0, `stringify(parse('a = 1.0'))` is
+//     `'a = 1\n'`, and a `# comment` in the input has no output at all.
+//     Delegating to `codex mcp add` is worse: it re-serializes EVERY entry, so
+//     installing yaw-mcp would rewrite the user's other servers (`20` comes
+//     back `20.0`, env keys get re-sorted, unknown keys are dropped).
 //
 // The splice replaces, deletes or inserts WHOLE LINES of the table it owns and
 // touches no other byte: comments, blank lines, key order, string quoting,
@@ -32,12 +33,20 @@
 // rather than guessing.
 //
 // Every write returned by `upsertTomlEntry` / `removeTomlEntry` has already
-// been verified (`verifyTomlSplice`): the result parses, every OTHER entry is
-// byte-for-byte semantically what it was and keeps its position, the document
-// outside the container is unchanged, and our own entry reads back as the
-// value asked for. There is no exported way to get spliced text that skipped
-// that check, so a bug in the scanner is a refusal (nothing written), never a
-// corrupted config.
+// been verified (`verifyTomlSplice`), and there is no exported way to get
+// spliced text that skipped that check -- so a scanner bug that would move,
+// eat or re-nest anything is a refusal (nothing written), not a corrupted
+// config.
+//
+// What the check proves, exactly: the result PARSES; the document with the
+// touched entries dropped MEANS what it meant; the other entries keep their
+// file order; ours reads back as the value asked for. It compares the
+// canonical JSON of the two PARSED documents, so it is blind to everything
+// that is not meaning -- measured, it accepts an `after` in which two
+// comments were deleted, a `'literal'` became a `"basic"` and `20` was
+// respelled `20.0`. Byte preservation is a property of the splice never
+// touching those spans (it edits whole lines of the table it owns), not of
+// this check; the byte-exact fixtures in the tests are what pin it.
 //
 // STRING IN, STRING OUT. The caller does the disk IO (atomicWriteFile etc.)
 // and, as in jsonc.ts, offsets are computed against the text each call is
@@ -215,9 +224,31 @@ export interface TomlAssignment {
   start: number;
 }
 
+/** Why a line did not begin in normal state at bracket depth 0: it is inside a
+ *  `"""` block, inside a `'''` block, or inside an unclosed `[` / `{` value. */
+export type TomlLineCarry = "mlBasic" | "mlLiteral" | "bracket";
+
 export interface TomlScan {
   sections: TomlSection[];
   assignments: TomlAssignment[];
+  /** Line-start offsets of the lines that did NOT begin in normal state at
+   *  bracket depth 0, and what carried into each.
+   *
+   *  Such a line is the CONTENT of the key above it, and it can look like
+   *  anything: `# closes it"""` is the last line of a multi-line string, not a
+   *  comment, and a line holding only spaces inside `"""` is not a blank line.
+   *  So anything that walks lines backwards or forwards over the text has to
+   *  consult this map instead of trusting the characters -- which is what the
+   *  `contentEnd` back-off below does.
+   *
+   *  Honest about which carry earns its keep: the back-off is fixed by the two
+   *  STRING carries. `bracket` cannot change its answer, because the line that
+   *  closes a bracket holds the `]` or `}` that closes it and is therefore
+   *  never blank-or-comment -- a backwards walk stops on that line whether or
+   *  not this map is consulted. It is recorded because the map states a fact
+   *  about the document rather than a private of one caller, and the next
+   *  line-walker will want it; it is not a guard with a consequence to pin. */
+  continuedLines: Map<number, TomlLineCarry>;
   /** The file's own line ending, from its first line break. LF when it has none. */
   eol: string;
 }
@@ -251,7 +282,14 @@ function isBlankLine(text: string, start: number, end: number): boolean {
   return true;
 }
 
-/** True when the line is blank or holds nothing but a `#` comment. */
+/** True when the line's TEXT is blank or holds nothing but a `#` comment.
+ *
+ *  Text only: it has no idea whether the line began inside a `"""` block, an
+ *  `'''` block or an open bracket, where those same characters are string or
+ *  array content. Every caller must first exclude such a line with
+ *  `TomlScan.continuedLines` -- the back-off below is the only caller, and
+ *  doing exactly that is what keeps an insert anchor out of a sibling's
+ *  multi-line string. */
 function isBlankOrCommentLine(text: string, start: number, end: number): boolean {
   let i = start;
   while (i < end && isHorizontalSpace(text[i])) i++;
@@ -422,6 +460,10 @@ function readHeader(text: string, pos: number): { keyPath: string[]; arrayTable:
  *  multi-line array is text, not a table, which is exactly the case a
  *  line-oriented regex scan gets wrong.
  *
+ *  The same carry is recorded per line in `continuedLines`, because a line
+ *  inside a multi-line string or an open bracket also has to be invisible to
+ *  the `contentEnd` back-off below, which walks lines by their text.
+ *
  *  Pure and total: it never throws and it never needs the document to be
  *  valid. It is nonetheless only ever run on text the parser has already
  *  accepted, and the splice's post-write verification is what turns a mistake
@@ -429,6 +471,7 @@ function readHeader(text: string, pos: number): { keyPath: string[]; arrayTable:
 export function scanTomlSections(text: string): TomlScan {
   const sections: TomlSection[] = [];
   const assignments: TomlAssignment[] = [];
+  const continuedLines = new Map<number, TomlLineCarry>();
   let section: string[] = [];
   let state: ScanState = "normal";
   let depth = 0;
@@ -442,6 +485,11 @@ export function scanTomlSections(text: string): TomlScan {
 
   while (pos < text.length || lineStart < text.length) {
     const end = lineEnd(text, pos);
+    // Record what carried INTO this line before reading a character of it: the
+    // same fact that stops a `[header]` being recognised here is the fact a
+    // line-walking back-off needs later.
+    if (state === "mlBasic" || state === "mlLiteral") continuedLines.set(lineStart, state);
+    else if (depth > 0) continuedLines.set(lineStart, "bracket");
     if (state === "normal" && depth === 0) {
       let i = pos;
       while (isHorizontalSpace(text[i])) i++;
@@ -496,13 +544,20 @@ export function scanTomlSections(text: string): TomlScan {
     let contentEnd = self.end;
     while (contentEnd > self.headerEnd) {
       const prevStart = lineStartBefore(text, contentEnd);
+      // A line that began inside a multi-line string or an open bracket is
+      // the VALUE of the key above it, whatever it looks like: `# closes
+      // it"""` ends a string and a spaces-only line inside `"""` is content.
+      // Backing off over one would put a replace or an insert anchor INSIDE
+      // that value, which writes our table into the middle of a sibling's
+      // string -- valid TOML that loads, with our entry nowhere in it.
+      if (continuedLines.has(prevStart)) break;
       if (!isBlankOrCommentLine(text, prevStart, contentEnd)) break;
       contentEnd = prevStart;
     }
     self.contentEnd = Math.max(contentEnd, self.headerEnd);
   }
 
-  return { sections, assignments, eol: detectTomlEol(text) };
+  return { sections, assignments, continuedLines, eol: detectTomlEol(text) };
 }
 
 /** The start offset of the line that ENDS at `end` (`end` is just past a line
@@ -577,8 +632,11 @@ function scanSpan(
           i += 3;
           // TOML allows up to two extra quotes immediately after the
           // delimiter (`"""he said """"` closes with the last three), so a
-          // run of 4 or 5 quotes still ends the string here.
-          while (text[i] === '"' && i < to) i++;
+          // run of 4 or 5 quotes still ends the string here. The bound is
+          // tested BEFORE the character: `to` always lands on a line break
+          // today, so the other order read a character it had no business
+          // reading and happened to get away with it.
+          while (i < to && text[i] === '"') i++;
           state = "normal";
           continue;
         }
@@ -587,7 +645,8 @@ function scanSpan(
       case "mlLiteral":
         if (c === "'" && text[i + 1] === "'" && text[i + 2] === "'") {
           i += 3;
-          while (text[i] === "'" && i < to) i++;
+          // Bound first, as above.
+          while (i < to && text[i] === "'") i++;
           state = "normal";
           continue;
         }
@@ -702,6 +761,38 @@ function tomlArrayItem(item: unknown, key: string): string {
   return tomlValue(item, key);
 }
 
+// DECISION -- what happens to a field this renderer cannot spell (2026-09-11).
+//
+// `--repair` re-renders our entry from the fields read back off disk, so
+// anything the renderer cannot spell is a field the re-render would DROP. The
+// two that matter are Codex's own `oauth` and `tools` tables: a user who hand
+// wrote `[mcp_servers.mcp.tools.echo]` on OUR entry has a table we can read and
+// cannot write.
+//
+// CHOSEN: refuse, naming the field. `renderTomlEntry` throws `TomlRenderError`
+// for any table-valued field outside `SUBTABLE_FIELDS`, the message names the
+// field and says the re-render would drop it, and because every write verifies
+// its own output there is no path that drops it quietly. The user keeps the
+// table; the write is what fails.
+//
+// REJECTED: carry both through the re-render. It is the nicer outcome and it
+// is a bigger change than it looks -- `tools` is an IMPLICIT parent with
+// explicit children (`[mcp_servers.mcp.tools.echo]` with no
+// `[mcp_servers.mcp.tools]` header above it), so `renderTomlEntry` would have
+// to emit a header shape it emits nowhere else, and `oauth` is a table of
+// typed scalars Codex re-serializes with its own unknown-key drop. Neither
+// layout is exercised by anything this package writes, so the code would ship
+// untested against a real Codex -- which is the state that produced the
+// "verified by round-trip, never loaded" fixtures this adapter exists to
+// avoid. A loud refusal costs the user one manual edit; a guessed layout costs
+// them their config.
+//
+// So `FIELD_ORDER` below lists `oauth` and `tools` (this writer knows they
+// exist and where they sit) while `SUBTABLE_FIELDS` does not (it cannot write
+// them). If the codex-cli target package ever needs to carry them, the work is
+// in `renderTomlEntry`'s sub-table branch plus fixtures loaded by a real
+// codex -- not in `FIELD_ORDER`.
+
 /** Codex's own serializer order (`serialize_mcp_server_table`), so that a
  *  later `codex mcp add <other>` -- which re-serializes every entry -- rewrites
  *  our block to the bytes it already has.
@@ -709,7 +800,38 @@ function tomlArrayItem(item: unknown, key: string): string {
  *  stdio first (command, args, env, env_vars, cwd), then the HTTP transport's
  *  fields, then the shared tail. `env` appears in this list for ordering only:
  *  it is written as a sub-table AFTER every key-value line, which is where
- *  toml_edit puts a non-inline table too. */
+ *  toml_edit puts a non-inline table too.
+ *
+ *  MEASURED, not read out of the vendor's source, which 0.144.0 ships as a
+ *  binary: a config.toml carrying every field below was re-serialized by
+ *  `codex mcp add <other>` under a scratch CODEX_HOME, and the order it wrote
+ *  back is the order below. Three results from that run are worth naming,
+ *  because each is a claim this comment would otherwise be making for free:
+ *
+ *   - `http_headers_helper` and `omit_tools_from` came back DROPPED, so
+ *     0.144.0 has no such fields and their place here is NOT vendor-verified.
+ *     They stay because a neighbouring version may know them and this list
+ *     costs nothing; nothing in this package ever writes either.
+ *   - `oauth` and `tools` are TABLES wherever they appear (`SUBTABLE_FIELDS`),
+ *     so their position among key-value LINES is not observable and this run
+ *     is no evidence about it. The renderer refuses a table outside
+ *     `SUBTABLE_FIELDS`, so the only value that can reach either slot is a
+ *     hand-written scalar of that name -- which Codex itself rejects.
+ *   - `enabled` came back only when false and `auth` only on an HTTP entry
+ *     (`auth is not supported for stdio`), each in the position below.
+ *
+ *  The Rust names this file cites -- `serialize_mcp_server_table` here,
+ *  `table_from_pairs` and `entries.sort_by_key` at the renderer,
+ *  `Duration::as_secs_f64` at `FLOAT_FIELDS`, `toml_edit` above -- came from
+ *  the design pass's read of the vendor source and are NOT re-verified here;
+ *  0.144.0 ships a binary. They are labels for behaviour that was measured,
+ *  so treat a mismatch in a name as a stale label and the measured behaviour
+ *  as the claim.
+ *
+ *  A table-valued `oauth` or `tools` is therefore a `TomlRenderError` naming
+ *  the field. That refusal is the deliberate choice: our entry never carries
+ *  either, and a user who hand-wrote one keeps it (the write fails, loudly)
+ *  instead of having it dropped or re-rendered into a guessed layout. */
 const FIELD_ORDER = [
   "command",
   "args",
@@ -733,22 +855,55 @@ const FIELD_ORDER = [
   "enabled_tools",
   "disabled_tools",
   "scopes",
+  "oauth",
   "oauth_resource",
+  "tools",
 ];
 
 /** Field keys rendered as their own `[<container>.<name>.<key>]` sub-table.
  *
- *  Only the three Codex writes as a table for a server entry. Any OTHER
- *  table-valued field is refused rather than guessed at: Codex's `tools` table
- *  is implicit and its children explicit (`[mcp_servers.mcp.tools.x]` with no
- *  `[mcp_servers.mcp.tools]` header), a shape this writer has not verified and
- *  never needs to emit. */
+ *  The three Codex writes as a flat, explicit table of string pairs, which is
+ *  exactly the layout below. It writes FIVE fields as tables in all -- MEASURED
+ *  on codex-cli 0.144.0, by handing it an entry carrying each and reading back
+ *  what `codex mcp add <other>` re-serialized:
+ *
+ *      [mcp_servers.hh.http_headers]      explicit, flat, sorted
+ *      [mcp_servers.hh.env_http_headers]  explicit, flat, sorted
+ *      [mcp_servers.zz.env]               explicit, flat, sorted
+ *      [mcp_servers.hh.oauth]             explicit, flat -- but NOT a string
+ *                                         map: an unknown key inside it
+ *                                         (`issuer`) was dropped
+ *      [mcp_servers.zz.tools.echo]        IMPLICIT parent, explicit child --
+ *                                         no [.tools] header is written
+ *
+ *  The last two are deliberately absent here. Neither is a flat string map,
+ *  `tools` needs a layout this writer does not produce at all, and our own
+ *  entry never carries either. A table-valued `oauth` or `tools` is therefore
+ *  a `TomlRenderError` that names the field -- the write fails and the user's
+ *  hand-written table survives untouched, which beats dropping it or guessing
+ *  a layout. See the decision note above `FIELD_ORDER`. */
 const SUBTABLE_FIELDS = new Set(["env", "http_headers", "env_http_headers"]);
+
+/** Order two sub-table keys the way Codex's `entries.sort_by_key` does:
+ *  Rust's `Ord for String` is a byte comparison of the UTF-8 encoding, so this
+ *  compares the UTF-8 bytes rather than the JS string.
+ *
+ *  The two orders disagree above the BMP, and a JS `<` would be wrong there:
+ *  measured, `U+1F600` sorts BEFORE `U+E000` by UTF-16 code unit (`0xD83D` <
+ *  `0xE000`) and AFTER it by UTF-8 byte (`f0 9f 98 80` > `ee 80 80`). Only an
+ *  env var NAME with an astral character reaches the difference, and the cost
+ *  of getting it wrong is only a one-line drift diff on the next install --
+ *  but the claim is cheap to make true, so it is true.
+ *
+ *  A lone surrogate has no UTF-8 encoding and `Buffer.from` substitutes
+ *  U+FFFD, so such a key sorts as the replacement character and then throws in
+ *  `tomlString` when it is rendered. The throw is the answer either way. */
+const byUtf8Bytes = (a: string, b: string): number => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
 
 function orderedFields(entry: Record<string, unknown>): string[] {
   const present = Object.keys(entry).filter((k) => entry[k] !== undefined);
   const known = FIELD_ORDER.filter((k) => present.includes(k));
-  const unknown = present.filter((k) => !FIELD_ORDER.includes(k)).sort();
+  const unknown = present.filter((k) => !FIELD_ORDER.includes(k)).sort(byUtf8Bytes);
   return [...known, ...unknown];
 }
 
@@ -756,10 +911,14 @@ function orderedFields(entry: Record<string, unknown>): string[] {
  *  line break. `eol` defaults to LF.
  *
  *  Sub-table keys are sorted, because Codex's `table_from_pairs` sorts them
- *  (`entries.sort_by_key`) -- a `BTreeMap`-equivalent byte order over the
- *  decoded key, not the quoted spelling. An unknown scalar field keeps its
- *  place after the known ones, sorted, so the output is a function of the
- *  entry's content and not of its JS key insertion order.
+ *  (`entries.sort_by_key` over Rust `String`s) -- UTF-8 byte order over the
+ *  DECODED key, not the quoted spelling; see `byUtf8Bytes`, which is where the
+ *  above-the-BMP disagreement with a JS string compare lives. An unknown
+ *  scalar field keeps its place after the known ones, in the same UTF-8 byte
+ *  order, so the output is a function of the entry's content and not of its JS
+ *  key insertion order. (Codex never writes an unknown field at all -- it
+ *  drops what its struct has no room for -- so that order matches no vendor
+ *  behaviour; it only has to be stable.)
  *
  *  TWO OMISSIONS, and they are the only ones: a field whose value is
  *  `undefined` (it has no TOML spelling), and a sub-table field whose table is
@@ -791,15 +950,18 @@ export function renderTomlEntry(
       }
       const pairs = Object.entries(value).filter(([, v]) => v !== undefined);
       if (pairs.length === 0) continue;
-      pairs.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      pairs.sort(([a], [b]) => byUtf8Bytes(a, b));
       subTables.push(
         [`[${header}.${tomlKey(key)}]`, ...pairs.map(([k, v]) => `${tomlKey(k)} = ${tomlValue(v, k)}`)].join(eol),
       );
       continue;
     }
     if (isTomlTable(value)) {
+      // Name the field AND the loss. This is the refusal the decision note
+      // above `FIELD_ORDER` chose over dropping the table silently, so the
+      // message has to say what would have been dropped.
       throw new TomlRenderError(
-        `cannot write the "${key}" field of the "${name}" entry: only ${[...SUBTABLE_FIELDS].map((k) => `"${k}"`).join(", ")} are written as sub-tables, and a table elsewhere needs a layout this writer does not produce -- edit it by hand`,
+        `cannot write the "${key}" field of the "${name}" entry: only ${[...SUBTABLE_FIELDS].map((k) => `"${k}"`).join(", ")} are written as sub-tables, so rewriting this entry would drop your "${key}" table -- move it to another server or delete it, then re-run`,
       );
     }
     lines.push(`${tomlKey(key)} = ${tomlValue(value, key)}`);
@@ -1190,9 +1352,12 @@ export function upsertTomlEntry(
  *  `raw`.
  *
  *  Returns `raw` ITSELF -- the same string, byte for byte, BOM included --
- *  when the entry is absent. That is the contract `removeJsoncEntry` already
- *  has and that try's cleanup and doctor's GC depend on (`next === raw` means
- *  "nothing to do", so they neither write nor report a removal).
+ *  whenever there is nothing to remove: when the entry is absent, and when the
+ *  file is empty or holds nothing but whitespace (never `""`, which would read
+ *  as "I rewrote your file to nothing"). That is the contract
+ *  `removeJsoncEntry` already has and that try's cleanup and doctor's GC
+ *  depend on (`next === raw` means "nothing to do", so they neither write nor
+ *  report a removal).
  *
  *  Deleting takes the table's own lines and one blank line above it when the
  *  deletion would otherwise leave a double blank or a trailing blank at EOF.
