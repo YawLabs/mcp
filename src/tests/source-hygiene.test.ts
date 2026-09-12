@@ -406,10 +406,6 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       why: "uninstall: builds one RemovalSite per helper-derived path",
     },
     {
-      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
-      why: "findBlockedContainerSegment: the pre-WRITE non-object check, on the canonical path a write goes to",
-    },
-    {
       shape: "LOOP for (let i = 0; i < containerPath.length - 1; i++)",
       why: "mergeClientConfig: clones the chain it WRITES into -- one path, never a variant",
     },
@@ -434,6 +430,13 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       shape:
         "INDEX return { absolute, display: absolute, " + 'containerPath: ["projects", projectKey, "mcpServers"] };',
       why: "resolveInstallPath's other return, same canonical path for the explicit --project-dir branch",
+    },
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length; i++)",
+      why:
+        "findBlockedContainerSegment: the pre-WRITE non-object check, on the canonical path a write goes to. " +
+        "It lives here, not in install-cmd.ts, so doctor and import can ask the same question without an " +
+        "import cycle -- and every caller hands it a path it must NOT fold",
     },
   ],
   "src/try-cmd.ts": [

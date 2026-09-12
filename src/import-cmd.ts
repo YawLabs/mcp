@@ -68,8 +68,11 @@ import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { resolveInstallSite } from "./install-cmd.js";
 import {
+  blockedContainerFix,
   claudeCodeContainerPaths,
+  describeJsonShape,
   ENTRY_NAME,
+  findBlockedContainerSegment,
   INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
@@ -77,6 +80,7 @@ import {
   LEGACY_ENTRY_NAMES,
   resolveAppDataDir,
   resolveInstallPath,
+  unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc, removeJsoncEntry } from "./jsonc.js";
 import { deriveNamespace, type LaunchShape, previewUpsertUserBundle, upsertUserBundle } from "./local-bundles.js";
@@ -428,25 +432,94 @@ function hasYawMcpEntry(container: Record<string, unknown>): boolean {
   return ENTRY_NAME in container || LEGACY_ENTRY_NAMES.some((n) => n in container);
 }
 
-/** The server container at one path, or null when the file is absent,
- *  unreadable, not JSON, or holds no object there.
+/** What one searched container turned out to be. Only `container` can hold a
+ *  yaw-mcp entry; the other two differ in what `yaw-mcp install` would do
+ *  with the file, which is what the refusal's advice depends on.
  *
- *  An unreadable container counts as NOT holding a yaw-mcp entry, and the two
+ *  - `none`: nothing install objects to -- the file is absent or empty, the
+ *    container key is absent, or it holds a shape install replaces with `{}`
+ *    itself (null, a scalar, an empty array; see findBlockedContainerSegment).
+ *    "Run install first" is true for these.
+ *  - `refused`: a file install will NOT write -- unreadable, not JSON, a root
+ *    that is not an object, or a container key holding a non-empty array. A
+ *    bare `yaw-mcp install <client>` exits 1 on it, so the advice has to name
+ *    the by-hand step first. `clause` says what is wrong; `installSays` and
+ *    `fix` say what install does and what gets past it, in install's words. */
+type ContainerRead =
+  | { state: "container"; container: Record<string, unknown> }
+  | { state: "none" }
+  | { state: "refused"; clause: string; installSays: string; fix: (then: string) => string };
+
+/** Read the server container at one path, telling apart the states install
+ *  treats differently (see ContainerRead). The checks follow install's own
+ *  read in runInstall, in its order, so the two do not disagree about which
+ *  file install refuses: that disagreement was the bug -- an unparseable file
+ *  answered "no yaw-mcp entry ... run `yaw-mcp install` first", and install
+ *  then exited 1 on it.
+ *
+ *  Anything but `container` counts as NOT holding a yaw-mcp entry, and the two
  *  errors are not symmetric: a false "wired" removes originals the client can
  *  no longer reach, while a false "not wired" only refuses a removal that
  *  would have been safe. */
-async function readContainer(ref: ContainerRef): Promise<Record<string, unknown> | null> {
+async function readContainer(ref: ContainerRef): Promise<ContainerRead> {
+  const where = displaySafe(ref.absolute);
   let raw: string;
   try {
     raw = await readFile(ref.absolute, "utf8");
-  } catch {
-    return null;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    // Absent: install creates the file, so "run install" works.
+    if (code === "ENOENT") return { state: "none" };
+    // install's describeUnreadableConfig wording, so the two name one fault
+    // the same way.
+    if (code === "EISDIR") {
+      return {
+        state: "refused",
+        clause: `${where} is a directory, not a file`,
+        installSays: `cannot read ${where}`,
+        fix: (then) => `move or remove it, then ${then}`,
+      };
+    }
+    return {
+      state: "refused",
+      clause: `${where} could not be read (${displaySafe((e as Error).message)})`,
+      installSays: `cannot read ${where}`,
+      fix: (then) => `check the file and its permissions, then ${then}`,
+    };
   }
+  // install writes an empty (or whitespace-only) file as if it were absent.
+  if (raw.trim().length === 0) return { state: "none" };
   let parsed: unknown;
   try {
     parsed = parseJsonc(raw);
   } catch {
-    return null;
+    return {
+      state: "refused",
+      clause: `${where} is not valid JSON`,
+      installSays: `refuses to overwrite ${where}`,
+      fix: unparseableConfigFix,
+    };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {
+      state: "refused",
+      clause: `${where} is not a JSON object`,
+      installSays: `refuses to overwrite ${where}`,
+      fix: unparseableConfigFix,
+    };
+  }
+  const blocked = findBlockedContainerSegment(parsed as Record<string, unknown>, ref.containerPath);
+  if (blocked) {
+    if (!blocked.reparable) {
+      const keyPath = `"${blocked.path.join(".")}" in ${where}`;
+      return {
+        state: "refused",
+        clause: `${keyPath} is ${describeJsonShape(blocked.value)}, not a JSON object`,
+        installSays: `refuses to overwrite ${keyPath}`,
+        fix: blockedContainerFix,
+      };
+    }
+    return { state: "none" };
   }
   // EVERY projects[] read resolves its path through the one helper -- see
   // claudeCodeContainerPaths. The canonical key comes first; a drive-letter-case
@@ -468,10 +541,10 @@ async function readContainer(ref: ContainerRef): Promise<Record<string, unknown>
     }
     if (!node || typeof node !== "object" || Array.isArray(node)) continue;
     const container = node as Record<string, unknown>;
-    if (hasYawMcpEntry(container)) return container;
+    if (hasYawMcpEntry(container)) return { state: "container", container };
     fallback ??= container;
   }
-  return fallback;
+  return fallback ? { state: "container", container: fallback } : { state: "none" };
 }
 
 export function parseImportArgs(
@@ -903,6 +976,10 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   // The imported container is FIRST and is the copy already in memory, so the
   // single-scope clients read no extra files at all.
   const searched: ContainerRef[] = [{ absolute: resolved.absolute, containerPath: sourcePath }];
+  // The container a bare `yaw-mcp install <client>` writes -- the step the
+  // refusal below names. Every client has a user scope and resolveInstallSite
+  // defaults to it, so it is the user-scope ref.
+  let installRef: ContainerRef | null = site.scope === "user" ? searched[0] : null;
   for (const spec of target.scopes) {
     if (spec.scope === site.scope) continue;
     try {
@@ -919,22 +996,26 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
           : undefined,
         claudeConfigDir: opts.claudeConfigDir,
       });
-      const already = searched.some(
+      const already = searched.find(
         (r) => r.absolute === other.absolute && r.containerPath.join(".") === other.containerPath.join("."),
       );
-      if (!already) searched.push({ absolute: other.absolute, containerPath: other.containerPath });
+      const ref = already ?? { absolute: other.absolute, containerPath: other.containerPath };
+      if (!already) searched.push(ref);
+      if (spec.scope === "user") installRef = ref;
     } catch {
       // A scope this machine cannot resolve a path for is one the client is
       // not reading either, so it is simply not searched.
     }
   }
   let wiredIn: ContainerRef | null = null;
+  const refused = new Map<ContainerRef, Extract<ContainerRead, { state: "refused" }>>();
   for (let i = 0; i < searched.length; i++) {
-    const found = i === 0 ? container : await readContainer(searched[i]);
-    if (found && hasYawMcpEntry(found)) {
+    const read: ContainerRead = i === 0 ? { state: "container", container } : await readContainer(searched[i]);
+    if (read.state === "container" && hasYawMcpEntry(read.container)) {
       wiredIn = searched[i];
       break;
     }
+    if (read.state === "refused") refused.set(searched[i], read);
   }
 
   if (!wiredIn) {
@@ -945,8 +1026,23 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
     // made about the client as a whole: "it has no entry" was a statement
     // about one container, made as though it covered every file the client
     // reads.
+    //
+    // A container install refuses is named for what it is, not as "no entry".
+    // When it is the one `yaw-mcp install <client>` writes, "run install
+    // first" sent the user to a command that exits 1 on it, so the advice
+    // leads with install's own by-hand step instead. One clause per distinct
+    // fault: Claude Code's user and local scopes share ~/.claude.json, and an
+    // unparseable one would otherwise be reported twice.
+    const noEntry = searched.filter((r) => !refused.has(r));
+    const clauses = [`no yaw-mcp entry in ${noEntry.map(describeContainer).join(" or ")}`];
+    for (const r of refused.values()) if (!clauses.includes(r.clause)) clauses.push(r.clause);
+    const installCmd = `yaw-mcp install ${target.clientId}`;
+    const blocking = installRef ? refused.get(installRef) : undefined;
+    const next = blocking
+      ? `\`${installCmd}\` ${blocking.installSays}; ${blocking.fix(`run \`${installCmd}\` and re-run this with --remove-originals`)}.`
+      : `Run \`${installCmd}\` first, then re-run this with --remove-originals.`;
     printErr(
-      `Not removing the originals: no yaw-mcp entry in ${searched.map(describeContainer).join(" or ")}, so ${target.label} would be left with no way to reach them. Run \`yaw-mcp install ${target.clientId}\` first, then re-run this with --remove-originals.`,
+      `Not removing the originals: ${clauses.join(", and ")}, so ${target.label} would be left with no way to reach them. ${next}`,
     );
     return { exitCode: 0, written };
   }

@@ -1002,6 +1002,106 @@ export function findLegacyEntry(container: Record<string, unknown>): string | nu
   return LEGACY_ENTRY_NAMES.find((n) => n in container) ?? null;
 }
 
+/** A key along the container path whose existing value is not an object, and so
+ *  cannot have the launch entry spliced into it. */
+export interface BlockedContainerSegment {
+  /** Full key path to the offending key, for naming it in a message. */
+  path: string[];
+  /** What is there instead of an object. */
+  value: unknown;
+  /** Whether replacing it with `{}` throws nothing away -- see
+   *  `findBlockedContainerSegment`. */
+  reparable: boolean;
+}
+
+/**
+ * First key along `containerPath` that holds a non-object, or null when the
+ * chain is spliceable as-is.
+ *
+ * editJsoncEntry materializes MISSING intermediate keys, but a key that exists
+ * and holds a non-object is left to jsonc-parser's `modify`, which throws
+ * "Can not add index to parent of type null" -- an internal message naming
+ * neither the file nor the key. The
+ * pre-existing top-level check catches only a non-object ROOT, so `"mcpServers":
+ * null` (hand-edited, or written by a tool that emptied it) reached the splice
+ * and failed the whole install. Walking the chain here is what lets the caller
+ * either repair the key or refuse while naming it.
+ *
+ * `reparable` splits the two shapes deliberately. null, a scalar, and an empty
+ * array hold no server definitions, so replacing them with `{}` loses nothing
+ * and restores the behaviour of the pre-splice merge path (which overwrote any
+ * non-object container). A NON-EMPTY array can hold real entries in the wrong
+ * shape, and silently dropping those to write ours is not a repair -- that case
+ * is the caller's refusal.
+ *
+ * Lives here, not in install-cmd.ts, because doctor asks the same question of
+ * the same file: install-cmd imports doctor-cmd, so doctor could not import it
+ * from there without a cycle.
+ */
+export function findBlockedContainerSegment(
+  root: Record<string, unknown>,
+  containerPath: string[],
+): BlockedContainerSegment | null {
+  // EXACT, never folded through claudeCodeContainerPaths: this is the
+  // pre-flight for a WRITE, and a write goes to the canonical path only. A
+  // drive-case sibling's shape cannot block it and must not be reported as if
+  // it did. Registered as such in the source-shape scan in
+  // src/tests/source-hygiene.test.ts.
+  let node: Record<string, unknown> = root;
+  for (let i = 0; i < containerPath.length; i++) {
+    const value = node[containerPath[i]];
+    // Absent from here down: editJsoncEntry builds the rest of the chain itself.
+    if (value === undefined) return null;
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      node = value as Record<string, unknown>;
+      continue;
+    }
+    return {
+      path: containerPath.slice(0, i + 1),
+      value,
+      reparable: value === null || !Array.isArray(value) || value.length === 0,
+    };
+  }
+  return null;
+}
+
+/** How to name a non-object container value in a message. Shape, not contents:
+ *  a `~/.claude.json` value can be arbitrarily large and the user needs to know
+ *  WHICH key is wrong, not to have it echoed back. Used by install's messages
+ *  and by doctor's CLIENTS line, so both name the key the same way. */
+export function describeJsonShape(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return value.length === 0 ? "an empty array" : `an array of ${value.length}`;
+  return `a ${typeof value}`;
+}
+
+/** The by-hand fix for a client config that exists but does not parse as a
+ *  JSON object: invalid JSON, or valid JSON whose root is an array, a scalar or
+ *  null. `yaw-mcp install` refuses such a file with exit 1 and writes nothing,
+ *  and it refuses before --force, --repair, --skip or --dry-run is acted on --
+ *  none of them gets past it (client-config-remedy.test.ts pins each).
+ *
+ *  ONE wording for every place that describes the state: install's refusal,
+ *  doctor's CLIENTS line for the same file, and import's refusal to remove
+ *  originals when this is the file install would write. Doctor used to say
+ *  "fix or rerun `yaw-mcp install`", and a bare rerun is exactly what hits the
+ *  refusal, so half of that advice could never work. `then` is the step once
+ *  the file parses: install passes "re-run" (the user just typed the command),
+ *  doctor passes the install command for the row it is describing, and import
+ *  passes that command plus its own re-run. */
+export function unparseableConfigFix(then: string): string {
+  return `fix the JSON by hand, or move the file aside, then ${then}`;
+}
+
+/** The by-hand fix for a container key install cannot splice its entry into:
+ *  one findBlockedContainerSegment reports as NOT reparable (a non-empty
+ *  array -- null, a scalar and an empty array are replaced with `{}` instead).
+ *  Shared by install's refusal, doctor's CLIENTS line and import's refusal to
+ *  remove originals, for the same reason as unparseableConfigFix. */
+export function blockedContainerFix(then: string): string {
+  return `make it an object (or remove the key), then ${then}`;
+}
+
 /** Pattern added to Claude Code's `permissions.allow` on install so the
  *  user isn't re-prompted for each yaw-mcp MCP tool call. Only matters for
  *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).

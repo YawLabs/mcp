@@ -56,9 +56,12 @@ import {
 } from "./default-runtime.js";
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import {
+  blockedContainerFix,
   CURRENT_OS,
   claudeCodeContainerPaths,
+  describeJsonShape,
   ENTRY_NAME,
+  findBlockedContainerSegment,
   findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -66,6 +69,7 @@ import {
   type InstallScope,
   resolveAppDataDir,
   resolveInstallPath,
+  unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import {
@@ -404,12 +408,21 @@ export interface ClientProbeResult {
    *  --list` tells `other-entries` from `no-entries` by it. Additive JSON
    *  field. */
   containerEntries: number;
-  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced so
-   *  upgraded users know to trim by hand — nothing in the runtime writes
-   *  this key anymore. */
+  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced because
+   *  the client launches it too, so the user is running yaw-mcp twice --
+   *  nothing in the runtime writes this key anymore (LEGACY_ENTRY_NAMES in
+   *  install-targets.ts). Removing it is not the user's chore: `install`
+   *  removes the key itself unless `--keep-legacy`, in the same write as the
+   *  working entry -- or as the run's only edit when that entry is already
+   *  correct -- so the status lines whose remedy is an install run say
+   *  install removes it. The two that name no run (an entry that already
+   *  works, and one whose launch path is for another OS) say only that the
+   *  key has to go. */
   hasLegacyEntry: boolean;
   /** The specific legacy entry key found (e.g. "mcp.hosting" / "yaw-mcp"), or
-   *  null. Lets the status line name the stale key in the trim hint. */
+   *  null. Lets the status line name the stale key in its legacy clause.
+   *  Same division of labour as the field above: the clause names an install
+   *  run where one is the remedy, and install is what removes the key. */
   legacyEntryName: string | null;
   /** The file exists but its content did not PARSE as a JSON object. Never
    *  set for a read failure -- that is `unreadable`. */
@@ -429,6 +442,13 @@ export interface ClientProbeResult {
    *  see clientCannotLaunch) from a real one WITHOUT parsing the message,
    *  whose wording node reshapes across versions. */
   unreadableCode: string | null;
+  /** The container key install cannot splice its entry into, worded for a
+   *  message (`"mcpServers" is an array of 2`), or null. Set only for a key
+   *  findBlockedContainerSegment reports as NOT reparable -- the shape install
+   *  REFUSES with exit 1. A reparable one (null, a scalar, an empty array)
+   *  stays null: install replaces it with `{}`, so the ordinary "run install"
+   *  line is true there. Additive JSON field. */
+  containerBlocked: string | null;
   unavailable: boolean;
   /** On an `unavailable` row whose client DOES ship on this OS but that
    *  yaw-mcp cannot configure there (Claude Desktop on Linux), the reason from
@@ -722,7 +742,12 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
   for (const c of clients) {
     if (!clientCannotLaunch(c)) continue;
     const { client, status } = describeClient(c);
-    const key = `${c.path}\0${client}\0${status}`;
+    // Malformed is file-level, but its line names the row's OWN install
+    // command (a project-scope file needs `--scope project`), so the status
+    // text now differs per scope and cannot be the key. Keyed on the state
+    // instead; the folded line keeps the first grouped row's wording -- for
+    // Claude Code's (user, local) pair on ~/.claude.json, the user scope's.
+    const key = `${c.path}\0${client}\0${c.malformed ? "malformed" : status}`;
     const seen = grouped.get(key);
     if (seen) seen.scopes.push(c.scope);
     else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });
@@ -2192,22 +2217,56 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     }
     return `exists but could not be read (${c.unreadable}) -- check the file and its permissions, then rerun doctor`;
   }
-  if (c.malformed) return "exists but JSON is malformed -- fix or rerun `yaw-mcp install`";
+  // install REFUSES this file (exit 1, --force included -- see
+  // unparseableConfigFix), so the old "fix or rerun `yaw-mcp install`" offered
+  // a rerun that could only hit that refusal. The remedy is install's own,
+  // from the one helper both surfaces call, and names this row's command.
+  if (c.malformed) {
+    return `exists but JSON is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``)}`;
+  }
+  // The same trap one level down: the file parses, but a key on the way to the
+  // entry holds a non-empty array, which install refuses rather than drop (see
+  // findBlockedContainerSegment). It used to fall through to "present, no
+  // entry -- run install", and running it exits 1.
+  if (c.containerBlocked !== null) {
+    return `present, but ${c.containerBlocked}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``)}`;
+  }
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
   // and the combined branch used to swallow it -- a config carrying both a
   // legacy entry and a rotted absolute command reported "OK" and told the user
   // to remove the OTHER entry, leaving only the broken one. When both are true
-  // the legacy trim hint is appended rather than dropped, so neither problem
-  // goes unnamed.
+  // the legacy entry is named rather than dropped, so neither problem goes
+  // unnamed.
   //
   // Hoisted above all THREE cannot-launch branches, not just the first: a
   // bare `oam` command (or a rotted oam entry file) plus a legacy entry used
   // to report only the launch problem, so fixing it took two doctor runs --
   // the legacy hint only appeared once the first fault was gone. All three
-  // states mean "cannot start", so all three carry the same trim hint.
+  // states mean "cannot start", so all three carry the same trailer.
+  //
+  // "install removes it", not "remove it once the working entry is back": each
+  // line's remedy is an install run, and install trims the legacy entry in the
+  // same write as the working one (unless --keep-legacy) -- off a TTY too, where
+  // the collision refusal names --repair and that run trims. The old wording
+  // sent the user to remove by hand an entry that run had already removed, the
+  // claim the lone-legacy line below dropped for the same reason.
+  //
+  // The bare-oam line carries the SAME trailer, with no by-hand clause of its
+  // own. It used to read as if OAM_BIN were a second remedy that leaves the
+  // legacy entry behind, but setting OAM_BIN cannot bring the working entry
+  // back, so that state does not exist. OAM_BIN is read only inside yaw-mcp's
+  // OWN process (probeOamUncached, oam-spawn.ts): it changes which binary
+  // INSTALL resolves and writes, never what the client spawns -- the client
+  // runs the stored bare `oam` against its own PATH. This line is computed from
+  // that stored token alone (launchOamNotAbsolute, below; renderClientStatus is
+  // not even handed an env), so doctor's output does not move when the var is
+  // set. Install's own lines pair it with a re-run for the same reason
+  // (install-cmd.ts, the two "Set OAM_BIN to oam's full path and re-run install"
+  // runtime lines), so this one names it as a precondition of the rerun rather
+  // than as an alternative to it.
   const legacy = c.hasLegacyEntry
-    ? `; legacy "${c.legacyEntryName}" entry also present -- remove it once the working entry is back`
+    ? `; legacy "${c.legacyEntryName}" entry also present -- install removes it as it writes the working entry`
     : "";
   // The entry is real but lives under the OTHER drive-letter spelling of this
   // directory's projects[] key. Appended to every branch that reports an
@@ -2230,7 +2289,7 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${keyNote}`;
   }
   if (c.launchOamNotAbsolute) {
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}${keyNote}`;
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path (set OAM_BIN to oam's full path first if install cannot find it)${legacy}${keyNote}`;
   }
   // Below the cannot-launch branches and above the OK ones: doctor knows
   // neither. The path is absolute on the OS the entry was written for, and
@@ -2248,7 +2307,10 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}${keyNote}`;
   }
   if (c.hasLegacyEntry) {
-    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate, then remove the legacy entry by hand${keyNote}`;
+    // No "then remove it by hand": install trims the legacy entry in the same
+    // write that adds the new one (unless --keep-legacy), so after following
+    // this line there is nothing left to remove.
+    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate; install removes the legacy entry as it writes the new one${keyNote}`;
   }
   if (c.exists) return `present, no "${ENTRY_NAME}" entry -- run \`${installCmd}\``;
   return `not configured -- run \`${installCmd}\``;
@@ -2319,6 +2381,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   malformed: false,
   unreadable: null,
   unreadableCode: null,
+  containerBlocked: null,
   launchCommandMissing: null,
   launchRuntime: null,
   launchOamNotAbsolute: null,
@@ -2591,6 +2654,17 @@ function classifyProbeContent(
       if (wired) break;
     }
     if (!container) {
+      // walkContainer answers "is there a container", and null covers two
+      // shapes install treats differently: an absent or reparable key (install
+      // writes one) and a non-empty array (install refuses). Only the second
+      // changes what doctor should advise, so ask install's own question.
+      const blocked = findBlockedContainerSegment(parsed as Record<string, unknown>, containerPath);
+      if (blocked !== null && !blocked.reparable) {
+        return {
+          ...EMPTY_PROBE,
+          containerBlocked: `"${blocked.path.join(".")}" is ${describeJsonShape(blocked.value)}`,
+        };
+      }
       return { ...EMPTY_PROBE };
     }
     const legacyEntryName = findLegacyEntry(container);
@@ -2662,6 +2736,7 @@ function classifyProbeContent(
       malformed: false,
       unreadable: null,
       unreadableCode: null,
+      containerBlocked: null,
       launchCommandMissing,
       launchRuntime,
       launchOamNotAbsolute,
