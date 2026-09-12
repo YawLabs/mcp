@@ -6326,3 +6326,141 @@ describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files
     }
   });
 });
+
+describe("runInstall -- .mcp.json is STRICT JSON, so a commented one is refused", () => {
+  // Claude Code reads `.mcp.json` with strict JSON, unlike `~/.claude.json`: a
+  // comment or a trailing comma in it means it loads NO server from that file.
+  // Measured before claude-code's project scope declared `strictJson`: install
+  // spliced its entry in and printed `Done`, over a file Claude Code was
+  // already ignoring in full -- so the user saw a successful install and no
+  // yaw-mcp, with nothing on screen connecting the two.
+  //
+  // The answer is a REFUSAL, not a repair. The comments are the user's, and
+  // yaw-mcp does not get to delete them so its own write can land.
+  const COMMENTED = [
+    "{",
+    "  // our servers",
+    '  "mcpServers": {',
+    '    "other": { "command": "node" }',
+    "  }",
+    "}",
+    "",
+  ].join("\n");
+  const TRAILING_COMMA = ["{", '  "mcpServers": {', '    "other": { "command": "node" },', "  }", "}", ""].join("\n");
+
+  let home: string;
+  let project: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "yaw-strict-"));
+    project = mkdtempSync(join(home, "repo-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const mcpJson = (): string => join(project, ".mcp.json");
+
+  function run(raw: string, extra: Record<string, unknown> = {}) {
+    writeFileSync(mcpJson(), raw);
+    const cap = captureIo();
+    return {
+      cap,
+      before: raw,
+      result: runInstall({
+        clientId: "claude-code",
+        scope: "project",
+        projectDir: project,
+        home,
+        cwd: project,
+        suppressBundlesNote: true,
+        io: cap.io,
+        ...extra,
+      }),
+    };
+  }
+
+  // --force and --repair are the flags a user reaches for when a write was
+  // refused, and NEITHER may get past this one: the file is unreadable by the
+  // client either way, so writing into it would still print Done over nothing.
+  for (const [name, extra] of [
+    ["no flags", {}],
+    ["--force", { force: true }],
+    ["--repair", { repair: true }],
+    ["--dry-run", { dryRun: true }],
+  ] as const) {
+    for (const [shape, raw] of [
+      ["a comment", COMMENTED],
+      ["a trailing comma", TRAILING_COMMA],
+    ] as const) {
+      it(`refuses ${shape} under ${name}, leaving the bytes exactly as they were`, async () => {
+        const { cap, before, result } = run(raw, extra);
+        const r = await result;
+        expect(r.exitCode).toBe(1);
+        expect(r.written).toEqual([]);
+        expect(r.wouldWrite).toEqual([]);
+        // The refusal names the syntax the CLIENT could not read, and says why
+        // it matters -- that nothing in the file is loading.
+        expect(cap.stderr()).toMatch(/comments or trailing commas/);
+        expect(cap.stderr()).toMatch(/no server in it is loading/);
+        // Byte for byte. A "refusal" that reformatted the file would be a
+        // write the user did not ask for.
+        expect(readFileSync(mcpJson(), "utf8")).toBe(before);
+      });
+    }
+  }
+
+  it("still writes a .mcp.json that is valid strict JSON", async () => {
+    // The gate is the CLIENT's parser, not a new rule about project files: an
+    // ordinary .mcp.json installs exactly as it did.
+    const { result } = run('{\n  "mcpServers": {\n    "other": { "command": "node" }\n  }\n}\n');
+    const r = await result;
+    expect(r.exitCode).toBe(0);
+    // The client config, plus the project's settings.json permissions patch --
+    // the one every claude-code install makes.
+    expect(r.written).toContain(mcpJson());
+    const after = JSON.parse(readFileSync(mcpJson(), "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(Object.keys(after.mcpServers).sort()).toEqual([ENTRY_NAME, "other"]);
+  });
+
+  it("leaves the USER scope tolerant -- ~/.claude.json is not read strictly", async () => {
+    // The flag is on the project scope alone. ~/.claude.json is Claude Code's
+    // own state file and it does accept a comment, so refusing one there would
+    // block an install for no reason the client cares about.
+    writeFileSync(join(home, ".claude.json"), '{\n  // mine\n  "mcpServers": {}\n}\n');
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      home,
+      cwd: project,
+      suppressBundlesNote: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(join(home, ".claude.json"), "utf8")).toContain("// mine");
+  });
+
+  it("refuses through the `mcp` alias too, which is this exact file's own name", async () => {
+    // `install mcp` resolves to claude-code at project scope, so it inherits
+    // the same gate -- and it is the spelling the docs use, i.e. the one most
+    // likely to meet a hand-edited .mcp.json.
+    const parsed = parseInstallArgs(["mcp"]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.options.clientId).toBe("claude-code");
+    expect(parsed.options.scope).toBe("project");
+    writeFileSync(mcpJson(), COMMENTED);
+    const cap = captureIo();
+    const r = await runInstall({
+      ...parsed.options,
+      projectDir: project,
+      home,
+      cwd: project,
+      suppressBundlesNote: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(readFileSync(mcpJson(), "utf8")).toBe(COMMENTED);
+  });
+});

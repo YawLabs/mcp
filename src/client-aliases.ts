@@ -7,12 +7,14 @@
 // in doctor, once under each name, and would tell `try`'s auto-detect that
 // there are two clients to probe where there is one file.
 //
-// THE TABLE IS EMPTY IN THIS BUILD, deliberately. Every consumer already
-// routes through `resolveClientArg` and `clientChoices`, and every expectation
-// that names the id list DERIVES from them, so filling the table is a one-hunk
-// change in this file -- which is exactly what the empty table is here to make
-// possible. `clientChoices` returns the canonical ids unchanged while it is
-// empty, so nothing about today's output depends on the table being non-empty.
+// THE TABLE HOLDS ONE ENTRY: `mcp`, for Claude Code at PROJECT scope -- the
+// `.mcp.json` in the repo you are standing in, the file a team commits. It is
+// the name the docs and the install one-liner use, and before it existed
+// `yaw-mcp install mcp` was an unknown-client error.
+//
+// Every consumer routes through `resolveClientArg` and `clientChoices`, and
+// every expectation that names the id list DERIVES from them, so adding the
+// next alias stays a one-hunk change in this file.
 
 import { INSTALL_TARGETS, type InstallClientId, type InstallScope } from "./install-targets.js";
 
@@ -36,9 +38,22 @@ export interface ClientAlias {
   label: string;
 }
 
-/** Empty by design -- see the header. A sibling package fills this one array
- *  and nothing else. */
-export const CLIENT_ALIASES: readonly ClientAlias[] = [];
+/** One entry per alias -- see the header. A new name is one element here and
+ *  nothing else: the usage synopses, the completion words, the "Choose: ..."
+ *  line and the import/uninstall parsers all derive from `clientChoices`. */
+export const CLIENT_ALIASES: readonly ClientAlias[] = [
+  {
+    id: "mcp",
+    clientId: "claude-code",
+    // PINNED, and pinned to the scope whose file the name refers to: `.mcp.json`
+    // is Claude Code's project scope, and an alias that resolved to the user
+    // scope would write ~/.claude.json under a name that means the repo's file.
+    // Applied as a DEFAULT -- an explicit `--scope` beside it still wins, which
+    // is `resolveClientArg`'s contract.
+    scope: "project",
+    label: "Claude Code, project scope (.mcp.json in this repo)",
+  },
+];
 
 /** The ids `verb` accepts, canonical rows first in table order, then the
  *  aliases in table order.

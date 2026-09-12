@@ -120,6 +120,15 @@ const TARGET_ROWS = [
         label: "Project",
         description: "Commit to share with your team.",
         requiresProjectDir: true,
+        // `.mcp.json` is read with strict JSON, unlike `~/.claude.json`: a
+        // comment or a trailing comma in it means Claude Code loads NO server
+        // from that file. Declaring it here is what makes the write facade
+        // refuse to splice an entry into one -- printing "Done" over a file
+        // nothing reads, and leaving the user to wonder why their broker never
+        // appears, is the failure this flag exists to stop. It is a REFUSAL,
+        // not a repair: the comments are the user's, and yaw-mcp does not get
+        // to delete them to make its own write land.
+        strictJson: true,
       },
       {
         scope: "local",
