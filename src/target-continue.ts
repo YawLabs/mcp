@@ -2,12 +2,24 @@
 //
 // Imports the LEAF model only -- see the header of target-zed.ts for why.
 //
-// Continue is the one target whose file yaw-mcp OWNS: every other client is
+// Continue is the one target whose file yaw-mcp CREATES: every other client is
 // handed a user config we splice one entry into, while Continue's IDE
-// extensions load each JSON file in an `mcpServers/` folder, so install
-// creates `mcpServers/yaw-mcp.json` and nothing else is ever in it. That is
-// what `ownership: "dedicated"` records, and the only thing it changes today
-// is wording -- an uninstall from a shared file says the file stays.
+// extensions load the JSON files in an `mcpServers/` folder, so install makes
+// `mcpServers/yaw-mcp.json` itself when it is not there. That is what
+// `ownership: "dedicated"` records.
+//
+// TWO THINGS THAT FIELD DOES NOT MEAN, both stated because the obvious reading
+// of "dedicated" is wrong:
+//   * It is not "nothing else is ever in it". Every write is still a splice, a
+//     user may add a server to the file by hand, and `import continue` reads
+//     the siblings out of it. src/tests/target-continue.test.ts round-trips a
+//     hand-edited copy of this file with a foreign server, a tab indent, CRLF
+//     and two comments through install and uninstall, byte for byte.
+//   * It changes no OUTPUT today. Nothing in src/ reads it, and the uninstall
+//     Done line is byte-identical to a shared client's -- pinned by that same
+//     file's "says exactly what a SHARED client's uninstall says". The field is
+//     carried so the wording CAN come to depend on it (whether the file stays
+//     behind is the obvious candidate); until something reads it, it is data.
 
 import { isAbsolute, join, resolve } from "node:path";
 import { defineTarget, type PathBase, type ResolvedPath } from "./install-target-model.js";

@@ -3,10 +3,17 @@
 // Continue is the ONE row whose config file yaw-mcp creates and owns:
 // `<continue global dir>/mcpServers/yaw-mcp.json` for the user scope and
 // `<project>/.continue/mcpServers/yaw-mcp.json` for the project one. Continue's
-// IDE core reads every `.json` file in those folders, so a dedicated block file
+// IDE core reads the `.json` files in those folders, so a dedicated block file
 // needs no YAML reader, splices into nobody's settings, and is ours to assert
 // WHOLE: where every other client's test can only check that our entry landed
 // and the neighbours survived, these compare the entire file byte for byte.
+//
+// "the `.json` files" rather than "every `.json` file", deliberately: the
+// loader reads that folder through `walkDir` with Continue's own
+// DEFAULT_IGNORE_FILETYPES minus `config.json` and `settings.json`, so
+// `appsettings.json`, `auth.json` and anything matching `*-lock.json` in it are
+// SKIPPED (core/indexing/ignore.ts). `yaw-mcp.json` matches none of them, which
+// is one of the reasons the file is named that and not `mcp.json`.
 //
 // WHAT THE VENDOR FACTS ARE, and where they were checked (continuedev/continue
 // at main = 5522c6f, re-read 2026-09-12 with curl against raw.githubusercontent
@@ -31,10 +38,17 @@
 //     (core/context/mcp/MCPConnection.ts, WINDOWS_BATCH_COMMANDS), and skips
 //     that wrap when the Windows host is attached to a WSL remote. So the
 //     broker entry is a bare `npx`.
-//   * Nothing watches either mcpServers folder. extensions/vscode's
-//     VsCodeExtension.ts watches config.json, config.yaml, config.ts and the
-//     global `rules` directory -- that is the whole list -- which is why this
-//     row's reload kind is "reload-window" rather than "live".
+//   * No file watcher covers either mcpServers folder. VsCodeExtension.ts
+//     (extensions/vscode) has exactly four: fs.watchFile on config.json,
+//     config.yaml and config.ts, and fs.watch on the global `rules` directory.
+//     It also forwards VS Code's own onDidSaveTextDocument / onDidCreateFiles,
+//     so opening this file IN the editor and saving it does reload the config
+//     -- but VS Code's typings say onDidCreateFiles "is *not* fired when files
+//     change on disk, e.g triggered by another application", which is exactly
+//     what a yaw-mcp write is. Hence "reload-window" rather than "live", and
+//     hence the note telling the user to reload. JetBrains is UNVERIFIED: its
+//     plugin forwards VFS_CHANGES, and whether an external write under
+//     ~/.continue reaches the IntelliJ VFS without a refresh was not measured.
 //
 // HERMETIC: a synthetic home per test, the oam probe and the bundles.json read
 // both seamed, and nothing reads the developer's own client config. The one
