@@ -252,8 +252,16 @@ if (subcommand === "compliance") {
                              \`other-entries\` that the list holds other
                              servers, \`no-entries\` that the file exists but
                              has no server in that list, \`not installed\` that
-                             the file is absent, and \`not supported yet\` that
-                             yaw-mcp cannot configure that client on this OS
+                             the file is absent, \`legacy: <key>\` that the only
+                             yaw-mcp wiring there is a pre-rename entry,
+                             \`malformed\` that the file does not parse,
+                             \`unreadable: <reason>\` that its bytes could not
+                             be read, and \`not supported yet\` that yaw-mcp
+                             cannot configure that client on this OS. An
+                             \`installed\` or \`legacy\` row can add \`(other
+                             drive case)\`, for a Claude Code local-scope entry
+                             an older version left under the other
+                             drive-letter spelling of this directory
                              (read-only; no writes).
     install --all            Install into every client yaw-mcp supports on this
                              OS. It plans from that list, not from a probe of
