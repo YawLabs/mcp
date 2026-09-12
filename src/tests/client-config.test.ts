@@ -50,6 +50,22 @@ import { findLegacyEntry, INSTALL_TARGETS, resolveInstallPath } from "../install
 
 const ENTRY: Record<string, unknown> = { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] };
 
+/** The TOML adapter the codex-cli row registers at its own module scope --
+ *  importing `../install-targets.js` above is what runs that registration.
+ *
+ *  Captured here because `resetConfigAdapterRegistry` is a REGISTRY reset, not
+ *  a module reset: a test that drops the registry cannot make that module
+ *  evaluate a second time, so every reset in this file has to put the adapter
+ *  back or the tests after it lose a format a shipped row uses. */
+const ROW_TOML_ADAPTER = adapterFor("toml");
+
+/** Reset to the state a fresh process is in: the JSON family built in, plus
+ *  the one adapter a shipped row registers. */
+function resetAdapters(): void {
+  resetConfigAdapterRegistry();
+  registerConfigAdapter("toml", ROW_TOML_ADAPTER);
+}
+
 const site = (over: Partial<ConfigSite> = {}): ConfigSite => ({
   id: "default",
   label: "Test Client",
@@ -66,30 +82,43 @@ describe("the format registry", () => {
     expect(adapterFor("jsonc").syntax).toBe("JSON");
   });
 
-  it("declares toml without shipping an adapter, and refuses it by name", () => {
-    // The whole point of declaring the format: a consumer asking for it gets a
-    // sentence about this build, not a parse failure three layers down.
+  it("serves toml out of the row that registers it, and refuses a format with no adapter by name", () => {
+    // `toml` is DECLARED here and registered by the codex-cli row's own module
+    // (see ROW_TOML_ADAPTER), so in a process that has imported the table it
+    // is served. Drop the registry and the refusal is the point of declaring
+    // the format at all: a consumer asking for it gets a sentence about this
+    // build, not a parse failure three layers down.
     expect(CONFIG_FORMATS).toContain("toml");
-    expect(hasConfigAdapter("toml")).toBe(false);
-    expect(() => adapterFor("toml")).toThrow(MissingConfigAdapterError);
-    expect(() => adapterFor("toml")).toThrow(/cannot read or write TOML client configs/);
+    expect(hasConfigAdapter("toml")).toBe(true);
+    expect(adapterFor("toml").syntax).toBe("TOML");
+    try {
+      resetConfigAdapterRegistry();
+      expect(hasConfigAdapter("toml")).toBe(false);
+      expect(() => adapterFor("toml")).toThrow(MissingConfigAdapterError);
+      expect(() => adapterFor("toml")).toThrow(/cannot read or write TOML client configs/);
+    } finally {
+      resetAdapters();
+    }
     expect(syntaxNameFor("toml")).toBe("TOML");
   });
 
   it("lets a sibling module add one, and refuses a second for the same format", () => {
     const stub = { syntax: "TOML" } as unknown as ConfigAdapter;
     try {
+      // A row already holds "toml", and that is itself the refusal below: two
+      // readers of one syntax is the split this seam exists to prevent.
+      expect(() => registerConfigAdapter("toml", stub)).toThrow(/already registered/);
+      resetConfigAdapterRegistry();
       registerConfigAdapter("toml", stub);
       expect(hasConfigAdapter("toml")).toBe(true);
       expect(adapterFor("toml")).toBe(stub);
       expect(() => registerConfigAdapter("toml", stub)).toThrow(/already registered/);
-      // And never over a built-in: two readers of one syntax is the split this
-      // seam exists to prevent.
+      // And never over a built-in.
       expect(() => registerConfigAdapter("jsonc", stub)).toThrow(/already registered/);
     } finally {
-      resetConfigAdapterRegistry();
+      resetAdapters();
     }
-    expect(hasConfigAdapter("toml")).toBe(false);
+    expect(adapterFor("toml")).toBe(ROW_TOML_ADAPTER);
   });
 });
 
@@ -693,7 +722,7 @@ const BLOCK_ADAPTER: ConfigAdapter = {
 };
 
 describe("contract fit: the five new clients", () => {
-  afterEach(resetConfigAdapterRegistry);
+  afterEach(resetAdapters);
 
   it("zed: a different root key, its own carried fields, and a live reload", () => {
     const zed = site({
@@ -828,7 +857,12 @@ describe("contract fit: the five new clients", () => {
     expect(reloadDoneClause("reload-window", "Continue")).toBe("Reload the IDE window to pick up the new MCP server.");
   });
 
-  it("codex-cli: a format with no adapter in this build, added by a sibling module", () => {
+  it("codex-cli: a TOML site runs through the same facade, whichever module's adapter serves it", () => {
+    // Drop the row's real adapter for this test so the stand-in below can take
+    // the format. The stand-in is the point: it spells TOML differently from
+    // the shipped adapter, and the facade still drives it with no branch on
+    // the format anywhere. `afterEach` puts the real one back.
+    resetConfigAdapterRegistry();
     const codex = site({
       id: "default",
       label: "Codex CLI",

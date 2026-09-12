@@ -25,7 +25,7 @@
 
 import { describe, expect, it } from "vitest";
 import { CLIENT_ALIASES, clientChoices } from "../client-aliases.js";
-import { CLIENT_ENV_VARS } from "../client-config.js";
+import { CLIENT_ENV_VARS, hasConfigAdapter } from "../client-config.js";
 import { INSTALL_TARGETS, type InstallClientId } from "../install-targets.js";
 import { sourceFiles, sourceSubdirectories } from "./source-files.js";
 
@@ -109,6 +109,9 @@ const RULES: Rule[] = [
     allowed: {
       "src/client-config.ts": "findLegacyKey and the view's default key -- the core's own answer",
       "src/install-targets.ts": "findLegacyEntry's body, over an object rather than a key list",
+      "src/target-codex-cli.ts":
+        "the one-element list of names its adapter asks the TOML reader about spliceability -- " +
+        "an array literal, not a membership test on a container",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
       "src/install-cmd.ts": NOT_YET_MIGRATED,
@@ -127,6 +130,7 @@ const RULES: Rule[] = [
       "src/install-target-model.ts": "declares ResolvedPath.containerPath",
       "src/install-targets.ts": "resolves it per client; the six inline rows and claudeCodeContainerPaths",
       "src/target-cline.ts": "its own row's path",
+      "src/target-codex-cli.ts": "its own row's path, and the address its TOML adapter hands the splice",
       "src/target-continue.ts": "its own row's path",
       "src/target-zed.ts": "its own row's path",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
@@ -337,6 +341,7 @@ describe("the table's structure", () => {
       "zed",
       "cline",
       "continue",
+      "codex-cli",
     ]);
   });
 
@@ -365,11 +370,13 @@ describe("the table's structure", () => {
 
   it("declares an adapter for every format a row uses", () => {
     // A row whose format has no adapter registered resolves, lists and probes
-    // -- and then throws MissingConfigAdapterError on the first read. The
-    // formats WP1 ships are the JSON family; "toml" is declared and has no
-    // adapter, so no row may use it yet.
+    // -- and then throws MissingConfigAdapterError on the first read. Asked of
+    // the REGISTRY rather than of a hard-coded format list: the JSON family is
+    // built in, and "toml" is registered by the codex-cli row's own module, so
+    // importing INSTALL_TARGETS (which this file just did) is what makes it
+    // available. A row whose module forgot to register fails here.
     for (const t of INSTALL_TARGETS) {
-      expect(["json", "jsonc"], `${t.clientId} uses a format with no adapter in this build`).toContain(t.config.format);
+      expect(hasConfigAdapter(t.config.format), `${t.clientId} uses a format with no adapter in this build`).toBe(true);
     }
   });
 
@@ -385,11 +392,13 @@ describe("the table's structure", () => {
 describe("the Environment help block names every LIVE client env var", () => {
   /** Declared in CLIENT_ENV_VARS for a target that has not landed, so no
    *  shipped row reads it and a help line claiming install honours it would be
-   *  FALSE. One entry, owned by the package that lands its target: WP2 (codex)
-   *  deletes this line and adds the help text in the same commit. */
-  const NOT_YET_LIVE: Record<string, string> = {
-    CODEX_HOME: "no codex-cli row ships in this build; nothing reads it yet",
-  };
+   *  FALSE. One entry per such variable, owned by the package that lands its
+   *  target: that package deletes its line and adds the help text in the same
+   *  commit, which is what the codex-cli row did to the CODEX_HOME entry that
+   *  stood here. EMPTY today -- every declared variable is read by a row and
+   *  documented in --help -- and kept so the next such variable has somewhere
+   *  to say so. */
+  const NOT_YET_LIVE: Record<string, string> = {};
 
   it("documents each one, since the existing scan cannot see a read off a parameter", () => {
     // index-dispatch.test.ts's env scan looks for `process.env.X` / `env["X"]`

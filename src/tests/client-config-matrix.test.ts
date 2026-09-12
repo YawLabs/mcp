@@ -109,7 +109,10 @@ describe("every row round-trips through the core", () => {
       const after = classifyClientConfig(removed, site);
       expect(after.entry()).toBeUndefined();
       expect(after.otherServerKeys()).toEqual(["other"]);
-      expect(removed).toContain('"other"');
+      // The neighbour's own BYTES are still there, which the re-parse above
+      // cannot tell from a file the splicer rewrote. Spelled per syntax: a
+      // JSON member is `"other"`, a TOML server is a `[<root>.other]` header.
+      expect(removed).toContain(site.format === "toml" ? `[${target.config.root}.other]` : '"other"');
     });
   }
 });
