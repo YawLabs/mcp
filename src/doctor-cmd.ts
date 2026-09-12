@@ -57,6 +57,7 @@ import {
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import {
   CURRENT_OS,
+  claudeCodeContainerPaths,
   ENTRY_NAME,
   findLegacyEntry,
   INSTALL_TARGETS,
@@ -452,6 +453,20 @@ export interface ClientProbeResult {
    *  (see isForeignAbsoluteLaunch). Not a cannot-launch state: the OS the
    *  entry was written for may well run it fine. */
   launchForeignPath: string | null;
+  /** The `projects[...]` key the reported entry was actually found under, when
+   *  that key is NOT the canonical spelling for this directory -- otherwise
+   *  null, which is every non-Windows checkout, every other client, and every
+   *  config this version wrote.
+   *
+   *  Claude Code's lookup is byte-exact, so a key differing only in
+   *  drive-letter case is a separate entry, read by a different set of shells
+   *  (see claudeCodeProjectKey). Probing only the canonical key reported "not
+   *  installed" for a project that WAS installed -- by an older version, or by
+   *  an install run from a cmd prompt with a lower-case drive. The probe now
+   *  looks under every variant (claudeCodeContainerPaths) and names the one it
+   *  read, so the status line can say which spelling is live instead of
+   *  implying there is only ever one. Additive JSON field. */
+  entryProjectKey: string | null;
 }
 
 export interface DoctorResult {
@@ -2174,17 +2189,28 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   const legacy = c.hasLegacyEntry
     ? `; legacy "${c.legacyEntryName}" entry also present -- remove it once the working entry is back`
     : "";
+  // The entry is real but lives under the OTHER drive-letter spelling of this
+  // directory's projects[] key. Appended to every branch that reports an
+  // entry, because each of them otherwise reads as a statement about the key
+  // doctor was asked about -- and a session whose cwd is spelled the canonical
+  // way sees nothing at all. Empty for every other client, every POSIX
+  // checkout, and every config this version wrote.
+  const keyNote = c.entryProjectKey
+    ? `; found under projects[${JSON.stringify(c.entryProjectKey)}], the same directory spelled with the other ` +
+      `drive-letter case -- only a Claude Code whose cwd is spelled that way reads it, and \`${installCmd}\` ` +
+      "writes the canonical key"
+    : "";
   if (c.launchCommandMissing) {
-    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}${keyNote}`;
   }
   // Both oam-specific states below are "the entry looks fine and will not
   // start", so they rank with launchCommandMissing rather than with the OK
   // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
   if (c.launchOamEntryMissing) {
-    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}`;
+    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${keyNote}`;
   }
   if (c.launchOamNotAbsolute) {
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}`;
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}${keyNote}`;
   }
   // Below the cannot-launch branches and above the OK ones: doctor knows
   // neither. The path is absolute on the OS the entry was written for, and
@@ -2193,16 +2219,16 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // not happen; reporting broken would flag a Windows profile as seen from
   // WSL for being a Windows profile.
   if (c.launchForeignPath) {
-    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}`;
+    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}${keyNote}`;
   }
   if (c.hasMcpEntry && c.hasLegacyEntry) {
-    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice`;
+    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice${keyNote}`;
   }
   if (c.hasMcpEntry) {
-    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
+    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}${keyNote}`;
   }
   if (c.hasLegacyEntry) {
-    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
+    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate, then remove the legacy entry by hand${keyNote}`;
   }
   if (c.exists) return `present, no "${ENTRY_NAME}" entry -- run \`${installCmd}\``;
   return `not configured -- run \`${installCmd}\``;
@@ -2274,6 +2300,7 @@ const EMPTY_PROBE: Readonly<ProbeClassification> = {
   launchOamNotAbsolute: null,
   launchOamEntryMissing: null,
   launchForeignPath: null,
+  entryProjectKey: null,
 };
 
 const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: true };
@@ -2514,7 +2541,29 @@ function classifyProbeContent(
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return { ...MALFORMED };
     }
-    const container = walkContainer(parsed as Record<string, unknown>, containerPath);
+    // EVERY projects[] read resolves its path through the one helper -- see
+    // claudeCodeContainerPaths. The canonical key comes first and wins when it
+    // carries wiring; a drive-letter-case sibling is only reported when the
+    // canonical key has nothing, which is exactly the upgrade case (an older
+    // version wrote the other spelling). `entryProjectKey` then names the key
+    // that was actually read, so no surface claims the entry is somewhere it
+    // is not.
+    const variantPaths = claudeCodeContainerPaths(parsed, containerPath);
+    let container: Record<string, unknown> | null = null;
+    let entryProjectKey: string | null = null;
+    for (let i = 0; i < variantPaths.length; i++) {
+      const found = walkContainer(parsed as Record<string, unknown>, variantPaths[i]);
+      if (!found) continue;
+      const wired = ENTRY_NAME in found || findLegacyEntry(found) !== null;
+      // The first container that exists is the fallback (so an empty canonical
+      // container still reads as "present, no entry" rather than "not
+      // configured"); the first WIRED one wins outright.
+      if (container === null || wired) {
+        container = found;
+        entryProjectKey = i === 0 ? null : variantPaths[i][1];
+      }
+      if (wired) break;
+    }
     if (!container) {
       return { ...EMPTY_PROBE };
     }
@@ -2591,6 +2640,10 @@ function classifyProbeContent(
       launchOamNotAbsolute,
       launchOamEntryMissing,
       launchForeignPath,
+      // Only when something is actually wired there: a bare sibling container
+      // is not news, and naming it would send the user after a key that holds
+      // nothing.
+      entryProjectKey: ENTRY_NAME in container || legacyEntryName !== null ? entryProjectKey : null,
     };
   } catch {
     // Parse failures only: the READ happens in the caller, under its own

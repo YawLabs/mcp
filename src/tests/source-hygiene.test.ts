@@ -160,3 +160,142 @@ describe("tracked source carries no raw control bytes", () => {
     expect(BINARY_EXT.has(extname("logo.PNG").toLowerCase())).toBe(true);
   });
 });
+
+// Every walk of a client-config container path in tracked source.
+//
+// Claude Code keys local-scope MCP under projects[<absolute dir>], looks it up
+// byte-exactly, and older versions of this tool wrote that key with whatever
+// drive-letter case the shell reported -- so one project can have TWO keys in
+// ~/.claude.json ("c:/repo" and "C:/repo"), each read by a different set of
+// shells. claudeCodeContainerPaths (install-targets.ts) is the ONE place that
+// equivalence is resolved, and every reader is supposed to take its paths from
+// it. A reader that indexes projects[<key>] directly sees only one of the two
+// and reports a state the other contradicts: that is how `uninstall` came to
+// strip the permission grant, print "Done: Claude Code no longer launches
+// yaw-mcp", and leave the entry that a cmd-started session still reads.
+//
+// The recurring failure this guards is narrower than "someone writes a bug":
+// it is a shared guard that gets exactly ONE adopter, so the command a finding
+// named is fixed and every sibling command keeps the same blindness. A
+// whitelist is therefore the right shape -- a NEW raw walk fails, and so does
+// deleting an existing one, so the table cannot rot quietly in either
+// direction.
+//
+// To update: if the new walk resolves a projects[] key, route it through
+// claudeCodeContainerPaths and add the helper-derived shape here. If it must
+// stay exact (a write, or a path recorded verbatim in a marker), say WHY in
+// its `why` and in a comment at the code.
+const CONTAINER_WALK_CALL = /\b(?:readNested|readEntryAt|walkContainer|readContainer)\((?:[^()\n]|\([^()\n]*\))*\)/g;
+const CONTAINER_WALK_LOOP = /for \(const [A-Za-z_$][\w$]* of (?:[^()\n]|\([^()\n]*\))*\)/g;
+const LOOP_IS_A_WALK = /containerPath|variantPath|claudeCodeContainerPaths/;
+
+interface Walk {
+  shape: string;
+  why: string;
+}
+
+const EXPECTED_WALKS: Record<string, Walk[]> = {
+  "src/doctor-cmd.ts": [
+    {
+      shape: "CALL walkContainer(root: Record<string, unknown>, path: string[])",
+      why: "the generic walker's own declaration -- it takes whatever path it is handed",
+    },
+    {
+      shape: "CALL walkContainer(parsed as Record<string, unknown>, variantPaths[i])",
+      why: "the probe behind doctor and `install --list`; paths from claudeCodeContainerPaths",
+    },
+  ],
+  "src/import-cmd.ts": [
+    { shape: "CALL readContainer(ref: ContainerRef)", why: "declaration of the other-scope container read" },
+    { shape: "CALL readContainer(searched[i])", why: "the is-yaw-mcp-wired-in search; folds inside readContainer" },
+    {
+      shape: "LOOP for (const variantPath of claudeCodeContainerPaths(parsed, ref.containerPath))",
+      why: "readContainer: every variant is checked for a yaw-mcp entry",
+    },
+    {
+      shape: "LOOP for (const variantPath of claudeCodeContainerPaths(parsed, resolved.containerPath))",
+      why: "the import SOURCE read; sourcePath then carries the key found into the removal",
+    },
+    { shape: "LOOP for (const key of variantPath)", why: "readContainer walking one helper-derived path" },
+    { shape: "LOOP for (const key of variantPath)", why: "the source read walking one helper-derived path" },
+  ],
+  "src/install-cmd.ts": [
+    {
+      shape: "CALL readNested(root: Record<string, unknown>, containerPath: string[])",
+      why: "the generic walker's own declaration -- it takes whatever path it is handed",
+    },
+    {
+      shape: "CALL readNested(existing, containerPath)",
+      why: "readEntryAt's body, the same generic accessor one level up",
+    },
+    { shape: "CALL readNested(existing, canonicalPath)", why: "install: the container this run writes" },
+    { shape: "CALL readNested(existing, variantPath)", why: "install: the drive-case sibling scan it reports" },
+    { shape: "CALL readNested(existing, variantPath)", why: "uninstall: every site it has to clear" },
+    { shape: "CALL readEntryAt(existing, canonicalPath, ENTRY_NAME)", why: "install: env carried over into the entry" },
+    { shape: "LOOP for (const key of containerPath)", why: "readNested's own body" },
+    { shape: "LOOP for (const variantPath of variantPaths.slice(1))", why: "install: the sibling scan" },
+  ],
+  "src/try-cmd.ts": [
+    {
+      shape: "LOOP for (const segment of containerPath)",
+      why: "peelEntryFromConfig: the path a trial MARKER recorded -- must delete that entry and no other",
+    },
+    {
+      shape: "LOOP for (const segment of containerPath)",
+      why: "configHasEntry: will the write at THIS path replace something -- the write goes to one path",
+    },
+  ],
+};
+
+function scanContainerWalks(): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const file of trackedFiles()) {
+    if (!file.startsWith("src/") || !file.endsWith(".ts") || file.includes("/tests/")) continue;
+    const src = readFileSync(join(REPO_ROOT, file), "utf8");
+    const found = [
+      ...(src.match(CONTAINER_WALK_CALL) ?? []).map((m) => `CALL ${m}`),
+      ...(src.match(CONTAINER_WALK_LOOP) ?? []).filter((m) => LOOP_IS_A_WALK.test(m)).map((m) => `LOOP ${m}`),
+    ].sort();
+    if (found.length > 0) out[file] = found;
+  }
+  return out;
+}
+
+describe("every client-config container walk goes through claudeCodeContainerPaths", () => {
+  it("scanned real files, rather than an empty list", () => {
+    // A regex that matches nothing would make every assertion below vacuous.
+    const scanned = scanContainerWalks();
+    expect(Object.keys(scanned).length).toBeGreaterThanOrEqual(4);
+    expect(scanned["src/install-cmd.ts"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it("finds exactly the walks the table accounts for", () => {
+    const scanned = scanContainerWalks();
+    const expected: Record<string, string[]> = {};
+    for (const [file, walks] of Object.entries(EXPECTED_WALKS)) expected[file] = walks.map((w) => w.shape).sort();
+    // Whole-map compare, so a walk in a file the table does not list fails too
+    // -- a new reader module is exactly the shape this is watching for.
+    expect(scanned).toEqual(expected);
+  });
+
+  it("has a stated reason for every exact, unfolded walk", () => {
+    // The three walks that deliberately do NOT fold are the ones a reviewer
+    // has to be able to challenge, so each carries its reason here and a
+    // comment at the code.
+    for (const [file, walks] of Object.entries(EXPECTED_WALKS)) {
+      for (const w of walks) {
+        expect(w.why.length, `${file}: ${w.shape}`).toBeGreaterThan(10);
+      }
+    }
+  });
+
+  it("keeps every folding reader importing the helper", () => {
+    // The compile would catch a removed import, but not a reader that quietly
+    // stops calling it while the import lingers -- the shape table above is
+    // what catches that. This pins the other half: the three readers that must
+    // fold all name the helper.
+    for (const file of ["src/install-cmd.ts", "src/doctor-cmd.ts", "src/import-cmd.ts"]) {
+      expect(readFileSync(join(REPO_ROOT, file), "utf8"), file).toContain("claudeCodeContainerPaths");
+    }
+  });
+});

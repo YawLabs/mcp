@@ -363,6 +363,15 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
  *  read "c:/...", while that Git Bash after `cd .`, a PowerShell started from
  *  it, and cmd after `cd /d C:\\...` read "C:/...".)
  *
+ *  The lower-case sibling an OLDER version wrote is no longer invisible to
+ *  this tool. Every reader resolves its `projects[...]` lookups through
+ *  claudeCodeContainerPaths below, which treats two keys differing only in
+ *  drive-letter case as ONE project: `uninstall` removes the entry from both
+ *  spellings, and `doctor` / `install --list` name the key an entry was
+ *  actually found under. Install still writes only the canonical key -- see
+ *  claudeCodeContainerPaths for why it reports the sibling instead of
+ *  migrating it.
+ *
  *  Scoped to Windows-shaped paths (drive letter or UNC) so a POSIX directory
  *  whose name legitimately contains a backslash is not mangled. A UNC path has
  *  no drive letter, so only its separators change.
@@ -371,10 +380,94 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
  *  resolveInstallPath on a POSIX runner (isAbsolute("C:\\...") is false
  *  there, so resolve() rewrites the fixture first). */
 export function claudeCodeProjectKey(projectDir: string): string {
-  if (/^[A-Za-z]:[\\/]/.test(projectDir)) {
+  if (WINDOWS_DRIVE_PATH.test(projectDir)) {
     return projectDir[0].toUpperCase() + projectDir.slice(1).replace(/\\/g, "/");
   }
   return projectDir.startsWith("\\\\") ? projectDir.replace(/\\/g, "/") : projectDir;
+}
+
+/** A path (or a `projects[...]` key, which is the same string) that starts
+ *  with a drive letter. Shared by claudeCodeProjectKey and the key folding
+ *  below so the two cannot disagree about what "Windows-shaped" means. A
+ *  drive-RELATIVE spelling ("c:repo") is deliberately excluded: it is not a
+ *  directory on its own, and resolveInstallPath has already resolved it. */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+
+/** The `projects` object's own key inside ~/.claude.json, and the first
+ *  segment of every local-scope containerPath. */
+const PROJECTS_KEY = "projects";
+
+/** True when two `projects[...]` keys name the SAME project directory as far
+ *  as this tool is concerned: byte-identical, or Windows-shaped and differing
+ *  ONLY in the case of the leading drive letter.
+ *
+ *  Claude Code's own lookup is byte-exact, so "c:/repo" and "C:/repo" really
+ *  are two entries to IT, and which one a session reads depends on how its
+ *  shell spelled the cwd (see claudeCodeProjectKey). They are one PROJECT to
+ *  the user, though, and a command that sees only one of them reports a state
+ *  the other contradicts -- an `uninstall` that leaves the sibling in place
+ *  says the client no longer launches yaw-mcp while it still does.
+ *
+ *  ONLY the drive letter folds. Everything after it is compared byte for byte,
+ *  because Claude Code keys the rest of the path case-sensitively and folding
+ *  more would merge two directories its lookup keeps apart. A separator
+ *  difference is not a drive-letter difference either: "C:\\repo" and "C:/repo"
+ *  are NOT the same key here. POSIX and UNC keys have no drive letter, so they
+ *  only ever match themselves. */
+export function sameClaudeCodeProjectKey(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (!WINDOWS_DRIVE_PATH.test(a) || !WINDOWS_DRIVE_PATH.test(b)) return false;
+  return a[0].toLowerCase() === b[0].toLowerCase() && a.slice(1) === b.slice(1);
+}
+
+/** Every containerPath under which an entry for `containerPath`'s project can
+ *  ALREADY live in `root` -- the canonical path FIRST, then one more for each
+ *  drive-letter-case variant key `root` actually carries.
+ *
+ *  This is the ONE place a `projects[...]` lookup is resolved. Install writes
+ *  the canonical key and nothing else, but a config written by an older
+ *  version (or by an install run from a cmd prompt with a lower-case drive)
+ *  carries the other spelling, and a reader that looks only at the canonical
+ *  key cannot see it: `uninstall` reported "Nothing to do" and printed Done
+ *  over an entry that still launched yaw-mcp, and `doctor` / `install --list`
+ *  reported "not installed" for a project that was. Every reader takes its
+ *  paths from here so a new one cannot reintroduce that split -- enforced by
+ *  the source-shape scan in src/tests/source-hygiene.test.ts.
+ *
+ *  Callers that deliberately want only the canonical path (a WRITE, or "will
+ *  my write at this exact path replace something") take `[0]`, which is always
+ *  present even when `root` carries no such key -- the canonical path is where
+ *  writes go whether or not anything is there yet.
+ *
+ *  Install is one of those callers on purpose: it writes the canonical key and
+ *  REPORTS a sibling rather than migrating it. Migrating means deleting the
+ *  sibling, and the session that reads the sibling is precisely the one that
+ *  cannot read the canonical key -- so a migration would silently unwire a
+ *  live cmd-started Claude Code and hand it nothing back, which is the one
+ *  outcome an ADDITIVE command must not produce. `uninstall` is the
+ *  subtractive command and does clear every spelling, so the cleanup the user
+ *  is pointed at exists and is one line.
+ *
+ *  Non-projects container paths (`["mcpServers"]`, `["servers"]`) and
+ *  POSIX/UNC project keys get exactly one path back, so every other client and
+ *  every non-Windows checkout is untouched. */
+export function claudeCodeContainerPaths(root: unknown, containerPath: readonly string[]): string[][] {
+  const canonical = [...containerPath];
+  if (containerPath.length < 2 || containerPath[0] !== PROJECTS_KEY) return [canonical];
+  const key = containerPath[1];
+  if (!WINDOWS_DRIVE_PATH.test(key)) return [canonical];
+  if (typeof root !== "object" || root === null || Array.isArray(root)) return [canonical];
+  const projects = (root as Record<string, unknown>)[PROJECTS_KEY];
+  if (typeof projects !== "object" || projects === null || Array.isArray(projects)) return [canonical];
+  const out: string[][] = [canonical];
+  // Own keys only, in the file's own order, so the result is deterministic and
+  // an inherited member cannot conjure a path that is not in the JSON.
+  for (const candidate of Object.keys(projects as Record<string, unknown>)) {
+    if (candidate !== key && sameClaudeCodeProjectKey(candidate, key)) {
+      out.push([PROJECTS_KEY, candidate, ...containerPath.slice(2)]);
+    }
+  }
+  return out;
 }
 
 function pathFor(
