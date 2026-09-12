@@ -396,12 +396,21 @@ export interface ClientProbeResult {
   path: string;
   exists: boolean;
   hasMcpEntry: boolean;
-  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced so
-   *  upgraded users know to trim by hand — nothing in the runtime writes
-   *  this key anymore. */
+  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced because
+   *  the client launches it too, so the user is running yaw-mcp twice --
+   *  nothing in the runtime writes this key anymore (LEGACY_ENTRY_NAMES in
+   *  install-targets.ts). Removing it is not the user's chore: `install`
+   *  removes the key itself unless `--keep-legacy`, in the same write as the
+   *  working entry -- or as the run's only edit when that entry is already
+   *  correct -- so the status lines whose remedy is an install run say
+   *  install removes it. The two that name no run (an entry that already
+   *  works, and one whose launch path is for another OS) say only that the
+   *  key has to go. */
   hasLegacyEntry: boolean;
   /** The specific legacy entry key found (e.g. "mcp.hosting" / "yaw-mcp"), or
-   *  null. Lets the status line name the stale key in the trim hint. */
+   *  null. Lets the status line name the stale key in its legacy clause.
+   *  Same division of labour as the field above: the clause names an install
+   *  run where one is the remedy, and install is what removes the key. */
   legacyEntryName: string | null;
   /** The file exists but its content did not PARSE as a JSON object. Never
    *  set for a read failure -- that is `unreadable`. */

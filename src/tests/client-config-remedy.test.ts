@@ -23,6 +23,7 @@ import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runDoctor } from "../doctor-cmd.js";
 import { runImport } from "../import-cmd.js";
@@ -438,6 +439,54 @@ describe("a legacy entry -- doctor does not send the user to remove what install
     // the path it was set to appears nowhere.
     expect(row.split("OAM_BIN").length - 1).toBe(1);
     expect(withSet.text).not.toContain(oamBin);
+  });
+
+  // Everything above pins the rendered STRINGS. This pins the premise they
+  // were derived from: the field every one of those lines reads carried a doc
+  // comment making the claim the lines dropped -- "Surfaced so upgraded users know to
+  // trim by hand -- nothing in the runtime writes this key anymore" (a4a204d,
+  // predating any of this and untouched by the fix). A comment is not
+  // executable, so no assertion above could go red on it, and the next caller
+  // to print from this field takes its word. `install` is the remover on every
+  // path that writes: the same write as the working entry, or the run's only
+  // edit when that entry is already correct (install-cmd.ts, `trimLegacy` /
+  // the `skipEntryWrite` removeJsoncEntry branch), unless `--keep-legacy`.
+  it("the fields those lines read do not document a by-hand trim", () => {
+    const src = readFileSync(fileURLToPath(new URL("../doctor-cmd.ts", import.meta.url)), "utf8");
+    /** The contiguous doc block immediately above a field declaration, comment
+     *  furniture stripped and rejoined. THROWS rather than returning "" when
+     *  the field or its block is missing: a scan that quietly finds nothing
+     *  satisfies every assertion made about it. */
+    const docFor = (decl: string): string => {
+      const lines = src.split("\n");
+      const at = lines.findIndex((l) => l.trim() === decl);
+      if (at < 0) throw new Error(`no declaration \`${decl}\` in doctor-cmd.ts`);
+      let start = at;
+      while (start > 0 && /^\s*(\/\*\*|\*)/.test(lines[start - 1])) start -= 1;
+      if (!/^\s*\/\*\*/.test(lines[start])) throw new Error(`no doc comment above \`${decl}\``);
+      return lines
+        .slice(start, at)
+        .map((l) =>
+          l
+            .replace(/^\s*\/?\*+/, "")
+            .replace(/\*\/\s*$/, "")
+            .trim(),
+        )
+        .join(" ")
+        .trim();
+    };
+    expect(() => docFor("noSuchField: boolean;")).toThrow(/no declaration/);
+
+    const legacyDoc = docFor("hasLegacyEntry: boolean;");
+    const nameDoc = docFor("legacyEntryName: string | null;");
+    // Anchors: the blocks were found, so the assertions below are about real
+    // text rather than about an empty string.
+    expect(legacyDoc).toContain("Pre-rename");
+    expect(nameDoc).toContain("legacy entry key");
+    for (const doc of [legacyDoc, nameDoc]) expect(doc).not.toMatch(/by[ -]hand/i);
+    // And the remover is named, so a reader does not have to infer it from the
+    // status lines: install trims the key in the run those lines send you to.
+    expect(legacyDoc).toContain("install removes it");
   });
 });
 
