@@ -19,7 +19,7 @@
 //            returned the intended entry, so they are the vendor-verified
 //            ground truth for the renderer's field order, its `60.0` spelling
 //            and its sorted env sub-table.
-//   g01-g20  were added by this package for the splice shapes f01-f16 does not
+//   g01-g21  were added by this package for the splice shapes f01-f16 does not
 //            reach (a header inside a multi-line string, first/middle/last
 //            position, detached sub-tables, a BOM on the table's own line, the
 //            refused spellings, a string that ENDS on a comment-looking line,
@@ -27,7 +27,9 @@
 //            running this adapter and then read back with a codex-cli 0.144.0
 //            (same read-only probe), so they pin behaviour that was reviewed
 //            and loaded rather than behaviour that was merely round-tripped.
-//            g18/g19/g20 input AND expected were each loaded by that codex.
+//            g18/g19/g20/g21 input AND expected were each loaded by that codex
+//            (`codex mcp list --json` / `get mcp --json` under a scratch
+//            CODEX_HOME); g21's input returns both `mcp` and `other`.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -142,6 +144,31 @@ describe("the fixtures on disk", () => {
     for (let i = 0; i < raw.length; i++) {
       const code = raw.charCodeAt(i);
       expect(code >= 0x20 || code === 0x0a, `raw control byte 0x${code.toString(16)} at offset ${i}`).toBe(true);
+    }
+  });
+
+  it("g21 still holds the escaped quote that only the mlBasic skip gets past", () => {
+    // g20 is about SINGLE-line strings; the same skip exists a second time for
+    // `"""` blocks, and only this fixture reaches it. The whole point is four
+    // bytes -- backslash, quote, quote, quote -- so they are spelled from code
+    // points here and read back from disk, never typed as an escape that a
+    // shell or an editor could halve on the way in.
+    for (const file of ["input.toml", "expected.toml"]) {
+      const raw = fixture("g21-mlbasic-escaped-quote", file);
+      expect(raw, file).toContain(`he said ${BS}${QUOTE}${QUOTE}${QUOTE}`);
+      // Exactly one backslash in the file, and it is that one: a doubled or
+      // eaten backslash would leave every other assertion here passing while
+      // testing a different document.
+      expect(raw.split(BS), file).toHaveLength(2);
+      expect(raw.indexOf(BS), file).toBe(raw.indexOf(`he said ${BS}`) + "he said ".length);
+      // The escape has NOT collapsed into the byte it denotes, and no other
+      // control byte rode in with it. LF is the only sub-0x20 byte allowed.
+      for (let i = 0; i < raw.length; i++) {
+        const code = raw.charCodeAt(i);
+        expect(code >= 0x20 || code === 0x0a, `${file}: raw control byte 0x${code.toString(16)} at offset ${i}`).toBe(
+          true,
+        );
+      }
     }
   });
 });
@@ -393,6 +420,43 @@ describe("scanner", () => {
     expect(tomlEntryNames(readTomlConfig(raw, CONTAINER))).toEqual(["other", `café ${QUOTE}x${QUOTE}`, "mcp"]);
   });
 
+  it("stays in phase across an escaped quote inside a MULTI-LINE string (g21)", () => {
+    // The scanner carries the same in-string backslash skip twice, once per
+    // basic-string state, and g20 above only reaches the single-line one. This
+    // is the `"""` twin: `he said \"""` is an escaped quote followed by two
+    // literal quotes, so the block runs on. Without the skip in `mlBasic` the
+    // scanner reads those three raw quotes as the terminator, ends the string
+    // two lines early, and the `"""` that really closes it OPENS a new block
+    // that swallows the rest of the file -- taking `[mcp_servers.mcp]` with
+    // it. Codex 0.144.0 loads this file and lists both servers, so the answer
+    // has to be a correct write; the next test is the consequence.
+    const raw = fixture("g21-mlbasic-escaped-quote", "input.toml");
+    const scan = scanTomlSections(raw);
+    expect(scan.sections.map((s) => s.keyPath)).toEqual([
+      ["mcp_servers", "other"],
+      ["mcp_servers", "mcp"],
+    ]);
+    // The three lines inside the block, and nothing after it: the closing
+    // `"""` line is the last one that did not begin in normal state.
+    expect(
+      [...scan.continuedLines.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([start, kind]) => [lineTextAt(raw, start), kind]),
+    ).toEqual([
+      [`he said ${BS}${QUOTE}${QUOTE}${QUOTE}`, "mlBasic"],
+      ["still inside", "mlBasic"],
+      [QUOTE.repeat(3), "mlBasic"],
+    ]);
+    // ...and the sibling's span ends at the block's real end, not inside it.
+    expect(raw.slice(scan.sections[0].start, scan.sections[0].contentEnd)).toBe(
+      raw.slice(0, raw.indexOf(`\n\n[mcp_servers.mcp]`) + 1),
+    );
+    expect(tomlEntryFields(readTomlConfig(raw, CONTAINER), "other")).toEqual({
+      command: "node",
+      note: `he said ${QUOTE.repeat(3)}\nstill inside\n`,
+    });
+  });
+
   it("keeps a BOM outside every section span (g17)", () => {
     const raw = fixture("g17-bom-first-table", "input.toml");
     const scan = scanTomlSections(raw);
@@ -427,6 +491,45 @@ describe("scanner", () => {
 describe("renderer", () => {
   it("writes the broker entry in Codex's own field order (f01)", () => {
     expect(renderTomlEntry(CONTAINER, ENTRY, BROKER)).toBe(fixture("f01-missing", "expected.toml"));
+  });
+
+  it("puts auth and enabled where Codex re-serialized them on an HTTP entry", () => {
+    // The third bullet above FIELD_ORDER, as an assertion instead of a
+    // sentence. MEASURED on codex-cli 0.144.0: a scrambled HTTP entry handed
+    // to `codex mcp add <other>` under a scratch CODEX_HOME came back in
+    // exactly this order -- `auth` between `bearer_token_env_var` and
+    // `enabled`, the two header maps as sub-tables after every key-value line.
+    // The value is `chatgpt` and not `oauth` on purpose: `oauth` is the one
+    // spelling 0.144.0 drops on the way back out, so it could not have placed
+    // the field.
+    expect(
+      renderTomlEntry(CONTAINER, ENTRY, {
+        tool_timeout_sec: 11,
+        enabled: false,
+        auth: "chatgpt",
+        startup_timeout_sec: 22,
+        bearer_token_env_var: "TOK",
+        url: "https://example.com/mcp",
+        env_http_headers: { B: "b" },
+        http_headers: { A: "a" },
+      }),
+    ).toBe(
+      lf(
+        "[mcp_servers.mcp]",
+        'url = "https://example.com/mcp"',
+        'bearer_token_env_var = "TOK"',
+        'auth = "chatgpt"',
+        "enabled = false",
+        "startup_timeout_sec = 22.0",
+        "tool_timeout_sec = 11.0",
+        "",
+        "[mcp_servers.mcp.http_headers]",
+        'A = "a"',
+        "",
+        "[mcp_servers.mcp.env_http_headers]",
+        'B = "b"',
+      ),
+    );
   });
 
   it("spells an integral timeout as a float, the way Codex's f64 serializer does", () => {
@@ -647,6 +750,7 @@ describe("upsert -- byte-exact", () => {
     ["g18-mlbasic-hash-close", "expected.toml", BROKER, [], "appends AFTER a sibling string that ends on a `#` line"],
     ["g19-own-hash-close", "expected.toml", BROKER, [], "replaces our own table whose string ends on a `#` line"],
     ["g20-backslash", "expected.toml", BROKER, [], "keeps every escaped backslash and quote around the edit"],
+    ["g21-mlbasic-escaped-quote", "expected.toml", BROKER, [], "replaces our table below a sibling's escaped quote"],
   ];
   for (const [id, expectedFile, entry, legacy, what] of cases) {
     it(`${id}: ${what}`, () => {
@@ -748,6 +852,30 @@ describe("upsert -- byte-exact", () => {
       uni: "café",
       literal: `C:${BS}dir${BS}raw`,
     });
+  });
+
+  it("g21: a sibling's escaped quote does not turn a legitimate config into a refusal", () => {
+    // The g18 failure class, on the `"""` twin of the skip g20 pins. Out of
+    // phase, the scan loses `[mcp_servers.mcp]` into a string, the parse still
+    // finds the entry, and the two disagree -- which upsert reports as
+    // `TomlSpliceRefusal`. A user whose config real codex loads would be told
+    // their entry "is not written as a [mcp_servers.mcp] table" and left to
+    // edit it by hand. So assert the write SUCCEEDS, and that both entries
+    // still mean what they meant.
+    const input = fixture("g21-mlbasic-escaped-quote", "input.toml");
+    const next = upsertTomlEntry(input, CONTAINER, ENTRY, BROKER);
+    const read = readTomlConfig(next, CONTAINER);
+    expect(tomlEntryNames(read)).toEqual(["other", ENTRY]);
+    expect(tomlEntryFields(read, "other")).toEqual({
+      command: "node",
+      note: `he said ${QUOTE.repeat(3)}\nstill inside\n`,
+    });
+    expect(tomlEntryFields(read, ENTRY)).toEqual(entryAsWritten(BROKER));
+    // Replaced in place, not appended next to a leftover: one such header.
+    expect(next.split("[mcp_servers.mcp]")).toHaveLength(2);
+    expect(next).not.toContain('command = "old"');
+    // The one backslash survived the splice.
+    expect(next.split(BS)).toHaveLength(2);
   });
 
   it("leaves every other byte alone -- comments, quoting, number spelling, unsorted env (f03)", () => {

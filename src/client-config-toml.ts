@@ -805,8 +805,9 @@ function tomlArrayItem(item: unknown, key: string): string {
  *  MEASURED, not read out of the vendor's source, which 0.144.0 ships as a
  *  binary: a config.toml carrying every field below was re-serialized by
  *  `codex mcp add <other>` under a scratch CODEX_HOME, and the order it wrote
- *  back is the order below. Three results from that run are worth naming,
- *  because each is a claim this comment would otherwise be making for free:
+ *  back is the order below. That was repeated per VALUE where a field turned
+ *  out to have a value-dependent answer (the third bullet). Three results are
+ *  worth naming, because each is a claim this comment would make for free:
  *
  *   - `http_headers_helper` and `omit_tools_from` came back DROPPED, so
  *     0.144.0 has no such fields and their place here is NOT vendor-verified.
@@ -817,8 +818,17 @@ function tomlArrayItem(item: unknown, key: string): string {
  *     is no evidence about it. The renderer refuses a table outside
  *     `SUBTABLE_FIELDS`, so the only value that can reach either slot is a
  *     hand-written scalar of that name -- which Codex itself rejects.
- *   - `enabled` came back only when false and `auth` only on an HTTP entry
- *     (`auth is not supported for stdio`), each in the position below.
+ *   - `enabled` and `auth` each came back in the position below, but each for
+ *     only ONE of its values: `enabled = false` survived where `enabled =
+ *     true` was dropped, and `auth = "chatgpt"` survived where `auth =
+ *     "oauth"` was dropped. Those two spellings are the whole of `auth`
+ *     ("unknown variant `none`, expected `oauth` or `chatgpt`"), and it is
+ *     HTTP-only: on a stdio entry 0.144.0 refuses the whole config with "auth
+ *     is not supported for stdio". Reading that as a serializer skipping a
+ *     field at its default is an inference, not something measured -- what is
+ *     measured is the asymmetry, and its consequence for this list: a dropped
+ *     VALUE is no evidence against a FIELD, so `auth` is placed here on the
+ *     `chatgpt` run and not moved into the sentence above on the `oauth` one.
  *
  *  The Rust names this file cites -- `serialize_mcp_server_table` here,
  *  `table_from_pairs` and `entries.sort_by_key` at the renderer,
