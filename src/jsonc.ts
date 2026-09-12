@@ -33,6 +33,7 @@ import {
   type Edit,
   type FormattingOptions,
   findNodeAtLocation,
+  getNodeValue,
   type JSONPath,
   modify,
   type Node,
@@ -650,6 +651,19 @@ export function editJsoncPath(src: string, path: Array<string | number>, value: 
   return applyEdits(debommed, edits);
 }
 
+/** One element of an array node, as a JS value.
+ *
+ *  `Node.value` is populated ONLY for a scalar: an `object` or an `array`
+ *  child reports `value: undefined` (measured against the jsonc-parser this
+ *  repo pins), so comparing or testing children through `child.value` treats
+ *  every non-scalar element as one and the same `undefined` -- a dedupe that
+ *  can never match an object, and a predicate that is handed nothing to
+ *  decide on. `getNodeValue` materialises the subtree, which is what both
+ *  helpers below need. */
+function elementValue(child: Node): unknown {
+  return getNodeValue(child);
+}
+
 /** The ARRAY at `path`, or null when `src` does not parse or nothing of that
  *  type is there. Shared by the two array helpers below so they agree about
  *  what counts as an array to splice into. */
@@ -682,7 +696,11 @@ function arrayNodeAt(text: string, path: Array<string | number>): Node | null {
  *  Returns the input unchanged, byte for byte and BOM included, when the value
  *  is already an element of that array -- the same no-op contract, and the
  *  same reason, as `removeJsoncEntry`. Equality is `JSON.stringify` over the
- *  parsed element, so it covers a string, a number and an object alike.
+ *  element's fully materialised value (`getNodeValue`, not `Node.value`, which
+ *  is undefined for an object or an array child), so it covers a string, a
+ *  number, an object and a nested array alike. Key ORDER counts, as it does in
+ *  any stringify comparison: `{"a":1,"b":2}` and `{"b":2,"a":1}` are two
+ *  elements, and this appends the second.
  *
  *  Throws when `path` names something that is NOT an array (a string, an
  *  object): silently replacing it would throw away whatever the user put
@@ -702,7 +720,7 @@ export function addJsoncArrayElement(src: string, path: Array<string | number>, 
   }
   const wanted = JSON.stringify(value);
   for (const child of array.children ?? []) {
-    if (JSON.stringify(child.value) === wanted) return src;
+    if (JSON.stringify(elementValue(child)) === wanted) return src;
   }
   const edits = insertMember(debommed, array, null, value);
   // `insertMember` returns null only for a container shape its scanner cannot
@@ -710,7 +728,7 @@ export function addJsoncArrayElement(src: string, path: Array<string | number>, 
   // working (it is what this function replaces) at the cost of the comments
   // inside -- strictly better than refusing, and the caller cannot do more.
   if (edits === null) {
-    const next = [...(array.children ?? []).map((c) => c.value), value];
+    const next = [...(array.children ?? []).map(elementValue), value];
     return editJsoncPath(debommed, path, next);
   }
   return applyEdits(debommed, edits);
@@ -718,6 +736,10 @@ export function addJsoncArrayElement(src: string, path: Array<string | number>, 
 
 /** Remove from the array at `path` every element whose parsed value satisfies
  *  `matches`, preserving the comments on the elements that stay.
+ *
+ *  `matches` is handed the element's fully materialised value, so an object or
+ *  a nested-array element is a value the predicate can actually test rather
+ *  than the `undefined` `Node.value` reports for those types.
  *
  *  The mirror of `addJsoncArrayElement`, and the same reason for existing: the
  *  whole-array write that would otherwise do this deletes every comment in the
@@ -738,7 +760,7 @@ export function removeJsoncArrayElements(
   const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
   const array = arrayNodeAt(debommed, path);
   if (array === null) return src;
-  const doomed = (array.children ?? []).filter((child) => matches(child.value));
+  const doomed = (array.children ?? []).filter((child) => matches(elementValue(child)));
   if (doomed.length === 0) return src;
   // One at a time, each against the text the last one produced: `removeMember`
   // computes offsets against the tree it was given, so two sets of edits taken
@@ -747,7 +769,7 @@ export function removeJsoncArrayElements(
   for (let i = 0; i < doomed.length; i++) {
     const current = arrayNodeAt(text, path);
     if (current === null) break;
-    const member = (current.children ?? []).find((child) => matches(child.value));
+    const member = (current.children ?? []).find((child) => matches(elementValue(child)));
     if (member === undefined) break;
     text = applyEdits(text, removeMember(text, current, member));
   }

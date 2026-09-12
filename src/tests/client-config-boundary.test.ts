@@ -49,6 +49,16 @@ interface Rule {
   /** File -> why it is allowed to match. A reason is required, so an entry
    *  cannot be added without saying what it is. */
   allowed: Record<string, string>;
+  /** Path PATTERNS allowed to match, for a family of files whose membership
+   *  grows by design -- `src/target-*.ts`, one module per client row.
+   *
+   *  Naming those file by file made a landing target edit this table for a
+   *  path its own row legitimately spells, which is a hunk the handoff to
+   *  those packages does not mention and would not survive review as
+   *  "expected". Each pattern carries a reason like a file does, and the scan
+   *  below asserts at least one file matches it -- so a pattern that stopped
+   *  matching anything cannot sit here reading as a live exemption. */
+  allowedPaths?: { pattern: RegExp; why: string }[];
   /** Scan `src/tests` too. Default false: these are source-shape rules, and a
    *  fixture quoting a forbidden shape is not an offender. */
   includeTests?: boolean;
@@ -125,14 +135,17 @@ const RULES: Rule[] = [
       "src/jsonc.ts": "editJsoncEntry/removeJsoncEntry take one as a parameter",
       "src/install-target-model.ts": "declares ResolvedPath.containerPath",
       "src/install-targets.ts": "resolves it per client; the six inline rows and claudeCodeContainerPaths",
-      "src/target-cline.ts": "its own row's path",
-      "src/target-continue.ts": "its own row's path",
-      "src/target-zed.ts": "its own row's path",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
       "src/install-cmd.ts": NOT_YET_MIGRATED,
       "src/try-cmd.ts": NOT_YET_MIGRATED,
     },
+    allowedPaths: [
+      {
+        pattern: /^src\/target-[^/]+\.ts$/,
+        why: "a row spells its OWN container path -- which is what `what` above means by 'and the target rows'",
+      },
+    ],
     positive: ["const p = resolved.containerPath;", "containerPath: ['mcpServers']"],
     negative: ["const containerPaths2 = 1;", "// containerPath in prose"],
   },
@@ -152,9 +165,13 @@ const RULES: Rule[] = [
     pattern: /clientId\s*===\s*["']|as\s+InstallClientId\b/,
     allowed: {
       "src/install-cmd.ts":
-        "two Claude Code branches remain -- the project-scope approval clause and the settings patch -- " +
-        "plus the target lookup by id; the permissions one moves to hooks.permissionsPatch with the consumer",
-      "src/import-cmd.ts": "one cast on the probe's own id, which comes from the table it just read",
+        "THREE Claude Code branches remain, each on a line this reason names so it can be deleted with the " +
+        'branch: install\'s settings patch (the `opts.clientId === "claude-code"` guarding ' +
+        "prepareClaudeCodeSettingsPatch), the project-scope approval clause in the Done block, and " +
+        "uninstall's settings patch. All three move to hooks.permissionsPatch with the consumer migration",
+      "src/import-cmd.ts":
+        'one `target.clientId === "vscode"` branch, the input-variable expansion that ' +
+        "hooks.importVariables is declared to replace -- it goes when import reads the hook instead",
     },
     positive: ['if (t.clientId === "vscode") {', "const c = x as InstallClientId;"],
     negative: ["if (t.clientId === id) {", "resolveClientArg('install', arg)"],
@@ -244,6 +261,9 @@ describe("the client-config boundary", () => {
       for (const [file, why] of Object.entries(rule.allowed)) {
         expect(why.length, `${rule.what}: ${file} has no reason`).toBeGreaterThan(10);
       }
+      for (const { pattern, why } of rule.allowedPaths ?? []) {
+        expect(why.length, `${rule.what}: ${pattern.source} has no reason`).toBeGreaterThan(10);
+      }
     }
   });
 
@@ -253,6 +273,9 @@ describe("the client-config boundary", () => {
       const silent: string[] = [];
       const every = new RegExp(rule.pattern.source, "g");
       const matched = new Set<string>();
+      /** Which path patterns actually covered a matching file, so a pattern
+       *  that has stopped matching is reported like a silent file entry. */
+      const coveredByPath = new Set<string>();
       for (const file of sourceFiles({ includeTests: rule.includeTests })) {
         const code = codeOf(file.text);
         every.lastIndex = 0;
@@ -260,6 +283,11 @@ describe("the client-config boundary", () => {
         if (hits.length === 0) continue;
         matched.add(file.path);
         if (rule.allowed[file.path] !== undefined) continue;
+        const byPath = (rule.allowedPaths ?? []).find((a) => a.pattern.test(file.path));
+        if (byPath !== undefined) {
+          coveredByPath.add(byPath.pattern.source);
+          continue;
+        }
         for (const hit of hits) {
           const line = code.slice(0, hit.index ?? 0).split("\n").length;
           offenders.push(`${file.path}:${line}  ${(file.text.split("\n")[line - 1] ?? "").trim().slice(0, 110)}`);
@@ -271,6 +299,11 @@ describe("the client-config boundary", () => {
       // this repo keeps hitting.
       for (const file of Object.keys(rule.allowed)) {
         if (!matched.has(file)) silent.push(file);
+      }
+      // A path pattern covering nothing is the same stale exemption as a file
+      // entry covering nothing, and is reported the same way.
+      for (const { pattern } of rule.allowedPaths ?? []) {
+        if (!coveredByPath.has(pattern.source)) silent.push(`${pattern.source} (pattern)`);
       }
       expect(
         offenders,

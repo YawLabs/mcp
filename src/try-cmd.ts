@@ -74,6 +74,7 @@ import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
 import { clientUnavailableMessage, describeUnreadableConfig, mergeClientConfig } from "./install-cmd.js";
 import {
   buildLaunchEntry,
+  type ClientEnvValues,
   CURRENT_OS,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -737,6 +738,15 @@ async function autoDetectClient(opts: {
   os: InstallOS;
   cwd: string;
   claudeConfigDir: string | undefined;
+  /** Every client env var, as `readClientEnv` reported it -- threaded for the
+   *  same reason `claudeConfigDir` is, and it was the one consumer that
+   *  missed it. `try` RESOLVES its write through `clientEnv` (see
+   *  resolveInstallPath below), so probing without it split the two: with
+   *  $XDG_CONFIG_HOME set and only Zed configured, the probe looked at
+   *  `~/.config/zed/settings.json`, found nothing, and fell through to
+   *  claude-code -- while a write to the Zed slot would have gone to the
+   *  redirected file the user actually has. */
+  clientEnv?: ClientEnvValues;
   appData?: string;
 }): Promise<{ clientId: InstallClientId; scope: InstallScope | null }> {
   const probes = await probeClientsAsync({
@@ -744,6 +754,7 @@ async function autoDetectClient(opts: {
     os: opts.os,
     cwd: opts.cwd,
     claudeConfigDir: opts.claudeConfigDir,
+    clientEnv: opts.clientEnv,
     appData: opts.appData,
   });
   // First: any client whose config file already exists AND whose contents
@@ -835,7 +846,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   }
 
   // Step 2: pick a client (explicit > auto-detect).
-  const detected = opts.clientId ? null : await autoDetectClient({ home, os, cwd, claudeConfigDir, appData });
+  const detected = opts.clientId
+    ? null
+    : await autoDetectClient({ home, os, cwd, claudeConfigDir, clientEnv, appData });
   const clientId = opts.clientId ?? (detected as { clientId: InstallClientId }).clientId;
 
   // Step 3: resolve the config file path (user scope; project scope
