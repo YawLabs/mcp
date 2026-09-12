@@ -2,7 +2,53 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
-## Unreleased -- adding a server no longer means restarting your client, an authenticated remote server can actually authenticate, and the two doors that blew a context budget are shut
+## Unreleased -- `install --force` stops keeping the env it promised to overwrite, editing a client config stops rewriting the entry next to ours, and three install surfaces stop stating things that are not so
+
+An audit of the install surface. Nothing here changes how yaw-mcp brokers servers at runtime; all of it is `yaw-mcp install` and the commands that share its config-writing code. The `--force` block is first, deliberately: it is the one change that makes an existing script do something different, and the difference is a credential that used to survive and no longer does.
+
+**Changed -- `install --force` drops the old entry's `env`; `--repair` is the flag that keeps it**
+
+`--force` was documented as "Overwrite whatever is there" and never did. install carried the existing `mcp` entry's `env` into the new one on every path, so `--force` and `--repair` wrote byte-identical entries, and a user running `--force` to purge a wrong `YAW_MCP_VAULT_PASSPHRASE` got the same passphrase back.
+
+`--force` is now a true overwrite. The entry it writes carries none of the old entry's `env`, and install names the keys it is dropping -- keys only, never values:
+
+```
+Dropping existing env on the mcp entry (--force): OAM_BIN, YAW_MCP_VAULT_PASSPHRASE. (--repair would keep them; --force does not.)
+```
+
+`Would drop ...` under `--dry-run`. The collision diff printed alongside it names every key that goes, including a non-string value that `--repair` would not have kept either.
+
+`--repair` keeps the string values exactly as before, and so does a TTY prompt answered `[o]verwrite`, which now names the keys it keeps: `[o]verwrite (keeping env: OAM_BIN, YAW_MCP_VAULT_PASSPHRASE), [s]kip, or [a]bort?`. The off-TTY refusal names the same keys next to `--repair` and says `--force` drops the env.
+
+**This changes what an existing script does, with nothing of yours having moved.** A script that relied on `--force` preserving `OAM_BIN` or `YAW_MCP_VAULT_PASSPHRASE` now loses them; switch it to `--repair`, which writes what `--force` used to write. There is no flag or environment variable that restores the old `--force`, and this release does not add one: the two behaviours are exactly what `--repair` and `--force` now mean, and one of the pair had to become the overwrite the name promises. `--repair` is the way back, named in the refusal, in the prompt and in `install --help`. And `--force --repair` together, accepted until now as two flags that agreed, exits **2**: they disagree about `env`, and honouring either one would silently discard the other.
+
+**Fixed -- editing a client config no longer rewrites the entry next to ours**
+
+`install`, `uninstall`, `try` and its cleanup, `import` and `set` all write back into a config you may have formatted and commented by hand. They used to go through jsonc-parser's `modify` with formatting on, which starts an insert or a removal at the end of the *previous* member and re-formats that range. So installing into a 4-space or tab-indented `mcp.json` re-rendered the server before ours in a 2-space step and moved its trailing `// comment` onto our entry, and uninstalling deleted a comment trailing the entry before ours.
+
+Each edit is now a splice the helpers compute themselves. An insert adds our lines below the last entry, after its comment, plus the one separator comma JSON needs straight after that entry's value. A removal takes our lines and, only when ours was last, the comma before them. New text copies the file's indent step, line endings (a CRLF file stays CRLF) and trailing-comma habit. A container whose `}` sits on its last entry's line gets our entry compact on that line, and an empty `{}` in a multi-line file is opened onto lines of its own. Install followed by uninstall now restores the file byte for byte for the common shapes: 4-space, tab, CRLF, trailing-comma and nested local-scope configs.
+
+Three differences remain, all of them the same before this change and after: a one-line `permissions.allow` array inside a multi-line `permissions` object is expanded when the pattern is added; an `"mcpServers": {}` we filled comes back opened onto two lines; and a leading BOM is dropped on a real edit.
+
+**Fixed -- `install --all` over a drifted entry, off a TTY, stops swallowing the diff that tells you what to do**
+
+Off a TTY, `yaw-mcp install --all` over a client whose `mcp` entry had drifted from what install writes swallowed that client's refusal whole -- the diff showing what differs included -- because it recognised the refusal by matching its own prose on stderr. Each refusing client now prints its own file and diff under its own header, and the one shared hint after the run leads with `--all --repair`, then `--force`, `--skip` and `--dry-run`; it used to leave `--repair` out and say "1 client already have". Both write flags now say in that hint what they do to `env`, so the consolidated copy-paste cannot be the one that strips a vault passphrase out of every client at once.
+
+**The exit code changes.** A run in which every client that did not succeed was refused this way now exits **2** -- the code `install <client>` already returns for the same refusal -- where it used to exit 1. A run in which any client failed outright, a malformed config say, still exits 1. A script that tests for `1` specifically after `install --all` will now see `2` on a refusal-only run. And `install --all --dry-run` now closes on `Dry run: N/N clients would be installed; nothing written.` instead of claiming the clients were installed successfully.
+
+**Fixed -- `install --list` stops claiming servers a list does not have, and keeps its `~` under a forward-slash home**
+
+`install --list` printed `other-entries` for every client config that existed, including the empty `{"mcpServers": {}}` that `uninstall` leaves behind, while its help defined the status as "the file exists with other servers in it". The status now comes from the one server list the row reads -- `mcpServers`, VS Code's `servers`, or Claude Code local scope's `projects[<dir>].mcpServers` -- and a list that is absent or empty prints the new `no-entries`. The scoping matters for Claude Code, whose user and local rows read the same `.claude.json`: a user-level server no longer makes the local row claim it, and the help legend now says the status is about the row's list, not about the file. `doctor --json` gains the count behind it, as an additive `containerEntries` field on each `clients[]` entry.
+
+The PATH column lost its `~` on Windows whenever `USERPROFILE` was spelled with forward slashes, as a Git Bash or CI shell may export it. `os.homedir()` returns that spelling verbatim, every config path is rebuilt with backslashes, and the shortening was a raw prefix compare. It now goes through one helper that resolves both sides and folds case on Windows and macOS. It still refuses a sibling directory that merely shares the prefix (`C:\Users\jeff-old` under a home of `C:\Users\jeff`). A source-shape test fails on a new raw `startsWith(home)` comparison anywhere in `src`, including one wrapped in `resolve()` or split across lines by the formatter.
+
+**Fixed -- Claude Desktop on Linux reads as "not supported yet", not as an app that does not exist**
+
+Anthropic ships Claude Desktop for Linux as a beta, and documents `claude_desktop_config.json` for macOS and Windows only. yaw-mcp read the second fact as the first: `install claude-desktop` on Linux answered that Anthropic ships the app on macOS and Windows only, `doctor` and `install --list` called the client unavailable, and `--all` left it out without a word -- telling people running that beta that the app they had open did not exist.
+
+The refusal stays, because no official source names the Linux path and a guessed one writes a file nothing reads. What changes is that yaw-mcp now says why, once. The reason lives on the install target (`notConfigurableOn`), and every surface reads that one string: `install`, `uninstall`, `import` and `try` each refuse with the reason plus a remedy in their own verb's terms, `install --list` shows `not supported yet`, `--all` names the client on a skip line instead of dropping it silently, and `doctor` carries the sentence in a new additive `unavailableReason` field. `import` also stops offering `--os`, a flag it does not have.
+
+## 1.0.0 -- adding a server no longer means restarting your client, an authenticated remote server can actually authenticate, and the two doors that blew a context budget are shut
 
 The largest release this project has had, by a wide margin -- 60 commits against a previous high of 28 -- and the first to merge three lines of work that had been running in parallel: a remote server that can finally authenticate, a session that re-reads its own configuration while it runs, and a shell surface wide enough to import, inspect and call servers without an MCP client in the loop. Behind them sits a ship-readiness audit that drove the real CLI against throwaway homes and came back with a ship-blocker and thirty-one smaller things. One command is removed outright, and that block is first, deliberately; a second breaking change, to the shape of `exec`'s output, is described further down. Where two of the branches produced a fix for the same thing, there is one implementation here, not two; the reconciliation is described at the end.
 
