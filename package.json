@@ -2,7 +2,7 @@
   "name": "@yawlabs/mcp",
   "version": "1.0.0",
   "mcpName": "io.github.YawLabs/mcp",
-  "description": "One install, every MCP server, managed from yaw.sh/mcp. Runs locally: no account, no sign-in.",
+  "description": "MCP gateway and orchestrator: one local install fronts every MCP server for Claude Code, Cursor, and VS Code, loading tools on demand.",
   "license": "SEE LICENSE IN LICENSE.md",
   "author": "Yaw Labs <support@yaw.sh> (https://yaw.sh/mcp)",
   "type": "module",
@@ -52,9 +52,22 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "orchestrator",
     "mcp-server",
+    "mcp-gateway",
+    "mcp-proxy",
+    "mcp-broker",
+    "mcp-manager",
+    "orchestrator",
+    "cli",
     "ai",
+    "claude-code",
+    "claude-desktop",
+    "cursor",
+    "vscode",
+    "windsurf",
+    "gemini-cli",
+    "secrets-vault",
+    "lazy-loading",
     "yaw",
     "yaw-mcp",
     "yawlabs"
@@ -66,5 +79,5 @@
   "bugs": {
     "url": "https://github.com/YawLabs/mcp/issues"
   },
-  "homepage": "https://yaw.sh/mcp"
+  "homepage": "https://yaw.sh/mcp/"
 }
