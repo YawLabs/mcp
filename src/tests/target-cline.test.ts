@@ -66,6 +66,7 @@ import {
   effectiveConfigFormat,
   importViewOf,
   normalizeEntry,
+  readClientConfigFile,
   reloadDoneClause,
   selectSites,
   terminateWithNewline,
@@ -435,17 +436,22 @@ describe("each site's own bytes", () => {
     // on its first activation in an editor, so this is the commonest input.
     expect(BOOTSTRAP.endsWith("\n")).toBe(false);
     const base = machine("linux");
-    installAcross(base);
-    const shared = detectedSites(base)[0].resolved.absolute;
+    const shared = sitesOf(base)[0].resolved.absolute;
+    mkdirSync(dirname(shared), { recursive: true });
     writeFileSync(shared, BOOTSTRAP, "utf8");
-    installAcross(base);
+
+    expect(installAcross(base).map((o) => o.action)).toEqual(["wrote"]);
     expect(readFileSync(shared, "utf8")).toBe(FRESH_POSIX);
   });
 
-  it("keeps a CRLF file on CRLF", () => {
-    const crlf = SIBLINGS.split("\n").join(`${CR}\n`);
-    // The fixture is LF on disk (`.gitattributes` normalises every committed
-    // file), so the CRLF input is built here and checked before it is used.
+  it("keeps a CRLF file on CRLF, final line ending included", () => {
+    // The fixture is LF on disk -- `.gitattributes` sets `* text=auto eol=lf`,
+    // so a committed CRLF file would be normalised and would be lying about
+    // its own bytes -- and the CRLF input is therefore built here, from a code
+    // point, and checked before it is used. It ends WITH a CRLF, so the one
+    // trailing newline the writer guarantees is already there and the whole
+    // output can be asserted rather than all-but-the-last-byte.
+    const crlf = `${SIBLINGS.split("\n").join(`${CR}\n`)}${CR}\n`;
     expect(crlf.includes(`${CR}\n`)).toBe(true);
     expect(/[^\r]\n/.test(crlf)).toBe(false);
 
@@ -453,7 +459,8 @@ describe("each site's own bytes", () => {
     const file = editorRan(base, "Code", crlf);
     installAcross(base);
     const after = readFileSync(file, "utf8");
-    expect(/[^\r]\n/.test(after.slice(0, after.length - 1))).toBe(false);
+    expect(/[^\r]\n/.test(after), "a bare LF got into a CRLF file").toBe(false);
+    expect(after.split(`${CR}\n`).length).toBeGreaterThan(crlf.split(`${CR}\n`).length);
     expect(JSON.parse(after).mcpServers.mcp.command).toBe("cmd");
   });
 
@@ -835,27 +842,24 @@ describe("--list and doctor report one row per site", () => {
     expect(detectedSites(base).map((s) => statusOf(viewOf(s)))).toEqual(["installed", "installed", "installed"]);
   });
 
-  it("reports a legacy key and an unreadable path distinctly", () => {
+  it("reports a legacy key and an unreadable path distinctly", async () => {
     const base = machine("linux");
     const shared = sitesOf(base)[0].resolved.absolute;
     mkdirSync(dirname(shared), { recursive: true });
     writeFileSync(shared, LEGACY_KEY, "utf8");
     expect(statusOf(viewOf(sitesOf(base)[0]))).toBe("legacy: yaw-mcp");
 
-    // A DIRECTORY where the file should be: the read fails with a code rather
-    // than a syntax complaint, so the user is not sent to fix JSON that is not
-    // there.
+    // A DIRECTORY where the file should be. Through the core's own IO, so the
+    // errno is carried rather than turned into a syntax complaint: a user with
+    // a directory (or an AV scanner holding the handle) must not be sent to go
+    // and fix JSON that is not there.
     const dirBase = machine("linux");
-    mkdirSync(sitesOf(dirBase)[0].resolved.absolute, { recursive: true });
     const site = sitesOf(dirBase)[0];
-    let read: string;
-    try {
-      readFileSync(site.resolved.absolute, "utf8");
-      read = "readable";
-    } catch (err) {
-      read = (err as { code?: string }).code ?? "?";
-    }
-    expect(read === "EISDIR" || read === "EACCES" || read === "EPERM").toBe(true);
+    mkdirSync(site.resolved.absolute, { recursive: true });
+    const view = await readClientConfigFile(site, { transform: row.entry });
+    expect(view.read.kind).toBe("unreadable");
+    expect(statusOf(view).startsWith("unreadable: ")).toBe(true);
+    expect(statusOf(view)).not.toBe("unreadable: ?");
   });
 });
 
@@ -911,9 +915,12 @@ describe("the cline row as data", () => {
     expect(notes).toContain(`<editor>/User/globalStorage/${STORAGE}/settings/`);
     expect(notes).toContain("strict JSON: no comments, no trailing commas");
     expect(notes).toContain("without a restart");
-    // It does not claim a rollout share, and it does not claim a click path --
-    // there is no "Cline: Open MCP Settings" command in either manifest.
-    expect(notes).not.toContain("%");
+    // And it does NOT send the user to a command that does not exist. Neither
+    // manifest contributes one for the settings file: both 4.1.17 (main) and
+    // 4.0.12 (legacy-extension) contribute exactly `cline.mcpButtonClicked`
+    // ("MCP Servers", no category) and a dev-mode OAuth command, so a
+    // "Cline: Open MCP Settings" instruction would be false.
+    expect(notes).not.toContain("Open MCP Settings");
     expect(notes).not.toContain("command palette");
   });
 
