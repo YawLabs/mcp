@@ -19,7 +19,7 @@ import {
   terminateWithNewline,
 } from "../client-config.js";
 import { buildFreshConfig, JSON_ADAPTER, JSONC_ADAPTER, UTF8_BOM } from "../client-config-json.js";
-import { deepEqualJson, mergeClientConfig, readEntryAt } from "../install-cmd.js";
+import { deepEqualJson } from "../install-cmd.js";
 // findBlockedContainerSegment lives in install-targets.ts, which is where
 // doctor reads it from too; install-cmd.ts only imports it.
 import { findBlockedContainerSegment } from "../install-targets.js";
@@ -172,15 +172,17 @@ describe("a JSONC file keeps every neighbouring byte", () => {
     expect(install(null)).toBe(FRESH);
   });
 
-  it("renders that fresh document the same way install-cmd's merge does", () => {
-    // Two spellings of one rule: the adapter's own nesting and the
-    // mergeClientConfig the missing-file path uses today. Pinned against each
-    // other so the pair cannot drift while the consumer still has its copy.
-    expect(buildFreshConfig(["mcpServers"], "mcp", ENTRY)).toEqual(mergeClientConfig({}, ["mcpServers"], ENTRY));
-    expect(buildFreshConfig(["projects", "C:/r", "mcpServers"], "mcp", ENTRY)).toEqual(
-      mergeClientConfig({}, ["projects", "C:/r", "mcpServers"], ENTRY),
-    );
-    expect(`${JSON.stringify(mergeClientConfig({}, ["mcpServers"], ENTRY), null, 2)}\n`).toBe(FRESH);
+  it("nests a fresh document exactly as the merge it replaced did", () => {
+    // These two objects, and the FRESH bytes above, are what
+    // `mergeClientConfig({}, containerPath, entry)` produced in install-cmd.ts
+    // before every consumer moved onto this adapter. That function is gone, so
+    // the pin is the SHAPE itself rather than a comparison against a second
+    // implementation of it -- having two was the thing being fixed.
+    expect(buildFreshConfig(["mcpServers"], "mcp", ENTRY)).toEqual({ mcpServers: { mcp: ENTRY } });
+    expect(buildFreshConfig(["projects", "C:/r", "mcpServers"], "mcp", ENTRY)).toEqual({
+      projects: { "C:/r": { mcpServers: { mcp: ENTRY } } },
+    });
+    expect(`${JSON.stringify(buildFreshConfig(["mcpServers"], "mcp", ENTRY), null, 2)}\n`).toBe(FRESH);
   });
 });
 
@@ -459,11 +461,15 @@ describe("reading the entry map", () => {
     expect(view.otherServerKeys()).toEqual(["fs"]);
   });
 
-  it("carries env exactly as install-cmd's readEntryAt filters it", () => {
-    const parsed = JSON.parse(RAW) as Record<string, unknown>;
+  it("carries env the way the entry accessor it replaced filtered it", () => {
+    // `readEntryAt` in install-cmd.ts filtered an entry's env to its STRING
+    // values, PER KEY, and reported undefined when nothing was left. Those are
+    // the two answers it gave for this fixture -- "mcp" carries a string A
+    // beside a numeric key, "fs" carries no env at all. It is gone, so the
+    // values are pinned here rather than against a second copy of the rule.
     const view = classifyClientConfig(RAW, FLAT);
-    expect(view.carryableEnv()).toEqual(readEntryAt(parsed, ["mcpServers"], "mcp")?.env);
-    expect(view.carryableEnv("fs")).toEqual(readEntryAt(parsed, ["mcpServers"], "fs")?.env);
+    expect(view.carryableEnv()).toEqual({ A: "1" });
+    expect(view.carryableEnv("fs")).toBeUndefined();
   });
 
   it("migrates a legacy entry in one pass", () => {

@@ -73,8 +73,10 @@ import {
   composeEntry,
   containerKeysAt,
   describeValueShape,
+  type EntryTransform,
   readClientConfigFile,
   reloadDoneClause,
+  selectSites,
   siteAt,
   terminateWithNewline,
 } from "./client-config.js";
@@ -306,22 +308,11 @@ export async function summarizeBundles(opts: { home?: string; cwd?: string }): P
   return { state, count, path: loaded.path ?? localBundlesPath(userConfigDir(home)), warnings: loaded.warnings };
 }
 
-/** Entry keys in the container this install writes into that are somebody
- *  else's server: everything except our own entry and the pre-rename keys for
- *  it (both are the BROKER, not an upstream). Non-object values are skipped --
- *  a key holding a string or null is not a server any client can launch, and
- *  counting it inflates the number the user is asked to trust.
- *
- *  Returns the NAMES, not just a count: install prints only `.length` (the
- *  dry-run preview is asserted not to echo a sibling's name), while a later
- *  import prompt needs the names themselves. Exported for tests. */
-export function directClientEntries(container: unknown): string[] {
-  if (typeof container !== "object" || container === null || Array.isArray(container)) return [];
-  const skip = new Set<string>([ENTRY_NAME, ...LEGACY_ENTRY_NAMES]);
-  return Object.entries(container as Record<string, unknown>)
-    .filter(([k, v]) => !skip.has(k) && typeof v === "object" && v !== null && !Array.isArray(v))
-    .map(([k]) => k);
-}
+// `directClientEntries` used to live here: "every key in this container that
+// is somebody else's server", skipping our own entry and the pre-rename
+// spellings of it, non-object values included. It is `view.otherServerKeys()`
+// now -- the same rule, answered by the core off the site's own adapter, with
+// one reader of the legacy-name list instead of two.
 
 /** Where the counted entries live. The file alone under-describes claude-code
  *  LOCAL scope, whose container is projects[<dir>].mcpServers inside a
@@ -824,7 +815,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // order, indentation and the neighbouring entries all survive -- and now
   // the result is VERIFIED before install has anything to persist.
   const containerPath = resolved.containerPath;
-  const site = plan.sites[0];
+  // The sites this machine actually has: every unconditional one, plus each
+  // conditional one whose editor-storage directory exists. Every row but Cline
+  // declares exactly one, so `extraSites` is empty for all of them and nothing
+  // downstream of it runs.
+  //
+  // `sites[0]` stays THE site: the file every message names, the one the
+  // collision ladder and the drift diff are about, and the one a fresh install
+  // creates. The extras are COPIES of the same entry -- see applyToExtraSites.
+  const selectedSites = selectSites(plan.sites);
+  const site = selectedSites[0];
+  const extraSites = selectedSites.slice(1);
   /** `projects[...]` keys that name THIS project with the other drive-letter
    *  case and already carry yaw-mcp wiring. Reported, never written to -- see
    *  claudeCodeContainerPaths for why install adds rather than migrates. */
@@ -1122,7 +1123,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // describeEntryDiff and DRY_RUN_ENV_PLACEHOLDER follow for this same block --
   // because the drop is otherwise visible only as one `env: drops ...` diff
   // line. It names only the keys --repair would have kept: a non-string value
-  // is filtered out by readEntryAt on both paths, so claiming --repair keeps
+  // is filtered out by the core's carryableEnv on both paths, so claiming --repair keeps
   // it would be false (the diff line still names it). The same filter is why
   // the parenthetical speaks of THESE keys rather than of "an entry's env":
   // --repair does not keep a non-string value either. Sorted (the "Kept" line
@@ -1131,8 +1132,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // not "Dropped": the line prints before the write, which can still fail.
   //
   // carriedKeys is shared with the TTY prompt and the off-TTY hint below. Both
-  // name the kept keys rather than saying "its env", for the same readEntryAt
-  // reason, and in the same sorted order.
+  // name the kept keys rather than saying "its env", for the same
+  // string-values-only reason, and in the same sorted order.
   const carriedKeys = carryableEnv ? Object.keys(carryableEnv).sort() : [];
   if (carryableEnv) {
     const keys = carriedKeys.join(", ");
@@ -1164,6 +1165,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     : deepEqualJson(storedEntry, entryToWrite)
       ? "identical"
       : "differs";
+
+  /** May this run replace a DIFFERING yaw-mcp entry? A flag says so outright;
+   *  otherwise it is what the collision ladder below decided for the primary
+   *  site. Read only by `applyToExtraSites`, which must not prompt again per
+   *  editor copy but must not clobber one silently either. */
+  let overwriteAuthorised = opts.force === true || opts.repair === true;
 
   if (entryState === "differs") {
     // Computed once and shared by the prompt and the off-TTY refusal: a
@@ -1204,7 +1211,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // diff above was computed WITH the env carried, so it has no `env:` line
       // for the carried keys and nothing here would warn that --force removes
       // them. It names those keys rather than saying --repair keeps "its env":
-      // a non-string value is filtered out by readEntryAt, goes on either flag,
+      // a non-string value is filtered out by the core's carryableEnv, goes on either flag,
       // and is named by the `env: drops ...` line of the diff above. Under
       // --all the same distinction rides the one consolidated hint instead, so
       // it is built here only for the hint this run actually prints.
@@ -1238,6 +1245,10 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       err("Cancelled.");
       return { written: [], wouldWrite: [], messages, exitCode: 130 };
     }
+    // Getting here means the run may replace a differing entry -- a flag, or
+    // an answered prompt. The editor copies follow that one answer rather than
+    // asking again.
+    overwriteAuthorised = true;
     // Conditional tense under --dry-run: the decision above maps dryRun onto
     // "overwrite" so this collision path is exercised, but the run returns
     // before any write. Present tense here told a user scanning the transcript
@@ -1460,6 +1471,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // `clientJson` null, and naming the client file as "would write" there
     // promises an edit the real run does not make.
     const wouldWrite: string[] = clientJson !== null ? [resolved.absolute] : [];
+    // Every editor copy the real run would write, named here for the same
+    // reason: a preview that omits a file the run touches is the one thing
+    // --dry-run must never do. Each copy is READ (so a copy that is already
+    // correct, or that differs without authorisation, is reported as such) and
+    // none is written.
+    wouldWrite.push(
+      ...(await applyToExtraSites({
+        cmd: "install",
+        sites: extraSites,
+        transform: target.entry,
+        entry: entryToWrite,
+        keepLegacy: opts.keepLegacy === true,
+        authorised: overwriteAuthorised,
+        dryRun: true,
+        log,
+        err,
+      })),
+    );
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
@@ -1506,6 +1535,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       log(`Removed the legacy "${legacyEntry}" entry -- it would have run yaw-mcp a second time.`);
     }
   }
+
+  // The editor copies, AFTER the primary write: that write is the product of
+  // the command, so a copy that cannot be written is a warning rather than a
+  // failure. Runs even when the primary needed no write -- an identical shared
+  // file beside a stale editor copy is exactly the state a re-run is for.
+  written.push(
+    ...(await applyToExtraSites({
+      cmd: "install",
+      sites: extraSites,
+      transform: target.entry,
+      entry: entryToWrite,
+      keepLegacy: opts.keepLegacy === true,
+      authorised: overwriteAuthorised,
+      dryRun: false,
+      log,
+      err,
+    })),
+  );
 
   // Claude Code: merge permissions.allow into settings.json so tool
   // calls don't prompt. Best-effort: any failure here is logged but does
@@ -1641,7 +1688,7 @@ function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
  *  which USAGE also calls an overwrite, DROPS that env, and the diff above the
  *  question lists only what changes -- so a kept env would otherwise go
  *  unmentioned and "overwrite" would mean two things. KEYS, not "its env":
- *  readEntryAt filters out a non-string value, so an overwrite of a mixed env
+ *  the core's carryableEnv filters out a non-string value, so an overwrite of a mixed env
  *  does not keep all of it, and the diff line above the question names the
  *  key that goes. */
 async function promptCollision(
@@ -1675,18 +1722,6 @@ async function promptCollision(
   } finally {
     rl.close();
   }
-}
-
-/** Walk `containerPath` to find the existing mcpServers/servers container.
- *  Returns the value at the path, or undefined if any segment is missing
- *  or non-object. Does not mutate. */
-export function readNested(root: Record<string, unknown>, containerPath: string[]): unknown {
-  let cur: unknown = root;
-  for (const key of containerPath) {
-    if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return undefined;
-    cur = (cur as Record<string, unknown>)[key];
-  }
-  return cur;
 }
 
 /**
@@ -1791,90 +1826,146 @@ export function describeEntryDiff(stored: unknown, nextEntry: object): string[] 
   return lines.length > 0 ? lines : ["the entries differ in key order only"];
 }
 
-/** Read the existing launch entry at `containerPath`, or null when the path or
- *  the entry is absent. Walks with readNested, the same walk mergeClientConfig
- *  and the collision check use, so all three agree on where the entry lives. */
-export function readEntryAt(
-  existing: Record<string, unknown>,
-  containerPath: string[],
-  entryName: string = ENTRY_NAME,
-): { command?: string; args?: string[]; env?: Record<string, string> } | null {
-  const node = readNested(existing, containerPath);
-  if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
-  const entry = (node as Record<string, unknown>)[entryName];
-  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
-  // Validate `env` before anyone carries it forward: the user chose
-  // overwrite (or --repair) precisely to replace a broken entry, and a
-  // malformed env (a string -- whose Object.keys are "0","1","2" -- or an
-  // array) would otherwise ride into the fresh entry and get the whole
-  // file rejected by the client. Filter PER KEY, not all-or-nothing: one
-  // hand-added numeric value ("DEBUG": 1) must not silently drop the
-  // valid string keys beside it -- OAM_BIN is the load-bearing example
-  // (losing it moves the sidecars to a different runtime with no
-  // diagnostic, the exact failure the carry-over exists to prevent).
-  const result = { ...entry } as { command?: string; args?: string[]; env?: Record<string, string> };
-  const env = (entry as Record<string, unknown>).env;
-  if (typeof env === "object" && env !== null && !Array.isArray(env)) {
-    const kept = Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === "string")) as Record<
-      string,
-      string
-    >;
-    result.env = Object.keys(kept).length > 0 ? kept : undefined;
-  } else {
-    result.env = undefined;
-  }
-  return result;
-}
+// `readNested`, `readEntryAt`, `mergeClientConfig` and `removeFromClientConfig`
+// used to live here: an object-level walk, an entry accessor over it, and the
+// merge / delete pair that wrote through them. All four are gone. Every read
+// and write of a client config in this file now goes through the client-config
+// core -- `readClientConfigFile` and `classifyClientConfig` for the reads,
+// `applyClientConfigEdits` for the writes -- which asks the site's OWN adapter
+// for the entries at the address it was handed, so the walk no longer has to
+// be written once per syntax and the write is verified before there are bytes
+// to persist. `removeFromClientConfig` went first, and for the sharper reason:
+// its doc comment named two callers it did not have.
+//
+// What replaces each, for anyone following an old reference: readNested and
+// readEntryAt -> `view.entry()` / `view.normalized()` / `view.carryableEnv()`;
+// mergeClientConfig -> an `upsert` edit into an absent file, which the JSON
+// adapter renders with `buildFreshConfig` (pinned byte-for-byte against the
+// shape this function produced, in client-config-json.test.ts).
 
-/** Merge `entry` into the container at `existing[...containerPath][entryName]`,
- *  preserving every sibling at every level of the path. Returns a new object;
- *  does not mutate. For Claude Code local scope, containerPath is
- *  ["projects", <absDir>, "mcpServers"] and this preserves every other
- *  project's settings + every other top-level key in ~/.claude.json.
- *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp entry);
- *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
- *  next to a real yaw-mcp install without colliding. */
-export function mergeClientConfig(
-  existing: Record<string, unknown>,
-  containerPath: string[],
-  entry: Record<string, unknown> | { command: string; args: string[]; env?: Record<string, string> },
-  entryName: string = ENTRY_NAME,
-): Record<string, unknown> {
-  if (containerPath.length === 0) throw new Error("mergeClientConfig: containerPath cannot be empty");
-  // EXACT, never folded through claudeCodeContainerPaths: this clones the
-  // chain it is about to WRITE into, and every caller hands it the canonical
-  // path. Folding here would splice the entry into a drive-case sibling as
-  // well, which is the silent second install that the sibling REPORT exists to
-  // avoid. Registered as such in the source-shape scan in
-  // src/tests/source-hygiene.test.ts.
-  const out: Record<string, unknown> = { ...existing };
-  let parent: Record<string, unknown> = out;
-  for (let i = 0; i < containerPath.length - 1; i++) {
-    const key = containerPath[i];
-    const child = parent[key];
-    const cloned: Record<string, unknown> =
-      typeof child === "object" && child !== null && !Array.isArray(child)
-        ? { ...(child as Record<string, unknown>) }
-        : {};
-    parent[key] = cloned;
-    parent = cloned;
-  }
-  const leafKey = containerPath[containerPath.length - 1];
-  const prev = parent[leafKey];
-  const container: Record<string, unknown> =
-    typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
-  container[entryName] = entry;
-  parent[leafKey] = container;
-  return out;
-}
+/** Apply the edit this run already decided on to a target's EXTRA sites -- the
+ *  per-editor copies a `sites` hook fans one (client, scope) out to.
+ *
+ *  WHY IT EXISTS. Cline keeps one cline_mcp_settings.json per runtime: a
+ *  shared `~/.cline/...` file that the CLI and the extension's newer runtime
+ *  read, and one under each editor's own globalStorage that the extension's
+ *  legacy runtime reads. A shared-file-only install is invisible to a Cline
+ *  window on that older runtime, and the row's `notes` -- which install prints
+ *  verbatim -- says install writes the shared file "and each editor copy it
+ *  finds". This is what makes that sentence true. Measured before it existed:
+ *  `install cline` with a seeded VS Code extension-storage directory wrote the
+ *  shared file only.
+ *
+ *  WHAT IT IS NOT. It does not re-run the collision ladder per file. The user
+ *  answered for this CLIENT once, on the site every message names, and asking
+ *  again per editor copy would be a prompt per window they have ever opened.
+ *  So a copy is written when it has no entry of ours, or when the run is
+ *  AUTHORISED to overwrite a differing one (`--force`, `--repair`, or an
+ *  answered prompt on the primary site). A copy whose entry differs without
+ *  that authorisation is REPORTED and left, which is the same answer the
+ *  primary site gives off a TTY -- never a silent clobber of a launch entry
+ *  somebody edited.
+ *
+ *  Best-effort throughout: the primary write is the product of the command and
+ *  has already landed by the time this runs, so every failure here is a
+ *  warning naming the file, never a non-zero exit. `entry` null is the removal
+ *  (`uninstall`), which takes our entry and any legacy key out of each copy --
+ *  without it an uninstall would leave a live broker wired in every editor
+ *  copy it had written, which is the duplicate-broker state the legacy trim
+ *  exists to prevent. */
+async function applyToExtraSites(args: {
+  cmd: "install" | "uninstall";
+  sites: readonly ConfigSite[];
+  transform: EntryTransform | undefined;
+  /** The entry to upsert, or null to remove ours. */
+  entry: Record<string, unknown> | null;
+  keepLegacy: boolean;
+  authorised: boolean;
+  dryRun: boolean;
+  log: (s: string) => void;
+  err: (s: string) => void;
+}): Promise<string[]> {
+  const { cmd, entry, log, err } = args;
+  const touched: string[] = [];
+  for (const site of args.sites) {
+    const where = site.resolved.absolute;
+    const named = `${where} (${site.label})`;
+    const view = await readClientConfigFile(site, { transform: args.transform });
+    const read = view.read;
+    if (read.kind === "unreadable" || read.kind === "malformed" || read.kind === "unspliceable") {
+      err(`yaw-mcp ${cmd}: warning -- ${named} could not be edited; left unchanged. Edit it by hand.`);
+      continue;
+    }
+    const legacy = view.legacyKey();
+    const trimLegacy = legacy !== null && !args.keepLegacy;
+    const stored = view.normalized();
+    const hasEntry = view.entry() !== undefined;
 
-// `removeFromClientConfig` used to live here: an object-level "delete this
-// entry, preserve every sibling" mirror of mergeClientConfig, documented as the
-// helper behind `try-cleanup` and doctor's trial-GC. It was neither -- both of
-// those peel a trial entry out of the RAW bytes via `removeJsoncEntry`
-// (jsonc.ts), which is the only way to keep the user's comments, so this export
-// had zero callers and zero tests while its doc comment claimed two. Removed
-// rather than left as a second, comment-destroying way to do the same job.
+    if (entry === null) {
+      // Removal. Nothing of ours in this copy is the ordinary case for an
+      // editor the user installed after wiring yaw-mcp, and it is silent: the
+      // primary site's own line already speaks for the run.
+      if (!hasEntry && legacy === null) continue;
+      const edits: ClientConfigEdit[] = [];
+      if (hasEntry) edits.push({ op: "remove", key: ENTRY_NAME });
+      if (legacy !== null) edits.push({ op: "remove", key: legacy });
+      if (args.dryRun) {
+        log(`Would also remove the "${ENTRY_NAME}" entry from ${named}.`);
+        touched.push(where);
+        continue;
+      }
+      try {
+        await atomicWriteFile(where, terminateWithNewline(applyClientConfigEdits(view, edits, site)));
+        log(`Removed the "${ENTRY_NAME}" entry from ${named}.`);
+        touched.push(where);
+      } catch (e) {
+        err(
+          `yaw-mcp ${cmd}: warning -- failed to remove the "${ENTRY_NAME}" entry from ${named} (${(e as Error).message}); left unchanged. Remove it by hand.`,
+        );
+      }
+      continue;
+    }
+
+    if (hasEntry && deepEqualJson(stored, entry) && !trimLegacy) {
+      log(`The "${ENTRY_NAME}" entry in ${named} is already correct.`);
+      continue;
+    }
+    if (hasEntry && !deepEqualJson(stored, entry) && !args.authorised) {
+      err(
+        `yaw-mcp ${cmd}: warning -- ${named} already has a differing "${ENTRY_NAME}" entry; left untouched. ` +
+          "Re-run with --repair to bring every copy up to date, or --force to overwrite them.",
+      );
+      continue;
+    }
+    const edits: ClientConfigEdit[] = [];
+    if (read.kind === "blocked") {
+      if (!read.reparable) {
+        err(
+          `yaw-mcp ${cmd}: warning -- "${read.path.join(".")}" in ${named} is ${read.shape}, not an object; left unchanged. Fix it by hand.`,
+        );
+        continue;
+      }
+      edits.push({ op: "repair", path: read.path });
+    }
+    edits.push({ op: "upsert", key: ENTRY_NAME, entry });
+    if (trimLegacy) edits.push({ op: "remove", key: legacy as string });
+    if (args.dryRun) {
+      log(`Would also write the same entry to ${named}.`);
+      touched.push(where);
+      continue;
+    }
+    try {
+      await atomicWriteFile(where, terminateWithNewline(applyClientConfigEdits(view, edits, site)));
+      log(`Wrote ${named}`);
+      touched.push(where);
+    } catch (e) {
+      err(
+        `yaw-mcp ${cmd}: warning -- failed to write ${named} (${(e as Error).message}); left unchanged. ${args.cmd === "install" ? "That copy of the client will not see yaw-mcp." : "Remove the entry by hand."}`,
+      );
+    }
+  }
+  return touched;
+}
 
 /** True when a value-flag's argument reads as the NEXT flag rather than as the
  *  value. `--token --force` was already refused, but the guard tested only for
@@ -2703,7 +2794,14 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   log(`File:   ${resolved.absolute}`);
 
   const containerPath = resolved.containerPath;
-  const site = plan.sites[0];
+  // Same site selection install makes: `sites[0]` is the file every message
+  // names, and `extraSites` holds each per-editor copy this machine has. Empty
+  // for every row but Cline. An uninstall that cleared only the shared file
+  // would leave a live broker entry in every editor copy install had written
+  // -- the duplicate-broker state the legacy trim exists to prevent.
+  const selectedSites = selectSites(plan.sites);
+  const site = selectedSites[0];
+  const extraSites = selectedSites.slice(1);
   /** Every container carrying wiring for this project -- see RemovalSite. */
   const sites: RemovalSite[] = [];
   // Fingerprinted BEFORE the read and compared again ahead of the write, for
@@ -2832,6 +2930,19 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     for (const line of preview) log(`    ${line}`);
     const wouldWrite: string[] = [];
     if (removals.length > 0) wouldWrite.push(resolved.absolute);
+    wouldWrite.push(
+      ...(await applyToExtraSites({
+        cmd: "uninstall",
+        sites: extraSites,
+        transform: target.entry,
+        entry: null,
+        keepLegacy: opts.keepLegacy === true,
+        authorised: true,
+        dryRun: true,
+        log,
+        err,
+      })),
+    );
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
@@ -2919,6 +3030,23 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       if (trimsLegacy(s)) log(`Removed the legacy "${s.legacyEntry}" entry${where(s)}.`);
     }
   }
+
+  // The editor copies. Outside the `clientJson !== null` block on purpose: the
+  // shared file can hold nothing of ours while a copy still does, and that copy
+  // is precisely what a user running uninstall wants gone.
+  written.push(
+    ...(await applyToExtraSites({
+      cmd: "uninstall",
+      sites: extraSites,
+      transform: target.entry,
+      entry: null,
+      keepLegacy: opts.keepLegacy === true,
+      authorised: true,
+      dryRun: false,
+      log,
+      err,
+    })),
+  );
 
   // Best-effort, exactly like install's patch: the entry is already gone, and a
   // stale allow-pattern costs the user nothing but a dead line in a config.
