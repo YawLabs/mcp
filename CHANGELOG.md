@@ -4,7 +4,7 @@ All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented 
 
 ## Unreleased -- `install --force` stops keeping the env it promised to overwrite, editing a client config stops rewriting the entry next to ours, and three install surfaces stop stating things that are not so
 
-An audit of the install surface. Nothing here changes how yaw-mcp brokers servers at runtime; all of it is `yaw-mcp install` and the commands that share its config-writing code. The `--force` block is first, deliberately: it is the one change that makes an existing script do something different, and the difference is a credential that used to survive and no longer does.
+An audit of the install surface. Nothing here changes how yaw-mcp brokers servers at runtime; all of it is `yaw-mcp install` and the commands that share its config-writing code. The `--force` block is first, deliberately: it is the first of this section's script-visible changes, and the one whose difference is a credential that used to survive and no longer does. It is not the only one -- `install --all` now exits 2 where it exited 1 on a refusal-only run, and `--force --repair` together now exits 2 instead of writing -- and each such change is called out in the block it belongs to.
 
 **Changed -- `install --force` drops the old entry's `env`; `--repair` is the flag that keeps it**
 
@@ -28,7 +28,15 @@ Dropping existing env on the mcp entry (--force): OAM_BIN, YAW_MCP_VAULT_PASSPHR
 
 Each edit is now a splice the helpers compute themselves. An insert adds our lines below the last entry, after its comment, plus the one separator comma JSON needs straight after that entry's value. A removal takes our lines and, only when ours was last, the comma before them. New text copies the file's indent step, line endings (a CRLF file stays CRLF) and trailing-comma habit. A container whose `}` sits on its last entry's line gets our entry compact on that line, and an empty `{}` in a multi-line file is opened onto lines of its own. Install followed by uninstall now restores the file byte for byte for the common shapes: 4-space, tab, CRLF, trailing-comma and nested local-scope configs.
 
-Three differences remain, all of them the same before this change and after: a one-line `permissions.allow` array inside a multi-line `permissions` object is expanded when the pattern is added; an `"mcpServers": {}` we filled comes back opened onto two lines; and a leading BOM is dropped on a real edit.
+Five differences remain, all of them the same before this change and after:
+
+- A one-line `permissions.allow` array inside a multi-line `permissions` object is expanded when the pattern is added.
+- A comment sitting *inside* that `allow` array is dropped when `mcp__mcp__*` is added or removed. The permissions patch is the one edit here that replaces a whole array value rather than splicing within it, so the comment-preserving helpers keep only what lies outside the array -- a comment between the `permissions` keys survives, one between two entries of `allow` does not.
+- An `"mcpServers": {}` we filled comes back opened onto two lines.
+- A leading BOM is dropped on a real edit.
+- A file that does not end in a newline gains one, so install followed by uninstall is not byte-exact for a config that ended without it. That is deliberate -- POSIX tools and diffs both want the terminator, and install is rewriting the file anyway -- and it is why the byte-for-byte claim above is about the common shapes rather than every file.
+
+None of the five fire on a no-op: an entry that already matches what install writes is not rewritten at all, and the file keeps both its bytes and its mtime.
 
 **Fixed -- `install --all` over a drifted entry, off a TTY, stops swallowing the diff that tells you what to do**
 
@@ -40,7 +48,7 @@ Off a TTY, `yaw-mcp install --all` over a client whose `mcp` entry had drifted f
 
 `install --list` printed `other-entries` for every client config that existed, including the empty `{"mcpServers": {}}` that `uninstall` leaves behind, while its help defined the status as "the file exists with other servers in it". The status now comes from the one server list the row reads -- `mcpServers`, VS Code's `servers`, or Claude Code local scope's `projects[<dir>].mcpServers` -- and a list that is absent or empty prints the new `no-entries`. The scoping matters for Claude Code, whose user and local rows read the same `.claude.json`: a user-level server no longer makes the local row claim it, and the help legend now says the status is about the row's list, not about the file. `doctor --json` gains the count behind it, as an additive `containerEntries` field on each `clients[]` entry.
 
-The PATH column lost its `~` on Windows whenever `USERPROFILE` was spelled with forward slashes, as a Git Bash or CI shell may export it. `os.homedir()` returns that spelling verbatim, every config path is rebuilt with backslashes, and the shortening was a raw prefix compare. It now goes through one helper that resolves both sides and folds case on Windows and macOS. It still refuses a sibling directory that merely shares the prefix (`C:\Users\jeff-old` under a home of `C:\Users\jeff`). A source-shape test fails on a new raw `startsWith(home)` comparison anywhere in `src`, including one wrapped in `resolve()` or split across lines by the formatter.
+The PATH column lost its `~` on Windows whenever `USERPROFILE` was spelled with forward slashes, as a Git Bash or CI shell may export it. `os.homedir()` returns that spelling verbatim, every config path is rebuilt with backslashes, and the shortening was a raw prefix compare. It now goes through one helper that resolves both sides and folds case on Windows and macOS. It still refuses a sibling directory that merely shares the prefix (`C:\Users\jeff-old` under a home of `C:\Users\jeff`). A source-shape test fails on a new raw `startsWith(home)` comparison in the top-level `src/*.ts` sources, including one wrapped in `resolve()` or split across lines by the formatter.
 
 **Fixed -- Claude Desktop on Linux reads as "not supported yet", not as an app that does not exist**
 
