@@ -84,7 +84,6 @@ const RULES: Rule[] = [
       "src/install-targets.ts":
         "declares findBlockedContainerSegment and findLegacyEntry, which doctor and install both ask",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/import-cmd.ts": NOT_YET_MIGRATED,
       "src/install-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: [
@@ -108,7 +107,10 @@ const RULES: Rule[] = [
       "src/local-bundles.ts": "bundles.json",
       "src/local-set-cmd.ts": "bundles.json, edited through editJsoncPath by design",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/import-cmd.ts": NOT_YET_MIGRATED,
+      "src/import-cmd.ts":
+        "ONE parse, in readVsCodeInputs, for VS Code's document-level `inputs` ARRAY -- variable " +
+        "declarations, not a server container, and the core models entry maps. The vscode row declares " +
+        'hooks.importVariables "vscode-inputs" for the handler that will own it; this line goes with that',
     },
     positive: ["const v = parseJsonc(raw);", "editJsoncPath(src, ['servers', 3], v)"],
     negative: ["/* parseJsonc( */", "const parseJsoncish = 1;"],
@@ -120,7 +122,6 @@ const RULES: Rule[] = [
       "src/client-config.ts": "findLegacyKey and the view's default key -- the core's own answer",
       "src/install-targets.ts": "findLegacyEntry's body, over an object rather than a key list",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/import-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["if (ENTRY_NAME in container) {", "const e = c[ENTRY_NAME];", "LEGACY_ENTRY_NAMES.some((n) => n === k)"],
     negative: ["const ENTRY_NAMES = 1;", "view.entry()", "LEGACY_ENTRY_NAMES.join(', ')"],
@@ -135,7 +136,10 @@ const RULES: Rule[] = [
       "src/install-target-model.ts": "declares ResolvedPath.containerPath",
       "src/install-targets.ts": "resolves it per client; the six inline rows and claudeCodeContainerPaths",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/import-cmd.ts": NOT_YET_MIGRATED,
+      "src/import-cmd.ts":
+        'the SITE\'s own container path, read off the resolver -- named in the "nothing to import" line, ' +
+        "compared when de-duplicating the searched scopes, and carried into `siteAt` as the address the " +
+        "removal goes to. Not a walk: every read and write goes through the core",
       "src/install-cmd.ts": NOT_YET_MIGRATED,
       "src/try-cmd.ts":
         "a TRIAL MARKER records the container path it wrote at, on disk, in a versioned schema -- so try " +
@@ -213,7 +217,6 @@ const RULES: Rule[] = [
     pattern: /(?:readFile|readFileSync|existsSync)\(\s*(?:[\w.]*resolved\.absolute|[\w.]*clientPath|read\.path)/,
     allowed: {
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/import-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["await readFile(resolved.absolute, 'utf8')", "existsSync(site.resolved.absolute)"],
     negative: ["await readFile(path, 'utf8')", "atomicWriteFile(resolved.absolute, next)"],

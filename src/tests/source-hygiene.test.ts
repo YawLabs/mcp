@@ -377,19 +377,17 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       why: "that probe's own loop over the helper's paths; the index is what names entryProjectKey",
     },
   ],
+  // import reads and writes through the client-config core now, so the two
+  // per-variant WALKS are gone. `driveCaseVariants` is this file's one call of
+  // the fold helper, over `containerKeysAt` rather than a parsed root, and
+  // readContainer's own fold consumes it through `classifyClientConfig`.
   "src/import-cmd.ts": [
     { shape: "CALL readContainer(ref: ContainerRef)", why: "declaration of the other-scope container read" },
     { shape: "CALL readContainer(searched[i])", why: "the is-yaw-mcp-wired-in search; folds inside readContainer" },
     {
-      shape: "LOOP for (const variantPath of claudeCodeContainerPaths(parsed, ref.containerPath))",
-      why: "readContainer: every variant is checked for a yaw-mcp entry",
-    },
-    {
-      shape: "LOOP for (const variantPath of claudeCodeContainerPaths(parsed, resolved.containerPath))",
+      shape: "LOOP for (const variantPath of driveCaseVariants(targetSite, view.raw))",
       why: "the import SOURCE read; sourcePath then carries the key found into the removal",
     },
-    { shape: "LOOP for (const key of variantPath)", why: "readContainer walking one helper-derived path" },
-    { shape: "LOOP for (const key of variantPath)", why: "the source read walking one helper-derived path" },
   ],
   "src/install-cmd.ts": [
     {
@@ -521,8 +519,17 @@ describe("every client-config container read goes through claudeCodeContainerPat
     // stops calling it while the import lingers -- the shape table above is
     // what catches that. This pins the other half: the three readers that must
     // fold all name the helper.
+    //
+    // Either SPELLING counts. The rule and the sibling-key list live in one
+    // place; `claudeCodeContainerPaths` takes a parsed root and
+    // `claudeCodeContainerPathVariants` takes a key lister, and a reader that
+    // holds the client config's BYTES rather than a parsed object must use the
+    // second -- so requiring the first name would push a migrated reader back
+    // to parsing a client config itself.
     for (const file of ["src/install-cmd.ts", "src/doctor-cmd.ts", "src/import-cmd.ts"]) {
-      expect(readFileSync(join(REPO_ROOT, file), "utf8"), file).toContain("claudeCodeContainerPaths");
+      expect(readFileSync(join(REPO_ROOT, file), "utf8"), file).toMatch(
+        /claudeCodeContainerPaths\b|claudeCodeContainerPathVariants\b/,
+      );
     }
   });
 });
