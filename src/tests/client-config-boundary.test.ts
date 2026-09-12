@@ -122,6 +122,7 @@ const RULES: Rule[] = [
     allowed: {
       "src/client-config.ts": "the address the core hands the adapter",
       "src/client-config-json.ts": "the adapter walks it -- that is its job",
+      "src/client-config-toml.ts": "the TOML adapter's splice, scan and post-write check all take one as a parameter",
       "src/jsonc.ts": "editJsoncEntry/removeJsoncEntry take one as a parameter",
       "src/install-target-model.ts": "declares ResolvedPath.containerPath",
       "src/install-targets.ts": "resolves it per client; the six inline rows and claudeCodeContainerPaths",
