@@ -185,7 +185,8 @@ run_npm_check() {
   # CHECK-shaped run on this host while answering `--version` with exit 0
   # (bc2076e, 2026-07-21 17:01), whereas 2.4.16 and 2.5.13 both run correctly
   # (measured 2026-09-11, direct and via npm).
-  # 66c48f3 pinned biome to 2.4.16 exactly 79 minutes later; CHANGELOG 0.72.0
+  # 66c48f3 pinned biome to 2.4.16 exactly (an exact version, not a caret
+  # range) about 78 minutes later; CHANGELOG 0.72.0
   # records it. And `npm run lint` now goes through scripts/lint.mjs, which runs
   # the x64 build of the INSTALLED version under emulation on Windows ARM64, so
   # an arm64 regression in a future biome cannot take the gate down. Types and
