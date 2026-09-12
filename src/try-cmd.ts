@@ -846,9 +846,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // A client yaw-mcp cannot configure on this OS is refused HERE, in the same
   // sentence `install` uses, rather than at resolveInstallPath -- whose bare
   // throw reached the user as a resolver internal with nothing to do about
-  // it. Exit 2: the argv named a
-  // client that cannot work on this machine, which is a usage error, and the
-  // same code install's identical refusal returns.
+  // it. Exit 2: the argv named a client that cannot work on this machine,
+  // which is a usage error, and the same code install's identical refusal
+  // returns.
   //
   // The generic fix line is `try`'s own: install offers `--os <os> --dry-run`,
   // a flag pair `try` does not have, so advertising it here would hand the

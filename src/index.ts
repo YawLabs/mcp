@@ -251,9 +251,15 @@ if (subcommand === "compliance") {
                              list): \`installed\` means yaw-mcp is in that list,
                              \`other-entries\` that the list holds other
                              servers, \`no-entries\` that the file exists but
-                             has no server in that list, and \`not installed\`
-                             that the file is absent (read-only; no writes).
-    install --all            Configure every installed MCP client in one go.
+                             has no server in that list, \`not installed\` that
+                             the file is absent, and \`not supported yet\` that
+                             yaw-mcp cannot configure that client on this OS
+                             (read-only; no writes).
+    install --all            Install into every client yaw-mcp supports on this
+                             OS. It plans from that list, not from a probe of
+                             what you have installed (--list is the detecting
+                             one), so it may create a config for a client that
+                             is not on this machine.
     uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
                              for Claude Code, its permissions.allow grant).
                              Your servers in bundles.json are untouched.
