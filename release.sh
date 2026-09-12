@@ -809,7 +809,7 @@ if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
 fi
 
 step 1 "Lint + typecheck + tests"
-run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'
+run_npm_check "Lint" lint 'Found [0-9]+ error' 'Checked [0-9]+ files'  # done_re is inert -- run_npm_check's lint-crash guard hard-fails every 139/134 before the ARM64 tolerance block that would read it; kept so narrowing that guard re-arms it.
 run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 # Tests go through the same wrapper as lint/typecheck: `npm test` is an
 # npm-run script on the same host that segfaults (139/134) in npm's exit
