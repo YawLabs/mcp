@@ -101,6 +101,28 @@ describe("patchPermissionsAllowText -- the grant is one array ELEMENT", () => {
     expect(patchPermissionsAllowText(once, [CLAUDE_CODE_ALLOW_PATTERN], "add")).toBe(once);
   });
 
+  it("removes EVERY copy when the list carries our pattern twice", () => {
+    // `mergePermissionsAllow` dedupes, so install never writes a duplicate --
+    // but a hand-edited settings.json can carry one, and an uninstall that
+    // dropped only the first would print Done over a grant that is still
+    // live. Each removal therefore re-parses the text the LAST one produced:
+    // one set of edits taken from a single parse would land the second at a
+    // stale offset.
+    const before =
+      "{\n" +
+      '  "permissions": {\n' +
+      '    "allow": [\n' +
+      '      "mcp__mcp__*",\n' +
+      '      "Bash(ls:*)",\n' +
+      '      "mcp__mcp__*"\n' +
+      "    ]\n" +
+      "  }\n" +
+      "}\n";
+    expect(patchPermissionsAllowText(before, [CLAUDE_CODE_ALLOW_PATTERN], "remove")).toBe(
+      '{\n  "permissions": {\n    "allow": [\n      "Bash(ls:*)"\n    ]\n  }\n}\n',
+    );
+  });
+
   it("leaves an emptied list as [] and a list it is not in untouched", () => {
     const only = '{\n  "permissions": {\n    "allow": [\n      "mcp__mcp__*"\n    ]\n  }\n}\n';
     expect(patchPermissionsAllowText(only, [CLAUDE_CODE_ALLOW_PATTERN], "remove")).toBe(
