@@ -32,14 +32,20 @@
 #                                    disabled on the repo), so nothing
 #                                    downstream re-checks formatting: a release
 #                                    run with this set is published UNLINTED.
-#                                    Origin: biome 2.5.x's native win32-arm64
-#                                    binary segfaulted on every input (the
-#                                    binary itself, not npm's run-script);
-#                                    v0.72.0 pinned 2.4.16 (66c48f3), which runs
-#                                    clean there. `npm run lint` now goes
-#                                    through scripts/lint.mjs, which runs the
-#                                    x64 biome under emulation on Windows ARM64,
-#                                    so this should be unnecessary. Use it only
+#                                    Origin: biome 2.5.4's native win32-arm64
+#                                    binary dies (exit 139) on CHECK-shaped
+#                                    runs -- the binary itself, not npm's
+#                                    run-script; it answers `--version` with
+#                                    exit 0, so "it starts" is not evidence the
+#                                    gate works. That is a PER-VERSION defect,
+#                                    not a standing arm64 one -- 2.4.16 and
+#                                    2.5.13 both run correctly on this host
+#                                    (measured 2026-09-11). v0.72.0
+#                                    pinned 2.4.16 (66c48f3). `npm run lint` now
+#                                    goes through scripts/lint.mjs, which runs
+#                                    the x64 build of the INSTALLED version
+#                                    under emulation on Windows ARM64, so this
+#                                    should be unnecessary. Use it only
 #                                    if scripts/lint.mjs cannot produce a
 #                                    verdict at all, and treat that as a bug. A
 #                                    failing lint is a real finding, or a broken
@@ -174,15 +180,16 @@ run_npm_check() {
   #
   # HISTORY: the crash it was added for is in biome's native win32-arm64
   # EXECUTABLE, not in npm's run-script wrapper -- invoking the node_modules
-  # binary directly, with no npm in the picture, died the same way. Under biome
-  # ^2.5.0 it segfaulted (139) on THIS repo for every input with zero output
-  # (bc2076e, 2026-07-21 17:01). Superseded 79 minutes later by 66c48f3, which
-  # pinned biome to 2.4.16 exactly; CHANGELOG 0.72.0 records it. 2.4.16's arm64
-  # binary runs clean here (re-checked 2026-09-06 and 2026-09-11, direct and via
-  # npm). And `npm run lint` now goes through scripts/lint.mjs, which runs the
-  # x64 biome under emulation on Windows ARM64, so an arm64 regression in a
-  # future biome cannot take the gate down. Types and tests still gate the
-  # release when it is set.
+  # binary directly, with no npm in the picture, died the same way. It is
+  # VERSION-SPECIFIC, not a standing arm64 defect: 2.5.4 dies (139) on every
+  # CHECK-shaped run on this host while answering `--version` with exit 0
+  # (bc2076e, 2026-07-21 17:01), whereas 2.4.16 and 2.5.13 both run correctly
+  # (measured 2026-09-11, direct and via npm).
+  # 66c48f3 pinned biome to 2.4.16 exactly 79 minutes later; CHANGELOG 0.72.0
+  # records it. And `npm run lint` now goes through scripts/lint.mjs, which runs
+  # the x64 build of the INSTALLED version under emulation on Windows ARM64, so
+  # an arm64 regression in a future biome cannot take the gate down. Types and
+  # tests still gate the release when it is set.
   if [ "${SKIP_LINT:-}" = "1" ] && [[ "$script" == lint* ]]; then
     warn "SKIP_LINT=1 -- skipping '$label' (lint gate disabled by request; formatting goes unverified)"
     return 0
