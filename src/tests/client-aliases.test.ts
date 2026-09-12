@@ -102,13 +102,24 @@ describe("which verbs accept the alias", () => {
     }
   });
 
-  it("leaves a canonical id resolving to itself, with no pinned scope", () => {
+  it("leaves EVERY canonical id resolving to itself, with no pinned scope", () => {
     // The alias must not change what the real ids do. `via: null` is how a
     // caller tells "the user typed claude-code" from "the user typed mcp",
     // and an undefined `scope` is what leaves the caller's own default alone.
-    const direct = resolveClientArg("install", "claude-code");
-    expect(direct).toEqual({ clientId: "claude-code", via: null });
-    expect(direct?.scope).toBeUndefined();
+    //
+    // Every row rather than just claude-code, because this is the observable
+    // half of `resolveClientArg`'s canonical-ids-win ordering: the ordering
+    // itself cannot be mutated into a failure while the two id sets are
+    // disjoint (`aliasTableProblems` is what keeps them so, and is asserted
+    // above), but an alias that DID shadow a real client would surface here
+    // as a `via` naming the alias instead of null.
+    for (const verb of CLIENT_VERBS) {
+      for (const target of INSTALL_TARGETS) {
+        const direct = resolveClientArg(verb, target.clientId);
+        expect(direct, `${verb} ${target.clientId}`).toEqual({ clientId: target.clientId, via: null });
+        expect(direct?.scope, `${verb} ${target.clientId} must pin no scope`).toBeUndefined();
+      }
+    }
   });
 
   it("still rejects a name that is neither a client nor an alias", () => {

@@ -8,12 +8,16 @@
 // there are two clients to probe where there is one file.
 //
 // The table holds ONE row, `mcp`. It was landed as the one-hunk change the
-// empty table was built to make possible: every consumer already routes
-// through `resolveClientArg` and `clientChoices`, and every expectation that
-// names the id list DERIVES from them, so no other file changed to add it.
-// The literal list of alias ids is spelled in exactly one place, and it is a
-// test (client-aliases.test.ts), not this module -- the same arrangement
-// client-config-boundary.test.ts uses for the canonical client ids.
+// empty table was built to make possible: every other surface -- the install
+// and uninstall usage synopses, the `import` usage, the "Choose: ..." line of
+// all three unknown-client errors, and the four completion scripts -- builds
+// its id list from `clientChoices()` rather than spelling one, so adding a row
+// here was the whole change.
+//
+// What RE-STATES the list, so that derivation cannot be satisfied by an empty
+// table, is client-aliases.test.ts -- the arrangement
+// client-config-boundary.test.ts already uses for the canonical client ids,
+// and which its own comment there points at.
 
 import { INSTALL_TARGETS, type InstallClientId, type InstallScope } from "./install-targets.js";
 
