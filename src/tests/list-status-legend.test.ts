@@ -10,13 +10,32 @@ import { INSTALL_TARGETS, type InstallOS } from "../install-targets.js";
 // Nothing enforced it. The statuses live in `statusFor` (install-cmd.ts) and
 // the legend lives in a help string two files away, so the next status added
 // to statusFor would have falsified a shipped claim silently, exactly the way
-// `not supported yet` and `legacy: <key>` did before this sweep.
+// `legacy: <key>`, `malformed`, `unreadable: <reason>` and `unavailable` did
+// before this sweep. Measured at the tag: v1.0.0 (0b999ba) returned seven
+// shapes from statusFor -- `unavailable`, `malformed`, `unreadable: `,
+// `installed`, `legacy: `, `other-entries`, `not installed`
+// (v1.0.0:src/install-cmd.ts:2155-2172) -- and its legend named three of
+// them, `installed`, `other-entries` and `not installed`
+// (v1.0.0:src/index.ts:248-251). `unavailable` counts as shipped-unnamed
+// there even though it is deliberately unlisted today (see below): v1.0.0 had
+// no `notConfigurableOn` at all, so claude-desktop on Linux printed the bare
+// string.
+//
+// `not supported yet` is NOT in that set, though an earlier draft of this
+// comment and the 30a10c5 commit message both named it. Git settles it: the
+// status arrived with 21c62e0 (the Claude Desktop Linux fix), which is not an
+// ancestor of v1.0.0, and the legend at 21c62e0 contains zero occurrences of
+// the string -- 0d98947, a descendant on this same branch, is what added it
+// there. So it went unnamed only DURING this sweep, across a handful of
+// unreleased commits, and never shipped unnamed.
 //
 // This scan derives the shapes statusFor can actually return and requires the
-// legend to name each one. It reads SOURCE rather than running the CLI, for
-// the same reason its sibling scans do: the legend is a string constant, so
-// there is nothing to run, and a source read cannot pass because the built
-// dist is stale.
+// legend to name each one. It reads SOURCE rather than running the CLI
+// because there is no seam to run: the legend is literal text inside the
+// `--help` template, and `statusFor` is module-private, so provoking all nine
+// statuses through the CLI would mean standing up a client config in nine
+// different states first. Reading src/ also keeps the build out of the loop,
+// so a stale dist/ cannot let the scan pass over sources that disagree.
 //
 // What it does NOT see, stated rather than implied: a status returned through
 // a variable rather than a literal (the `literalless` assertion below turns
