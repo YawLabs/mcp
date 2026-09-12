@@ -1918,7 +1918,7 @@ describe("runTry — auto-detected client (no --client)", () => {
   // CLAUDE_CONFIG_DIR out of it and hands it to the probes, so an ambient one
   // (this dev shell sets it) would move claude-code's probe path outside
   // synthHome and make the result machine-dependent. `os` is pinned for the
-  // same reason -- claude-desktop is unavailable on linux but available on
+  // same reason -- yaw-mcp cannot configure claude-desktop on linux but can on
   // macos/windows, so the probe list itself differs by runner.
 
   it("picks the one client whose config already exists", async () => {
@@ -2496,10 +2496,15 @@ describe("runTry -- refusals that were resolver internals", () => {
       fetchExplore: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(2);
-    expect(cap.errText()).toContain("not available on linux");
-    expect(cap.errText()).toMatch(/Claude Code|Cursor/);
-    // No --os in `try`, so it must not advertise one.
-    expect(cap.errText()).not.toContain("--os");
+    // Byte-exact. It names the undocumented config path rather than claiming
+    // the app is missing (it ships on Linux as a beta), points at other
+    // clients by `try`'s own flag -- and, since `try` has no --os, does not
+    // advertise one.
+    expect(cap.errText()).toBe(
+      "yaw-mcp try: Claude Desktop on linux is not supported yet.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
+        "  Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.\n",
+    );
   });
 
   it("carries the `yaw-mcp try:` prefix on a catalog failure, like every other message here", async () => {

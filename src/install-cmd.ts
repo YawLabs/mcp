@@ -149,7 +149,7 @@ export interface InstallCommandOptions {
   skipYawMcpConfig?: boolean;
   /** Read-only: enumerate clients and show which scopes already host a yaw-mcp entry. */
   listOnly?: boolean;
-  /** Install into every client available on this OS in one shot. */
+  /** Install into every client yaw-mcp supports on this OS in one shot. */
   all?: boolean;
   /** Override for tests; defaults to homedir(). */
   home?: string;
@@ -395,13 +395,14 @@ const USAGE =
   "                       [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                       [--force | --repair | --skip] [--keep-legacy] [--dry-run]\n" +
   "       yaw-mcp install --list  (detect clients; no writes)\n" +
-  // "every client available on this OS", NOT "every detected client":
-  // runInstallAll plans from `availableOn` (the OSes a client ships on), not
-  // from a probe of what is actually installed here, so `--all` creates a
-  // config for clients the user may not have. That is deliberate (it
-  // pre-provisions), and --list is the detecting one -- the help text just
-  // has to stop promising detection.
-  "       yaw-mcp install --all   (install into every client available on this OS)\n" +
+  // "every client yaw-mcp supports on this OS", NOT "every detected client":
+  // runInstallAll plans from `availableOn` (the OSes yaw-mcp can configure a
+  // client on), not from a probe of what is actually installed here, so
+  // `--all` creates a config for clients the user may not have. That is
+  // deliberate (it pre-provisions), and --list is the detecting one -- the
+  // help text just has to stop promising detection. Nor "every client
+  // available": Claude Desktop is available on Linux and `--all` skips it.
+  "       yaw-mcp install --all   (install into every client yaw-mcp supports on this OS)\n" +
   "\n" +
   "  Re-running install over an entry that already matches is a no-op (exit 0, no prompt).\n" +
   "  Undo it with `yaw-mcp uninstall <client>`.\n" +
@@ -453,37 +454,50 @@ export function describeUnreadableConfig(cmd: string, path: string, err: unknown
   return `yaw-mcp ${cmd}: cannot read ${path}: ${(err as Error).message}`;
 }
 
-/** The refusal for a client this OS does not have, as one two-line message.
+/** The refusal for a client yaw-mcp cannot configure on this OS.
  *
  *  Shared so every verb that resolves a client path says the same thing.
- *  `install` and `uninstall` route their availability check through here;
- *  `try` did NOT have one at all -- it went straight to resolveInstallPath,
- *  whose bare `throw new Error("Claude Desktop is not available on linux")`
- *  surfaced as a resolver internal with no way forward. Same fault, three
- *  verbs, one sentence.
+ *  `install`, `uninstall` and `import` reach it through resolveInstallSite;
+ *  `try` did NOT have a check at all -- it went straight to
+ *  resolveInstallPath, whose bare throw surfaced as a resolver internal with
+ *  no way forward. Same fault, four verbs, one sentence.
  *
- *  The claude-desktop-on-linux case gets its own line because it is the only
- *  one a user cannot fix by changing a flag: Anthropic does not ship that app
- *  for Linux, so the remedy is a different client, not different arguments.
- *  Every other verb passes its own `genericFix` -- the flags differ (`try` has
- *  no --os, so it must not advertise one).
- *
- *  A CLAIM about a third party, checked when written: Anthropic's own download
- *  page lists macOS and Windows builds and no Linux one, which is what
- *  INSTALL_TARGETS encodes as `availableOn: ["macos", "windows"]` for
- *  claude-desktop -- the two agree, and this message reads the table, not a
- *  memory of it. */
+ *  Two shapes. A client that is simply not available on the OS gets the
+ *  caller's `genericFix` -- the flags differ per verb (`try` and `import` have
+ *  no --os, so they must not advertise one). A client that DOES ship on the
+ *  OS but has no documented path for the config file yaw-mcp writes --
+ *  INSTALL_TARGETS' `notConfigurableOn`, today only Claude Desktop on Linux --
+ *  says so instead of "not available": the app IS available there, and a
+ *  message denying it is a false claim about a third party. No flag fixes
+ *  that case, so its remedy is another client or a hand edit. The reason
+ *  itself is read from the table, never restated here. */
 export function clientUnavailableMessage(
   cmd: string,
   target: (typeof INSTALL_TARGETS)[number],
   os: InstallOS,
   genericFix: string,
 ): string {
-  const fix =
-    target.clientId === "claude-desktop" && os === "linux"
-      ? "Anthropic ships Claude Desktop on macOS and Windows only. Install Claude Code or Cursor instead."
-      : genericFix;
-  return `yaw-mcp ${cmd}: ${target.label} is not available on ${os}.\n  ${fix}`;
+  const reason = target.notConfigurableOn?.[os];
+  if (reason === undefined) return `yaw-mcp ${cmd}: ${target.label} is not available on ${os}.\n  ${genericFix}`;
+  // Per verb, because "use another client" means something different to each.
+  // uninstall has nothing of yaw-mcp's to take back on an OS it never writes
+  // to: any entry there is one the user added, so removing it is theirs too.
+  let fix: string;
+  switch (cmd) {
+    case "uninstall":
+      fix = "Remove the entry by hand if you added one.";
+      break;
+    case "import":
+      fix =
+        'Add those servers to yaw-mcp yourself instead: `yaw-mcp add <slug>` for a catalog server, or `yaw-mcp add <name> --command "<launch line>"` for any other.';
+      break;
+    case "try":
+      fix = "Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.";
+      break;
+    default:
+      fix = "Install into Claude Code or Cursor instead, or add the entry by hand.";
+  }
+  return `yaw-mcp ${cmd}: ${target.label} on ${os} is not supported yet.\n  ${reason}.\n  ${fix}`;
 }
 
 /** Warning printed when the retired `--token` flag is passed. Exported so
@@ -521,8 +535,8 @@ export const DRY_RUN_ENV_PLACEHOLDER = "<kept from existing entry>";
  *  EXPORTED for `yaw-mcp import`, which resolves the very same {client, scope,
  *  OS} -> config-file path and must not hand-roll a second table of config
  *  locations to do it. Every refusal here is one that path needs word for word
- *  -- unknown client, unsupported scope, a client that does not ship on this
- *  OS, --project-dir on a scope that reads none -- which is why `cmd` is a
+ *  -- unknown client, unsupported scope, a client yaw-mcp cannot configure on
+ *  this OS, --project-dir on a scope that reads none -- which is why `cmd` is a
  *  parameter rather than a literal. */
 export function resolveInstallSite(
   cmd: "install" | "uninstall" | "import",
@@ -560,7 +574,10 @@ export function resolveInstallSite(
         // NOT "pass --os to override": install resolves paths against THIS
         // machine, so a cross-OS --os write is refused at the flag boundary
         // (see parseInstallArgs) — only the --dry-run preview is offered.
-        "Pick a different client, or preview another OS's config with --os <os> --dry-run.",
+        // `import` has no --os flag at all, so it must not advertise one.
+        cmd === "import"
+          ? "Pick a different client."
+          : "Pick a different client, or preview another OS's config with --os <os> --dry-run.",
       ),
     );
     return null;
@@ -2261,12 +2278,15 @@ async function runInstallList(
   }
   log("");
   log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
-  log("Install into every available client (user scope where supported): `yaw-mcp install --all`");
+  log("Install into every supported client (user scope where supported): `yaw-mcp install --all`");
   return { written: [], wouldWrite: [], messages, exitCode: 0 };
 }
 
 function statusFor(p: ClientProbeResult): string {
-  if (p.unavailable) return "unavailable";
+  // A client that ships on this OS but has no documented path for the config
+  // file yaw-mcp writes is not "unavailable" -- the user may be running it.
+  // `doctor` prints the reason.
+  if (p.unavailable) return p.unavailableReason !== undefined ? "not supported yet" : "unavailable";
   if (p.malformed) return "malformed";
   // A READ failure (a directory at the path, EACCES, a win32 EBUSY from an
   // indexer) is not a syntax error: the probe reports it separately so the
@@ -2317,10 +2337,12 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
   return tildePath(abs, home, os === "windows" ? "\\" : "/");
 }
 
-/** `yaw-mcp install --all` — install into every available client (user
- *  scope where supported). For clients without a user scope, falls back to
- *  the first non-project scope; clients that ONLY have project scopes
- *  (vscode) are included just when --project-dir is passed, otherwise
+/** `yaw-mcp install --all` — install into every client yaw-mcp supports on
+ *  this OS (user scope where supported), naming any it skips -- including a
+ *  client that ships here but has no documented path for the config file
+ *  yaw-mcp writes (`notConfigurableOn`). For clients without a user scope,
+ *  falls back to the first non-project scope; clients that ONLY have project
+ *  scopes (vscode) are included just when --project-dir is passed, otherwise
  *  skipped. Mirrors the per-client run behavior: prompts and
  *  --force/--repair/--skip propagate, so `--all --force` drops each entry's
  *  env exactly as a per-client --force does.
@@ -2362,6 +2384,16 @@ async function runInstallAll(
   type Plan = { clientId: InstallClientId; scope: InstallScope; usesProjectDir: boolean };
   const plans: Plan[] = [];
   const skipped: Array<{ clientId: InstallClientId; reason: string }> = [];
+  // A client that ships on this OS but that yaw-mcp cannot configure is named
+  // rather than silently left out: on a Linux box running the Claude Desktop
+  // beta, `--all` otherwise reads as having forgotten it. No availableOn
+  // check: a reason is only ever recorded for an OS missing from
+  // `availableOn` (install-targets.test.ts pins that), so a client skipped
+  // here is never also one of `targets`.
+  for (const t of INSTALL_TARGETS) {
+    const why = t.notConfigurableOn?.[os];
+    if (why !== undefined) skipped.push({ clientId: t.clientId, reason: why });
+  }
   for (const t of targets) {
     const userScope = t.scopes.find((s) => s.scope === "user");
     if (userScope) {

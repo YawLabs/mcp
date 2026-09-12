@@ -59,6 +59,8 @@ npx -y @yawlabs/mcp@latest install <claude-code|claude-desktop|cursor|vscode|win
 
 This edits the chosen client's config (correct path + JSON shape for your OS) to launch yaw-mcp. On Windows it wraps `npx` in `cmd /c` (without which MCP clients hit `ENOENT` on the `npx.cmd` shim). Run it once per client.
 
+Claude Desktop on Linux is not supported yet. Anthropic ships a Linux beta but has not documented where it reads `claude_desktop_config.json`, so `install claude-desktop` refuses on Linux rather than write a guessed path, and `--all` skips it. Add the entry by hand, or use another client.
+
 Useful flags:
 
 - `--scope user|project|local` -- which file to write. Claude Code and Cursor support project and local; VS Code and Gemini CLI support user and project; Claude Desktop and Windsurf are user-only.
@@ -67,11 +69,11 @@ Useful flags:
 
 After it writes, install reports two things it did **not** change. First, how many servers `~/.yaw-mcp/bundles.json` gives yaw-mcp to serve -- and when that is none, the `yaw-mcp add <slug>` step still to take -- though no longer *before* a restart, since yaw-mcp re-reads that file while the session runs and picks up a server added afterwards on the next `mcp_connect_*` call. Second, how many other MCP servers were already configured in the client file it just edited; those keep launching directly from the client, and installing yaw-mcp does not move them behind the broker. The count is a number, never the server names. Under `--all` the bundles.json line prints once for the run, while the per-client count prints under each client.
 
-Or do every detected client at once:
+Or work across every client at once:
 
 ```bash
 yaw-mcp install --list   # detect clients + show install state (read-only)
-yaw-mcp install --all    # install into every user-scope client on this machine
+yaw-mcp install --all    # install into every client yaw-mcp supports on this OS
 ```
 
 > The launch entry is keyed `"mcp"`, so its tools surface under the `mcp__mcp__` namespace. Installs made before the rename used `"mcp.hosting"` / `"yaw-mcp"`; `yaw-mcp install` detects and migrates those.
