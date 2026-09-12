@@ -1735,6 +1735,11 @@ export function findBlockedContainerSegment(
   root: Record<string, unknown>,
   containerPath: string[],
 ): BlockedContainerSegment | null {
+  // EXACT, never folded through claudeCodeContainerPaths: this is the
+  // pre-flight for a WRITE, and a write goes to the canonical path only. A
+  // drive-case sibling's shape cannot block it and must not be reported as if
+  // it did. Registered as such in the source-shape scan in
+  // src/tests/source-hygiene.test.ts.
   let node: Record<string, unknown> = root;
   for (let i = 0; i < containerPath.length; i++) {
     const value = node[containerPath[i]];
@@ -1914,6 +1919,12 @@ export function mergeClientConfig(
   entryName: string = ENTRY_NAME,
 ): Record<string, unknown> {
   if (containerPath.length === 0) throw new Error("mergeClientConfig: containerPath cannot be empty");
+  // EXACT, never folded through claudeCodeContainerPaths: this clones the
+  // chain it is about to WRITE into, and every caller hands it the canonical
+  // path. Folding here would splice the entry into a drive-case sibling as
+  // well, which is the silent second install that the sibling REPORT exists to
+  // avoid. Registered as such in the source-shape scan in
+  // src/tests/source-hygiene.test.ts.
   const out: Record<string, unknown> = { ...existing };
   let parent: Record<string, unknown> = out;
   for (let i = 0; i < containerPath.length - 1; i++) {
@@ -2896,9 +2907,9 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       let next = rawClient;
       // Every removal in ONE pass so the file never lands on disk holding one
       // key without the other -- across the drive-letter-case siblings too,
-      // which is what makes the Done line below true of the whole file rather
-      // than of one key in it. All of them go through jsonc-parser so the
-      // user's comments and formatting survive.
+      // which is what lets the closing line below speak for every container
+      // THIS scope reads rather than for one key in it. All of them go through
+      // jsonc-parser so the user's comments and formatting survive.
       for (const s of removals) {
         if (s.hasEntry) next = removeJsoncEntry(next, s.containerPath, ENTRY_NAME);
         if (trimsLegacy(s)) next = removeJsoncEntry(next, s.containerPath, s.legacyEntry as string);
@@ -2956,10 +2967,21 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
 
   // Wiring this run deliberately LEFT that still makes the client launch
   // yaw-mcp. Only --keep-legacy can produce one now: every drive-letter-case
-  // sibling is cleared in the same write above. The Done line below states a
-  // property of the whole file, so it is gated on that property actually
-  // holding -- an all-clear over an entry the client still reads is the exact
-  // failure this branch exists to prevent.
+  // sibling is cleared in the same write above, so an all-clear over an entry
+  // this scope itself left behind -- the exact failure the drive-case sibling
+  // produced -- cannot happen.
+  //
+  // The gate reaches exactly as far as `sites` does, and no further: the
+  // containers THIS scope reads, canonical plus drive-case variants of the
+  // same project dir. Another scope's wiring in the SAME file is outside it --
+  // measured, with a root `mcpServers.mcp` (user scope) and a
+  // projects[<dir>] entry both present, `uninstall --scope local` removes the
+  // local entry, prints Done, and the root entry still launches yaw-mcp. That
+  // per-scope reach predates this branch (uninstall resolves one scope and has
+  // always spoken about it); widening the Done line to the file's other scopes
+  // would make a scoped uninstall report on wiring it deliberately does not
+  // touch, which is a separate decision. Read the line below as "nothing this
+  // run left behind in the containers this scope reads".
   const stillLaunching = sites.filter((s) => s.legacyEntry !== null && !trimsLegacy(s));
   if (stillLaunching.length > 0) {
     const kept = stillLaunching.map((s) => `"${s.legacyEntry}"${where(s)}`);

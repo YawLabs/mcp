@@ -1240,8 +1240,12 @@ describe("ENTRY_NAME", () => {
 // are two entries to IT -- but one project to the user, and to every yaw-mcp
 // command that reads them. These two functions are the ONLY place that
 // equivalence is decided; every reader in install-cmd / doctor-cmd /
-// import-cmd takes its paths from claudeCodeContainerPaths (enforced by the
-// source-shape scan in source-hygiene.test.ts). Pure, so unlike the
+// import-cmd takes its paths from claudeCodeContainerPaths, and the
+// source-shape scan in source-hygiene.test.ts holds that by accounting for
+// each container read in tracked non-test source by shape -- a raw index into
+// the projects object, a hand-built ["projects", ...] path, a C-style index
+// loop and a wrapped helper call all fail it. Textual, so a net rather than a
+// proof; its limits are stated where it lives. Pure, so unlike the
 // command-level drive-case tests these run on every platform.
 describe("sameClaudeCodeProjectKey (which two projects[] keys are one project)", () => {
   it("folds a leading drive letter, in both directions", () => {

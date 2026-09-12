@@ -431,8 +431,16 @@ export function sameClaudeCodeProjectKey(a: string, b: string): boolean {
  *  key cannot see it: `uninstall` reported "Nothing to do" and printed Done
  *  over an entry that still launched yaw-mcp, and `doctor` / `install --list`
  *  reported "not installed" for a project that was. Every reader takes its
- *  paths from here so a new one cannot reintroduce that split -- enforced by
- *  the source-shape scan in src/tests/source-hygiene.test.ts.
+ *  paths from here, and the source-shape scan in
+ *  src/tests/source-hygiene.test.ts accounts for each container read in
+ *  tracked non-test source by shape, so the four ways a new reader would
+ *  reintroduce that split -- indexing the projects object directly, building a
+ *  container path with "projects" as its first segment, a C-style index loop
+ *  over a container path, or a helper call the formatter wrapped across lines
+ *  -- each fail the suite. That scan is textual, so it is a net
+ *  under the behavioural tests and not a proof: it cannot follow a container
+ *  object handed in by a caller, nor a third local helper a new file declares
+ *  for itself. Its own limits are spelled out where it lives.
  *
  *  Callers that deliberately want only the canonical path (a WRITE, or "will
  *  my write at this exact path replace something") take `[0]`, which is always

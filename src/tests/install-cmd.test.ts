@@ -5181,8 +5181,10 @@ describe("Claude Code local scope -- an entry under the OTHER drive-letter case"
 
   it("does not claim Done while a legacy entry the user asked to keep still launches yaw-mcp", async () => {
     // The same false-all-clear class, from the other direction: --keep-legacy
-    // leaves a pre-rename entry the client still launches, and the Done line
-    // is a statement about the whole file.
+    // leaves a pre-rename entry the client still launches, in a container this
+    // very run read. The Done line speaks for the containers the run's own
+    // scope reads -- not for the whole file, which can also hold another
+    // scope's or another project's wiring -- and this is one of them.
     writeFileSync(
       join(synthHome, ".claude.json"),
       JSON.stringify({
