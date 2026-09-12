@@ -139,7 +139,11 @@ const RULES: Rule[] = [
         'the SITE\'s own container path, read off the resolver -- named in the "nothing to import" line, ' +
         "compared when de-duplicating the searched scopes, and carried into `siteAt` as the address the " +
         "removal goes to. Not a walk: every read and write goes through the core",
-      "src/install-cmd.ts": NOT_YET_MIGRATED,
+      "src/install-cmd.ts":
+        "the SITE's own container path, read off the resolver -- rendered by `describeContainer` in the " +
+        "entry-count line, handed to `claudeCodeContainerPathVariants` as the canonical address a write " +
+        "goes to, and carried per RemovalSite into `siteAt`. Not a walk: every read and write goes " +
+        "through the core",
       "src/try-cmd.ts":
         "a TRIAL MARKER records the container path it wrote at, on disk, in a versioned schema -- so try " +
         "reads that field back and hands it to `markerSite`, which is the only way a sweep can delete the " +
