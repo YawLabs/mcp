@@ -99,7 +99,9 @@ describe("parseTryArgs", () => {
   });
 
   it("rejects --client with unknown value", () => {
-    const r = parseTryArgs(["demo", "--client", "zed"]);
+    // A name no row can ever carry. A real client id here goes red the day
+    // that client lands, which is what the previous spelling did.
+    const r = parseTryArgs(["demo", "--client", "not-a-client"]);
     expect(r.ok).toBe(false);
   });
 

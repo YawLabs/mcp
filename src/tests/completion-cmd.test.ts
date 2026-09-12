@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseAuditArgs } from "../audit-cmd.js";
 import { parseBundlesArgs } from "../bundles-cmd.js";
 import { parseCallArgs } from "../call-cmd.js";
+import { CLIENT_ALIASES, clientChoices } from "../client-aliases.js";
 import {
   COMPLETION_USAGE,
   parseCompletionArgs,
@@ -26,6 +27,29 @@ import { parseTryArgs, parseTryCleanupArgs } from "../try-cmd.js";
 import { parseUpgradeArgs } from "../upgrade-cmd.js";
 
 const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
+
+// The client word list every shell offers, DERIVED -- never a literal. Six
+// separate copies of the same ids (one per shell, twice for powershell) is
+// six places a landing client has to edit, which is the one thing that would
+// make two parallel packages collide in this file. The shape checks below are
+// what stop the derivation being tautological: an empty list, or one that
+// silently lost claude-code's first place, would otherwise "match" whatever
+// the generator produced.
+const INSTALL_CLIENTS = clientChoices("install");
+const CLIENT_WORDS = INSTALL_CLIENTS.join(" ");
+
+describe("the derived client word list", () => {
+  it("is non-empty, leads with claude-code, and ends with every alias id", () => {
+    expect(INSTALL_CLIENTS.length).toBeGreaterThan(0);
+    expect(INSTALL_CLIENTS[0]).toBe("claude-code");
+    // Aliases come LAST, so the real clients are what a user sees first.
+    expect(INSTALL_CLIENTS.slice(INSTALL_CLIENTS.length - CLIENT_ALIASES.length)).toEqual(
+      CLIENT_ALIASES.map((a) => a.id),
+    );
+    // `try` picks a client by probing, so it takes no alias.
+    expect(clientChoices("try")).toEqual(INSTALL_CLIENTS.slice(0, INSTALL_CLIENTS.length - CLIENT_ALIASES.length));
+  });
+});
 
 // Ground truth comes straight from the real dispatch table
 // (src/subcommands.ts), which index.ts imports. Drop the leading-dash
@@ -133,7 +157,7 @@ describe("renderScript — bash", () => {
   it("offers positional alternatives at the SAME argument position (one compgen word list)", () => {
     const s = renderScript("bash");
     // All four install clients complete at `install <TAB>`, not one per slot.
-    expect(s).toContain('compgen -W "claude-code claude-desktop cursor vscode windsurf gemini-cli"');
+    expect(s).toContain(`compgen -W "${CLIENT_WORDS}"`);
     // Same for bundles actions and completion shells.
     expect(s).toContain('compgen -W "list match"');
     expect(s).toContain('compgen -W "bash zsh fish powershell"');
@@ -212,7 +236,7 @@ describe("renderScript — zsh", () => {
 
   it("offers positional alternatives at the same _arguments slot", () => {
     const s = renderScript("zsh");
-    expect(s).toContain("'1: :(claude-code claude-desktop cursor vscode windsurf gemini-cli)'");
+    expect(s).toContain(`'1: :(${CLIENT_WORDS})'`);
     expect(s).toContain("'1: :(bash zsh fish powershell)'");
     expect(s).toContain("'1: :(list match)'");
   });
@@ -225,9 +249,7 @@ describe("renderScript — zsh", () => {
     // occupy) were untabbable. bash, fish and powershell all offer flags there.
     // As option specs zsh offers them at every position.
     const s = renderScript("zsh");
-    const installLine = s
-      .split("\n")
-      .find((l) => l.includes("'1: :(claude-code claude-desktop cursor vscode windsurf gemini-cli)'"));
+    const installLine = s.split("\n").find((l) => l.includes(`'1: :(${CLIENT_WORDS})'`));
     expect(installLine, "no install _arguments line in the generated zsh script").toBeDefined();
     for (const flag of ["--list", "--all", "--scope", "--dry-run", "--help"]) {
       expect(installLine, `install flag missing from the zsh option specs: ${flag}`).toContain(`'${flag}'`);
@@ -295,7 +317,7 @@ describe("renderScript — fish", () => {
 
   it("offers positional alternatives at the same argument position", () => {
     const s = renderScript("fish");
-    expect(s).toContain('-a "claude-code claude-desktop cursor vscode windsurf gemini-cli"');
+    expect(s).toContain(`-a "${CLIENT_WORDS}"`);
     expect(s).toContain('-a "list match"');
   });
 
@@ -333,7 +355,7 @@ describe("renderScript — powershell", () => {
 
   it("offers positional alternatives at the same token position", () => {
     const s = renderScript("powershell");
-    expect(s).toContain("@('claude-code', 'claude-desktop', 'cursor', 'vscode', 'windsurf', 'gemini-cli')");
+    expect(s).toContain(psList(INSTALL_CLIENTS));
     expect(s).toContain("@('list', 'match')");
   });
 
@@ -349,9 +371,7 @@ describe("renderScript — powershell", () => {
     expect(s).toContain("if ($wordToComplete -ne '') { $argIndex-- }");
     expect(s).toContain("if ($argIndex -lt 0) {");
     // Slot 0 candidates are emitted under the normalized index.
-    expect(s).toContain(
-      "if ($argIndex -eq 0) { $completions += @('claude-code', 'claude-desktop', 'cursor', 'vscode', 'windsurf', 'gemini-cli') }",
-    );
+    expect(s).toContain(`if ($argIndex -eq 0) { $completions += ${psList(INSTALL_CLIENTS)} }`);
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('bash', 'zsh', 'fish', 'powershell') }");
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('list', 'match') }");
     expect(s).toContain("if ($argIndex -eq 0) { $completions += @('export') }");
@@ -375,7 +395,7 @@ describe("renderScript — powershell", () => {
     expect(installEmpty).toEqual(expect.arrayContaining(["--scope", "--dry-run"]));
     // deprecated flags still work but are no longer suggested
     expect(installEmpty).not.toContain("--token");
-    expect(complete(["yaw-mcp", "install", "cl"], "cl")).toEqual(["claude-code", "claude-desktop"]);
+    expect(complete(["yaw-mcp", "install", "cl"], "cl")).toEqual(INSTALL_CLIENTS.filter((c) => c.startsWith("cl")));
 
     // Slot 1: `yaw-mcp secrets set <TAB>` is past the action list, so only the
     // free-form <name> slot (no candidates) plus flags remain.
@@ -389,7 +409,10 @@ describe("renderScript — powershell", () => {
   });
 });
 
-const INSTALL_CLIENTS = ["claude-code", "claude-desktop", "cursor", "vscode"];
+/** The PowerShell array literal `renderPowershell` emits for a word list. */
+function psList(words: readonly string[]): string {
+  return `@(${words.map((w) => `'${w}'`).join(", ")})`;
+}
 
 /**
  * Minimal interpreter for the exact shape `renderPowershell` emits, so the

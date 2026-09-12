@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { sourceFiles } from "./source-files.js";
 
 // A raw control byte in tracked source, which nothing else in the gate catches.
 //
@@ -161,7 +162,9 @@ describe("tracked source carries no raw control bytes", () => {
   });
 });
 
-// Every read of a client-config container in tracked non-test source, by shape.
+// Every read of a client-config container in non-test source, by shape --
+// enumerated off the FILESYSTEM (sourceFiles), so a module escapes it only by
+// not existing, not by not being tracked yet.
 //
 // Claude Code keys local-scope MCP under projects[<absolute dir>], looks it up
 // byte-exactly, and older versions of this tool wrote that key with whatever
@@ -352,6 +355,14 @@ interface Walk {
 }
 
 const EXPECTED_WALKS: Record<string, Walk[]> = {
+  "src/client-config-json.ts": [
+    {
+      shape: "LOOP for (let i = 0; i < containerPath.length - 1; i++)",
+      why:
+        "buildFreshConfig: builds the chain of a file that does not exist yet, on the canonical path a write " +
+        "goes to. Nothing to fold -- an absent file carries no drive-case sibling key to find",
+    },
+  ],
   "src/doctor-cmd.ts": [
     {
       shape: "CALL walkContainer(root: Record<string, unknown>, path: string[])",
@@ -453,10 +464,16 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
 
 function scanContainerWalks(): Record<string, string[]> {
   const out: Record<string, string[]> = {};
-  for (const file of trackedFiles()) {
-    if (!file.startsWith("src/") || !file.endsWith(".ts") || file.includes("/tests/")) continue;
-    const found = scanSource(readFileSync(join(REPO_ROOT, file), "utf8"));
-    if (found.length > 0) out[file] = found;
+  // `sourceFiles()`, the shared RECURSIVE FILESYSTEM walker -- not
+  // `trackedFiles()`. Enumerating `git ls-files` meant a NEW module escaped
+  // this scan until somebody ran `git add`, which is exactly the window in
+  // which a new container reader gets written: the whole-map compare below
+  // could not fail on a file git had never heard of. A directory read sees a
+  // file the moment it exists. (The BYTE scans above still walk the tracked
+  // set: their subject is what the repo ships, not what is on disk.)
+  for (const file of sourceFiles()) {
+    const found = scanSource(file.text);
+    if (found.length > 0) out[file.path] = found;
   }
   return out;
 }

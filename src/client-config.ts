@@ -49,7 +49,7 @@ import {
   type LaunchEntry,
   LEGACY_ENTRY_NAMES,
   type ResolvedPath,
-} from "./install-targets.js";
+} from "./install-target-model.js";
 
 // ---------------------------------------------------------------------------
 // Formats

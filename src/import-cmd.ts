@@ -66,6 +66,7 @@ import { homedir } from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
+import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import { resolveInstallSite } from "./install-cmd.js";
 import {
   blockedContainerFix,
@@ -73,7 +74,6 @@ import {
   describeJsonShape,
   ENTRY_NAME,
   findBlockedContainerSegment,
-  INSTALL_TARGETS,
   type InstallClientId,
   type InstallOS,
   type InstallScope,
@@ -96,7 +96,7 @@ export const IMPORT_USAGE = `Usage: yaw-mcp import <client> [flags]
   local ~/.yaw-mcp/bundles.json, so yaw-mcp serves the servers you already had
   instead of starting empty.
 
-  <client> is one of: ${INSTALL_TARGETS.map((t) => t.clientId).join(", ")}.
+  <client> is one of: ${clientChoices("import").join(", ")}.
 
   yaw-mcp's own entry is never imported, under any of its names. Each server's
   command, args, url, headers and env come across as they are -- an import that
@@ -602,17 +602,20 @@ export function parseImportArgs(
   if (positional.length !== 1) {
     return { ok: false, error: `yaw-mcp import: expected exactly one client.\n${IMPORT_USAGE}` };
   }
-  const clientId = positional[0] as InstallClientId;
-  // Validated HERE rather than left to resolveInstallSite: that helper answers
+  // Resolved HERE rather than left to resolveInstallSite: that helper answers
   // an unknown client by printing install's own multi-KB usage, which is not
-  // the text an `import` typo should produce.
-  if (!INSTALL_TARGETS.some((t) => t.clientId === clientId)) {
+  // the text an `import` typo should produce. Same resolver as install's, so
+  // import takes exactly the names install does, aliases included.
+  const resolved = resolveClientArg("import", positional[0]);
+  if (!resolved) {
     return {
       ok: false,
-      error: `yaw-mcp import: unknown client "${clientId}". Choose: ${INSTALL_TARGETS.map((t) => t.clientId).join(", ")}`,
+      error: `yaw-mcp import: unknown client "${positional[0]}". Choose: ${clientChoices("import").join(", ")}`,
     };
   }
-  opts.clientId = clientId;
+  opts.clientId = resolved.clientId;
+  // An alias's scope is a DEFAULT: an explicit --scope beside it still wins.
+  if (resolved.scope !== undefined && opts.scope === undefined) opts.scope = resolved.scope;
   return { ok: true, options: opts };
 }
 

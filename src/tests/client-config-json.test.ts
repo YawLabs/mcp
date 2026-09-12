@@ -19,7 +19,10 @@ import {
   terminateWithNewline,
 } from "../client-config.js";
 import { buildFreshConfig, JSON_ADAPTER, JSONC_ADAPTER, UTF8_BOM } from "../client-config-json.js";
-import { deepEqualJson, findBlockedContainerSegment, mergeClientConfig, readEntryAt } from "../install-cmd.js";
+import { deepEqualJson, mergeClientConfig, readEntryAt } from "../install-cmd.js";
+// findBlockedContainerSegment lives in install-targets.ts, which is where
+// doctor reads it from too; install-cmd.ts only imports it.
+import { findBlockedContainerSegment } from "../install-targets.js";
 
 // TAB is built from its code point, never typed as an escape: a backslash-t
 // that loses a level on its way into this file becomes a REAL tab inside a

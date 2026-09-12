@@ -20,15 +20,23 @@ import {
 } from "../install-targets.js";
 
 describe("INSTALL_TARGETS metadata", () => {
-  it("includes the six expected clients", () => {
-    expect(INSTALL_TARGETS.map((t) => t.clientId).sort()).toEqual([
-      "claude-code",
-      "claude-desktop",
-      "cursor",
-      "gemini-cli",
-      "vscode",
-      "windsurf",
-    ]);
+  // The id LIST is pinned once for the whole suite, in
+  // client-config-boundary.test.ts, as the append-ORDER prefix -- a sorted
+  // literal here would be a second copy of the same fact that every landing
+  // target has to edit, and it could not see an insert (sorting hides it).
+  // What is checked here is the shape a row must have, whatever the ids are.
+  it("gives every client an id, a label, a config root and at least one scope", () => {
+    expect(INSTALL_TARGETS.length).toBeGreaterThan(0);
+    for (const t of INSTALL_TARGETS) {
+      expect(t.clientId, "a row with no clientId").toBeTruthy();
+      expect(t.label, `${t.clientId} has no label`).toBeTruthy();
+      expect(t.config.root, `${t.clientId} has no config root`).toBeTruthy();
+      expect(t.availableOn.length, `${t.clientId} is available nowhere`).toBeGreaterThan(0);
+    }
+    // Ids are unique: two rows sharing one would make `--list` print the file
+    // twice and `resolveInstallPath`'s find return whichever came first.
+    const ids = INSTALL_TARGETS.map((t) => t.clientId);
+    expect(new Set(ids).size, `duplicate client id in ${ids.join(", ")}`).toBe(ids.length);
   });
 
   it("keeps claude-code FIRST in declaration order", () => {
@@ -73,19 +81,36 @@ describe("INSTALL_TARGETS metadata", () => {
     // This is the wire contract — getting it wrong silently fails.
     // code.visualstudio.com/docs/copilot/customization/mcp-servers
     const vscode = INSTALL_TARGETS.find((t) => t.clientId === "vscode");
-    expect(vscode?.jsonShape).toBe("servers");
+    expect(vscode?.config.root).toBe("servers");
   });
 
-  it("every client except VS Code uses the `mcpServers` root key", () => {
-    const mcpServerClients = INSTALL_TARGETS.filter((t) => t.jsonShape === "mcpServers").map((t) => t.clientId);
-    expect(mcpServerClients.sort()).toEqual(["claude-code", "claude-desktop", "cursor", "gemini-cli", "windsurf"]);
+  it("pins the root key of each of the six INLINE clients", () => {
+    // Scoped to the six ids whose paths are resolved by the inline `pathFor`
+    // switch, which is a CLOSED set -- every new target resolves its own path
+    // and pins its own root in its own target test. Unscoped, this literal
+    // would have to be edited by every landing client, which is the collision
+    // the derived lists exist to remove.
+    const roots: Record<string, string> = {};
+    for (const id of ["claude-code", "claude-desktop", "cursor", "vscode", "windsurf", "gemini-cli"]) {
+      const t = INSTALL_TARGETS.find((x) => x.clientId === id);
+      expect(t, `${id} is missing from INSTALL_TARGETS`).toBeDefined();
+      roots[id] = t?.config.root ?? "";
+    }
+    expect(roots).toEqual({
+      "claude-code": "mcpServers",
+      "claude-desktop": "mcpServers",
+      cursor: "mcpServers",
+      vscode: "servers",
+      windsurf: "mcpServers",
+      "gemini-cli": "mcpServers",
+    });
   });
 
   it("agrees with itself about the root key on every scope", () => {
-    // jsonShape is documentation; containerPath is what actually gets
-    // written. Nothing in src/ reads jsonShape, so the two can disagree
-    // silently -- and a row whose containerPath names the wrong key writes a
-    // file the client parses and ignores.
+    // config.root is what messages and previews name; containerPath is what
+    // actually gets written. A row whose containerPath names a different key
+    // writes a file the client parses and ignores, and nothing else in the
+    // suite compares the two.
     for (const t of INSTALL_TARGETS) {
       for (const sc of t.scopes) {
         const resolved = resolveInstallPath({
@@ -100,7 +125,7 @@ describe("INSTALL_TARGETS metadata", () => {
           appData: "/a",
         });
         expect(resolved.containerPath[resolved.containerPath.length - 1], `${t.clientId}/${sc.scope}`).toBe(
-          t.jsonShape,
+          t.config.root,
         );
       }
     }

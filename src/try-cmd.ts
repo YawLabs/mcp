@@ -68,6 +68,7 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
+import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
 import { clientUnavailableMessage, describeUnreadableConfig, mergeClientConfig } from "./install-cmd.js";
 import {
@@ -125,7 +126,7 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
   it on a timer -- once --ttl has elapsed it is removed by the next
   \`yaw-mcp doctor\` run. Run \`yaw-mcp try-cleanup <slug>\` to remove it now.
 
-  --client <name>      ${wrapToUsageColumn(INSTALL_TARGETS.map((t) => t.clientId))}
+  --client <name>      ${wrapToUsageColumn(clientChoices("try"))}
                        (default: auto-detect, prefers the first installed
                        client in the order probed by \`yaw-mcp install --list\`)
   --ttl <duration>     How long the trial lives before doctor GCs it
@@ -299,15 +300,18 @@ export function parseTryArgs(
     switch (a) {
       case "--client": {
         const v = next();
-        // Validate against the canonical client set so a new INSTALL_TARGETS
-        // entry is accepted here without touching this literal.
-        if (!v || !INSTALL_TARGETS.some((t) => t.clientId === v)) {
+        // `clientChoices("try")` is the canonical client set with NO alias:
+        // `try` picks a client by probing, so a second name for a slot it
+        // already probes would let one file be trialled twice. A new row is
+        // accepted here without touching any literal.
+        const resolved = v === undefined ? null : resolveClientArg("try", v);
+        if (!resolved) {
           return {
             ok: false,
-            error: `--client requires ${INSTALL_TARGETS.map((t) => t.clientId).join("|")}`,
+            error: `--client requires ${clientChoices("try").join("|")}`,
           };
         }
-        opts.clientId = v as InstallClientId;
+        opts.clientId = resolved.clientId;
         break;
       }
       case "--ttl": {

@@ -1,7 +1,5 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { sourceFiles } from "./source-files.js";
 
 // `install --list` printed the full absolute path in every home-rooted row,
 // instead of `~\.cursor\mcp.json`, whenever USERPROFILE was spelled with
@@ -23,12 +21,15 @@ import { describe, expect, it } from "vitest";
 // It narrows the obvious shape; it does not prove the bug absent. It does NOT
 // see a home compared some other way (`abs.indexOf(home) === 0`,
 // `abs.slice(0, home.length) === home`) or held in a variable whose name lacks
-// "home" (`h`, `base`, `root`). Top-level src/*.ts only, like
-// count-plurals.test.ts -- every non-test source file is top-level today, and
-// tests compare paths they built themselves. Comment lines are skipped: prose
-// quoting the old shape (this file's siblings do) is not a comparison.
-
-const SRC_DIR = fileURLToPath(new URL("..", import.meta.url));
+// "home" (`h`, `base`, `root`). Source only -- tests compare paths they built
+// themselves. Comment lines are skipped: prose quoting the old shape (this
+// file's siblings do) is not a comparison.
+//
+// The walk is `sourceFiles()`, the RECURSIVE walker every source-shape scan in
+// this suite shares. It used to be `readdirSync(src/)` with no recursion:
+// every source file is top-level today, so that saw all of them -- but the
+// coverage rested on a comment saying so, and one `src/targets/` would have
+// made it scan a fraction of the tree in silence.
 
 /** A `.startsWith(` whose argument opens with an identifier naming a home
  *  dir -- `home`, `opts.home`, `homeDir`, `userHome`, `os.homedir()`,
@@ -101,11 +102,11 @@ describe("no raw startsWith(home) comparison in src", () => {
 
   it("finds none -- home-relative checks go through tildePath or isUnderHome", () => {
     const offenders: string[] = [];
-    for (const file of readdirSync(SRC_DIR)) {
-      if (!file.endsWith(".ts")) continue;
-      const source = readFileSync(join(SRC_DIR, file), "utf8");
-      const lines = source.split("\n");
-      for (const n of rawHomePrefixLines(source)) offenders.push(`${file}:${n}  ${lines[n - 1].trim().slice(0, 100)}`);
+    for (const file of sourceFiles()) {
+      const lines = file.text.split("\n");
+      for (const n of rawHomePrefixLines(file.text)) {
+        offenders.push(`${file.path}:${n}  ${lines[n - 1].trim().slice(0, 100)}`);
+      }
     }
     expect(
       offenders,

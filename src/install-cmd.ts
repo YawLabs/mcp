@@ -60,11 +60,13 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
+import { CLAUDE_CODE_ALLOW_PATTERN, prepareClaudeCodeSettingsPatch } from "./claude-code-settings.js";
+import { clientChoices, resolveClientArg } from "./client-aliases.js";
+import { reloadDoneClause } from "./client-config.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
   blockedContainerFix,
   buildLaunchEntry,
-  CLAUDE_CODE_ALLOW_PATTERN,
   CURRENT_OS,
   claudeCodeContainerPaths,
   describeJsonShape,
@@ -75,10 +77,10 @@ import {
   type InstallClientId,
   type InstallOS,
   type InstallScope,
+  type InstallTarget,
   isProjectLocalEntry,
   LEGACY_ENTRY_NAMES,
   resolveAppDataDir,
-  resolveClaudeCodeSettingsPath,
   resolveInstallPath,
   unparseableConfigFix,
 } from "./install-targets.js";
@@ -217,6 +219,14 @@ export interface InstallCommandOptions {
    *  is never deferred: it differs per client, and it is what the user needs
    *  to pick between --repair, --force and --skip. */
   deferCollisionHint?: boolean;
+  /** The table `--all` plans from. Defaults to INSTALL_TARGETS, and no CLI
+   *  flag sets it: it exists because INSTALL_TARGETS is a READONLY array --
+   *  the append-only row order is an invariant `try`'s auto-detect depends on,
+   *  so nothing may reorder or narrow it at runtime -- while one closing line
+   *  ("1/1 client installed successfully") is reachable only from a plan of
+   *  exactly one, and no OS plans one. Passing a narrower table here is how
+   *  that line gets exercised without the test mutating the shared array. */
+  targets?: readonly InstallTarget[];
 }
 
 /** The oam-absent Runtime line. Shared so `--all`'s single copy and the
@@ -396,7 +406,11 @@ export interface InstallResult {
 }
 
 const USAGE =
-  "Usage: yaw-mcp install <claude-code|claude-desktop|cursor|vscode|windsurf|gemini-cli> [--scope user|project|local]\n" +
+  // DERIVED, never a hand-kept list: `parseInstallArgs` validates against
+  // `clientChoices("install")`, so a literal synopsis is a promise the parser
+  // stops keeping the moment a client or an alias lands -- it reads as a
+  // refusal that never happens.
+  `Usage: yaw-mcp install <${clientChoices("install").join("|")}> [--scope user|project|local]\n` +
   "                       [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                       [--force | --repair | --skip] [--keep-legacy] [--dry-run]\n" +
   "       yaw-mcp install --list  (detect clients; no writes)\n" +
@@ -484,6 +498,17 @@ export function clientUnavailableMessage(
 ): string {
   const reason = target.notConfigurableOn?.[os];
   if (reason === undefined) return `yaw-mcp ${cmd}: ${target.label} is not available on ${os}.\n  ${genericFix}`;
+  // The two clients the remedy names are the FIRST TWO in table order that are
+  // configurable on this OS and are not the one being refused -- not a
+  // hand-kept pair. Table order is claude-code then cursor, so today's bytes
+  // ("Claude Code or Cursor", "--client claude-code or --client cursor") are
+  // reproduced exactly, and they stay put when a row is APPENDED. A literal
+  // pair here would have to be re-judged by every landing client, and
+  // "every configurable client" would rewrite the sentence each time.
+  const alternatives = INSTALL_TARGETS.filter(
+    (t) => t.clientId !== target.clientId && t.availableOn.includes(os) && t.notConfigurableOn?.[os] === undefined,
+  ).slice(0, 2);
+  const orList = (parts: string[]): string => parts.join(" or ");
   // Per verb, because "use another client" means something different to each.
   // uninstall has nothing of yaw-mcp's to take back on an OS it never writes
   // to: any entry there is one the user added, so removing it is theirs too.
@@ -497,10 +522,12 @@ export function clientUnavailableMessage(
         'Add those servers to yaw-mcp yourself instead: `yaw-mcp add <slug>` for a catalog server, or `yaw-mcp add <name> --command "<launch line>"` for any other.';
       break;
     case "try":
-      fix = "Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.";
+      fix = `Pick another client, such as ${orList(
+        alternatives.map((t) => `--client ${t.clientId}`),
+      )}, or add the entry by hand.`;
       break;
     default:
-      fix = "Install into Claude Code or Cursor instead, or add the entry by hand.";
+      fix = `Install into ${orList(alternatives.map((t) => t.label))} instead, or add the entry by hand.`;
   }
   return `yaw-mcp ${cmd}: ${target.label} on ${os} is not supported yet.\n  ${reason}.\n  ${fix}`;
 }
@@ -925,7 +952,16 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // path to write", which stays on npx exactly like oam-absent does.
   const oamBinPath = oamProbeResult.binPath;
   const oamEntry = oamBinPath ? resolveEntry("@yawlabs/mcp") : null;
-  const newEntry = buildLaunchEntry({ os, oamBinPath, oamEntry });
+  // The Windows launch policy is the ROW's, read from `entry.windowsLaunch`
+  // rather than from a client-id branch here: `bare` is for a client that
+  // resolves the `.cmd` shim itself, and the default stays the `cmd /c` wrap
+  // every other client needs, so the six existing rows are unchanged.
+  const newEntry = buildLaunchEntry({
+    os,
+    oamBinPath,
+    oamEntry,
+    windowsWrap: target.entry?.windowsLaunch?.broker !== "bare",
+  });
   // Every fallback gets a reason. The npx entry is the right outcome in all of
   // them, but "I installed oam and it still runs on node" is unexplainable from
   // the outside, and a silent below-min / broken / unresolvable oam is
@@ -1519,7 +1555,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     target.clientId === "claude-code" && scope === "project"
       ? `\nDone: ${target.label} is configured. Restart it in this project and approve the .mcp.json server when ` +
           "prompted -- Claude Code keeps project-scope (.mcp.json) servers disabled until you approve them."
-      : `\nDone: ${target.label} is configured. Restart it to pick up the new MCP server.`,
+      : // How the client picks the change up is the ROW's fact, not this
+        // line's: a client that watches its config file must not be told to
+        // restart, and one that needs a window reload must not be told the
+        // editor. `reload` defaults to "restart", whose clause is what every
+        // pre-existing row printed, byte for byte.
+        `\nDone: ${target.label} is configured. ${reloadDoneClause(target.reload, target.label)}`,
   );
   return { written, wouldWrite: [], messages, exitCode: 0 };
 }
@@ -1542,225 +1583,15 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
  *  pre-empt, the comment-preserving splice of exactly the `allow` node -- is
  *  delicate and had to be identical on both sides. `uninstall` copying it
  *  would have been a second place for that reasoning to drift. */
-async function prepareClaudeCodeSettingsPatch(opts: {
-  scope: InstallScope;
-  home: string;
-  projectDir: string | undefined;
-  claudeConfigDir: string | undefined;
-  /** "add" (install) unions the pattern in; "remove" (uninstall) drops it. */
-  op?: "add" | "remove";
-}): Promise<{
-  path: string;
-  nextJson: string;
-  changed: boolean;
-  /** The patterns this patch appends to `permissions.allow` -- the whole
-   *  delta, since the merge only ever adds. What `--dry-run` prints instead of
-   *  `nextJson`, which is the entire settings.json (hooks, `env`, ...). Empty
-   *  when nothing changed, and empty under `op: "remove"` (see `removed`). */
-  added: string[];
-  /** The mirror of `added` under `op: "remove"` -- the patterns this patch
-   *  drops. Empty on the add path. */
-  removed: string[];
-  /** stat of the file taken ahead of the read; null when it was absent. */
-  fingerprint: FileFingerprint;
-  malformed?: boolean;
-  malformedReason?: string;
-} | null> {
-  const path = resolveClaudeCodeSettingsPath(opts.scope, {
-    home: opts.home,
-    projectDir: opts.projectDir,
-    claudeConfigDir: opts.claudeConfigDir,
-  });
-  if (!path) return null;
-
-  let existing: Record<string, unknown> = {};
-  // Raw bytes of the pre-existing settings.json, for the same reason install
-  // keeps the client config's: settings.json is JSONC and hand-maintained,
-  // and a JSON.stringify rewrite drops every comment in it.
-  let rawSettings: string | null = null;
-  // Fingerprinted BEFORE the read, for the same reason the client config is
-  // (runInstall, ahead of its readFile): taken after, a write landing between
-  // the read and the stat would be carried forward under a fresh fingerprint.
-  // null is "absent", which is the existence test this used to be an
-  // existsSync for; an unreadable file still reaches the readFile below and
-  // is reported from there.
-  const fingerprint = await fileFingerprint(path);
-  if (fingerprint !== null) {
-    try {
-      const raw = await readFile(path, "utf8");
-      if (raw.trim().length > 0) {
-        const parsed = parseJsonc(raw);
-        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-          existing = parsed as Record<string, unknown>;
-          rawSettings = raw;
-        } else {
-          // Not an object — leave alone, but flag it so the caller can warn
-          // (otherwise the settings.json is silently never patched).
-          return {
-            path,
-            nextJson: "",
-            changed: false,
-            added: [],
-            removed: [],
-            malformed: true,
-            malformedReason: "not a JSON object",
-            fingerprint,
-          };
-        }
-      }
-    } catch (e) {
-      // Malformed settings.json — don't try to rewrite; flag it so the
-      // caller can warn (let the user fix it by hand).
-      return {
-        path,
-        nextJson: "",
-        changed: false,
-        added: [],
-        removed: [],
-        malformed: true,
-        malformedReason: (e as Error).message,
-        fingerprint,
-      };
-    }
-  }
-
-  const op = opts.op ?? "add";
-  const merged =
-    op === "remove"
-      ? removePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN])
-      : mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
-  // If nothing changed, signal no-op to the caller.
-  const before = JSON.stringify(existing);
-  const after = JSON.stringify(merged);
-  if (before === after) return { path, nextJson: "", changed: false, added: [], removed: [], fingerprint };
-  // The delta is "our patterns that were not already there" (add) or "ours that
-  // were" (remove): both helpers preserve every other element, so a membership
-  // test against the PREVIOUS list is the whole change either way.
-  const prevAllow = (existing.permissions as { allow?: unknown } | undefined)?.allow;
-  const prevAllowList: unknown[] = Array.isArray(prevAllow) ? prevAllow : [];
-  const added = op === "add" ? [CLAUDE_CODE_ALLOW_PATTERN].filter((p) => !prevAllowList.includes(p)) : [];
-  const removed = op === "remove" ? [CLAUDE_CODE_ALLOW_PATTERN].filter((p) => prevAllowList.includes(p)) : [];
-  if (rawSettings !== null) {
-    // Pre-empt the one shape that makes the splice below throw: a `permissions`
-    // key holding a non-object (null, a scalar, an array) has no `allow` node
-    // to hang the pattern off, and jsonc-parser's message for it ("Can not add
-    // index to parent of type array") names neither the file nor the key --
-    // exactly the internal text the client-config path takes care never to
-    // print. Named here instead, in the same shape vocabulary that path uses.
-    //
-    // Reported, NOT repaired -- deliberately asymmetric with the client config.
-    // There, replacing an empty container is the difference between installing
-    // and not; here the patch is best-effort (the launch entry is already
-    // written), settings.json is hand-maintained, and rewriting a key the user
-    // put there is a bigger liberty than naming it and letting them fix it.
-    const blockedPermissions = findBlockedContainerSegment(existing, ["permissions"]);
-    if (blockedPermissions) {
-      return {
-        path,
-        nextJson: "",
-        changed: false,
-        added: [],
-        removed: [],
-        malformed: true,
-        malformedReason: `"permissions" is ${describeJsonShape(blockedPermissions.value)}, not a JSON object`,
-        fingerprint,
-      };
-    }
-    // Only `permissions.allow` changes, so edit exactly that node in the
-    // original bytes. Everything else -- hooks, model, comments, formatting --
-    // is left untouched rather than re-serialized.
-    const nextAllow = (merged.permissions as { allow: string[] }).allow;
-    try {
-      const next = editJsoncEntry(rawSettings, ["permissions"], "allow", nextAllow);
-      return { path, nextJson: next.endsWith("\n") ? next : `${next}\n`, changed: true, added, removed, fingerprint };
-    } catch (e) {
-      // Backstop for whatever the shape check above cannot foresee. Named the
-      // same way, so even here the user gets the key alongside the parser's
-      // text rather than the text alone.
-      return {
-        path,
-        nextJson: "",
-        changed: false,
-        added: [],
-        removed: [],
-        malformed: true,
-        malformedReason: `could not splice permissions.allow (${(e as Error).message})`,
-        fingerprint,
-      };
-    }
-  }
-  return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true, added, removed, fingerprint };
-}
-
-/** Union `patterns` into `existing.permissions.allow`, preserving every
- *  other key and every element already there. Deduplicates by string equality
- *  so repeated installs don't grow the list.
+/** The Claude Code `permissions.allow` grant moved to claude-code-settings.ts
+ *  when the splice changed from replacing the whole array to editing its one
+ *  member (a comment inside the list used to be deleted by every install and
+ *  every uninstall). Re-exported here because the tests that pin the merge and
+ *  the removal import them from this module.
  *
- *  Deliberately NOT a place that strips the pre-rename legacy wildcards
- *  (`mcp__yaw_mcp__*`, `mcp__mcph__*`, `mcp__mcp_hosting__*`). An earlier
- *  version dropped them unless the legacy mcpServers entry was still present
- *  in the ONE container install was writing -- but ~/.claude/settings.json is
- *  global, so a user-scope install could not see the legacy `yaw-mcp` entry a
- *  repo's .mcp.json (or another project's local scope) still runs, stripped
- *  its grant, and Claude Code re-prompted on every tool call of that live
- *  server. No cheap read sees every container a global allow-list covers.
- *  Three dead wildcards are harmless; a revoked live grant is not.
- *
- *  That reasoning SURVIVES the legacy-entry trim runInstall now performs, and
- *  the two must not be conflated: the trim removes the legacy key from the one
- *  container this run writes, while the allow-list it would have to strip is
- *  machine-global and may still be serving a legacy entry in a container this
- *  run never reads. Same asymmetry, same conclusion -- the entry goes, the
- *  wildcard stays.
- *  Exported for tests. */
-export function mergePermissionsAllow(existing: Record<string, unknown>, patterns: string[]): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...existing };
-  const prev = out.permissions;
-  const perms: Record<string, unknown> =
-    typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
-  const prevAllow = perms.allow;
-  // Every existing element is carried through VERBATIM, non-strings included.
-  // The dedupe below is a string-only concept, so a pass that narrowed to
-  // string silently DELETED anything else the user (or a future Claude Code
-  // schema) had put in `permissions.allow` -- an object rule, a nested array --
-  // on the next install, contradicting this function's own promise to preserve
-  // everything it does not manage.
-  const allow: unknown[] = Array.isArray(prevAllow) ? [...(prevAllow as unknown[])] : [];
-  for (const p of patterns) {
-    if (!allow.includes(p)) allow.push(p);
-  }
-  perms.allow = allow;
-  out.permissions = perms;
-  return out;
-}
-
-/**
- * The subtract side of `mergePermissionsAllow`: drop `patterns` from
- * `existing.permissions.allow`, preserving every other key and every other
- * element (non-strings included, for the same preserve-what-we-do-not-manage
- * reason the merge carries them).
- *
- * Returns the SAME object reference when there is nothing to drop -- no
- * `permissions` key, no `allow` array, or no member matching. The caller's
- * `JSON.stringify(before) === JSON.stringify(after)` no-op test then trivially
- * holds, which is what keeps `uninstall` from rewriting a settings.json it has
- * no change to make to.
- *
- * An emptied `allow` is left as `[]` rather than deleted, and `permissions`
- * with it. Deleting a key the user's file declares is a bigger liberty than
- * this best-effort patch is entitled to -- the same asymmetry the install path
- * draws when it REPORTS a non-object `permissions` instead of repairing it.
- * Exported for tests.
- */
-export function removePermissionsAllow(existing: Record<string, unknown>, patterns: string[]): Record<string, unknown> {
-  const prev = existing.permissions;
-  if (typeof prev !== "object" || prev === null || Array.isArray(prev)) return existing;
-  const prevAllow = (prev as Record<string, unknown>).allow;
-  if (!Array.isArray(prevAllow)) return existing;
-  const allow = (prevAllow as unknown[]).filter((p) => !(typeof p === "string" && patterns.includes(p)));
-  if (allow.length === (prevAllow as unknown[]).length) return existing;
-  return { ...existing, permissions: { ...(prev as Record<string, unknown>), allow } };
-}
+ *  `prepareClaudeCodeSettingsPatch` is imported, not re-exported: nothing
+ *  outside this file calls it. */
+export { mergePermissionsAllow, removePermissionsAllow } from "./claude-code-settings.js";
 
 /** The fields a concurrent writer moves; null when the file is absent. Used
  *  to detect a write that lands between install's read of a file and its
@@ -2201,14 +2032,22 @@ export function parseInstallArgs(argv: string[]):
 
   if (positional.length !== 1)
     return { ok: false, error: `Expected exactly one client argument, got ${positional.length}.\n${USAGE}` };
-  const clientId = positional[0] as InstallClientId;
-  if (!INSTALL_TARGETS.some((t) => t.clientId === clientId)) {
+  // One resolver for every client-taking verb, so an alias is accepted
+  // wherever the id is and the cast to InstallClientId happens in exactly one
+  // place -- here it is the resolver's return type, not an assertion about a
+  // string nobody checked.
+  const resolved = resolveClientArg("install", positional[0]);
+  if (!resolved) {
     return {
       ok: false,
-      error: `Unknown client: ${clientId}. Choose: ${INSTALL_TARGETS.map((t) => t.clientId).join(", ")}`,
+      error: `Unknown client: ${positional[0]}. Choose: ${clientChoices("install").join(", ")}`,
     };
   }
-  opts.clientId = clientId;
+  opts.clientId = resolved.clientId;
+  // An alias may pin a scope. It is applied as the DEFAULT, so an explicit
+  // --scope the user typed beside it still wins -- an alias that overrode the
+  // flag next to it would be a silent surprise.
+  if (resolved.scope !== undefined && opts.scope === undefined) opts.scope = resolved.scope;
   return { ok: true, options: opts as InstallCommandOptions };
 }
 
@@ -2386,7 +2225,7 @@ async function runInstallAll(
   messages: string[],
 ): Promise<InstallResult> {
   const os = opts.os ?? CURRENT_OS;
-  const targets = INSTALL_TARGETS.filter((t) => t.availableOn.includes(os));
+  const targets = (opts.targets ?? INSTALL_TARGETS).filter((t) => t.availableOn.includes(os));
   if (targets.length === 0) {
     err(`yaw-mcp install --all: no installable clients on ${os}.`);
     // `messages`, not [] -- the err() above (and any deprecation warning
@@ -2608,11 +2447,12 @@ export const INSTALL_USAGE = USAGE;
 // ---------------------------------------------------------------------------
 
 const UNINSTALL_USAGE =
-  // Every client INSTALL_TARGETS carries, because that array is what the
-  // parser validates against -- uninstall has accepted windsurf and gemini-cli
-  // since they were added to it, and a usage line naming only the first four
-  // reads as a refusal that never happens.
-  `Usage: yaw-mcp uninstall <${INSTALL_TARGETS.map((t) => t.clientId).join("|")}> [--scope user|project|local]\n` +
+  // Every name the parser accepts, because `clientChoices` is what it
+  // validates against -- uninstall has accepted windsurf and gemini-cli since
+  // they were added to the table, and a usage line naming only the first four
+  // reads as a refusal that never happens. Aliases ride along for the same
+  // reason, at the end, after the real clients.
+  `Usage: yaw-mcp uninstall <${clientChoices("uninstall").join("|")}> [--scope user|project|local]\n` +
   "                         [--project-dir <path>] [--os macos|linux|windows]\n" +
   "                         [--force | -y] [--keep-legacy] [--dry-run]\n" +
   "\n" +
@@ -2725,14 +2565,18 @@ export function parseUninstallArgs(
 
   if (positional.length !== 1)
     return { ok: false, error: `Expected exactly one client argument, got ${positional.length}.\n${UNINSTALL_USAGE}` };
-  const clientId = positional[0] as InstallClientId;
-  if (!INSTALL_TARGETS.some((t) => t.clientId === clientId)) {
+  // Same resolver as install's, so uninstall takes exactly the names install
+  // does -- an alias you can install with but not uninstall with is the worst
+  // shape this could have.
+  const resolved = resolveClientArg("uninstall", positional[0]);
+  if (!resolved) {
     return {
       ok: false,
-      error: `Unknown client: ${clientId}. Choose: ${INSTALL_TARGETS.map((t) => t.clientId).join(", ")}`,
+      error: `Unknown client: ${positional[0]}. Choose: ${clientChoices("uninstall").join(", ")}`,
     };
   }
-  opts.clientId = clientId;
+  opts.clientId = resolved.clientId;
+  if (resolved.scope !== undefined && opts.scope === undefined) opts.scope = resolved.scope;
   return { ok: true, options: opts as UninstallCommandOptions };
 }
 

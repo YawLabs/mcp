@@ -519,16 +519,16 @@ describe("every existing client and scope expresses itself through this model", 
           const where: ConfigSite = {
             id: "default",
             label: target.label,
-            format: effectiveConfigFormat({ format: "jsonc", root: resolved.containerPath.at(-1) as string }),
+            format: effectiveConfigFormat(target.config, spec),
             resolved,
             detectDir: null,
           };
           // The container key every consumer used to hard-code is the last
-          // segment of the resolved path -- "servers" for VS Code, "mcpServers"
-          // for everyone else -- and the adapter reads it from the address.
-          expect(resolved.containerPath.at(-1), `${target.clientId}/${spec.scope}`).toBe(
-            target.clientId === "vscode" ? "servers" : "mcpServers",
-          );
+          // segment of the resolved path, and it is the row's own
+          // `config.root` -- "servers" for VS Code, "context_servers" for Zed,
+          // "mcpServers" for the rest. The adapter reads it from the address,
+          // never from a client id.
+          expect(resolved.containerPath.at(-1), `${target.clientId}/${spec.scope}`).toBe(target.config.root);
           const view = classifyClientConfig(null, where);
           expect(view.read.kind, `${target.clientId}/${spec.scope}/${os}`).toBe("absent");
           const written = applyClientConfigEdits(view, [{ op: "upsert", key: "mcp", entry: ENTRY }], where);
