@@ -83,6 +83,10 @@ const NUL = String.fromCharCode(0x00);
 // assertion is unambiguously two bytes in the fixture, not one escape.
 const BS = String.fromCharCode(0x5c);
 const QUOTE = String.fromCharCode(0x22);
+/** The server name g25's literal-quoted header spells: `C:\temp\`. Built from
+ *  the same code point, so the test and the fixture cannot disagree about how
+ *  many backslashes there are. */
+const WIN_KEY = `C:${BS}temp${BS}`;
 
 const lf = (...lines: string[]): string => `${lines.join("\n")}\n`;
 
@@ -145,6 +149,55 @@ describe("the fixtures on disk", () => {
       const code = raw.charCodeAt(i);
       expect(code >= 0x20 || code === 0x0a, `raw control byte 0x${code.toString(16)} at offset ${i}`).toBe(true);
     }
+  });
+
+  it("g23 and g25 still hold the backslashes their structural tests are about", () => {
+    // g23's point is ONE backslash, at the end of a literal string inside an
+    // array (`['C:\', 'x']`): the `'` after it closes the string and the `]`
+    // after that closes the array, so a scanner that treats the backslash as
+    // an escape loses both. g25's point is a literal-quoted HEADER KEY holding
+    // two, and its expected file holding the four that spell the same key as a
+    // basic string. Counted here, from the file, because a layer between the
+    // editor and disk halving or doubling them would leave every assertion in
+    // the structural tests passing about a different document.
+    const g23in = fixture("g23-string-structural", "input.toml");
+    expect(g23in).toContain(`paths = ['C:${BS}', 'x']`);
+    expect(g23in.split(BS)).toHaveLength(2);
+    expect(fixture("g23-string-structural", "expected.toml").split(BS)).toHaveLength(2);
+
+    const g25in = fixture("g25-literal-key-backslash", "input.toml");
+    expect(g25in).toContain(`[mcp_servers.'C:${BS}temp${BS}']`);
+    expect(g25in.split(BS)).toHaveLength(3);
+    const g25out = fixture("g25-literal-key-backslash", "expected.toml");
+    expect(g25out).toContain(`[mcp_servers.${QUOTE}C:${BS}${BS}temp${BS}${BS}${QUOTE}]`);
+    expect(g25out.split(BS)).toHaveLength(5);
+    // Both spellings name the SAME server, which is the whole point.
+    expect(tomlEntryNames(readTomlConfig(g25in, CONTAINER))).toContain(WIN_KEY);
+    expect(tomlEntryNames(readTomlConfig(g25out, CONTAINER))).toContain(WIN_KEY);
+
+    // No escape collapsed into the byte it denotes on the way in, in any of
+    // the four new fixtures. LF is the only sub-0x20 byte they may hold; a raw
+    // control byte would be invisible in `git diff`, which calls the file
+    // binary and prints no hunks at all.
+    for (const dir of [
+      "g22-comment-structural",
+      "g23-string-structural",
+      "g24-indented",
+      "g25-literal-key-backslash",
+    ]) {
+      for (const file of ["input.toml", "expected.toml"]) {
+        const raw = fixture(dir, file);
+        for (let i = 0; i < raw.length; i++) {
+          const code = raw.charCodeAt(i);
+          expect(code >= 0x20 || code === 0x0a, `${dir}/${file}: control byte 0x${code.toString(16)} at ${i}`).toBe(
+            true,
+          );
+        }
+      }
+    }
+    // g24 is about INDENTATION, so its leading whitespace has to survive too.
+    expect(fixture("g24-indented", "input.toml").startsWith("  [mcp_servers.other]")).toBe(true);
+    expect(fixture("g24-indented", "expected.toml").startsWith("  [mcp_servers.other]")).toBe(true);
   });
 
   it("g21 still holds the escaped quote that only the mlBasic skip gets past", () => {
@@ -751,6 +804,9 @@ describe("upsert -- byte-exact", () => {
     ["g19-own-hash-close", "expected.toml", BROKER, [], "replaces our own table whose string ends on a `#` line"],
     ["g20-backslash", "expected.toml", BROKER, [], "keeps every escaped backslash and quote around the edit"],
     ["g21-mlbasic-escaped-quote", "expected.toml", BROKER, [], "replaces our table below a sibling's escaped quote"],
+    ["g22-comment-structural", "expected.toml", BROKER, [], "replaces our table below a `[` inside a comment"],
+    ["g23-string-structural", "expected.toml", BROKER, [], "replaces our table below a `[` inside single-line strings"],
+    ["g24-indented", "expected.toml", BROKER, [], "replaces an INDENTED table, and keeps the sibling's indent"],
   ];
   for (const [id, expectedFile, entry, legacy, what] of cases) {
     it(`${id}: ${what}`, () => {
@@ -1204,6 +1260,464 @@ describe("canon and post-write verification", () => {
   // wrong -- so there is nothing for the check to catch and nothing to assert.
   // It stays because the cost is one parse and the thing it guards against is
   // a future scanner change, not a present bug.
+});
+
+describe("a byte that only LOOKS structural", () => {
+  // THE CLASS, pinned as a class rather than one instance at a time.
+  //
+  // The scanner carries several guards whose whole job is to decide that a
+  // `[`, a `#`, a quote or a backslash is CONTENT -- inside a comment, inside
+  // a string, inside a value that spans lines. Delete any one of them and
+  // `scanTomlSections` stops seeing a table that is really there; `upsert`
+  // then finds no `[mcp_servers.mcp]` section, falls through to the generic
+  // shape, and refuses with
+  //
+  //     the "mcp" entry is not written as a [mcp_servers.mcp] table
+  //
+  // on a file real codex-cli 0.144.0 loads without complaint. Three rounds
+  // each found ONE more of these, fixed it, and left the siblings unguarded,
+  // so this block enumerates the guards instead: every case below was measured
+  // by deleting (or, where the defect would be ADDING one, inserting) the
+  // guard and watching this file go red.
+  //
+  // Every input here was handed to a real codex-cli 0.144.0 under a scratch
+  // CODEX_HOME (`codex mcp list --json`, read-only) and came back listing BOTH
+  // servers -- so "the scanner missed it" is never "the file was broken".
+
+  const bothServers = (raw: string, extra: string[] = []) => {
+    const read = readTomlConfig(raw, CONTAINER, [ENTRY]);
+    expect(read.kind, JSON.stringify(raw)).toBe("ok");
+    expect(tomlEntryNames(read).sort()).toEqual([ENTRY, "other", ...extra].sort());
+  };
+
+  it("a `[` or a quote run inside a COMMENT is prose (g22)", () => {
+    // `# TODO: fix the [broken thing` is an ordinary thing to find in a config.
+    // Without the `#` skip in scanSpan's normal state the `[` counts as an open
+    // value-bracket, every following line reads as bracket continuation, and
+    // BOTH headers vanish from the scan. The second comment is the worse half:
+    // a `"""` in prose opens a multi-line string that swallows the rest of the
+    // file.
+    const raw = fixture("g22-comment-structural", "input.toml");
+    expect(raw).toContain("# TODO: fix the [broken thing");
+    expect(raw).toContain(`${QUOTE.repeat(3)} and an apostrophe run '''`);
+    const scan = scanTomlSections(raw);
+    expect(scan.sections.map((s) => s.keyPath)).toEqual([
+      ["mcp_servers", "other"],
+      ["mcp_servers", "mcp"],
+    ]);
+    expect(scan.continuedLines.size).toBe(0);
+    bothServers(raw);
+  });
+
+  it("a `[` inside a single-line string is text, in both quote styles (g23)", () => {
+    // Three separate guards meet on this fixture, and none of them had a test:
+    // ENTERING literal state on a `'`, LEAVING it on the closing `'`, and NOT
+    // treating a backslash inside a literal string as an escape. Each failure
+    // leaves an open bracket counted that should not have been, and the
+    // depth carries down the file over `[mcp_servers.mcp]`.
+    const raw = fixture("g23-string-structural", "input.toml");
+    expect(raw).toContain("literal = 'an opening [ inside a literal string'");
+    expect(raw).toContain(`basic = ${QUOTE}an opening [ inside a basic string${QUOTE}`);
+    // A literal string that ENDS in a backslash, inside an array: a backslash
+    // is an ordinary character in a literal string, so the `'` after it really
+    // does close it and the `]` after THAT really does close the array.
+    expect(raw).toContain(`paths = ['C:${BS}', 'x']`);
+    expect(raw.split(BS)).toHaveLength(2); // exactly one backslash, and it is that one
+    const scan = scanTomlSections(raw);
+    expect(scan.sections.map((s) => s.keyPath)).toEqual([
+      ["mcp_servers", "other"],
+      ["mcp_servers", "mcp"],
+    ]);
+    expect(scan.continuedLines.size).toBe(0);
+    bothServers(raw);
+  });
+
+  it("an INDENTED header is still a header, with spaces or with a tab (g24)", () => {
+    // TOML allows leading whitespace before a header and before a key, and
+    // nothing in the fixture set used it -- so the scanner's own leading-space
+    // skip, and `isHorizontalSpace` counting a TAB, were both deletable in
+    // silence. Either one turns an indented config into "your mcp entry is not
+    // written as a [mcp_servers.mcp] table".
+    for (const raw of [
+      fixture("g24-indented", "input.toml"),
+      lf("\t[mcp_servers.other]", '\tcommand = "node"', "", "\t[mcp_servers.mcp]", '\tcommand = "old"'),
+    ]) {
+      const scan = scanTomlSections(raw);
+      expect(
+        scan.sections.map((s) => s.keyPath),
+        JSON.stringify(raw),
+      ).toEqual([
+        ["mcp_servers", "other"],
+        ["mcp_servers", "mcp"],
+      ]);
+      bothServers(raw);
+      expect(() => upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER)).not.toThrow();
+    }
+  });
+
+  it("a literal-quoted header key keeps its backslashes (g25)", () => {
+    // `[mcp_servers.'C:\temp\']` names the server `C:\temp\` -- codex 0.144.0
+    // lists it under exactly that name. Two guards keep the scanner agreeing:
+    // readQuoted must NOT treat the backslash as an escape in a literal (or
+    // the closing quote is eaten and the header disappears), and readKeyPath
+    // must NOT run a literal segment through decodeBasicBody (or `\t` becomes
+    // a TAB and the decoded name stops matching).
+    const raw = fixture("g25-literal-key-backslash", "input.toml");
+    expect(raw).toContain(`[mcp_servers.'C:${BS}temp${BS}']`);
+    expect(raw.split(BS)).toHaveLength(3); // two backslashes, both in that key
+    const scan = scanTomlSections(raw);
+    expect(scan.sections.map((s) => s.keyPath)).toEqual([
+      ["mcp_servers", WIN_KEY],
+      ["mcp_servers", ENTRY],
+    ]);
+    // The scanner's decoded key and the PARSER's key are the same string --
+    // which is the only thing that makes a span splice safe.
+    expect(tomlEntryNames(readTomlConfig(raw, CONTAINER))).toEqual([WIN_KEY, ENTRY]);
+    // ...and the entry is spliceable under that name, byte for byte. The
+    // rendered header switches to the basic spelling, which is the same key.
+    expect(upsertTomlEntry(raw, CONTAINER, WIN_KEY, BROKER)).toBe(
+      fixture("g25-literal-key-backslash", "expected.toml"),
+    );
+    expect(
+      tomlEntryFields(readTomlConfig(fixture("g25-literal-key-backslash", "expected.toml"), CONTAINER), WIN_KEY),
+    ).toEqual(entryAsWritten(BROKER));
+  });
+
+  it("decodes every escape codex accepts in a quoted header key, to the same character the parser does", () => {
+    // decodeBasicBody has one `case` per escape and NOT ONE of them was
+    // covered: each was individually deletable with the suite green, and each
+    // deletion makes the scanner's decoded key stop matching the parser's, so
+    // the table is "not written as a [...] table".
+    //
+    // The set is not invented. codex 0.144.0's own parse error names it --
+    // "missing escaped value, expected `b`, `e`, `f`, `n`, `r`, `\`, `"`,
+    // `x`, `u`, `U`" -- and `\t` loads as well despite being absent from that
+    // message. `\e` and `\xNN` are TOML 1.1 additions, and BOTH smol-toml
+    // 1.8.0 and codex 0.144.0 accept them, so they are reachable on a file the
+    // client loads and not merely defensive.
+    const escapes: Array<[string, string]> = [
+      ["b", String.fromCharCode(0x08)],
+      ["t", String.fromCharCode(0x09)],
+      ["n", String.fromCharCode(0x0a)],
+      ["f", String.fromCharCode(0x0c)],
+      ["r", String.fromCharCode(0x0d)],
+      ["e", String.fromCharCode(0x1b)],
+      [QUOTE, QUOTE],
+      [BS, BS],
+      ["u00e9", String.fromCharCode(0xe9)],
+      ["U0001F600", String.fromCodePoint(0x1f600)],
+      ["x41", "A"],
+    ];
+    for (const [spelling, decoded] of escapes) {
+      const raw = lf(`[mcp_servers.${QUOTE}a${BS}${spelling}b${QUOTE}]`, 'command = "node"');
+      const name = `a${decoded}b`;
+      // The parser agrees the key is that string...
+      expect(Object.keys((parseTomlConfig(raw) as { mcp_servers: object }).mcp_servers), spelling).toEqual([name]);
+      // ...and so does the scanner, which is the claim under test.
+      expect(
+        scanTomlSections(raw).sections.map((s) => s.keyPath),
+        spelling,
+      ).toEqual([["mcp_servers", name]]);
+      // ...so the entry is spliceable under it rather than refused.
+      expect(() => upsertTomlEntry(raw, CONTAINER, name, { command: "npx" }), spelling).not.toThrow();
+    }
+  });
+
+  it("a `#` or a backslash INSIDE a multi-line block is content, not structure", () => {
+    // The mirror image of the guards above: these are guards that must NOT
+    // exist. Adding the `#` comment skip to either multi-line state, or the
+    // in-string backslash skip to the LITERAL ones, is the obvious symmetry
+    // fix and it is wrong -- a multi-line literal has no escapes at all, and a
+    // `#` inside any block is just a character. Each of the three was
+    // inserted and this file stayed green until these assertions existed.
+    const TICK = String.fromCharCode(0x27);
+    const shapes: Array<[string, string]> = [
+      // The terminator sits ON the `#` line, so a comment skip eats it.
+      ["mlBasic, # line carries the terminator", `note = ${QUOTE.repeat(3)}line1\n# closes it${QUOTE.repeat(3)}`],
+      ["mlLiteral, # line carries the terminator", `note = ${TICK.repeat(3)}line1\n# closes it${TICK.repeat(3)}`],
+      // A backslash immediately before the terminator, which a literal string
+      // does not escape -- so `'''` really does close it.
+      ["mlLiteral, backslash before the terminator", `note = ${TICK.repeat(3)}a${BS}${TICK.repeat(3)}`],
+    ];
+    for (const [label, value] of shapes) {
+      const raw = `[mcp_servers.other]\ncommand = "node"\n${value}\n\n[mcp_servers.mcp]\ncommand = "old"\n`;
+      const scan = scanTomlSections(raw);
+      expect(
+        scan.sections.map((s) => s.keyPath),
+        label,
+      ).toEqual([
+        ["mcp_servers", "other"],
+        ["mcp_servers", "mcp"],
+      ]);
+      bothServers(raw);
+      // ...and the sibling's block stays whole: our table goes after it.
+      expect(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER), label).toContain(value);
+    }
+  });
+
+  it("a multi-line INLINE table's lines are its value, not the container's", () => {
+    // `other = {` ... `}` across lines is TOML 1.1 and BOTH smol-toml 1.8.0
+    // and codex 0.144.0 accept it. The brace half of the bracket-depth
+    // tracking is what keeps those lines out of the scan: drop the closing
+    // `}` and the depth never returns to 0, so `[mcp_servers.mcp]` below is
+    // never seen and the entry is refused.
+    const raw = lf("[mcp_servers]", "other = {", '  command = "node"', "}", "", "[mcp_servers.mcp]", 'command = "old"');
+    const scan = scanTomlSections(raw);
+    expect(scan.sections.map((s) => s.keyPath)).toEqual([["mcp_servers"], ["mcp_servers", "mcp"]]);
+    // The two lines inside the braces are recorded as continuation, so nothing
+    // that walks lines mistakes them for a blank line or a comment.
+    expect([...scan.continuedLines.values()]).toEqual(["bracket", "bracket"]);
+    expect([...scan.continuedLines.keys()].sort((a, b) => a - b).map((start) => lineTextAt(raw, start))).toEqual([
+      '  command = "node"',
+      "}",
+    ]);
+    // Under [mcp_servers] the ONLY assignment is `other = {` -- the
+    // `command = "node"` line inside the braces is that assignment's value and
+    // is not recorded as a second key of the container. (The `command` below
+    // belongs to `[mcp_servers.mcp]`, which is a real table.)
+    expect(scan.assignments.map((a) => [a.section, a.keyPath, a.inlineTable])).toEqual([
+      [["mcp_servers"], ["other"], true],
+      [["mcp_servers", "mcp"], ["command"], false],
+    ]);
+    bothServers(raw);
+  });
+
+  it("the scanner never throws, whatever the text -- including text the parser rejects", () => {
+    // `scanTomlSections` documents itself as pure and total, and several
+    // branches (decodeBasicBody's hex-validity guard, readQuoted's
+    // unterminated returns, readHeader's closing-bracket check, the depth
+    // floor) are reachable ONLY on input smol-toml has already refused. They
+    // are not dead code -- they are what makes that sentence true -- but the
+    // only thing to assert about them is the sentence.
+    const TICK = String.fromCharCode(0x27);
+    const rejected = [
+      `[mcp_servers.${QUOTE}a${BS}uZZZZ${QUOTE}]`, // invalid hex escape
+      `[mcp_servers.${QUOTE}a${BS}u00${QUOTE}]`, // truncated hex escape
+      `[mcp_servers.${QUOTE}a${BS}qb${QUOTE}]`, // unknown escape
+      `[mcp_servers.${QUOTE}a${BS}xZZ${QUOTE}]`, // invalid TOML 1.1 hex escape
+      `[mcp_servers.${QUOTE}oops\ncommand = "x"`, // unterminated basic key
+      `[mcp_servers.${TICK}oops\ncommand = "x"`, // unterminated literal key
+      '[mcp_servers.mcp\ncommand = "x"', // header with no closing bracket
+      '[]\ncommand = "x"', // empty header
+      "]\n[mcp_servers.mcp]", // a stray close bracket at depth 0
+      "}\n[mcp_servers.mcp]", // a stray close brace at depth 0
+      `[mcp_servers.mcp]\nnote = ${QUOTE.repeat(3)}never closed`,
+    ];
+    for (const raw of rejected) {
+      expect(() => parseTomlConfig(raw), JSON.stringify(raw)).toThrow(TomlConfigError);
+      expect(() => scanTomlSections(raw), JSON.stringify(raw)).not.toThrow();
+    }
+  });
+});
+
+describe("the line-shaped decisions around the edit", () => {
+  // Not the "is this byte structural" class above -- these are the helpers
+  // that decide where a LINE starts and ends, and whether it counts as blank
+  // or as a comment. They were as unpinned as the scanner guards were, for the
+  // same reason: no fixture happened to hold a tab, an indented comment, a
+  // whitespace-only line, or a file that stops without a line break in the
+  // middle of its container.
+
+  it("treats a whitespace-only line as blank, whether it holds spaces or a tab", () => {
+    for (const gap of ["  ", "\t", " \t "]) {
+      const raw = `[mcp_servers.a]\ncommand = "x"\n${gap}\n[tui]\ntheme = "d"\n`;
+      // The gap line belongs to neither section's content.
+      const scan = scanTomlSections(raw);
+      expect(raw.slice(scan.sections[0].start, scan.sections[0].contentEnd), JSON.stringify(gap)).toBe(
+        lf("[mcp_servers.a]", 'command = "x"'),
+      );
+      // ...so the insert anchors at that line's START: one blank goes in above
+      // our block, no SECOND blank is added below it (the suffix is only added
+      // when the line at the anchor is not blank), and the user's own spacing
+      // line survives verbatim -- now separating our table from `[tui]`.
+      expect(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER), JSON.stringify(gap)).toBe(
+        `[mcp_servers.a]\ncommand = "x"\n\n[mcp_servers.mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcp@latest"]\nstartup_timeout_sec = 60.0\n${gap}\n[tui]\ntheme = "d"\n`,
+      );
+    }
+  });
+
+  it("treats an INDENTED comment as a comment", () => {
+    // `isBlankOrCommentLine` skips indentation before looking for the `#`.
+    // Without that, an indented trailing comment reads as content, the
+    // section's contentEnd runs past it, and our block is spliced in BELOW the
+    // comment instead of above it.
+    const raw = lf("[mcp_servers.a]", 'command = "x"', "  # indented note", "", "[tui]", 'theme = "d"');
+    const scan = scanTomlSections(raw);
+    expect(raw.slice(scan.sections[0].start, scan.sections[0].contentEnd)).toBe(lf("[mcp_servers.a]", 'command = "x"'));
+    expect(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER)).toBe(
+      lf(
+        "[mcp_servers.a]",
+        'command = "x"',
+        "",
+        "[mcp_servers.mcp]",
+        'command = "npx"',
+        'args = ["-y", "@yawlabs/mcp@latest"]',
+        "startup_timeout_sec = 60.0",
+        "",
+        "  # indented note",
+        "",
+        "[tui]",
+        'theme = "d"',
+      ),
+    );
+  });
+
+  it("handles a file whose last line is whitespace with no line break", () => {
+    // The only way `isBlankOrCommentLine` reaches its end-of-span return: the
+    // span runs out before a character is examined. A config.toml that stops
+    // after a couple of spaces is ordinary (an editor that strips the final
+    // newline), and Codex reads it fine.
+    const raw = `[mcp_servers.a]\ncommand = "x"\n   `;
+    expect(() => parseTomlConfig(raw)).not.toThrow();
+    const scan = scanTomlSections(raw);
+    expect(raw.slice(scan.sections[0].start, scan.sections[0].contentEnd)).toBe(lf("[mcp_servers.a]", 'command = "x"'));
+    // The trailing spaces are the anchor line, so they end up below our block
+    // -- still there, still the file's last bytes, still with no line break.
+    expect(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER)).toBe(
+      `[mcp_servers.a]\ncommand = "x"\n\n[mcp_servers.mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcp@latest"]\nstartup_timeout_sec = 60.0\n   `,
+    );
+  });
+
+  it("adds the missing final line break only at the END of the file", () => {
+    // `insertEdit`'s no-final-newline prefix is guarded on the insert point
+    // being at end of file. Without that guard a config whose LAST line has no
+    // break, but whose container ends earlier, gets a spurious blank line
+    // spliced into the middle.
+    const raw = `[mcp_servers.a]\ncommand = "x"\n\n[tui]\ntheme = "d"`;
+    expect(upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER)).toBe(
+      `[mcp_servers.a]\ncommand = "x"\n\n[mcp_servers.mcp]\ncommand = "npx"\nargs = ["-y", "@yawlabs/mcp@latest"]\nstartup_timeout_sec = 60.0\n\n[tui]\ntheme = "d"`,
+    );
+  });
+
+  it("pairs a CRLF as ONE line break, so a header's span ends past both bytes", () => {
+    // `lineEnd` returns the offset past the WHOLE break. Returning `i + 1` for
+    // a CRLF puts every span boundary on the LF instead of after it -- every
+    // offset this scanner publishes is then one byte short on every CRLF
+    // config, which is the file shape Windows editors write by default.
+    const raw = fixture("f04-crlf-bom", "input.toml");
+    expect(raw).toContain("\r\n");
+    const scan = scanTomlSections(raw);
+    for (const section of scan.sections) {
+      // The header line's end is past the CRLF: the byte before it is the LF,
+      // and the byte before THAT is the CR.
+      expect(raw.slice(section.headerEnd - 2, section.headerEnd)).toBe("\r\n");
+      expect(raw.slice(section.contentEnd - 2, section.contentEnd)).toBe("\r\n");
+    }
+    expect(detectTomlEol(raw)).toBe("\r\n");
+  });
+
+  it("keeps a blank line beside a table it deletes only when one is there to keep", () => {
+    // `deleteSectionEdits` gives up ONE adjacent blank line so a removal
+    // cannot leave a double blank. It must not take a blank when what follows
+    // is real content: here the next header sits immediately after our table,
+    // so the blank above ours belongs to the section ABOVE it.
+    const raw = lf("[tui]", 'theme = "d"', "", "[mcp_servers.mcp]", 'command = "old"', "[other]", "k = 1");
+    expect(removeTomlEntry(raw, CONTAINER, ENTRY)).toBe(lf("[tui]", 'theme = "d"', "", "[other]", "k = 1"));
+  });
+
+  it("sorts the edits, so a legacy table ABOVE ours is not applied out of order", () => {
+    // A migration writes two edits: replace ours, delete the legacy one. When
+    // the legacy table is EARLIER in the file the two are pushed in the wrong
+    // order, and only the sort in `applyEdits` saves it -- without it the
+    // overlap guard fires and the whole write is refused.
+    const raw = lf("[mcp_servers.yaw-mcp]", 'command = "legacy"', "", "[mcp_servers.mcp]", 'command = "old"');
+    const next = upsertTomlEntry(raw, CONTAINER, ENTRY, BROKER, { replaceLegacy: ["yaw-mcp"] });
+    expect(next).toBe(
+      lf("[mcp_servers.mcp]", 'command = "npx"', 'args = ["-y", "@yawlabs/mcp@latest"]', "startup_timeout_sec = 60.0"),
+    );
+    expect(tomlEntryNames(readTomlConfig(next, CONTAINER))).toEqual([ENTRY]);
+  });
+
+  it("remove(upsert(x)) is x byte for byte for the ordinary shapes, and ADDS one line break for three others", () => {
+    // The identity the `deleteSectionEdits` comment claims, and its exact
+    // limit. Measured, not asserted in prose: the round trip never drops a
+    // byte of `x`, but in three shapes it comes back with one MORE line break
+    // than it went in with.
+    for (const x of [
+      lf("[mcp_servers.a]", 'command = "x"', "", "[tui]", 'theme = "d"'),
+      lf("[mcp_servers.a]", 'command = "x"'),
+      lf("model = 'gpt-5'"),
+      // A trailing comment separated by a blank line still round-trips: the
+      // blank the insert took is the blank the remove gives back.
+      lf("[mcp_servers.a]", 'command = "x"', "", "# trailing note"),
+    ]) {
+      expect(removeTomlEntry(upsertTomlEntry(x, CONTAINER, ENTRY, BROKER), CONTAINER, ENTRY), JSON.stringify(x)).toBe(
+        x,
+      );
+    }
+
+    // ...and the three that gain exactly one line break. Two mechanisms:
+    // a comment with no blank line above it gets one (the insert adds a blank
+    // on each side and the remove can only take back the one BEFORE), and a
+    // file with no final break gets one (the insert adds it; nothing removes
+    // it again).
+    const additive: Array<[string, string]> = [
+      [
+        lf("[mcp_servers.a]", 'command = "x"', "# trailing note"),
+        lf("[mcp_servers.a]", 'command = "x"', "", "# trailing note"),
+      ],
+      [
+        lf("[mcp_servers.a]", 'command = "x"', "# note", "[tui]", 'theme = "d"'),
+        lf("[mcp_servers.a]", 'command = "x"', "", "# note", "[tui]", 'theme = "d"'),
+      ],
+      ["model = 'gpt-5'", lf("model = 'gpt-5'")],
+    ];
+    for (const [x, expected] of additive) {
+      const back = removeTomlEntry(upsertTomlEntry(x, CONTAINER, ENTRY, BROKER), CONTAINER, ENTRY);
+      expect(back, JSON.stringify(x)).toBe(expected);
+      // Additive, and additive ONLY: one line break longer, nothing of x lost,
+      // and it still means what it meant.
+      expect(back.length - x.length, JSON.stringify(x)).toBe(1);
+      expect(canonTomlConfig(back, CONTAINER), JSON.stringify(x)).toBe(canonTomlConfig(x, CONTAINER));
+    }
+  });
+});
+
+describe("values the renderer must spell, and the ones it refuses", () => {
+  it("writes a bigint field, which is what --repair carries off disk", () => {
+    // smol-toml returns an integer outside the JS safe range as a bigint, so
+    // a --repair that re-renders our entry from what it read WILL hand the
+    // renderer one. Without the bigint branch it falls through to the
+    // finite-number check and refuses a config Codex loads.
+    const raw = lf("[mcp_servers.mcp]", 'command = "old"', "big = 1152921504606846976");
+    const carried = tomlEntryFields(readTomlConfig(raw, CONTAINER), ENTRY);
+    expect(typeof carried?.big).toBe("bigint");
+    expect(upsertTomlEntry(raw, CONTAINER, ENTRY, { ...carried, command: "npx" })).toBe(
+      lf("[mcp_servers.mcp]", 'command = "npx"', "big = 1152921504606846976"),
+    );
+  });
+
+  it("writes a FRACTIONAL f64 timeout as itself, not as `60.5.0`", () => {
+    // The `.0` suffix is only for an INTEGER value of an f64 field. Applying
+    // it unconditionally produces `60.5.0`, which is not TOML at all -- the
+    // post-write check catches it, so the user gets a refusal instead of the
+    // write they asked for.
+    expect(renderTomlEntry(CONTAINER, ENTRY, { command: "npx", startup_timeout_sec: 60.5 })).toBe(
+      lf("[mcp_servers.mcp]", 'command = "npx"', "startup_timeout_sec = 60.5"),
+    );
+    expect(renderTomlEntry(CONTAINER, ENTRY, { command: "npx", startup_timeout_sec: 60 })).toBe(
+      lf("[mcp_servers.mcp]", 'command = "npx"', "startup_timeout_sec = 60.0"),
+    );
+  });
+
+  it("refuses a nested table OR array inside an `env_vars` inline table, naming the key", () => {
+    // Codex's `env_vars` items are a bare name or `{ name, source }`. Anything
+    // deeper has no spelling here, and the refusal names the offending key --
+    // dropping the array half of that check let `source = [1, 2]` through
+    // silently, which is a shape nothing has ever loaded.
+    for (const source of [{ deep: 1 }, [1, 2]]) {
+      expect(() => renderTomlEntry(CONTAINER, ENTRY, { command: "npx", env_vars: [{ name: "A", source }] })).toThrow(
+        TomlRenderError,
+      );
+      expect(() => renderTomlEntry(CONTAINER, ENTRY, { command: "npx", env_vars: [{ name: "A", source }] })).toThrow(
+        /its inline table has a nested "source"/,
+      );
+    }
+    // The shapes it DOES write, unchanged.
+    expect(renderTomlEntry(CONTAINER, ENTRY, { command: "npx", env_vars: ["PATH", { name: "A", source: "b" }] })).toBe(
+      lf("[mcp_servers.mcp]", 'command = "npx"', 'env_vars = ["PATH", { name = "A", source = "b" }]'),
+    );
+  });
 });
 
 describe("the vendor claims this file's comments make", () => {

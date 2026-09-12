@@ -561,7 +561,16 @@ export function scanTomlSections(text: string): TomlScan {
 }
 
 /** The start offset of the line that ENDS at `end` (`end` is just past a line
- *  break, or the text length). */
+ *  break, or the text length).
+ *
+ *  Both step-backs over the line break are load-bearing, and their failure
+ *  mode is not a wrong answer: drop either one and this returns `end` itself
+ *  for a line ending in that break, so the `contentEnd` back-off assigns
+ *  `contentEnd = prevStart = contentEnd` and never advances. The suite does
+ *  not go red, it HANGS -- measured, on ordinary LF and CRLF fixtures. That is
+ *  the one defect in this file with no test: a synchronous infinite loop is
+ *  not something a test runner can fail, only something it can stop finishing.
+ *  Named here rather than left for the next reader to find with a wedged CI. */
 function lineStartBefore(text: string, end: number): number {
   let i = end;
   if (i > 0 && text[i - 1] === "\n") i--;
@@ -570,7 +579,27 @@ function lineStartBefore(text: string, end: number): number {
   return i;
 }
 
-/** Advance the string/bracket state machine over [from, to). */
+/** Advance the string/bracket state machine over [from, to).
+ *
+ *  EVERY branch below is a decision that one byte is CONTENT rather than
+ *  structure, and each one is load-bearing in the same way: lose it and the
+ *  scanner stops seeing a table that is really there, so `upsertTomlEntry`
+ *  refuses `the "mcp" entry is not written as a [mcp_servers.mcp] table` on a
+ *  file codex-cli loads without complaint. Three separate rounds each found
+ *  ONE of these, fixed it, and left its siblings unguarded.
+ *
+ *  They are now pinned as a SET, in the test file's "a byte that only LOOKS
+ *  structural" block: the `#` skip here in normal state, entering and leaving
+ *  both single-line string states, the in-string backslash skip (twice, once
+ *  per basic-string state), the bracket AND brace halves of the depth count,
+ *  and the two multi-line terminators with their extra-quote runs. That block
+ *  also pins the guards that must NOT exist -- a `#` skip inside either
+ *  multi-line state, or a backslash skip inside either LITERAL one, is the
+ *  obvious symmetry fix and is wrong, because a literal string has no escapes
+ *  and a `#` inside any string is a character.
+ *
+ *  So: before adding, deleting or "tidying" a branch here, delete it and run
+ *  that block. If nothing goes red, the branch is not what you think it is. */
 function scanSpan(
   text: string,
   from: number,
@@ -632,10 +661,21 @@ function scanSpan(
           i += 3;
           // TOML allows up to two extra quotes immediately after the
           // delimiter (`"""he said """"` closes with the last three), so a
-          // run of 4 or 5 quotes still ends the string here. The bound is
-          // tested BEFORE the character: `to` always lands on a line break
-          // today, so the other order read a character it had no business
-          // reading and happened to get away with it.
+          // run of 4 or 5 quotes still ends the string here.
+          //
+          // The bound is tested BEFORE the character for reading order only.
+          // The two spellings are EQUIVALENT, and not for the reason this
+          // comment used to give: `to` is `lineEnd`'s result, which is the
+          // offset PAST the line break, so `text[to]` is the first byte of the
+          // NEXT line (or `undefined` at end of text) and never the break
+          // itself. What makes the order not matter is that `&&` demands both
+          // operands either way, so `i` advances over exactly the same bytes;
+          // reversing them only adds one read of a byte outside the span whose
+          // value is then discarded, and an out-of-range string index in JS is
+          // `undefined` rather than a throw. Measured: reversing this run, or
+          // the `'''` one below, leaves the whole suite green -- so it is
+          // recorded as an equivalence, not dressed up with a test that cannot
+          // fail.
           while (i < to && text[i] === '"') i++;
           state = "normal";
           continue;
@@ -645,7 +685,8 @@ function scanSpan(
       case "mlLiteral":
         if (c === "'" && text[i + 1] === "'" && text[i + 2] === "'") {
           i += 3;
-          // Bound first, as above.
+          // Bound first, as above -- and equivalent either way, for the
+          // reason spelled out there.
           while (i < to && text[i] === "'") i++;
           state = "normal";
           continue;
@@ -1234,9 +1275,28 @@ function applyEdits(text: string, edits: SpanEdit[]): string {
  *  blank, a blank line at EOF, or a file that opens on an empty line.
  *
  *  The blank taken is the one BEFORE the region, which is the one the insert
- *  put there: that is what makes `remove(upsert(x))` return `x` byte for byte.
- *  A region at the very start of the file has no blank before it, so there the
- *  blank after it goes instead. */
+ *  put there. A region at the very start of the file has no blank before it,
+ *  so there the blank after it goes instead.
+ *
+ *  That is what makes `remove(upsert(x))` return `x` BYTE FOR BYTE for the
+ *  ordinary shapes -- a container whose last table is followed by a blank
+ *  line, by end of file, or by a comment that already had a blank line above
+ *  it, plus a file with no container at all. It is NOT a general identity, and
+ *  the exception is ADDITIVE WHITESPACE ONLY. Measured, two mechanisms, and
+ *  in each the result is `x` plus exactly ONE line break:
+ *
+ *   - the container's last table is followed IMMEDIATELY by a comment, with no
+ *     blank line between (whether the comment ends the file or another section
+ *     follows it). The insert puts a blank on each side of the new block; the
+ *     remove can only take back the one BEFORE, so the comment keeps a blank
+ *     line above it that `x` did not have.
+ *   - `x` has no trailing line break at all. The insert gives the last line
+ *     one before appending, and nothing gives it back.
+ *
+ *  Nothing of `x` is ever dropped and the meaning is unchanged -- what is lost
+ *  in those shapes is only the claim to byte equality. The round-trip tests
+ *  pin both halves: the shapes that are byte-exact, and the three that come
+ *  back one line break longer. */
 function deleteSectionEdits(text: string, sections: readonly TomlSection[]): SpanEdit[] {
   const spans = sections.map((s) => ({ start: s.start, end: s.contentEnd })).sort((a, b) => a.start - b.start);
   const regions: Array<{ start: number; end: number }> = [];

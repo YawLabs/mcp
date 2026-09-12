@@ -1,0 +1,9 @@
+[mcp_servers.other]
+command = "node"
+literal = 'an opening [ inside a literal string'
+basic = "an opening [ inside a basic string"
+args = ['-y', 'pkg']
+paths = ['C:\', 'x']
+
+[mcp_servers.mcp]
+command = "old"
