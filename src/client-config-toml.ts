@@ -1325,15 +1325,25 @@ function applyEdits(text: string, edits: SpanEdit[]): string {
  *   - SHORTER: BYTES OF `x` ARE DROPPED (14). The insert added NO front blank,
  *     because the line before the anchor was ALREADY blank -- and this
  *     function takes the blank before the region regardless, so the blank it
- *     eats is `x`'s. Reachable only when the container has no table at all,
- *     since only then does the anchor sit at end of file with `x`'s own last
- *     line in front of it. A no-container file ending in a blank line comes
- *     back without it, and one ending in a whitespace-only line loses the
- *     spaces or tabs as well.
+ *     eats is `x`'s. Reachable when the container has no table at all AND
+ *     `x` ends on a blank or whitespace-only line -- the anchor then sits at
+ *     end of file with that blank in front of it, so the insert skips its
+ *     front blank and the remove takes `x`'s. BOTH halves are load-bearing,
+ *     and an anchor at end of file is not itself the discriminator: a file
+ *     that is nothing but a container table puts the anchor at end of file
+ *     too, and round-trips exactly whether its last line is content or blank
+ *     (measured, delta 0 both ways) -- the presence of a table is what moves
+ *     the anchor off `x`'s own trailing blank. A no-container
+ *     file ending in a blank line comes back without it, and one ending in a
+ *     whitespace-only line loses the spaces or tabs as well.
  *
- *  So two of the sentences this comment used to carry were false: bytes of `x`
- *  CAN be dropped, and "a file with no container at all" is byte-exact only
- *  while it does not end on a blank line. What IS true in all three classes is
+ *  This block used to carry five false sentences, corrected above: that the
+ *  blank taken is "the one the insert put there" (nothing here knows who put
+ *  it there); that the exception is additive whitespace only; that nothing of
+ *  `x` is ever dropped; that two mechanisms produce the additive class (it is
+ *  one rule, and what the line at the anchor happens to be does not enter
+ *  into it); and that "a file with no container at all" is byte-exact, which
+ *  holds only while it does not end on a blank line. What IS true in all three classes is
  *  that the meaning survives -- the same test asserts `canonTomlConfig` is
  *  equal going in and coming out for every one of the 150 shapes.
  *
