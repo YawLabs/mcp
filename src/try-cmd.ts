@@ -577,6 +577,13 @@ async function peelEntryFromConfig(
   // Own properties only, so this walk sees exactly what jsonc-parser's walk
   // over the parse tree will see: an inherited member is not a container in
   // the text.
+  //
+  // EXACT, never folded through claudeCodeContainerPaths: `containerPath` is
+  // the value the MARKER recorded when the trial entry was written, and this
+  // peel must delete that entry and nothing else. Folding a drive-letter-case
+  // sibling in here would let a cleanup remove a key the trial never wrote.
+  // Registered as such in the source-shape scan in
+  // src/tests/source-hygiene.test.ts.
   let container = parsed as Record<string, unknown>;
   for (const segment of containerPath) {
     const child = Object.hasOwn(container, segment) ? container[segment] : undefined;
@@ -612,7 +619,15 @@ async function peelEntryFromConfig(
  *  own-property rule, so this answers for the bytes that are about to be
  *  rewritten rather than for a JSON.parse view of them. Any unparseable or
  *  unexpected shape answers false: the run is about to fail on that anyway,
- *  and claiming a replacement it cannot see would be worse than staying quiet. */
+ *  and claiming a replacement it cannot see would be worse than staying quiet.
+ *
+ *  Deliberately EXACT, never folded through claudeCodeContainerPaths: the
+ *  question is "will the write I am about to make at THIS path replace
+ *  something", and the write goes to one path. A trial entry under a
+ *  drive-letter-case sibling of the project key is a different key that this
+ *  run does not touch, so answering yes for it would promise a replacement
+ *  that does not happen. Registered as such in the source-shape scan in
+ *  src/tests/source-hygiene.test.ts. */
 function configHasEntry(raw: string | null, containerPath: string[], entryName: string): boolean {
   if (raw === null || raw.trim().length === 0) return false;
   let parsed: unknown;

@@ -68,6 +68,7 @@ import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { resolveInstallSite } from "./install-cmd.js";
 import {
+  claudeCodeContainerPaths,
   ENTRY_NAME,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -447,12 +448,30 @@ async function readContainer(ref: ContainerRef): Promise<Record<string, unknown>
   } catch {
     return null;
   }
-  let node: unknown = parsed;
-  for (const key of ref.containerPath) {
-    if (!node || typeof node !== "object" || Array.isArray(node)) return null;
-    node = (node as Record<string, unknown>)[key];
+  // EVERY projects[] read resolves its path through the one helper -- see
+  // claudeCodeContainerPaths. The canonical key comes first; a drive-letter-case
+  // sibling of the same project is checked too, because the only question this
+  // function is asked is "is yaw-mcp already wired in for this project", and an
+  // entry an older version wrote under the other spelling answers it yes. The
+  // first container carrying a yaw-mcp entry wins; otherwise the first one that
+  // exists is returned, so a bare canonical container still reads as "present,
+  // nothing wired".
+  let fallback: Record<string, unknown> | null = null;
+  for (const variantPath of claudeCodeContainerPaths(parsed, ref.containerPath)) {
+    let node: unknown = parsed;
+    for (const key of variantPath) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) {
+        node = undefined;
+        break;
+      }
+      node = (node as Record<string, unknown>)[key];
+    }
+    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+    const container = node as Record<string, unknown>;
+    if (hasYawMcpEntry(container)) return container;
+    fallback ??= container;
   }
-  return node && typeof node === "object" && !Array.isArray(node) ? (node as Record<string, unknown>) : null;
+  return fallback;
 }
 
 export function parseImportArgs(
@@ -615,15 +634,37 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   // at local scope. Reading it off the resolved target is what keeps this
   // command from assuming a single spelling; pasting a Claude Code shape into
   // a VS Code file fails silently, which is the bug the table records.
-  let container: unknown = parsed;
-  for (const key of resolved.containerPath) {
-    if (!container || typeof container !== "object" || Array.isArray(container)) {
-      container = undefined;
-      break;
+  //
+  // EVERY projects[] read resolves its path through the one helper -- see
+  // claudeCodeContainerPaths. The canonical key comes first; a drive-letter-case
+  // sibling of the same project is read too, because an older version wrote the
+  // servers there and "Nothing to import" over a file full of them is the same
+  // blindness `uninstall` had. `sourcePath` carries the key that was actually
+  // read all the way down to the removal below: reading a sibling and then
+  // deleting from the canonical key would leave every imported server wired.
+  let container: Record<string, unknown> | null = null;
+  let sourcePath: string[] = [...resolved.containerPath];
+  for (const variantPath of claudeCodeContainerPaths(parsed, resolved.containerPath)) {
+    let node: unknown = parsed;
+    for (const key of variantPath) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) {
+        node = undefined;
+        break;
+      }
+      node = (node as Record<string, unknown>)[key];
     }
-    container = (container as Record<string, unknown>)[key];
+    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+    const found = node as Record<string, unknown>;
+    // The first NON-EMPTY container wins; an empty one is only a fallback, so
+    // an empty canonical container still produces the "nothing to import"
+    // message about the key the user asked about.
+    if (container === null || Object.keys(found).length > 0) {
+      container = found;
+      sourcePath = variantPath;
+    }
+    if (Object.keys(found).length > 0) break;
   }
-  if (!container || typeof container !== "object" || Array.isArray(container)) {
+  if (container === null) {
     print(`\nNothing to import: no "${resolved.containerPath.join(".")}" object in ${displaySafe(resolved.absolute)}.`);
     return { exitCode: 0, written: [] };
   }
@@ -641,7 +682,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   /** Servers refused over a `${...}` this importer cannot resolve, already
    *  rendered as "  <key>: <spans>" lines. */
   const unresolvable: string[] = [];
-  for (const [key, value] of Object.entries(container as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(container)) {
     if (isSelfEntry(key)) {
       skippedSelf.push(key);
       continue;
@@ -861,7 +902,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   //
   // The imported container is FIRST and is the copy already in memory, so the
   // single-scope clients read no extra files at all.
-  const searched: ContainerRef[] = [{ absolute: resolved.absolute, containerPath: resolved.containerPath }];
+  const searched: ContainerRef[] = [{ absolute: resolved.absolute, containerPath: sourcePath }];
   for (const spec of target.scopes) {
     if (spec.scope === site.scope) continue;
     try {
@@ -889,7 +930,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   }
   let wiredIn: ContainerRef | null = null;
   for (let i = 0; i < searched.length; i++) {
-    const found = i === 0 ? (container as Record<string, unknown>) : await readContainer(searched[i]);
+    const found = i === 0 ? container : await readContainer(searched[i]);
     if (found && hasYawMcpEntry(found)) {
       wiredIn = searched[i];
       break;
@@ -950,7 +991,7 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
   const unremovable: string[] = [];
   for (const r of imported) {
     try {
-      const after = removeJsoncEntry(next, resolved.containerPath, r.candidate.key);
+      const after = removeJsoncEntry(next, sourcePath, r.candidate.key);
       if (after !== next) removed++;
       next = after;
     } catch (e) {

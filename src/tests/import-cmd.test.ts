@@ -713,3 +713,49 @@ describe("runImport -- replacing a CATALOG entry, which launchChanged never repo
     expect(all).toContain("@modelcontextprotocol/server-github");
   });
 });
+
+describe("runImport -- a projects[] key with the other drive-letter case", () => {
+  // v1.0.0 wrote the projects[] key with whatever drive-letter case it was
+  // handed, so a config written by `--project-dir c:/repo` holds the user's
+  // servers under "c:/repo". Reading only the canonical key made import say
+  // "Nothing to import" over a file full of them -- the same blindness
+  // uninstall had. Win32-only: on POSIX "c:/x" is not a drive path, so no
+  // drive key is ever built (the fold itself is pinned platform-independently
+  // in install-targets.test.ts).
+  it.runIf(process.platform === "win32")("imports from the variant key and removes from that same key", async () => {
+    const localPath = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: CURRENT_OS,
+      projectDir: synthCwd,
+      home: synthHome,
+    });
+    const projectKey = localPath.containerPath[1];
+    expect(projectKey).toMatch(/^[A-Z]:\//);
+    const lowerKey = projectKey[0].toLowerCase() + projectKey.slice(1);
+    writeClaudeCode({
+      // yaw-mcp wired at user scope, so the removal step is reached at all.
+      mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } },
+      projects: { [lowerKey]: { mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } } },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      scope: "local",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toMatch(/Nothing to import/);
+    expect(bundles().length).toBe(1);
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    // Removed from the key it was READ from. Deleting from the canonical key
+    // instead would have left the client launching every imported server
+    // alongside yaw-mcp -- the exact duplicate-broker state the removal exists
+    // to prevent.
+    expect(Object.keys(after.projects[lowerKey].mcpServers)).toEqual([]);
+  });
+});

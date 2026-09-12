@@ -65,6 +65,7 @@ import {
   buildLaunchEntry,
   CLAUDE_CODE_ALLOW_PATTERN,
   CURRENT_OS,
+  claudeCodeContainerPaths,
   ENTRY_NAME,
   findLegacyEntry,
   INSTALL_TARGETS,
@@ -770,6 +771,16 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // non-object leaves this empty, which is correct in every one of those
   // shapes: there is nothing there to bypass.
   let directEntryNames: string[] = [];
+  /** `projects[...]` keys that name THIS project with the other drive-letter
+   *  case and already carry yaw-mcp wiring. Reported, never written to -- see
+   *  claudeCodeContainerPaths for why install adds rather than migrates. */
+  const driveCaseSiblings: { key: string; hasEntry: boolean; legacy: string | null }[] = [];
+  /** The container path this run READS and WRITES: `resolved.containerPath`,
+   *  taken from claudeCodeContainerPaths so the reads in this function cannot
+   *  drift from the one place that resolves a projects[] key. Seeded for the
+   *  no-file case, where there is nothing to read and the write path
+   *  materializes the chain. */
+  let canonicalPath: string[] = claudeCodeContainerPaths({}, containerPath)[0];
   // Fingerprinted BEFORE the read (never after: a write landing between a
   // read and a later stat would be carried forward under a fresh fingerprint)
   // and compared again right before atomicWriteFile -- see there for why. A
@@ -803,7 +814,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }
     }
-    const container = readNested(existing, containerPath);
+    // EVERY projects[] read in this file resolves its path here -- see
+    // claudeCodeContainerPaths. `canonicalPath` is the key this run writes;
+    // the rest are drive-letter-case siblings of the same project that an
+    // older version, or an install run from a cmd prompt with a lower-case
+    // drive, already wrote. They are read so the run can REPORT them, and
+    // written to never: the Claude Code session that reads a sibling is
+    // exactly the one that cannot read the canonical key.
+    const variantPaths = claudeCodeContainerPaths(existing, containerPath);
+    canonicalPath = variantPaths[0];
+    for (const variantPath of variantPaths.slice(1)) {
+      const sibling = readNested(existing, variantPath);
+      if (typeof sibling !== "object" || sibling === null || Array.isArray(sibling)) continue;
+      const s = sibling as Record<string, unknown>;
+      const siblingLegacy = findLegacyEntry(s);
+      if (!(ENTRY_NAME in s) && siblingLegacy === null) continue;
+      driveCaseSiblings.push({ key: variantPath[1], hasEntry: ENTRY_NAME in s, legacy: siblingLegacy });
+    }
+    const container = readNested(existing, canonicalPath);
     if (typeof container === "object" && container !== null && !Array.isArray(container)) {
       const c = container as Record<string, unknown>;
       existingHasEntry = ENTRY_NAME in c;
@@ -817,6 +845,27 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       legacyEntry = findLegacyEntry(c);
       directEntryNames = directClientEntries(c);
     }
+  }
+
+  // A sibling key naming the same project with the other drive-letter case.
+  // Reported HERE, before the first early exit, so --skip, the identical
+  // no-op, a dry run and the write path all name it. Left on disk on purpose:
+  // Claude Code's lookup is byte-exact (see claudeCodeProjectKey), so the
+  // session that reads the sibling is precisely the one that cannot read the
+  // key this run writes -- deleting it would unwire that session and hand it
+  // nothing back. `uninstall` is the command that clears both spellings.
+  for (const sibling of driveCaseSiblings) {
+    const what = sibling.hasEntry
+      ? sibling.legacy !== null
+        ? `"${ENTRY_NAME}" and legacy "${sibling.legacy}" entries`
+        : `a "${ENTRY_NAME}" entry`
+      : `a legacy "${sibling.legacy}" entry`;
+    log(
+      `Note: ${resolved.absolute} also has ${what} under projects[${JSON.stringify(sibling.key)}] -- the same ` +
+        "directory spelled with the other drive-letter case. Left alone: only a Claude Code whose cwd is spelled " +
+        "that way reads it, and that session cannot see the entry this command writes. " +
+        `\`yaw-mcp uninstall ${target.clientId} --scope ${scope}\` removes both spellings.`,
+    );
   }
 
   // --skip short-circuits BEFORE the entry is built, so the oam probe below
@@ -971,7 +1020,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // documented as overwriting whatever is there, and a user running it to
   // purge a wrong YAW_MCP_VAULT_PASSPHRASE used to get the same passphrase
   // back, byte-for-byte what --repair wrote.
-  const previousEntry = readEntryAt(existing, containerPath, ENTRY_NAME);
+  const previousEntry = readEntryAt(existing, canonicalPath, ENTRY_NAME);
   const previousEnv = previousEntry?.env;
   const carryableEnv =
     newEntry.env === undefined && previousEnv && Object.keys(previousEnv).length > 0 ? previousEnv : undefined;
@@ -1816,6 +1865,11 @@ export function findBlockedContainerSegment(
   root: Record<string, unknown>,
   containerPath: string[],
 ): BlockedContainerSegment | null {
+  // EXACT, never folded through claudeCodeContainerPaths: this is the
+  // pre-flight for a WRITE, and a write goes to the canonical path only. A
+  // drive-case sibling's shape cannot block it and must not be reported as if
+  // it did. Registered as such in the source-shape scan in
+  // src/tests/source-hygiene.test.ts.
   let node: Record<string, unknown> = root;
   for (let i = 0; i < containerPath.length; i++) {
     const value = node[containerPath[i]];
@@ -1995,6 +2049,12 @@ export function mergeClientConfig(
   entryName: string = ENTRY_NAME,
 ): Record<string, unknown> {
   if (containerPath.length === 0) throw new Error("mergeClientConfig: containerPath cannot be empty");
+  // EXACT, never folded through claudeCodeContainerPaths: this clones the
+  // chain it is about to WRITE into, and every caller hands it the canonical
+  // path. Folding here would splice the entry into a drive-case sibling as
+  // well, which is the silent second install that the sibling REPORT exists to
+  // avoid. Registered as such in the source-shape scan in
+  // src/tests/source-hygiene.test.ts.
   const out: Record<string, unknown> = { ...existing };
   let parent: Record<string, unknown> = out;
   for (let i = 0; i < containerPath.length - 1; i++) {
@@ -2277,6 +2337,21 @@ async function runInstallList(
     );
   }
   log("");
+  // An entry found under the OTHER drive-letter spelling of this directory's
+  // projects[] key. The STATUS column can only carry a marker, so the key
+  // itself is named here -- a row reading "installed" with no key would send
+  // the user looking under the canonical one, which holds nothing.
+  for (const p of probes) {
+    if (!p.entryProjectKey) continue;
+    const label = INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId;
+    log(
+      `Note: the ${label} (${p.scope}) entry is under projects[${JSON.stringify(p.entryProjectKey)}] in ` +
+        `${displayPath(p.path, home, os)} -- the same directory spelled with the other drive-letter case. Only a ` +
+        `Claude Code whose cwd is spelled that way reads it. \`yaw-mcp install ${p.clientId} --scope ${p.scope}\` ` +
+        `writes the canonical key; \`yaw-mcp uninstall ${p.clientId} --scope ${p.scope}\` removes both spellings.`,
+    );
+    log("");
+  }
   log("Install into a specific client: `yaw-mcp install <client> [--scope user|project|local]`");
   log("Install into every supported client (user scope where supported): `yaw-mcp install --all`");
   return { written: [], wouldWrite: [], messages, exitCode: 0 };
@@ -2293,14 +2368,19 @@ function statusFor(p: ClientProbeResult): string {
   // row does not send the user to fix JSON that may be perfectly fine, and so
   // it does not fall through to "other-entries" as if the file had been read.
   if (p.unreadable) return `unreadable: ${p.unreadable}`;
-  if (p.hasMcpEntry) return "installed";
+  // The entry is real, but under the other drive-letter spelling of this
+  // directory's projects[] key -- a bare "installed" would claim the canonical
+  // key holds it. The key itself is named in a note under the table, which is
+  // the only place a full path fits.
+  const keySuffix = p.entryProjectKey ? " (other drive case)" : "";
+  if (p.hasMcpEntry) return `installed${keySuffix}`;
   // A file whose only yaw-mcp wiring is a PRE-RENAME entry is an upgrade
   // pending, not somebody else's config: `install <client>` has something
   // specific to do there (write `mcp`, then tell the user to trim the old key).
   // Folding it into "other-entries" threw away the probe's own
   // hasLegacyEntry/legacyEntryName and left the row indistinguishable from a
   // config that has nothing to do with yaw-mcp.
-  if (p.hasLegacyEntry) return `legacy: ${p.legacyEntryName ?? "unknown"}`;
+  if (p.hasLegacyEntry) return `legacy: ${p.legacyEntryName ?? "unknown"}${keySuffix}`;
   if (!p.exists) return "not installed";
   // `other-entries` promises OTHER SERVERS in the list this row reads -- the
   // slot's container object (`mcpServers`; `servers` for VS Code;
@@ -2760,6 +2840,28 @@ async function promptUninstall(
   }
 }
 
+/** One container `uninstall` has to clear, in the order claudeCodeContainerPaths
+ *  returns them: the canonical key first, then each drive-letter-case sibling
+ *  of the same project that actually carries yaw-mcp wiring.
+ *
+ *  Siblings exist because Claude Code's projects[] lookup is byte-exact and
+ *  older versions wrote the key with whatever drive-letter case the shell
+ *  reported (see claudeCodeProjectKey). Clearing only the canonical one is how
+ *  uninstall came to print "Done: ... no longer launches yaw-mcp" over a file
+ *  that still launched it for a cmd-started session. */
+interface RemovalSite {
+  containerPath: string[];
+  /** The projects[] key, or null when the container is not under projects[]
+   *  (every other client, and Claude Code's user and project scopes). */
+  projectKey: string | null;
+  /** True for everything but the canonical key -- the only sites whose
+   *  removals need naming separately in the preview and the log. */
+  sibling: boolean;
+  hasEntry: boolean;
+  storedEntry: unknown;
+  legacyEntry: string | null;
+}
+
 export async function runUninstall(opts: UninstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
   const stderr = opts.io?.stderr ?? process.stderr;
@@ -2787,9 +2889,8 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
   let rawClient: string | null = null;
-  let storedEntry: unknown;
-  let hasEntry = false;
-  let legacyEntry: string | null = null;
+  /** Every container carrying wiring for this project -- see RemovalSite. */
+  const sites: RemovalSite[] = [];
   // Fingerprinted BEFORE the read and compared again ahead of the write, for
   // exactly install's reason: ~/.claude.json is a file Claude Code itself
   // rewrites during a session, and the prompt below waits on a human.
@@ -2820,19 +2921,44 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }
     }
-    const container = readNested(existing, containerPath);
-    if (typeof container === "object" && container !== null && !Array.isArray(container)) {
+    // EVERY projects[] read here resolves its path through the one helper --
+    // see claudeCodeContainerPaths. The canonical key comes back first; the
+    // rest are drive-letter-case siblings of the SAME project that an older
+    // version wrote, and skipping them is what let this command report a
+    // client it had stopped nothing for.
+    const variantPaths = claudeCodeContainerPaths(existing, containerPath);
+    for (let i = 0; i < variantPaths.length; i++) {
+      const variantPath = variantPaths[i];
+      const container = readNested(existing, variantPath);
+      if (typeof container !== "object" || container === null || Array.isArray(container)) continue;
       const c = container as Record<string, unknown>;
-      hasEntry = ENTRY_NAME in c;
-      storedEntry = c[ENTRY_NAME];
-      legacyEntry = findLegacyEntry(c);
+      const sibling = i > 0;
+      const entryHere = ENTRY_NAME in c;
+      const legacyHere = findLegacyEntry(c);
+      // An empty sibling container has nothing to remove and nothing to say;
+      // the canonical site is kept regardless, because the messages below
+      // describe it even when it is bare.
+      if (sibling && !entryHere && legacyHere === null) continue;
+      sites.push({
+        containerPath: variantPath,
+        projectKey: containerPath[0] === "projects" ? variantPath[1] : null,
+        sibling,
+        hasEntry: entryHere,
+        storedEntry: c[ENTRY_NAME],
+        legacyEntry: legacyHere,
+      });
     }
   }
 
   // Leaving a legacy entry behind would keep the client launching yaw-mcp
   // after a command whose whole job is to stop that -- the same
   // duplicate-broker hazard install now trims, seen from the other side.
-  const trimLegacy = legacyEntry !== null && !opts.keepLegacy;
+  const trimsLegacy = (s: RemovalSite): boolean => s.legacyEntry !== null && !opts.keepLegacy;
+  /** " under projects[\"c:/repo\"]" for a sibling, "" for the canonical site,
+   *  so every message names a removal the user did not ask for by key and the
+   *  ordinary single-key run reads exactly as it always did. */
+  const where = (s: RemovalSite): string => (s.sibling ? ` under projects[${JSON.stringify(s.projectKey)}]` : "");
+  const removals = sites.filter((s) => s.hasEntry || trimsLegacy(s));
 
   const home = opts.home ?? homedir();
   // Computed even when the client config has nothing to remove: the entry and
@@ -2855,10 +2981,22 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     );
   }
 
-  if (!hasEntry && !trimLegacy && !settingsPatch?.changed) {
+  if (removals.length === 0 && !settingsPatch?.changed) {
     // Exit 0, not an error: a subtract that cannot no-op cannot be scripted,
     // and re-running uninstall is the shape a cleanup script takes.
-    log(`\nNothing to do: ${target.label} (${scope}) has no yaw-mcp entry.`);
+    //
+    // The only way to reach this with wiring still on disk is --keep-legacy
+    // over a legacy-only config. Saying "no yaw-mcp entry" there is the same
+    // false all-clear the Done line below is gated against, so the kept entry
+    // is named instead.
+    const kept = sites.filter((s) => s.legacyEntry !== null).map((s) => `"${s.legacyEntry}"${where(s)}`);
+    log(
+      kept.length > 0
+        ? `\nNothing to do: ${target.label} (${scope}) has no "${ENTRY_NAME}" entry, and the legacy ` +
+            `${kept.join(" and ")} entr${kept.length === 1 ? "y" : "ies"} you asked to keep (--keep-legacy) ` +
+            "still launch yaw-mcp."
+        : `\nNothing to do: ${target.label} (${scope}) has no yaw-mcp entry.`,
+    );
     return { written: [], wouldWrite: [], messages, exitCode: 0 };
   }
 
@@ -2866,20 +3004,24 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   // scripted run gets to read the preview before being told which flag it
   // needed, the courtesy `yaw-mcp remove` already extends.
   const preview: string[] = [];
-  if (hasEntry) {
-    preview.push(`entry:    "${ENTRY_NAME}"`);
-    preview.push(`launch:   ${renderEntryLaunch(storedEntry)}`);
-    const envKeys = entryEnvKeys(storedEntry);
-    if (envKeys.length > 0) preview.push(`env keys: ${envKeys.join(", ")} (values go with the entry)`);
+  for (const s of sites) {
+    if (s.hasEntry) {
+      preview.push(`entry:    "${ENTRY_NAME}"${where(s)}`);
+      preview.push(`launch:   ${renderEntryLaunch(s.storedEntry)}`);
+      const envKeys = entryEnvKeys(s.storedEntry);
+      if (envKeys.length > 0) preview.push(`env keys: ${envKeys.join(", ")} (values go with the entry)`);
+    }
+    if (trimsLegacy(s)) {
+      preview.push(`legacy:   "${s.legacyEntry}"${where(s)} (also removed; --keep-legacy leaves it)`);
+    }
   }
-  if (trimLegacy) preview.push(`legacy:   "${legacyEntry}" (also removed; --keep-legacy leaves it)`);
   if (settingsPatch?.changed) preview.push(`grant:    ${CLAUDE_CODE_ALLOW_PATTERN} from ${settingsPatch.path}`);
 
   if (opts.dryRun) {
     log(`\n--- dry run: would remove the following (the rest of each file is left as-is) ---`);
     for (const line of preview) log(`    ${line}`);
     const wouldWrite: string[] = [];
-    if (hasEntry || trimLegacy) wouldWrite.push(resolved.absolute);
+    if (removals.length > 0) wouldWrite.push(resolved.absolute);
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
@@ -2919,14 +3061,18 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   }
 
   let clientJson: string | null = null;
-  if (rawClient !== null && (hasEntry || trimLegacy)) {
+  if (rawClient !== null && removals.length > 0) {
     try {
       let next = rawClient;
-      // Both removals in ONE pass so the file never lands on disk holding one
-      // key without the other, and both as splices (jsonc.ts) so the user's
-      // comments and formatting survive.
-      if (hasEntry) next = removeJsoncEntry(next, containerPath, ENTRY_NAME);
-      if (trimLegacy) next = removeJsoncEntry(next, containerPath, legacyEntry as string);
+      // Every removal in ONE pass so the file never lands on disk holding one
+      // key without the other -- across the drive-letter-case siblings too,
+      // which is what lets the closing line below speak for every container
+      // THIS scope reads rather than for one key in it. All of them are
+      // splices (jsonc.ts) so the user's comments and formatting survive.
+      for (const s of removals) {
+        if (s.hasEntry) next = removeJsoncEntry(next, s.containerPath, ENTRY_NAME);
+        if (trimsLegacy(s)) next = removeJsoncEntry(next, s.containerPath, s.legacyEntry as string);
+      }
       clientJson = next.endsWith("\n") ? next : `${next}\n`;
     } catch (e) {
       err(
@@ -2952,8 +3098,10 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     }
     log(`Wrote ${resolved.absolute}`);
     written.push(resolved.absolute);
-    if (hasEntry) log(`Removed the "${ENTRY_NAME}" entry.`);
-    if (trimLegacy) log(`Removed the legacy "${legacyEntry}" entry.`);
+    for (const s of removals) {
+      if (s.hasEntry) log(`Removed the "${ENTRY_NAME}" entry${where(s)}.`);
+      if (trimsLegacy(s)) log(`Removed the legacy "${s.legacyEntry}" entry${where(s)}.`);
+    }
   }
 
   // Best-effort, exactly like install's patch: the entry is already gone, and a
@@ -2974,6 +3122,35 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
         );
       }
     }
+  }
+
+  // Wiring this run deliberately LEFT that still makes the client launch
+  // yaw-mcp. Only --keep-legacy can produce one now: every drive-letter-case
+  // sibling is cleared in the same write above, so an all-clear over an entry
+  // this scope itself left behind -- the exact failure the drive-case sibling
+  // produced -- cannot happen.
+  //
+  // The gate reaches exactly as far as `sites` does, and no further: the
+  // containers THIS scope reads, canonical plus drive-case variants of the
+  // same project dir. Another scope's wiring in the SAME file is outside it --
+  // measured, with a root `mcpServers.mcp` (user scope) and a
+  // projects[<dir>] entry both present, `uninstall --scope local` removes the
+  // local entry, prints Done, and the root entry still launches yaw-mcp. That
+  // per-scope reach predates this branch (uninstall resolves one scope and has
+  // always spoken about it); widening the Done line to the file's other scopes
+  // would make a scoped uninstall report on wiring it deliberately does not
+  // touch, which is a separate decision. Read the line below as "nothing this
+  // run left behind in the containers this scope reads".
+  const stillLaunching = sites.filter((s) => s.legacyEntry !== null && !trimsLegacy(s));
+  if (stillLaunching.length > 0) {
+    const kept = stillLaunching.map((s) => `"${s.legacyEntry}"${where(s)}`);
+    log(
+      `\n${target.label} still launches yaw-mcp through the legacy ${kept.join(" and ")} ` +
+        `entr${kept.length === 1 ? "y" : "ies"} you asked to keep (--keep-legacy). Remove ` +
+        `${kept.length === 1 ? "it" : "them"} from ${resolved.absolute} to stop it. ` +
+        "Your servers in ~/.yaw-mcp/bundles.json are untouched.",
+    );
+    return { written, wouldWrite: [], messages, exitCode: 0 };
   }
 
   // Names what was NOT touched on purpose: `uninstall` unwires a client, it

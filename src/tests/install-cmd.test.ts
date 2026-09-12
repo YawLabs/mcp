@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runDoctor } from "../doctor-cmd.js";
 import {
   type BundlesSummary,
   clientUnavailableMessage,
@@ -78,11 +79,16 @@ afterEach(() => {
   rmSync(synthCwd, { recursive: true, force: true });
 });
 
-/** The projects[] key install writes for a project dir: Claude Code spells
- *  those keys with forward slashes on every OS, so a host-native fixture path
- *  (backslashes on a Windows runner) must be normalized before indexing into
- *  the written JSON. No-op on POSIX. */
-const projectsKey = (dir: string): string => dir.replace(/\\/g, "/");
+/** The projects[] key install writes for a project dir: forward slashes and
+ *  an upper-case drive letter -- the spelling Claude Code reads whenever its
+ *  cwd has an upper-case drive (a cmd prompt, or a Git Bash started from
+ *  one, can still hand it a lower-case "c:") -- so a
+ *  host-native fixture path (backslashes on a Windows runner) must be
+ *  normalized before indexing into the written JSON. Deliberately NOT
+ *  claudeCodeProjectKey: an independent spelling of the rule, so a regression
+ *  in that helper cannot also rewrite the expectation. No-op on POSIX fixture
+ *  paths, which are absolute and so never start with a drive letter. */
+const projectsKey = (dir: string): string => dir.replace(/\\/g, "/").replace(/^[a-z]:/, (d) => d.toUpperCase());
 
 /** The four cells of the one `install --list` row for CLIENT + SCOPE. Split
  *  on the two-space gutter the table pads with, so a single space inside a
@@ -5810,5 +5816,342 @@ describe("install / uninstall keep the neighbouring entries' bytes", () => {
         ...close,
       ),
     );
+  });
+});
+
+describe("Claude Code local scope -- a lower-case --project-dir drive letter", () => {
+  // Claude Code looks projects[] up under its cwd as the shell reported it,
+  // and Git Bash / PowerShell report "C:" even after `cd c:/...`. A
+  // lower-case --project-dir used to write a "c:/..." key: install printed
+  // Done, and --list handed the SAME lower-case dir agreed (same wrong key),
+  // so only a probe from the directory as the shell spells it -- which is
+  // what Claude Code does -- came up empty. Windows-only: on a POSIX runner
+  // "c:..." is not a drive path at all.
+  it.runIf(process.platform === "win32")(
+    "install writes the upper-case key, and --list, doctor and uninstall all find it",
+    async () => {
+      // mkdtemp under tmpdir(): an upper-case drive, as the shell reports it.
+      expect(synthCwd).toMatch(/^[A-Z]:/);
+      const lowerDir = synthCwd[0].toLowerCase() + synthCwd.slice(1);
+      const key = projectsKey(synthCwd);
+      expect(key).toMatch(/^[A-Z]:\//);
+
+      const inst = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "local",
+        os: "windows",
+        home: synthHome,
+        cwd: synthCwd,
+        projectDir: lowerDir,
+        io: inst.io,
+        oamProbe: OAM_ABSENT,
+        bundlesSummary: BUNDLES_EMPTY,
+      });
+      expect(r.exitCode).toBe(0);
+      const written = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+      // Byte-exact, and the ONLY key: no lower-case sibling beside it.
+      expect(Object.keys(written.projects)).toEqual([key]);
+      expect(written.projects[key].mcpServers[ENTRY_NAME]).toBeDefined();
+
+      const localRow = (out: string): string =>
+        out.split("\n").find((l) => /^\s*Claude Code\s+local\s/.test(l)) ?? "(no Claude Code local row)";
+      // --list from the directory as the shell spells it (upper-case drive),
+      // i.e. where Claude Code itself runs...
+      const listHere = captureIo();
+      await runInstall({ listOnly: true, os: "windows", home: synthHome, cwd: synthCwd, io: listHere.io });
+      expect(localRow(listHere.stdout())).toMatch(/\binstalled\s*$/);
+      expect(localRow(listHere.stdout())).not.toMatch(/not installed/);
+      // ...and handed the same lower-case --project-dir install got.
+      const listLower = captureIo();
+      await runInstall({
+        listOnly: true,
+        os: "windows",
+        home: synthHome,
+        cwd: synthCwd,
+        projectDir: lowerDir,
+        io: listLower.io,
+      });
+      expect(localRow(listLower.stdout())).toMatch(/\binstalled\s*$/);
+      expect(localRow(listLower.stdout())).not.toMatch(/not installed/);
+
+      // doctor, from the directory as the shell spells it.
+      const doctorOut: string[] = [];
+      await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: {},
+        os: "windows",
+        out: (s) => doctorOut.push(s),
+        err: () => {},
+      });
+      expect(doctorOut.join("")).toContain(`Claude Code (local): OK -- has "${ENTRY_NAME}" entry`);
+
+      // uninstall handed the lower-case dir removes exactly what install wrote.
+      const un = captureIo();
+      const u = await runUninstall({
+        clientId: "claude-code",
+        scope: "local",
+        os: "windows",
+        home: synthHome,
+        cwd: synthCwd,
+        projectDir: lowerDir,
+        force: true,
+        io: un.io,
+      });
+      expect(u.exitCode).toBe(0);
+      const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+      expect(Object.keys(after.projects)).toEqual([key]);
+      expect(after.projects[key].mcpServers?.[ENTRY_NAME]).toBeUndefined();
+    },
+  );
+});
+
+describe("Claude Code local scope -- an entry under the OTHER drive-letter case", () => {
+  // The upgrade path off v1.0.0. That version wrote the projects[] key with
+  // whatever drive-letter case it was handed, so `--project-dir c:/repo` left
+  // projects["c:/repo"].mcpServers.mcp in ~/.claude.json plus mcp__mcp__* in
+  // the project's .claude/settings.local.json. This version writes the
+  // upper-case key -- and reading only that key is how uninstall came to strip
+  // the grant, print "Done: Claude Code no longer launches yaw-mcp", and leave
+  // the entry a cmd-started session still reads.
+  //
+  // Windows-only for the same reason the rest of the drive-case suite is: on a
+  // POSIX runner "c:/x" is not a drive path, so resolveInstallPath resolves it
+  // against the cwd and no drive key is ever built. The fold itself is pinned
+  // platform-independently in install-targets.test.ts.
+  const win32 = process.platform === "win32";
+
+  /** ~/.claude.json as v1.0.0 left it: the entry under the lower-case key,
+   *  plus two entries for an unrelated project (in BOTH cases) that nothing
+   *  here may touch. */
+  const seedLegacyConfig = (lowerKey: string): { otherUpper: string; otherLower: string } => {
+    const otherUpper = "C:/somewhere/else";
+    const otherLower = "c:/somewhere/else";
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify(
+        {
+          projects: {
+            [lowerKey]: {
+              mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } },
+            },
+            [otherUpper]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["other-upper"] } } },
+            [otherLower]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["other-lower"] } } },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    return { otherUpper, otherLower };
+  };
+
+  const lowerOf = (key: string): string => key[0].toLowerCase() + key.slice(1);
+
+  it.runIf(win32)("uninstall clears the sibling entry AND the grant, and only then prints Done", async () => {
+    const upperKey = projectsKey(synthCwd);
+    const lowerKey = lowerOf(upperKey);
+    expect(lowerKey).not.toBe(upperKey);
+    const { otherUpper, otherLower } = seedLegacyConfig(lowerKey);
+    const settingsPath = join(synthCwd, ".claude", "settings.local.json");
+    mkdirSync(join(synthCwd, ".claude"), { recursive: true });
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({ permissions: { allow: ["Bash(git *)", CLAUDE_CODE_ALLOW_PATTERN] } }, null, 2),
+    );
+
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "windows",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    // The bug, stated as an assertion: the first run used to see only the
+    // canonical key, so it removed the grant, said Done, and left the entry.
+    expect(out).not.toMatch(/Nothing to do/);
+    expect(out).toContain(`Removed the "${ENTRY_NAME}" entry under projects[${JSON.stringify(lowerKey)}].`);
+    expect(out).toContain("Done: Claude Code no longer launches yaw-mcp");
+
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(after.projects[lowerKey].mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).permissions.allow).toEqual(["Bash(git *)"]);
+    // Two keys that differ from this project's in a NON-drive character are a
+    // different project -- in both drive cases -- and keep their entries.
+    expect(after.projects[otherUpper].mcpServers[ENTRY_NAME].args).toEqual(["other-upper"]);
+    expect(after.projects[otherLower].mcpServers[ENTRY_NAME].args).toEqual(["other-lower"]);
+
+    // Second run: now there genuinely is nothing, and it says so.
+    const cap2 = captureIo();
+    const r2 = await runUninstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "windows",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      force: true,
+      io: cap2.io,
+    });
+    expect(r2.exitCode).toBe(0);
+    expect(cap2.stdout()).toContain("Nothing to do");
+  });
+
+  it.runIf(win32)("uninstall names the sibling key in the removal preview", async () => {
+    const lowerKey = lowerOf(projectsKey(synthCwd));
+    seedLegacyConfig(lowerKey);
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "windows",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      dryRun: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toContain(`entry:    "${ENTRY_NAME}" under projects[${JSON.stringify(lowerKey)}]`);
+    expect(r.wouldWrite).toContain(join(synthHome, ".claude.json"));
+    // A dry run promises, it does not do.
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(after.projects[lowerKey].mcpServers[ENTRY_NAME]).toBeDefined();
+  });
+
+  it.runIf(win32)("doctor and --list report the entry and name the key it is under", async () => {
+    const lowerKey = lowerOf(projectsKey(synthCwd));
+    seedLegacyConfig(lowerKey);
+
+    const doctorOut: string[] = [];
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "windows",
+      out: (s) => doctorOut.push(s),
+      err: () => {},
+    });
+    const doctorText = doctorOut.join("");
+    // Not "not configured": the entry is real, it is just under the other
+    // spelling -- and the line says which.
+    expect(doctorText).toContain(`Claude Code (local): OK -- has "${ENTRY_NAME}" entry`);
+    expect(doctorText).toContain(`found under projects[${JSON.stringify(lowerKey)}]`);
+
+    const list = captureIo();
+    await runInstall({ listOnly: true, os: "windows", home: synthHome, cwd: synthCwd, io: list.io });
+    const listText = list.stdout();
+    const localRow = listText.split("\n").find((l) => /^\s*Claude Code\s+local\s/.test(l)) ?? "(no row)";
+    expect(localRow).toMatch(/installed \(other drive case\)\s*$/);
+    expect(listText).toContain(`under projects[${JSON.stringify(lowerKey)}]`);
+  });
+
+  it.runIf(win32)("install writes the canonical key, leaves the sibling, and reports it", async () => {
+    const upperKey = projectsKey(synthCwd);
+    const lowerKey = lowerOf(upperKey);
+    seedLegacyConfig(lowerKey);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "windows",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: synthCwd,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+      bundlesSummary: BUNDLES_EMPTY,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toContain(`also has a "${ENTRY_NAME}" entry under projects[${JSON.stringify(lowerKey)}]`);
+    expect(out).toContain("yaw-mcp uninstall claude-code --scope local");
+
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    // The canonical key is written...
+    expect(after.projects[upperKey].mcpServers[ENTRY_NAME]).toBeDefined();
+    // ...and the sibling is left exactly as it was. Deleting it would unwire
+    // the one kind of session that can read it and give that session nothing
+    // back -- install adds, uninstall subtracts.
+    expect(after.projects[lowerKey].mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcp@latest"]);
+  });
+
+  it.runIf(win32)("leaves a UNC project key alone, including one differing only in case", async () => {
+    // A UNC path has no drive letter, so nothing folds and a host name
+    // differing only in case is a DIFFERENT key. Win32-only because
+    // resolveInstallSite resolves the project dir against the real cwd, which
+    // rewrites a foreign-shaped path on the other platform -- the POSIX half
+    // of the same claim is pinned platform-independently in
+    // install-targets.test.ts.
+    const key = "//server/share/repo";
+    const otherHost = "//Server/share/repo";
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        projects: {
+          [key]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["mine"] } } },
+          [otherHost]: { mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["theirs"] } } },
+        },
+      }),
+    );
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "windows",
+      home: synthHome,
+      cwd: synthCwd,
+      projectDir: "\\\\server\\share\\repo",
+      force: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(after.projects[key].mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(after.projects[otherHost].mcpServers[ENTRY_NAME].args).toEqual(["theirs"]);
+    // No key was named in the output, because none of this is a case variant.
+    expect(cap.stdout()).not.toContain("under projects[");
+  });
+
+  it("does not claim Done while a legacy entry the user asked to keep still launches yaw-mcp", async () => {
+    // The same false-all-clear class, from the other direction: --keep-legacy
+    // leaves a pre-rename entry the client still launches, in a container this
+    // very run read. The Done line speaks for the containers the run's own
+    // scope reads -- not for the whole file, which can also hold another
+    // scope's or another project's wiring -- and this is one of them.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+          "mcp.hosting": { command: "npx", args: ["-y", "@yawlabs/mcp@0.1.0"] },
+        },
+      }),
+    );
+    const cap = captureIo();
+    const r = await runUninstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      force: true,
+      keepLegacy: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).not.toContain("no longer launches yaw-mcp");
+    expect(out).toContain('still launches yaw-mcp through the legacy "mcp.hosting" entry');
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(after.mcpServers[ENTRY_NAME]).toBeUndefined();
+    expect(after.mcpServers["mcp.hosting"]).toBeDefined();
   });
 });
