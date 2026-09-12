@@ -156,9 +156,17 @@ fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 MCP_PUBLISHER_VERSION="v1.7.9"
 
 # MINGW64 on Windows ARM64 intermittently segfaults in npm's exit cleanup AFTER
-# a tool has finished and printed its report. This is npm's WRAPPER, not any one
-# tool -- distinct from the biome-2.5.x binary crash that v0.72.0 fixed by
-# pinning 2.4.16 (the @biomejs/biome pin in package.json); do not merge the two.
+# a tool has finished and printed its report. Attributed to npm's WRAPPER rather
+# than to any one tool because it fires after the tool's output is complete, and
+# on subcommands that never invoke a linter (`npm version` in step 3, `npm
+# publish` in step 4). That is an inference from the shape, not a measured root
+# cause -- it has never been isolated the way the biome crash below was, so do
+# not harden it into more than it is.
+# DISTINCT from the biome 2.5.4 win32-arm64 binary crash that v0.72.0 pinned
+# around (the @biomejs/biome pin in package.json): that one is a PER-VERSION
+# fault in the tool's OWN executable and fires BEFORE any output -- 2.4.16 and
+# 2.5.13 both run clean on this host. See the header and run_npm_check below for
+# the measurements. Do not merge the two.
 # Being intermittent, a clean run does not retire it. The tool's OUTPUT is
 # authoritative: a 139/134 from `npm run` is tolerated only if the tool's own
 # success marker is in the captured output (or a direct re-run bypasses the
