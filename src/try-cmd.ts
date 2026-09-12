@@ -69,6 +69,7 @@ import { createInterface } from "node:readline/promises";
 import { atomicWriteFile } from "./atomic-write.js";
 import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
 import { clientChoices, resolveClientArg } from "./client-aliases.js";
+import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
 import { clientUnavailableMessage, describeUnreadableConfig, mergeClientConfig } from "./install-cmd.js";
 import {
@@ -800,7 +801,13 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     }
     ttlMs = parsedTtl;
   }
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Every client env var through the ONE reader (empty counts as unset, one
+  // rule in one place), so a trial lands in the same file install writes --
+  // including a client whose path an env var redirects. `try` used to spell
+  // the CLAUDE_CONFIG_DIR rule for itself, which is how two commands come to
+  // disagree about whether an empty value relocates anything.
+  const clientEnv = readClientEnv(env);
+  const claudeConfigDir = clientEnv.claudeConfigDir;
   // Hermetic-home seam: keep the %APPDATA%-based claude-desktop path inside an
   // overridden home, and otherwise read the ambient %APPDATA% so try names the
   // same file install writes. Computed ONCE -- the step-2 probe and the step-3
@@ -890,6 +897,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       appData,
       projectDir,
       claudeConfigDir,
+      // A MODULAR row resolves its own path from these, so a trial written for
+      // an env-redirected client lands where that client reads.
+      clientEnv,
     });
   } catch (e) {
     printErr(`yaw-mcp try: ${(e as Error).message}`);

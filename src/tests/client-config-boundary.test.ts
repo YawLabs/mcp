@@ -164,12 +164,11 @@ const RULES: Rule[] = [
     pattern:
       /env(?:\?\.|\.|\[")(?:CLAUDE_CONFIG_DIR|CODEX_HOME|CLINE_MCP_SETTINGS_PATH|CLINE_DATA_DIR|CLINE_DIR|CONTINUE_GLOBAL_DIR|XDG_CONFIG_HOME|APPDATA)\b/,
     allowed: {
-      "src/install-target-model.ts": "resolveAppDataDir -- the one place %APPDATA% is chosen",
-      "src/index.ts":
-        "reads CLAUDE_CONFIG_DIR once per verb and threads it in; moves to readClientEnv with the consumer",
-      "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/local-add-cmd.ts": NOT_YET_MIGRATED,
-      "src/try-cmd.ts": NOT_YET_MIGRATED,
+      "src/install-target-model.ts": "resolveAppDataDir -- the one place %APPDATA% is chosen for a client path",
+      "src/doctor-cmd.ts":
+        "%APPDATA% for the PowerShell HISTORY file, which is not a client config at all. APPDATA stays in " +
+        "the pattern rather than being dropped, because the client-PATH use of that variable is exactly " +
+        "what has to stay in one place",
     },
     positive: ["process.env.CODEX_HOME", 'env["XDG_CONFIG_HOME"]', "opts.env?.CLINE_DIR"],
     negative: ["process.env.LOG_LEVEL", "env.HOME"],

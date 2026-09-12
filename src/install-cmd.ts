@@ -67,6 +67,7 @@ import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
   blockedContainerFix,
   buildLaunchEntry,
+  type ClientEnvValues,
   CURRENT_OS,
   claudeCodeContainerPaths,
   describeJsonShape,
@@ -175,6 +176,12 @@ export interface InstallCommandOptions {
    *  in index.ts populates this from `process.env.CLAUDE_CONFIG_DIR`;
    *  tests leave it undefined to stay hermetic against an env-set value. */
   claudeConfigDir?: string;
+  /** Every client env var, as `readClientEnv` reported it, threaded from the
+   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
+   *  three knobs, Continue's global dir); the six inline rows take their one
+   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
+   *  here, so a test that calls this runner directly stays hermetic. */
+  clientEnv?: ClientEnvValues;
   /** Override for tests; defaults to process.stdin/stdout. */
   io?: {
     stdin: NodeJS.ReadableStream;
@@ -581,6 +588,7 @@ export function resolveInstallSite(
     appData?: string;
     cwd?: string;
     claudeConfigDir?: string;
+    clientEnv?: ClientEnvValues;
   },
   err: (s: string) => void,
 ): {
@@ -691,6 +699,10 @@ export function resolveInstallSite(
       appData: resolveAppDataDir({ appData: opts.appData, home: opts.home }),
       projectDir,
       claudeConfigDir: opts.claudeConfigDir,
+      // A MODULAR row resolves its own path from these (Zed's
+      // $XDG_CONFIG_HOME, Cline's three knobs, Continue's global dir). Read
+      // once by the dispatcher; a row never reads process.env itself.
+      clientEnv: opts.clientEnv,
     });
   } catch (e) {
     // Defensive; unreachable via the checks above. Everything the resolver
@@ -2080,6 +2092,10 @@ async function runInstallList(
     os,
     cwd,
     claudeConfigDir: opts.claudeConfigDir,
+    // `--list` must resolve each row's path the way INSTALL does, or it
+    // reports on a file install never writes: an env-redirected client would
+    // show "not installed" beside an entry sitting at the redirected path.
+    clientEnv: opts.clientEnv,
     appData: resolveAppData(opts),
   });
 
@@ -2486,6 +2502,12 @@ export interface UninstallCommandOptions {
   cwd?: string;
   /** Claude Code's `CLAUDE_CONFIG_DIR`; see InstallCommandOptions. */
   claudeConfigDir?: string;
+  /** Every client env var, as `readClientEnv` reported it, threaded from the
+   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
+   *  three knobs, Continue's global dir); the six inline rows take their one
+   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
+   *  here, so a test that calls this runner directly stays hermetic. */
+  clientEnv?: ClientEnvValues;
   io?: InstallCommandOptions["io"];
   /** Override for tests; replaces the interactive prompt with a fixed answer. */
   promptAnswer?: string;

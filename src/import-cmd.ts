@@ -70,6 +70,7 @@ import { clientChoices, resolveClientArg } from "./client-aliases.js";
 import { resolveInstallSite } from "./install-cmd.js";
 import {
   blockedContainerFix,
+  type ClientEnvValues,
   claudeCodeContainerPaths,
   describeJsonShape,
   ENTRY_NAME,
@@ -141,6 +142,12 @@ export interface ImportCommandOptions {
   cwd?: string;
   appData?: string;
   claudeConfigDir?: string;
+  /** Every client env var, as `readClientEnv` reported it, threaded from the
+   *  dispatcher. Only a MODULAR row reads it (Zed's $XDG_CONFIG_HOME, Cline's
+   *  three knobs, Continue's global dir); the six inline rows take their one
+   *  variable from `claudeConfigDir` above. Read by the dispatcher and never
+   *  here, so a test that calls this runner directly stays hermetic. */
+  clientEnv?: ClientEnvValues;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Test hook: override the TTY verdict instead of reading process.std*. */
@@ -992,6 +999,9 @@ export async function runImport(opts: ImportCommandOptions): Promise<ImportComma
         os: site.os,
         home,
         appData: resolveAppDataDir({ appData: opts.appData, home }),
+        // Same env the target scope resolved with, so an env-redirected client
+        // is searched at its REAL other-scope path rather than the default one.
+        clientEnv: opts.clientEnv,
         // The project the user is standing in -- the same resolution
         // resolveInstallSite would have made had that scope been the target.
         projectDir: spec.requiresProjectDir

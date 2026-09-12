@@ -2,6 +2,7 @@ import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCallArgs, runCall } from "./call-cmd.js";
 import { clientChoices } from "./client-aliases.js";
+import { readClientEnv } from "./client-config.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
@@ -129,6 +130,14 @@ function run<T>(
 // subcommand here is local-only.
 const subcommand = process.argv[2];
 
+// Every client env var, read ONCE here and threaded into the verbs that need
+// it -- never inside a runner, so a test that calls the runner directly stays
+// hermetic and cannot inherit a wrapper's env. `readClientEnv` is the single
+// reader of these names (empty counts as UNSET, one rule in one place); three
+// hand-rolled copies of that rule is how two commands came to disagree about
+// whether an empty CLAUDE_CONFIG_DIR relocates anything.
+const clientEnv = readClientEnv(process.env);
+
 // Any subcommand at all means a person at a terminal, not a client speaking
 // JSON-RPC -- the server launch is the one invocation with NO first argument
 // (see the else branch at the bottom). Told here rather than inferred inside
@@ -160,31 +169,21 @@ if (subcommand === "compliance") {
     process.stdout.write(`${INSTALL_USAGE}\n`);
     process.exitCode = 0;
   } else {
-    // Read CLAUDE_CONFIG_DIR here (not inside runInstall) so tests stay
-    // hermetic — they call runInstall directly and never inherit env state.
-    const claudeConfigDir =
-      process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-        ? process.env.CLAUDE_CONFIG_DIR
-        : undefined;
-    run("install", parsed, (options) => runInstall({ ...options, claudeConfigDir }));
+    run("install", parsed, (options) =>
+      runInstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
+    );
   }
 } else if (subcommand === "uninstall") {
   // Rides the shared parse-then-dispatch tail: parseUninstallArgs signals
   // --help the ordinary way (`{ ok: false, error: USAGE, help: true }`), so
   // unlike `install` it needs no branch of its own for it.
   //
-  // CLAUDE_CONFIG_DIR is read HERE, not inside runUninstall, for the same
-  // hermeticity reason install does it: the tests call the runner directly and
-  // must not inherit a wrapper's env. It matters as much on the subtract side
-  // -- under a Yaw Mode overlay the entry lives in the wrapper's dir, and an
-  // uninstall that ignored the redirect would report "nothing to do" while the
-  // real entry stayed wired.
-  const claudeConfigDir =
-    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-      ? process.env.CLAUDE_CONFIG_DIR
-      : undefined;
+  // The env comes from the ONE reader above, not from a read of its own. It
+  // matters as much on the subtract side -- under a Yaw Mode overlay the entry
+  // lives in the wrapper's dir, and an uninstall that ignored the redirect
+  // would report "nothing to do" while the real entry stayed wired.
   run("uninstall", parseUninstallArgs(process.argv.slice(3)), (options) =>
-    runUninstall({ ...options, claudeConfigDir }),
+    runUninstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
   );
 } else if (subcommand === "doctor") {
   // Argv parsing lives in doctor-cmd.ts (parseDoctorArgs) like every sibling
@@ -224,17 +223,12 @@ if (subcommand === "compliance") {
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
 } else if (subcommand === "import") {
-  // CLAUDE_CONFIG_DIR is read HERE, not inside runImport, for the same
-  // hermeticity reason install and uninstall do it: the tests call the runner
-  // directly and must not inherit a wrapper's env. It matters as much on the
-  // READ side -- under a Yaw Mode overlay the servers to import live in the
-  // wrapper's dir, and an import that ignored the redirect would report the
-  // user has none.
-  const claudeConfigDir =
-    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-      ? process.env.CLAUDE_CONFIG_DIR
-      : undefined;
-  run("import", parseImportArgs(process.argv.slice(3)), (options) => runImport({ ...options, claudeConfigDir }));
+  // Same one reader. It matters as much on the READ side -- under a Yaw Mode
+  // overlay the servers to import live in the wrapper's dir, and an import
+  // that ignored the redirect would report the user has none.
+  run("import", parseImportArgs(process.argv.slice(3)), (options) =>
+    runImport({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
+  );
 } else if (subcommand === "call") {
   run("call", parseCallArgs(process.argv.slice(3)), runCall);
 } else if (subcommand === "search") {

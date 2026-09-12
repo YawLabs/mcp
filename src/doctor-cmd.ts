@@ -41,6 +41,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
+import { readClientEnv } from "./client-config.js";
 import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
@@ -57,6 +58,7 @@ import {
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import {
   blockedContainerFix,
+  type ClientEnvValues,
   CURRENT_OS,
   claudeCodeContainerPaths,
   describeJsonShape,
@@ -591,6 +593,7 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   config: ResolvedConfig;
   trustProbe: ProjectTrustProbe | null;
   claudeConfigDir: string | undefined;
+  clientEnv: ClientEnvValues;
 }> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
@@ -612,11 +615,27 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   const trustWarning = projectTrustWarning(trustProbe);
   if (trustWarning) config.warnings = [...config.warnings, trustWarning];
 
-  // Honor CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
-  // when run inside a wrapper (Yaw Mode, dev container with the env set).
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Every client env var through the ONE reader, so doctor sees exactly the
+  // files install writes: CLAUDE_CONFIG_DIR for Claude Code inside a wrapper
+  // (Yaw Mode, a dev container with the env set), and the rest for the clients
+  // that have one -- a redirected Zed, Cline or Continue would otherwise be
+  // probed at its DEFAULT path while install writes the redirected one, which
+  // is the same read-write split CLAUDE_CONFIG_DIR was added for. Empty counts
+  // as unset there, one rule in one place.
+  const clientEnv = readClientEnv(env);
 
-  return { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir };
+  return {
+    cwd,
+    home,
+    appData,
+    os,
+    env,
+    timestamp,
+    config,
+    trustProbe,
+    claudeConfigDir: clientEnv.claudeConfigDir,
+    clientEnv,
+  };
 }
 
 /** state.json, peeked and (when usable) loaded ONCE, for the STATE and
@@ -765,7 +784,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     write(`${s}\n`);
   };
 
-  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir } = await collectDoctorBase(opts);
+  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
+    await collectDoctorBase(opts);
 
   print(`yaw-mcp doctor -- ${timestamp}`);
   print(`yaw-mcp version: ${VERSION}`);
@@ -867,6 +887,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     os,
     cwd,
     claudeConfigDir,
+    clientEnv,
     appData,
     platform: opts.platform,
     readClientConfig: opts.readClientConfig,
@@ -1001,7 +1022,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // Same collection prologue as the text path -- option defaults, config load,
   // project-trust fold, CLAUDE_CONFIG_DIR -- so `doctor --json` reports the
   // gate in `.warnings` and exits 2 identically. See collectDoctorBase.
-  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir } = await collectDoctorBase(opts);
+  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
+    await collectDoctorBase(opts);
 
   // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
   // `doctor` and `doctor --json` have the SAME persistent side effects
@@ -1031,6 +1053,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     os,
     cwd,
     claudeConfigDir,
+    clientEnv,
     appData,
     platform: opts.platform,
     readClientConfig: opts.readClientConfig,
@@ -2330,6 +2353,13 @@ interface ProbeOptions {
    *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
    *  `yaw-mcp install --list` see the same file Claude Code reads. */
   claudeConfigDir?: string;
+  /** Every client env var, as `readClientEnv` reported it. Only a MODULAR row
+   *  reads it (Zed's $XDG_CONFIG_HOME, Cline's three knobs, Continue's global
+   *  dir); the six inline rows take their one variable from `claudeConfigDir`
+   *  above. Without it, doctor and `--list` resolve a redirected client's path
+   *  from the DEFAULT location while install writes the redirected one -- the
+   *  same read-write split `claudeConfigDir` was added for. */
+  clientEnv?: ClientEnvValues;
   /** Path semantics for the launch checks: which `isAbsolute` an entry's
    *  command is judged by, and whether a drive-letter path is foreign (see
    *  isForeignAbsoluteLaunch). Defaults to process.platform -- what the
@@ -2446,6 +2476,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           appData: opts.appData,
           projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
           claudeConfigDir: opts.claudeConfigDir,
+          clientEnv: opts.clientEnv,
         });
       } catch {
         // resolveInstallPath throws when project is required but missing —

@@ -19,6 +19,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
+import { readClientEnv } from "./client-config.js";
 import { probeClientsAsync } from "./doctor-cmd.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 import { CURRENT_OS, resolveAppDataDir } from "./install-targets.js";
@@ -487,18 +488,26 @@ async function anyClientWiredToYawMcp(
   env: NodeJS.ProcessEnv,
   appData: string,
 ): Promise<boolean> {
+  const clientEnv = readClientEnv(env);
   try {
     const probes = await probeClientsAsync({
       home,
       os: CURRENT_OS,
       cwd,
-      // CLAUDE_CONFIG_DIR relocates claude-code's file; `appData` is resolved
-      // by the caller (see runAdd) because choosing between the ambient
-      // %APPDATA% and a home-derived one is a caller's job -- resolving it
-      // from the ALREADY-defaulted home here would pin every real run to
-      // <home>\AppData\Roaming and miss a redirected profile, which is the
-      // exact split resolveAppDataDir exists to prevent.
-      claudeConfigDir: env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined,
+      // Every client env var comes from `readClientEnv`, the ONE reader of
+      // those names -- not from a `process.env.X` of this module's own, which
+      // is how two commands came to disagree about whether an EMPTY value
+      // counts as set. CLAUDE_CONFIG_DIR relocates claude-code's file; the
+      // rest are read for the clients that have one, so a Continue- or
+      // Cline-only user stops getting a false "nothing is wired" nudge.
+      //
+      // `appData` stays resolved by the CALLER (see runAdd): choosing between
+      // the ambient %APPDATA% and a home-derived one is a caller's job --
+      // resolving it from the ALREADY-defaulted home here would pin every
+      // real run to <home>\AppData\Roaming and miss a redirected profile,
+      // which is the exact split resolveAppDataDir exists to prevent.
+      claudeConfigDir: clientEnv.claudeConfigDir,
+      clientEnv,
       appData,
     });
     return probes.some((p) => p.hasMcpEntry);
