@@ -27,8 +27,14 @@
 //
 // Failure semantics:
 //   - Existing client file with malformed JSON  → refuse, point at the file.
-//   - Existing `mcp` entry                      → prompt (TTY) or refuse
-//                                                  with --force/--skip flag.
+//   - Existing `mcp` entry that differs         → prompt (TTY) or refuse
+//                                                  (exit 2) off one, unless
+//                                                  --repair (keeps its env's
+//                                                  string values), --force
+//                                                  (drops all of it) or
+//                                                  --skip answers up front.
+//                                                  One that already matches
+//                                                  is a no-op.
 //   - Client file changed between read + write  → refuse, ask for a re-run
 //                                                  (see the fingerprint check
 //                                                  ahead of atomicWriteFile).
@@ -96,15 +102,21 @@ export interface InstallCommandOptions {
    *  Still accepted (with a stderr warning) so scripted installs that pass
    *  `--token mcp_pat_...` keep working and keep exiting 0. */
   token?: string;
-  /** Overwrite an existing yaw-mcp entry without prompting. */
+  /** Overwrite an existing yaw-mcp entry without prompting -- ALL of it. The
+   *  entry written carries no `env` from the one it replaces (the carry-over in
+   *  runInstall is skipped), so this is the flag that purges a wrong
+   *  YAW_MCP_VAULT_PASSPHRASE or a stale OAM_BIN; install names each env key it
+   *  drops. Mutually exclusive with `repair`, which keeps that env's string
+   *  values. */
   force?: boolean;
   /** Replace an existing entry that DIFFERS from the one this run would write,
-   *  without prompting. Distinct from `--force` only in intent, and that
-   *  distinction is the point: `--force` reads as "overwrite whatever is
-   *  there", which is why a setup script could not use it casually. `--repair`
-   *  says "make the entry match what install would write", and on an entry
-   *  that ALREADY matches it is a no-op like every other path now is -- so a
-   *  post-upgrade fixup can run it unconditionally. */
+   *  without prompting, KEEPING the existing entry's string-valued `env`.
+   *  That is what separates it from `--force`: `--force` overwrites whatever is
+   *  there, env included, which is why a setup script cannot use it casually.
+   *  `--repair` says "make the entry match what install would write, and keep
+   *  what the user added", and on an entry that ALREADY matches it is a no-op
+   *  like every other path now is -- so a post-upgrade fixup can run it
+   *  unconditionally. */
   repair?: boolean;
   /** Leave an existing yaw-mcp entry untouched (exit 0). */
   skip?: boolean;
@@ -409,10 +421,11 @@ const USAGE =
   "  as a malformed config, exits 1). Under --all the run exits 2 when every\n" +
   "  client that did not succeed was refused this way, and 1 if any one failed.\n" +
   "  Answer up front with:\n" +
-  "  --force     Overwrite whatever is there.\n" +
-  "  --repair    Replace an entry that has DRIFTED from what install writes; a\n" +
-  "              no-op when it already matches, so a fixup script can run it\n" +
-  "              unconditionally.\n" +
+  "  --force     Overwrite whatever is there, env included: the new entry keeps\n" +
+  "              none of the old entry's env, and install names each key it drops.\n" +
+  "  --repair    Replace an entry that has DRIFTED from what install writes,\n" +
+  "              keeping the old entry's string-valued env; a no-op when it\n" +
+  "              already matches, so a fixup script can run it unconditionally.\n" +
   "  --skip      Leave the existing entry untouched and exit 0.\n" +
   "  --dry-run   Print the entry (and any permissions patch) that WOULD be\n" +
   "              written, and exit 0 without touching a file.\n" +
@@ -679,12 +692,23 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
   // Same class, same place: --repair replaces a drifted entry and --skip
-  // leaves it, so the pair states two contradictory intents. --repair WITH
-  // --force is deliberately allowed -- they agree (both mean "do not prompt,
-  // write the entry"), and refusing an agreeing pair would be the opposite
-  // mistake from the one this guard exists for.
+  // leaves it, so the pair states two contradictory intents.
   if (opts.repair && opts.skip) {
     err("yaw-mcp install: --repair and --skip are mutually exclusive");
+    return { written: [], wouldWrite: [], messages, exitCode: 2 };
+  }
+  // And --force with --repair, for the same reason. The pair used to be
+  // allowed as agreeing ("do not prompt, write the entry"), which held only
+  // while the two flags wrote byte-identical entries. They no longer do:
+  // --force drops the existing entry's env and --repair keeps its string
+  // values, so honoring either one silently discards the other -- and picking
+  // the env-dropping one is how a scripted run loses a vault passphrase nobody
+  // asked it to remove.
+  if (opts.force && opts.repair) {
+    err(
+      "yaw-mcp install: --force and --repair are mutually exclusive -- --force drops the existing entry's env, " +
+        "--repair keeps its string values. Pass one.",
+    );
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
 
@@ -916,24 +940,56 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     runtimeLines.push(oamAbsentNote(os, opts.oamPublishesBinary));
   }
 
-  // Carry over an existing entry's `env`. The merge replaces our entry
-  // wholesale, and the default entry sets no env at all -- so re-running
-  // install silently dropped anything the user had put there. OAM_BIN is the
-  // live example: it pins which oam hosts the sidecars, and losing it moves
-  // them to a different runtime with no diagnostic. Only fills a gap; an
-  // entry that brings its own env (the upstream/try shape) is untouched.
+  // Carry over an existing entry's `env` -- on every path EXCEPT --force. The
+  // merge replaces our entry wholesale, and the default entry sets no env at
+  // all -- so re-running install silently dropped anything the user had put
+  // there. OAM_BIN is the live example: it pins which oam hosts the sidecars,
+  // and losing it moves them to a different runtime with no diagnostic. Only
+  // fills a gap; an entry that brings its own env (the upstream/try shape) is
+  // untouched.
+  //
+  // Carried on --repair, on a TTY prompt answered [o]verwrite (the diff that
+  // prompt shows is computed against this env-carrying entry, so it must be
+  // the entry written), and on a bare --dry-run. NOT on --force: that flag is
+  // documented as overwriting whatever is there, and a user running it to
+  // purge a wrong YAW_MCP_VAULT_PASSPHRASE used to get the same passphrase
+  // back, byte-for-byte what --repair wrote.
   const previousEntry = readEntryAt(existing, containerPath, ENTRY_NAME);
   const previousEnv = previousEntry?.env;
-  const entryToWrite =
-    newEntry.env === undefined && previousEnv && Object.keys(previousEnv).length > 0
-      ? { ...newEntry, env: previousEnv }
-      : newEntry;
+  const carryableEnv =
+    newEntry.env === undefined && previousEnv && Object.keys(previousEnv).length > 0 ? previousEnv : undefined;
+  const entryToWrite = carryableEnv && !opts.force ? { ...newEntry, env: carryableEnv } : newEntry;
   // Buffered with the Runtime lines, and for the same reason: it describes the
   // entry this run is about to WRITE. On the identical path nothing is written
   // and the env was never at risk, so announcing that it was "kept" is a claim
   // about a merge that did not happen.
-  if (entryToWrite !== newEntry) {
-    runtimeLines.push(`Kept existing env on the ${ENTRY_NAME} entry: ${Object.keys(previousEnv ?? {}).join(", ")}`);
+  //
+  // The --force line names what it drops -- KEYS only, never values, the rule
+  // describeEntryDiff and DRY_RUN_ENV_PLACEHOLDER follow for this same block --
+  // because the drop is otherwise visible only as one `env: drops ...` diff
+  // line. It names only the keys --repair would have kept: a non-string value
+  // is filtered out by readEntryAt on both paths, so claiming --repair keeps
+  // it would be false (the diff line still names it). The same filter is why
+  // the parenthetical speaks of THESE keys rather than of "an entry's env":
+  // --repair does not keep a non-string value either. Sorted (the "Kept" line
+  // too), so a multi-key drop names its keys in the order the `env: drops ...`
+  // diff line does rather than the same set twice in two orders. "Dropping",
+  // not "Dropped": the line prints before the write, which can still fail.
+  //
+  // carriedKeys is shared with the TTY prompt and the off-TTY hint below. Both
+  // name the kept keys rather than saying "its env", for the same readEntryAt
+  // reason, and in the same sorted order.
+  const carriedKeys = carryableEnv ? Object.keys(carryableEnv).sort() : [];
+  if (carryableEnv) {
+    const keys = carriedKeys.join(", ");
+    if (opts.force) {
+      runtimeLines.push(
+        `${opts.dryRun ? "Would drop" : "Dropping"} existing env on the ${ENTRY_NAME} entry (--force): ${keys}. ` +
+          `(--repair would keep ${carriedKeys.length === 1 ? "it" : "them"}; --force does not.)`,
+      );
+    } else {
+      runtimeLines.push(`Kept existing env on the ${ENTRY_NAME} entry: ${keys}`);
+    }
   }
 
   // ---- what this run has to do about the entry already on disk ------------
@@ -975,7 +1031,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       return { written: [], wouldWrite: [], messages, exitCode: 0 };
     } else if (opts.promptAnswer) decision = opts.promptAnswer;
     else if (opts.io?.isTTY ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY))) {
-      const answer = await promptCollision(resolved.absolute, diff, opts.io);
+      const answer = await promptCollision(
+        resolved.absolute,
+        diff,
+        opts.io,
+        entryToWrite !== newEntry ? carriedKeys : [],
+      );
       if (answer === "skip") {
         log(`Existing "${ENTRY_NAME}" entry left untouched. Nothing to do.`);
         return { written: [], wouldWrite: [], messages, exitCode: 0 };
@@ -988,13 +1049,27 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // runInstallAll, which learns of the refusal from `collisionRefused`
       // below. It used to learn of it by matching this message's prose on
       // stderr, and swallowed the whole message -- diff included -- with it.
+      //
+      // When the stored entry has env to carry, the two write flags stop being
+      // interchangeable, and this line is where a scripted user picks one: the
+      // diff above was computed WITH the env carried, so it has no `env:` line
+      // for the carried keys and nothing here would warn that --force removes
+      // them. It names those keys rather than saying --repair keeps "its env":
+      // a non-string value is filtered out by readEntryAt, goes on either flag,
+      // and is named by the `env: drops ...` line of the diff above. Under
+      // --all the same distinction rides the one consolidated hint instead, so
+      // it is built here only for the hint this run actually prints.
       const differs = `  It differs from the entry install would write:\n${diffBlock}`;
+      const flagHint = carryableEnv
+        ? `  Re-run with --repair to bring it up to date (keeping env: ${carriedKeys.join(", ")}), ` +
+          "--force to overwrite it outright (dropping its env), --skip to leave it, or --dry-run to preview."
+        : "  Re-run with --repair to bring it up to date, --force to overwrite, --skip to leave it, or --dry-run to preview.";
       err(
         opts.deferCollisionHint
           ? `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry -- left untouched.\n${differs}`
           : `yaw-mcp install: ${resolved.absolute} already has a "${ENTRY_NAME}" entry and stdin is not a TTY.\n` +
               `${differs}\n` +
-              "  Re-run with --repair to bring it up to date, --force to overwrite, --skip to leave it, or --dry-run to preview.",
+              flagHint,
       );
       // Exit 2, not 1: this is a confirmation that could not be asked for off
       // a TTY, which is what `remove`, `set`, `uninstall` and `secrets remove`
@@ -1197,15 +1272,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // whole change, so it is all that prints.
     //
     // The entry's own `env` is the one part of that diff that is NOT ours: it
-    // is the existing entry's, carried over verbatim above, and README tells
-    // users to put YAW_MCP_VAULT_PASSPHRASE in exactly that block. So the
-    // preview keeps its KEYS (the "Kept existing env" line already names
-    // them, and the user needs to see the block survives the overwrite) and
-    // masks every VALUE. A live run writes the real values to the file; the
-    // preview is the one output that exists to be pasted somewhere. Gated on
-    // the carry-over rather than on `env` being present so the placeholder
-    // stays truthful: buildLaunchEntry emits no env of its own here, so an
-    // env on the entry can only have come from the user's file.
+    // is the existing entry's, carried over verbatim above (on every path but
+    // --force, which previews an entry with no env and a "Would drop" line
+    // instead), and README tells users to put YAW_MCP_VAULT_PASSPHRASE in
+    // exactly that block. So the preview keeps its KEYS (the "Kept existing
+    // env" line already names them, and the user needs to see the block
+    // survives the overwrite) and masks every VALUE. A live run writes the
+    // real values to the file; the preview is the one output that exists to
+    // be pasted somewhere. Gated on the carry-over rather than on `env` being
+    // present so the placeholder stays truthful: buildLaunchEntry emits no env
+    // of its own here, so an env on the entry can only have come from the
+    // user's file.
     //
     // `clientJson === null` is the identical-entry, nothing-to-trim case: the
     // preview must promise exactly what the real run would do, and the real run
@@ -1632,10 +1709,20 @@ function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
   return a.mtimeMs === b.mtimeMs && a.size === b.size;
 }
 
+/** `keptEnvKeys`: the stored env keys that the entry an [o]verwrite answer
+ *  writes carries over (runInstall's carry-over runs on this path), sorted;
+ *  empty when it carries none. The question names them because `--force`,
+ *  which USAGE also calls an overwrite, DROPS that env, and the diff above the
+ *  question lists only what changes -- so a kept env would otherwise go
+ *  unmentioned and "overwrite" would mean two things. KEYS, not "its env":
+ *  readEntryAt filters out a non-string value, so an overwrite of a mixed env
+ *  does not keep all of it, and the diff line above the question names the
+ *  key that goes. */
 async function promptCollision(
   path: string,
   diff: string[],
   io: InstallCommandOptions["io"],
+  keptEnvKeys: string[],
 ): Promise<"overwrite" | "skip" | "abort" | "cancelled"> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
@@ -1652,7 +1739,7 @@ async function promptCollision(
       rl,
       `${path} already has an "${ENTRY_NAME}" entry that differs from the one install would write:\n` +
         `${indentDiff(diff, "    ")}\n` +
-        "  [o]verwrite, [s]kip, or [a]bort? (default: skip) ",
+        `  [o]verwrite${keptEnvKeys.length > 0 ? ` (keeping env: ${keptEnvKeys.join(", ")})` : ""}, [s]kip, or [a]bort? (default: skip) `,
     );
     if (raw === QUESTION_CANCELLED) return "cancelled";
     const answer = raw.trim().toLowerCase();
@@ -1854,7 +1941,7 @@ export function readEntryAt(
   const entry = (node as Record<string, unknown>)[entryName];
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
   // Validate `env` before anyone carries it forward: the user chose
-  // overwrite (or --force) precisely to replace a broken entry, and a
+  // overwrite (or --repair) precisely to replace a broken entry, and a
   // malformed env (a string -- whose Object.keys are "0","1","2" -- or an
   // array) would otherwise ride into the fresh entry and get the whole
   // file rejected by the client. Filter PER KEY, not all-or-nothing: one
@@ -2235,7 +2322,8 @@ function displayPath(abs: string, home: string, os: InstallOS): string {
  *  the first non-project scope; clients that ONLY have project scopes
  *  (vscode) are included just when --project-dir is passed, otherwise
  *  skipped. Mirrors the per-client run behavior: prompts and
- *  --force/--repair/--skip propagate.
+ *  --force/--repair/--skip propagate, so `--all --force` drops each entry's
+ *  env exactly as a per-client --force does.
  *
  *  Exit code, aggregated from the per-client results:
  *    0  every planned client succeeded -- written, already correct, or left
@@ -2386,13 +2474,20 @@ async function runInstallAll(
 
   const refused = refusedClients.length;
   const them = refused === 1 ? "it" : "them";
+  const theirEnv = refused === 1 ? "in its env" : "in each entry's env";
   if (refused > 0) {
     // --repair first, as in the single-client refusal: it is the flag
     // INSTALL_USAGE documents for an entry that has drifted from what install
-    // writes, and a differing entry is the only thing that refuses here.
+    // writes, and a differing entry is the only thing that refuses here. It is
+    // also the flag that brings every entry up to date WITHOUT the env loss
+    // --force now carries; this hint used to name --force alone, the one
+    // copy-paste that would strip a vault passphrase out of every client at
+    // once. The env clause is unconditional here, unlike the per-client hint,
+    // because the refusals are consolidated: runInstallAll sees only
+    // `collisionRefused`, not each sub-install's carried keys.
     err(
       `yaw-mcp install --all: ${refused} client${refused === 1 ? " already has" : "s already have"} a differing "${ENTRY_NAME}" entry (${refusedClients.join(", ")}) and stdin is not a TTY.\n` +
-        `  Re-run \`yaw-mcp install --all --repair\` to bring ${them} up to date, \`--force\` to overwrite ${them}, \`--skip\` to leave ${them} untouched, or \`--dry-run\` to preview.`,
+        `  Re-run \`yaw-mcp install --all --repair\` to bring ${them} up to date (keeping the string values ${theirEnv}), \`--force\` to overwrite ${them} outright (dropping all of it), \`--skip\` to leave ${them} untouched, or \`--dry-run\` to preview.`,
     );
   }
 
