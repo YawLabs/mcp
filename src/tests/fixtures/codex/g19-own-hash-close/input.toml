@@ -1,0 +1,5 @@
+[mcp_servers.mcp]
+command = "old"
+note = """
+line1
+# closes it"""

@@ -5,27 +5,40 @@ import { isAbsolute, join, resolve } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   buildLaunchEntry,
+  claudeCodeContainerPaths,
+  claudeCodeContainerPathVariants,
   claudeCodeProjectKey,
   ENTRY_NAME,
   escapeCmdArg,
   INSTALL_TARGETS,
+  type InstallOS,
   isCmdShimLauncher,
   isProjectLocalEntry,
   resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
+  resolveInstallSites,
+  sameClaudeCodeProjectKey,
 } from "../install-targets.js";
 
 describe("INSTALL_TARGETS metadata", () => {
-  it("includes the six expected clients", () => {
-    expect(INSTALL_TARGETS.map((t) => t.clientId).sort()).toEqual([
-      "claude-code",
-      "claude-desktop",
-      "cursor",
-      "gemini-cli",
-      "vscode",
-      "windsurf",
-    ]);
+  // The id LIST is pinned once for the whole suite, in
+  // client-config-boundary.test.ts, as the append-ORDER prefix -- a sorted
+  // literal here would be a second copy of the same fact that every landing
+  // target has to edit, and it could not see an insert (sorting hides it).
+  // What is checked here is the shape a row must have, whatever the ids are.
+  it("gives every client an id, a label, a config root and at least one scope", () => {
+    expect(INSTALL_TARGETS.length).toBeGreaterThan(0);
+    for (const t of INSTALL_TARGETS) {
+      expect(t.clientId, "a row with no clientId").toBeTruthy();
+      expect(t.label, `${t.clientId} has no label`).toBeTruthy();
+      expect(t.config.root, `${t.clientId} has no config root`).toBeTruthy();
+      expect(t.availableOn.length, `${t.clientId} is available nowhere`).toBeGreaterThan(0);
+    }
+    // Ids are unique: two rows sharing one would make `--list` print the file
+    // twice and `resolveInstallPath`'s find return whichever came first.
+    const ids = INSTALL_TARGETS.map((t) => t.clientId);
+    expect(new Set(ids).size, `duplicate client id in ${ids.join(", ")}`).toBe(ids.length);
   });
 
   it("keeps claude-code FIRST in declaration order", () => {
@@ -36,44 +49,85 @@ describe("INSTALL_TARGETS metadata", () => {
     expect(INSTALL_TARGETS[0].clientId).toBe("claude-code");
   });
 
-  it("Claude Desktop is marked unavailable on Linux (no Linux build)", () => {
+  it("Claude Desktop is left off Linux for an undocumented config path, not a missing build", () => {
     const cd = INSTALL_TARGETS.find((t) => t.clientId === "claude-desktop");
     expect(cd?.availableOn).not.toContain("linux");
     expect(cd?.availableOn).toContain("macos");
     expect(cd?.availableOn).toContain("windows");
+    // Byte-exact: the refusal in every verb, doctor and `install --list` all
+    // read this one string, so a drift here is a drift everywhere at once.
+    expect(cd?.notConfigurableOn?.linux).toBe(
+      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
+    );
+  });
+
+  it("notConfigurableOn names only OSes missing from availableOn, where Claude Code and Cursor work", () => {
+    // A reason on an OS the client IS available on would be dead text. And the
+    // refusal's remedy names Claude Code and Cursor by name, so both must be
+    // configurable on every OS a reason is recorded for.
+    let seen = 0;
+    for (const t of INSTALL_TARGETS) {
+      for (const os of Object.keys(t.notConfigurableOn ?? {}) as InstallOS[]) {
+        seen++;
+        expect(t.availableOn).not.toContain(os);
+        for (const alt of ["claude-code", "cursor"]) {
+          expect(INSTALL_TARGETS.find((x) => x.clientId === alt)?.availableOn).toContain(os);
+        }
+      }
+    }
+    // Not vacuous: the loop above must have checked the claude-desktop entry.
+    expect(seen).toBeGreaterThan(0);
   });
 
   it("VS Code uses the `servers` root key, not `mcpServers`", () => {
     // This is the wire contract — getting it wrong silently fails.
     // code.visualstudio.com/docs/copilot/customization/mcp-servers
     const vscode = INSTALL_TARGETS.find((t) => t.clientId === "vscode");
-    expect(vscode?.jsonShape).toBe("servers");
+    expect(vscode?.config.root).toBe("servers");
   });
 
-  it("every client except VS Code uses the `mcpServers` root key", () => {
-    const mcpServerClients = INSTALL_TARGETS.filter((t) => t.jsonShape === "mcpServers").map((t) => t.clientId);
-    expect(mcpServerClients.sort()).toEqual(["claude-code", "claude-desktop", "cursor", "gemini-cli", "windsurf"]);
+  it("pins the root key of each of the six INLINE clients", () => {
+    // Scoped to the six ids whose paths are resolved by the inline `pathFor`
+    // switch, which is a CLOSED set -- every new target resolves its own path
+    // and pins its own root in its own target test. Unscoped, this literal
+    // would have to be edited by every landing client, which is the collision
+    // the derived lists exist to remove.
+    const roots: Record<string, string> = {};
+    for (const id of ["claude-code", "claude-desktop", "cursor", "vscode", "windsurf", "gemini-cli"]) {
+      const t = INSTALL_TARGETS.find((x) => x.clientId === id);
+      expect(t, `${id} is missing from INSTALL_TARGETS`).toBeDefined();
+      roots[id] = t?.config.root ?? "";
+    }
+    expect(roots).toEqual({
+      "claude-code": "mcpServers",
+      "claude-desktop": "mcpServers",
+      cursor: "mcpServers",
+      vscode: "servers",
+      windsurf: "mcpServers",
+      "gemini-cli": "mcpServers",
+    });
   });
 
   it("agrees with itself about the root key on every scope", () => {
-    // jsonShape is documentation; containerPath is what actually gets
-    // written. Nothing in src/ reads jsonShape, so the two can disagree
-    // silently -- and a row whose containerPath names the wrong key writes a
-    // file the client parses and ignores.
+    // config.root is what messages and previews name; containerPath is what
+    // actually gets written. A row whose containerPath names a different key
+    // writes a file the client parses and ignores, and nothing else in the
+    // suite compares the two.
     for (const t of INSTALL_TARGETS) {
       for (const sc of t.scopes) {
         const resolved = resolveInstallPath({
           clientId: t.clientId,
           scope: sc.scope,
-          // Each target on an OS it actually supports -- Claude Desktop is
-          // macOS/Windows only, and resolveInstallPath refuses the pair.
+          // Each target on an OS yaw-mcp can configure it on -- Claude Desktop
+          // only on macOS/Windows (see notConfigurableOn), and
+          // resolveInstallPath refuses the pair.
           os: t.availableOn[0],
           home: "/h",
           projectDir: "/p",
           appData: "/a",
         });
         expect(resolved.containerPath[resolved.containerPath.length - 1], `${t.clientId}/${sc.scope}`).toBe(
-          t.jsonShape,
+          t.config.root,
         );
       }
     }
@@ -156,11 +210,16 @@ describe("resolveInstallPath — Claude Code", () => {
     });
     const key = r.containerPath[1];
     expect(isAbsolute(key)).toBe(true);
-    // resolve() spells the key with the HOST separator, but Claude Code
-    // writes projects[] keys with forward slashes on every OS — so on a
-    // Windows runner the key is the normalized spelling (no-op on POSIX,
-    // where resolve() already emits `/`).
-    const expected = resolve(rel).replace(/\\/g, "/");
+    // resolve() spells the key with the HOST separator and keeps the drive
+    // letter's case, but the projects[] key install writes uses forward slashes
+    // on every OS and an upper-case drive letter (the spelling Claude Code
+    // reads whenever its cwd has an upper-case drive) — so on a Windows runner
+    // the key is the normalized spelling, even when the runner's cwd came from
+    // a cmd.exe `cd /d c:\...` (no-op on POSIX, where resolve() already emits
+    // `/` and there is no drive letter).
+    const expected = resolve(rel)
+      .replace(/\\/g, "/")
+      .replace(/^[a-z]:/, (d) => d.toUpperCase());
     expect(key).toBe(expected);
     expect(r.containerPath).toEqual(["projects", expected, "mcpServers"]);
   });
@@ -447,10 +506,15 @@ describe("resolveInstallPath — Claude Desktop", () => {
     expect(isAbsolute(ambient.absolute)).toBe(true);
   });
 
-  it("Linux is refused (no Linux build)", () => {
+  it("Linux is refused with the undocumented-path reason, not 'not available'", () => {
+    // An Error instance makes toThrow compare the WHOLE message, not a substring.
     expect(() =>
       resolveInstallPath({ clientId: "claude-desktop", scope: "user", os: "linux", home: "/home/alice" }),
-    ).toThrow(/not available on linux/);
+    ).toThrow(
+      new Error(
+        "Claude Desktop cannot be configured on linux: Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
+      ),
+    );
   });
 });
 
@@ -1089,6 +1153,72 @@ describe("claudeCodeProjectKey (projects[] key spelling)", () => {
     // containing a backslash must not be mangled.
     expect(claudeCodeProjectKey("/home/alice/weird\\name")).toBe("/home/alice/weird\\name");
   });
+
+  // The lookup is case-sensitive, and Claude Code looks under its cwd as the
+  // shell reported it: Git Bash and PowerShell report "C:" even after
+  // `cd c:/...`. resolve() keeps a typed lower-case drive letter, so without
+  // the fold `--project-dir c:/repo` wrote a "c:/repo" key those sessions
+  // never read -- while install, doctor and --list all agreed it was there.
+  it("upper-cases a lower-case drive letter (forward-slash input)", () => {
+    expect(claudeCodeProjectKey("c:/Users/me/repo")).toBe("C:/Users/me/repo");
+  });
+
+  it("upper-cases a lower-case drive letter (backslash input)", () => {
+    expect(claudeCodeProjectKey("c:\\Users\\me\\repo")).toBe("C:/Users/me/repo");
+  });
+
+  it("upper-cases the drive root itself", () => {
+    expect(claudeCodeProjectKey("d:\\")).toBe("D:/");
+  });
+
+  it("folds ONLY the drive letter -- the rest of the path keeps its case", () => {
+    // Git Bash and PowerShell keep the rest as typed (`cd c:/users` ->
+    // C:\users), so Claude Code's key does too; folding more would break the
+    // match.
+    expect(claudeCodeProjectKey("d:\\users\\Me\\REPO")).toBe("D:/users/Me/REPO");
+  });
+
+  it("upper-cases nothing in a UNC path, which has no drive letter", () => {
+    expect(claudeCodeProjectKey("\\\\c\\share\\repo")).toBe("//c/share/repo");
+    expect(claudeCodeProjectKey("\\\\server\\Share\\repo")).toBe("//server/Share/repo");
+  });
+
+  it("upper-cases nothing in a POSIX path, drive-ish or not", () => {
+    // /c/... is Git Bash's own spelling of C:\ -- still a POSIX string here.
+    expect(claudeCodeProjectKey("/c/users/me/repo")).toBe("/c/users/me/repo");
+    expect(claudeCodeProjectKey("/home/alice/c:/repo")).toBe("/home/alice/c:/repo");
+  });
+
+  // Through the resolver every caller funnels through. Windows-only: on a
+  // POSIX runner "c:..." is not absolute, so resolve() turns it into a POSIX
+  // path under the cwd before the key is built.
+  it.runIf(process.platform === "win32")(
+    "resolveInstallPath keys a lower-case drive under the upper-case one, relative or absolute",
+    () => {
+      // Drive-relative "c:<name>" is NOT absolute, so resolveInstallPath
+      // resolves it -- and resolve() keeps the typed lower-case drive.
+      const rel = "c:yaw-drive-case-rel";
+      const resolvedRel = resolve(rel);
+      // Precondition, so this cannot pass vacuously if resolve() ever starts
+      // folding the drive itself.
+      expect(resolvedRel.slice(0, 2)).toBe("c:");
+      const cases: Array<[string, string]> = [
+        [rel, `C:${resolvedRel.slice(2).split("\\").join("/")}`],
+        ["c:/Users/me/repo", "C:/Users/me/repo"],
+        ["c:\\Users\\me\\repo", "C:/Users/me/repo"],
+      ];
+      for (const [projectDir, key] of cases) {
+        const r = resolveInstallPath({
+          clientId: "claude-code",
+          scope: "local",
+          os: "windows",
+          home: "C:\\Users\\me",
+          projectDir,
+        });
+        expect(r.containerPath).toEqual(["projects", key, "mcpServers"]);
+      }
+    },
+  );
 });
 
 describe("isProjectLocalEntry", () => {
@@ -1160,5 +1290,217 @@ describe("ENTRY_NAME", () => {
   it("is the stable key the installer writes under mcpServers / servers", () => {
     // Doctor depends on this constant to detect an existing install.
     expect(ENTRY_NAME).toBe("mcp");
+  });
+});
+
+// Claude Code's projects[] lookup is byte-exact, so "c:/repo" and "C:/repo"
+// are two entries to IT -- but one project to the user, and to every yaw-mcp
+// command that reads them. These two functions are the ONLY place that
+// equivalence is decided; every reader in install-cmd / doctor-cmd /
+// import-cmd takes its paths from claudeCodeContainerPaths, and the
+// source-shape scan in source-hygiene.test.ts holds that by accounting for
+// each container read in tracked non-test source by shape -- a raw index into
+// the projects object, a hand-built ["projects", ...] path, a C-style index
+// loop and a wrapped helper call all fail it. Textual, so a net rather than a
+// proof; its limits are stated where it lives. Pure, so unlike the
+// command-level drive-case tests these run on every platform.
+describe("sameClaudeCodeProjectKey (which two projects[] keys are one project)", () => {
+  it("folds a leading drive letter, in both directions", () => {
+    expect(sameClaudeCodeProjectKey("c:/Users/me/repo", "C:/Users/me/repo")).toBe(true);
+    expect(sameClaudeCodeProjectKey("C:/Users/me/repo", "c:/Users/me/repo")).toBe(true);
+    expect(sameClaudeCodeProjectKey("d:/x", "D:/x")).toBe(true);
+  });
+
+  it("is reflexive for every shape, drive or not", () => {
+    for (const k of ["C:/repo", "c:/repo", "/home/alice/repo", "//server/share/repo", ""]) {
+      expect(sameClaudeCodeProjectKey(k, k)).toBe(true);
+    }
+  });
+
+  it("does NOT fold anything but the drive letter", () => {
+    // The rest of the path is what Claude Code keys case-sensitively. Folding
+    // it would merge two directories its own lookup keeps apart.
+    expect(sameClaudeCodeProjectKey("C:/Users/me/Repo", "C:/Users/me/repo")).toBe(false);
+    expect(sameClaudeCodeProjectKey("C:/users/me/repo", "C:/Users/me/repo")).toBe(false);
+    // A different drive is a different disk, not a different case.
+    expect(sameClaudeCodeProjectKey("c:/repo", "D:/repo")).toBe(false);
+    // A separator difference is not a drive-letter difference.
+    expect(sameClaudeCodeProjectKey("c:\\repo", "C:/repo")).toBe(false);
+  });
+
+  it("leaves POSIX and UNC keys matching only themselves", () => {
+    // Neither shape has a drive letter, so there is nothing to fold and no way
+    // for this to start merging keys on a Linux checkout.
+    expect(sameClaudeCodeProjectKey("/home/alice/repo", "/home/Alice/repo")).toBe(false);
+    expect(sameClaudeCodeProjectKey("//server/share/repo", "//Server/share/repo")).toBe(false);
+    expect(sameClaudeCodeProjectKey("//c/share/repo", "//C/share/repo")).toBe(false);
+  });
+
+  it("does not fold a drive-RELATIVE spelling, which is not a directory", () => {
+    // "c:repo" means "repo, relative to the cwd on drive C" -- resolveInstallPath
+    // has already turned it into an absolute path before a key is built.
+    expect(sameClaudeCodeProjectKey("c:repo", "C:repo")).toBe(false);
+  });
+});
+
+describe("claudeCodeContainerPaths (the one place a projects[] key is resolved)", () => {
+  const local = (key: string): string[] => ["projects", key, "mcpServers"];
+  const withProjects = (...keys: string[]): Record<string, unknown> => ({
+    projects: Object.fromEntries(keys.map((k) => [k, { mcpServers: {} }])),
+  });
+
+  it("returns the canonical path first, even when root carries nothing", () => {
+    // The canonical path is where WRITES go whether or not anything is there,
+    // so [0] is always safe to take.
+    expect(claudeCodeContainerPaths({}, local("C:/repo"))).toEqual([local("C:/repo")]);
+    expect(claudeCodeContainerPaths(null, local("C:/repo"))).toEqual([local("C:/repo")]);
+    expect(claudeCodeContainerPaths([1, 2], local("C:/repo"))).toEqual([local("C:/repo")]);
+    expect(claudeCodeContainerPaths({ projects: 5 }, local("C:/repo"))).toEqual([local("C:/repo")]);
+  });
+
+  it("adds the drive-letter-case sibling that root actually carries", () => {
+    expect(claudeCodeContainerPaths(withProjects("c:/repo"), local("C:/repo"))).toEqual([
+      local("C:/repo"),
+      local("c:/repo"),
+    ]);
+    // ...and the other way round, for a caller whose canonical key is already
+    // the lower-case one (nothing writes that now, but the fold is symmetric).
+    expect(claudeCodeContainerPaths(withProjects("C:/repo"), local("c:/repo"))).toEqual([
+      local("c:/repo"),
+      local("C:/repo"),
+    ]);
+  });
+
+  it("never returns the canonical key twice", () => {
+    expect(claudeCodeContainerPaths(withProjects("C:/repo", "c:/repo"), local("C:/repo"))).toEqual([
+      local("C:/repo"),
+      local("c:/repo"),
+    ]);
+  });
+
+  it("keeps the deeper segments of the container path on every variant", () => {
+    expect(claudeCodeContainerPaths(withProjects("c:/repo"), ["projects", "C:/repo", "a", "b"])).toEqual([
+      ["projects", "C:/repo", "a", "b"],
+      ["projects", "c:/repo", "a", "b"],
+    ]);
+  });
+
+  it("ignores keys that differ anywhere but the drive letter", () => {
+    const root = withProjects("C:/other", "C:/Repo", "c:/repo/sub", "d:/repo");
+    expect(claudeCodeContainerPaths(root, local("C:/repo"))).toEqual([local("C:/repo")]);
+  });
+
+  it("leaves POSIX and UNC project keys with exactly one path", () => {
+    const posix = { projects: { "/home/alice/repo": {}, "/home/Alice/repo": {} } };
+    expect(claudeCodeContainerPaths(posix, local("/home/alice/repo"))).toEqual([local("/home/alice/repo")]);
+    const unc = { projects: { "//server/share/repo": {}, "//Server/share/repo": {} } };
+    expect(claudeCodeContainerPaths(unc, local("//server/share/repo"))).toEqual([local("//server/share/repo")]);
+  });
+
+  it("leaves every non-projects container path alone", () => {
+    // User scope, and every other client. There is no key to fold, and a fold
+    // here would be a cross-client behaviour change.
+    const root = { mcpServers: {}, servers: {}, projects: { "c:/repo": {} } };
+    expect(claudeCodeContainerPaths(root, ["mcpServers"])).toEqual([["mcpServers"]]);
+    expect(claudeCodeContainerPaths(root, ["servers"])).toEqual([["servers"]]);
+    expect(claudeCodeContainerPaths(root, ["projects"])).toEqual([["projects"]]);
+  });
+
+  it("reads own keys only, so an inherited member cannot conjure a path", () => {
+    const proto = { "c:/repo": { mcpServers: {} } };
+    const root = { projects: Object.create(proto) as Record<string, unknown> };
+    expect(claudeCodeContainerPaths(root, local("C:/repo"))).toEqual([local("C:/repo")]);
+  });
+
+  it("returns a copy, so a caller cannot mutate the resolved target's path", () => {
+    const containerPath = local("C:/repo");
+    const out = claudeCodeContainerPaths({}, containerPath);
+    expect(out[0]).not.toBe(containerPath);
+    out[0][1] = "mutated";
+    expect(containerPath[1]).toBe("C:/repo");
+  });
+
+  it("answers the same over a KEY LISTER as over a parsed root", () => {
+    // The two spellings exist because a consumer holding BYTES must not parse
+    // a client config itself. They have to agree, or the drive-case fold would
+    // depend on which one a consumer happened to reach for.
+    const root = { projects: { "c:/repo": { mcpServers: {} }, "D:/other": {} } };
+    const keysAt = (prefix: readonly string[]): readonly string[] =>
+      prefix.length === 1 && prefix[0] === "projects" ? Object.keys(root.projects) : [];
+    for (const path of [local("C:/repo"), local("c:/repo"), local("/posix/repo"), ["mcpServers"]]) {
+      expect(claudeCodeContainerPathVariants(path, keysAt)).toEqual(claudeCodeContainerPaths(root, path));
+    }
+  });
+});
+
+describe("resolveInstallSites", () => {
+  const base = { os: "linux" as InstallOS, home: "/home/u" };
+
+  it("gives a single-site row one site at its resolved path, with the scope's effective format", () => {
+    const sites = resolveInstallSites({ ...base, clientId: "cursor", scope: "user" });
+    expect(sites).toHaveLength(1);
+    expect(sites[0].id).toBe("default");
+    expect(sites[0].detectDir).toBeNull();
+    expect(sites[0].resolved).toEqual(resolveInstallPath({ ...base, clientId: "cursor", scope: "user" }));
+    expect(sites[0].format).toBe("jsonc");
+  });
+
+  it("applies the SCOPE's strictJson, so one site is read and written at one strictness", () => {
+    // Every (client, scope) pair, against the format the row plus the scope
+    // declare. Derived rather than spelled out: a row that lands with a strict
+    // scope is covered the day it lands.
+    for (const target of INSTALL_TARGETS) {
+      if (!target.availableOn.includes("linux")) continue;
+      for (const scope of target.scopes) {
+        const sites = resolveInstallSites({
+          ...base,
+          clientId: target.clientId,
+          scope: scope.scope,
+          projectDir: scope.requiresProjectDir ? "/home/u/proj" : undefined,
+        });
+        const expected = scope.strictJson === true && target.config.format === "jsonc" ? "json" : target.config.format;
+        for (const site of sites) {
+          expect(site.format, `${target.clientId} ${scope.scope}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it("fans a row with a sites hook out to every declared copy, all at one format", () => {
+    const sites = resolveInstallSites({ ...base, clientId: "cline", scope: "user" });
+    expect(sites.length).toBeGreaterThan(1);
+    expect(sites[0].id).toBe("shared");
+    expect(sites[0].detectDir).toBeNull();
+    // Every editor copy is CONDITIONAL: it is written only where that editor's
+    // Cline storage dir exists.
+    for (const site of sites.slice(1)) expect(site.detectDir, site.id).not.toBeNull();
+    expect(new Set(sites.map((s) => s.format))).toEqual(new Set(["json"]));
+    expect(new Set(sites.map((s) => s.id)).size).toBe(sites.length);
+    // The first site is the one `resolvePath` answers with, so a caller that
+    // only wants "the" file agrees with the fan-out's head.
+    expect(sites[0].resolved).toEqual(resolveInstallPath({ ...base, clientId: "cline", scope: "user" }));
+  });
+
+  it("refuses exactly what resolveInstallPath refuses, with the same message", () => {
+    const cases = [
+      { clientId: "claude-desktop" as const, scope: "user" as const, os: "linux" as InstallOS },
+      { clientId: "claude-code" as const, scope: "local" as const, os: "linux" as InstallOS },
+    ];
+    for (const c of cases) {
+      let fromPath = "";
+      let fromSites = "";
+      try {
+        resolveInstallPath({ ...base, ...c });
+      } catch (e) {
+        fromPath = (e as Error).message;
+      }
+      try {
+        resolveInstallSites({ ...base, ...c });
+      } catch (e) {
+        fromSites = (e as Error).message;
+      }
+      expect(fromPath, `${c.clientId} ${c.scope} should throw`).not.toBe("");
+      expect(fromSites).toBe(fromPath);
+    }
   });
 });

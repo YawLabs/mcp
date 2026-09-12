@@ -1,0 +1,7 @@
+# TODO: fix the [broken thing
+[mcp_servers.other]
+command = "node"
+
+# a stray quote run """ and an apostrophe run ''' in prose
+[mcp_servers.mcp]
+command = "old"

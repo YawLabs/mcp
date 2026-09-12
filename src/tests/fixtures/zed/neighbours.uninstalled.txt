@@ -1,0 +1,8 @@
+// my zed
+{
+  "theme": "One Dark",
+  "context_servers": {
+    // github
+    "github": { "command": "gh-mcp", "args": [] }, // keep me
+  },
+}

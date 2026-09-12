@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Confines the candidate probe to the synthetic trees a test created. OUTSIDE
@@ -38,8 +38,70 @@ import {
   GUIDE_FILENAME,
   guidePath,
   isUnderHome,
+  tildePath,
   userConfigDir,
 } from "../paths.js";
+
+describe("tildePath", () => {
+  // POSIX-shaped fixtures resolve the same way on every host (win32 anchors
+  // both sides on the current drive), so this group runs everywhere.
+  it("renders a path under home as ~ plus the tail, in the separator asked for", () => {
+    expect(tildePath("/home/u/.cursor/mcp.json", "/home/u", "/")).toBe("~/.cursor/mcp.json");
+    expect(tildePath("/home/u/.cursor/mcp.json", "/home/u", "\\")).toBe("~\\.cursor\\mcp.json");
+  });
+
+  it("ignores a trailing separator on home and collapses dot segments", () => {
+    expect(tildePath("/home/u/.cursor/mcp.json", "/home/u/", "/")).toBe("~/.cursor/mcp.json");
+    expect(tildePath("/home/u/x/../.cursor/mcp.json", "/home/u", "/")).toBe("~/.cursor/mcp.json");
+  });
+
+  it("renders home itself as a bare ~", () => {
+    expect(tildePath("/home/u", "/home/u", "/")).toBe("~");
+  });
+
+  it("leaves a SIBLING that only shares the prefix untouched", () => {
+    expect(tildePath("/home/u-old/.cursor/mcp.json", "/home/u", "/")).toBe("/home/u-old/.cursor/mcp.json");
+  });
+
+  it("leaves a path outside home untouched", () => {
+    expect(tildePath("/etc/x.json", "/home/u", "/")).toBe("/etc/x.json");
+  });
+
+  // path.resolve anchors a relative path on the cwd, and resolves an empty
+  // home TO the cwd. The two guards that keep both out are only observable
+  // where that anchor would match, so these fixtures sit there: a home above
+  // the cwd, and a path under it. With a home like /home/u both pass with the
+  // guards deleted.
+  it("leaves a relative label untouched even when the cwd is under home", () => {
+    expect(tildePath("(n/a)", dirname(process.cwd()), "/")).toBe("(n/a)");
+  });
+
+  it("leaves a path untouched when home is empty, even one under the cwd", () => {
+    const underCwd = join(process.cwd(), "x.json");
+    expect(tildePath(underCwd, "", "/")).toBe(underCwd);
+  });
+
+  it("treats a root home as already ending at a separator", () => {
+    expect(tildePath("/etc/x.json", "/", "/")).toBe("~/etc/x.json");
+  });
+
+  describe.runIf(process.platform === "win32")("on win32", () => {
+    it("matches a forward-slash home against a backslash path (Git Bash / CI USERPROFILE)", () => {
+      expect(tildePath("C:\\Users\\x\\.cursor\\mcp.json", "C:/Users/x", "\\")).toBe("~\\.cursor\\mcp.json");
+      expect(tildePath("C:/Users/x/.cursor/mcp.json", "C:\\Users\\x", "\\")).toBe("~\\.cursor\\mcp.json");
+    });
+
+    it("matches case-insensitively and keeps the tail's own spelling", () => {
+      expect(tildePath("C:\\Users\\X\\.Cursor\\mcp.json", "c:\\users\\x", "\\")).toBe("~\\.Cursor\\mcp.json");
+    });
+
+    it("still refuses a sibling when the two spellings differ", () => {
+      expect(tildePath("C:\\Users\\x-old\\.cursor\\mcp.json", "C:/Users/x", "\\")).toBe(
+        "C:\\Users\\x-old\\.cursor\\mcp.json",
+      );
+    });
+  });
+});
 
 describe("cacheDir", () => {
   const ORIG_PLATFORM = process.platform;

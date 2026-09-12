@@ -1,0 +1,4 @@
+{
+  // added by hand while debugging, and never taken out again
+  "mcpServers": {}
+}

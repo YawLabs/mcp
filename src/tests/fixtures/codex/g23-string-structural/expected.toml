@@ -1,0 +1,11 @@
+[mcp_servers.other]
+command = "node"
+literal = 'an opening [ inside a literal string'
+basic = "an opening [ inside a basic string"
+args = ['-y', 'pkg']
+paths = ['C:\', 'x']
+
+[mcp_servers.mcp]
+command = "npx"
+args = ["-y", "@yawlabs/mcp@latest"]
+startup_timeout_sec = 60.0

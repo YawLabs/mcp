@@ -1,0 +1,15 @@
+[mcp_servers.other]
+command = "node"
+args = ["--header", "X-Note: \"[draft] #1\"", "C:\\Users\\jeff"]
+cwd = "C:\\dir\\"
+tab = "a\tb"
+uni = "caf\u00e9"
+literal = 'C:\dir\raw'
+
+[mcp_servers."caf\u00e9 \"x\""]
+command = "node"
+
+[mcp_servers.mcp]
+command = "npx"
+args = ["-y", "@yawlabs/mcp@latest"]
+startup_timeout_sec = 60.0

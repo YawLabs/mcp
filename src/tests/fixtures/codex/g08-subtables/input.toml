@@ -1,0 +1,12 @@
+[mcp_servers.mcp]
+command = "npx"
+args = ["-y", "@yawlabs/mcp@latest"]
+
+[mcp_servers.mcp.env]
+B = "2"
+
+[mcp_servers.mcp.tools.echo]
+approval_mode = "auto"
+
+[tui]
+theme = "dark"

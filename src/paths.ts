@@ -73,6 +73,52 @@ export function normalizeForCompare(p: string): string {
   return process.platform === "win32" || process.platform === "darwin" ? p.toLowerCase() : p;
 }
 
+/**
+ * `abs` rendered relative to `home` -- `~` plus the tail, joined with `sep` --
+ * or `abs` unchanged when it is neither `home` nor a path under it. Display
+ * only: the result is for a person to read and paste, never a path to open.
+ *
+ * Both sides go through path.resolve before they are compared. On win32
+ * os.homedir() returns USERPROFILE exactly as the environment spells it, so a
+ * Git Bash or CI shell exporting `USERPROFILE=C:/Users/x` hands over a
+ * forward-slash home, while every config path built from it with path.join
+ * comes back with backslashes. A raw `abs.startsWith(home)` never matched
+ * that pair, and every row lost its `~`. resolve also drops a trailing
+ * separator and collapses `.` / `..` segments. The comparison then
+ * case-folds wherever normalizeForCompare does (win32, darwin), the same rule
+ * isUnderHome applies to the same home.
+ *
+ * The match has to END AT A SEPARATOR: `C:\Users\jeff-old\...` is not under
+ * `C:\Users\jeff`, and rendering it as `~\-old\...` names a path the user does
+ * not have. A home that is a filesystem root already ends in one.
+ *
+ * `sep` is the separator to RENDER with, which need not be the host's:
+ * `install --list --os linux` on Windows lists another OS's layout. Every
+ * HOST separator in the tail is rewritten to it, and only those -- on POSIX a
+ * backslash is a legal filename character, so it survives.
+ */
+export function tildePath(abs: string, home: string, sep: "/" | "\\"): string {
+  // A relative `abs` is a label rather than a location (`(n/a)`), and
+  // resolving it would anchor it on the cwd -- which may well sit under home.
+  if (!home || !path.isAbsolute(abs)) return abs;
+  const absResolved = path.resolve(abs);
+  const homeResolved = path.resolve(home);
+  // Fold the two prefixes separately rather than slicing a folded string: a
+  // case fold may change a string's length, and the slice below is taken on
+  // the unfolded one so the tail keeps the spelling it was built with.
+  const head = absResolved.slice(0, homeResolved.length);
+  if (normalizeForCompare(head) !== normalizeForCompare(homeResolved)) return abs;
+  const rest = absResolved.slice(homeResolved.length);
+  if (rest === "") return "~";
+  // After resolve every separator is path.sep, so one character settles the
+  // boundary. A root home (`/`, `C:\`) carries its own, so `rest` is the tail.
+  let tail: string;
+  if (homeResolved.endsWith(path.sep)) tail = rest;
+  else if (rest.startsWith(path.sep)) tail = rest.slice(path.sep.length);
+  else return abs;
+  return `~${sep}${tail.split(path.sep).join(sep)}`;
+}
+
 // Best-effort physical path: symlinked homes (/home -> /var/home), NFS
 // automounts, and macOS's symlinked /tmp all make the logical spelling of a
 // path differ from the physical one. Falls back to the raw path when

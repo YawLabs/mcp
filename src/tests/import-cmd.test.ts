@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseImportArgs, runImport } from "../import-cmd.js";
-import { CURRENT_OS, resolveInstallPath } from "../install-targets.js";
+import { CURRENT_OS, INSTALL_TARGETS, resolveInstallPath } from "../install-targets.js";
 import { loadLocalBundles } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
 
@@ -112,6 +112,38 @@ describe("parseImportArgs", () => {
     const r = parseImportArgs(["--help"]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.help).toBe(true);
+  });
+});
+
+describe("runImport -- a client yaw-mcp cannot configure on this OS", () => {
+  it("refuses Claude Desktop on Linux with the undocumented-path reason and an import-shaped remedy", async () => {
+    const cap = capture();
+    const r = await runImport({ clientId: "claude-desktop", os: "linux", home: synthHome, cwd: synthCwd, ...cap });
+    expect(r.exitCode).toBe(2);
+    expect(r.written).toEqual([]);
+    expect(cap.errText()).toBe(
+      "yaw-mcp import: Claude Desktop on linux is not supported yet.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
+        '  Add those servers to yaw-mcp yourself instead: `yaw-mcp add <slug>` for a catalog server, or `yaw-mcp add <name> --command "<launch line>"` for any other.\n',
+    );
+    expect(cap.text()).toBe("");
+  });
+
+  it("does not advertise --os, a flag import does not have, for a client with no build on this OS", async () => {
+    // No real client is missing an OS without a reason today, so cursor is
+    // made to be one for the length of this test and then put back.
+    const cursor = INSTALL_TARGETS.find((t) => t.clientId === "cursor");
+    if (!cursor) throw new Error("INSTALL_TARGETS lost cursor");
+    const saved = cursor.availableOn;
+    cursor.availableOn = ["macos", "windows"];
+    try {
+      const cap = capture();
+      const r = await runImport({ clientId: "cursor", os: "linux", home: synthHome, cwd: synthCwd, ...cap });
+      expect(r.exitCode).toBe(2);
+      expect(cap.errText()).toBe("yaw-mcp import: Cursor is not available on linux.\n  Pick a different client.\n");
+    } finally {
+      cursor.availableOn = saved;
+    }
   });
 });
 
@@ -679,5 +711,138 @@ describe("runImport -- replacing a CATALOG entry, which launchChanged never repo
     const all = cap.text() + cap.errText();
     expect(all).toMatch(/replace|overwrit/i);
     expect(all).toContain("@modelcontextprotocol/server-github");
+  });
+});
+
+describe("runImport -- a projects[] key with the other drive-letter case", () => {
+  // v1.0.0 wrote the projects[] key with whatever drive-letter case it was
+  // handed, so a config written by `--project-dir c:/repo` holds the user's
+  // servers under "c:/repo". Reading only the canonical key made import say
+  // "Nothing to import" over a file full of them -- the same blindness
+  // uninstall had. Win32-only: on POSIX "c:/x" is not a drive path, so no
+  // drive key is ever built (the fold itself is pinned platform-independently
+  // in install-targets.test.ts).
+  it.runIf(process.platform === "win32")("imports from the variant key and removes from that same key", async () => {
+    const localPath = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: CURRENT_OS,
+      projectDir: synthCwd,
+      home: synthHome,
+    });
+    const projectKey = localPath.containerPath[1];
+    expect(projectKey).toMatch(/^[A-Z]:\//);
+    const lowerKey = projectKey[0].toLowerCase() + projectKey.slice(1);
+    writeClaudeCode({
+      // yaw-mcp wired at user scope, so the removal step is reached at all.
+      mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } },
+      projects: { [lowerKey]: { mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } } },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      scope: "local",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).not.toMatch(/Nothing to import/);
+    expect(bundles().length).toBe(1);
+    const after = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    // Removed from the key it was READ from. Deleting from the canonical key
+    // instead would have left the client launching every imported server
+    // alongside yaw-mcp -- the exact duplicate-broker state the removal exists
+    // to prevent.
+    expect(Object.keys(after.projects[lowerKey].mcpServers)).toEqual([]);
+  });
+});
+
+describe("runImport -- a client's OWN spelling of an entry, through the row's transform", () => {
+  it("imports a Cline entry stored in its nested transport form", async () => {
+    // Cline writes `{ transport: { command, args } }` alongside the flat
+    // shape, and the importer reads only the flat one. Before the entry went
+    // through `importViewOf` -- which applies the row's `normalize` hook --
+    // such a server had no `command` at the top level and was reported
+    // "Skipped (no command or url to launch)": a real, launchable server the
+    // user could see in Cline, refused by name with nothing to do about it.
+    const settings = join(synthHome, ".cline", "data", "settings");
+    mkdirSync(settings, { recursive: true });
+    writeFileSync(
+      join(settings, "cline_mcp_settings.json"),
+      `${JSON.stringify(
+        {
+          mcpServers: {
+            // The broker, so the removal step is reachable at all.
+            mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] },
+            nested: { transport: { command: "node", args: ["server.js"], env: { TOKEN: "t" } } },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const cap = capture();
+    const r = await runImport({ clientId: "cline", home: synthHome, cwd: synthCwd, keepOriginals: true, ...cap });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/no command or url to launch/);
+    const imported = bundles();
+    expect(imported.length).toBe(1);
+    expect(imported[0].command).toBe("node");
+    expect(imported[0].args).toEqual(["server.js"]);
+    expect(imported[0].env).toEqual({ TOKEN: "t" });
+  });
+});
+
+describe("runImport -- the wired-in SEARCH folds the drive-letter case too", () => {
+  // The search that decides whether removing the originals is safe reads the
+  // client's OTHER scopes, and it has to fold the same way the source read
+  // does: a broker entry an older version wrote under `projects["c:/repo"]`
+  // wires the client just as much as one under `projects["C:/repo"]`. Without
+  // that fold the removal is REFUSED -- "no yaw-mcp entry in ..." -- over a
+  // file that does hold one, and the user is sent to re-run an install that
+  // already ran. Win32-only for the same reason as the case above: on POSIX
+  // "c:/x" is not a drive path, so no drive key is ever built.
+  it.runIf(process.platform === "win32")("finds the broker under a drive-case sibling of another scope", async () => {
+    const localPath = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: CURRENT_OS,
+      projectDir: synthCwd,
+      home: synthHome,
+    });
+    const projectKey = localPath.containerPath[1];
+    expect(projectKey).toMatch(/^[A-Z]:\//);
+    const lowerKey = projectKey[0].toLowerCase() + projectKey.slice(1);
+    // The servers to import live in the PROJECT file; the broker lives only in
+    // ~/.claude.json under the lower-case spelling of this project's key --
+    // i.e. in a container no un-folded read of any searched scope would see.
+    writeFileSync(
+      join(synthCwd, ".mcp.json"),
+      `${JSON.stringify({ mcpServers: { github: { command: "npx", args: ["-y", "gh"] } } }, null, 2)}\n`,
+    );
+    writeClaudeCode({
+      projects: { [lowerKey]: { mcpServers: { mcp: { command: "npx", args: ["-y", "@yawlabs/mcp@latest"] } } } },
+    });
+    const cap = capture();
+    const r = await runImport({
+      clientId: "claude-code",
+      scope: "project",
+      projectDir: synthCwd,
+      home: synthHome,
+      cwd: synthCwd,
+      removeOriginals: true,
+      ...cap,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/Not removing the originals/);
+    expect(bundles().length).toBe(1);
+    // Reached through a container that is not the one the servers came from,
+    // so the run says which -- and the originals are gone.
+    expect(cap.text()).toMatch(/Reached through the yaw-mcp entry in/);
+    const after = JSON.parse(readFileSync(join(synthCwd, ".mcp.json"), "utf8"));
+    expect(Object.keys(after.mcpServers)).toEqual([]);
   });
 });

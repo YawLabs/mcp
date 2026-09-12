@@ -1,0 +1,9 @@
+[mcp_servers.mcp]
+command = "cmd"
+args = ["/c", "npx", "-y", "@yawlabs/mcp@latest"]
+
+[tui]
+theme = "dark"
+
+[mcp_servers.mcp.env]
+YAW_MCP_VAULT_PASSPHRASE = "s3cret"
