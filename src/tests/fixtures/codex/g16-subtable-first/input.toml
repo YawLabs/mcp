@@ -1,0 +1,8 @@
+[mcp_servers.mcp.env]
+B = "2"
+
+[mcp_servers.mcp]
+command = "npx"
+
+[tui]
+theme = "dark"

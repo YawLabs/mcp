@@ -1,0 +1,7 @@
+[mcp_servers.sib]
+command = "node"
+
+[tui]
+notes = [
+  ["[mcp_servers.fake]"],
+]

@@ -1,0 +1,15 @@
+# These fixtures ARE their bytes. The root .gitattributes normalizes every
+# file to LF (`* text=auto eol=lf`), which is right for source and wrong here:
+# f04-crlf-bom exists to pin that a CRLF config.toml comes back CRLF, and with
+# normalization on, git stored it as LF (54 bytes instead of 56) so the test
+# compared LF input against LF expected -- green, and testing nothing. The
+# same normalization on a Windows checkout would push CRLF onto the LF
+# fixtures and break the ones that assert LF.
+#
+# `-text` turns the conversion off in both directions: what is committed is
+# what lands in the working tree, on every platform.
+#
+# src/tests/client-config-toml.test.ts asserts the CRLF fixture still holds a
+# CRLF and the LF fixtures still hold none, so if this file ever stops
+# applying, a test says so instead of quietly passing.
+* -text

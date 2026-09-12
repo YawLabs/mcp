@@ -1,0 +1,8 @@
+[mcp_servers.mcp]
+command = "cmd"
+args = ["/c", "npx", "-y", "@yawlabs/mcp@latest"]
+env_vars = ["HTTPS_PROXY"]
+
+[mcp_servers.mcp.env]
+"A.B" = "1"
+OAM_BIN = "/opt/oam"

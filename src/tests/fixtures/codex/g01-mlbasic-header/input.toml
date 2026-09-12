@@ -1,0 +1,9 @@
+[mcp_servers.sib]
+command = "node"
+
+[tui]
+notice = """
+[mcp_servers.fake]
+command = "no"
+"""
+theme = "dark"

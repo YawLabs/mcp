@@ -1,0 +1,14 @@
+[mcp_servers.sib]
+command = "node"
+
+[mcp_servers.mcp]
+command = "npx"
+args = ["-y", "@yawlabs/mcp@latest"]
+startup_timeout_sec = 60.0
+
+[tui]
+notice = '''
+[mcp_servers.fake]
+command = "no"
+'''
+theme = "dark"

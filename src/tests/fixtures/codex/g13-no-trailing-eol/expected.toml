@@ -1,0 +1,6 @@
+model = "gpt-5"
+
+[mcp_servers.mcp]
+command = "npx"
+args = ["-y", "@yawlabs/mcp@latest"]
+startup_timeout_sec = 60.0

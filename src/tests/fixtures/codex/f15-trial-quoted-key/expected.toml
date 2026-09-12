@@ -1,0 +1,7 @@
+[mcp_servers."yaw-mcp-try-foo.bar"]
+command = "npx"
+args = ["-y", "@acme/foo-mcp"]
+startup_timeout_sec = 60.0
+
+[mcp_servers."yaw-mcp-try-foo.bar".env]
+FOO_TOKEN = "t0k"

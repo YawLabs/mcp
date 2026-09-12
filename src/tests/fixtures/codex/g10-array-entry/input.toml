@@ -1,0 +1,5 @@
+[[mcp_servers.mcp]]
+command = "npx"
+
+[tui]
+theme = "dark"
