@@ -167,10 +167,15 @@ MCP_PUBLISHER_VERSION="v1.7.9"
 # fault in the tool's OWN executable and fires BEFORE any output -- 2.4.16 and
 # 2.5.13 both run clean on this host. See the header and run_npm_check below for
 # the measurements. Do not merge the two.
-# Being intermittent, a clean run does not retire it. The tool's OUTPUT is
-# authoritative: a 139/134 from `npm run` is tolerated only if the tool's own
-# success marker is in the captured output (or a direct re-run bypasses the
-# wrapper). Other platforms treat any non-zero as a hard failure.
+# Being intermittent, a clean run does not retire it. What the tool actually DID
+# is authoritative, never npm's exit code -- and each tolerance site proves that
+# its own way: run_npm_check on the tool's success marker in the captured output
+# (or a direct re-run that bypasses the wrapper), step 2's build on a
+# dist/index.js mtime newer than the step, step 3's bump on package.json reading
+# the target version, step 4's publish on the registry answering with it. A
+# 139/134 is tolerated only against one of those four, never on the exit code
+# alone -- and never for lint at all, whose crash run_npm_check hard-fails before
+# this tolerance can see it. Other platforms treat any non-zero as a hard failure.
 IS_MINGW_ARM64=false
 case "$(uname -s 2>/dev/null)" in
   MINGW*ARM64* | MSYS*ARM64* | CYGWIN*ARM64*) IS_MINGW_ARM64=true ;;
