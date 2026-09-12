@@ -6192,3 +6192,137 @@ describe("Claude Code local scope -- an entry under the OTHER drive-letter case"
     expect(after.mcpServers["mcp.hosting"]).toBeDefined();
   });
 });
+
+describe("runInstall / runUninstall -- a target whose one scope is SEVERAL files", () => {
+  // Cline is the only row with a `sites` hook: a shared file the CLI and the
+  // extension's newer runtime read, plus one copy under each editor whose
+  // Cline extension storage exists. Its `notes` -- which install prints
+  // verbatim -- say install writes the shared file "and each editor copy it
+  // finds", and before the fan-out was wired that sentence was false: measured
+  // on a seeded VS Code storage directory, only the shared file was written.
+  const EDITOR_DIR = join("AppData", "Roaming", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+
+  /** The editor copy's path, its storage directory created so the site is
+   *  DETECTED (that directory existing is what says the extension has run
+   *  there). */
+  function seedEditorStorage(home: string): string {
+    const dir = join(home, EDITOR_DIR, "settings");
+    mkdirSync(dir, { recursive: true });
+    return join(dir, "cline_mcp_settings.json");
+  }
+
+  const sharedPath = (home: string): string => join(home, ".cline", "data", "settings", "cline_mcp_settings.json");
+
+  function clineOpts(home: string, extra: Record<string, unknown> = {}) {
+    return {
+      clientId: "cline" as const,
+      home,
+      appData: join(home, "AppData", "Roaming"),
+      suppressBundlesNote: true,
+      ...extra,
+    };
+  }
+
+  it("writes the shared file AND every editor copy it finds", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(sharedPath(home));
+      expect(r.written).toContain(copy);
+      // The same entry in both, under the row's own container key.
+      const entryOf = (p: string): unknown =>
+        (JSON.parse(readFileSync(p, "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers[ENTRY_NAME];
+      expect(entryOf(copy)).toEqual(entryOf(sharedPath(home)));
+      expect(entryOf(copy)).toBeDefined();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("writes only the shared file when no editor has Cline storage", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([sharedPath(home)]);
+      expect(existsSync(join(home, EDITOR_DIR, "settings", "cline_mcp_settings.json"))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names every copy it would write under --dry-run, and writes none", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home, { dryRun: true }), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toEqual([]);
+      expect(r.wouldWrite).toContain(copy);
+      expect(existsSync(copy)).toBe(false);
+      expect(existsSync(sharedPath(home))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a copy whose entry DIFFERS alone, and says which", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      // Somebody's own launch entry at our key. Not ours to replace without a
+      // flag -- the primary site would refuse it off a TTY too.
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "theirs" } } }, null, 2)}\n`);
+      const before = readFileSync(copy, "utf8");
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home), io: cap.io });
+      // The shared file is still written: the primary install succeeded.
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(sharedPath(home));
+      expect(r.written).not.toContain(copy);
+      expect(readFileSync(copy, "utf8")).toBe(before);
+      expect(cap.stderr()).toMatch(/already has a differing "mcp" entry/);
+      expect(cap.stderr()).toContain(copy);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--repair brings that copy up to date without a second prompt", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      writeFileSync(copy, `${JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "theirs" } } }, null, 2)}\n`);
+      const cap = captureIo();
+      const r = await runInstall({ ...clineOpts(home, { repair: true }), io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(copy);
+      const written = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, { command: string }> };
+      expect(written.mcpServers[ENTRY_NAME].command).not.toBe("theirs");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uninstall clears the copy too, so no editor is left launching yaw-mcp", async () => {
+    const home = mkdtempSync(join(tmpdir(), "yaw-cline-"));
+    try {
+      const copy = seedEditorStorage(home);
+      const installed = await runInstall({ ...clineOpts(home), io: captureIo().io });
+      expect(installed.written).toContain(copy);
+      const cap = captureIo();
+      const r = await runUninstall({ ...clineOpts(home), force: true, io: cap.io });
+      expect(r.exitCode).toBe(0);
+      expect(r.written).toContain(copy);
+      const after = JSON.parse(readFileSync(copy, "utf8")) as { mcpServers: Record<string, unknown> };
+      expect(Object.keys(after.mcpServers)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

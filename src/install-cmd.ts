@@ -73,8 +73,10 @@ import {
   composeEntry,
   containerKeysAt,
   describeValueShape,
+  type EntryTransform,
   readClientConfigFile,
   reloadDoneClause,
+  selectSites,
   siteAt,
   terminateWithNewline,
 } from "./client-config.js";
@@ -813,7 +815,17 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // order, indentation and the neighbouring entries all survive -- and now
   // the result is VERIFIED before install has anything to persist.
   const containerPath = resolved.containerPath;
-  const site = plan.sites[0];
+  // The sites this machine actually has: every unconditional one, plus each
+  // conditional one whose editor-storage directory exists. Every row but Cline
+  // declares exactly one, so `extraSites` is empty for all of them and nothing
+  // downstream of it runs.
+  //
+  // `sites[0]` stays THE site: the file every message names, the one the
+  // collision ladder and the drift diff are about, and the one a fresh install
+  // creates. The extras are COPIES of the same entry -- see applyToExtraSites.
+  const selectedSites = selectSites(plan.sites);
+  const site = selectedSites[0];
+  const extraSites = selectedSites.slice(1);
   /** `projects[...]` keys that name THIS project with the other drive-letter
    *  case and already carry yaw-mcp wiring. Reported, never written to -- see
    *  claudeCodeContainerPaths for why install adds rather than migrates. */
@@ -1154,6 +1166,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       ? "identical"
       : "differs";
 
+  /** May this run replace a DIFFERING yaw-mcp entry? A flag says so outright;
+   *  otherwise it is what the collision ladder below decided for the primary
+   *  site. Read only by `applyToExtraSites`, which must not prompt again per
+   *  editor copy but must not clobber one silently either. */
+  let overwriteAuthorised = opts.force === true || opts.repair === true;
+
   if (entryState === "differs") {
     // Computed once and shared by the prompt and the off-TTY refusal: a
     // scripted run gets to see what it WOULD have replaced before being told
@@ -1227,6 +1245,10 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       err("Cancelled.");
       return { written: [], wouldWrite: [], messages, exitCode: 130 };
     }
+    // Getting here means the run may replace a differing entry -- a flag, or
+    // an answered prompt. The editor copies follow that one answer rather than
+    // asking again.
+    overwriteAuthorised = true;
     // Conditional tense under --dry-run: the decision above maps dryRun onto
     // "overwrite" so this collision path is exercised, but the run returns
     // before any write. Present tense here told a user scanning the transcript
@@ -1449,6 +1471,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     // `clientJson` null, and naming the client file as "would write" there
     // promises an edit the real run does not make.
     const wouldWrite: string[] = clientJson !== null ? [resolved.absolute] : [];
+    // Every editor copy the real run would write, named here for the same
+    // reason: a preview that omits a file the run touches is the one thing
+    // --dry-run must never do. Each copy is READ (so a copy that is already
+    // correct, or that differs without authorisation, is reported as such) and
+    // none is written.
+    wouldWrite.push(
+      ...(await applyToExtraSites({
+        cmd: "install",
+        sites: extraSites,
+        transform: target.entry,
+        entry: entryToWrite,
+        keepLegacy: opts.keepLegacy === true,
+        authorised: overwriteAuthorised,
+        dryRun: true,
+        log,
+        err,
+      })),
+    );
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
@@ -1495,6 +1535,24 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       log(`Removed the legacy "${legacyEntry}" entry -- it would have run yaw-mcp a second time.`);
     }
   }
+
+  // The editor copies, AFTER the primary write: that write is the product of
+  // the command, so a copy that cannot be written is a warning rather than a
+  // failure. Runs even when the primary needed no write -- an identical shared
+  // file beside a stale editor copy is exactly the state a re-run is for.
+  written.push(
+    ...(await applyToExtraSites({
+      cmd: "install",
+      sites: extraSites,
+      transform: target.entry,
+      entry: entryToWrite,
+      keepLegacy: opts.keepLegacy === true,
+      authorised: overwriteAuthorised,
+      dryRun: false,
+      log,
+      err,
+    })),
+  );
 
   // Claude Code: merge permissions.allow into settings.json so tool
   // calls don't prompt. Best-effort: any failure here is logged but does
@@ -1784,6 +1842,130 @@ export function describeEntryDiff(stored: unknown, nextEntry: object): string[] 
 // mergeClientConfig -> an `upsert` edit into an absent file, which the JSON
 // adapter renders with `buildFreshConfig` (pinned byte-for-byte against the
 // shape this function produced, in client-config-json.test.ts).
+
+/** Apply the edit this run already decided on to a target's EXTRA sites -- the
+ *  per-editor copies a `sites` hook fans one (client, scope) out to.
+ *
+ *  WHY IT EXISTS. Cline keeps one cline_mcp_settings.json per runtime: a
+ *  shared `~/.cline/...` file that the CLI and the extension's newer runtime
+ *  read, and one under each editor's own globalStorage that the extension's
+ *  legacy runtime reads. A shared-file-only install is invisible to a Cline
+ *  window on that older runtime, and the row's `notes` -- which install prints
+ *  verbatim -- says install writes the shared file "and each editor copy it
+ *  finds". This is what makes that sentence true. Measured before it existed:
+ *  `install cline` with a seeded VS Code extension-storage directory wrote the
+ *  shared file only.
+ *
+ *  WHAT IT IS NOT. It does not re-run the collision ladder per file. The user
+ *  answered for this CLIENT once, on the site every message names, and asking
+ *  again per editor copy would be a prompt per window they have ever opened.
+ *  So a copy is written when it has no entry of ours, or when the run is
+ *  AUTHORISED to overwrite a differing one (`--force`, `--repair`, or an
+ *  answered prompt on the primary site). A copy whose entry differs without
+ *  that authorisation is REPORTED and left, which is the same answer the
+ *  primary site gives off a TTY -- never a silent clobber of a launch entry
+ *  somebody edited.
+ *
+ *  Best-effort throughout: the primary write is the product of the command and
+ *  has already landed by the time this runs, so every failure here is a
+ *  warning naming the file, never a non-zero exit. `entry` null is the removal
+ *  (`uninstall`), which takes our entry and any legacy key out of each copy --
+ *  without it an uninstall would leave a live broker wired in every editor
+ *  copy it had written, which is the duplicate-broker state the legacy trim
+ *  exists to prevent. */
+async function applyToExtraSites(args: {
+  cmd: "install" | "uninstall";
+  sites: readonly ConfigSite[];
+  transform: EntryTransform | undefined;
+  /** The entry to upsert, or null to remove ours. */
+  entry: Record<string, unknown> | null;
+  keepLegacy: boolean;
+  authorised: boolean;
+  dryRun: boolean;
+  log: (s: string) => void;
+  err: (s: string) => void;
+}): Promise<string[]> {
+  const { cmd, entry, log, err } = args;
+  const touched: string[] = [];
+  for (const site of args.sites) {
+    const where = site.resolved.absolute;
+    const named = `${where} (${site.label})`;
+    const view = await readClientConfigFile(site, { transform: args.transform });
+    const read = view.read;
+    if (read.kind === "unreadable" || read.kind === "malformed" || read.kind === "unspliceable") {
+      err(`yaw-mcp ${cmd}: warning -- ${named} could not be edited; left unchanged. Edit it by hand.`);
+      continue;
+    }
+    const legacy = view.legacyKey();
+    const trimLegacy = legacy !== null && !args.keepLegacy;
+    const stored = view.normalized();
+    const hasEntry = view.entry() !== undefined;
+
+    if (entry === null) {
+      // Removal. Nothing of ours in this copy is the ordinary case for an
+      // editor the user installed after wiring yaw-mcp, and it is silent: the
+      // primary site's own line already speaks for the run.
+      if (!hasEntry && legacy === null) continue;
+      const edits: ClientConfigEdit[] = [];
+      if (hasEntry) edits.push({ op: "remove", key: ENTRY_NAME });
+      if (legacy !== null) edits.push({ op: "remove", key: legacy });
+      if (args.dryRun) {
+        log(`Would also remove the "${ENTRY_NAME}" entry from ${named}.`);
+        touched.push(where);
+        continue;
+      }
+      try {
+        await atomicWriteFile(where, terminateWithNewline(applyClientConfigEdits(view, edits, site)));
+        log(`Removed the "${ENTRY_NAME}" entry from ${named}.`);
+        touched.push(where);
+      } catch (e) {
+        err(
+          `yaw-mcp ${cmd}: warning -- failed to remove the "${ENTRY_NAME}" entry from ${named} (${(e as Error).message}); left unchanged. Remove it by hand.`,
+        );
+      }
+      continue;
+    }
+
+    if (hasEntry && deepEqualJson(stored, entry) && !trimLegacy) {
+      log(`The "${ENTRY_NAME}" entry in ${named} is already correct.`);
+      continue;
+    }
+    if (hasEntry && !deepEqualJson(stored, entry) && !args.authorised) {
+      err(
+        `yaw-mcp ${cmd}: warning -- ${named} already has a differing "${ENTRY_NAME}" entry; left untouched. ` +
+          "Re-run with --repair to bring every copy up to date, or --force to overwrite them.",
+      );
+      continue;
+    }
+    const edits: ClientConfigEdit[] = [];
+    if (read.kind === "blocked") {
+      if (!read.reparable) {
+        err(
+          `yaw-mcp ${cmd}: warning -- "${read.path.join(".")}" in ${named} is ${read.shape}, not an object; left unchanged. Fix it by hand.`,
+        );
+        continue;
+      }
+      edits.push({ op: "repair", path: read.path });
+    }
+    edits.push({ op: "upsert", key: ENTRY_NAME, entry });
+    if (trimLegacy) edits.push({ op: "remove", key: legacy as string });
+    if (args.dryRun) {
+      log(`Would also write the same entry to ${named}.`);
+      touched.push(where);
+      continue;
+    }
+    try {
+      await atomicWriteFile(where, terminateWithNewline(applyClientConfigEdits(view, edits, site)));
+      log(`Wrote ${named}`);
+      touched.push(where);
+    } catch (e) {
+      err(
+        `yaw-mcp ${cmd}: warning -- failed to write ${named} (${(e as Error).message}); left unchanged. ${args.cmd === "install" ? "That copy of the client will not see yaw-mcp." : "Remove the entry by hand."}`,
+      );
+    }
+  }
+  return touched;
+}
 
 /** True when a value-flag's argument reads as the NEXT flag rather than as the
  *  value. `--token --force` was already refused, but the guard tested only for
@@ -2612,7 +2794,14 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
   log(`File:   ${resolved.absolute}`);
 
   const containerPath = resolved.containerPath;
-  const site = plan.sites[0];
+  // Same site selection install makes: `sites[0]` is the file every message
+  // names, and `extraSites` holds each per-editor copy this machine has. Empty
+  // for every row but Cline. An uninstall that cleared only the shared file
+  // would leave a live broker entry in every editor copy install had written
+  // -- the duplicate-broker state the legacy trim exists to prevent.
+  const selectedSites = selectSites(plan.sites);
+  const site = selectedSites[0];
+  const extraSites = selectedSites.slice(1);
   /** Every container carrying wiring for this project -- see RemovalSite. */
   const sites: RemovalSite[] = [];
   // Fingerprinted BEFORE the read and compared again ahead of the write, for
@@ -2741,6 +2930,19 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
     for (const line of preview) log(`    ${line}`);
     const wouldWrite: string[] = [];
     if (removals.length > 0) wouldWrite.push(resolved.absolute);
+    wouldWrite.push(
+      ...(await applyToExtraSites({
+        cmd: "uninstall",
+        sites: extraSites,
+        transform: target.entry,
+        entry: null,
+        keepLegacy: opts.keepLegacy === true,
+        authorised: true,
+        dryRun: true,
+        log,
+        err,
+      })),
+    );
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
@@ -2828,6 +3030,23 @@ export async function runUninstall(opts: UninstallCommandOptions): Promise<Insta
       if (trimsLegacy(s)) log(`Removed the legacy "${s.legacyEntry}" entry${where(s)}.`);
     }
   }
+
+  // The editor copies. Outside the `clientJson !== null` block on purpose: the
+  // shared file can hold nothing of ours while a copy still does, and that copy
+  // is precisely what a user running uninstall wants gone.
+  written.push(
+    ...(await applyToExtraSites({
+      cmd: "uninstall",
+      sites: extraSites,
+      transform: target.entry,
+      entry: null,
+      keepLegacy: opts.keepLegacy === true,
+      authorised: true,
+      dryRun: false,
+      log,
+      err,
+    })),
+  );
 
   // Best-effort, exactly like install's patch: the entry is already gone, and a
   // stale allow-pattern costs the user nothing but a dead line in a config.
