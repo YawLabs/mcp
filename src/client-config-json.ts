@@ -375,29 +375,43 @@ function canonJson(
   const clone = JSON.parse(JSON.stringify(parsed)) as Record<string, unknown>;
   const segments = addr.containerPath;
   const leaf = segments[segments.length - 1];
-  const parent = containerAt(clone, segments.slice(0, -1));
-  if (parent !== null && leaf !== undefined) {
-    if (opts?.dropContainer === true) {
-      delete parent[leaf];
-      // Then prune every ancestor the deletion just emptied. Creating the
-      // container can create the whole chain above it -- Claude Code's
-      // per-project object is the live case -- and those keys are part of what
-      // the edit was about, so a before/after comparison that kept an
-      // emptied-out `{}` on one side and nothing on the other would fail a
-      // write the caller asked for. An ancestor that still holds anything else
-      // stays, which is what keeps real damage to a sibling visible.
-      for (let depth = segments.length - 1; depth > 0; depth--) {
-        const holder = containerAt(clone, segments.slice(0, depth - 1));
-        const key = segments[depth - 1];
-        const value = holder === null ? undefined : holder[key];
-        if (holder === null || !isRecord(value) || Object.keys(value).length > 0) break;
-        delete holder[key];
-      }
-    } else {
-      const container = parent[leaf];
-      if (isRecord(container)) {
-        for (const key of opts?.drop ?? []) delete container[key];
-      }
+  if (opts?.dropContainer === true && leaf !== undefined) {
+    // Walk to the DEEPEST key on the path the document actually has, and
+    // delete that one. Normally it is the container itself. On a REPAIR's
+    // before-side it is a key partway down that holds a non-object
+    // (`"projects": null` blocking Claude Code's local scope three segments
+    // up) -- and that key is precisely what the repair replaced, so leaving
+    // it in would report the repair the caller asked for as damage to the
+    // rest of the file. An ABSENT key stops the walk too, where the delete is
+    // a no-op: there was nothing there to compare.
+    let holder: Record<string, unknown> = clone;
+    let cut = 0;
+    for (let i = 0; i < segments.length; i++) {
+      cut = i;
+      const value = holder[segments[i]];
+      if (!isRecord(value) || i === segments.length - 1) break;
+      holder = value;
+    }
+    delete holder[segments[cut]];
+    // Then prune every ancestor the deletion just emptied. Creating the
+    // container can create the whole chain above it -- Claude Code's
+    // per-project object is the live case -- and those keys are part of what
+    // the edit was about, so a before/after comparison that kept an
+    // emptied-out `{}` on one side and nothing on the other would fail a
+    // write the caller asked for. An ancestor that still holds anything else
+    // stays, which is what keeps real damage to a sibling visible.
+    for (let depth = cut; depth > 0; depth--) {
+      const above = containerAt(clone, segments.slice(0, depth - 1));
+      const key = segments[depth - 1];
+      const value = above === null ? undefined : above[key];
+      if (above === null || !isRecord(value) || Object.keys(value).length > 0) break;
+      delete above[key];
+    }
+  } else if (leaf !== undefined) {
+    const parent = containerAt(clone, segments.slice(0, -1));
+    const container = parent === null ? undefined : parent[leaf];
+    if (isRecord(container)) {
+      for (const key of opts?.drop ?? []) delete container[key];
     }
   }
   return canonicalJson(clone);

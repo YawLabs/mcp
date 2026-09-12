@@ -107,7 +107,6 @@ const RULES: Rule[] = [
       "src/local-set-cmd.ts": "bundles.json, edited through editJsoncPath by design",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
-      "src/install-cmd.ts": NOT_YET_MIGRATED,
       "src/try-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["const v = parseJsonc(raw);", "editJsoncPath(src, ['servers', 3], v)"],
@@ -121,7 +120,6 @@ const RULES: Rule[] = [
       "src/install-targets.ts": "findLegacyEntry's body, over an object rather than a key list",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
-      "src/install-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["if (ENTRY_NAME in container) {", "const e = c[ENTRY_NAME];", "LEGACY_ENTRY_NAMES.some((n) => n === k)"],
     negative: ["const ENTRY_NAMES = 1;", "view.entry()", "LEGACY_ENTRY_NAMES.join(', ')"],
@@ -212,7 +210,6 @@ const RULES: Rule[] = [
     allowed: {
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
       "src/import-cmd.ts": NOT_YET_MIGRATED,
-      "src/install-cmd.ts": NOT_YET_MIGRATED,
       "src/try-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: ["await readFile(resolved.absolute, 'utf8')", "existsSync(site.resolved.absolute)"],

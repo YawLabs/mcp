@@ -406,10 +406,11 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       shape: "CALL readNested(existing, containerPath)",
       why: "readEntryAt's body, the same generic accessor one level up",
     },
-    { shape: "CALL readNested(existing, canonicalPath)", why: "install: the container this run writes" },
-    { shape: "CALL readNested(existing, variantPath)", why: "install: the drive-case sibling scan it reports" },
-    { shape: "CALL readNested(existing, variantPath)", why: "uninstall: every site it has to clear" },
-    { shape: "CALL readEntryAt(existing, canonicalPath, ENTRY_NAME)", why: "install: env carried over into the entry" },
+    // install and uninstall no longer walk a container at all: both read
+    // through the client-config core, which asks its own adapter for the
+    // entries at the address it was handed. What is left in this file is the
+    // two generic accessors' declarations and their bodies, kept while
+    // try-cmd still calls mergeClientConfig.
     { shape: "LOOP for (const key of containerPath)", why: "readNested's own body" },
     { shape: "LOOP for (const variantPath of variantPaths.slice(1))", why: "install: the sibling scan" },
     {

@@ -827,9 +827,23 @@ function makeView(
  *  paths can both use it on text they already hold. */
 export function containerKeysAt(raw: string | null, site: ConfigSite, prefix: readonly string[]): readonly string[] {
   if (raw === null || prefix.length === 0) return [];
-  const at: ConfigSite = { ...site, resolved: { ...site.resolved, containerPath: [...prefix] } };
-  const read = classifyClientConfig(raw, at).read;
+  const read = classifyClientConfig(raw, siteAt(site, prefix)).read;
   return read.kind === "ok" ? read.entries.map((entry) => entry.key) : [];
+}
+
+/** The same site with its container path replaced -- one FILE, a different
+ *  container inside it.
+ *
+ *  Claude Code's `~/.claude.json` is the reason it exists: user scope reads
+ *  the root container and local scope reads one per project, and an
+ *  older-version drive-letter-case sibling is a third in the same file. A
+ *  caller that needs the entries under a second container classifies the
+ *  bytes it already has at this site, rather than mutating the site it was
+ *  handed (which would send the read that follows to the wrong container) or
+ *  building a ConfigSite literal of its own (which would have to restate the
+ *  format, and could restate it wrong). */
+export function siteAt(site: ConfigSite, containerPath: readonly string[]): ConfigSite {
+  return { ...site, resolved: { ...site.resolved, containerPath: [...containerPath] } };
 }
 
 export interface ReadSeam {
