@@ -6,7 +6,10 @@ BYTE. Two spellings in this directory are deliberate and both are load-bearing.
 ## Why `.txt` and not `.json` / `.jsonc`
 
 Zed's settings.json is JSONC: `//` comments and trailing commas are legal, and
-Zed's own default template ships both. Biome is this repo's formatter and its
+Zed's own default template ships both -- `zed: open settings file`
+(`OpenSettingsFile` in crates/zed/src/zed.rs) creates settings.json from
+`initial_user_settings_content()`, the `assets/settings/initial_user_settings
+.json` asset committed here verbatim. Biome is this repo's formatter and its
 `files.includes` is `["src/**", ...]` with one narrow exclusion,
 `!src/tests/fixtures/*.json` -- a single-level glob that does not reach this
 subdirectory. Measured on this branch with biome 2.4.16:

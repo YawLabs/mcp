@@ -3,11 +3,14 @@
 // WHAT MAKES ZED DIFFERENT, and therefore what this file is about:
 //
 //   * Its settings.json is JSONC -- `//` comments AND trailing commas -- and
-//     that is not a tolerated edge case, it is the file Zed itself WRITES:
-//     `zed: open settings file` creates `assets/settings/initial_user_settings
-//     .json`, which ships 8 comment lines and two trailing commas. So the
-//     decisive test here is an install into that verbatim template with a
-//     byte-for-byte comparison, not a parse-and-compare.
+//     that is not a tolerated edge case, it is the file Zed itself WRITES.
+//     The `zed: open settings file` action (`OpenSettingsFile` in
+//     crates/zed/src/zed.rs) creates settings.json from
+//     `initial_user_settings_content()`, which is the asset
+//     `assets/settings/initial_user_settings.json` -- and that asset ships 8
+//     `//` header lines and two trailing commas. So the decisive test here is
+//     an install into that verbatim template with a byte-for-byte
+//     comparison, not a parse-and-compare.
 //   * The container key is `context_servers`, not `mcpServers`.
 //   * Zed watches the file and starts, restarts or stops servers on save, so
 //     the Done line must not tell anyone to restart the editor.
