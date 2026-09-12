@@ -99,7 +99,9 @@ describe("parseTryArgs", () => {
   });
 
   it("rejects --client with unknown value", () => {
-    const r = parseTryArgs(["demo", "--client", "zed"]);
+    // A name no row can ever carry. A real client id here goes red the day
+    // that client lands, which is what the previous spelling did.
+    const r = parseTryArgs(["demo", "--client", "not-a-client"]);
     expect(r.ok).toBe(false);
   });
 
@@ -1918,7 +1920,7 @@ describe("runTry — auto-detected client (no --client)", () => {
   // CLAUDE_CONFIG_DIR out of it and hands it to the probes, so an ambient one
   // (this dev shell sets it) would move claude-code's probe path outside
   // synthHome and make the result machine-dependent. `os` is pinned for the
-  // same reason -- claude-desktop is unavailable on linux but available on
+  // same reason -- yaw-mcp cannot configure claude-desktop on linux but can on
   // macos/windows, so the probe list itself differs by runner.
 
   it("picks the one client whose config already exists", async () => {
@@ -2001,6 +2003,39 @@ describe("runTry — auto-detected client (no --client)", () => {
     const cursor = JSON.parse(readFileSync(cursorPath, "utf8"));
     expect(cursor.mcpServers["yaw-mcp-try-demo"].command).toBe("npx");
     expect(cursor.mcpServers.existing).toBeDefined();
+  });
+
+  it("probes a client at the path its env var REDIRECTS it to, not the default one", async () => {
+    // `try` resolved its WRITE through readClientEnv and probed WITHOUT it, so
+    // the read and the write disagreed for every modular row: with
+    // $XDG_CONFIG_HOME set and only Zed configured, the probe looked at
+    // ~/.config/zed/settings.json (nothing there), fell through to the
+    // merely-available loop, and returned claude-code -- creating a fresh
+    // ~/.claude.json while the user's actual Zed config sat at the redirected
+    // path.
+    const xdg = join(synthHome, "xdg");
+    mkdirSync(join(xdg, "zed"), { recursive: true });
+    const zedPath = join(xdg, "zed", "settings.json");
+    writeFileSync(zedPath, JSON.stringify({ context_servers: { existing: { command: "x" } } }));
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: { XDG_CONFIG_HOME: xdg },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.marker?.clientName).toBe("zed");
+    expect(r.marker?.clientPath).toBe(zedPath);
+    expect(JSON.parse(readFileSync(zedPath, "utf8")).context_servers["yaw-mcp-try-demo"]).toBeDefined();
+    // And nothing was created for the client the un-threaded probe fell back
+    // to, which is the half of the split a path assertion alone would miss.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
   });
 });
 
@@ -2496,10 +2531,15 @@ describe("runTry -- refusals that were resolver internals", () => {
       fetchExplore: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(2);
-    expect(cap.errText()).toContain("not available on linux");
-    expect(cap.errText()).toMatch(/Claude Code|Cursor/);
-    // No --os in `try`, so it must not advertise one.
-    expect(cap.errText()).not.toContain("--os");
+    // Byte-exact. It names the undocumented config path rather than claiming
+    // the app is missing (it ships on Linux as a beta), points at other
+    // clients by `try`'s own flag -- and, since `try` has no --os, does not
+    // advertise one.
+    expect(cap.errText()).toBe(
+      "yaw-mcp try: Claude Desktop on linux is not supported yet.\n" +
+        "  Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json.\n" +
+        "  Pick another client, such as --client claude-code or --client cursor, or add the entry by hand.\n",
+    );
   });
 
   it("carries the `yaw-mcp try:` prefix on a catalog failure, like every other message here", async () => {

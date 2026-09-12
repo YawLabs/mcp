@@ -1,6 +1,8 @@
 import { parseAuditArgs, runAudit } from "./audit-cmd.js";
 import { parseBundlesArgs, runBundlesCommand } from "./bundles-cmd.js";
 import { parseCallArgs, runCall } from "./call-cmd.js";
+import { clientChoices } from "./client-aliases.js";
+import { readClientEnv } from "./client-config.js";
 import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
@@ -31,6 +33,37 @@ import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
 // tested, without booting this dispatcher.
 
 declare const __VERSION__: string;
+
+/** Column the help block's right-hand text starts at, and the width it wraps
+ *  to. Both are properties of the two-column layout the whole block is written
+ *  in, so a derived list has to respect them rather than run past the edge. */
+const HELP_INDENT = " ".repeat(29);
+
+/** Wrap a comma-separated list to the help block's text column.
+ *
+ *  The client list is DERIVED (`clientChoices`), not a literal, so it grows
+ *  when a client or an alias lands -- and a literal that did not grow was
+ *  simply FALSE: it named six clients while the parser accepted more. Wrapping
+ *  here keeps the derivation and the layout: a further name wraps instead of
+ *  soft-wrapping back to column 0 and breaking the two columns. */
+function wrapHelpList(parts: readonly string[], width = 80): string {
+  const lines: string[] = [];
+  let current = "";
+  parts.forEach((part, i) => {
+    const last = i === parts.length - 1;
+    const piece = last ? part : `${part},`;
+    const candidate = current === "" ? piece : `${current} ${piece}`;
+    // +1 for the sentence's own full stop on the final line.
+    if (HELP_INDENT.length + candidate.length + (last ? 1 : 0) > width && current !== "") {
+      lines.push(current);
+      current = piece;
+    } else {
+      current = candidate;
+    }
+  });
+  lines.push(current);
+  return lines.join(`\n${HELP_INDENT}`);
+}
 
 // Shared dispatch tail for the subcommand runners. Every `runX(...)`
 // returns either a `{ exitCode }` result or a bare number; this funnels
@@ -97,6 +130,14 @@ function run<T>(
 // subcommand here is local-only.
 const subcommand = process.argv[2];
 
+// Every client env var, read ONCE here and threaded into the verbs that need
+// it -- never inside a runner, so a test that calls the runner directly stays
+// hermetic and cannot inherit a wrapper's env. `readClientEnv` is the single
+// reader of these names (empty counts as UNSET, one rule in one place); three
+// hand-rolled copies of that rule is how two commands came to disagree about
+// whether an empty CLAUDE_CONFIG_DIR relocates anything.
+const clientEnv = readClientEnv(process.env);
+
 // Any subcommand at all means a person at a terminal, not a client speaking
 // JSON-RPC -- the server launch is the one invocation with NO first argument
 // (see the else branch at the bottom). Told here rather than inferred inside
@@ -128,31 +169,21 @@ if (subcommand === "compliance") {
     process.stdout.write(`${INSTALL_USAGE}\n`);
     process.exitCode = 0;
   } else {
-    // Read CLAUDE_CONFIG_DIR here (not inside runInstall) so tests stay
-    // hermetic — they call runInstall directly and never inherit env state.
-    const claudeConfigDir =
-      process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-        ? process.env.CLAUDE_CONFIG_DIR
-        : undefined;
-    run("install", parsed, (options) => runInstall({ ...options, claudeConfigDir }));
+    run("install", parsed, (options) =>
+      runInstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
+    );
   }
 } else if (subcommand === "uninstall") {
   // Rides the shared parse-then-dispatch tail: parseUninstallArgs signals
   // --help the ordinary way (`{ ok: false, error: USAGE, help: true }`), so
   // unlike `install` it needs no branch of its own for it.
   //
-  // CLAUDE_CONFIG_DIR is read HERE, not inside runUninstall, for the same
-  // hermeticity reason install does it: the tests call the runner directly and
-  // must not inherit a wrapper's env. It matters as much on the subtract side
-  // -- under a Yaw Mode overlay the entry lives in the wrapper's dir, and an
-  // uninstall that ignored the redirect would report "nothing to do" while the
-  // real entry stayed wired.
-  const claudeConfigDir =
-    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-      ? process.env.CLAUDE_CONFIG_DIR
-      : undefined;
+  // The env comes from the ONE reader above, not from a read of its own. It
+  // matters as much on the subtract side -- under a Yaw Mode overlay the entry
+  // lives in the wrapper's dir, and an uninstall that ignored the redirect
+  // would report "nothing to do" while the real entry stayed wired.
   run("uninstall", parseUninstallArgs(process.argv.slice(3)), (options) =>
-    runUninstall({ ...options, claudeConfigDir }),
+    runUninstall({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
   );
 } else if (subcommand === "doctor") {
   // Argv parsing lives in doctor-cmd.ts (parseDoctorArgs) like every sibling
@@ -192,17 +223,12 @@ if (subcommand === "compliance") {
 } else if (subcommand === "remove") {
   run("remove", parseRemoveArgs(process.argv.slice(3)), runRemove);
 } else if (subcommand === "import") {
-  // CLAUDE_CONFIG_DIR is read HERE, not inside runImport, for the same
-  // hermeticity reason install and uninstall do it: the tests call the runner
-  // directly and must not inherit a wrapper's env. It matters as much on the
-  // READ side -- under a Yaw Mode overlay the servers to import live in the
-  // wrapper's dir, and an import that ignored the redirect would report the
-  // user has none.
-  const claudeConfigDir =
-    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
-      ? process.env.CLAUDE_CONFIG_DIR
-      : undefined;
-  run("import", parseImportArgs(process.argv.slice(3)), (options) => runImport({ ...options, claudeConfigDir }));
+  // Same one reader. It matters as much on the READ side -- under a Yaw Mode
+  // overlay the servers to import live in the wrapper's dir, and an import
+  // that ignored the redirect would report the user has none.
+  run("import", parseImportArgs(process.argv.slice(3)), (options) =>
+    runImport({ ...options, claudeConfigDir: clientEnv.claudeConfigDir, clientEnv }),
+  );
 } else if (subcommand === "call") {
   run("call", parseCallArgs(process.argv.slice(3)), runCall);
 } else if (subcommand === "search") {
@@ -240,16 +266,33 @@ if (subcommand === "compliance") {
     install <client>         Connect one MCP client to yaw-mcp. This wires the
                              aggregator into the client; it does NOT add a
                              server (for that, see \`add\` below). <client> is
-                             one of: claude-code, claude-desktop, cursor, vscode,
-                             windsurf, gemini-cli.
+                             one of: ${wrapHelpList(clientChoices("install"))}.
     install --list           Show every MCP client config location on this
                              machine and whether yaw-mcp is wired into each.
                              The STATUS column is about YAW-MCP, not about the
-                             client: \`installed\` means yaw-mcp is configured
-                             in that file, \`other-entries\` that the file
-                             exists with other servers in it, \`not installed\`
-                             that the file is absent (read-only; no writes).
-    install --all            Configure every installed MCP client in one go.
+                             client, and about the one server list that row
+                             reads in its file (Claude Code's user and local
+                             rows read the same .claude.json, each its own
+                             list): \`installed\` means yaw-mcp is in that list,
+                             \`other-entries\` that the list holds other
+                             servers, \`no-entries\` that the file exists but
+                             has no server in that list, \`not installed\` that
+                             the file is absent, \`legacy: <key>\` that the only
+                             yaw-mcp wiring there is a pre-rename entry,
+                             \`malformed\` that the file does not parse,
+                             \`unreadable: <reason>\` that its bytes could not
+                             be read, and \`not supported yet\` that yaw-mcp
+                             cannot configure that client on this OS. An
+                             \`installed\` or \`legacy\` row can add \`(other
+                             drive case)\`, for a Claude Code local-scope entry
+                             an older version left under the other
+                             drive-letter spelling of this directory
+                             (read-only; no writes).
+    install --all            Install into every client yaw-mcp supports on this
+                             OS. It plans from that list, not from a probe of
+                             what you have installed (--list is the detecting
+                             one), so it may create a config for a client that
+                             is not on this machine.
     uninstall <client>       Unwire a client: removes the yaw-mcp entry (and,
                              for Claude Code, its permissions.allow grant).
                              Your servers in bundles.json are untouched.
@@ -532,6 +575,34 @@ if (subcommand === "compliance") {
                                location is read and written instead of
                                ~/.claude. It is Claude Code's knob, not
                                yaw-mcp's; the server itself never reads it.
+    APPDATA                       Windows' roaming app-data directory, honored
+                               by \`install\`, \`try\`, \`doctor\` and
+                               \`install --list\` when they locate a config
+                               under it (Claude Desktop, VS Code, Zed, and
+                               Cline's per-editor copies). Read once, so all
+                               four agree even where it is redirected away
+                               from %USERPROFILE%\\AppData\\Roaming.
+    XDG_CONFIG_HOME               Honored by the same four commands when they
+                               locate Zed's settings.json on Linux, and only
+                               when it is ABSOLUTE -- the rule Zed inherits
+                               from the dirs crate it resolves paths with. The
+                               Flatpak build reads
+                               $FLATPAK_XDG_CONFIG_HOME instead, which
+                               yaw-mcp does not follow.
+    CLINE_MCP_SETTINGS_PATH       Cline's own three knobs, in this precedence,
+    CLINE_DATA_DIR                honored by the same four commands when they
+    CLINE_DIR                     locate Cline's shared cline_mcp_settings.json:
+                               the first names the FILE, the second its data
+                               directory, the third the directory above that.
+                               Cline's per-editor copies are found by probing
+                               and are not affected.
+    CONTINUE_GLOBAL_DIR           Continue's global directory, honored by the
+                               same four commands when they locate
+                               <dir>/mcpServers/yaw-mcp.json. A relative value
+                               is resolved against the current directory, as
+                               Continue's own IDE core does -- note that
+                               resolves against ITS working directory, not
+                               this one, so an absolute value is safer.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when

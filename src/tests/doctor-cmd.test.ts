@@ -514,7 +514,9 @@ describe("runDoctor — client detection", () => {
     expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
   });
 
-  it("reports Claude Desktop as unavailable on Linux", async () => {
+  it("reports Claude Desktop on Linux as not supported yet, with the reason", async () => {
+    // The app ships on Linux as a beta, so "unavailable on this OS" was a
+    // false claim; what yaw-mcp lacks is a documented config path.
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -525,7 +527,17 @@ describe("runDoctor — client detection", () => {
     });
     const cd = r.snapshot.clients.find((c) => c.clientId === "claude-desktop");
     expect(cd?.unavailable).toBe(true);
-    expect(cap.text()).toMatch(/Claude Desktop.*unavailable/);
+    expect(cd?.unavailableReason).toBe(
+      "Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json",
+    );
+    // The field rides ONLY on that row.
+    expect(r.snapshot.clients.filter((c) => c.unavailableReason !== undefined).map((c) => c.clientId)).toEqual([
+      "claude-desktop",
+    ]);
+    expect(cap.text()).toContain(
+      "Claude Desktop (user): not supported on this OS yet -- Claude Desktop for Linux is in beta, and Anthropic has not documented where it reads claude_desktop_config.json\n",
+    );
+    expect(cap.text()).not.toContain("unavailable on this OS");
   });
 
   it("flags malformed JSON in a client config", async () => {

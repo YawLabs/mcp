@@ -41,6 +41,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
+import { readClientEnv } from "./client-config.js";
 import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
@@ -56,8 +57,13 @@ import {
 } from "./default-runtime.js";
 import { type GuideFile, loadProjectGuide, projectGuideNotice } from "./guide.js";
 import {
+  blockedContainerFix,
+  type ClientEnvValues,
   CURRENT_OS,
+  claudeCodeContainerPaths,
+  describeJsonShape,
   ENTRY_NAME,
+  findBlockedContainerSegment,
   findLegacyEntry,
   INSTALL_TARGETS,
   type InstallClientId,
@@ -65,6 +71,7 @@ import {
   type InstallScope,
   resolveAppDataDir,
   resolveInstallPath,
+  unparseableConfigFix,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import {
@@ -392,12 +399,32 @@ export interface ClientProbeResult {
   path: string;
   exists: boolean;
   hasMcpEntry: boolean;
-  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced so
-   *  upgraded users know to trim by hand — nothing in the runtime writes
-   *  this key anymore. */
+  /** How many keys the JSON object at the slot's container path holds
+   *  (`mcpServers`; `servers` for VS Code; `projects[<dir>].mcpServers` for
+   *  Claude Code's local scope), yaw-mcp's own entry and any legacy one
+   *  included. That object only, never the whole file: Claude Code's user and
+   *  local slots read the same .claude.json and each counts its own list. 0
+   *  when there is nothing to count: no file, a file that could not be read or
+   *  parsed, or one that parses with no such object or an empty one (what
+   *  `uninstall` leaves behind once it removes the last entry). `install
+   *  --list` tells `other-entries` from `no-entries` by it. Additive JSON
+   *  field. */
+  containerEntries: number;
+  /** Pre-rename `"mcp.hosting"` key still in the container. Surfaced because
+   *  the client launches it too, so the user is running yaw-mcp twice --
+   *  nothing in the runtime writes this key anymore (LEGACY_ENTRY_NAMES in
+   *  install-targets.ts). Removing it is not the user's chore: `install`
+   *  removes the key itself unless `--keep-legacy`, in the same write as the
+   *  working entry -- or as the run's only edit when that entry is already
+   *  correct -- so the status lines whose remedy is an install run say
+   *  install removes it. The two that name no run (an entry that already
+   *  works, and one whose launch path is for another OS) say only that the
+   *  key has to go. */
   hasLegacyEntry: boolean;
   /** The specific legacy entry key found (e.g. "mcp.hosting" / "yaw-mcp"), or
-   *  null. Lets the status line name the stale key in the trim hint. */
+   *  null. Lets the status line name the stale key in its legacy clause.
+   *  Same division of labour as the field above: the clause names an install
+   *  run where one is the remedy, and install is what removes the key. */
   legacyEntryName: string | null;
   /** The file exists but its content did not PARSE as a JSON object. Never
    *  set for a read failure -- that is `unreadable`. */
@@ -417,7 +444,19 @@ export interface ClientProbeResult {
    *  see clientCannotLaunch) from a real one WITHOUT parsing the message,
    *  whose wording node reshapes across versions. */
   unreadableCode: string | null;
+  /** The container key install cannot splice its entry into, worded for a
+   *  message (`"mcpServers" is an array of 2`), or null. Set only for a key
+   *  findBlockedContainerSegment reports as NOT reparable -- the shape install
+   *  REFUSES with exit 1. A reparable one (null, a scalar, an empty array)
+   *  stays null: install replaces it with `{}`, so the ordinary "run install"
+   *  line is true there. Additive JSON field. */
+  containerBlocked: string | null;
   unavailable: boolean;
+  /** On an `unavailable` row whose client DOES ship on this OS but that
+   *  yaw-mcp cannot configure there (Claude Desktop on Linux), the reason from
+   *  INSTALL_TARGETS' `notConfigurableOn`; absent on every other row.
+   *  Additive JSON field. */
+  unavailableReason?: string;
   /** An absolute launch `command` in the entry that no longer exists on disk,
    *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
    *  PATH-resolved and cannot be verified cheaply. This catches the failure
@@ -452,6 +491,20 @@ export interface ClientProbeResult {
    *  (see isForeignAbsoluteLaunch). Not a cannot-launch state: the OS the
    *  entry was written for may well run it fine. */
   launchForeignPath: string | null;
+  /** The `projects[...]` key the reported entry was actually found under, when
+   *  that key is NOT the canonical spelling for this directory -- otherwise
+   *  null, which is every non-Windows checkout, every other client, and every
+   *  config this version wrote.
+   *
+   *  Claude Code's lookup is byte-exact, so a key differing only in
+   *  drive-letter case is a separate entry, read by a different set of shells
+   *  (see claudeCodeProjectKey). Probing only the canonical key reported "not
+   *  installed" for a project that WAS installed -- by an older version, or by
+   *  an install run from a cmd prompt with a lower-case drive. The probe now
+   *  looks under every variant (claudeCodeContainerPaths) and names the one it
+   *  read, so the status line can say which spelling is live instead of
+   *  implying there is only ever one. Additive JSON field. */
+  entryProjectKey: string | null;
 }
 
 export interface DoctorResult {
@@ -540,6 +593,7 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   config: ResolvedConfig;
   trustProbe: ProjectTrustProbe | null;
   claudeConfigDir: string | undefined;
+  clientEnv: ClientEnvValues;
 }> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
@@ -561,11 +615,27 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   const trustWarning = projectTrustWarning(trustProbe);
   if (trustWarning) config.warnings = [...config.warnings, trustWarning];
 
-  // Honor CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
-  // when run inside a wrapper (Yaw Mode, dev container with the env set).
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  // Every client env var through the ONE reader, so doctor sees exactly the
+  // files install writes: CLAUDE_CONFIG_DIR for Claude Code inside a wrapper
+  // (Yaw Mode, a dev container with the env set), and the rest for the clients
+  // that have one -- a redirected Zed, Cline or Continue would otherwise be
+  // probed at its DEFAULT path while install writes the redirected one, which
+  // is the same read-write split CLAUDE_CONFIG_DIR was added for. Empty counts
+  // as unset there, one rule in one place.
+  const clientEnv = readClientEnv(env);
 
-  return { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir };
+  return {
+    cwd,
+    home,
+    appData,
+    os,
+    env,
+    timestamp,
+    config,
+    trustProbe,
+    claudeConfigDir: clientEnv.claudeConfigDir,
+    clientEnv,
+  };
 }
 
 /** state.json, peeked and (when usable) loaded ONCE, for the STATE and
@@ -622,7 +692,7 @@ function isTransientRead(c: ClientProbeResult): boolean {
 }
 
 /** True when the probe found a config file whose CONTENTS are known: it is on
- *  disk, on a client available on this OS, and doctor could both read and
+ *  disk, on a client yaw-mcp can configure on this OS, and doctor could both read and
  *  parse it. This is the gate `yaw-mcp try`'s auto-detect picks "the client
  *  the user is actively using" by. Both failure kinds are excluded on
  *  purpose: `malformed` always was, but `unreadable` (split out of it later)
@@ -691,7 +761,12 @@ function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
   for (const c of clients) {
     if (!clientCannotLaunch(c)) continue;
     const { client, status } = describeClient(c);
-    const key = `${c.path}\0${client}\0${status}`;
+    // Malformed is file-level, but its line names the row's OWN install
+    // command (a project-scope file needs `--scope project`), so the status
+    // text now differs per scope and cannot be the key. Keyed on the state
+    // instead; the folded line keeps the first grouped row's wording -- for
+    // Claude Code's (user, local) pair on ~/.claude.json, the user scope's.
+    const key = `${c.path}\0${client}\0${c.malformed ? "malformed" : status}`;
     const seen = grouped.get(key);
     if (seen) seen.scopes.push(c.scope);
     else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });
@@ -709,7 +784,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     write(`${s}\n`);
   };
 
-  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir } = await collectDoctorBase(opts);
+  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
+    await collectDoctorBase(opts);
 
   print(`yaw-mcp doctor -- ${timestamp}`);
   print(`yaw-mcp version: ${VERSION}`);
@@ -811,6 +887,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     os,
     cwd,
     claudeConfigDir,
+    clientEnv,
     appData,
     platform: opts.platform,
     readClientConfig: opts.readClientConfig,
@@ -945,7 +1022,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   // Same collection prologue as the text path -- option defaults, config load,
   // project-trust fold, CLAUDE_CONFIG_DIR -- so `doctor --json` reports the
   // gate in `.warnings` and exits 2 identically. See collectDoctorBase.
-  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir } = await collectDoctorBase(opts);
+  const { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir, clientEnv } =
+    await collectDoctorBase(opts);
 
   // Trial GC + readout. The --json path MUST run gcExpiredTrials too, so
   // `doctor` and `doctor --json` have the SAME persistent side effects
@@ -975,6 +1053,7 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     os,
     cwd,
     claudeConfigDir,
+    clientEnv,
     appData,
     platform: opts.platform,
     readClientConfig: opts.readClientConfig,
@@ -2141,7 +2220,11 @@ function schemaSuffix(f: LoadedConfigFile): string {
  *  Centralises the per-state wording so the renderer in `runDoctor`
  *  doesn't carry a nested ternary tree as more states get added. */
 function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
-  if (c.unavailable) return "unavailable on this OS";
+  if (c.unavailable) {
+    return c.unavailableReason !== undefined
+      ? `not supported on this OS yet -- ${c.unavailableReason}`
+      : "unavailable on this OS";
+  }
   // A READ failure, named as one. It used to fall into the malformed line
   // below and send the user hunting for a syntax error in a file that is a
   // directory, or that the process simply cannot open. No install hint: on
@@ -2157,34 +2240,79 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
     }
     return `exists but could not be read (${c.unreadable}) -- check the file and its permissions, then rerun doctor`;
   }
-  if (c.malformed) return "exists but JSON is malformed -- fix or rerun `yaw-mcp install`";
+  // install REFUSES this file (exit 1, --force included -- see
+  // unparseableConfigFix), so the old "fix or rerun `yaw-mcp install`" offered
+  // a rerun that could only hit that refusal. The remedy is install's own,
+  // from the one helper both surfaces call, and names this row's command.
+  if (c.malformed) {
+    return `exists but JSON is malformed -- install refuses to overwrite it; ${unparseableConfigFix(`run \`${installCmd}\``)}`;
+  }
+  // The same trap one level down: the file parses, but a key on the way to the
+  // entry holds a non-empty array, which install refuses rather than drop (see
+  // findBlockedContainerSegment). It used to fall through to "present, no
+  // entry -- run install", and running it exits 1.
+  if (c.containerBlocked !== null) {
+    return `present, but ${c.containerBlocked}, not a JSON object -- install refuses to overwrite it; ${blockedContainerFix(`run \`${installCmd}\``)}`;
+  }
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
   // and the combined branch used to swallow it -- a config carrying both a
   // legacy entry and a rotted absolute command reported "OK" and told the user
   // to remove the OTHER entry, leaving only the broken one. When both are true
-  // the legacy trim hint is appended rather than dropped, so neither problem
-  // goes unnamed.
+  // the legacy entry is named rather than dropped, so neither problem goes
+  // unnamed.
   //
   // Hoisted above all THREE cannot-launch branches, not just the first: a
   // bare `oam` command (or a rotted oam entry file) plus a legacy entry used
   // to report only the launch problem, so fixing it took two doctor runs --
   // the legacy hint only appeared once the first fault was gone. All three
-  // states mean "cannot start", so all three carry the same trim hint.
+  // states mean "cannot start", so all three carry the same trailer.
+  //
+  // "install removes it", not "remove it once the working entry is back": each
+  // line's remedy is an install run, and install trims the legacy entry in the
+  // same write as the working one (unless --keep-legacy) -- off a TTY too, where
+  // the collision refusal names --repair and that run trims. The old wording
+  // sent the user to remove by hand an entry that run had already removed, the
+  // claim the lone-legacy line below dropped for the same reason.
+  //
+  // The bare-oam line carries the SAME trailer, with no by-hand clause of its
+  // own. It used to read as if OAM_BIN were a second remedy that leaves the
+  // legacy entry behind, but setting OAM_BIN cannot bring the working entry
+  // back, so that state does not exist. OAM_BIN is read only inside yaw-mcp's
+  // OWN process (probeOamUncached, oam-spawn.ts): it changes which binary
+  // INSTALL resolves and writes, never what the client spawns -- the client
+  // runs the stored bare `oam` against its own PATH. This line is computed from
+  // that stored token alone (launchOamNotAbsolute, below; renderClientStatus is
+  // not even handed an env), so doctor's output does not move when the var is
+  // set. Install's own lines pair it with a re-run for the same reason
+  // (install-cmd.ts, the two "Set OAM_BIN to oam's full path and re-run install"
+  // runtime lines), so this one names it as a precondition of the rerun rather
+  // than as an alternative to it.
   const legacy = c.hasLegacyEntry
-    ? `; legacy "${c.legacyEntryName}" entry also present -- remove it once the working entry is back`
+    ? `; legacy "${c.legacyEntryName}" entry also present -- install removes it as it writes the working entry`
+    : "";
+  // The entry is real but lives under the OTHER drive-letter spelling of this
+  // directory's projects[] key. Appended to every branch that reports an
+  // entry, because each of them otherwise reads as a statement about the key
+  // doctor was asked about -- and a session whose cwd is spelled the canonical
+  // way sees nothing at all. Empty for every other client, every POSIX
+  // checkout, and every config this version wrote.
+  const keyNote = c.entryProjectKey
+    ? `; found under projects[${JSON.stringify(c.entryProjectKey)}], the same directory spelled with the other ` +
+      `drive-letter case -- only a Claude Code whose cwd is spelled that way reads it, and \`${installCmd}\` ` +
+      "writes the canonical key"
     : "";
   if (c.launchCommandMissing) {
-    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}`;
+    return `has "${ENTRY_NAME}" entry, but its launch command does not exist: ${c.launchCommandMissing} -- the client cannot start yaw-mcp; rerun \`${installCmd}\`${legacy}${keyNote}`;
   }
   // Both oam-specific states below are "the entry looks fine and will not
   // start", so they rank with launchCommandMissing rather than with the OK
   // branches -- reporting "OK (runs on oam)" for either is the wrong answer.
   if (c.launchOamEntryMissing) {
-    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}`;
+    return `has "${ENTRY_NAME}" entry running on oam, but its entry file does not exist: ${c.launchOamEntryMissing} -- oam cannot fetch it on demand the way npx would; rerun \`${installCmd}\`${legacy}${keyNote}`;
   }
   if (c.launchOamNotAbsolute) {
-    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}`;
+    return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path (set OAM_BIN to oam's full path first if install cannot find it)${legacy}${keyNote}`;
   }
   // Below the cannot-launch branches and above the OK ones: doctor knows
   // neither. The path is absolute on the OS the entry was written for, and
@@ -2193,16 +2321,19 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   // not happen; reporting broken would flag a Windows profile as seen from
   // WSL for being a Windows profile.
   if (c.launchForeignPath) {
-    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}`;
+    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}${keyNote}`;
   }
   if (c.hasMcpEntry && c.hasLegacyEntry) {
-    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice`;
+    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice${keyNote}`;
   }
   if (c.hasMcpEntry) {
-    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}`;
+    return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}${keyNote}`;
   }
   if (c.hasLegacyEntry) {
-    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate, then remove the legacy entry by hand`;
+    // No "then remove it by hand": install trims the legacy entry in the same
+    // write that adds the new one (unless --keep-legacy), so after following
+    // this line there is nothing left to remove.
+    return `legacy "${c.legacyEntryName}" entry present -- run \`${installCmd}\` to migrate; install removes the legacy entry as it writes the new one${keyNote}`;
   }
   if (c.exists) return `present, no "${ENTRY_NAME}" entry -- run \`${installCmd}\``;
   return `not configured -- run \`${installCmd}\``;
@@ -2222,6 +2353,13 @@ interface ProbeOptions {
    *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
    *  `yaw-mcp install --list` see the same file Claude Code reads. */
   claudeConfigDir?: string;
+  /** Every client env var, as `readClientEnv` reported it. Only a MODULAR row
+   *  reads it (Zed's $XDG_CONFIG_HOME, Cline's three knobs, Continue's global
+   *  dir); the six inline rows take their one variable from `claudeConfigDir`
+   *  above. Without it, doctor and `--list` resolve a redirected client's path
+   *  from the DEFAULT location while install writes the redirected one -- the
+   *  same read-write split `claudeConfigDir` was added for. */
+  clientEnv?: ClientEnvValues;
   /** Path semantics for the launch checks: which `isAbsolute` an entry's
    *  command is judged by, and whether a drive-letter path is foreign (see
    *  isForeignAbsoluteLaunch). Defaults to process.platform -- what the
@@ -2254,7 +2392,10 @@ interface ProbeSlot {
  *  classifyProbeContent are both typed against it, so a field added to
  *  ClientProbeResult that neither sets is a compile error rather than an
  *  `undefined` in the --json blob. */
-type ProbeClassification = Omit<ClientProbeResult, "clientId" | "scope" | "path" | "exists" | "unavailable">;
+type ProbeClassification = Omit<
+  ClientProbeResult,
+  "clientId" | "scope" | "path" | "exists" | "unavailable" | "unavailableReason"
+>;
 
 // The "nothing found" probe skeleton, in ONE place. classifyProbeContent
 // returns this shape from four separate exits (empty file, non-object JSON,
@@ -2264,16 +2405,19 @@ type ProbeClassification = Omit<ClientProbeResult, "clientId" | "scope" | "path"
 // as `undefined` there while every other exit reported it properly.
 const EMPTY_PROBE: Readonly<ProbeClassification> = {
   hasMcpEntry: false,
+  containerEntries: 0,
   hasLegacyEntry: false,
   legacyEntryName: null,
   malformed: false,
   unreadable: null,
   unreadableCode: null,
+  containerBlocked: null,
   launchCommandMissing: null,
   launchRuntime: null,
   launchOamNotAbsolute: null,
   launchOamEntryMissing: null,
   launchForeignPath: null,
+  entryProjectKey: null,
 };
 
 const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: true };
@@ -2303,6 +2447,7 @@ function unreadableProbe(err: unknown): ProbeClassification {
 function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
   for (const target of INSTALL_TARGETS) {
     if (!target.availableOn.includes(opts.os)) {
+      const why = target.notConfigurableOn?.[opts.os];
       yield {
         result: {
           clientId: target.clientId,
@@ -2311,6 +2456,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           exists: false,
           unavailable: true,
           ...EMPTY_PROBE,
+          ...(why !== undefined ? { unavailableReason: why } : {}),
         },
         read: null,
       };
@@ -2330,6 +2476,7 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           appData: opts.appData,
           projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
           claudeConfigDir: opts.claudeConfigDir,
+          clientEnv: opts.clientEnv,
         });
       } catch {
         // resolveInstallPath throws when project is required but missing —
@@ -2514,8 +2661,41 @@ function classifyProbeContent(
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return { ...MALFORMED };
     }
-    const container = walkContainer(parsed as Record<string, unknown>, containerPath);
+    // EVERY projects[] read resolves its path through the one helper -- see
+    // claudeCodeContainerPaths. The canonical key comes first and wins when it
+    // carries wiring; a drive-letter-case sibling is only reported when the
+    // canonical key has nothing, which is exactly the upgrade case (an older
+    // version wrote the other spelling). `entryProjectKey` then names the key
+    // that was actually read, so no surface claims the entry is somewhere it
+    // is not.
+    const variantPaths = claudeCodeContainerPaths(parsed, containerPath);
+    let container: Record<string, unknown> | null = null;
+    let entryProjectKey: string | null = null;
+    for (let i = 0; i < variantPaths.length; i++) {
+      const found = walkContainer(parsed as Record<string, unknown>, variantPaths[i]);
+      if (!found) continue;
+      const wired = ENTRY_NAME in found || findLegacyEntry(found) !== null;
+      // The first container that exists is the fallback (so an empty canonical
+      // container still reads as "present, no entry" rather than "not
+      // configured"); the first WIRED one wins outright.
+      if (container === null || wired) {
+        container = found;
+        entryProjectKey = i === 0 ? null : variantPaths[i][1];
+      }
+      if (wired) break;
+    }
     if (!container) {
+      // walkContainer answers "is there a container", and null covers two
+      // shapes install treats differently: an absent or reparable key (install
+      // writes one) and a non-empty array (install refuses). Only the second
+      // changes what doctor should advise, so ask install's own question.
+      const blocked = findBlockedContainerSegment(parsed as Record<string, unknown>, containerPath);
+      if (blocked !== null && !blocked.reparable) {
+        return {
+          ...EMPTY_PROBE,
+          containerBlocked: `"${blocked.path.join(".")}" is ${describeJsonShape(blocked.value)}`,
+        };
+      }
       return { ...EMPTY_PROBE };
     }
     const legacyEntryName = findLegacyEntry(container);
@@ -2581,16 +2761,22 @@ function classifyProbeContent(
     }
     return {
       hasMcpEntry: ENTRY_NAME in container,
+      containerEntries: Object.keys(container).length,
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
       unreadable: null,
       unreadableCode: null,
+      containerBlocked: null,
       launchCommandMissing,
       launchRuntime,
       launchOamNotAbsolute,
       launchOamEntryMissing,
       launchForeignPath,
+      // Only when something is actually wired there: a bare sibling container
+      // is not news, and naming it would send the user after a key that holds
+      // nothing.
+      entryProjectKey: ENTRY_NAME in container || legacyEntryName !== null ? entryProjectKey : null,
     };
   } catch {
     // Parse failures only: the READ happens in the caller, under its own
