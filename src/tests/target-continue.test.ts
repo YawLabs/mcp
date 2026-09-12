@@ -317,9 +317,19 @@ describe("the fixtures themselves", () => {
 });
 
 describe("the continue row, as data", () => {
-  it("is APPENDED last, so try's auto-detect picks the same client it did before", () => {
-    expect(INSTALL_TARGETS.at(-1)?.clientId).toBe("continue");
-    expect(INSTALL_TARGETS[0].clientId).toBe("claude-code");
+  // The invariant is APPENDED-NEVER-INSERTED, not "continue is the last row":
+  // `try`'s auto-detect returns the first usable probe slot in array order, so
+  // inserting a row AHEAD of the six that shipped in 1.0.0 would silently
+  // change which client an existing user's `try` picks. Landing a row after
+  // them cannot. This test asserted `at(-1)` while continue happened to be the
+  // newest row; codex-cli landed after it, so the literal-last form was a
+  // statement about merge order rather than about the invariant.
+  it("is APPENDED after the rows that shipped in 1.0.0, so try's auto-detect picks the same client it did before", () => {
+    const ids = INSTALL_TARGETS.map((t) => t.clientId);
+    const shippedIn100 = ["claude-code", "claude-desktop", "cursor", "vscode", "windsurf", "gemini-cli"];
+    expect(ids.slice(0, shippedIn100.length)).toEqual(shippedIn100);
+    expect(ids.indexOf("continue")).toBeGreaterThanOrEqual(shippedIn100.length);
+    expect(ids[0]).toBe("claude-code");
   });
 
   it("declares a DEDICATED jsonc file keyed mcpServers, on every OS, user before project", () => {

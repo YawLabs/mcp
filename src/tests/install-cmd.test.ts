@@ -4305,9 +4305,26 @@ describe("runInstall --all — an all-refused run", () => {
         os: "linux",
         home: synthHome,
       });
-      const seeded = { [t.config.root]: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] } } };
       mkdirSync(dirname(resolved.absolute), { recursive: true });
-      writeFileSync(resolved.absolute, JSON.stringify(seeded), "utf8");
+      // The seed has to be in the row's OWN FORMAT, not JSON for everyone.
+      // Writing JSON into a `toml` row's file seeds a MALFORMED config, and a
+      // malformed file is a FAILURE rather than a collision refusal -- which
+      // silently turns this all-refused run into a mixed one and moves the
+      // aggregate exit code off the "needs a flag" code the assertions below
+      // are about. (Measured when codex-cli landed: exit 1 where 2 was
+      // expected, and 1 where 0 was, from this one line.)
+      const args = ["-y", "@yawlabs/mcp"];
+      if (t.config.format === "toml") {
+        const argList = args.map((a) => JSON.stringify(a)).join(", ");
+        writeFileSync(
+          resolved.absolute,
+          `[${t.config.root}.${ENTRY_NAME}]\ncommand = "npx"\nargs = [${argList}]\n`,
+          "utf8",
+        );
+      } else {
+        const seeded = { [t.config.root]: { [ENTRY_NAME]: { command: "npx", args } } };
+        writeFileSync(resolved.absolute, JSON.stringify(seeded), "utf8");
+      }
     }
   };
 
