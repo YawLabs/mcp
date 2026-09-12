@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "mcpName": "io.github.YawLabs/mcp",
   "description": "MCP gateway and orchestrator: one local install fronts every MCP server for Claude Code, Cursor, and VS Code, loading tools on demand.",
   "license": "SEE LICENSE IN LICENSE.md",
