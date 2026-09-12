@@ -1,0 +1,8 @@
+{
+	"theme": "One Dark",
+	"context_servers": {
+		"github": {
+			"command": "gh-mcp"
+		}
+	}
+}
