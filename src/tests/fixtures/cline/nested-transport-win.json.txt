@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "mcp": {
+      "transport": {
+        "type": "stdio",
+        "command": "cmd",
+        "args": [
+          "/c",
+          "npx",
+          "-y",
+          "@yawlabs/mcp@latest"
+        ]
+      },
+      "disabled": false,
+      "timeout": 60
+    }
+  }
+}

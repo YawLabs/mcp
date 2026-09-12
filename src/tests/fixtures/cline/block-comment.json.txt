@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    /* the filesystem server, parked until the rewrite lands */
+    "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}
+  }
+}

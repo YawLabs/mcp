@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "autoApprove": [],
+      "disabled": true,
+      "timeout": 60,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp"
+      ],
+      "type": "stdio"
+    },
+    "mcp": {
+      "timeout": 60,
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@yawlabs/mcp@latest"
+      ],
+      "type": "stdio"
+    }
+  }
+}
