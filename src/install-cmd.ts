@@ -306,22 +306,11 @@ export async function summarizeBundles(opts: { home?: string; cwd?: string }): P
   return { state, count, path: loaded.path ?? localBundlesPath(userConfigDir(home)), warnings: loaded.warnings };
 }
 
-/** Entry keys in the container this install writes into that are somebody
- *  else's server: everything except our own entry and the pre-rename keys for
- *  it (both are the BROKER, not an upstream). Non-object values are skipped --
- *  a key holding a string or null is not a server any client can launch, and
- *  counting it inflates the number the user is asked to trust.
- *
- *  Returns the NAMES, not just a count: install prints only `.length` (the
- *  dry-run preview is asserted not to echo a sibling's name), while a later
- *  import prompt needs the names themselves. Exported for tests. */
-export function directClientEntries(container: unknown): string[] {
-  if (typeof container !== "object" || container === null || Array.isArray(container)) return [];
-  const skip = new Set<string>([ENTRY_NAME, ...LEGACY_ENTRY_NAMES]);
-  return Object.entries(container as Record<string, unknown>)
-    .filter(([k, v]) => !skip.has(k) && typeof v === "object" && v !== null && !Array.isArray(v))
-    .map(([k]) => k);
-}
+// `directClientEntries` used to live here: "every key in this container that
+// is somebody else's server", skipping our own entry and the pre-rename
+// spellings of it, non-object values included. It is `view.otherServerKeys()`
+// now -- the same rule, answered by the core off the site's own adapter, with
+// one reader of the legacy-name list instead of two.
 
 /** Where the counted entries live. The file alone under-describes claude-code
  *  LOCAL scope, whose container is projects[<dir>].mcpServers inside a
@@ -1122,7 +1111,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // describeEntryDiff and DRY_RUN_ENV_PLACEHOLDER follow for this same block --
   // because the drop is otherwise visible only as one `env: drops ...` diff
   // line. It names only the keys --repair would have kept: a non-string value
-  // is filtered out by readEntryAt on both paths, so claiming --repair keeps
+  // is filtered out by the core's carryableEnv on both paths, so claiming --repair keeps
   // it would be false (the diff line still names it). The same filter is why
   // the parenthetical speaks of THESE keys rather than of "an entry's env":
   // --repair does not keep a non-string value either. Sorted (the "Kept" line
@@ -1131,8 +1120,8 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // not "Dropped": the line prints before the write, which can still fail.
   //
   // carriedKeys is shared with the TTY prompt and the off-TTY hint below. Both
-  // name the kept keys rather than saying "its env", for the same readEntryAt
-  // reason, and in the same sorted order.
+  // name the kept keys rather than saying "its env", for the same
+  // string-values-only reason, and in the same sorted order.
   const carriedKeys = carryableEnv ? Object.keys(carryableEnv).sort() : [];
   if (carryableEnv) {
     const keys = carriedKeys.join(", ");
@@ -1204,7 +1193,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       // diff above was computed WITH the env carried, so it has no `env:` line
       // for the carried keys and nothing here would warn that --force removes
       // them. It names those keys rather than saying --repair keeps "its env":
-      // a non-string value is filtered out by readEntryAt, goes on either flag,
+      // a non-string value is filtered out by the core's carryableEnv, goes on either flag,
       // and is named by the `env: drops ...` line of the diff above. Under
       // --all the same distinction rides the one consolidated hint instead, so
       // it is built here only for the hint this run actually prints.
@@ -1641,7 +1630,7 @@ function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
  *  which USAGE also calls an overwrite, DROPS that env, and the diff above the
  *  question lists only what changes -- so a kept env would otherwise go
  *  unmentioned and "overwrite" would mean two things. KEYS, not "its env":
- *  readEntryAt filters out a non-string value, so an overwrite of a mixed env
+ *  the core's carryableEnv filters out a non-string value, so an overwrite of a mixed env
  *  does not keep all of it, and the diff line above the question names the
  *  key that goes. */
 async function promptCollision(
@@ -1675,18 +1664,6 @@ async function promptCollision(
   } finally {
     rl.close();
   }
-}
-
-/** Walk `containerPath` to find the existing mcpServers/servers container.
- *  Returns the value at the path, or undefined if any segment is missing
- *  or non-object. Does not mutate. */
-export function readNested(root: Record<string, unknown>, containerPath: string[]): unknown {
-  let cur: unknown = root;
-  for (const key of containerPath) {
-    if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return undefined;
-    cur = (cur as Record<string, unknown>)[key];
-  }
-  return cur;
 }
 
 /**
@@ -1791,90 +1768,22 @@ export function describeEntryDiff(stored: unknown, nextEntry: object): string[] 
   return lines.length > 0 ? lines : ["the entries differ in key order only"];
 }
 
-/** Read the existing launch entry at `containerPath`, or null when the path or
- *  the entry is absent. Walks with readNested, the same walk mergeClientConfig
- *  and the collision check use, so all three agree on where the entry lives. */
-export function readEntryAt(
-  existing: Record<string, unknown>,
-  containerPath: string[],
-  entryName: string = ENTRY_NAME,
-): { command?: string; args?: string[]; env?: Record<string, string> } | null {
-  const node = readNested(existing, containerPath);
-  if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
-  const entry = (node as Record<string, unknown>)[entryName];
-  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
-  // Validate `env` before anyone carries it forward: the user chose
-  // overwrite (or --repair) precisely to replace a broken entry, and a
-  // malformed env (a string -- whose Object.keys are "0","1","2" -- or an
-  // array) would otherwise ride into the fresh entry and get the whole
-  // file rejected by the client. Filter PER KEY, not all-or-nothing: one
-  // hand-added numeric value ("DEBUG": 1) must not silently drop the
-  // valid string keys beside it -- OAM_BIN is the load-bearing example
-  // (losing it moves the sidecars to a different runtime with no
-  // diagnostic, the exact failure the carry-over exists to prevent).
-  const result = { ...entry } as { command?: string; args?: string[]; env?: Record<string, string> };
-  const env = (entry as Record<string, unknown>).env;
-  if (typeof env === "object" && env !== null && !Array.isArray(env)) {
-    const kept = Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === "string")) as Record<
-      string,
-      string
-    >;
-    result.env = Object.keys(kept).length > 0 ? kept : undefined;
-  } else {
-    result.env = undefined;
-  }
-  return result;
-}
-
-/** Merge `entry` into the container at `existing[...containerPath][entryName]`,
- *  preserving every sibling at every level of the path. Returns a new object;
- *  does not mutate. For Claude Code local scope, containerPath is
- *  ["projects", <absDir>, "mcpServers"] and this preserves every other
- *  project's settings + every other top-level key in ~/.claude.json.
- *  `entryName` defaults to ENTRY_NAME (the canonical yaw-mcp entry);
- *  `yaw-mcp try` overrides it with `yaw-mcp-try-<slug>` so the trial entry sits
- *  next to a real yaw-mcp install without colliding. */
-export function mergeClientConfig(
-  existing: Record<string, unknown>,
-  containerPath: string[],
-  entry: Record<string, unknown> | { command: string; args: string[]; env?: Record<string, string> },
-  entryName: string = ENTRY_NAME,
-): Record<string, unknown> {
-  if (containerPath.length === 0) throw new Error("mergeClientConfig: containerPath cannot be empty");
-  // EXACT, never folded through claudeCodeContainerPaths: this clones the
-  // chain it is about to WRITE into, and every caller hands it the canonical
-  // path. Folding here would splice the entry into a drive-case sibling as
-  // well, which is the silent second install that the sibling REPORT exists to
-  // avoid. Registered as such in the source-shape scan in
-  // src/tests/source-hygiene.test.ts.
-  const out: Record<string, unknown> = { ...existing };
-  let parent: Record<string, unknown> = out;
-  for (let i = 0; i < containerPath.length - 1; i++) {
-    const key = containerPath[i];
-    const child = parent[key];
-    const cloned: Record<string, unknown> =
-      typeof child === "object" && child !== null && !Array.isArray(child)
-        ? { ...(child as Record<string, unknown>) }
-        : {};
-    parent[key] = cloned;
-    parent = cloned;
-  }
-  const leafKey = containerPath[containerPath.length - 1];
-  const prev = parent[leafKey];
-  const container: Record<string, unknown> =
-    typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
-  container[entryName] = entry;
-  parent[leafKey] = container;
-  return out;
-}
-
-// `removeFromClientConfig` used to live here: an object-level "delete this
-// entry, preserve every sibling" mirror of mergeClientConfig, documented as the
-// helper behind `try-cleanup` and doctor's trial-GC. It was neither -- both of
-// those peel a trial entry out of the RAW bytes via `removeJsoncEntry`
-// (jsonc.ts), which is the only way to keep the user's comments, so this export
-// had zero callers and zero tests while its doc comment claimed two. Removed
-// rather than left as a second, comment-destroying way to do the same job.
+// `readNested`, `readEntryAt`, `mergeClientConfig` and `removeFromClientConfig`
+// used to live here: an object-level walk, an entry accessor over it, and the
+// merge / delete pair that wrote through them. All four are gone. Every read
+// and write of a client config in this file now goes through the client-config
+// core -- `readClientConfigFile` and `classifyClientConfig` for the reads,
+// `applyClientConfigEdits` for the writes -- which asks the site's OWN adapter
+// for the entries at the address it was handed, so the walk no longer has to
+// be written once per syntax and the write is verified before there are bytes
+// to persist. `removeFromClientConfig` went first, and for the sharper reason:
+// its doc comment named two callers it did not have.
+//
+// What replaces each, for anyone following an old reference: readNested and
+// readEntryAt -> `view.entry()` / `view.normalized()` / `view.carryableEnv()`;
+// mergeClientConfig -> an `upsert` edit into an absent file, which the JSON
+// adapter renders with `buildFreshConfig` (pinned byte-for-byte against the
+// shape this function produced, in client-config-json.test.ts).
 
 /** True when a value-flag's argument reads as the NEXT flag rather than as the
  *  value. `--token --force` was already refused, but the guard tested only for

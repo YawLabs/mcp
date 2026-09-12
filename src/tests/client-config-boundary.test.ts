@@ -84,7 +84,6 @@ const RULES: Rule[] = [
       "src/install-targets.ts":
         "declares findBlockedContainerSegment and findLegacyEntry, which doctor and install both ask",
       "src/doctor-cmd.ts": NOT_YET_MIGRATED,
-      "src/install-cmd.ts": NOT_YET_MIGRATED,
     },
     positive: [
       "const c = readNested(root, path);",

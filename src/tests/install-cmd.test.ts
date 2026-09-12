@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { classifyClientConfig } from "../client-config.js";
 import { runDoctor } from "../doctor-cmd.js";
 import {
   type BundlesSummary,
@@ -19,14 +20,11 @@ import {
   DRY_RUN_ENV_PLACEHOLDER,
   deepEqualJson,
   describeEntryDiff,
-  directClientEntries,
   INSTALL_USAGE,
-  mergeClientConfig,
   mergePermissionsAllow,
   NO_CONFIG_FLAG_DEPRECATION,
   parseInstallArgs,
   parseUninstallArgs,
-  readEntryAt,
   removePermissionsAllow,
   runInstall,
   runUninstall,
@@ -308,74 +306,15 @@ describe("parseInstallArgs", () => {
   });
 });
 
-describe("mergeClientConfig", () => {
-  it("preserves other servers in mcpServers", () => {
-    const existing = { mcpServers: { other: { command: "x" } } };
-    const merged = mergeClientConfig(existing, ["mcpServers"], { command: "npx", args: ["-y", "@yawlabs/mcp"] });
-    expect(merged.mcpServers).toEqual({
-      other: { command: "x" },
-      [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcp"] },
-    });
-  });
-
-  it("preserves sibling top-level keys (e.g., model, hooks)", () => {
-    const existing = { model: "claude-opus-4-7", mcpServers: {} };
-    const merged = mergeClientConfig(existing, ["mcpServers"], { command: "npx", args: ["-y", "@yawlabs/mcp"] });
-    expect(merged.model).toBe("claude-opus-4-7");
-    expect((merged.mcpServers as Record<string, unknown>)[ENTRY_NAME]).toBeDefined();
-  });
-
-  it("creates the container if missing", () => {
-    const merged = mergeClientConfig({}, ["servers"], { command: "npx", args: [] });
-    expect(merged.servers).toEqual({ [ENTRY_NAME]: { command: "npx", args: [] } });
-  });
-
-  it("uses the right container key for VS Code (servers, not mcpServers)", () => {
-    const merged = mergeClientConfig({}, ["servers"], { command: "x", args: [] });
-    expect(merged.mcpServers).toBeUndefined();
-    expect(merged.servers).toBeDefined();
-  });
-
-  it("does not mutate the input", () => {
-    const existing = { mcpServers: { other: { command: "x" } } };
-    const snapshot = JSON.stringify(existing);
-    mergeClientConfig(existing, ["mcpServers"], { command: "y", args: [] });
-    expect(JSON.stringify(existing)).toBe(snapshot);
-  });
-
-  it("walks a nested containerPath and preserves siblings at every level", () => {
-    // Claude Code local scope: ["projects", "/abs/dir", "mcpServers"].
-    // Must preserve other projects + every top-level key in ~/.claude.json.
-    const existing = {
-      userID: "abc",
-      projects: {
-        "/other/project": { mcpServers: { foo: { command: "f" } }, history: ["x"] },
-        "/abs/dir": { history: ["y"] },
-      },
-    };
-    const merged = mergeClientConfig(existing, ["projects", "/abs/dir", "mcpServers"], {
-      command: "npx",
-      args: ["-y", "@yawlabs/mcp"],
-    });
-    expect(merged.userID).toBe("abc");
-    const projects = merged.projects as Record<string, Record<string, unknown>>;
-    // Other project untouched.
-    expect(projects["/other/project"].mcpServers).toEqual({ foo: { command: "f" } });
-    expect(projects["/other/project"].history).toEqual(["x"]);
-    // Target project: history preserved, mcpServers added.
-    expect(projects["/abs/dir"].history).toEqual(["y"]);
-    expect((projects["/abs/dir"].mcpServers as Record<string, unknown>)[ENTRY_NAME]).toEqual({
-      command: "npx",
-      args: ["-y", "@yawlabs/mcp"],
-    });
-  });
-
-  it("creates intermediate path segments when missing", () => {
-    const merged = mergeClientConfig({}, ["projects", "/new/dir", "mcpServers"], { command: "npx", args: [] });
-    const projects = merged.projects as Record<string, Record<string, unknown>>;
-    expect(projects["/new/dir"].mcpServers).toEqual({ [ENTRY_NAME]: { command: "npx", args: [] } });
-  });
-});
+// The `mergeClientConfig` describe stood here: sibling preservation at every
+// level of a nested container path, intermediate segments created on the way
+// down, the input never mutated, and the container key taken from the target
+// rather than assumed. That function is gone -- every write goes through
+// `applyClientConfigEdits` -- and each of those properties is now pinned
+// against the live splicer instead: see the nested-container cases in
+// client-config-json.test.ts (which assert the OTHER project is untouched and
+// the chain is materialised), the fresh-document shape there, and the write
+// facade's own verification, which refuses any edit that changed a neighbour.
 
 describe("mergePermissionsAllow", () => {
   it("adds the pattern to an empty settings object", () => {
@@ -867,28 +806,51 @@ describe("runInstall -- other client entries stay direct", () => {
   });
 });
 
-describe("directClientEntries", () => {
+describe("the other servers wired DIRECTLY into a container", () => {
+  // `directClientEntries` in install-cmd.ts used to answer this, over a
+  // container object the consumer had walked to. It is the core's
+  // `otherServerKeys()` now, over the entries the site's own adapter read --
+  // same rule, one reader of the legacy-name list. These are its cases,
+  // moved onto the live implementation rather than deleted with the old one.
+  const keysOf = (container: Record<string, unknown>): string[] =>
+    classifyClientConfig(JSON.stringify({ mcpServers: container }), {
+      id: "default",
+      label: "test",
+      resolved: { absolute: "/x", display: "/x", containerPath: ["mcpServers"] },
+      format: "jsonc",
+      detectDir: null,
+    }).otherServerKeys();
+
   it("skips our own entry and every pre-rename spelling of it", () => {
-    expect(directClientEntries({})).toEqual([]);
-    expect(directClientEntries({ [ENTRY_NAME]: {} })).toEqual([]);
-    expect(directClientEntries({ "mcp.hosting": {} })).toEqual([]);
-    expect(directClientEntries({ mcph: {} })).toEqual([]);
-    expect(directClientEntries({ "yaw-mcp": {} })).toEqual([]);
+    expect(keysOf({})).toEqual([]);
+    expect(keysOf({ [ENTRY_NAME]: {} })).toEqual([]);
+    expect(keysOf({ "mcp.hosting": {} })).toEqual([]);
+    expect(keysOf({ mcph: {} })).toEqual([]);
+    expect(keysOf({ "yaw-mcp": {} })).toEqual([]);
   });
 
   it("counts a trial entry, which is a server wired straight into the client", () => {
-    expect(directClientEntries({ github: {}, "yaw-mcp-try-linear": {} })).toEqual(["github", "yaw-mcp-try-linear"]);
+    expect(keysOf({ github: {}, "yaw-mcp-try-linear": {} })).toEqual(["github", "yaw-mcp-try-linear"]);
   });
 
   it("skips values no client could launch", () => {
-    expect(directClientEntries({ a: "s", b: null, c: [] })).toEqual([]);
+    expect(keysOf({ a: "s", b: null, c: [] })).toEqual([]);
   });
 
-  it("returns nothing for a container that is not an object", () => {
-    expect(directClientEntries(null)).toEqual([]);
-    expect(directClientEntries([])).toEqual([]);
-    expect(directClientEntries("x")).toEqual([]);
-    expect(directClientEntries(undefined)).toEqual([]);
+  it("returns nothing for a container that is not an object at all", () => {
+    // The container key holding a non-object is a `blocked` read, and every
+    // question the view answers is empty for a read that is not ok.
+    for (const raw of ['{"mcpServers":5}', '{"mcpServers":[]}', '{"mcpServers":"x"}', "[1]", null]) {
+      expect(
+        classifyClientConfig(raw, {
+          id: "default",
+          label: "test",
+          resolved: { absolute: "/x", display: "/x", containerPath: ["mcpServers"] },
+          format: "jsonc",
+          detectDir: null,
+        }).otherServerKeys(),
+      ).toEqual([]);
+    }
   });
 });
 
@@ -1692,7 +1654,7 @@ describe("runInstall — collision handling", () => {
   });
 
   it("--force's drop line names only what --repair would have kept; the diff names every dropped key", async () => {
-    // readEntryAt filters a non-string value out on BOTH paths, so "--repair
+    // The core's carryableEnv filters a non-string value out on BOTH paths, so "--repair
     // keeps it" would be false of DEBUG. The line names OAM_BIN alone; the diff
     // line, which describes the real file-to-file change, names both.
     writeFileSync(
@@ -4036,21 +3998,6 @@ describe("runInstall — returned messages match what was printed", () => {
   });
 });
 
-describe("readEntryAt", () => {
-  it("returns the entry, or null for every shape that is not one", () => {
-    const cfg = { mcpServers: { [ENTRY_NAME]: { command: "npx", env: { A: "1" } } } };
-    expect(readEntryAt(cfg, ["mcpServers"], ENTRY_NAME)?.env).toEqual({ A: "1" });
-    // Absent container, absent entry, and non-object shapes must all be null
-    // rather than throw: these come from a user-editable config file.
-    expect(readEntryAt({}, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: {} }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: [] }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: "nope" }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: "nope" } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-    expect(readEntryAt({ mcpServers: { [ENTRY_NAME]: [] } }, ["mcpServers"], ENTRY_NAME)).toBeNull();
-  });
-});
-
 describe("mergePermissionsAllow — non-string entries", () => {
   it("keeps non-string elements of a pre-existing allow array", () => {
     // The filter used to type-narrow to string, so anything else a user (or a
@@ -4517,7 +4464,7 @@ describe("runInstall — idempotence (re-run over an entry that already matches)
   });
 
   it("an extra key on the stored entry is a DIFFERENCE, not a match", async () => {
-    // readEntryAt's sanitized view drops keys it does not model, so comparing
+    // The carried env is string-valued only, so comparing
     // against THAT would call this identical and decline to fix the very thing
     // a re-run is for. The comparison reads the RAW stored value.
     await seedByInstalling();
@@ -4869,7 +4816,7 @@ describe("runInstall — a DIFFERING entry shows what differs", () => {
   });
 
   it("the off-TTY hint names only the env keys --repair keeps when a stored value is not a string", async () => {
-    // readEntryAt filters a non-string value out of the carry-over, so --repair
+    // The core's carryableEnv filters a non-string value out of the carry-over, so --repair
     // does NOT keep all of this env. The diff says DEBUG goes; the hint under
     // it must not then claim the env is kept.
     seedStale({ command: "old", args: [], env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2", DEBUG: 1 } });

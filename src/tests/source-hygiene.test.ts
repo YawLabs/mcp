@@ -389,35 +389,17 @@ const EXPECTED_WALKS: Record<string, Walk[]> = {
       why: "the import SOURCE read; sourcePath then carries the key found into the removal",
     },
   ],
+  // install and uninstall no longer walk a container at all: both read through
+  // the client-config core, which asks its own adapter for the entries at the
+  // address it was handed. `readNested`, `readEntryAt` and `mergeClientConfig`
+  // are DELETED, not merely unused -- their last caller was try-cmd, which now
+  // goes through the core too -- so what is left here is the two loops over
+  // the drive-case variant PATHS, which are addresses rather than walks.
   "src/install-cmd.ts": [
-    {
-      shape: "CALL readNested(root: Record<string, unknown>, containerPath: string[])",
-      why: "the generic walker's own declaration -- it takes whatever path it is handed",
-    },
-    {
-      shape:
-        "CALL readEntryAt(existing: Record<string, unknown>, containerPath: string[], " +
-        "entryName: string = ENTRY_NAME)",
-      why: "declaration of the entry accessor one level up; same generic contract, same handed-in path",
-    },
-    {
-      shape: "CALL readNested(existing, containerPath)",
-      why: "readEntryAt's body, the same generic accessor one level up",
-    },
-    // install and uninstall no longer walk a container at all: both read
-    // through the client-config core, which asks its own adapter for the
-    // entries at the address it was handed. What is left in this file is the
-    // two generic accessors' declarations and their bodies, kept while
-    // try-cmd still calls mergeClientConfig.
-    { shape: "LOOP for (const key of containerPath)", why: "readNested's own body" },
     { shape: "LOOP for (const variantPath of variantPaths.slice(1))", why: "install: the sibling scan" },
     {
       shape: "LOOP for (let i = 0; i < variantPaths.length; i++)",
       why: "uninstall: builds one RemovalSite per helper-derived path",
-    },
-    {
-      shape: "LOOP for (let i = 0; i < containerPath.length - 1; i++)",
-      why: "mergeClientConfig: clones the chain it WRITES into -- one path, never a variant",
     },
   ],
   // Every hit here is in the module that OWNS the projects key. That is the
